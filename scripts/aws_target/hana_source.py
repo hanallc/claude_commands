@@ -13,6 +13,7 @@ import socket
 import subprocess
 
 from scripts.aws_target import hana_protocol
+from scripts.aws_target.hana_protocol import MissingBasis as MissingBasis
 from scripts.lib import build_folders, build_slots, conf
 
 # Match the control protocol without importing controller or AWS modules.
@@ -22,12 +23,6 @@ SOURCE_ROOT = Path('/var/lib/hana')
 def read_limits(configuration: conf.ConfigRead) -> hana_protocol.SourceLimits:
     return hana_protocol.SourceLimits(configuration.whole('source_git_timeout_s'),
                                       configuration.words('source_allowed_environment'))
-
-
-@dataclass(frozen=True)
-class MissingBasis:
-    repository: str
-    commits: tuple[str, ...]
 
 
 @dataclass(frozen=True)

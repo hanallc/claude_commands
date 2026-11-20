@@ -44,6 +44,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, build_folders, build_slots, conf, test_hang_guard
+from scripts.lib.build_slots_test_support import private_slot_config, write_private_slot_roots
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, command_job, read_step_names
@@ -58,6 +59,7 @@ REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
 STEVIE_OUTPUT = memory_feed.stevie_output
 UNIT_LABELS_FOR = unit_labels.unit_labels_for
 STEVIE = Path("/fixture/bin/stevie")
+FIXTURE_MACHINE = "fixture"
 
 
 def needs_all_page_proof_views(repo: Path) -> bool:
@@ -265,6 +267,7 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertEqual(REQUEST_TOKEN_DUMP(), expected)
 
     def test_run_slot_numbers_use_the_run_machine_root(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
         mac_machine = "private-mac-host"
         _ = (self.root / "machines.conf").write_text(f"mac.hosts={mac_machine}\n")
         roots = {"natedev": self.root / "linux-slots", mac_machine: self.root / "mac-slots"}
@@ -359,6 +362,7 @@ class MemoryFeedTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        write_private_slot_roots(self.root / "build_folders.conf", self.root, FIXTURE_MACHINE)
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
         _ = write_config_fixture(self.root / "build_steps.conf",
@@ -387,7 +391,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(admission_client, "view",
             side_effect=AssertionError("The test must supply a private queue reading")))
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
-        _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value="fixture"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value=FIXTURE_MACHINE))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
@@ -649,6 +653,7 @@ process.stdout.write(JSON.stringify({
             (["--tests-only", "--module", "a", "--module=b"], StepJob("test-modules", modules=2)),
             (["--tests-only"], StepJob("test-all")),
             (["--nightly"], StepJob("test-nightly", branch="sdlc")),
+            (["--unit", "handler"], StepJob("integrate", unit="handler", branch="sdlc")),
         )
         names = read_step_names()
         with tempfile.TemporaryDirectory() as folder:
@@ -660,9 +665,9 @@ process.stdout.write(JSON.stringify({
                     _ = (proc / str(pid) / "cmdline").write_bytes(b"\0".join(part.encode() for part in command) + b"\0")
                     job = memory_feed.step_job("merge-gate", pid, proc)
                     self.assertEqual(job, expected)
-                    notes = memory_feed.job_notes(job, "report", names)
+                    notes = memory_feed.job_notes(job, names)
                     self.assertTrue(notes.get("about"))
-                    self.assertEqual(notes.get("changes"), "no branch")
+                    self.assertEqual(notes.get("changes"), "sdlc branch" if expected.step == "integrate" else "no branch")
             self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
             self.assertIsInstance(memory_feed.step_job("merge-gate", 99, proc), memory_feed.CommandUnreadable)
         for command, named in (
@@ -685,6 +690,40 @@ process.stdout.write(JSON.stringify({
             with self.subTest(command=command):
                 self.assertEqual(command_job(command), named)
         self.assertEqual(names.about(StepJob("test-all"), "—"), "")
+        about = "Merges the checkpoint into the sdlc branch, runs every test module, then pushes sdlc"
+        self.assertEqual(names.about(StepJob("integrate", unit="handler", branch="sdlc")), about)
+        self.assertEqual(names.about(StepJob("test-all")), "Runs every test module")
+        reading = reservation_reading()
+        integrate = StepJob("integrate", unit="handler", branch="sdlc")
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(memory_feed, "step_job", return_value=integrate)):
+            page = memory_feed.reading()
+        running, = [row for row in page["walk"] if row.get("queued")]
+        for row in (running, *page["waiters"]):
+            self.assertEqual(row.get("changes"), "sdlc branch")
+            self.assertEqual(row.get("about"), about)
+            self.assertIn("integrate", row["name"])
+
+    def test_step_descriptions_use_the_current_templates_and_recorded_work(self) -> None:
+        path = self.root / "build_steps.conf"
+        _ = write_config_fixture(path, "about.verify-final=Runs the final checks and tests\n")
+        names = read_step_names()
+        verify = admission_records.VerifyCall("final", "verify final hana", 2, 2)
+        notes = memory_feed.job_notes(memory_feed.NotGateStep(), names,
+                                     step="nextest", verify=verify)
+        self.assertEqual(notes.get("about"), "Runs the final checks and tests")
+        self.assertNotIn("changes", notes)
+        for step, ci, kind, expected in (
+            ("bench", True, "build-step", "Runs the selected benchmarks for CI"),
+            ("nextest", True, "build-step", "Runs the selected tests for CI"),
+            ("c", False, "build-step", "Checks that the selected targets compile"),
+            ("", False, "compiler-cache", "This cache stores compiled code for reuse"),
+            ("", False, "unowned-processes", "These processes run outside the queue"),
+        ):
+            with self.subTest(step=step, kind=kind):
+                notes = memory_feed.job_notes(memory_feed.NotGateStep(), names, step=step, ci=ci, kind=kind)
+                self.assertEqual(notes.get("about"), expected)
+
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
         for step in ("targeted-test", "merge-gate", "nextest", "test", "t"):
@@ -1068,7 +1107,6 @@ process.stdout.write(JSON.stringify({
                 assert_status_states(self, page, seconds, cast(dict[str, object], json.loads((self.output / "memory.json").read_text())))
 
     def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
-        _ = write_config_fixture(self.root / "build_folders.conf")
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         chrome = self.root / "chrome"
         report = self.root / "chrome-report.json"
@@ -1391,7 +1429,7 @@ process.stdout.write(JSON.stringify({
         from scripts.build_queue.test_target_availability import MAC_BLOCK
 
         names = read_step_names()
-        notes = memory_feed.job_notes(StepJob("test-all"), "builder", names)
+        notes = memory_feed.job_notes(StepJob("test-all"), names, unit="builder")
         self.assertEqual(notes.get("about_parts"), [{"kind": "text", "text": "Tests every module of "},
             {"kind": "staff", "text": "builder"}, {"kind": "text", "text": "."}])
         self.assertEqual(staff_names.parts_text(notes.get("about_parts", [])), notes.get("about"))
@@ -1741,6 +1779,13 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(after["reserved"], before["reserved"])
         self.assertEqual(after["used"], before["used"])
         self.assertEqual(after["waiting"], 1)
+        self.assertEqual(row.get("about"), "Waits for a build slot")
+
+        saved = replace(slot, identity=replace(slot.identity, step="merge-gate", job=StepJob("test-all", unit="widget")))
+        with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(saved,))):
+            waiting, = memory_feed.reading()["waiters"]
+        self.assertEqual(waiting.get("about"), "Tests every module of widget.")
+        self.assertEqual(waiting.get("changes"), "no branch")
 
     def copies_slot_page(self, command: str, *, source: str, unit: str = "",
                          worktree_owner: str = "", recorded_step: str = "bash",
@@ -1834,32 +1879,60 @@ process.stdout.write(JSON.stringify({
 
     def test_copies_sends_the_wrapped_step_and_staff_unit_in_the_slot_request(self) -> None:
         from scripts.copies import copies
-        from scripts.lib import build_slots
 
         owner = "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"
         source = self.root / "repository"
+        pool = private_slot_config(self.root / "slot-request", repository="hana")
         runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "hana", staff.StaffRoot(),
                                current_session=staff.StaffId("runner-session"))
         member = staff.StaffRow(staff.StaffId(owner), "unit", "startup", staff.ReportsTo(runner.id),
                                 current_session=staff.StaffId("startup-session"))
-        command = ["bash", "-c", 'cd . && env MODE=test bash /fixture/verify.sh test --filter "a b" hana']
-        with (mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": runner.current_session}),
-              mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((runner, member))),
-              mock.patch.object(copies, "source_commit", return_value="abc"),
-              mock.patch.object(copies, "slot_source", return_value=source),
-              mock.patch.object(copies, "main_checkout", return_value=source),
-              mock.patch.object(build_slots, "_try_slot", side_effect=build_slots.SlotsFull("hana", "fixture", 1)),
-              mock.patch.object(build_slots, "configured_slot_root", return_value=self.root / "slots"),
-              mock.patch.object(admission_client, "repository_slot", return_value=wire.Refused("fixture refusal")) as send):
-            with self.assertRaisesRegex(RuntimeError, "fixture refusal"):
-                with copies.command_tree(owner, source, copies.CommittedSource("HEAD"), command):
-                    self.fail("The slot is full")
-        send.assert_called_once()
-        request = cast(wire.RepositorySlotRequest, send.call_args.args[0])
-        self.assertEqual(request.identity.step, "test hana")
-        self.assertEqual(request.identity.session_id, owner)
-        self.assertEqual(request.identity.unit, "")
-        self.assertEqual(request.identity.folder, str(source))
+        cases = (
+            ('env MODE=test bash /fixture/verify.sh test --filter "a b" hana', "test hana", GATE_JOB_NOT_RECORDED,
+             admission_records.VerifyCall("test", "verify test --filter 'a b' hana", 1, 1), "Runs the selected tests"),
+            ('env MODE=test bash /fixture/verify.sh --session-dir /fixture/session final hana --local "check local code"',
+             "final hana", GATE_JOB_NOT_RECORDED,
+             admission_records.VerifyCall("final", "verify final hana --local 'check local code'", 1, 1),
+             "Checks the workspace targets and runs the selected tests"),
+            ('python3 /fixture/merge_gate.py --tests-only --full', "test-all", StepJob("test-all"),
+             admission_records.NotVerifyCall(), "Tests every module of startup."),
+        )
+        for command, step, job, verify, about in cases:
+            with (self.subTest(step=step),
+                  mock.patch.dict(os.environ, {
+                      "CONF_DIR": str(pool.settings.parent), "CLAUDE_CODE_SESSION_ID": runner.current_session}),
+                  mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((runner, member))),
+                  mock.patch.object(copies, "source_commit", return_value="abc"),
+                  mock.patch.object(copies, "slot_source", return_value=source),
+                  mock.patch.object(copies, "main_checkout", return_value=source),
+                  mock.patch.object(build_slots, "_try_slot", side_effect=build_slots.SlotsFull("hana", "fixture", 1)),
+                  mock.patch.object(admission_client, "repository_slot", return_value=wire.Refused("fixture refusal")) as send):
+                with self.assertRaisesRegex(RuntimeError, "fixture refusal"):
+                    with copies.command_tree(owner, source, copies.CommittedSource("HEAD"),
+                                             ["bash", "-c", f"cd . && {command}"]):
+                        self.fail("The slot is full")
+                send.assert_called_once()
+                request = cast(wire.RepositorySlotRequest, send.call_args.args[0])
+                self.assertEqual(request.root, str(pool.slots.resolve()))
+                saved = wire.parse_request(wire.encode_request(request))
+                assert isinstance(saved, wire.RepositorySlotRequest)
+                self.assertEqual(saved.identity.step, step)
+                self.assertEqual(saved.identity.session_id, owner)
+                self.assertEqual(saved.identity.unit, "")
+                self.assertEqual(saved.identity.folder, str(source))
+                self.assertEqual(saved.identity.job, job)
+                self.assertEqual(saved.identity.verify, verify)
+                slot = wire.RepositorySlotRow(saved.owner, saved.identity, saved.since, saved.machine,
+                    wire.RepositorySlotWaiting("hana", (1,), 1, "slots.fixture.hana.max"))
+                reading = replace(cloud_reading(captured_reading()), repository_slots=(slot,), cloud=())
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((runner, member)))):
+                    row, = memory_feed.reading()["waiters"]
+                self.assertEqual(row.get("about"), about)
+                if isinstance(verify, admission_records.VerifyCall):
+                    self.assertEqual(row.get("verify"),
+                        {"verb": verify.verb, "call": verify.call, "position": 1, "total": 1, "step": step})
+
 
     def test_queue_row_name_rejects_shell_words_and_ids_inside_names(self) -> None:
         for name in ("startup bash", "startup /bin/env", "exec -a", "startup $UNIT",
@@ -2291,7 +2364,11 @@ process.stdout.write(JSON.stringify({
         placed, unrelated = [row for row in page["walk"] if row.get("kind") == "mac-build"]
         self.assertEqual(placed.get("verify"), {
             "step": "nextest", "verb": "test", "call": "verify test sample --no-cache", "position": 1, "total": 1})
+        self.assertEqual(placed.get("about"), "Runs the selected tests")
+        self.assertEqual(unrelated.get("about"), "Runs the selected tests")
         self.assertNotIn("verify", unrelated)
+        self.assertEqual(unrelated.get("call"), "cargo nextest run")
+        self.assertNotIn("call", placed)
 
     def test_verify_call_reaches_running_and_waiting_feed_rows(self) -> None:
         page = self.verify_call_page()
@@ -2306,6 +2383,72 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(waiting_call["call"], running_call["call"])
         self.assertEqual((running_call["verb"], waiting_call["total"]), ("final", 2))
         self.assertNotIn("verify", direct)
+
+    def test_the_page_shortens_calls_without_changing_the_record(self) -> None:
+        cases = (
+            ("verify test " + " ".join(f"--filter check_{index}" for index in range(14)),
+             "verify test · 14 filters"),
+            ("verify test --filter=first --filter second --no-cache", "verify test --no-cache · 2 filters"),
+            ("verify check /work/project/ --manifest-path='/work/project/Cargo test.toml'",
+             "verify check project '--manifest-path=Cargo test.toml'"),
+            ("verify test --run-id fixture --commit f4ab123 --job 786a38ed-dffe-4fea-b6cf-814fa44aeee5",
+             "verify test --run-id --commit --job"),
+            ("verify final sample --local 'creates a Linux install'", "verify final sample --local 'creates a Linux install'"),
+            ("verify test --filter first --filter second hana", "verify test hana · 2 filters"),
+            ("verify test --filter=first --filter=second hana", "verify test hana · 2 filters"),
+            ("verify test --no-cache --no-cache hana", "verify test hana · --no-cache ×2"),
+            ("verify check --keep-going --keep-going hana", "verify check hana · --keep-going ×2"),
+            ("verify test hana --mac screenshots --fetch target/shots",
+             "verify test hana --mac screenshots --fetch target/shots"),
+            ("verify test --features hana/dynamic_linking", "verify test --features hana/dynamic_linking"),
+        )
+        for original, expected in cases:
+            with self.subTest(call=original):
+                saved = admission_records.VerifyCall("test", original, 1, 1)
+                verify = memory_feed.call_notes(saved, "nextest").get("verify")
+                assert verify is not None
+                self.assertEqual(verify["call"], expected)
+                self.assertEqual(saved.call, original)
+
+    def test_cargo_and_gate_commands_use_the_call_formatter(self) -> None:
+        cases = (
+            (("cargo", "test", "-p", "sample", "--release"), "cargo test -p sample --release"),
+            (("cargo", "test", "-F", "hana/dynamic_linking", "--manifest-path=work/project/Cargo.toml"),
+             "cargo test -F hana/dynamic_linking --manifest-path=work/project/Cargo.toml"),
+            (("cargo", "check", "--manifest-path=~/work/project/Cargo.toml"),
+             "cargo check --manifest-path=Cargo.toml"),
+            (("cargo", "test", "-v", "-v"), "cargo test · -v ×2"),
+            (("cargo", "test", "--", "--skip", "first", "--skip", "second", "hana"), "cargo test -- hana · 2 skips"),
+            (("py", "merge_gate.py", "--tests-only", "--module", "one", "--module=two"),
+             "merge_gate.py --tests-only · 2 modules"),
+            (("py", "merge_gate.py", "--checkout", "/work/project/", "--tests-only", "--module", "suite/module"),
+             "merge_gate.py --checkout project --tests-only --module suite/module"),
+        )
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                self.assertEqual(memory_feed.build_command_call(arguments), expected)
+
+    def test_queued_cargo_keeps_the_command_from_the_admission_child(self) -> None:
+        base = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
+        waiter, = base.view.waiting
+        current: admission_records.RankedWaiter = {
+            "pid": waiter.pid, "start_time": "waiter", "need": waiter.need, "since": waiter.since,
+            "session_id": waiter.session_id, "session_name": waiter.session_name,
+            "step": waiter.step, "folder": waiter.folder, "order": admission_records.NormalOrder(),
+        }
+        reading = replace(base, ordered=((Path("fixture.waiting"), current),))
+        proc = self.root / "proc"
+        write_process(proc, waiter.pid, start="waiter")
+        child = waiter.pid + 1
+        write_process(proc, child, parent=waiter.pid)
+        _ = (proc / str(child) / "cmdline").write_text(
+            "\0".join(("python3", "queue_place.py", "admit", "--pid", str(waiter.pid), "--",
+                        "cargo", "nextest", "run", "-p", "hana")) + "\0")
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            waiting, = memory_feed.reading()["waiters"]
+        self.assertEqual(waiting.get("call"), "cargo nextest run -p hana")
+        self.assertNotIn("verify", waiting)
+
 
     def test_queued_tooltips_use_the_verify_route_or_the_direct_command_reason(self) -> None:
         page = self.macroute_page()
@@ -2588,7 +2731,7 @@ process.stdout.write(JSON.stringify({
                         self.assertEqual(row["name"], "devtools " + named if named else "devtools")
                         self.assertEqual(row["title"]["step"], named or "devtools")
                         self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
-                        about = names.about(job, "devtools") if isinstance(job, StepJob) else ""
+                        about = names.about(job, "devtools") if isinstance(job, StepJob) else "Runs a merge or test job"
                         self.assertEqual(row.get("about", ""), about)
                         self.assertEqual(row.get("changes", ""), names.changes(job) if isinstance(job, StepJob) and about else "")
 
@@ -2689,6 +2832,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(row["name"], "devtools test all")
         self.assertEqual(row.get("about"), "Tests every module of devtools.")
         self.assertEqual(row.get("changes"), "no branch")
+        self.assertEqual(row.get("call"), "merge_gate.py --tests-only --full")
 
     def owner_machine_page(self, owner: unit_labels.UnitLabels, *, ci: bool = False) -> memory_feed.MemoryPage:
         """Use the same owner across the local, Mac, and cloud rows."""
@@ -3153,13 +3297,83 @@ process.stdout.write(JSON.stringify({
             with self.subTest(gpu_slot=code):
                 self.assertEqual(memory_feed.memory_status(gpu_wait, self.fixture_room(available), 0)["code"], code)
 
+    def tool_process(self, pid: int, command: str, kib: int, *, parent: int = 1,
+                     children: tuple[int, ...] = (), shared_kib: int = 0) -> Path:
+        proc = self.root / "proc"
+        write_process(proc, pid, kib * 1024, parent=parent)
+        process = proc / str(pid)
+        _ = (process / "cmdline").write_bytes(command.encode().replace(b" ", b"\0") + b"\0")
+        _ = (process / "status").write_text(
+            f"VmRSS: {kib + 2 * shared_kib} kB\nRssAnon: {kib} kB\nRssShmem: {2 * shared_kib} kB\n")
+        _ = (process / "smaps_rollup").write_text(f"Pss_Anon: {kib} kB\nPss_Shmem: {shared_kib} kB\n")
+        task = process / "task" / str(pid)
+        task.mkdir(parents=True, exist_ok=True)
+        _ = (task / "children").write_text(" ".join(map(str, children)))
+        return process
+
+    def tool_scope_unit(self, scope: Path, command: str) -> Path:
+        unit = self.root / "runtime" / "systemd" / "transient" / scope.name
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        _ = unit.write_text(f"[Scope]\nDescription=[systemd-run] {command}\n")
+        return unit
+
+    def tool_split(self, *waiting: int) -> memory_feed.BuildToolRam:
+        waiters: list[admission_records.RankedWaiter] = [
+            {"pid": pid, "start_time": str(pid), "need": 1024, "since": 0, "order": admission_records.NormalOrder()}
+            for pid in waiting]
+        with (mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}),
+              mock.patch.object(memory_feed, "PROC", self.root / "proc"),
+              mock.patch.object(memory_feed, "CGROUP", self.root),
+              mock.patch.object(gate, "builds_slice_cgroup", return_value=self.root / "builds.slice")):
+            return memory_feed.build_tool_ram((), 0, waiters)
+
+    def test_detect_scope_estimates_test_only_and_mixed_charges(self) -> None:
+        _ = self.tool_process(101, "python -m unittest", 10, children=(102,))
+        _ = self.tool_process(102, "python3 -c child", 20, parent=101, children=(103,))
+        _ = self.tool_process(103, "sleep 10", 10, parent=102)
+        _ = self.tool_process(104, "other", 50)
+        builds = self.root / "builds.slice"
+        scope = builds / "builds-detached.slice" / "detached-detect-20261117T192504-3473301-5b4c.scope"
+        cases: tuple[tuple[tuple[int, ...], int], ...] = (
+            ((101, 102, 103), 100),
+            ((101, 102, 103, 104), 40),
+            ((), 0),
+        )
+        for members, expected in cases:
+            with self.subTest(members=members):
+                write_scope(builds, anonymous=100 * 1024)
+                write_scope(scope.parent, anonymous=100 * 1024)
+                write_scope(scope, members=members, anonymous=100 * 1024)
+                self.assertEqual(self.tool_split(), memory_feed.BuildToolRam(0, 0, (100 - expected) * 1024,
+                                                                           python_tests=expected * 1024))
+
+    def test_detached_test_scope_keeps_its_class_after_the_runner_exits(self) -> None:
+        _ = self.tool_process(102, "python3 -c child", 20)
+        builds = self.root / "builds.slice"
+        run_id = "20261117T192504-3473301-5b4c"
+        scope = builds / "builds-detached.slice" / f"detached-python-tests-{run_id}.scope"
+        child_group = scope / "children"
+        write_scope(builds, anonymous=100 * 1024)
+        write_scope(scope.parent, anonymous=100 * 1024)
+        write_scope(scope, anonymous=100 * 1024)
+        write_scope(child_group, members=(102,), anonymous=70 * 1024)
+        record = self.root / "detached_runs" / f"{run_id}.json"
+        record.parent.mkdir()
+        _ = record.write_text('{"status": "finished", "kind": "python-tests"}')
+        expected = memory_feed.BuildToolRam(0, 0, 0, python_tests=100 * 1024)
+        with (mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.root)}),
+              mock.patch.object(memory_feed.ToolProcessReader, "command", side_effect=AssertionError("live command read"))):
+            self.assertEqual(self.tool_split(), expected)
+            record.unlink()
+            self.assertEqual(self.tool_split(), expected)
+
     def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
         for cargo_use in (0, 2 * admission_records.GIB):
             with self.subTest(cargo_use=cargo_use), AdmissionFixture(root=self.root / str(cargo_use)) as fixture:
                 python = fixture.fixture_owner(700001, "100")
                 process = fixture.proc.path / str(python.pid)
                 _ = process.joinpath("comm").write_text("python3\n")
-                _ = process.joinpath("cmdline").write_bytes(b"python3\0-m\0unittest\0")
+                _ = process.joinpath("cmdline").write_bytes(b"python3\0build_tool.py\0")
                 python_use = 4 * admission_records.GIB
                 builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
                 detached = builds / "builds-detached.slice"
@@ -3189,6 +3403,158 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(page["leftovers"], [])
                 self.assertTrue(all(row.get("queued", False) for row in build_rows))
                 room = reading.explanation.room
+                assert isinstance(room, admission_records.MemoryRoom)
+                self.assertEqual(len(room.runs), int(bool(cargo_use)))
+                self.assertEqual(room.used, cargo_use)
+                self.assertEqual(room.used + room.kept, 8 * admission_records.GIB if cargo_use else 0)
+
+    def test_detached_scope_without_test_evidence_counts_as_other_tools(self) -> None:
+        builds = self.root / "builds.slice"
+        detached = builds / "builds-detached.slice"
+        for name, command in (
+            ("run-test.scope", "python3 -c child"),
+            ("detached-other-20261117T192504-3473301-5b4c.scope", "python3 -m unittest"),
+        ):
+            with self.subTest(name=name):
+                _ = self.tool_process(102, command, 20)
+                scope = detached / name
+                unit = self.tool_scope_unit(scope, "/usr/bin/python3 -m unittest")
+                write_scope(builds, anonymous=100 * 1024)
+                write_scope(detached, anonymous=100 * 1024)
+                write_scope(scope, members=(102,), anonymous=100 * 1024)
+                self.assertEqual(self.tool_split(), memory_feed.BuildToolRam(0, 0, 100 * 1024))
+                unit.unlink()
+                _ = scope.rename(self.root / name)
+
+    def test_tool_group_split_names_both_byte_counts(self) -> None:
+        builds = self.root / "builds.slice"
+        detached = builds / "builds-detached.slice"
+        scope = detached / "test.scope"
+        _ = self.tool_process(101, "python3 -m unittest", 10)
+        _ = self.tool_process(102, "other", 20)
+        write_scope(detached, anonymous=30 * 1024)
+        write_scope(scope, members=(101, 102), anonymous=30 * 1024)
+        with (mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}),
+              mock.patch.object(memory_feed, "PROC", self.root / "proc")):
+            shares = memory_feed.split_tool_groups(builds, set(), set(), set(), ())[scope]
+        self.assertNotIsInstance(shares, tuple)
+        self.assertEqual(shares.python_tests_bytes, 10 * 1024)
+        self.assertEqual(shares.waiting_runs_bytes, 0)
+
+    def test_shared_pages_in_mixed_group_count_once_for_waiting_wrappers(self) -> None:
+        builds = self.root / "builds.slice"
+        for pid, command, parent, children, shared in (
+            (101, "bash /fixture/verify.sh test", 1, (102,), 15),
+            (102, "python3 local_release_wait.py", 101, (), 15),
+            (103, "other", 1, (), 0),
+        ):
+            process = self.tool_process(pid, command, 10 if shared else 50,
+                                        parent=parent, children=children, shared_kib=shared)
+            _ = (process / "cgroup").write_text("0::/builds.slice/mixed.scope\n")
+        write_scope(builds, anonymous=100 * 1024)
+        write_scope(builds / "mixed.scope", members=(101, 102, 103), anonymous=100 * 1024)
+        self.assertEqual(self.tool_split(102), memory_feed.BuildToolRam(0, 0, 50 * 1024, waiting_runs=50 * 1024))
+
+    def test_waiting_verify_shell_with_options_counts_as_a_wrapper(self) -> None:
+        builds = self.root / "builds.slice"
+        shell = self.tool_process(101, "bash -e /fixture/verify.sh test", 10, children=(102,))
+        owner = self.tool_process(102, "python3 local_release_wait.py", 10, parent=101)
+        for process in (shell, owner):
+            _ = (process / "cgroup").write_text("0::/builds.slice/verify.scope\n")
+        write_scope(builds, anonymous=20 * 1024)
+        write_scope(builds / "verify.scope", members=(101, 102), anonymous=20 * 1024)
+        self.assertEqual(self.tool_split(102), memory_feed.BuildToolRam(0, 0, 0, waiting_runs=20 * 1024))
+
+    def test_waiting_tools_skip_unrelated_processes_and_cgroup_subtrees(self) -> None:
+        builds = self.root / "builds.slice"
+        shell = self.tool_process(101, "bash /fixture/verify.sh test", 10, children=(102,))
+        owner = self.tool_process(102, "python3 local_release_wait.py", 10, parent=101)
+        thread = owner / "task" / "104"
+        thread.mkdir()
+        _ = (thread / "children").write_text("103")
+        helper = self.tool_process(103, "python3 verify_helper.py", 10, parent=102)
+        _ = self.tool_process(199, "other", 20)
+        for process in (shell, owner):
+            _ = (process / "cgroup").write_text("0::/builds.slice/verify.scope\n")
+        _ = (helper / "cgroup").write_text("0::/builds.slice/verify.scope/helper.scope\n")
+        write_scope(builds, anonymous=50 * 1024)
+        write_scope(builds / "verify.scope", members=(101, 102), anonymous=30 * 1024)
+        write_scope(builds / "verify.scope" / "helper.scope", members=(103,), anonymous=10 * 1024)
+        unrelated = builds / "unrelated.scope" / "child.scope"
+        write_scope(unrelated.parent, anonymous=20 * 1024)
+        write_scope(unrelated, members=(199,), anonymous=20 * 1024)
+        with (mock.patch.object(gate, "process_table", wraps=gate.process_table) as table,
+              mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as read):
+            tools = self.tool_split(102)
+        table.assert_not_called()
+        self.assertNotIn(mock.call(unrelated / "cgroup.procs"), read.call_args_list)
+        self.assertEqual(tools, memory_feed.BuildToolRam(0, 0, 20 * 1024, waiting_runs=30 * 1024))
+
+    def test_python_tests_and_waiting_wrappers_split_tools_without_counting_cargo_twice(self) -> None:
+        gib = admission_records.GIB
+        for cargo_use in (0, 2 * admission_records.GIB):
+            with self.subTest(cargo_use=cargo_use), AdmissionFixture(root=self.root / str(cargo_use)) as fixture:
+                python = fixture.fixture_owner(700001, "100")
+                process = fixture.proc.path / str(python.pid)
+                _ = process.joinpath("comm").write_text("python3\n")
+                _ = process.joinpath("cmdline").write_bytes(b"python3\0-m\0unittest\0")
+                proc = fixture.proc.path
+                shell, waiter_pid, helper, unknown = 700010, 700011, 700012, 700013
+                for pid, parent, use, command in (
+                    (shell, 1, gib // 4, b"bash\0/fixture/verify.sh\0test\0"),
+                    (waiter_pid, shell, gib // 4, b"python3\0local_release_wait.py\0"),
+                    (helper, shell, gib // 2, b"python3\0verify_helper.py\0"),
+                    (unknown, 1, gib, b"python3\0tree_watch.py\0"),
+                ):
+                    write_process(proc, pid, use, parent=parent)
+                    process = proc / str(pid)
+                    _ = (process / "cmdline").write_bytes(command)
+                    _ = (process / "smaps_rollup").write_text(f"Pss_Anon: {use // 1024} kB\nPss_Shmem: 0 kB\n")
+                    task = process / "task" / str(pid)
+                    task.mkdir(parents=True)
+                    children = {shell: f"{waiter_pid} {helper}"}
+                    _ = (task / "children").write_text(children.get(pid, ""))
+                python_use = 4 * gib
+                builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+                detached = builds / "builds-detached.slice"
+                write_scope(builds, current=python_use + cargo_use + 2 * gib, anonymous=python_use + cargo_use + 2 * gib)
+                write_scope(detached, current=python_use + cargo_use + 2 * gib, anonymous=python_use + cargo_use + 2 * gib)
+                python_scope = detached / "detached-python-tests-20261117T192504-3473301-5b4c.scope"
+                write_scope(python_scope, members=(python.pid,),
+                    current=python_use + cargo_use, anonymous=python_use + cargo_use)
+                write_scope(detached / "verify.scope", members=(shell, waiter_pid, helper, unknown),
+                            current=2 * gib, anonymous=2 * gib)
+                if cargo_use:
+                    cargo = fixture.fixture_owner(700002, "200")
+                    sidecar = fixture.scope(cargo, folder=str((python_scope / "cargo.scope").relative_to(builds.parent)),
+                        current=cargo_use, anonymous=cargo_use)
+                    request = replace(fixture.request(owner=cargo, need=8 * admission_records.GIB), sidecar=str(sidecar))
+                    grant = only_admitted(fixture.server.handle_request(request))
+                    self.assertEqual(len(fixture.server.reservations), 1)
+                    self.assertIn(grant.reservation, [record.reservation_id for record in fixture.server.reservations.values()])
+                fixture.free(60 * gib - python_use - cargo_use - 2 * gib)
+                _ = fixture.run_pass()
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                inputs = reply.reading.explanation.decided_from
+                for start_time, wrapper_use in ((str(waiter_pid), gib), ("reused pid", 0)):
+                    waiter: admission_records.Waiter = {"pid": waiter_pid, "start_time": start_time,
+                        "since": inputs.now, "need": 60 * gib, "step": "nextest", "folder": "/fixture"}
+                    reading = gate.queue_read_from(replace(inputs, ordered=[(Path("waiter"), waiter)]),
+                                                   admission_policy_fixture())
+                    with (mock.patch.object(admission_client, "view", return_value=reading),
+                          mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}),
+                          mock.patch.object(memory_feed, "PROC", proc)):
+                        page = memory_feed.reading()
+                    ram = page["ram"]
+                    self.assertEqual((ram["python_tests_bytes"], ram["waiting_runs_bytes"], ram["other_build_tools_bytes"]),
+                                     (python_use, wrapper_use, 2 * gib - wrapper_use))
+                    self.assertEqual(ram["build_tools_bytes"], python_use + 2 * gib)
+                    self.assertEqual(page["used"], cargo_use / gib)
+                    build_rows = [row for row in page["walk"] if not row.get("ci", False)]
+                    self.assertEqual(len(build_rows), int(bool(cargo_use)))
+                    self.assertTrue(all(row.get("queued", False) for row in build_rows))
+                room = reply.reading.explanation.room
                 assert isinstance(room, admission_records.MemoryRoom)
                 self.assertEqual(len(room.runs), int(bool(cargo_use)))
                 self.assertEqual(room.used, cargo_use)
@@ -3342,6 +3708,22 @@ process.stdout.write(JSON.stringify({
 
 
 class BuildsPageProofTests(unittest.TestCase):
+    def test_only_a_nightly_lease_selects_all_page_proof_views(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _ = write_config_fixture(root / "build_folders.conf")
+            checkout = root / "checkout"
+            checkout.mkdir()
+            lease = build_slots.lease_path(checkout)
+            with (mock.patch.dict(os.environ, {"CONF_DIR": directory}),
+                  checkout.with_name(checkout.name + ".lock").open("wb") as lock):
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertFalse(needs_all_page_proof_views(checkout))
+                _ = lease.write_text(json.dumps({"work": "test-all"}), encoding="utf-8")
+                self.assertFalse(needs_all_page_proof_views(checkout))
+                _ = lease.write_text(json.dumps({"work": "test-nightly"}), encoding="utf-8")
+                self.assertTrue(needs_all_page_proof_views(checkout))
+
     def test_held_nightly_lease_selects_all_page_proof_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _ = write_config_fixture(Path(directory) / "build_folders.conf")
@@ -3359,14 +3741,13 @@ class BuildsPageProofTests(unittest.TestCase):
         source = Path(__file__).resolve()
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         proof = source.with_name("memory_page_proof.mjs")
+        all_views = needs_all_page_proof_views(source.parents[2])
+        mode = [] if all_views else ["--gate"]
         environment = {**os.environ, "PYTHON": sys.executable}
         for setting in ("MEMORY_PAGE_SHOT", "SWAP_BEFORE_PAGE", "STEADY_BASELINE"):
             _ = environment.pop(setting, None)
         with tempfile.TemporaryDirectory(prefix="builds-page-proof-") as directory:
-            _ = write_config_fixture(Path(directory) / "build_folders.conf")
-            with mock.patch.dict(os.environ, {"CONF_DIR": directory}):
-                all_views = needs_all_page_proof_views(source.parents[2])
-            mode = [] if all_views else ["--gate"]
+            write_private_slot_roots(Path(directory) / "build_folders.conf", Path(directory), FIXTURE_MACHINE)
             result = subprocess.run([executable, str(proof), *mode, directory],
                 env={**environment, "CONF_DIR": directory, "TMPDIR": directory}, text=True, capture_output=True,
                 timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)

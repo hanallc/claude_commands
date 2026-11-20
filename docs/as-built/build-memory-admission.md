@@ -998,6 +998,11 @@ A zero launch limit refuses its first hold and accepts an immediate grant.
 The leave hook runs during held waits and returns `LeftQueue` when another machine can start the step.
 
 `detached_runs.py start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to the worker.
+The launcher accepts `--kind python-tests` before `--` and defaults to `detect`.
+It records the kind and creates the scope `detached-<kind>-<run-id>.scope` when systemd is available.
+The scope name omits the worker suffix from the run ID.
+The Builds page reads the kind from the scope name.
+For a `detect` scope or an unmarked scope, the page estimates memory use from live Python test processes and their descendants.
 Orphan reaping uses the same runs-folder lock as start, including the `reap` verb and launcher reaping.
 The reaper cannot finish a record while start publishes its supervisor PID.
 Only running records with their matching supervisor hold a place.

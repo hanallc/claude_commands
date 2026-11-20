@@ -198,12 +198,13 @@ source_check_seconds=1
         self.configuration = self.base / "copies.conf"
         self.settings = {"owner.verify": "verify",
                          "remote_registry": str(self.base / "remote-mirrors"),
-                         "wait_seconds": "0.01", "git_timeout_seconds": "10",
+                         "git_timeout_seconds": "10",
                          "guard_timeout_seconds": "10", "guard_choice_limit": "32"}
         self.write_config(self.settings)
         # A run inside a build slot carries that slot's Cargo cache; the test's gates lease their own.
         environment = {key: value for key, value in os.environ.items()
-                       if not key.startswith("GIT_") and key not in ("UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR")}
+                       if not key.startswith("GIT_")
+                       and key not in ("UNIT_RUN_DIR", "CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR")}
         environment.update({
             **slot_configuration.environment,
             "HOME": str(home),
@@ -355,7 +356,7 @@ source_check_seconds=1
 
     def test_free_slot_does_not_resolve_the_queue_name(self) -> None:
         command = ("bash", "-c", "bash /fixture/verify.sh check hana")
-        with mock.patch.object(slot_wait, "command_slot_name", wraps=slot_wait.command_slot_name) as resolve:
+        with mock.patch.object(slot_wait, "command_slot_job", wraps=slot_wait.command_slot_job) as resolve:
             with copies.command_tree(self.owner_id, self.source, copies.CommittedSource(self.head), command) as tree:
                 self.assertTrue(tree.is_dir())
         resolve.assert_not_called()
@@ -1126,6 +1127,24 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertIn("/other", projects)
             self.assertIn(str(self.source.resolve()), projects)
 
+    def test_mirror_receiver_names_the_check_that_refused_it(self) -> None:
+        tree = self.base / "mirrors" / "hana"
+        tree.mkdir(parents=True)
+        _ = (tree / floor_claims.MIRROR_SESSION).write_text("reader\n")
+        receive = ("mirror-receive", "--path", str(tree), "--owner", "verify",
+                   "--repository", "hana", "--session", "writer", "--", sys.executable, "-c", "pass")
+        with floor_claims.mirror_lock_path(tree).open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            refused = self.cli(*receive)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("busy; held by session reader (mirror lease)", refused.stderr)
+
+        processes = copies.MirrorProcessScan(tmp_sweep.ProcessUsesUnavailable(), frozenset())
+        with mock.patch.object(copies, "scan_mirror_processes", return_value=processes):
+            refused = self.cli(*receive)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("busy; held by session reader (mirror process check)", refused.stderr)
+
     def test_copies_removal_clears_clone_trust_before_deleting_the_folder(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:remove-trust")
@@ -1816,29 +1835,20 @@ with patch.object(subprocess, 'run', pause_clone):
     def test_missing_or_invalid_required_configuration_refuses_before_clone(self) -> None:
         variants = [
             {**self.settings, key: value}
-            for key, value in (("remote_registry", ""), ("wait_seconds", "bad"), ("wait_seconds", "-1"),
+            for key, value in (("remote_registry", ""),
                                ("git_timeout_seconds", "0"), ("git_timeout_seconds", "nan"),
                                ("guard_timeout_seconds", "inf"))
         ]
         variants.extend({key: value for key, value in self.settings.items() if key != missing}
-                        for missing in ("remote_registry", "wait_seconds", "git_timeout_seconds", "guard_timeout_seconds"))
+                        for missing in ("remote_registry", "git_timeout_seconds", "guard_timeout_seconds"))
         for settings in variants:
             with self.subTest(settings=settings):
                 self.write_config(settings)
                 result = self.run_cli()
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.gates.exists())
-        for legacy in ("absent", "empty", "relative"):
-            with self.subTest(legacy_root=legacy):
-                settings = {key: value for key, value in self.settings.items() if key != "root"}
-                if legacy != "absent":
-                    settings["root"] = "" if legacy == "empty" else "unused-relative-root"
-                self.write_config(settings)
-                result = self.run_cli()
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertFalse(self.gates.exists())
 
-    def test_copy_roots_use_build_folders_without_a_copies_root_key(self) -> None:
+    def test_copy_roots_use_build_folders(self) -> None:
         scratch_root = self.base / "configured-scratch"
         workspace_root = self.base / "configured-workspaces"
         configuration = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
@@ -1846,8 +1856,6 @@ with patch.object(subprocess, 'run', pause_clone):
         environment = {key: value for key, value in os.environ.items()
                        if key not in (copy_record.ROOT_ENV, copy_record.COPIES_ENV)}
         with mock.patch.dict(os.environ, environment, clear=True):
-            _, settings = copies.config_settings()
-            self.assertNotIn("root", settings)
             self.assertEqual(copies.load_config().remote_registry, self.base / "remote-mirrors")
             self.assertEqual(copy_record.root(), scratch_root)
             self.assertEqual(copy_record.copies_root(), workspace_root)

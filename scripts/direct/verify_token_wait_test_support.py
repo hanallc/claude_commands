@@ -1,7 +1,7 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
@@ -201,11 +201,8 @@ esac
             + '    if [ "$available" = 0 ]; then exec python3 "$TEST_MEMORY_EVENT"; fi\n'
             + 'fi\nexit 0\n')
         self.environment = {
+            **verify_test_environment(),
             "UNIT_DETACHED_RUN": "1",
-            **{name: value for name, value in os.environ.items()
-               if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
-                               "CODEX_SESSION_ID", "UNIT_DETACHED_RUN", "BASH_ENV", "ENV"}
-               and not name.startswith(("PLAN_DELEGATE_", "BASH_FUNC_", "UNIT_DETACHED_", "GIT_"))},
             "PATH": stub_build_tool_path(stubs),
             "HOME": str(home),
             # These tests supply the complete build toolchain; nix discovery is
@@ -290,7 +287,7 @@ esac
         """
         found: list[int] = []
         result = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
-                                capture_output=True, text=True, check=True)
+                                env=verify_test_environment(), capture_output=True, text=True, check=True)
         for line in result.stdout.splitlines():
             parts = line.split()
             if len(parts) != 3 or parts[2].startswith("Z"):

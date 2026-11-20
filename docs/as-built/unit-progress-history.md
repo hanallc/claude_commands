@@ -35,9 +35,8 @@ The legacy roots are `/tmp/claude/unit` and `/tmp/claude/delegate`.
 Deleting `/tmp`
 does not remove the durable event stream.
 
-The guard refuses recorder state with a root `phase_last_percent` key and names the conversion script, `run_conversion.sh`.
-The guard offers limited protection during deployment because paths that only read can give incorrect results before conversion.
-A later change removes the guard after conversion.
+The guard refuses old recorder state with a root `phase_last_percent` key.
+The warning gives the path to the state file and names no command.
 
 ## Configuration digest
 

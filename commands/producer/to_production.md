@@ -101,7 +101,7 @@ Write `<source-stem>-production.md` beside the first source plan, in the
 production format, with status `planned`:
 
 - **Hub files** are copied from the greenlight result.
-- **Merge tests:** give the command for the app package's tests, if one exists.
+- **Merge tests:** give the command for the app package's tests, if one exists. Exclude type checks. The nightly run checks types.
   Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
   These tests find failures across packages. Give a command, never a bare package name.
 - **Log:** `docs/handoff/<name>-production-log.md`.

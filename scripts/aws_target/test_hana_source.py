@@ -20,11 +20,11 @@ from unittest import mock
 
 from scripts.aws_target import hana_payload, hana_protocol, hana_receiver, hana_render
 from scripts.aws_target import hana_source as source, hana_transport as transport
+from scripts.aws_target.ledger_test_support import install_aws_fixture_settings, override_fixture_settings
 from scripts.copies import copies
 from scripts.lib import build_folders, build_slots, conf
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lib.git_test_support import commit_repository
-from scripts.lint.memory_test_support import write_config_fixture
 
 
 class MemorySourceObjects:
@@ -68,11 +68,47 @@ class HanaSourceTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        config_dir = self.root / 'config'
+        install_aws_fixture_settings(config_dir)
+        _ = (config_dir / 'copies.conf').write_text(
+            'wait_seconds=1\ngit_timeout_seconds=60\nguard_timeout_seconds=10\n')
+        _ = (config_dir / 'build_targets.conf').write_text(
+            '# range: 0.001..\nloopback.shell_timeout_s=120\n')
         private = private_slot_config(self.root, repository='hana')
         self.enterContext(mock.patch.dict(os.environ, private.environment))
 
         self.pool_settings = private.settings
-        _ = write_config_fixture(self.configuration.source, 'host=aws-hana\n')
+        configuration = config_dir / 'hana_aws.conf'
+        _ = configuration.write_text("""\
+host=aws-hana
+enabled=on
+# whole: 1..60
+guard_grace_seconds=60
+# whole: 1..60
+watchdog_check_seconds=1
+# whole: 1..1800
+permit_max_seconds=1800
+# whole: 1..8
+step_cpu_limit=4
+# whole: 1..24
+step_memory_gib=24
+# whole: 1..60
+mount_timeout_seconds=15
+execution_shell=ci
+# whole: 1..
+free_floor_gib=30
+source_allowed_ignored=target/ .direnv/ __pycache__/ **/__pycache__/ .claude/settings.local.json .unit.toml
+source_forbidden_paths=.claude/settings.local.json .direnv/ .aws/ .env .env.* **/.env **/.env.* *.pem **/*.pem *.key **/*.key
+source_allowed_environment=RUSTFLAGS RUSTDOCFLAGS CARGO_INCREMENTAL RUST_BACKTRACE
+# whole: 1..
+source_max_bytes=1073741824
+# whole: 1..
+source_download_timeout_s=120
+# whole: 1..
+source_git_timeout_s=60
+# whole: 1..
+source_basis_max_commits=8
+""")
         self.runtime_checkout = self.root / 'commands'
         (self.runtime_checkout / 'config').mkdir(parents=True)
         for name in ('build_targets.conf', 'build_folders.conf', 'copies.conf'):
@@ -85,7 +121,7 @@ class HanaSourceTests(unittest.TestCase):
                             self.runtime_checkout / hana_render.RUNNER_ENTRY)
         _ = (manifest.parent / 'hana_protocol.py').write_text(f'RUNTIME_ABI = {hana_protocol.RUNTIME_ABI}\n')
         _ = (manifest.parent / 'fixture_runtime.py').write_text('version = "captured"\n')
-        _ = write_config_fixture(private.settings,
+        override_fixture_settings(private.settings,
             f'roots.slots.aws-hana={self.root / "guest-slots"}\n'
             + '# whole: 1..\nslots.aws-hana.hana.max=1\n# whole: 1..\nslots.aws-hana.hana.max_bytes=1073741824\n')
         self.checkout = self.enterContext(build_folders.leased_build_folder(build_folders.BuildFolderSpec(
@@ -171,7 +207,7 @@ class HanaSourceTests(unittest.TestCase):
                         self.sender.acknowledge(leased.identity)
 
     def test_acknowledged_basis_sends_only_new_objects_and_retains_a_small_record(self) -> None:
-        _ = write_config_fixture(self.configuration.source, 'source_basis_max_commits=1\n')
+        override_fixture_settings(self.configuration.source, 'source_basis_max_commits=1\n')
         first = self.prepare()
         with self.guest(), self.materialize(first) as leased:
             assert isinstance(leased, source.LeasedSource)
@@ -379,7 +415,7 @@ class HanaSourceTests(unittest.TestCase):
     def test_upload_bound_applies_to_the_entire_archive(self) -> None:
         manifest = self.prepare()
         bundle_size = len(self.member(manifest, 'source.bundle'))
-        _ = write_config_fixture(self.configuration.source, f'source_max_bytes={bundle_size}\n')
+        override_fixture_settings(self.configuration.source, f'source_max_bytes={bundle_size}\n')
         objects = MemorySourceObjects()
         sender = transport.SourceSender(objects, self.root / 'acknowledged', self.configuration,
                                         checkout=self.runtime_checkout)
