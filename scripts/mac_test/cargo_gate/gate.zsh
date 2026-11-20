@@ -89,6 +89,69 @@ if (( agent_call )); then
         mv -f -- "$cache_file.$$" "$cache_file"
     fi
     label="placement $placement"
+
+    worker_budget=$(conf_value mac_gate worker_budget) || exit 2
+    [[ ${worker_budget#+} == <-> && ${#worker_budget} -le 15 ]] && (( worker_budget > 0 )) \
+        || refuse 'invalid worker_budget' ''
+    worker_budget=$(( worker_budget ))
+    logical_cpus=''
+    limit_worker_width() {
+        local requested=$1 width
+        REPLY=$requested
+        case $requested in
+            default|num-cpus|-<->)
+                if [[ -z $logical_cpus ]]; then
+                    logical_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+                    [[ $logical_cpus == <-> && $logical_cpus != 0 ]] \
+                        || refuse 'cannot read the logical CPU count' ''
+                fi
+                width=$logical_cpus
+                if [[ $requested == -* && ${#requested} -le 16 ]]; then
+                    (( width += requested ))
+                elif [[ $requested == -* ]]; then
+                    return 0
+                fi
+                ;;
+            <->|+<->)
+                [[ ${#requested} -le 16 ]] || return 0
+                width=$requested
+                ;;
+            *) return 0 ;;
+        esac
+        if (( width > worker_budget )); then REPLY=$worker_budget; fi
+    }
+
+    limit_worker_width "${CARGO_BUILD_JOBS-$worker_budget}"
+    export CARGO_BUILD_JOBS=$REPLY
+    limit_worker_width "${NEXTEST_TEST_THREADS-$worker_budget}"
+    export NEXTEST_TEST_THREADS=$REPLY
+
+    # Cargo and nextest give command-line options priority over the environment.
+    if [[ $program != rustc ]]; then
+        gate_arguments=()
+        while (( $# )); do
+            argument=$1
+            shift
+            case $argument in
+                --) gate_arguments+=("$argument" "$@"); break ;;
+                --jobs|-j|--build-jobs|--test-threads)
+                    gate_arguments+=("$argument")
+                    (( $# )) || break
+                    limit_worker_width "$1"
+                    gate_arguments+=("$REPLY")
+                    shift
+                    ;;
+                --jobs=*|--build-jobs=*|--test-threads=*|-j?*)
+                    prefix=-j
+                    if [[ $argument == *=* ]]; then prefix=${argument%%=*}=; fi
+                    limit_worker_width "${argument#"$prefix"}"
+                    gate_arguments+=("$prefix$REPLY")
+                    ;;
+                *) gate_arguments+=("$argument") ;;
+            esac
+        done
+        set -- "${gate_arguments[@]}"
+    fi
 fi
 # Verify both the ancestor relation and the recorded process start time.
 ancestor=${MAC_GATE_RECORD:-}

@@ -39,6 +39,15 @@ Interactive Mac terminal work bypasses the limit.
 Hana CI can start at any time.
 A cached idle result can stay in use until its age limit after CI starts.
 
+The Mac Cargo gate at `scripts/mac_test/cargo_gate/gate.zsh` checks placement for agent and SSH calls.
+The `cargo`, `cargo-nextest`, and `rustc` links use this gate.
+For a placed call, `worker_budget` in `config/mac_gate.conf` sets the maximum Cargo jobs and nextest test threads.
+The initial budget is four workers per command.
+The gate exports `CARGO_BUILD_JOBS` and `NEXTEST_TEST_THREADS` for the tool and its children.
+It also caps explicit job and thread arguments before `--` and keeps smaller caller values.
+Mac `mend-fix` uses the same budget for mend and the follow-up Clippy command.
+The gate leaves interactive calls under the `user` label at their existing width.
+
 Converted verify steps execute only at the destination assigned by the queue.
 The queue preserves configured target order.
 `step_routing_rule` supplies fixed pins, platform constraints, tree-write rules, local artifact rules, and final-step rules.

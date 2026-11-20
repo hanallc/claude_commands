@@ -13,6 +13,7 @@ import unittest
 from typing import cast
 
 from scripts.lib.helper_tree_test_support import copy_helpers
+from scripts.lib.shell_test_support import shell_functions
 from scripts.mac_test.mac_ci_test_support import BUSY_PROCESS_LIST
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -20,12 +21,15 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 GATE = Path(__file__).with_name("cargo_gate") / "bin"
+FIXTURE_WORKER_BUDGET = "3"
 PROGRAM = '''import json, os, subprocess, sys
 from pathlib import Path
 root = Path(os.environ["GATE_TEST_ROOT"])
 records = root / ".local/state/mac-gate/records"
 with (root / "runs").open("a") as stream:
     stream.write(json.dumps({"argv":sys.argv[1:], "path":os.environ["PATH"],
+        "cargo_jobs":os.environ.get("CARGO_BUILD_JOBS"),
+        "nextest_threads":os.environ.get("NEXTEST_TEST_THREADS"),
         "record":os.environ.get("MAC_GATE_RECORD"),
         "records":[path.read_text() for path in records.iterdir()]}) + "\\n")
 if sys.argv[1:] == ["child"]:
@@ -90,7 +94,8 @@ class CargoGateTests(unittest.TestCase):
         ps.chmod(0o755)
         _ = write_config_fixture(root / "config/mac_gate.conf",
             "placement_check_command=" + shlex.join([sys.executable, str(check)])
-            + "\nplacement_check_timeout_seconds=1\nplacement_recheck_seconds=15\nrefusal_exit_code=125\n")
+            + "\nplacement_check_timeout_seconds=1\nplacement_recheck_seconds=15\nrefusal_exit_code=125\n"
+            + f"worker_budget={FIXTURE_WORKER_BUDGET}\n")
         ssh = fake / "ssh"
         _ = ssh.write_text(f"#!{sys.executable}\n" + "import json, os, sys\nfrom pathlib import Path\n"
             + "root = Path(os.environ['GATE_TEST_ROOT'])\n"
@@ -99,7 +104,8 @@ class CargoGateTests(unittest.TestCase):
             + "os.execv(sys.executable, [sys.executable, str(root / 'check.py'), *sys.argv[remote_at+1:]])\n")
         ssh.chmod(0o755)
         environment = {key: value for key, value in os.environ.items()
-                       if key not in ("CLAUDECODE", "CODEX_HOME", "SSH_CONNECTION", "SSH_CLIENT", "MAC_PLACEMENT", "MAC_GATE_RECORD")}
+                       if key not in ("CLAUDECODE", "CODEX_HOME", "SSH_CONNECTION", "SSH_CLIENT", "MAC_PLACEMENT",
+                                      "MAC_GATE_RECORD", "CARGO_BUILD_JOBS", "NEXTEST_TEST_THREADS")}
         environment.update(config_environment(root / "config"))
         environment.update(HOME=str(root), GATE_TEST_ROOT=str(root), GATE_TEST_BIN=str(GATE),
             PATH=os.pathsep.join((str(GATE), str(fake), str(real), "/usr/bin", "/bin")))
@@ -108,6 +114,9 @@ class CargoGateTests(unittest.TestCase):
     def run_gate(self, environment: dict[str, str], *arguments: str, name: str = "cargo") -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(GATE / name), *arguments], env=environment, capture_output=True, text=True,
                               timeout=TEST_HANG_GUARD_SECS)
+
+    def runs(self, root: Path) -> list[dict[str, object]]:
+        return [cast(dict[str, object], json.loads(line)) for line in (root / "runs").read_text().splitlines()]
 
     def test_copied_gate_links_find_the_copied_configuration_reader(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -148,7 +157,7 @@ class CargoGateTests(unittest.TestCase):
                         (root / "config/mac_gate.conf").unlink()
                     result = self.run_gate(environment, "quoted value", "", name=name)
                     self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
-                    rows = [cast(dict[str, object], json.loads(line)) for line in (root / "runs").read_text().splitlines()]
+                    rows = self.runs(root)
                     self.assertEqual(rows[0]["argv"], ["quoted value", ""])
                     self.assertNotIn(str(GATE), str(rows[0]["path"]).split(os.pathsep))
                     self.assertIn(str(root / "real"), str(rows[0]["path"]).split(os.pathsep))
@@ -172,17 +181,98 @@ class CargoGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = self.fixture(root, process_list=BUSY_PROCESS_LIST)
+            environment.update(CARGO_BUILD_JOBS="12", NEXTEST_TEST_THREADS="13")
             _ = write_config_fixture(root / "config/mac_test.conf", "max_active_builds=1\n")
-            result = self.run_gate(environment, "build")
+            result = self.run_gate(environment, "build", "--jobs=15")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            rows = (root / "runs").read_text().splitlines()
-            self.assertEqual(len(rows), 1)
-            self.assertIn("user", rows[0])
+            row, = self.runs(root)
+            self.assertEqual(row["argv"], ["build", "--jobs=15"])
+            self.assertEqual(row["cargo_jobs"], "12")
+            self.assertEqual(row["nextest_threads"], "13")
+            self.assertIn("\tuser\n", cast(list[str], row["records"])[0])
             calls = (root / "ps-calls").read_text().splitlines()
             self.assertEqual(len(calls), 1)
             self.assertTrue(calls[0].endswith(" -o lstart="))
             self.assertFalse((root / "checks").exists())
             self.assertFalse((root / "ssh-arguments").exists())
+
+    def test_placed_cargo_caps_jobs_and_preserves_smaller_values(self) -> None:
+        budget = FIXTURE_WORKER_BUDGET
+        for caller_jobs, arguments, jobs, expected in (
+            ("", ("build",), budget, ("build",)),
+            ("2", ("build", "-j1"), "2", ("build", "-j1")),
+            ("12", ("doc", "--jobs", "8"), budget, ("doc", "--jobs", budget)),
+        ):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = self.fixture(root)
+                environment.update(CLAUDECODE="1", MAC_PLACEMENT="episode/attempt")
+                if caller_jobs:
+                    environment["CARGO_BUILD_JOBS"] = caller_jobs
+                result = self.run_gate(environment, *arguments)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                row, = self.runs(root)
+                self.assertEqual(row["cargo_jobs"], jobs)
+                self.assertEqual(row["argv"], list(expected))
+
+    def test_placed_nextest_caps_build_and_test_width_before_the_separator(self) -> None:
+        budget = FIXTURE_WORKER_BUDGET
+        for name, requested, threads, arguments, expected in (
+            ("cargo", "", budget, (), ()),
+            ("cargo", "10", budget, ("--test-threads", "12"), ("--test-threads", budget)),
+            ("cargo-nextest", "2", "2", ("--build-jobs=8", "--jobs=1"), (f"--build-jobs={budget}", "--jobs=1")),
+            ("cargo-nextest", "2", "2", ("-j12",), (f"-j{budget}",)),
+        ):
+            with self.subTest(name=name, arguments=arguments), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = self.fixture(root)
+                environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
+                if requested:
+                    environment["NEXTEST_TEST_THREADS"] = requested
+                tail = ("--", "--test-threads", "99")
+                result = self.run_gate(environment, "nextest", "run", *arguments, *tail, name=name)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                row, = self.runs(root)
+                self.assertEqual(row["cargo_jobs"], budget)
+                self.assertEqual(row["nextest_threads"], threads)
+                self.assertEqual(row["argv"], ["nextest", "run", *expected, *tail])
+
+    def test_placed_nextest_resolves_cpu_relative_widths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            getconf = root / "fake/getconf"
+            _ = getconf.write_text('#!/bin/sh\n[ "$1" = _NPROCESSORS_ONLN ] && printf "12\\n"\n')
+            getconf.chmod(0o755)
+            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt",
+                               CARGO_BUILD_JOBS="-10", NEXTEST_TEST_THREADS="num-cpus")
+            result = self.run_gate(environment, "nextest", "run", "--test-threads=-1")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            row, = self.runs(root)
+            self.assertEqual(row["cargo_jobs"], "-10")
+            self.assertEqual(row["nextest_threads"], FIXTURE_WORKER_BUDGET)
+            self.assertEqual(row["argv"], ["nextest", "run", f"--test-threads={FIXTURE_WORKER_BUDGET}"])
+
+    def test_mend_fix_and_follow_up_clippy_use_the_placed_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
+            lint = GATE.parents[2] / "lint"
+            invoke = root / ".claude/scripts/lint/invoke.sh"
+            invoke.parent.mkdir(parents=True)
+            _ = invoke.write_text(
+                'run() { "$@"; }\nlint_config_enabled() { return 0; }\n'
+                + shell_functions(lint / "invoke.sh", "invoke_mend", "invoke_clippy")
+            )
+            result = subprocess.run(["bash", str(lint / "lint"), "mend-fix", "--workspace"],
+                                    env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            mend, clippy = self.runs(root)
+            self.assertEqual(mend["argv"], ["mend", "--all-targets", "--fix", "--fail-on-warn", "--workspace"])
+            self.assertEqual(clippy["argv"], ["clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"])
+            self.assertEqual(mend["cargo_jobs"], FIXTURE_WORKER_BUDGET)
+            self.assertEqual(clippy["cargo_jobs"], FIXTURE_WORKER_BUDGET)
 
     def test_agent_markers_and_failed_checks_refuse_without_starting_a_program(self) -> None:
         route = "; run it through mac_queue_run.py"
@@ -235,10 +325,12 @@ class CargoGateTests(unittest.TestCase):
             environment = {**self.fixture(root), "CLAUDECODE": "1", "MAC_PLACEMENT": "episode/attempt"}
             result = self.run_gate(environment, "child")
             self.assertEqual(result.returncode, 0, result.stderr)
-            rows = [cast(dict[str, object], json.loads(line)) for line in (root / "runs").read_text().splitlines()]
+            rows = self.runs(root)
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0]["record"], rows[1]["record"])
             self.assertEqual(len(cast(list[str], rows[1]["records"])), 1)
+            self.assertEqual(rows[1]["cargo_jobs"], FIXTURE_WORKER_BUDGET)
+            self.assertEqual(rows[1]["argv"], ["quoted value"])
 
     def test_missing_program_reports_the_name_without_recursion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
