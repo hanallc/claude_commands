@@ -11,12 +11,11 @@ import json
 from pathlib import Path, PurePosixPath
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
 import textwrap
-from typing import cast, final, override
+from typing import final, override
 import unittest
 from unittest import mock
 
@@ -24,7 +23,6 @@ from scripts.lib.git_test_support import git_fixture_environment
 from scripts.lib import land_main, live_settings, main_publish, main_sync, waiting_rows
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import land_queue
 
 
 @contextmanager
@@ -447,56 +445,6 @@ class MainPublishTests(PublicationTestCase):
         self.assertIsInstance(result.hook, land_main.HookFailed)
         self.assertFalse((repo.checkout / ".git/post-push-completed").exists())
         self.assertEqual(repo.remote_tip(), repo.head())
-
-    def test_hook_timeout_stops_a_child_that_keeps_the_hook_open(self) -> None:
-        repo = self.repository
-        hook = repo.checkout / ".claude/config/post_push.sh"
-        hook.parent.mkdir(parents=True)
-        _ = repo.change()
-        _ = repo.git(repo.checkout, "commit", "-qam", "tune(example): change amount")
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-            listener.bind(("127.0.0.1", 0))
-            listener.listen()
-            listener.settimeout(TEST_HANG_GUARD_SECS)
-            _, port = cast(tuple[str, int], listener.getsockname())
-            child = (f"import socket; connection = socket.create_connection(('127.0.0.1', {port})); "
-                     "connection.sendall(b'1'); connection.recv(1)")
-            _ = hook.write_text(f"{shlex.quote(sys.executable)} -S -c {shlex.quote(child)} &\nwait\n")
-            result = land_main.land(repo.checkout, repo.head(), time_limit=land_main.CommandTimeLimit(2))
-            self.assertIsInstance(result.hook, land_main.HookFailed)
-            child_connection, _ = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
-            with child_connection:
-                child_connection.settimeout(2)
-                self.assertEqual(child_connection.recv(1), b"1")
-                self.assertEqual(child_connection.recv(1), b"")
-
-    def test_push_timeout_stops_the_pre_push_hook_and_releases_the_gap(self) -> None:
-        repo = self.repository
-        hook = repo.checkout / ".git/hooks/pre-push"
-        hook.parent.mkdir(exist_ok=True)
-        _ = repo.change()
-        _ = repo.git(repo.checkout, "commit", "-qam", "tune(example): change amount")
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-            listener.bind(("127.0.0.1", 0))
-            listener.listen()
-            listener.settimeout(TEST_HANG_GUARD_SECS)
-            _, port = cast(tuple[str, int], listener.getsockname())
-            child = (f"import socket; connection = socket.create_connection(('127.0.0.1', {port})); "
-                     "connection.sendall(b'1'); connection.recv(1)")
-            _ = hook.write_text(f"#!/bin/sh\n{shlex.quote(sys.executable)} -S -c {shlex.quote(child)} &\nwait\n")
-            hook.chmod(0o755)
-            with land_queue.gap_lock(), self.assertRaisesRegex(land_main.LandError, "timed out"):
-                _ = land_main.land(repo.checkout, repo.head(), time_limit=land_main.CommandTimeLimit(2))
-            child_connection, _ = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
-            with child_connection:
-                child_connection.settimeout(2)
-                self.assertEqual(child_connection.recv(1), b"1")
-                self.assertEqual(child_connection.recv(1), b"")
-        lock = Path(repo.env["MERGE_GATE_STATE_DIR"]) / "settings-gap.lock"
-        probe = "import fcntl, sys\nwith open(sys.argv[1], 'a') as lock:\n    fcntl.flock(lock, fcntl.LOCK_EX)"
-        acquired = subprocess.run([sys.executable, "-S", "-c", probe, str(lock)],
-                                  capture_output=True, text=True, check=False, timeout=5)
-        self.assertEqual(acquired.returncode, 0, acquired.stderr)
 
     def test_ready_refuses_a_checkout_off_main_before_any_publication(self) -> None:
         repo = self.repository

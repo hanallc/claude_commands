@@ -226,6 +226,31 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         self.assertEqual(text, "account.claude1=#445566\n")
         self.assertEqual(pending, ["#445566"])
 
+    def test_mac_registry_publication_waits_in_the_caller(self) -> None:
+        before = "[fixture]\nmodel=old\n"
+        registry = self.write(self.repo / "config/models.conf", before)
+        self.seed()
+        after = before.replace("model=old", "model=new")
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "1", "TMPDIR": str(self.root)}
+        original_lock = main_push_lock.main_push_lock
+
+        @contextmanager
+        def busy_lock(checkout: Path, *, wait: bool = True) -> Generator[None]:
+            if not wait:
+                raise BlockingIOError("main push lock is busy")
+            with original_lock(checkout):
+                yield
+
+        with (patch.dict(os.environ, environment, clear=True),
+              patch("platform.system", return_value="Darwin"),
+              patch.object(models_registry, "DEFAULT_PATH", registry),
+              patch.object(main_push_lock, "main_push_lock", busy_lock),
+              patch.object(main_push_lock, "request_publication", return_value=land_queue.SETTINGS_WAIT_NOTICE) as waiter):
+            self.assertEqual(models_registry.store_registry(registry, before, after, "fixture"), after)
+
+        waiter.assert_not_called()
+        self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, after)
+
     def test_registry_publication_uses_the_settings_push_time_limit(self) -> None:
         before = "[fixture]\nmodel=old\n"
         registry = self.write(self.repo / "config/models.conf", before)

@@ -1083,6 +1083,7 @@ class MacPromotionPathTests(unittest.TestCase):
                                       + "# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
                 with mock.patch.dict(os.environ, {"ZONE_STATE": str(state / "zone"), "CONF_DIR": folder,
                                                   "PATH": folder + os.pathsep + os.environ["PATH"]}):
+                    _ = os.environ.pop("MAC_WAKE_PROGRAM", None)
                     waiting = main_publish.PendingMacPull("zone", text, "2026-11-08", "earlier failure")
                     if text or expected is not main_publish.MacPullPending:
                         main_publish.queue(waiting)

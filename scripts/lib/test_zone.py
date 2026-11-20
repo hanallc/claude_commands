@@ -248,6 +248,22 @@ class SetTests(unittest.TestCase):
             self.assertIn("broadcast.py", calls[-1][-1])
             self.assertFalse(self.queued().exists())
 
+    def test_a_newer_mac_write_clears_the_older_queued_notice(self) -> None:
+        offline = self.fakes / "OFFLINE"
+        _ = offline.write_text("")
+        first = self.run_zone("set", "Curacao")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertTrue(self.queued().exists())
+        offline.unlink()
+        before = len(self.log("ssh.log"))
+
+        second = self.run_zone("set", "Paris")
+
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("mac: live now: zone=Europe/Paris", second.stdout)
+        self.assertFalse(self.queued().exists())
+        self.assertFalse(any("broadcast.py" in call[-1] for call in self.log("ssh.log")[before:]))
+
     def test_a_promotion_without_a_tip_receipt_retries_the_saved_pull(self) -> None:
         _ = (self.fakes / "OFFLINE").write_text("", encoding="utf-8")
         _ = self.run_zone("set", "Curacao")

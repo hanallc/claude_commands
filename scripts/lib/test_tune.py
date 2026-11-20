@@ -813,7 +813,7 @@ class TuneTests(PublicationTestCase):
         self.assertIn("amount=3", repo.config.read_text())
         stage = "push"
         with mock.patch.dict(os.environ, repo.env, clear=True), \
-                mock.patch("scripts.lib.land_main._run_process_group", side_effect=network), \
+                mock.patch.object(subprocess, "run", side_effect=network), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             status = tune.main(arguments)
         self.assertEqual(status, 2)

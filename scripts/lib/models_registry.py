@@ -8,6 +8,7 @@ except FileNotFoundError:
 import argparse
 import json
 import os
+import platform
 import shlex
 import subprocess
 import sys
@@ -394,7 +395,7 @@ def _on_main(target: SharedRegistry) -> bool:
 
 
 def _publish_when_ready(target: SharedRegistry, path: Path, description: str) -> bool:
-    if not _on_main(target):
+    if platform.system() == "Darwin" or not _on_main(target):
         with main_push_lock.main_push_lock(target.repository):
             return _publish(target.repository, path, description)
     with main_push_lock.settings_push(target.repository) as gap, ExitStack() as locks:

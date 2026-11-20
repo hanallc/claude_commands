@@ -332,12 +332,12 @@ def clear_pull_only(mac: PurePosixPath = DEFAULT_MAC_CHECKOUT, *,
                 _finish_queue_update(replace(pending, pulls=pulls))
 
 
-def clear_notice(delivered: PendingMacPull) -> None:
-    """Clear only the notice that the Mac received."""
+def clear_notice(notice: PendingMacPull) -> None:
+    """Clear the notice only if it still matches the queue."""
     with _queue_update():
         pending = read_queue()
         if isinstance(pending, PendingMacPull) and (pending.label, pending.since, pending.text) == (
-                delivered.label, delivered.since, delivered.text):
+                notice.label, notice.since, notice.text):
             _finish_queue_update(replace(pending, text=""))
 
 

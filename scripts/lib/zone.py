@@ -195,6 +195,7 @@ def set_zone(name: str) -> int:
     delivered = True
     label = datetime.now(ZoneInfo(zone)).tzname() or zone
     message = f"{SUBJECT}{zone}): set with /zone ({label})"
+    pending = read_queue()
     saved = live_settings.stage_save(live_settings.WaitingChange(STEM, KEY, zone, message))
     if isinstance(saved, live_settings.UnchangedSave):
         print("was: the same; nothing to change")
@@ -207,6 +208,8 @@ def set_zone(name: str) -> int:
         if not isinstance(mac, live_settings.MacWriteSuperseded):
             text = notice(zone, before)
             if mac.startswith("mac: live now"):
+                if isinstance(pending, main_publish.PendingMacPull) and pending.text:
+                    main_publish.clear_notice(pending)
                 delivered, summary = broadcast(text, here=False)
             else:
                 since = datetime.now(ZoneInfo(zone)).strftime("%Y-%m-%d %H:%M %Z")
