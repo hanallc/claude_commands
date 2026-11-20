@@ -23,6 +23,7 @@ import threading
 import time
 from types import SimpleNamespace
 from typing import BinaryIO, cast, override
+import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 

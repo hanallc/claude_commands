@@ -144,7 +144,7 @@ class StoreTests(unittest.TestCase):
 
                 def advance(seconds: float) -> None:
                     nonlocal now
-                    now += seconds
+                    now = round(now + seconds, 12)
                     if now >= release_at:
                         fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
 
