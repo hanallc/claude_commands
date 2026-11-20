@@ -4349,7 +4349,7 @@ done
                 and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             waiting_for: list[PlacementHold] = []
             mac_wait: placement.WaitingForMac | placement.NoMacWait = placement.NoMacWait()
-            previous_mac_wait = self.mac_waits.get(request.episode, placement.NoMacWait())
+            local_start_proposed = False
             candidates = self.placement_eligibility.get(request.episode, ())
             for candidate in candidates:
                 destination = candidate.destination
@@ -4361,13 +4361,8 @@ done
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
-                    if can_record_mac_wait:
-                        if candidate.eligibility == placement.TemporaryExclusion("busy"):
-                            mac_wait = placement.WaitingForMac(destination, request.since, placement.MacProbeBusy())
-                        elif (isinstance(candidate.eligibility, placement.EvidenceNeeded)
-                                and isinstance(previous_mac_wait, placement.WaitingForMac)
-                                and previous_mac_wait.destination == destination):
-                            mac_wait = previous_mac_wait
+                    if can_record_mac_wait and candidate.eligibility == placement.TemporaryExclusion("busy"):
+                        mac_wait = placement.WaitingForMac(destination, request.since, placement.MacProbeBusy())
                     hold = self._placement_hold(request, candidate, answers)
                     if hold is not None:
                         waiting_for.append(hold)
@@ -4388,6 +4383,7 @@ done
                         continue
                 if destination.provider == "local":
                     if owner in local_starts:
+                        local_start_proposed = True
                         break
                     continue
                 if destination.provider == "scaler":
@@ -4421,13 +4417,12 @@ done
                     # A hold lasts until the next probe of the older request; it never starts again on the same reading.
                     if start is not None and hold.observed_at < start:
                         holds[(hold.episode, hold.destination)] = start
-            if request.episode in self.current_assignments:
+            if local_start_proposed or request.episode in self.current_assignments:
                 continue
-            if isinstance(mac_wait, placement.WaitingForMac) or request.episode in self.mac_waits:
-                if isinstance(self._terminal_candidate_refusal(request, candidates), placement.DoNotRetry):
-                    self._set_mac_wait(request.episode, placement.NoMacWait())
-                elif isinstance(mac_wait, placement.WaitingForMac):
-                    self._set_mac_wait(request.episode, mac_wait)
+            if (isinstance(mac_wait, placement.WaitingForMac)
+                    and isinstance(self._terminal_candidate_refusal(request, candidates), placement.DoNotRetry)):
+                mac_wait = placement.NoMacWait()
+            self._set_mac_wait(request.episode, mac_wait)
         self.placement_holds = holds
         self.placement_hold_answers = answers
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed

@@ -1012,9 +1012,11 @@ class PlacementTests(unittest.TestCase):
             self.assertNotIn(head.owner.pid, fixture.queue_pids())
 
     def test_only_a_busy_mac_candidate_appears_in_the_mac_waits(self) -> None:
-        cases = ((False, "busy", False), (True, "off", False), (False, "busy", True))
-        for pinned, reason, landing_pass in cases:
-            with self.subTest(reason=reason, landing_pass=landing_pass), PlacementFixture() as fixture:
+        cases = ((False, "busy", "none"), (True, "off", "none"),
+                 (False, "busy", "landing pass"), (False, "busy", "disable Mac"))
+        for pinned, reason, change in cases:
+            with self.subTest(reason=reason, change=change), PlacementFixture() as fixture:
+                landing_pass = change == "landing pass"
                 request = placement_request(fixture, since=fixture.clock.now() - 1 if landing_pass else None)
                 destination = request.constraints.candidates[0].destination
                 if pinned:
@@ -1022,6 +1024,9 @@ class PlacementTests(unittest.TestCase):
                         selection=placement.PinnedHost(destination.target)))
                 if landing_pass:
                     fixture.hold_starts()
+                elif change == "disable Mac":
+                    fixture.free(0)
+                if change != "none":
                     request = replace(request, prerequisite=placement.TokenNotRequired(), constraints=replace(
                         request.constraints, candidates=(*request.constraints.candidates, local_candidate(fixture))))
                 _ = publish_candidate(fixture, request, placement.TemporaryExclusion(reason))
@@ -1055,6 +1060,14 @@ class PlacementTests(unittest.TestCase):
                     granted, = fixture.server.handle_request(request)
                     self.assertIsInstance(granted, wire.LocalPlacementGranted)
                     self.assertEqual(published_mac_waits(fixture), ())
+                    continue
+                if change == "disable Mac":
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    self.assertEqual([wait.episode for wait in waits], [request.episode])
+                    _ = publish_candidate(fixture, request, placement.TemporaryExclusion("off"))
+                    _ = fixture.run_pass()
+                    self.assertEqual(published_mac_waits(fixture), ())
+                    self.assertIn(request.owner.pid, fixture.queue_pids())
                     continue
                 if reason == "busy":
                     self.assertIsInstance(reply, wire.PlacementWait)
