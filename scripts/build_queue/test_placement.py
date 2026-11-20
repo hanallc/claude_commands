@@ -161,6 +161,19 @@ def adopt_assignment(fixture: PlacementFixture, request: wire.PlacementRequest,
     return reference
 
 
+def restore_main_mac_assignment(fixture: PlacementFixture, request: wire.PlacementRequest,
+                                saved: records.SavedPlacementAssignment) -> str:
+    key = execution_identity.attempt_key(request.episode, saved.assignment.attempt)
+    state = replace(service.read_state(fixture.state_dir), placement_requests={request.episode: request},
+                    assignments={key: saved}, current_assignments={request.episode: key})
+    raw_state = cast(dict[str, object], json.loads(wire.encode_record(state)))
+    assignments = cast(dict[str, dict[str, object]], raw_state["assignments"])
+    del assignments[key]["mac_launch_source"]
+    _ = (fixture.state_dir / "state.json").write_text(json.dumps(raw_state))
+    fixture.restart()
+    return key
+
+
 def with_cargo_folder(request: wire.PlacementRequest, path: str) -> str:
     """Write a folder tag that the original service also accepts."""
     envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
@@ -2362,6 +2375,77 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 assert isinstance(status, wire.DispatchStatus)
                 self.assertEqual(status.state, placement.CurrentAssignment())
                 self.assertEqual(status.reason, "launch permission was already consumed")
+
+    def test_main_coordinator_mac_assignment_replays_the_saved_request(self) -> None:
+        with PlacementFixture(fixture_defaults_only=True) as fixture:
+            request = placement_request(fixture)
+            constraints = replace(request.constraints, command_kind="shot", selection=placement.PinnedHost("mac"))
+            request = replace(request, constraints=constraints)
+            evidence = publish_candidate(fixture, request)
+            assignment = placement.PlacementAssignment(request.episode, "main-attempt", evidence.key.destination,
+                constraints.source_key, request.owner, constraints.session, request.since)
+            saved = records.SavedPlacementAssignment(assignment, assigned_settings_generation=
+                placement.AssignedSettingsGeneration(evidence.key.configuration_generation))
+            key = restore_main_mac_assignment(fixture, request, saved)
+
+            for changed in (replace(constraints, command_kind="run"), replace(constraints, command=("fixture",)),
+                            replace(constraints, source_key=execution_identity.SourceKeyKnown("source-b"))):
+                with self.subTest(constraints=changed):
+                    reply, = fixture.server.handle_request(replace(request, constraints=changed))
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    self.assertEqual(fixture.server.assignments[key], saved)
+                    self.assertEqual(fixture.server.placement_requests[request.episode], request)
+
+            self.assertEqual(fixture.server.handle_request(request), [wire.Assignment(assignment)])
+            self.assertEqual(service.read_state(fixture.state_dir).assignments[key], saved)
+
+    def test_main_unclaimed_adapter_mac_assignment_waits_if_the_retry_adds_run(self) -> None:
+        with PlacementFixture(fixture_defaults_only=True) as fixture:
+            request = placement_request(fixture)
+            constraints = request.constraints
+            evidence = publish_candidate(fixture, request)
+            assignment = placement.PlacementAssignment(request.episode, "main-attempt", evidence.key.destination,
+                constraints.source_key, request.owner, constraints.session, request.since)
+            saved = records.SavedPlacementAssignment(assignment, assigned_settings_generation=
+                placement.AssignedSettingsGeneration(evidence.key.configuration_generation))
+            key = restore_main_mac_assignment(fixture, request, saved)
+
+            changed = replace(request, constraints=replace(constraints, command_kind="run"))
+            reply, = fixture.server.handle_request(changed)
+            self.assertIsInstance(reply, wire.PlacementWait)
+            self.assertEqual(fixture.server.assignments[key], saved)
+            self.assertEqual(fixture.server.handle_request(request), [wire.Assignment(assignment)])
+            claim = adopt_assignment(fixture, request, assignment)
+            self.assertEqual(fixture.server.handle_request(consume_permission("main-consume", assignment, claim)),
+                             [wire.FirstAuthorization(assignment, claim)])
+
+    def test_main_mac_assignment_with_a_provider_claim_replays_its_permission_state(self) -> None:
+        for consumed in (False, True):
+            with self.subTest(consumed=consumed), PlacementFixture(fixture_defaults_only=True) as fixture:
+                request = placement_request(fixture)
+                constraints = request.constraints
+                evidence = publish_candidate(fixture, request)
+                assignment = placement.PlacementAssignment(request.episode, "main-attempt", evidence.key.destination,
+                    constraints.source_key, request.owner, constraints.session, request.since)
+                claim = adopt_assignment(fixture, request, assignment)
+                saved = records.SavedPlacementAssignment(assignment, provider=claim, assigned_settings_generation=
+                    placement.AssignedSettingsGeneration(evidence.key.configuration_generation))
+                if consumed:
+                    saved = replace(saved, permission=placement.PermissionConsumed(fixture.clock.now()),
+                                    holder=coordinator_holder(assignment))
+                else:
+                    report = placement.TerminalAttemptReport(placement.PrelaunchRefused("busy"),
+                        placement.DispatchPathPending("provider settlement remains pending"), fixture.clock.now())
+                    saved = replace(saved, terminal_report=report,
+                                    retry=placement.retry_decision(assignment.destination, "busy", fixture.clock.now()))
+                key = restore_main_mac_assignment(fixture, request, saved)
+
+                reply, = fixture.server.handle_request(request)
+                if consumed:
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                else:
+                    self.assertEqual(reply, wire.Assignment(assignment))
+                self.assertEqual(service.read_state(fixture.state_dir).assignments[key], saved)
 
     def test_an_adapter_cannot_consume_a_coordinator_assignment_before_the_reply(self) -> None:
         with PlacementFixture(fixture_defaults_only=True) as fixture:

@@ -3717,15 +3717,16 @@ done
                 replay = self.ledger[request.episode]
                 assert isinstance(replay.reply, wire.Admitted)
                 return wire.LocalPlacementGranted(saved.assignment, replay.reply, diagnostics, disk_exclusions, stale_hana)
-            source = self._mac_launch_source(saved)
-            if saved.assignment.destination.provider == "mac" and source == "unrecorded":
-                return wire.Refused("the saved Mac assignment has no recorded launch source")
+            source = saved.mac_launch_source
+            matches_saved_launch = (request.owner == saved.assignment.owner
+                and requested_constraints.source_key == saved.assignment.source_key
+                and requested_constraints.command == request.constraints.command
+                and requested_constraints.command_kind == request.constraints.command_kind)
+            # Use the saved permission for a matching request from main.
+            legacy_mac_retry_changed = (saved.assignment.destination.provider == "mac"
+                and source == "unrecorded" and not matches_saved_launch)
             if source == "coordinator":
-                if (request.owner != saved.assignment.owner
-                        or requested_constraints.command_kind not in placement.MAC_RUN_KINDS
-                        or requested_constraints.source_key != saved.assignment.source_key
-                        or requested_constraints.command != request.constraints.command
-                        or requested_constraints.command_kind != request.constraints.command_kind):
+                if not matches_saved_launch or requested_constraints.command_kind not in placement.MAC_RUN_KINDS:
                     return wire.Refused("Mac launch request changed its owner, source or command")
                 if isinstance(saved.permission, placement.PermissionAvailable):
                     if not isinstance(saved.terminal_report, placement.NoTerminalReport):
@@ -3737,7 +3738,7 @@ done
                     key = execution_identity.attempt_key(saved.assignment.episode, saved.assignment.attempt)
                     self.assignments[key] = replace(saved, permission=placement.PermissionConsumed(self.clock.now()))
                     self.persist()
-            elif (isinstance(saved.permission, placement.PermissionConsumed)
+            elif (isinstance(saved.permission, placement.PermissionConsumed) or legacy_mac_retry_changed
                     or source == "adapter" and requested_constraints.command_kind in placement.MAC_RUN_KINDS):
                 return wire.PlacementWait(request.episode, request.since, 1,
                     self.placement_eligibility.get(request.episode, ()),
