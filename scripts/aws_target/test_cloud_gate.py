@@ -197,7 +197,8 @@ class CloudGateTests(CostFixture):
         _ = write_config_fixture(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
         _ = write_config_fixture(self.root / 'cloud_gate.conf',
-            'instance_types=m7a.8xlarge m7a.4xlarge\nspot_max_usd_per_hour=0.8\n'
+            '# one of: on, off\nenabled=on\n'
+            + 'instance_types=m7a.8xlarge m7a.4xlarge\nspot_max_usd_per_hour=0.8\n'
             + 'attempt_allowance_usd=0.02\nlaunch_reply_tries=2\n')
         self.now = float(instant('2026-01-15T01:00:00+00:00'))
         self.book = ledger.CostLedger(self.state)
@@ -2562,7 +2563,7 @@ class CloudRouteTests(CostFixture):
         _ = self.enterContext(mock.patch.object(cloud_gate, 'account_settings_path', side_effect=lambda: Path(os.environ.get('AWS_TARGET_CONFIG', str(self.settings)))))
         _ = write_config_fixture(self.root / 'merge_gate.conf')
         _ = write_config_fixture(self.root / 'cloud_gate.conf',
-            'credential_file=~/.config/aws-build/credentials\n')
+            '# one of: on, off\nenabled=on\ncredential_file=~/.config/aws-build/credentials\n')
         self.repo = self.root / 'repo'
         folder = self.repo / 'scripts/fixture'
         folder.mkdir(parents=True)
@@ -3404,6 +3405,32 @@ class CloudRouteTests(CostFixture):
                                  module_time_limit_s=1800, service=service)
         self.assertIsInstance(outcome, cloud_gate.LocalFallback)
         service.assert_not_called()
+
+    def test_disabled_cloud_gate_skips_deployment_and_aws(self) -> None:
+        _ = (self.root / 'cloud_gate.conf').write_text('# one of: on, off\nenabled=off\n')
+        fake = FakeGateAws()
+        api = AwsCli('fixture', 'us-east-2', 1, fake)
+        service = mock.Mock(side_effect=AssertionError('A disabled cloud gate must not start a service'))
+        with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
+              mock.patch.object(cloud_gate, 'control_lock') as lock,
+              mock.patch.object(cloud_gate, 'gate_deployment') as deployment):
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                                     module_time_limit_s=1800, service=service)
+        reason = 'cloud gates are off (cloud_gate.conf enabled=off)'
+        self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
+        lock.assert_not_called()
+        deployment.assert_not_called()
+        service.assert_not_called()
+        self.assertEqual(fake.commands, [])
+        self.assertEqual([row['reason'] for row in self.fallback_rows()], [reason])
+
+    def test_invalid_cloud_gate_switch_reports_config_error(self) -> None:
+        _ = (self.root / 'cloud_gate.conf').write_text('# one of: on, off\nenabled=invalid\n')
+        service = mock.Mock(side_effect=AssertionError('An invalid switch must not start a service'))
+        mode = gate.SuiteMode.MERGE_GATE
+        with self.assertRaisesRegex(conf.Unusable, r"cloud_gate\.conf: enabled='invalid':"):
+            _ = cloud_gate.run_cloud(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                     service=service, attempt=cloud_gate.CloudAttempt(self.state, mode))
 
     def test_fallback_row_write_error_keeps_the_original_fallback(self) -> None:
         service = mock.Mock(side_effect=AssertionError('An absent stack needs no service'))
