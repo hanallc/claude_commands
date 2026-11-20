@@ -37,6 +37,7 @@ from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, scratch, urgency
+from scripts.message import send_result
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import change_routing, change_review, footer_counts, next_item, record_store, showrunners, staff, unrouted_alert, update_registration
@@ -3309,7 +3310,7 @@ class ChangePageTests(unittest.TestCase):
     def test_a_failed_question_delivery_leaves_the_count_and_preserves_the_question(self) -> None:
         path, forms, body = self.browser()
         del body
-        with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
+        with patch.object(change_page, "send_message", side_effect=ValueError("socket unavailable")):
             self.delivery_done.clear()
             self.assertEqual(self.http_request(path, self.browser_fields(
                 forms, "page-owner/C1", "question", "Which <groups>?")).status, 200)
@@ -3323,6 +3324,9 @@ class ChangePageTests(unittest.TestCase):
         self.assertNotIn("C1", [entry.key for entry in prepared.queues["page-owner"].entries])
         self.assertIn("Which &lt;groups&gt;?", content)
         self.assertIn("The showrunner will answer this", content)
+        current = change_page.DeliveryStatus(self.root)
+        question = current.slots(self.page, "C1").question
+        self.assertTrue(change_page.review_question_failed(current, self.page, "C1", question))
         self.assertEqual(refreshed.outcomes["page-owner/C1"], [])
         self.assertEqual(footer_counts.changes(self.production), refreshed.counts["page-owner"])
         self.assert_no_delivery_controls(content)
@@ -3457,12 +3461,78 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), failed)
         self.assertEqual(self.messages, [])
 
+    def test_review_question_checks_the_change_list_before_sending(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        delivery = change_page.submit(self.page, urlencode(self.answer(outcome='question', feedback='Which groups?')), status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.page.review_list.unlink()
+        with patch.object(change_page, "send_to_staff") as send:
+            change_page.deliver(delivery, status)
+        send.assert_not_called()
+        self.assertEqual(status.request_attempts, {})
+
+    def test_review_question_stops_retrying_after_an_answer(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        delivery = change_page.submit(self.page, urlencode(self.answer(outcome='question', feedback='Which groups?')), status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        question = status.slots(delivery.page, delivery.row).question
+        assert isinstance(question, change_page.OpenQuestion)
+
+        def send(*_args: str, **_options: str) -> None:
+            self.assertTrue(status.answer_question(delivery.page, delivery.row, question.question_id, "All groups."))
+            raise RuntimeError("The fixture sender is offline.")
+
+        with patch.object(change_page, "send_to_staff", side_effect=send) as transport:
+            change_page.deliver(delivery, status)
+        transport.assert_called_once()
+        self.assertIsInstance(status.slots(delivery.page, delivery.row).question, change_page.AnsweredQuestion)
+        self.assertEqual(status.request_attempts, {})
+
+    def test_review_question_keeps_a_pending_send_for_recovery(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        delivery = change_page.submit(self.page, urlencode(self.answer(outcome='question', feedback='Which groups?')), status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        pending = send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("pending", "Unconfirmed.", ""))
+        skipped = send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("skipped", "Already received.", ""))
+        with (patch.object(change_page, "send_message", new=SEND_MESSAGE),
+              patch.object(unrouted_alert, "message_outcome", return_value=(pending, pending.header.detail)) as transport):
+            change_page.deliver(delivery, status)
+            self.assertEqual(transport.call_count, 3 * len(delivery.recipients))
+            sends = transport.call_args_list.copy()
+            question = status.slots(delivery.page, delivery.row).question
+            assert isinstance(question, change_page.OpenQuestion)
+            self.assertIsInstance(question.delivery, change_page.DeliveryIntent)
+            self.assertTrue(status.has_deferred_questions())
+
+            transport.reset_mock(return_value=True)
+            transport.return_value = (skipped, skipped.header.detail)
+            restarted = change_page.DeliveryStatus(self.root)
+            change_page.recover_pending(restarted)
+            change_page.recover_deferred_questions(status)
+
+        self.assertEqual(transport.call_args_list, sends[:len(delivery.recipients)])
+        self.assertEqual(status.slots(delivery.page, delivery.row).question,
+                         replace(question, delivery=change_page.NoDelivery()))
+
+    def test_review_question_configuration_refusal_releases_its_claim(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        delivery = change_page.submit(self.page, urlencode(self.answer(outcome='question', feedback='Which groups?')), status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        with (patch.object(conf, "read", side_effect=OSError("Cannot read the retry settings.")),
+              patch.object(change_page, "send_to_staff") as send, redirect_stderr(StringIO()) as errors):
+            change_page.deliver(delivery, status)
+        send.assert_not_called()
+        question = status.slots(delivery.page, delivery.row).question
+        self.assertTrue(change_page.review_question_failed(status, delivery.page, delivery.row, question))
+        self.assertEqual(status.request_attempts, {})
+        self.assertEqual(errors.getvalue(), "review-links question C1: Cannot read the retry settings.\n")
+
     def test_a_server_restart_sends_a_question_interrupted_before_the_send(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         fields = self.answer(outcome='question', feedback='Which groups?')
         delivery = change_page.submit(self.page, urlencode(fields), status)
         assert isinstance(delivery, change_page.MessageDelivery)
-        with (patch.object(change_page, 'send_with_retries', side_effect=SystemExit),
+        with (patch.object(change_page, 'send_to_staff', side_effect=SystemExit),
               self.assertRaises(SystemExit)):
             change_page.deliver(delivery, status)
         self.assertEqual(self.messages, [])
