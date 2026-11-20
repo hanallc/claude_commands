@@ -2471,27 +2471,33 @@ class RunnerAuthorizationTests(unittest.TestCase):
 
         holder = build_hold.Holder("fps", datetime.now(user_zone()), "Phase 3 timing", build_hold.UnknownReleaseEta(), "fps")
         held = records.NatedevHeld("fps", "Phase 3 timing")
-        with AdmissionFixture() as fixture, fixture.loop_turn():
-            request = fixture.service_request()
-            priority = records.QueuePriority(({"unit": request.runner, "why": "fixture",
-                "set_at": fixture.clock.now(), "set_by": "fixture"},))
-            fixture.server.priority = priority
-            with mock.patch.object(build_targets, "hold_waited_on", return_value=holder):
-                waiting, = fixture.server.handle_request(request)
-                assert isinstance(waiting, wire.Wait)
-                self.assertEqual(waiting.reason, held)
-                self.assertEqual(waiting.text, "natedev is held by fps for Phase 3 timing; waiting for release")
-                view, = fixture.server.handle_request(wire.ViewRequest())
-                assert isinstance(view, wire.ViewReply)
-                step, = view.reading.view.waiting
-                self.assertEqual(step.reason, held)
-                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
-                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
-                self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [request.owner.pid])
-                self.assertEqual(snapshot.inputs.priority, priority)
-                self.assertEqual(list(snapshot.inputs.waiter_orders.values()), [records.PriorityUnit(request.runner)])
-            fixture.allow_next_start()
-            fixture.release(only_admitted(fixture.server.handle_request(request)))
+        for priority_source in ("existing", "request"):
+            with self.subTest(priority_source=priority_source), AdmissionFixture() as fixture, fixture.loop_turn():
+                request = fixture.service_request()
+                priority = records.QueuePriority(({"unit": request.runner, "why": "fixture",
+                    "set_at": fixture.clock.now(), "set_by": "fixture"},))
+                if priority_source == "existing":
+                    fixture.server.priority = priority
+                with mock.patch.object(build_targets, "hold_waited_on", return_value=holder):
+                    waiting, = fixture.server.handle_request(request)
+                    assert isinstance(waiting, wire.Wait)
+                    self.assertEqual(waiting.reason, held)
+                    self.assertEqual(waiting.text, "natedev is held by fps for Phase 3 timing; waiting for release")
+                    if priority_source == "request":
+                        with mock.patch.object(gate, "priority_labels", return_value={}):
+                            self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
+                                "bump-ci-runner", request.runner, "fixture", "fixture")), [wire.Ok()])
+                    view, = fixture.server.handle_request(wire.ViewRequest())
+                    assert isinstance(view, wire.ViewReply)
+                    step, = view.reading.view.waiting
+                    self.assertEqual(step.reason, held)
+                    snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                    assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                    self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [request.owner.pid])
+                    self.assertEqual(snapshot.inputs.priority, priority)
+                    self.assertEqual(list(snapshot.inputs.waiter_orders.values()), [records.PriorityUnit(request.runner)])
+                fixture.allow_next_start()
+                fixture.release(only_admitted(fixture.server.handle_request(request)))
 
     def test_service_estimate_refreshes_history_and_replays_without_a_caller_run(self) -> None:
         with AdmissionFixture() as fixture, fixture.loop_turn():
