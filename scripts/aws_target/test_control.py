@@ -1129,7 +1129,7 @@ class HanaBilledHoursTests(CostFixture):
         primary = ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(0), Decimal('0.490279'), 'Hrs')
         fallback = ledger.UsageTypeCost('USE2-SpotUsage:c7a.4xlarge', Decimal(0), Decimal('0.25'), 'Hrs')
         bill = ledger.ChargeRead(day.isoformat(), start + 86400, start, start + 86400,
-                                 Decimal(1), Decimal(0), Decimal(0))
+                                 Decimal(0), Decimal(0), Decimal(0))
         for usage, expected in (
             ((*ignored, primary), Decimal('0.490279')),
             ((*ignored, primary, fallback), Decimal('0.740279')),
@@ -1196,11 +1196,11 @@ class HoursCheckTests(CostFixture):
             return ledger.LedgerEvidence(observations=list(self.observations), gate_reservations=list(self.reservations),
                                          hana_compute=list(self.exposures))
 
-        def bills(_book: ledger.CostLedger, _now: int) -> tuple[ledger.ChargeRead, ...]:
+        def bills(_book: ledger.CostLedger) -> tuple[ledger.ChargeRead, ...]:
             return tuple(self.bills)
 
         _ = self.enterContext(mock.patch.object(ledger.CostLedger, 'read_snapshot', evidence))
-        _ = self.enterContext(mock.patch.object(ledger.CostLedger, 'validated_bills', bills))
+        _ = self.enterContext(mock.patch.object(ledger.CostLedger, 'read_bills', bills))
 
     def day(self, back: int) -> datetime:
         """Midnight UTC, back days before the clock's day."""

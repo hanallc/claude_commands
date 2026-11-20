@@ -2402,11 +2402,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                                   r'\1=us-east-2 us-west-2', path.read_text()))
         worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1, execute=self.fake), self.book,
             self.settings, self.folder / 'reservation', clock=lambda: self.now)
-        charges = self.book.directory / 'charges'
-        charges.mkdir(exist_ok=True)
-        _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
         with (mock.patch.object(worker, 'reconcile'), mock.patch.object(worker, 'charges'),
-              redirect_stderr(StringIO()) as output):
+              mock.patch.object(self.book, 'read_bills', return_value=(reading,)), redirect_stderr(StringIO()) as output):
             aws_trial.reserve_trial(worker, [self.request])
         reserved = self.book.read_snapshot().gate_reservations[0]
         self.assertEqual(reserved.rate.usd_per_hour, Decimal('.5'))
@@ -2421,10 +2418,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             Decimal('2.8'), Decimal(0), Decimal(0), (
                 ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.8'), Decimal(1), 'Hrs'),
                 ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('2'), Decimal(1), 'Hrs')))
-        charges = self.book.directory / 'charges'
-        charges.mkdir(exist_ok=True)
-        _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
-        with mock.patch.object(cloud_gate.GateWorker, 'charges'):
+        with (mock.patch.object(cloud_gate.GateWorker, 'charges'),
+              mock.patch.object(self.book, 'read_bills', return_value=(reading,))):
             aws_trial.reserve_trial(worker, [self.request])
             reserved = self.book.read_snapshot().gate_reservations[0]
             self.assertEqual(reserved.usd_per_hour, Decimal('0.8'))

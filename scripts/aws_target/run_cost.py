@@ -150,7 +150,8 @@ BilledKey = tuple[str, str, str, str]
 def billed_readings(book: ledger.CostLedger, start: datetime, end: datetime, *,
                     bill_cutoff: int | None = None) -> list[ledger.ChargeRead]:
     """Read bill amounts for the UTC days in [start, end)."""
-    readings = book.validated_bills(int(time.time()) if bill_cutoff is None else bill_cutoff)
+    readings = (tuple(reading for reading in book.read_bills() if ledger.is_billed_day(reading))
+                if bill_cutoff is None else book.validated_bills(bill_cutoff))
     first, following = start.date().isoformat(), end.date().isoformat()
     return [reading for reading in readings if first <= reading.day < following]
 
@@ -184,11 +185,12 @@ def hana_billed_hours(directory: Path, day: date) -> Decimal | None:
     path = directory / 'charges' / (day.isoformat() + '.json')
     try:
         record = ledger.read_saved_bill(path, int(time.time()))
+        bill = record.pricing_read
+        if (record.usable_bill is ledger.BillRecordRejection.DUPLICATE_FIELDS
+                or not ledger.matches_utc_charge_day(path.name, bill, day)):
+            return None
     except (OSError, ValueError, ArithmeticError):
         return None
-    if isinstance(record.usable_bill, ledger.BillRecordRejection):
-        return None
-    bill = record.usable_bill.latest
     settings = hana_spend.read_settings(conf.read_or_repository('hana_aws'))
     keys = {(size, settings.region) for size in (settings.instance_type, *settings.fallback_instance_types)}
     return sum((row.quantity for row in bill.usage_types if _spot_usage_key(row.usage_type) in keys), Decimal('0.0'))

@@ -1122,21 +1122,12 @@ class LedgerTests(CostFixture):
         self.observe(now, 'stopped')
         bill = ledger.ChargeRead(day, end, start, end, Decimal(5), Decimal(0), Decimal(0))
         canonical = day + '.json'
-        settings = config.read_settings(self.settings)
 
         def check_amounts(expected: Decimal) -> None:
             published = spend.read_spend(self.settings, self.state, now, '2026-01-16')
             assert isinstance(published, spend.Spend)
             page_day = next(row.usd for row in published.days if row.day == day)
-            state = self.book.read_snapshot()
-            guard = self.book.placement_spending_preview(state, self.settings, now).evidence.costs
-            assert isinstance(guard, ledger.CostEstimate)
-            self.assertEqual((page_day, guard.monthly.usd), (expected, expected))
-            above = replace(settings, monthly_limit_usd=expected + Decimal('.001'))
-            self.assertEqual(self.book.reservation_cap(state, above, now, guard), '')
-            if expected:
-                at_limit = replace(settings, monthly_limit_usd=expected)
-                self.assertEqual(self.book.reservation_cap(state, at_limit, now, guard), 'monthly_limit')
+            self.assertEqual(page_day, expected)
 
         for expected in (Decimal(0), Decimal(3)):
             if expected:
@@ -1161,6 +1152,43 @@ class LedgerTests(CostFixture):
                     self.assertEqual(self.book.refused_bill_records(now), (ledger.RefusedBillRecord(date.fromisoformat(day), reason),))
                     check_amounts(expected)
                     path.unlink()
+
+    def test_page_shows_local_compute_on_a_refused_day_before_the_newest_bill(self) -> None:
+        start = instant('2026-01-31T00:00:00Z')
+        end = start + 86400
+        now = end + 86400
+        self.running(end - 3 * 3600)
+        self.observe(end, 'stopped')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-31', now, start, end,
+            Decimal(5), Decimal(0), Decimal(0)), 'alias.json')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-02-01', now, end, now,
+            Decimal(2), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(2), Decimal(2), 'Hrs'),)))
+        page = spend.read_spend(self.settings, self.state, now, '2026-02-02')
+        assert isinstance(page, spend.Spend)
+        estimate = next(row for row in page.days if row.day == '2026-01-31')
+        self.assertEqual((estimate.source, estimate.usd), ('estimated from the newest bill', Decimal(3)))
+
+    def test_n01_admission_refuses_wrong_name_bill_and_local_compute_at_four_dollars(self) -> None:
+        self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'monthly_limit_usd': '4'})
+        start = instant('2026-01-01T00:00:00Z')
+        end = start + 86400
+        now = end + 3 * 3600
+        self.inventory(start)
+        self.observe(start, 'stopped')
+        self.observe(end, 'running')
+        self.observe(now, 'stopped')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-01', now, start, end,
+            Decimal(5), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(5), Decimal(5), 'Hrs'),)), 'alias.json')
+        request = ledger.GateReservation('fixture-gate', now, now + 60, Decimal(0), Decimal(0), region='us-east-2')
+        self.assertEqual(self.book.validated_bills(now), ())
+        preview = self.book.placement_spending_preview(self.book.read_snapshot(), self.settings, now)
+        assert isinstance(preview, ledger.SpendingRefused)
+        self.assertEqual(preview.reason, 'monthly_limit')
+        self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached('monthly_limit'))
+        (self.state / 'charges' / 'alias.json').unlink()
+        self.assertIsInstance(self.book.reserve_gate(self.settings, request), ledger.GateReserved)
 
     def test_complete_bill_replaces_the_estimate_with_the_newest_amount(self) -> None:
         self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'monthly_limit_usd': '5'})
@@ -1392,7 +1420,7 @@ class LedgerTests(CostFixture):
         self.assertEqual(costs.monthly, ledger.MonthlyTotal('2026-02', Decimal(6)))
         self.assertEqual(costs.daily.usd, Decimal(0))
 
-    def test_account_reservation_counts_the_canonical_bill_and_open_allowance(self) -> None:
+    def test_account_reservation_adjusts_a_complete_day_and_keeps_the_open_allowance(self) -> None:
         self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'monthly_limit_usd': '6'})
         start = self.start
         end = start + 86400
@@ -1407,6 +1435,8 @@ class LedgerTests(CostFixture):
         self.write_complete_bill_fixture(replace(reading, actual_usd=Decimal(9), usage_types=(
             ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(9)),)), 'previous.json')
         proposed = ledger.GateReservation('next', now, now + 60, Decimal(0), Decimal(0), region='us-east-2')
+        with mock.patch.object(self.book, 'read_complete_day_amounts', return_value=()):
+            self.assertEqual(self.book.reserve_gate(self.settings, proposed), ledger.GateCapReached('monthly_limit'))
         self.replace('monthly_limit_usd', '5')
         self.assertEqual(self.book.reserve_gate(self.settings, proposed), ledger.GateCapReached('monthly_limit'))
         self.replace('monthly_limit_usd', '6')

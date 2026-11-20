@@ -930,18 +930,18 @@ Legacy cancellations and stopped states retain the full exposure when the journa
 Reports keep the existing reconciliation floors.
 The account checks adjust the existing total for each qualifying UTC day inside the limit window.
 They subtract that day's existing usage and add the newest qualifying AWS amount.
-The page, cost report, admission cap, and complete-day adjustment use `read_saved_bill` to check account bills.
+The page and the guard's complete-day adjustment use strict `read_saved_bill`, and admission retains `read_charge` to preserve all existing counts and refusals.
+The later `one-day-amount` phase joins the readers and protects the count with one `LegacyCountAddition`.
 The file name, day label, and bounds must match one full UTC day.
 The bill must exclude credits and give at least USD 0.01 before rounding.
 The newest read time must be valid and cannot be in the future.
 The check rejects duplicate JSON fields and invalid amount histories.
 The history times must increase and the last entry must match the newest read.
 A legacy file without a history supplies one read.
-The page and admission cap use their existing estimates when a day has no usable bill.
+The page uses its existing estimate when a day has no usable bill.
+It shows an earlier refused day when the estimate includes local charges.
 The buildlog report lists refused records by UTC day and gives the reason.
-The AWS page shows the number of refused records.
-Amounts below USD 0.01 use the estimate.
-The guard retains its existing pricing inputs to preserve its limit counts.
+On the page, amounts below USD 0.01 use the estimate.
 Known limit. Concurrent refreshes can record one USD 0.01 fee for two Cost Explorer reads.
 Within the lookback, the last `cost_explorer_unchanged_reads` reads after the UTC day ends must report the same amount.
 Reads less than `cost_explorer_interval_seconds` apart count once.

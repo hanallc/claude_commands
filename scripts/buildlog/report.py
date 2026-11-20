@@ -2405,7 +2405,7 @@ def aws_section(connection: sqlite3.Connection, day: str, *,
     lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, spend.daily_limit, today)]
     refused = ledger.CostLedger(directory).refused_bill_records(instant)
     if refused:
-        lines.extend(('**AWS bill records excluded from the report**', ''))
+        lines.extend(('**AWS bill records excluded from daily spend**', ''))
         lines.extend(f'- {record.display_line()}' for record in refused)
         lines.append('')
     try:
@@ -2444,7 +2444,7 @@ def aws_section(connection: sqlite3.Connection, day: str, *,
     notes.append('Spot compute can include the older Spot builder.')
     try:
         days = conf.read(settings).whole('gate_type_window_days')
-        comparison = aws_report.gate_type_report(directory, day, days, bill_cutoff=instant)
+        comparison = aws_report.gate_type_report(directory, day, days)
         lines.extend(comparison.tables)
         notes.append(comparison.source)
     except (OSError, ValueError, ArithmeticError, KeyError) as error:

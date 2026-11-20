@@ -548,9 +548,8 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     today = datetime.fromtimestamp(now, UTC).date().isoformat()
     read = aws_spend.read_spend(settings_path or conf.path('aws_target'), directory, now, today)
     spend = spend_data(read, now, configuration.whole('spend_pace_days'))
-    book = ledger.CostLedger(directory)
     try:
-        watched = book.read_charge_watch(aws_config.read_settings(configuration), now)
+        watched = ledger.CostLedger(directory).read_charge_watch(aws_config.read_settings(configuration), now)
     except (OSError, ValueError):
         watched = ()
     try:
@@ -561,11 +560,8 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     values = conf.read_or_repository('cloud_gate')
     gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
     tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
-    notes = settled_amount_notes(watched)
-    refused_count = len(book.refused_bill_records(now))
-    if refused_count:
-        notes += (f'AWS bill records excluded from this page: {refused_count}.',)
-    data = page_data(tables, spend, now, placement, launch_records=book.launches(), settled_notes=notes)
+    data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches(),
+                     settled_notes=settled_amount_notes(watched))
     comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
