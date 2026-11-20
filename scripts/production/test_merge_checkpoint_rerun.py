@@ -15,12 +15,14 @@ from types import ModuleType
 from typing import cast, final
 import unittest
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from scripts.production import merge_checkpoint
 from scripts.production import change_review
 from scripts.production import staff, unit_lookup
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, configure_test_environment
+from scripts.production.production_doc import ProductionDocument
 
 
 class Killed(BaseException):
@@ -55,6 +57,28 @@ class CheckpointRerunTests(MergeCheckpointFixture):
         self.assertEqual(snapshot.call_count, 1)
         self.assertEqual([row["Producer"] for row in change_review.pending(review)],
                          [unit.id], result.stdout)
+
+    def test_red_gate_retry_runs_only_the_red_modules_and_keeps_an_explicit_limit(self) -> None:
+        command = ["merge_gate.py", "--tests-only", "--module-time-limit-s", "1800"]
+        log = self.state / "red-gate.log"
+        production = ProductionDocument(self.root / "production.md", "example", "production",
+                                        self.checkout, log, ZoneInfo("UTC"))
+        red_module = "hooks/test_first.py"
+        red = f"--- {red_module} exit=1 ---\n"
+        for original, output, retry in (
+            (command, red, [*command, "--module", red_module]),
+            ([*command, "--module", red_module, "--module=lib/test_green.py"], red, [*command, "--module", red_module]),
+            (command, "module runner refused", command),
+        ):
+            with self.subTest(original=original, output=output):
+                step = checkpoint_gate.CheckpointTestStep("merge test 1", original, self.checkout)
+                with (patch.object(checkpoint_gate, "run_test_command", side_effect=[
+                        subprocess.CompletedProcess(original, 1, output, ""),
+                        subprocess.CompletedProcess(retry, 1, output, ""),
+                ]) as run, self.assertRaises(checkpoint_gate.RedCheckpointTests)):
+                    _ = checkpoint_gate.run_test_steps(production, (step,), frozenset(), frozenset(), log)
+                self.assertEqual(run.call_count, 2)
+                run.assert_called_with(retry, self.checkout, raise_start_errors=False)
 
     def save_case(self) -> Path:
         snapshot = self.root.with_name("rerun-seed")

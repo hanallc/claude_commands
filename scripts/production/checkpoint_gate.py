@@ -152,7 +152,14 @@ def red_names(command: Sequence[str], output: str) -> frozenset[str]:
 def only_tests(command: list[str], names: frozenset[str]) -> list[str]:
     """Restrict the command to the named gate modules, or tests with verify.sh --filter or nextest -E test(=name)."""
     if runs_merge_gate(command):
-        return [*command, *(word for name in sorted(names) for word in ("--module", name))]
+        narrowed_command: list[str] = []
+        words = iter(command)
+        for word in words:
+            if word == "--module":
+                _ = next(words, "")
+            elif not word.startswith("--module="):
+                narrowed_command.append(word)
+        return [*narrowed_command, *(word for name in sorted(names) for word in ("--module", name))]
     if any(Path(word).name == "verify.sh" for word in command):
         return [*command, *(word for name in sorted(names) for word in ("--filter", name))]
     return [*command, *(word for name in sorted(names) for word in ("-E", f"test(={name})"))]
@@ -248,9 +255,12 @@ def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTes
         name, command, folder = step
         # Run only the known flaky tests when they cause the failure.
         alone = bool(tests) and tests <= flaky_tests
+        if runs_merge_gate(command):
+            rerun_command = narrowed(RedStep(step, first_names)).command
+        else:
+            rerun_command = only_tests(command, tests) if alone else command
         with log.open("a", encoding="utf-8") as output:
-            result = run_test_command(only_tests(command, tests) if alone else command, folder,
-                                      raise_start_errors=raise_start_errors)
+            result = run_test_command(rerun_command, folder, raise_start_errors=raise_start_errors)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
         stop_cancelled_test(name, result, log)

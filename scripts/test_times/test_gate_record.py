@@ -79,6 +79,35 @@ class GateRecordTests(unittest.TestCase):
         _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
         self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(90))
 
+    def test_passing_module_wall_medians_skip_ineligible_attempts_and_keep_known_modules(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        index.create_schema(connection)
+        rows = (
+            ("a", 8, 0, 0, "full", 100, 0, ""),
+            ("b", 8, 0, 0, "full", 20, 0, ""),
+            ("c", 8, 0, 0, "affected", 40, 0, ""),
+            ("d", 8, 1, 0, "full", 100, 0, ""),
+            ("e", 8, 0, 1, "full", 100, 0, ""),
+            ("f", 8, 0, 0, "reused", 100, 0, ""),
+            ("g", 8, 0, 0, "full", 100, 1, ""),
+            ("h", 8, 0, 0, "full", 100, 0, "hold"),
+            ("i", 8, 0, 0, "full", 0, 0, ""),
+            ("j", 16, 0, 0, "full", 100, 0, ""),
+        )
+        for run, vcpus, status, aborted, selection, wall, module_status, restart in rows:
+            connection.execute("""INSERT INTO gate_runs
+                (id, started_at, step, vcpus, status, aborted, selection)
+                VALUES (?, ?, 'merge-gate', ?, ?, ?, ?)""", (run, run, vcpus, status, aborted, selection)).close()
+            connection.execute("""INSERT INTO gate_modules
+                (run_id, suite, module, attempt, wall_s, status, restart)
+                VALUES (?, 'lib', 'nested/test_a.py', 1, ?, ?, ?)""", (run, wall, module_status, restart)).close()
+        module = "scripts/lib/nested/test_a.py"
+        self.assertEqual(gate_record.passing_module_wall_medians(
+            connection, 8, [module, "hooks/test_missing.py"], 2), {module: 30.0})
+        self.assertEqual(gate_record.passing_module_wall_medians(connection, 16, [module], 2), {module: 100.0})
+        self.assertEqual(gate_record.passing_module_wall_medians(connection, 4, [module], 2), {})
+
     def test_full_time_limit_uses_only_runs_with_the_same_job_count(self) -> None:
         """A 16-job run on natedev never takes its limit from 32-job cloud runs on the same vCPU count."""
         _ = write_config_fixture(self.config / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=1.5")
