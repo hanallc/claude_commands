@@ -1573,8 +1573,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 3. When no land runs, the push goes at once. When a land runs, the publisher waits for a gap in its own detached process (sdlc, 04:46 EST Nov 20). It uses no wake files, no row in the land line and no runner-side replay; `next` keeps its base behavior. One gap lock: the waiter and land registration both take it, and the waiter holds it until its push process exits. The prepared commit is pushed before local main advances.
 4. A push that waits shows where it waits and does not block the caller's turn. One waiter covers all waiting changes. It cleans up after itself.
 5. Add no new check or refusal beyond the wait. Ask sdlc first if one seems needed.
-6. A promote into the live checkout with a waiting live value does not fail and keeps the value: when the next group changes the same file, and when it does not (builds, 18:23).
-7. Tests use fixture repos and line state only, and one test proves that no write reaches the live land line, also when the live file is absent (sdlc, 03:15 EST Nov 20): push at once, wait in a detached process, a second save starts no second waiter, a land that starts during the push waits for it, and the promote cases for a `.conf` and a settings.json value.
+6. A promote into the live checkout with a waiting `.conf` value does not fail and keeps the value: when the next group changes the same file, and when it does not (builds, 18:23). settings.json keeps its base route: phase 91 adds no settings.json publisher, journal or move recovery (sdlc, 06:41 EST Nov 20). The settings.json promote case moves to phase 92.
+7. Tests use fixture repos and line state only, and one test proves that no write reaches the live land line, also when the live file is absent (sdlc, 03:15 EST Nov 20): push at once, wait in a detached process, a second save starts no second waiter, a land that starts during the push waits for it, and the promote cases for a `.conf` value.
 
 **Files:** `scripts/lib/live_settings.py`, `scripts/lib/main_push_lock.py`, `scripts/lib/models_registry.py`, `scripts/lib/waiting_rows.py`, `scripts/production/land_queue.py`, the promote in `merge_checkpoint.py` only if a test needs it, their tests, the docs that tell a session how to change settings.json, `docs/as-built/merge-gate-and-test-speed.md` (Land line).
 
@@ -1597,7 +1597,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 2. The caller's reply says the push waits for a gap and where. The push goes in the gap and cleans up after itself.
 3. Add no new check or refusal beyond the wait.
 4. CI starts after the push goes in, from the pushed commit.
-5. Tests use fixture repos, line state and slots only. One test proves no write reaches the live land line or `/build/slot`.
+5. A promote into the live checkout with a waiting settings.json value does not fail and keeps the value: when the next group changes settings.json, and when it does not (moved from phase 91, sdlc 06:41 EST Nov 20).
+6. Tests use fixture repos, line state and slots only. One test proves no write reaches the live land line or `/build/slot`.
 
 **Files:** `scripts/validate_and_push/push_direct.sh`, `scripts/production/fast_track.py`, `scripts/production/ci_points.py`, `scripts/production/land_queue.py` (the phase 91 gap function), their tests, `docs/as-built/validate-and-push-cancel-prior.md`.
 
