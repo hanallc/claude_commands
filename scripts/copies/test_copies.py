@@ -32,6 +32,7 @@ from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
 from scripts.lib import build_folders, copy_record, nix_env, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.cleanup_process_test_support import private_cleanup_processes
 from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
 from textwrap import dedent
@@ -128,6 +129,7 @@ class StandingTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = self.enterContext(private_cleanup_processes(self.base))
         temporary = self.base / "temporary"
         temporary.mkdir()
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
@@ -391,10 +393,18 @@ source_check_seconds=1
         _ = self.git(self.source, "config", "i18n.logOutputEncoding", "UTF-16")
         tree = self.git(self.source, "rev-parse", "HEAD^{tree}")
         output = self.base / "slot-head"
-        result = self.cli("hold", "--repo", str(self.source), "--tree", tree,
-                          "--capacity-file", str(self.base / "capacity"), "--", "sh", "-eu", "-c",
-                          'git rev-parse HEAD > "$1"', "slot-command", str(output))
-        self.assertEqual(result.returncode, 0, result.stderr)
+        missing = str(self.base / "missing-cargo")
+        cases = (
+            (("sh", "-eu", "-c", 'git rev-parse HEAD > "$1"', "slot-command", str(output)), 0),
+            ((missing,), 125),
+        )
+        for command, status in cases:
+            with self.subTest(command=command):
+                result = self.cli("hold", "--repo", str(self.source), "--tree", tree,
+                                  "--capacity-file", str(self.base / "capacity"), "--", *command)
+                self.assertEqual(result.returncode, status, result.stderr)
+                if command[0] == missing:
+                    self.assertIn(f"cannot launch {missing}", result.stderr)
         self.assertEqual(output.read_text().strip(), self.head)
 
     def test_expired_slot_wait_stops_the_cli_before_it_starts_the_command(self) -> None:

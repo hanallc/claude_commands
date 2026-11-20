@@ -2444,14 +2444,24 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
                     print(f"copies: publish: {error}", file=sys.stderr)
             target = checkout / os.environ.get("CARGO_TARGET_DIR", "target")
             before = publication_candidates(checkout, target, command, paths)
+            command_started = False
+
             def record_start(pid: int) -> None:
+                nonlocal command_started
+                command_started = True
                 if args.verify_call_id:
                     from scripts.build_queue import admission_records
 
                     admission_records.record_started_verify_command(args.verify_call_id, pid)
 
-            status = build_folders.run_build_command(command, path=checkout, environment=os.environ,
-                                                     pass_fds=COMMAND_LOCKS.get(), on_start=record_start)
+            try:
+                status = build_folders.run_build_command(command, path=checkout, environment=os.environ,
+                                                         pass_fds=COMMAND_LOCKS.get(), on_start=record_start)
+            except OSError as error:
+                if command_started:
+                    raise
+                print(f"verify.sh: cannot launch {command[0]}: {error}", file=sys.stderr)
+                return 125
             capture_step_files(output, paths, before)
             return status
     except build_slots.SlotsFull:

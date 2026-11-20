@@ -1337,12 +1337,13 @@ class ProcessUseTests(TmpSweepCase):
         uid = os.geteuid()
         service = "/system.slice/upsmon.service"
         cases = (
-            ("system service with unreadable cwd", service, False, "cwd", ""),
-            ("system service working in target", service, True, "", "process 42 works in it"),
+            ("system service with unreadable cwd", f"0::{service}", False, "cwd", ""),
+            ("system service working in target", f"0::{service}", True, "", "process 42 works in it"),
             ("unreadable cgroup", "", False, "cwd", "cannot check process 42"),
-            ("user slice", f"/user.slice/user-{uid}.slice/session-1.scope", False, "cwd", "cannot check process 42"),
-            ("user manager", f"/user@{uid}.service/app.slice/tool.service", False, "cwd", "cannot check process 42"),
-            ("system service with unreadable root", service, False, "root", "cannot check process 42"),
+            ("user slice", f"0::/user.slice/user-{uid}.slice/session-1.scope", False, "cwd", "cannot check process 42"),
+            ("user manager", f"0::/user@{uid}.service/app.slice/tool.service", False, "cwd", "cannot check process 42"),
+            ("system service with unreadable root", f"0::{service}", False, "root", "cannot check process 42"),
+            ("malformed zero hierarchy", f"0:name=systemd:{service}", False, "cwd", "cannot check process 42"),
         )
         readlink = os.readlink
         for index, (case, cgroup, uses_target, denied_link, refusal) in enumerate(cases):
@@ -1351,7 +1352,7 @@ class ProcessUseTests(TmpSweepCase):
             fake_process(proc, 42, cwd=str(target) if uses_target else "/")
             _ = write(entry / "comm", "upsmon\n")
             if cgroup:
-                _ = write(entry / "cgroup", f"0::{cgroup}\n")
+                _ = write(entry / "cgroup", f"{cgroup}\n")
 
             def read_fixture_link(path: str) -> str:
                 if path == str(entry / denied_link):

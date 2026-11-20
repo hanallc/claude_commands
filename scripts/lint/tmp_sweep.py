@@ -103,6 +103,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
@@ -117,7 +118,6 @@ from scripts.lib.python_startup.sitecustomize import dataclass_code_root, datacl
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.agents import remote
-from scripts.mac_test import nextest_log
 from scripts.direct import phase_reservation, recorder_state
 
 if TYPE_CHECKING:
@@ -143,6 +143,23 @@ class SessionTemporaryRoot(Protocol):
 
 
 _session_temp = cast(SessionTemporaryRoot, cast(object, import_module("scripts.hooks.session-start-temp-root")))
+
+
+class NextestLogAccess(Protocol):
+    REMOVE: Enum
+
+
+class NextestLogCleanup(Protocol):
+    DIRECTORY: str
+    LOG_NAME: re.Pattern[str]
+    LogAccess: NextestLogAccess
+
+    def retention_days(self) -> int: ...
+
+    def locked_log(self, folder: int, name: str, access: Enum) -> AbstractContextManager[int]: ...
+
+
+nextest_log = cast(NextestLogCleanup, cast(object, import_module("scripts.mac_test.nextest_log")))
 SESSION_TEMP_ROOT = _session_temp.ROOT
 RUN_TEMP_NAME = unit_runs.RUN_TEMP_NAME
 # Claude Code keeps each session's scratch in /tmp/claude-<uid>/<project>/<session id>/.
@@ -640,10 +657,15 @@ def unit_outside_user_slice(entry: Path, uid: int) -> str | None:
         if len(fields) != 3:
             return None
         hierarchy, controllers, path = fields
-        if (hierarchy, controllers) != ("0", "") and controllers != "name=systemd":
+        if not hierarchy.isascii() or not hierarchy.isdecimal():
+            return None
+        if not hierarchy.lstrip("0"):
+            if hierarchy != "0" or controllers:
+                return None
+        elif controllers != "name=systemd":
             continue
         parts = Path(path).parts
-        if not hierarchy.isdecimal() or not path.startswith("/") or ".." in parts or user_units.intersection(parts):
+        if not path.startswith("/") or ".." in parts or user_units.intersection(parts):
             return None
         groups.append(parts)
     if not groups:
