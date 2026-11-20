@@ -3306,6 +3306,21 @@ Cause: the fixtures gave their child runs a made-up session id. During natemerge
 3. Part 3 (b268c1270a): the helper in `test_agent_exec.py` and `verify_token_wait_test_support.py`. In bb13.
 4. Left out: `test_verify_token_handoff.py` conflicts with `devtools-testorphans`; builds sent it to devtools through sdlc.
 
+### Phase 44ea — test_slot_order.py costs half as much CPU  · status: in progress
+**From builds and natest, 2026-11-20 16:17 EST (natest phase 399, AWS gate CPU rise).** `scripts/copies/test_slot_order.py` is the largest AWS gate module: 155.6 CPU s median per gate.
+
+1. Cut the module CPU to half or less. Every check it makes now stays.
+2. Move its own session environment onto `build_fixture_sessions` (the 44dz helper). One rule in one place.
+3. Built on the 44dz tip 4b2a2049c6; merges after 44dz.
+
+### Phase 44eb — Unit test runs wait for the merge test  · status: in progress
+**From builds, 2026-11-20 16:21 EST (RCA 261120-1).** At 16:17 four verify test runs started while natemerge's merge test (bb13) still ran. User rule (11-19): natemerge runs first in claude_commands. Nothing in build admission held them.
+
+1. One typed view of the protected merge tests: queued entries in the land line and the live landing, with no gap at dequeue.
+2. Merge test requests carry a landing reference through `step_request` and `Identity`.
+3. One eligibility check before local, cloud and routed grants holds each other claude_commands test run. The waiter shows "waits for the merge test" and keeps its queue order.
+4. When the merge test ends, the held runs start in their original order.
+
 ### Phase 44dv — Admission tests run on the Mac, with no skip  · status: todo
 **From builds, 2026-11-20 05:30 EST (found by report).** After the group merges; not urgent. User rule: tests run on the Mac too; no Mac skip.
 
