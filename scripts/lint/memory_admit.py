@@ -8,7 +8,7 @@ except FileNotFoundError:
     pass
 
 import errno
-from contextlib import closing
+from contextlib import ExitStack, closing
 import importlib
 import json
 import math
@@ -2574,7 +2574,8 @@ class FinalizationIntents(Protocol):
 def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, now: datetime,
                          status: int | OutcomeNotRecorded = OUTCOME_NOT_RECORDED, *,
                          intents: FinalizationIntents,
-                         end_kind: StepEnd | TokenReturn) -> HistoryRecorded | NoHistoryRecorded:
+                         end_kind: StepEnd | TokenReturn,
+                         deadline: float | None = None) -> HistoryRecorded | NoHistoryRecorded:
     """Save the peak before removing evidence; the service owns reservation state."""
     maximum = path.with_suffix(".max")
     history_path = path.parent / "anon_peaks.jsonl"
@@ -2585,7 +2586,9 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
                         Path(str(sidecar) + ".cloud.json"), sidecar))
     require_shared_state_write(Path(__file__), "lint/memory_admit.py", *targets)
     recovering = "finalization" in row
-    if not recovering:
+    if recovering:
+        intent = row["finalization"]
+    else:
         try:
             peak = int(maximum.read_text())
         except (FileNotFoundError, ValueError):
@@ -2613,15 +2616,21 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
         charge_use = row.get("test_phase_charge_use", NoTestPhaseChargeUse())
         if isinstance(charge_use, dict):
             intent["test_phase_charge_use"] = charge_use
-        if peak > 0 and intent["scoped"]:
-            intent["history_start"] = store.read_last_whole_row_end(history_path)
-        row["finalization"] = intent
-        intents.save(row, intent)
-    intent = row["finalization"]
     result: HistoryRecorded | NoHistoryRecorded = NoHistoryRecorded()
-    if intent["peak"] > 0 and intent["scoped"]:
-        # The store repairs an unfinished tail before the identity lookup.
-        with store.locked_append(history_path) as handle:
+    with ExitStack() as locks:
+        handle = None
+        if intent["peak"] > 0 and intent["scoped"]:
+            try:
+                handle = locks.enter_context(store.locked_append(history_path, deadline=deadline, wait=deadline is not None))
+            except store.AppendLockTimeout as error:
+                print(f"memory admission: skipped peak history for {path}: {error}", file=sys.stderr)
+        if not recovering:
+            if handle is not None:
+                intent["history_start"] = handle.tell()
+            row["finalization"] = intent
+            intents.save(row, intent)
+        if handle is not None:
+            # The store repairs an unfinished tail before the identity lookup.
             recorded = recovering and any(previous.get("reservation_id") == intent["reservation_id"]
                                           for previous in store.whole_rows(handle, intent.get("history_start", 0)))
             if not recorded:
@@ -2643,6 +2652,7 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
                     if name in intent:
                         history[name] = cast(Mapping[str, object], intent)[name]
                 store.append_locked(handle, history)
+    if handle is not None:
         result = HistoryRecorded()
         intents.published(row)
     if "queue_identity" in intent:

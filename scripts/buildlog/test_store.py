@@ -8,15 +8,19 @@ import io
 import json
 import os
 import tempfile
-import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.build_queue.admission_test_support import FakeClock
+from scripts.build_queue.queue_fixture import fixture_reservation
+from scripts.build_queue.step_estimator import Completed
 from scripts.buildlog import store
 from scripts.buildlog.test_index import use_test_log
+from scripts.lib import scratch
+from scripts.lint import memory_admit
 
 use_test_log()
 
@@ -122,16 +126,43 @@ class StoreTests(unittest.TestCase):
                 store.append_line(path, {"id": "next"})
                 self.assertEqual(path.read_bytes(), b'{"id":"next"}\n')
 
-    def test_append_lock_deadline_keeps_the_existing_bytes(self) -> None:
-        path = self.root / 'history.jsonl'
+    def test_finalization_skips_locked_peak_history_at_the_deadline(self) -> None:
+        path = self.root / 'admission' / 'anon_peaks.jsonl'
         path.parent.mkdir(parents=True)
         previous = b'{"id":"old"}\n{"id":"unfinished"'
         _ = path.write_bytes(previous)
+        reservation = path.with_name('test.reservation')
+        maximum = reservation.with_suffix('.max')
+        _ = maximum.write_text('20')
+        row = fixture_reservation(101, 30)
+        row['scoped'] = True
+        save, published, clear = mock.Mock(), mock.Mock(), mock.Mock()
+        intents = mock.Mock(save=save, published=published, clear=clear)
+        clock = FakeClock()
+        deadline = clock.monotonic() + 0.1
+        flock = fcntl.flock
+
+        def try_lock(fd: int, operation: int) -> None:
+            self.assertEqual(operation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flock(fd, operation)
+
         with path.open('rb') as held:
-            fcntl.flock(held, fcntl.LOCK_EX)
-            with self.assertRaisesRegex(TimeoutError, 'the append lock deadline passed'):
-                with store.locked_append(path, deadline=time.monotonic() + 0.01):
-                    self.fail('The append acquired a held lock')
+            flock(held.fileno(), fcntl.LOCK_EX)
+            with (mock.patch.object(scratch, 'time', clock),
+                  mock.patch.object(fcntl, 'flock', side_effect=try_lock),
+                  mock.patch('sys.stderr', io.StringIO()) as errors):
+                result = memory_admit.finalize_reservation(
+                    reservation, row, Completed(), datetime.fromtimestamp(clock.now(), UTC),
+                    status=0, intents=intents, end_kind=memory_admit.StepEnd(), deadline=deadline)
+            self.assertEqual(clock.monotonic(), deadline)
+            self.assertEqual(result, memory_admit.NoHistoryRecorded())
+        save.assert_called_once()
+        published.assert_not_called()
+        clear.assert_called_once_with(row)
+        self.assertFalse(maximum.exists())
+        line, = errors.getvalue().splitlines()
+        self.assertIn('skipped peak history', line)
+        self.assertIn(str(path), line)
         self.assertEqual(path.read_bytes(), previous)
         store.append_line(path, {'id': 'next'})
         self.assertEqual(path.read_bytes(), b'{"id":"old"}\n{"id":"next"}\n')
