@@ -20,7 +20,7 @@ from typing import NamedTuple, cast
 
 from scripts.production import investigation, session_staff, staff, unit_config
 from scripts.agents import stop_resume
-from scripts.lib import land_main, main_publish, main_push_lock
+from scripts.lib import land_main, main_publish, main_push_lock, main_sync
 from scripts.herdr import worker_panes
 from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
@@ -352,6 +352,14 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
     if not verdict_checked:
         ci_steps(production, tip, no_ci, ci_green, smoke_passed)
     with main_push_lock.main_push_lock(production.checkout):
+        try:
+            conflicts = main_sync.live_file_conflicts(main_checkout(production.checkout), tip)
+        except production_doc.ProductionPathsError as error:
+            raise LifecycleStop("push", "held", str(error)) from error
+        if conflicts:
+            for conflict in conflicts:
+                report("push", "held", str(conflict))
+            raise LifecycleStop("push", "held", "incoming tree conflicts with live production files")
         _ = checked(production.checkout, "main", "fetch", "origin", "main")
         if git(production.checkout, "merge-base", "--is-ancestor", "origin/main", tip).returncode:
             raise LifecycleStop("main", "held", f"origin/main has commits absent from {tip}")
