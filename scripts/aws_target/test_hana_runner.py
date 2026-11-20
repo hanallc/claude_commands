@@ -32,6 +32,7 @@ from scripts.aws_target import hana_guest as guest, hana_receiver as receiver
 from scripts.aws_target import hana_result, hana_runner as runner, hana_source as source
 from scripts.aws_target.hana_placement import HanaHostGeneration
 from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
+from scripts.aws_target.ledger_test_support import override_fixture_settings
 from scripts.aws_target import test_hana_receiver as receiver_tests, test_hana_source as source_tests
 from scripts.lib import build_folders, build_slots
 from scripts.mac_test import linux_runner
@@ -130,8 +131,6 @@ class HanaRunnerTests(unittest.TestCase):
         self.fixture = source_tests.HanaSourceTests()
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
-        _ = write_config_fixture(self.fixture.configuration.source,
-                                 'step_cpu_limit=4\nstep_memory_gib=24\n')
         _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
                                  'loopback.command_timeout_s=600\n')
         self.root = self.fixture.root
@@ -514,7 +513,7 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
     def test_execution_settings_use_the_image_and_shared_deadlines_and_disk_floor(self) -> None:
         _ = write_config_fixture(self.fixture.configuration.source.with_name('build_targets.conf'),
             'loopback.shell_timeout_s=7\nloopback.command_timeout_s=600\n')
-        _ = write_config_fixture(self.fixture.configuration.source, 'free_floor_gib=11\n')
+        override_fixture_settings(self.fixture.configuration.source, 'free_floor_gib=11\n')
         settings = runner.read_settings(self.fixture.configuration, 19)
         self.assertEqual((settings.compiler_version, settings.shell_timeout_s,
             settings.command_timeout_s, settings.free_floor_gib), ('1.2.3', 7, 19, 11))

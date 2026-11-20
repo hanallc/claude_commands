@@ -30,7 +30,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
-from scripts.aws_target.ledger_test_support import CostFixture, install_cost_settings, text_setting, write_gate_config, write_hana_config
+from scripts.aws_target.ledger_test_support import CostFixture, install_aws_fixture_settings, text_setting
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
@@ -48,9 +48,7 @@ class GuestTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
-        install_cost_settings(root / 'aws_target.conf')
-        write_gate_config(root / 'cloud_gate.conf')
-        _ = write_hana_config(root / 'hana_aws.conf')
+        install_aws_fixture_settings(root)
         _ = (root / 'test_times.conf').write_text(
             '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
             + '# whole: 1..\nTOP_RUNS=5\n')

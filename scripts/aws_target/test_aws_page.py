@@ -558,7 +558,7 @@ class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
         deployed_types = ('c7a.4xlarge', 'c7a.8xlarge', slow_type, 'm7a.8xlarge', unmeasured_type)
         self.text_setting('region', east)
         config = self.root / 'cloud_gate.conf'
-        self.configure_gate(
+        ledger_test_support.override_fixture_settings(config,
             f'regions={east} {west} {north}\nspot_candidate_regions={west} {east} {candidate_only}\n'
             + f'instance_types={" ".join((*deployed_types, undeployed_type))}\n'
             + 'gate_wait_usd_per_minute=0.02\nmax_gate_minutes=12\n'

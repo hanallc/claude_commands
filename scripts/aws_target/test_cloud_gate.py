@@ -28,7 +28,10 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presign
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings
-from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting, write_gate_config
+from scripts.aws_target.ledger_test_support import (
+    CostFixture, account_reply, install_aws_fixture_settings, instant, numeric_settings,
+    override_fixture_settings, text_setting,
+)
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
@@ -38,7 +41,6 @@ from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import merge_gate as gate
 from scripts.production.gate_modules import GateRefused
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
@@ -57,12 +59,14 @@ def service_environment(command: Sequence[str]) -> dict[str, str]:
 
 
 class CloudWorkerHoldTests(IsolatedBuildHoldTest):
-    def test_forwarded_worker_session_cannot_pass_another_sessions_hold(self) -> None:
-        from scripts.lib import conf
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        install_aws_fixture_settings(cls.seed)
 
-        settings = self.scratch / 'cloud_gate.conf'
-        write_gate_config(settings)
-        configuration = conf.read(settings)
+    def test_forwarded_worker_session_cannot_pass_another_sessions_hold(self) -> None:
+        configuration = conf.read(self.scratch / 'cloud_gate.conf')
         for paired in (False, True):
             with (self.subTest(paired=paired), mock.patch.dict(os.environ,
                   {'CLAUDE_CODE_SESSION_ID': 'fixture-caller', 'CODEX_THREAD_ID': ''}),
@@ -195,10 +199,10 @@ class CloudGateTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
-        _ = write_config_fixture(self.root / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
-        _ = write_config_fixture(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
+        override_fixture_settings(self.root / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
+        override_fixture_settings(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
-        self.configure_gate(
+        override_fixture_settings(self.root / 'cloud_gate.conf',
             'instance_types=m7a.8xlarge m7a.4xlarge\nspot_max_usd_per_hour=0.8\n'
             + 'attempt_allowance_usd=0.02\nlaunch_reply_tries=2\n')
         self.now = float(instant('2026-01-15T01:00:00+00:00'))
@@ -2615,9 +2619,6 @@ class CloudRouteTests(CostFixture):
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(cloud_gate, 'account_settings_path', side_effect=lambda: Path(os.environ.get('AWS_TARGET_CONFIG', str(self.settings)))))
-        _ = write_config_fixture(self.root / 'merge_gate.conf')
-        self.configure_gate(
-            'credential_file=~/.config/aws-build/credentials\n')
         self.repo = self.root / 'repo'
         folder = self.repo / 'scripts/fixture'
         folder.mkdir(parents=True)
@@ -2905,7 +2906,7 @@ class CloudRouteTests(CostFixture):
         self.assertFalse((pending / 'launch.json').exists())
 
     def test_main_commit_needs_no_bundle(self) -> None:
-        self.configure_gate(
+        override_fixture_settings(self.root / 'cloud_gate.conf',
             'clone_url=https://example.invalid/fixture-source.git\n')
         folder = self.root / 'attempt'
         request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
@@ -3507,7 +3508,7 @@ class CloudRouteTests(CostFixture):
                     self.assertIn('--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE', command)
 
     def test_forwarded_worker_records_keep_the_callers_labels_and_unit(self) -> None:
-        _ = write_config_fixture(self.root / 'build_steps.conf', 'owned.merge-gate={unit} merge\n')
+        override_fixture_settings(self.root / 'build_steps.conf', 'owned.merge-gate={unit} merge\n')
         owner = UnitLabels('fixture caller', 'fixture-production', 'fixture-unit', OwnerRole.UNIT)
         for paired in (False, True):
             for session_key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):

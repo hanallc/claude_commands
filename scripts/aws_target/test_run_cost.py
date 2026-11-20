@@ -10,7 +10,7 @@ from scripts.lib import conf
 class GateRunPricingTests(ledger_test_support.CostFixture):
     def test_ranked_cost_includes_transfer_and_wait(self) -> None:
         config = self.root / 'cloud_gate.conf'
-        self.configure_gate(
+        ledger_test_support.override_fixture_settings(config,
             'remote_region_transfer_usd=0.01\n'
             + 'region_transfer_usd={"us-west-2":0.03}\n'
             + 'gate_wait_usd_per_minute=0.06\n'

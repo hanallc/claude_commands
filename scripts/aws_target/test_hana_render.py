@@ -300,20 +300,6 @@ class HanaRenderTests(unittest.TestCase):
                 if path.is_file() and '__pycache__' not in path.parts:
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
 
-    def test_render_configuration_has_no_host_suffixes(self) -> None:
-        settings = conf.settings((ROOT / 'config/hana_aws.conf').read_text())
-        self.assertTrue(settings)
-        for key in settings:
-            with self.subTest(key=key):
-                self.assertNotIn('.', key)
-
-    def test_execution_values_have_no_copies_in_hana_configuration(self) -> None:
-        settings = conf.settings((ROOT / 'config/hana_aws.conf').read_text())
-        for key in ('execution_compiler_version', 'execution_shell_timeout_s', 'execution_command_timeout_s'):
-            self.assertNotIn(key, settings)
-        self.assertEqual(sum(line.startswith('free_floor_gib=')
-            for line in (ROOT / 'config/hana_aws.conf').read_text().splitlines()), 1)
-
 
 if __name__ == '__main__':
     _ = unittest.main()
