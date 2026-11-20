@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -18,7 +19,17 @@ class Chip:
     count: int | None = None
 
 
-def chip_row(name: str, chips: Iterable[Chip], selected: str) -> str:
+OWNER_QUERY_KEYS = ("owner", "showrunner")
+
+
+def identity_attribute(value: str) -> str:
+    """Preserve identity characters that the HTML parser changes."""
+    if "%" in value or "\r" in value or "\0" in value:
+        value = value.replace("%", "%25").replace("\r", "%0D").replace("\0", "%00")
+    return html.escape(value, quote=True)
+
+
+def chip_row(name: str, chips: Iterable[Chip], selected: str, *, encode_values: bool = False) -> str:
     """Render a named filter with All as its first choice."""
     key = name.lower().replace(' ', '-')
     choices = {chip.value: chip for chip in chips}
@@ -26,7 +37,7 @@ def chip_row(name: str, chips: Iterable[Chip], selected: str) -> str:
     selected = selected if selected in choices else 'all'
     buttons: list[str] = []
     for chip in (all_chip, *choices.values()):
-        value = html.escape(chip.value, quote=True)
+        value = identity_attribute(chip.value) if encode_values else html.escape(chip.value, quote=True)
         pressed = str(chip.value == selected).lower()
         count = '' if chip.count is None else str(chip.count)
         buttons.append(f'<button type="button" id="filter-{html.escape(key, quote=True)}-{quote(chip.value, safe="")}"'
@@ -47,12 +58,13 @@ def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_cla
             + f'<div{classes}{identity}{"" if filter_key else group}>{buttons}</div></div>')
 
 
-def words_box(element_id: str, placeholder: str) -> str:
+def words_box(element_id: str, placeholder: str, *, value: str = '') -> str:
     """Render the words box for the filters."""
     identity = html.escape(element_id, quote=True)
     words = html.escape(placeholder, quote=True)
+    initial = f' value="{html.escape(value, quote=True)}"' if value else ''
     return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words'
-            + f' autocomplete="off" aria-label="{words}" placeholder="{words}">'
+            + f' autocomplete="off" aria-label="{words}" placeholder="{words}"{initial}>'
             + f'<button type="button" id="{identity}-clear" data-clear-filter-words aria-label="Clear filter">×</button></div>')
 
 
@@ -214,7 +226,8 @@ border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--
 </style>'''
 
 
-SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''const filterControl={
+SCRIPT = page_frame.ACTION_STATUS_SCRIPT + 'const ownerQueryKeys=' + json.dumps(OWNER_QUERY_KEYS) + r''';
+const filterControl={
  wordValues:new WeakMap(),
  getWords(control){return this.wordValues.get(control) ?? '';},
  setWords(control,value){
@@ -270,11 +283,15 @@ SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''const filterControl={
   }
  }
 };
-function recordPlaceParams(){
+function recordPlaceParams({queryFields=[],expandFilters}={}){
  const params=new URLSearchParams(location.search);
+ expandFilters?.(params);
+ const preferred=new Set(queryFields.filter(key=>params.has(key)));
+ // The server cannot see the fragment, so its values apply after load.
  const fragment=new URLSearchParams(location.hash.slice(1));
- for(const key of new Set(fragment.keys())) params.delete(key);
- for(const [key,value] of fragment) params.append(key,value);
+ expandFilters?.(fragment);
+ for(const key of new Set(fragment.keys())) if(!preferred.has(key)) params.delete(key);
+ for(const [key,value] of fragment) if(!preferred.has(key)) params.append(key,value);
  return params;
 }
 function recordItemLink(params,resolve){
@@ -406,13 +423,17 @@ if(sharedWords()) addEventListener('pageshow',()=>setTimeout(()=>filterControl.s
 const chipRow=name=>content.querySelector('[data-filter-row="'+name+'"]');
 const staffChipPrefix='staff:';
 const isStaffChipFilter=name=>options.staffChipFilters?.includes(name);
+const encodeIdentity=value=>value.replace(/[%\r\0]/g,character=>encodeURIComponent(character));
 const filterChipValue=(name,value)=>value ? (isStaffChipFilter(name) ? staffChipPrefix+value : value) : 'all';
 function filterSelection(name){
  const row=chipRow(name),all=name==='show' ? 'all' : '';
  if(row){
-  const filterValue=value=>value==='all' ? all : isStaffChipFilter(name) ? value.slice(staffChipPrefix.length) : value;
+  const filterValue=value=>value==='all' ? all : isStaffChipFilter(name) ? decodeURIComponent(value.slice(staffChipPrefix.length)) : value;
   return {
-   set(value){return filterValue(filterControl.select(row,filterChipValue(name,value)));},
+   set(value){
+    const stored=isStaffChipFilter(name) ? encodeIdentity(value) : value;
+    return filterValue(filterControl.select(row,filterChipValue(name,stored)));
+   },
    bind(change){filterControl.bind(row,value=>change(filterValue(value)));},
    setCounts(counts){filterControl.setCounts(row,counts);}
   };
@@ -437,7 +458,7 @@ function filterSelection(name){
  };
 }
 function placeParams(){
- const params=recordPlaceParams();
+ const params=recordPlaceParams(options);
  options.place?.(params);
  return params;
 }
@@ -452,7 +473,7 @@ function itemWithKey(key){
 function readPlace(params,followingItemLink=false){
  placeHash=location.hash;
  keys=new Set(params.getAll('key'));
- owner=params.get('owner') || params.get('showrunner') || '';show=params.get('show') || defaultShow;query=params.get('q') || '';
+ owner=ownerQueryKeys.map(key=>params.get(key)).find(Boolean) || '';show=params.get('show') || defaultShow;query=params.get('q') || '';
  sort=params.get('sort') || '';direction=params.get('dir')==='desc' ? 'desc' : 'asc';
  type=params.get('type') || '';
  sourceOwner=params.get('source-owner') || '';
@@ -597,30 +618,37 @@ function canRevealLinked(item,selection){
 }
 function matches(item,selection,counts,allowExpanded=false){
  if(!isSelected(item)) return false;
- if(!options.filterValues) return options.visible(item.dataset,selection);
+ if(!options.eligibleChip) return options.visible(item.dataset,selection);
  const data=item.dataset;
- const activeValues=options.filterValues(data,selection.query,selection);
- const expanded=!activeValues && allowExpanded && opened.has(data.key) && options.expandedSelection?.(data,selection);
- const values=activeValues || (expanded && options.filterValues(data,expanded.query,expanded));
- if(!values) return false;
- const selected={show:selection.show,owner:selection.owner,...selection.filters};
- const excluded=Object.entries(values).filter(([name,choices])=>
-  filterChipValue(name,selected[name])!=='all' && !choices.includes(selected[name]));
- // A record counts for a row when it matches every other row.
- if(counts && excluded.length<2){
-  for(const [name,choices] of Object.entries(values)){
-   // A change to Show ends the exception for an open read row.
-   const sameShow=expanded && name==='show';
-   if(excluded.length && (excluded[0][0]!==name || sameShow)) continue;
-   const chipValues=sameShow ? [selection.show] : ['all',...choices.map(choice=>filterChipValue(name,choice))];
-   for(const value of chipValues)
-    counts[name][value]=(counts[name][value] ?? 0)+1;
-  }
+ let chip=options.eligibleChip(data,selection.query,selection);
+ const expanded=!chip && allowExpanded && opened.has(data.key) && options.expandedSelection?.(data,selection);
+ if(expanded) chip=options.eligibleChip(data,expanded.query,expanded);
+ if(!chip) return false;
+ let excluded=0;
+ for(const [name,field,bit] of options.filterFacets){
+  const chosen=selection[name] ?? selection.filters[name];
+  if(!chosen || (name==='show' && chosen==='all')) continue;
+  const actual=field==='chip' ? chip : isStaffChipFilter(name) ? decodeURIComponent(data[field]) : data[field];
+  if(chosen===actual) continue;
+  excluded|=bit;
  }
- return excluded.length===0;
+ if(counts) for(const [name,field,,countMask] of options.filterFacets){
+  if(excluded & countMask) continue;
+  const values=counts[name];
+  // A change to Show ends the exception for an open read row.
+  if(expanded && name==='show'){
+   if(!excluded) values[selection.show]=(values[selection.show] ?? 0)+1;
+   continue;
+  }
+  values.all=(values.all ?? 0)+1;
+  const value=filterChipValue(name,field==='chip' ? chip : data[field]);
+  if(value!=='all') values[value]=(values[value] ?? 0)+1;
+ }
+ return !excluded;
 }
+const normalizeWords=value=>options.normalizeWords?.(value) ?? value.trim().toLowerCase();
 function currentSelection(overrides={}){
- return {owner,show,query:query.trim().toLowerCase(),type,sourceOwner,keys,filters:{...filters},...overrides};
+ return {owner,show,query:normalizeWords(query),type,sourceOwner,keys,filters:{...filters},...overrides};
 }
 function apply(write=true,layout={}){
  options.beforeApply?.();
@@ -645,8 +673,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(revealedLinkedItem!==linkedItem) revealedLinkedItem='';
  const previousOwner=owner,previousShow=show,previousFilters={...filters};
  owner=options.resolveOwner?.(owner) ?? owner;
- const search=query.trim().toLowerCase();
- if(normalizeOwner) owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
+ if(normalizeOwner) owner=options.selectOwner?.({owner,type,query:normalizeWords(query),keys}) ?? owner;
  owner=filterSelection('owner').set(owner);
  if(previousOwner && !owner) sourceOwner='';
  show=filterSelection('show').set(show);
@@ -654,7 +681,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  for(const name of filterNames)
   filters[name]=filterSelection(name).set(filters[name]);
  const active=currentSelection();
- const counts=options.filterValues ? Object.fromEntries(['show','owner',...filterNames].map(name=>[name,Object.create(null)])) : undefined;
+ const counts=options.filterFacets && Object.fromEntries(options.filterFacets.map(([name])=>[name,Object.create(null)]));
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
  const currentKeys=windowMotions && new Set(rows.map(item=>item.dataset.key));
@@ -796,7 +823,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
    if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
    if(!keepMatchingFilters || sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
    if(!keepMatchingFilters || show!=='all' && !matches(target,{...unfiltered,show})) show='all';
-   if(query && !matches(target,{...unfiltered,query:query.trim().toLowerCase()})) query='';
+   if(query && !matches(target,{...unfiltered,query:normalizeWords(query)})) query='';
    if(type && !matches(target,{...unfiltered,type})) type='';
    for(const name of filterNames)
     if(filters[name] && !matches(target,{...unfiltered,filters:{[name]:filters[name]}})) filters[name]='';
@@ -878,7 +905,7 @@ function bind(){
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
  revealMatchingItem(key){
   const target=itemWithKey(key);
-  const selection=currentSelection({query:currentWords().trim().toLowerCase()});
+  const selection=currentSelection({query:normalizeWords(currentWords())});
   if(!target || !matches(target,selection)) return false;
   jump(key,{preserveFilters:true});
   return true;

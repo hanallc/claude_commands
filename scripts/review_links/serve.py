@@ -540,7 +540,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     live = server.mode is ServerMode.LIVE
                     reviews = server.list_review_records()
                     content = list_page.render(root, include_counts=live, defer_counts=True,
-                                               status=server.delivery_status,
+                                               status=server.delivery_status, query=route.query,
                                                review_records=(list_page.LinkedReviewRead.AFTER_RENDER
                                                                if live and reviews is list_page.LinkedReviewRead.FROM_DISK
                                                                else reviews))

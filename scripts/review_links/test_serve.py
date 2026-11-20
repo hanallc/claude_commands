@@ -3109,6 +3109,62 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual((response.status, response.body), (200, footer.encode()))
             counts.assert_called_once()
 
+    def add_list_filter_items(self) -> None:
+        keeper = staff.StaffId("pa")
+        for number, producer, parked, unread in (
+                (1, "pa", True, True), (2, "pb", True, True), (3, "pa", True, False),
+                (4, "pa", False, True), (5, "pb", False, True)):
+            item = the_list.add(keeper, f"Task {number}", owner=the_list.UnassignedOwner.NATE,
+                                source="nate", changes={"producer": staff.StaffId(producer)}, number=number)
+            if parked:
+                _ = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+            if not unread:
+                _ = the_list.mark_read(keeper, item.id, source="nate")
+
+    def list_filter_markup(self, query: str = "") -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
+        response = self.request(list_page.PAGE_PATH + query)
+        self.assertEqual(response.status, 200)
+        markup = response.body.decode()
+        visible = [match[1] for match in re.finditer(
+            r'<tbody data-list-item[^>]+ data-number="([^"]+)"([^>]*)>', markup) if not match[2].endswith(' hidden')]
+        chips = {(match[1], match[2]): (match[3], match[4]) for match in re.finditer(
+            r'id="filter-(owner|producer|show)-[^"]+" data-filter-value="([^"]+)" '
+            + r'aria-pressed="([^"]+)" data-filter-count="([^"]+)"', markup)}
+        return visible, chips
+
+    def test_list_applies_address_filters_before_javascript_runs(self) -> None:
+        self.add_list_filter_items()
+        visible, chips = self.list_filter_markup("?show=parked&producer=pa&unread=1&q=parked")
+        self.assertEqual(visible, ["1"])
+        self.assertEqual(chips["show", "all"], ("false", "1"))
+        self.assertEqual(chips["show", "parked"], ("true", "1"))
+        self.assertEqual(chips["show", "working"], ("false", "0"))
+        self.assertEqual(chips["producer", "all"], ("false", "2"))
+        self.assertEqual(chips["producer", "staff:pa"], ("true", "1"))
+        self.assertEqual(chips["producer", "staff:pb"], ("false", "1"))
+        self.assertEqual(chips["owner", "all"], ("true", "1"))
+
+    def test_list_drops_a_missing_linked_item_before_counting(self) -> None:
+        self.add_list_filter_items()
+        missing = "pa/L99"
+        for keys, expected, all_count in (
+                ([missing], ["4", "5"], "5"), ([missing, "pa/L4"], ["4"], "1")):
+            with self.subTest(keys=keys):
+                query = urlencode({"show": "working", "key": keys, "item": missing}, doseq=True)
+                visible, chips = self.list_filter_markup("?" + query)
+                self.assertCountEqual(visible, expected)
+                self.assertEqual(chips["show", "all"], ("false", all_count))
+                self.assertEqual(chips["show", "working"], ("true", str(len(expected))))
+
+    def test_list_without_a_query_keeps_the_plain_rows_and_counts(self) -> None:
+        self.add_list_filter_items()
+        visible, chips = self.list_filter_markup()
+        self.assertCountEqual(visible, ["1", "2", "3", "4", "5"])
+        for group in ("owner", "producer", "show"):
+            self.assertEqual(chips[group, "all"], ("true", "5"))
+        self.assertEqual(chips["show", "parked"], ("false", "3"))
+        self.assertEqual(chips["show", "working"], ("false", "2"))
+
     def test_list_reads_a_change_missing_from_a_partial_review_snapshot(self) -> None:
         case = self.review_fixture(changes=1)
         change = next(item for item in review_items.read(case.root) if item.type == review_items.ReviewType.CHANGE)

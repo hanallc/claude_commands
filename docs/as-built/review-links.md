@@ -813,7 +813,7 @@ The page uses the order from the latest server response.
 A column button sorts all matching items by its values.
 A second click reverses that order.
 
-The List starts with All selected in the Owner, Producer, and Show rows.
+By default, the List starts with All selected in the Owner, Producer, and Show rows.
 Owner and Producer list staff in name order after All and omit every trailing `-unit` from names.
 If the resulting name is empty, the chip shows the original staff ID.
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
@@ -835,6 +835,10 @@ All includes every open item, including parked items and Done items.
 The State cell shows the parking end time or delivery condition under the saved state.
 The Unread only switch shows and counts unread items and rows that stay open after an answer is read.
 Each chip count reflects the words box and the filters in the other rows.
+The server applies the address query filters before the first paint. Python and the script share one filter rule and one list of address names.
+Each source first expands its legacy names (`showrunner` to `owner`, `show=unread` to Unread). Then, for each name the server reads (`LIST_QUERY_FIELDS`), the query wins when the query and the fragment both name it. A value that only the fragment names applies after load.
+For other names, such as sort and dir, the fragment value wins after load.
+Search folds case with a pinned Unicode 15.1 table in `search_fold.py`, the same in Python and the script.
 In All, each Owner and Producer chip counts matching parked items.
 The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.

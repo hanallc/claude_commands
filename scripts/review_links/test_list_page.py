@@ -36,7 +36,8 @@ from scripts.production import change_review, change_routing, delivery_state, in
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_page
+from scripts.review_links import review_items, review_page, search_fold
+from scripts.review_links.test_accounts_page import firefox_probe_results
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_record_table import save_notice_failures
@@ -1567,6 +1568,132 @@ document.body.append(result);
         _ = the_list.park(MORTY.id, items[3].id, NOW + timedelta(days=2), source="nate")
         _ = the_list.close(MORTY.id, items[5].id, "The user removed this task.", source="nate")
         return items
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_keeps_the_first_paint_rows_and_chip_counts_for_query_filters(self) -> None:
+        upper, lower = "\u1c89", "\u1c8a"
+        for number, character, owner in (
+                (1, upper, OWNER.id), (2, lower, OWNER.id), (3, upper, OTHER.id), (4, upper, OWNER.id)):
+            item = self.add(f"Check \0 {character}", owner=owner, number=number)
+            if number != 4:
+                _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+            if number == 3:
+                _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        query = urlencode({"show": "parked", "owner": OWNER.id, "q": f"CHECK \0 {upper}"})
+        fragment = urlencode({"show": "working", "owner": OTHER.id, "q": "unmatched"})
+        key_query = urlencode({"show": "working", "key": f"{MORTY.id}/L4"})
+        key_fragment = urlencode({"key": f"{MORTY.id}/L1"})
+        numbers = ["1", "2"] if search_fold.fold(upper) == search_fold.fold(lower) else ["1"]
+        unread_alias = "show=unread&unread=0"
+        all_rows = ["1", "2", "3", "4"]
+        unread_rows = ["1", "2", "4"]
+        before = r'''<script>
+const [address,firstRows,loadedRows,allCount,firstUnread,loadedUnread]=CASE;
+history.replaceState(null,'',address);
+const snapshot=()=>({
+ rows:[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).sort(),
+ chips:[...document.querySelectorAll('[data-filter-count]')].map(chip=>
+  [chip.id,chip.dataset.filterCount,chip.getAttribute('aria-pressed')]),
+ unread:document.querySelector('#list-unread').checked,
+});
+const firstPaint=snapshot();
+</script>'''
+        after = r'''<script>
+const failures=[];
+const check=(ok,message)=>{if(!ok) failures.push(message);};
+const loaded=snapshot();
+check(JSON.stringify(firstPaint.rows)===JSON.stringify(firstRows),'The server shows the matching rows.');
+check(JSON.stringify(loaded.rows)===JSON.stringify(loadedRows),'Script start shows the matching rows.');
+check(firstPaint.unread===firstUnread && loaded.unread===loadedUnread,'Unread has the expected state.');
+if(firstUnread===loadedUnread)
+ check(JSON.stringify(firstPaint)===JSON.stringify(loaded),'Script start keeps the rows and chip counts.');
+check(document.querySelector('#filter-show-all').dataset.filterCount===String(allCount),'The All chip has the expected count.');
+const row=document.querySelector('[data-number="1"]');
+check(JSON.parse(row.dataset.sortValues)[3].includes('\0'),'The Item sort key keeps the null character.');
+void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>'''
+        script = "<script>" + list_page.SCRIPT
+        for server_query, browser_fragment, first_rows, loaded_rows, all_count, first_unread, loaded_unread in (
+                (query, fragment, numbers, numbers, len(numbers) + 1, False, False),
+                (query, fragment + "&unread=1", numbers, numbers, len(numbers) + 1, False, True),
+                ("unread=0", "show=unread", all_rows, all_rows, 4, False, False),
+                ("show=parked", unread_alias, ["1", "2", "3"], ["1", "2"], 3, False, True),
+                ("", unread_alias, all_rows, unread_rows, 3, False, True),
+                ("show=unread", "", unread_rows, unread_rows, 3, True, True),
+                (unread_alias, "unread=0", unread_rows, unread_rows, 3, True, True),
+                (key_query, key_fragment, ["4"], ["4"], 1, False, False),
+        ):
+            with self.subTest(query=server_query, fragment=browser_fragment):
+                address = ("?" + server_query if server_query else "") + ("#" + browser_fragment if browser_fragment else "")
+                case = json.dumps((address, first_rows, loaded_rows, all_count, first_unread, loaded_unread))
+                markup = list_page.render(self.root / "reviews", include_counts=False, query=server_query).decode()
+                page = markup.replace(script, before.replace("CASE", case) + script, 1)
+                page = page.replace("</body>", after + "</body>", 1)
+                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_preserves_staff_ids_in_query_filters(self) -> None:
+        owner, producer = staff.StaffId("o\ra"), staff.StaffId("p\rb")
+        for number, owner_id, producer_id in (
+            (1, owner, producer), (2, owner, staff.StaffId("p%0Db")), (3, staff.StaffId("o%0Da"), producer),
+        ):
+            item = self.add(f"Check item {number}", owner=owner_id, number=number)
+            _ = the_list.update(MORTY.id, item.id, {"producer": producer_id}, source="morty")
+        before = r'''<script>
+history.replaceState(null,'',ADDRESS);
+const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')]
+ .map(row=>row.dataset.number).sort().join();
+const firstPaint=visible();
+</script>'''
+
+        def check_query(query: str, after: str) -> None:
+            markup = list_page.render(self.root / "reviews", include_counts=False, query=query).decode()
+            script = "<script>" + list_page.SCRIPT
+            start = before.replace('ADDRESS', json.dumps(f"?{query}"))
+            page = markup.replace(script, start + script, 1).replace("</body>", after + "</body>", 1)
+            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+        after = r'''<script>
+const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+const chip=(name,selection)=>document.querySelector('[data-filter-row="'+name+'"] '+selection);
+check(firstPaint==='1' && visible()===firstPaint,'Both filters keep the first paint row.');
+const ownerChip=chip('owner','[aria-pressed="true"]'),producerChip=chip('producer','[aria-pressed="true"]');
+check(ownerChip.dataset.filterCount==='1' && producerChip.dataset.filterCount==='1',
+ 'Both selected chips show one matching row.');
+chip('owner','[data-filter-value="all"]').click();
+check(visible()==='1,3','The producer filter keeps its carriage return.');
+ownerChip.click();
+chip('producer','[data-filter-value="all"]').click();
+check(visible()==='1,2','The owner filter keeps its carriage return.');
+producerChip.click();
+const place=new URLSearchParams(location.hash.slice(1));
+check(visible()==='1' && place.get('owner')==='o\ra' && place.get('producer')==='p\rb',
+ 'The selected chips write the original IDs to the address.');
+void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>'''
+        with self.subTest(filter="staff"):
+            check_query(urlencode({"owner": owner, "producer": producer}), after)
+
+        keeper = staff.StaffId("k\r1")
+        for keeper_id in (keeper, staff.StaffId("k%0D1")):
+            _ = the_list.add(keeper_id, "Check the linked item", owner=OTHER.id, number=4,
+                             source="nate", changes={"state": the_list.ItemState.WORKING})
+        key = f"{keeper}/L4"
+        after = r'''<script>
+const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+const row=document.querySelector('[data-list-item]:not([hidden])');
+const working=document.querySelector('[data-filter-row="show"] [aria-pressed="true"]');
+check(firstPaint==='4' && visible()===firstPaint,'The key filter keeps the first paint row.');
+check(row?.dataset.key===KEY && working.dataset.filterCount==='1',
+ 'The selected row keeps its original key and the Working chip counts one row.');
+row?.querySelector('.list-toggle').click();
+const place=new URLSearchParams(location.hash.slice(1));
+check(place.get('item')===KEY && place.getAll('key').join()===KEY,
+ 'The selected row writes the original key to the address.');
+void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>'''.replace('KEY', json.dumps(key))
+        with self.subTest(filter="key"):
+            check_query(urlencode({"show": "working", "key": key}), after)
 
     def test_records_share_cli_order_and_each_render_reads_current_fields(self) -> None:
         items = self.fixture_items()
