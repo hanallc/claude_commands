@@ -205,7 +205,7 @@
 # Test keys also include the result environment selected in direct.conf.
 # Fixed terminal values replace caller values locally and on remote targets.
 # New result inputs and --env values do not change the build key.
-# Lint keys include mend, nightly rustfmt, Clippy and Taplo versions.
+# Lint keys include tool versions and the cargo-mend content hash.
 # Filter keys sort names and remove duplicate names.
 # Do not cache usage errors, sandbox failures or killed runs.
 # Do not cache lint failures if the last repair and format pass changed files.
@@ -1887,6 +1887,7 @@ VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
 LINT_FIX_INCOMPLETE=0
+LINT_USED_REMOTE_MEND=0
 PLACEMENT_FAILED=0
 RUN_STARTED=0
 CALL_NOTED=0
@@ -1952,7 +1953,7 @@ tree_key() {
         # Keyed on the package's own build, read from the call's metadata.
         if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi
     fi
-    if [[ "$CMD" == lint && -z "${CACHE_DIR:-}" ]]; then
+    if [[ "$CMD" == lint && ( "$content" == 1 || -z "${CACHE_DIR:-}" ) ]]; then
         key_options+=(--without-lint-versions)
     fi
     VERIFY_RESULT_ENVIRONMENT_FD=3 \
@@ -2427,6 +2428,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
 
     LAST_TARGET_OUTCOME="$result_word" LAST_TARGET_REASON="$result_reason"
+    if [[ "$CMD" == lint && "$MAC_VERB" == mend-* && ( "$result_word" == passed || "$result_word" == failed ) ]]; then
+        LINT_USED_REMOTE_MEND=1
+    fi
     BUILDLOG_MAC="$result_word"
     BUILDLOG_MAC_REASON="$result_reason"
     BUILDLOG_MAC_S="$result_seconds"
@@ -2825,6 +2829,7 @@ placement_failed() {
 }
 
 placement_once() {
+    local repository="${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
     local token=none reply line route="" status=0 monitor=0 refresh_source=${1:-0}
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
@@ -2847,8 +2852,7 @@ placement_once() {
             snapshot=$(verify_helper "$STEP_COPIES_SCRIPT" snapshot-tree --repo "$VERIFY_SLOT_SOURCE") || return $?
             read -r tree key head <<< "$snapshot"
         else
-            key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key \
-                --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}") || return $?
+            key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "$repository") || return $?
         fi
         VERIFY_SLOT_TREE=$tree PLACEMENT_SOURCE_KEY=$key VERIFY_SLOT_HEAD=$head
         PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
@@ -2864,7 +2868,7 @@ placement_once() {
     if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
-        --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
+        --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "$repository" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$token"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
@@ -3327,30 +3331,56 @@ run_local_test() {
 # with. Sets LOOKUP_KEY either way, --no-cache included.
 cache_lookup() {
     [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 1
-    local record outcome="" word
+    # The lint key identifies the local cargo-mend binary.
+    if [[ "$CMD" == lint && ( "$MAC_ONLY" == 1 || "${PINNED_TARGET:-natedev}" != natedev ) ]]; then
+        return 1
+    fi
+    local record kind record_text first_line host status_line saved_s line outcome="" word recheck_mend=0
     [[ -n "${CACHE_DIR}" ]] || return 1
     LOOKUP_KEY="$(tree_key)"
     [[ -n "${LOOKUP_KEY}" && "${NO_CACHE}" -eq 0 ]] || return 1
     record="${CACHE_DIR}/${LOOKUP_KEY}"
-    # --local needs a natedev pass; --mac needs a Mac pass.
-    if [[ -f "${record}.pass" \
-          && ! ( "$LOCAL_ONLY" == 1 && "$(sed -n 's/^host=//p' "${record}.pass")" == mac ) \
-          && ! ( "$MAC_ONLY" == 1 && "$(sed -n 's/^host=//p' "${record}.pass")" != mac ) ]]; then
-        record+=.pass outcome=reused word=PASS
-    elif [[ -f "${record}.fail" ]]; then
-        record+=.fail outcome=replayed word=FAIL
-    fi
+    if [[ "$CMD" == lint && "${1:-}" == --after-wait ]]; then recheck_mend=1; fi
+    for kind in pass fail; do
+        [[ -f "${record}.${kind}" ]] || continue
+        if (( recheck_mend )); then
+            verify_helper "$TREE_WATCH_SCRIPT" --recheck-mend </dev/null 2>/dev/null || return 1
+            recheck_mend=0
+        fi
+        record_text="$(cat -- "${record}.${kind}" 2>/dev/null)" || return 1
+        [[ -n "$record_text" ]] || return 1
+        host="" status_line="" saved_s=""
+        while IFS= read -r line; do
+            case "$line" in
+                host=*) host="${line#host=}" ;;
+                status=*) status_line="$line" ;;
+                saved_s=*) saved_s="${line#saved_s=}" ;;
+            esac
+        done <<< "$record_text"
+        if [[ "$kind" == pass ]]; then
+            # Pass records must match the requested host.
+            if [[ ( "$LOCAL_ONLY" == 1 && "$host" == mac ) || ( "$MAC_ONLY" == 1 && "$host" != mac ) ]]; then
+                continue
+            fi
+            outcome=reused word=PASS
+        else
+            outcome=replayed word=FAIL
+        fi
+        break
+    done
     [[ -n "${outcome}" ]] || return 1
-    LOOKUP_STATUS="$(sed -n 's/^status=//p' "${record}")"
-    LOOKUP_STATUS="${LOOKUP_STATUS:-0}"
-    note_event "${outcome}" "${SECONDS}" 0 0 "$(sed -n 's/^saved_s=//p' "${record}")" \
-        "${LOOKUP_STATUS}" || true
+    # Old pass records have no status line.
+    if [[ -z "$status_line" && "$kind" == pass ]]; then status_line=status=0; fi
+    [[ -n "${status_line#status=}" ]] || return 1
+    LOOKUP_STATUS="${status_line#status=}"
+    first_line="${record_text%%$'\n'*}"
+    note_event "${outcome}" "${SECONDS}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true
     if [[ "${FILTER_RUN}" -eq 1 ]]; then
-        echo "verify.sh: ${word} (recorded), skipped — $(head -n 1 "${record}"); the tree and every input are unchanged since, so nothing was built or run (--no-cache runs it anyway)."
+        echo "verify.sh: ${word} (recorded), skipped — ${first_line}; the tree and every input are unchanged since, so nothing was built or run (--no-cache runs it anyway)."
         return 0
     fi
-    echo "verify.sh: ${word} (recorded) — $(head -n 1 "${record}")"
-    if ! head -n 1 "${record}" | grep -qF "\`verify.sh $CMD${VERIFY_PACKAGE:+ $VERIFY_PACKAGE}${COMMAND_ARGS[*]:+ ${COMMAND_ARGS[*]}}\`"; then
+    echo "verify.sh: ${word} (recorded) — ${first_line}"
+    if [[ "$first_line" != *"\`verify.sh $CMD${VERIFY_PACKAGE:+ $VERIFY_PACKAGE}${COMMAND_ARGS[*]:+ ${COMMAND_ARGS[*]}}\`"* ]]; then
         echo "verify.sh: lint covers the workspace and every changed member, so that result answers this package too."
     fi
     if [[ "${outcome}" == reused ]]; then
@@ -3387,7 +3417,7 @@ user_clock() {
 }
 
 cache_record() {
-    local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
+    local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail key_options=()
     # A lost token gives no verdict about the tree.
     (( EXIT_STATUS != 125 )) || return 1
     if [[ -n "${VERIFY_SLOT_EXECUTED_TREE:-}" ]]; then
@@ -3396,9 +3426,12 @@ cache_record() {
         [[ "${snapshot%% *}" == "$VERIFY_SLOT_EXECUTED_TREE" ]] || return 1
     fi
     if [[ "$CMD" == lint ]]; then
+        # A remote mend result has no binary identity in the local key.
+        [[ "${LINT_USED_REMOTE_MEND:-0}" == 0 ]] || return 1
         [[ -n "$LINT_LOADED_CODE_KEY" && "$(lint_code_key)" == "$LINT_LOADED_CODE_KEY" ]] || return 1
+        key_options+=(--recheck-mend)
     fi
-    key="$(tree_key)"
+    key="$(tree_key ${key_options[@]+"${key_options[@]}"})"
     [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
     if [[ "${key}" != "${VERDICT_KEY}" ]]; then
         if [[ -z "$VERDICT_TREE_KEY" || "$(tree_key --tree-content)" != "$VERDICT_TREE_KEY" ]]; then
@@ -3666,8 +3699,7 @@ supersede_older_waiters() {
         [[ "$pid" =~ ^[0-9]+$ && "$stamp" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
         if ! kill -0 "$pid" 2>/dev/null; then
             rm -f "$file"
-        elif (( 10#$stamp < 10#$own )) \
-            && ps -p "$pid" -o args= 2>/dev/null | grep -q 'verify\.sh'; then
+        elif (( 10#$stamp < 10#$own )) && token_waiter_runs_verify "$pid"; then
             kill -USR1 "$pid" 2>/dev/null || true
         fi
     done
@@ -4174,7 +4206,7 @@ build_hold_wait_local() {
 
 # Again before the first step: a peer running this same call on this tree may
 # have recorded its result since the first lookup.
-if [[ "$MAC_ONLY" == 0 ]] && cache_lookup; then
+if [[ "$MAC_ONLY" == 0 ]] && cache_lookup --after-wait; then
     if ! release_token && (( LOOKUP_STATUS == 0 )); then
         LOOKUP_STATUS=1
     fi
