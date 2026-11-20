@@ -30,6 +30,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 from scripts.direct.cleanup_lease import ForegroundCleanupLease
+from scripts.direct import recorder_state
 from scripts.direct import verify_batch as batch
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB as CARGO_STUB
@@ -320,6 +321,15 @@ wait_for_file(Path({str(release)!r}))
                 _ = release.touch()
                 if process.poll() is None:
                     _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_batch_reports_old_recorder_state_without_a_traceback(self) -> None:
+        _ = self.environment.pop("VERIFY_BATCH_PHASE_DIR", None)
+        state = Path(self.environment["UNIT_RUN_DIR"]) / recorder_state.STATE_FILENAME
+        _ = state.write_text(json.dumps({"phase_last_percent": 0}), encoding="utf-8")
+        result = self.batch("--fail-first")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"verify.sh batch: {recorder_state.OldRecorderState(state)}", result.stderr.splitlines())
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_batch_refuses_a_regression_that_passed_on_the_baseline(self) -> None:
         self.fail_first(status=0)

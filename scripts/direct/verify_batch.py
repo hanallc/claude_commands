@@ -255,7 +255,7 @@ def main(argv: list[str]) -> int:
         baseline = baseline_proof(packages, options.fail_first)
         commands = BatchCommands(Path(verify), route, cleanup=ForegroundCleanupLease(int(lease)))
         return run_batch(commands, Path(repo), packages, LintScope(options.lint), baseline, Path(scratch))
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, recorder_state.OldRecorderState) as error:
         print(f"verify.sh batch: {error}", file=sys.stderr)
         return 2
 
