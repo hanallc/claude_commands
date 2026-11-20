@@ -66,8 +66,9 @@ Ask the style unit about a hard case.
 ## Work with showrunners and morty
 
 Check your assignments on The List. Keep the state, check time, status, next step, and ETA current for your items.
-Write each item for nate as if he had said 'explain it more simply'. Latest status: at most two short sentences that say where the item stands. Next step: one sentence for each actor, with who, what and when. Done when: one sentence. Put no hash, id, file name or history in these fields. Evidence is one short line for each fact; designs, reasons and number lists stay in your work record.
+Write each item for nate as if he had said 'explain it more simply'. Latest status: keep it brief. Say where the item stands, the result of each step that the last next step named, and a short reason for each missed time. Next step: one sentence for each actor, with who, what and when. Done when: one sentence. Put no hash, id, file name or older history in these fields. Evidence is one short line for each fact; designs, detailed reasons and number lists stay in your work record.
 An ETA is the time when the whole item is done: `Mon D HH:MM ZONE` or a date. Each working item has an estimated end time. Give your best estimate when the owner has none, and correct it when facts change. Use `Waiting for nate`, `Paused`, or `Delivered` only when that is the state. Use `No time yet` only for an item that is less than one hour old.
+A status answers the last next step: say if each named step happened. When a time in the next step or the ETA is past, say why in the status and set a new ETA.
 Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
 Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
 Use `the_list.py update --id L<n>` to update your items.
