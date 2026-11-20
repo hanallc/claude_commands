@@ -284,6 +284,9 @@ class ReviewRepairsTests(unittest.TestCase):
     def browser(self, markup: str, probe: str, place: str = '/', width: int = 1440) -> list[str]:
         results: list[list[str]] = []
         complete = threading.Event()
+        deliveries = threading.Condition()
+        pending_deliveries = 0
+        delivery_error = ''
         probe_timeout = 60
         case = self.case
         markup=markup.replace('<head>','<head><script>'+test_review_page.BODY_READY_SCRIPT+'</script>',1)
@@ -304,6 +307,16 @@ class ReviewRepairsTests(unittest.TestCase):
                     self.send_header('Location', review_page.legacy_url(route.path, route.query))
                     self.end_headers()
                     return
+                if route.path in ('/owner-answer', '/problem', '/passed'):
+                    with deliveries:
+                        finished = deliveries.wait_for(lambda: pending_deliveries == 0, timeout=probe_timeout)
+                        error = delivery_error
+                    if not finished:
+                        self.send_error(504, 'The Review action did not finish delivery.')
+                        return
+                    if error:
+                        self.send_error(500, error)
+                        return
                 if route.path == '/owner-answer':
                     key = parse_qs(route.query)['item'][0]
                     item = next(item for item in review_items.read(case.root) if item.key == key)
@@ -341,6 +354,7 @@ class ReviewRepairsTests(unittest.TestCase):
                     _ = self.wfile.write(document)
 
             def do_POST(self) -> None:
+                nonlocal pending_deliveries, delivery_error
                 body = self.rfile.read(int(self.headers['Content-Length']))
                 if self.path == '/action':
                     cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -350,12 +364,29 @@ class ReviewRepairsTests(unittest.TestCase):
                         later = saved.item.times.later
                         result.update(state=saved.item.state, later=0 if isinstance(later, review_items.NoLaterTime)
                                       else later.timestamp()*1000)
-                    delivery = change_page.finish_verdict_cleanup(saved.delivery, case.status)
-                    change_page.deliver(delivery, case.status)
-                    self.send_response(200)
-                    self.send_header('Content-Type','application/json')
-                    self.end_headers()
-                    _ = self.wfile.write(json.dumps(result).encode())
+                    content = json.dumps(result).encode()
+                    with deliveries:
+                        pending_deliveries += 1
+                    try:
+                        self.send_response(200)
+                        self.send_header('Content-Type','application/json')
+                        self.send_header('Content-Length',str(len(content)))
+                        self.end_headers()
+                        _ = self.wfile.write(content)
+                        self.wfile.flush()
+                    finally:
+                        try:
+                            delivery = change_page.finish_verdict_cleanup(saved.delivery, case.status)
+                            change_page.deliver(delivery, case.status)
+                        except Exception as error:
+                            with deliveries:
+                                if not delivery_error:
+                                    delivery_error = f'{type(error).__name__}: {error}'
+                            raise
+                        finally:
+                            with deliveries:
+                                pending_deliveries -= 1
+                                deliveries.notify_all()
                     return
                 results.append(cast(list[str],json.loads(body)))
                 complete.set()
@@ -587,7 +618,10 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
    await show('open');const before=count('open'),all=count('all');
    const key='page-owner/'+id,row=document.querySelector('[data-key="'+key+'"]');
    row.querySelector('.list-toggle').click();await readyReviewCard(row);await save(row.querySelector('form'));
-   await show(selected);await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
+   await show(selected);
+   const reply=await nativeFetch('/owner-answer?item='+encodeURIComponent(key));
+   if(!reply.ok) throw new Error('Owner reply for '+key+' returned HTTP '+reply.status+'.');
+   await refresh();
    check(count('open')===before && count('all')===all,
     'F005: the fresh index restores the counts after an owner answer in '+selected);
    await show('open');
@@ -649,6 +683,10 @@ window.fetch=async(url,options={})=>{
  const nextView=()=>new Promise(resolve=>document.querySelector('[data-review]').addEventListener('review-refreshed',resolve,{once:true}));
  const row=id=>document.querySelector('[data-key="page-owner/'+id+'"]');
  const refresh=async()=>{const loaded=nextView();dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await loaded;};
+ const reply=async path=>{
+  const response=await nativeFetch(path);
+  if(!response.ok) throw new Error('Simulated reply at '+path+' returned HTTP '+response.status+'.');
+ };
  const save=async(form,value)=>{
   const complete=new Promise(resolve=>{
    const observer=new MutationObserver(()=>{if(!form.dataset.sending){observer.disconnect();resolve();}});
@@ -682,11 +720,11 @@ window.fetch=async(url,options={})=>{
    row('C1').textContent.includes('With page-owner · Validating for'),
    'All shows the elapsed time and a button to open the active check.');
   await show('open');
-  await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
+  await reply('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
   row('C2').querySelector('.list-toggle').click();await readyReviewCard(row('C2'));
   const second=row('C2').querySelector('form');await save(second,'validate');
   const [openBeforePass,validatingBeforePass,allBeforePass]=counts();
-  await nativeFetch('/passed');await refresh();check(!row('C2') || row('C2').hidden,'a passed check stays out of Open');
+  await reply('/passed');await refresh();check(!row('C2') || row('C2').hidden,'a passed check stays out of Open');
   const [openAfterPass,validatingAfterPass,allAfterPass]=counts();
   check(openAfterPass===openBeforePass && validatingAfterPass===validatingBeforePass-1 && allAfterPass===allBeforePass-1,
    'A passed check leaves the Validating and All counts.');
@@ -725,7 +763,7 @@ window.fetch=async(url,options={})=>{
    for(let pass=0;pass<2;pass++){
     await refresh();check(!asked() || asked().hidden,'F021: the sent request stays out of Open after refresh for '+key);
    }
-   await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
+   await reply('/owner-answer?item='+encodeURIComponent(key));await refresh();
    const returnedState='Open';
    check(!asked().hidden && asked().dataset.state===returnedState,'F021: the owner answer returns '+key);
   }
