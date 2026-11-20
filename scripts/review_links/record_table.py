@@ -51,7 +51,8 @@ def words_box(element_id: str, placeholder: str) -> str:
     identity = html.escape(element_id, quote=True)
     words = html.escape(placeholder, quote=True)
     return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words'
-            + f' aria-label="{words}" placeholder="{words}"></div>')
+            + f' autocomplete="off" aria-label="{words}" placeholder="{words}">'
+            + f'<button type="button" id="{identity}-clear" data-clear-filter-words aria-label="Clear filter">×</button></div>')
 
 
 CLOCK = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
@@ -89,9 +90,16 @@ main{font-size:15px;line-height:1.5}
 background:var(--card);color:var(--ink);border-radius:8px;max-width:100%;min-width:0}
 .list-filters input{width:260px}
 .list-search-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
-.record-filter-words{display:flex;justify-content:flex-end;margin-bottom:10px}
-.record-filter-words input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
-background:var(--card);color:var(--ink);width:300px;max-width:100%;min-width:0;box-sizing:border-box}
+.record-filter-words{position:relative;width:300px;max-width:100%;margin:0 0 10px auto}
+.record-filter-words input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);
+border-radius:8px;background:var(--card);color:var(--ink);width:100%;min-width:0;box-sizing:border-box}
+.record-filter-words input:not(:placeholder-shown){padding-inline-end:44px;border-color:var(--filter-selected-bg)}
+.record-filter-words input::-webkit-search-cancel-button{appearance:none}
+.record-filter-words input:placeholder-shown+[data-clear-filter-words]{display:none}
+@media(max-width:340px){.record-filter-words input::placeholder{font-size:14px}}
+[data-clear-filter-words]{position:absolute;inset-block:0;inset-inline-end:0;width:44px;margin:0;padding:0;
+border:0;border-radius:8px;background:none;color:var(--ink-2);font-size:22px;cursor:pointer}
+[data-clear-filter-words]:hover{color:var(--ink)}
 .record-filter-row{display:grid;grid-template-columns:5rem minmax(0,1fr);align-items:baseline;gap:8px;margin-bottom:8px}
 .record-filter-row>span{color:var(--ink-2);font-size:13px}
 .record-filter-row>div{display:flex;flex-wrap:wrap;gap:6px}
@@ -206,6 +214,12 @@ border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--
 
 
 SCRIPT = r'''const filterControl={
+ wordValues:new WeakMap(),
+ getWords(control){return this.wordValues.get(control) ?? '';},
+ setWords(control,value){
+  this.wordValues.set(control,value);
+  if(control.value!==value) control.value=value;
+ },
  buttons(row){return [...row.querySelectorAll('[data-filter-value]')];},
  setCounts(row,counts){
   for(const button of this.buttons(row)){
@@ -232,9 +246,22 @@ SCRIPT = r'''const filterControl={
   const emit=value=>control.dispatchEvent(new CustomEvent('filterchange',{bubbles:true,detail:value}));
   if(control.hasAttribute('data-filter-words')){
    let timer;
-   control.addEventListener('input',()=>{
+   const clear=()=>{
     clearTimeout(timer);
-    timer=setTimeout(()=>{if(control.isConnected) emit(control.value);},120);
+    this.setWords(control,'');
+    control.focus({preventScroll:true});
+    emit('');
+   };
+   control.addEventListener('input',()=>{
+    this.setWords(control,control.value);
+    clearTimeout(timer);
+    timer=setTimeout(()=>{if(control.isConnected) emit(this.getWords(control));},120);
+   });
+   control.parentElement.querySelector('[data-clear-filter-words]').addEventListener('click',clear);
+   control.addEventListener('keydown',event=>{
+    if(event.key!=='Escape' || event.defaultPrevented || event.isComposing || !control.value) return;
+    event.preventDefault();
+    clear();
    });
   }else{
    for(const button of this.buttons(control))
@@ -351,6 +378,8 @@ if(options.mount){
 const sortValues=data=>options.sortValues?.(data) ?? JSON.parse(data.sortValues);
 const words=()=>content.querySelector('[data-filter-words]') ?? content.querySelector('#list-search');
 const sharedWords=()=>words().hasAttribute?.('data-filter-words');
+const currentWords=()=>sharedWords() ? filterControl.getWords(words()) : words().value;
+if(sharedWords()) addEventListener('pageshow',()=>setTimeout(()=>filterControl.setWords(words(),currentWords()),0));
 const chipRow=name=>content.querySelector('[data-filter-row="'+name+'"]');
 const staffChipPrefix='staff:';
 const isStaffChipFilter=name=>options.staffChipFilters?.includes(name);
@@ -425,7 +454,7 @@ function readPlace(params,followingItemLink=false){
   saved.opened.forEach(key=>opened.add(key));
  }
  owner=options.resolveOwner?.(owner) ?? owner;
- if(sharedWords()) words().value=query;
+ if(sharedWords()) filterControl.setWords(words(),query);
  return saved?.top;
 }
 function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}){
@@ -716,8 +745,8 @@ function restorePlace(event){
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
 }
 function saveDeparturePlace(){
- if(sharedWords() && query!==words().value){
-  query=words().value;
+ if(sharedWords() && query!==currentWords()){
+  query=currentWords();
   writePlace(false,scrollY);
  }else history.replaceState({recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top:scrollY}},'');
 }
@@ -739,7 +768,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
    if(type && !matches(target,{...unfiltered,type})) type='';
    for(const name of filterNames)
     if(filters[name] && !matches(target,{...unfiltered,filters:{[name]:filters[name]}})) filters[name]='';
-   if(sharedWords()) words().value=query;
+   if(sharedWords()) filterControl.setWords(words(),query);
   }
  }
  if(options.mount && target) revealKey=key;
@@ -779,7 +808,7 @@ function setRowsExpanded(items,expanded){
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
  const changePlace=(normalizeOwner=false)=>apply(true,{dismissMissingItem:true,normalizeOwner});
- const changeFilter=()=>{if(sharedWords()) query=words().value;changePlace(true);};
+ const changeFilter=()=>{if(sharedWords()) query=currentWords();changePlace(true);};
  content.querySelector('[data-clear-linked-reviews]')?.addEventListener('click',()=>{
   keys.clear();changeFilter();words().focus({preventScroll:true});
  });
@@ -815,13 +844,13 @@ function bind(){
 return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDeparturePlace,get linkedItem(){return linkedItem;},
  revealMatchingItem(key){
   const target=itemWithKey(key);
-  const selection=currentSelection({query:words().value.trim().toLowerCase()});
+  const selection=currentSelection({query:currentWords().trim().toLowerCase()});
   if(!target || !matches(target,selection)) return false;
   jump(key,{preserveFilters:true});
   return true;
  },
  setShownExpanded(expanded){
-  const currentQuery=words().value;
+  const currentQuery=currentWords();
   if(query!==currentQuery){
    query=currentQuery;
    apply(false,{dismissMissingItem:true});
@@ -862,11 +891,11 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  get hasActiveRowAnimations(){return rowMotion.size>0;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(draw=true){
-  const previous=words(),previousQuery=query;
+  const previous=currentWords(),previousQuery=query;
   for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
-  if(sharedWords()){query=previous.value;words().value=query;}
+  if(sharedWords()){query=previous;filterControl.setWords(words(),query);}
   bind();if(draw) applyRows(query!==previousQuery);
  }};
 }
