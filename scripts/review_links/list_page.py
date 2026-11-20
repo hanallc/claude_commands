@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlencode
 from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
+from scripts.production import change_review, delivery_state, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
@@ -792,9 +792,9 @@ def _replay_ask(keeper: staff.StaffId, item: the_list.ListItem, receipt: the_lis
     with status.locked():
         view = change_page.question_delivery_view(status, saved)
         attempt = view.attempt
-        if not isinstance(attempt, change_page.QuestionAttempt):
+        if not isinstance(attempt, delivery_state.QuestionAttempt):
             return change_page.NoMessageDelivery()
-        if isinstance(view, change_page.QuestionSendPermitted) and view.state is not change_page.QuestionSendState.FAILED:
+        if isinstance(view, change_page.QuestionSendPermitted) and view.state is not delivery_state.QuestionSendState.FAILED:
             return change_page.ready_and_claim_question(status, path, attempt, saved)
         if isinstance(view, change_page.ResendBlocked):
             status.defer_question(path)

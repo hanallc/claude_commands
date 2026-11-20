@@ -4000,8 +4000,10 @@ observer.observe(original.parentNode,{childList:true});
                     self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "false")
                     markup = list_page.render(root, include_counts=False, status=status).decode().split('<script>', 1)[0]
                     self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
-                    sections = dict(re.findall(r'<section class="page-question" data-question="(Q[12])">(.*?)</section>',
-                                               markup, re.DOTALL))
+                    sections: dict[str, str] = {
+                        match.group(1): match.group(2)
+                        for match in re.finditer(r'<section class="page-question" data-question="(Q[12])">(.*?)</section>',
+                                                 markup, re.DOTALL)}
                     self.assertEqual(set(sections), {"Q1", "Q2"})
                     self.assertIn("Question not delivered.", sections["Q1"])
                     self.assertNotIn("Question not delivered.", sections["Q2"])
