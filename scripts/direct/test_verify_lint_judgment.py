@@ -132,7 +132,7 @@ class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
         )
         functions += verify_cancellation_functions(VERIFY, "cancel_tree_run")
         functions += shell_functions(
-            SCRIPTS / "lint/invoke.sh", "close_checkout_handoffs", "run_without_checkout_handoffs",
+            SCRIPTS / "lint/invoke.sh", "run_without_checkout_handoffs",
             "fmt_cargo", "invoke_clippy", "invoke_clippy_fix", "invoke_mend",
         )
         changed_members = VERIFY.read_text(encoding="utf-8").split("CHANGED_MEMBERS_PY='", 1)[1].split("\n'\n", 1)[0]

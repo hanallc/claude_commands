@@ -10,8 +10,8 @@ INVOKE = VERIFY.parents[1] / "lint/invoke.sh"
 
 
 def verify_shell_functions(*names: str) -> str:
-    """Load the shared descriptor selector before the Verify functions."""
-    return shell_functions(INVOKE, "find_unused_file_descriptor") + shell_functions(VERIFY, *names)
+    """Load the descriptor selector and checkout cleanup before the Verify functions."""
+    return shell_functions(INVOKE, "find_unused_file_descriptor", "close_checkout_handoffs") + shell_functions(VERIFY, *names)
 
 
 def verify_cancellation_functions(verify: Path, handler: str) -> str:

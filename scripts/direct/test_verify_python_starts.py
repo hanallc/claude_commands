@@ -242,8 +242,7 @@ class VerifyOutputRootsTests(unittest.TestCase):
             harness = workspace / "metadata.sh"
             _ = harness.write_text(
                 'set -euo pipefail\n'
-                + shell_functions(VERIFY.parent.parent / "lint/invoke.sh",
-                                  "close_checkout_handoffs", "run_without_checkout_handoffs")
+                + shell_functions(VERIFY.parent.parent / "lint/invoke.sh", "run_without_checkout_handoffs")
                 + verify_shell_functions("verify_helper", "set_gate_metadata", "load_metadata")
                 + "cargo() { [[ ${CARGO_FAIL:-0} == 0 ]] || return 1; cat metadata.json; }\n"
                 + 'set_gate_metadata\nprintf "%s\\n" "$BUILDLOG_OUTPUT_ROOTS"\n'
