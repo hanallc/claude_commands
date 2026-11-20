@@ -469,15 +469,22 @@ def gate_launch_history(directory: Path, now: float, window_seconds: int) -> tup
     return tuple(row for row in history if float(str(row['time'])) <= now)
 
 
-def placement_run_evidence(directory: Path, now: float, values: conf.ConfigRead,
-                           policy: conf.ConfigRead, home: str) -> RunEvidence:
-    """Use the same launch window and run window as GateWorker.rank_variants."""
+@dataclass(frozen=True)
+class PlacementRunHistory:
+    """Launch rows for capacity checks and run evidence for placement pricing."""
+    launch_rows: tuple[dict[str, object], ...]
+    evidence: RunEvidence
+
+
+def read_placement_run_history(directory: Path, now: float, values: conf.ConfigRead,
+                               policy: conf.ConfigRead, home: str) -> PlacementRunHistory:
+    """Read the launch window once and build evidence for the run window."""
     max_age = policy.whole('price_max_age_seconds')
     cooldown = values.whole('capacity_cooldown_seconds')
     days = policy.whole('run_cost_days')
     rows = gate_launch_history(directory, now, max(max_age, cooldown, days * 86400))
     end = datetime.fromtimestamp(now, UTC)
-    return run_evidence(rows, end - timedelta(days=days), end, home)
+    return PlacementRunHistory(rows, run_evidence(rows, end - timedelta(days=days), end, home))
 
 
 def deployed_gate_prices(
@@ -501,8 +508,8 @@ def read_gate_pricing_inputs(directory: Path, now: int, values: conf.ConfigRead,
     home = policy.text('region')
     deployed = read_deployed_gate_variants(directory, values.words('instance_types'), home)
     zone_prices = current_zone_prices(directory, now, policy.whole('price_max_age_seconds')) if deployed else {}
-    return GatePricingInputs(deployed, deployed_gate_prices(deployed, zone_prices),
-                             placement_run_evidence(directory, now, values, policy, home))
+    history = read_placement_run_history(directory, now, values, policy, home)
+    return GatePricingInputs(deployed, deployed_gate_prices(deployed, zone_prices), history.evidence)
 
 
 @dataclass(frozen=True)
