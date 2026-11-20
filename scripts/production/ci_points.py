@@ -20,7 +20,7 @@ from typing import NamedTuple, cast
 
 from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
-from scripts.production import checkpoint_gate, merge_gate
+from scripts.production import merge_gate, staff
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.merge_checkpoint import git, merged_checkpoints, merge_lock
 
@@ -156,7 +156,6 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
     if no_ci:
         report("ci start", "ok", "skipped: no CI")
         return
-    production = checkpoint_gate.integration_production(production)
     script = Path(os.environ.get("CI_POINTS_VALIDATE_SCRIPT", str(Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh")))
     tip = branch_tip(production)
     push_origin = required(git(production.checkout, "remote", "get-url", "--push", "origin"), "ci start")
@@ -240,13 +239,12 @@ def ci_collect(production: Production, state_dir: Path, no_ci: bool) -> None:
         paths = resolve_production_paths(production.doc)
     except ProductionPathsError as error:
         raise PointFailure("ci collect", str(error)) from error
-    cargo_liner = isinstance(paths, EnrolledPaths) and production.name == "cargo-liner"
+    cargo_liner = isinstance(paths, EnrolledPaths) and production.name == staff.CARGO_LINER_PRODUCTION
     if no_ci:
         if cargo_liner:
             raise PointFailure("ci collect", "cargo-liner requires CI on its integration tip")
         report("ci collect", "ok", "skipped: no CI")
         return
-    production = checkpoint_gate.integration_production(production)
     run = read_run(state_dir)
     tip = branch_tip(production)
     count = len(merged_checkpoints(production))
@@ -348,7 +346,6 @@ def main() -> int:
     try:
         production = read_production(cast(str, args.production))
         if action == "due":
-            production = checkpoint_gate.integration_production(production)
             state = due(production, cast(Path, args.state_dir), cast(bool, args.no_ci))
             if isinstance(state, CiNotUsed):
                 report("due", "ok", "skipped: no CI")
