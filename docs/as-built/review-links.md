@@ -1797,11 +1797,12 @@ It exits with status 0 when the folder disappears.
 The rest of this section describes the normal server and its initial config values.
 The server reads the current settings when it needs them.
 
-The shared check covers POST requests, New item token requests, and Review attachment requests.
+The shared check covers POST requests, New item token requests, Go token requests, and Review attachment requests.
 These requests require a single `Host` header for the server's bound address and port.
 The server also accepts the published host on the same port if its process receives the same `REVIEW_LINKS_HOST` override.
 On port 80, the server also accepts either host without a port.
 If the request supplies `Origin`, it must match the HTTP origin for that `Host`.
+A Go change (`POST /console/tune`) must supply `Origin` and the token.
 The server returns 403 when the host or origin check fails.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
