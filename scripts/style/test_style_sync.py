@@ -434,7 +434,6 @@ class StyleSyncTests(unittest.TestCase):
         rule = "global:rust/names.md"
         _ = (self.root / "nate_style/rust/names.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\n---\n# Names\n")
         run = self.root / "run"
-        journal = style_ledger.publication_path(worktree, "publication.json")
 
         def assign(ticket: str, source: str) -> None:
             with style_ledger.open_ledger(worktree) as ledger:
@@ -445,12 +444,6 @@ class StyleSyncTests(unittest.TestCase):
                 blob = ledger.pinned_rule_texts(ticket)[0].blob
                 ledger.record(rule, source, head, blob, "clean", ticket=ticket, worker="test")
 
-        unlink = Path.unlink
-        def stop_before_journal_removal(path: Path, missing_ok: bool = False) -> None:
-            if path == journal:
-                raise RuntimeError("publication stopped after checkpoint record")
-            unlink(path, missing_ok=missing_ok)
-
         for case, interrupted in (("ordinary merge", False), ("stopped publication", True)):
             with self.subTest(case=case), mock.patch.object(
                     style_plan, "run_verification_step", return_value=subprocess.CompletedProcess([], 0)):
@@ -458,11 +451,12 @@ class StyleSyncTests(unittest.TestCase):
                     ledger.set_tip(self.tip, "main")
                 if interrupted:
                     assign("3001", "src/lib.rs")
-                    with mock.patch.object(Path, "unlink", stop_before_journal_removal):
+                    with mock.patch.object(style_ledger.Ledger, "finish_publication",
+                                           side_effect=RuntimeError("publication stopped after checkpoint record")):
                         with self.assertRaisesRegex(RuntimeError, "publication stopped after checkpoint record"):
                             _ = style_plan.publish_checkpoint(worktree, "3001", run, "1", "First checkpoint\n")
-                    self.assertTrue(journal.exists())
                     with style_ledger.open_ledger(worktree) as ledger:
+                        self.assertIsInstance(ledger.pending_publication("refs/heads/unit-names"), style_ledger.PendingPublication)
                         self.assertEqual(ledger.ticket_get("3001")["state"], "checkpointed")
                     self.assertEqual(style_sync.git(worktree, "status", "--porcelain"), "")
                 _ = (self.repo / "src/lib.rs").write_text(f"fn changed_{int(interrupted)}() {{}}\n")
@@ -480,9 +474,9 @@ class StyleSyncTests(unittest.TestCase):
                     self.assertEqual(connection.execute("SELECT style_branch FROM sync").fetchone(), ("refs/heads/main",))
                 if interrupted:
                     self.assertEqual(style_sync.git(worktree, "merge-base", "HEAD", tip), tip)
-                    self.assertFalse(journal.exists())
                     _ = self.git("merge", "--no-edit", "unit-names")
                     with style_ledger.open_ledger(worktree) as ledger:
+                        self.assertIsInstance(ledger.pending_publication("refs/heads/unit-names"), style_ledger.NoPendingPublication)
                         _ = ledger.ticket_merge("3001")
                     assign("3002", "src/later.rs")
                     checkpoint = style_plan.publish_checkpoint(worktree, "3002", run, "2", "Later checkpoint\n")

@@ -236,13 +236,21 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
 
     def test_a_reviewer_records_its_pass_once_the_sentinel_appears(self) -> None:
         session_dir = self.start_implementation("delivered")
+        self.recorder("arm-review", "--session-dir", str(session_dir), "--activity", "Read the partial diff")
+        armed, = [event for event in self.events("delivered") if event["event_type"] == "early_review_armed"]
+        pass_id = str(armed["pass_instance_id"])
         self.recorder("finish-pass", "--session-dir", str(session_dir), "--status", "completed")
         ready = session_dir / "final_diff_1.ready"
         _ = (session_dir / "final_diff_1.diff").write_text("diff\n", encoding="utf-8")
         _ = ready.write_text("", encoding="utf-8")
 
-        result = self.run_review(session_dir, ready)
+        command = self.review_command(session_dir, "", str(ready))
+        command[2:2] = ["--early-review-pass-id", pass_id]
+        result = subprocess.run(command, env=self.environment(), capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr + (session_dir / "review_agent_1.log").read_text())
+        disarmed, = [event for event in self.events("delivered") if event["event_type"] == "early_review_disarmed"]
+        self.assertEqual(disarmed["pass_instance_id"], pass_id)
 
         kinds = [
             (event["event_type"], event.get("pass_kind"))

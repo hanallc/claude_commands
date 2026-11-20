@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, GateJobNotRecorded, NotVerifyCall,
+    StepJob, VerifyStep)
 from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
@@ -140,6 +141,7 @@ class Identity:
     step: str
     folder: str
     unit: str = ""
+    verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
 
 
@@ -442,7 +444,7 @@ class PlacementRequest(CallerCode):
     since: float
     profile: records.StepProfile | records.ProgramProfile
     constraints: placement.PlacementConstraints
-    identity: Identity = Identity("", "", "", "")
+    identity: Identity = field(default_factory=lambda: Identity("", "", "", ""))
     run: RunIdentity | NoRun = NO_RUN
     local: LocalAdmissionContext | LocalAdmissionUnavailable = LocalAdmissionUnavailable("not supplied")
     prerequisite: placement.LocalExecutionPrerequisite = field(default_factory=lambda: placement.TokenNotRequired())

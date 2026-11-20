@@ -127,6 +127,22 @@ class PhaseTableTests(unittest.TestCase):
         with self.assertRaisesRegex(phase_table.NoState, "no available owner folder.*staff record must be an object"):
             _ = phase_table.build(self.session_dir)
 
+    def write_open_phases(
+        self, folder: Path, row: staff.StaffRow, events: tuple[dict[str, object], ...],
+    ) -> None:
+        open_phases: dict[str, dict[str, object]] = {}
+        for event in events:
+            instance = event.get("phase_instance_id")
+            if not isinstance(instance, str):
+                continue
+            if event.get("event_type") == "phase_started":
+                open_phases[instance] = {"id": event.get("phase_id"), "instance_id": instance, "status": "active"}
+            elif event.get("event_type") == "phase_finished":
+                _ = open_phases.pop(instance, None)
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({
+            "owner_staff_id": row.id, "open_phases": list(open_phases.values()),
+        }))
+
     def write_run(
         self,
         name: str,
@@ -141,7 +157,7 @@ class PhaseTableTests(unittest.TestCase):
             row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), self.working_dir), expected=row.worktree)
         folder = self.root / "unit" / name
         folder.mkdir(parents=True, exist_ok=True)
-        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": row.id}))
+        self.write_open_phases(folder, row, events)
         if any(event.get("event_type") == "run_finished" for event in events):
             if isinstance(row.run, staff.OpenRun):
                 _ = staff.clear_run(row.id, row.run.path)
@@ -263,7 +279,7 @@ class PhaseTableTests(unittest.TestCase):
         row = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), worktree), expected=row.worktree)
         folder = self.root / "unit" / name
         folder.mkdir(parents=True, exist_ok=True)
-        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"owner_staff_id": row.id}))
+        self.write_open_phases(folder, row, events)
         _ = staff.set_run(row.id, staff.OpenRun(folder))
         started = {
             "event_type": "run_started",
