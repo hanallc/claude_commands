@@ -216,6 +216,10 @@ class Clock(Protocol):
 class Readings(Protocol):
     @property
     def cgroups(self) -> gate.MemoryCgroups: ...
+    @property
+    def host_path(self) -> Path: ...
+    @property
+    def pressure_path(self) -> Path: ...
     def host(self) -> records.HostMemory | records.ReadingUnavailable: ...
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure: ...
     def compilers(self) -> list[records.StepMemory]: ...
@@ -2161,10 +2165,10 @@ class AdmissionServer:
     def _check_reading_alert(self, inputs: records.QueueInputs, result: gate.PassResult, config: records.MemoryConfig) -> None:
         """Measure unreadable holds with the service clock and start at most one sender."""
         if isinstance(inputs.host, records.ReadingUnavailable):
-            path = Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo"))
+            path = self.readings.host_path
             reason = inputs.host.reason
         elif isinstance(inputs.pressure, records.PressureUnavailable):
-            path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
+            path = self.readings.pressure_path
             reason = inputs.pressure.reason
         else:
             self.reading_hold = NoReadingHold()

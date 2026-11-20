@@ -3286,6 +3286,23 @@ class ReadingAlertTests(unittest.TestCase):
                 self.finish_delivery(fixture)
                 self.assertEqual(len(messages), 2)
 
+    def test_alert_names_the_saved_path_after_its_environment_key_is_removed(self) -> None:
+        for key, filename in (("BUILDLOG_MEMINFO", "meminfo"), ("BUILDLOG_MEMORY_PRESSURE", "pressure")):
+            with self.subTest(key=key), AdmissionFixture() as fixture:
+                fixture.configure(reading_alert_seconds=1)
+                path = fixture.root / filename
+                del os.environ[key]
+                path.unlink()
+                self.assertIsInstance(fixture.server.handle_request(fixture.request())[0], wire.Wait)
+                fixture.clock.advance(1)
+                with mock.patch.object(subprocess, "run",
+                                       return_value=subprocess.CompletedProcess(["stub"], 0, "", "")) as send:
+                    _ = fixture.run_pass()
+                    self.finish_delivery(fixture)
+                    send.assert_called_once()
+                    message = cast(str, send.call_args.kwargs["input"])
+                self.assertEqual(message.splitlines()[0], f"Build admission: {path} is unreadable.")
+
     def test_failed_delivery_releases_the_claim_for_retry(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.configure(reading_alert_seconds=1)
