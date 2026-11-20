@@ -400,3 +400,20 @@ Each floor row states its measurement conditions: revision, filesystem roots and
 Do not size these again unless the reason changes.
 
 - **Preloaded Python fork server for repo scripts (lib/py).** Census #83 (12 top AWS modules, 394 CPU s, revision `4f1692a05`): Python starts and import excess are about 48 s (about 12%). That is about 21 s for 2,305 interpreter starts at 9.3 ms, and about 27 s import excess (`mac_test.py` 7.4, `models_registry` 3.9, `copies` 3.1). Lazy imports reach only about 2%. Declined by builds, 2026-11-16 00:35 EST: it adds a second way to start every repo script, and a forked child that differs from a new process gives faults that are hard to find. About 12% on 12 modules does not pay for that.
+
+## Source size proposals (Lane D of the plan, from the 2026-11-20 analysis)
+
+Tests follow source. natest sends each row to its owner through builds; the owner decides.
+
+- **Targets:** proposals to owners. natest writes each proposal with numbers and measures the effect. The owner unit does the change unless the code is natest's.
+
+| # | Proposal | Size (size and duplication reports) | Tests and CPU that follow |
+| --- | --- | --- | --- |
+| D1 | After the review rule change (P7): Python uses `None` or one enum, and the marker classes go | 2,319 marker classes, about 12,100 lines; 15,000 to 20,000 lines with their branches | not determined |
+| D2 | One typed record decoder in `scripts/lib` | 3,000 to 9,000 lines (13,552 `isinstance` lines; 4,801 guard blocks) | not determined |
+| D3 | One record conversion on both machines, then delete the readers of old shapes | 3,000 to 5,000 lines; 769 mentions | 1,538 tests have a legacy name; 147 in three folders cost about 35 CPU s |
+| D4a | verify.sh remote routes: a Mac step has two results and no fallback or retry in verify.sh | part of 4,000 to 6,000 lines | about 110 tests and 350 CPU s; token and hold queue: 110 tests, 282 CPU s |
+| D4b | `style_ledger.py`: one schema, no migrations, split the class | 5,000 to 6,000 lines | up to 604 tests; about 90 CPU s |
+| D4c | `message/send.py`: resolve, deliver, log; one hook point for each policy | 3,000 lines | up to 394 tests |
+| D4d | `admission_service.py`: no wire versions, no state replay | 2,000 to 3,000 lines | up to 283 tests |
+| D4e | The gate's own resource governor in `merge_gate.py` | not determined | 93 tests, 81 CPU s |

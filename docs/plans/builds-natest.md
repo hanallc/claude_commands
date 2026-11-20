@@ -1,4 +1,203 @@
+# natest
 
+> **Status: IMPLEMENTATION PLAN — phased, direct-ready.** A standing plan with no end: lower the AWS CPU that `~/.claude` test gates use each day.
+
+## Source
+
+2026-11-03 09:30 EST
+
+From the user (via natedev): Mission: find the longest-running ~/.claude tests and make them faster. Keep a descending sort of test times; when it makes the longest one shorter, it takes the next one. Build tools that instantly show the history of ~/.claude test suite times and of individual test times. Use parallelism, removal of trivial tests, shared code and good engineering practice. It must also send architectural change proposals back. It organizes its work in phases so /unit:direct works, and keeps its own phase backlog: the user wants the standard process engaged.
+
+2026-11-06 12:15 EST
+
+From the user (via the showrunner): the verify is a good improvement. i think that it needs to recalibrate its approach to test improvement based on this feedback
+
+From the user (via the showrunner, 12:19 EST): natest should be the one doing the test work, of course
+
+The feedback: verify's Phase 41 cut `test_verify_mac_arguments.py` from 56.0 to 30.2 CPU s. It tests logic by direct calls and keeps a few real runs.
+
+2026-11-20
+
+From the user: "i approve all - and i want you to work this into a plan for natest - a plan that is recurring and unending"
+From the user: "keep your eyes on the prize - reducing the cost of our aws runs by reducing the cpu utilization of our ~/.claude repo tests"
+
+## Standing work
+
+This plan has no end. An agent with no memory runs one cycle from this section alone.
+`show.py` is `~/.claude/scripts/lib/py ~/.claude/scripts/test_times/show.py`. The "next file" is `docs/plans/builds-natest-next.md`.
+
+### The prize
+
+- The prize is one number: the AWS CPU that `~/.claude` test gates use each day. It is the mean CPU of a green full gate, times the gates each day. (user, 2026-11-20)
+- Test count is a cause to treat. It is never a score, a report or a gate. (user, 2026-11-20)
+- Keep these three header numbers. Update them by hand at each refill, with host and date.
+  1. AWS full gate, green, mean CPU: 4,192 s on 11-16 (low), 5,602 s on 11-19 (last AWS day). The first target is to return to the 11-16 value.
+  2. Full gates each day: about 150 on all hosts (computed: 1,933 gates from 11-08 to 11-20). AWS ran 1,674 of them and used 82% of the gate CPU.
+  3. Top 10 modules, AWS median CPU s, 11-19: `copies/test_slot_order.py` 156.9; `statusline/test_statusline.py` 154.2; `review_links/test_list_page.py` 114.1; `direct/test_verify_doc_checkout.py` 59.6; `direct/test_verify_wait_holder.py` 55.3; `production/test_fast_track.py` 50.3; `style/test_crate_run.py` 49.3; `agents/test_models_conf_publish.py` 47.4; `direct/test_verify_mac_only.py` 46.9; `direct/test_verify_ssh_targets_routing.py` 42.7. They are 13.8% of the module sum (5,632 s in 867 modules).
+
+### Measure rule (plan-set, 2026-11-20)
+
+Measure on AWS when AWS has a full gate in the last 2 days. If not, measure on natedev (`show.py top`, default host) and label each number 'natedev'. Never compare an AWS number with a natedev number, and never compare two numbers from different days as before and after of one change without a record on each day.
+
+- The last AWS gate record is from 2026-11-19 09:08 UTC (AWS hold). `show.py top --host aws` reads 7 days (`TOP_MAX_AGE_DAYS=7`). Label each predicted saving `computed` or `measured`, and name the host.
+
+### Order of work (plan-set, 2026-11-20)
+
+Order of work: (1) orders from builds; (2) the phase with the largest AWS CPU saved per worker hour. Pass `phase N` to /unit:direct to run it. Document order has no meaning.
+
+### One cycle
+
+A cycle runs at each phase end. Do steps 3 and 4 at most one time each day.
+
+1. Read the gate slowdown warnings (`slower_than_recorded`, `merge_gate.py:648` and `:1651`). natest owns them. Put each warned module in the next file.
+2. Read `show.py trend --days 8` and `show.py top --limit 50` for the host that the measure rule names.
+3. Do the riser check.
+4. Ask builds one time for the state of each open proposal. Write each answer in the proposal table. Write the three header numbers.
+5. For each phase merged to main since the last cycle, read its changed modules in `show.py top`. Write the measured saving, the host and the two dates in the next file.
+6. Do the refill.
+7. Choose the next phase by the order of work. Run `/unit:direct phase <N>`.
+
+### Riser check (plan-set, 2026-11-20)
+
+Riser check, once per cycle. Compare the module medians of the newest day with records against the lowest day in the last 7 days, same host. For each module that rose 10 CPU s or more: find the commit with `git log` on the module and its source; when the cause is in a test file, add a Lane A phase; when the cause is in source of another unit, send the commit and the two numbers to builds. When the sum over modules present on both days rose more than 5% and no module explains it, add one measure phase for the shared cost (import time, conftest, box load). Source of the 10 s and 5% values: plan-set, 2026-11-20; change them freely.
+
+### Refill (plan-set, 2026-11-20)
+
+Refill: at each phase end, run the riser check and `show.py top`. Never start the last todo phase before you add the next one. When the top list has no target above the floor, add a measure phase, not a stop.
+
+- Write each new phase after the last phase, with the next integer and the Work Order fields of `~/.claude/docs/direct_plan_format.md`. Write `**Depends on:** none` or phase ids only; put each other condition in Constraints. Put the predicted saving in Goal. Nothing follows the last phase in this file.
+
+### Lanes
+
+**Lane A: slow tests from the top list.**
+- Target: the first module in `show.py top` that has no open phase and no Floors row newer than its last owner change.
+- Put modules that share one cause or one support fixture in one phase.
+- Limits: every assertion stays. A cut is a cheaper start, a shared fixture, or a direct call of the real function. Never copy a production decision into a fixture. Keep a full-entry test where the decision exists only in the dispatch branch.
+- A target stops at half its baseline, or at a floor result with its cause and its measure conditions in the next file. (plan-set)
+- The cost report did not read each test for the "why" column of its top 40. Each phase confirms its cause first.
+
+**Lane B: verify.sh tests.**
+- Size on AWS: 1,452 CPU s in 147 modules, 25.8% of the module sum. The mac theme is 323 s in 37 modules.
+- Limits: read the Floors and Declined sections of the next file first. Do not propose startup reuse or a fork server (builds, 2026-11-12 and 2026-11-16). The verify unit owns the test files; get its go through builds for each edit. A change to `verify.sh` is a proposal to its owner.
+- The lane closes when Phase 401 finds no caller pair above 10 CPU s per gate. (builds, 2026-11-12)
+- Join small modules only after Phase 398 closes and only with the verify unit's go.
+
+**Lane C: fold and dead code.**
+- The rule "No test removal or coverage reduction is approved" stays in force for tests of live code. (user, 2026-11-11)
+- Lane C may do these with no question: fold sibling tests into one parametrized test with every assertion kept; delete a test only together with the dead code it tests, after the owner's answer.
+- Fold only groups that share one costly start. A fold of other groups lowers the count and saves no CPU.
+- Every other test deletion is a proposal. The director asks one question that replaces the 2026-11-11 rule or keeps it: open with the user since 2026-11-20. The value report's delete estimates (1,350 to 1,950 tests) come from a sample of 300 tests.
+
+**Lane D: proposals to cut source.**
+- Tests follow source. natest sends numbers to the owner through builds; natest sends no code for another owner's file. A rewrite of a file that every unit uses is the owner's decision.
+- The proposal list (D1 to D4e) moves from `plan_draft.md` to the next file at instantiation. D1 waits for P7.
+
+**Lane E: process rules.**
+- The user approved P1 to P5, P6 and P7 on 2026-11-20. P8 is a proposal; it is not approved.
+- builds assigns the owners. natest changes no process doc and no `assign.sh`. natest changes the gate route only in Phase 406, which builds assigned. (builds, 2026-11-20)
+- Live check for one proposal: `git grep` for the rule text on origin/main. For P4, grep `assign.sh` and the fix prompt template for the rule text.
+- Each natest prompt (implement, fix, test) carries the lines below now. P1 is not live; the lines bind natest workers by the work order only.
+
+### When you write no test
+
+1. Write a test only for a behavior that the Work Order names. A fix round may add one test for a finding that names a wrong result.
+2. Write no test for a refusal, unless the refused action damages saved state.
+3. Write no test for a message text, a doc, a prompt or a config wording.
+4. Write no test for a helper, a fixture or test support code.
+5. Write no test for a case that an existing test of the same function reaches.
+6. A rare case gets a test only when the defect causes damage that no later run or command restores.
+7. A test that needs a subprocess, a sleep or a real Git repository needs a reason in the summary.
+8. A new test above 1 CPU s needs its cost in the phase report.
+9. When your change makes a test a duplicate, name the test in the summary. Its deletion waits for the Lane C answer.
+10. "No test: <reason>" is a complete answer. A reviewer does not reopen it for coverage alone.
+
+### Rules for every phase
+
+1. Remove no test of live code and reduce no coverage, with the two Lane C exceptions. (user, 2026-11-11)
+2. Start no test run without natemerge's go. (user through builds, 2026-11-19)
+3. Keep one build-queue item for the unit at a time. (user, 2026-11-18)
+4. Every phase that changes code gets a blind review. (plan-set, 2026-11-20)
+5. Tests read no tunable config value; a test writes a fixture config (user, 2026-11-16). Put no hard-coded tunable in code (user, 2026-10-31).
+6. Add no lazy import (plan-set; each phase since 382 carries it). Make no copy of code (user, 2026-10-30).
+7. Tests run on the Mac too. (user, 2026-11-16)
+8. Measure like the gate: `module_cost.py`, fresh TMPDIR on /tmp, bytecode on, no load on purpose (plan-set, 2026-11-14). Run a heavy probe on natedev under `systemd-run --user --scope -p MemoryMax=2G` (user, 2026-11-12).
+9. Fix a defect where it is. A file of another owner needs that owner's go through builds. (user, decision criteria)
+10. For a merge that deletes code, ask builds for a full gate. (builds, 2026-11-12)
+11. Each code phase sends a main hash to builds after its review. (plan-set, 2026-11-17)
+
+### Proposals
+
+Full wording of P1 to P5 and P7: `report_process.md` (sections 6 and 7) and `plan_draft.md` (Lane E tracker), in the evidence folder of instantiation step 5.
+
+| id | what | owner | sent | answer |
+| --- | --- | --- | --- | --- |
+| P1 | Work Order `Tests:` field; the test worker writes only the tests that it names | builds assigns | | approved (user, 2026-11-20) |
+| P2 | A worker may delete a test that its change makes a duplicate; reviewers ask which added test is not needed | builds assigns | | approved (user, 2026-11-20) |
+| P3 | A finding gets a test only for damage that nothing restores; a closure Minor or nit opens no round | builds assigns | | approved (user, 2026-11-20) |
+| P4 | `assign.sh` adds the test rules to each implement, fix and test prompt | builds assigns | | approved (user, 2026-11-20) |
+| P5 | "When you write no test" section in the worker prompt contract | builds assigns | | approved (user, 2026-11-20) |
+| P6 | Affected-module merge gate on AWS, full gate each night (text below) | natest, Phase 406 (builds, 2026-11-20); aws reviews the box side | 2026-11-20 | approved (user, 2026-11-20); owner natest |
+| P7 | Python review rule in `config/review/code.md`, after the last `Option<T>` bullet: a class whose only purpose is to name absence is a finding | builds assigns | | approved (user, 2026-11-20) |
+| P8 | `aws_target/test_real_aws_cli.py` runs in the nightly gate only (384 natedev CPU s in 2 tests; 0.7 s on AWS) | aws, through builds | | not approved; proposal |
+
+P6. Affected-module merge gate on AWS, full gate each night. Owner: natest, Phase 406 (builds, 2026-11-20). Today the AWS box always runs the full suite: `scripts/production/merge_gate.py:1474` sets `FullSuite("whole machine")` for a not-shared machine, and `scripts/aws_target/gate_box.py:819` records 'cloud gate'. The box has no certified base (`affected_modules.py:967`). Computed saving: about 1,860 CPU s for each AWS gate; at about 129 AWS gates each day (1,674 in 13 days) this is about 240,000 CPU s each day (computed, not measured).
+
+P6 risk, approved by the user on 2026-11-20: a defect outside the selected modules reaches main, and the nightly gate finds it.
+
+### Instantiation steps
+
+1. Before the first phase starts, send P6 to builds. Date sent: 2026-11-20. Answer: natest owns it (Phase 406).
+2. Then send P1 to P5 and P7 in one message. Date sent: 2026-11-20
+3. Send P8 to builds as a proposal that is not approved. Date sent: ____
+4. The director asks the user the Lane C deletion question. Date answered: ____
+5. The evidence folder is `/session/natest/testcount` (adopted with `scratch.py adopt`, kept until 2026-12-20). At each refill, run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py renew /session/natest/testcount`.
+6. Build the plan file in this order: title, Status, Source, Standing work, Delegation Context, `## Phases`, Phases 381 to 398, Phases 399 and up.
+7. Mark Phases 382, 384 and 385 with one line each: "parked 2026-11-20: at most N AWS s; reopen from the top list". N is 19, 14 and 14. Do not park Phases 387, 394 and 395; their code is finished and waits for a gate.
+8. Correct each `**Depends on:**` line of Phases 391, 392 and 393 to phase ids only. Move the other words to Constraints.
+9. Move the Lane D list from `plan_draft.md` to the next file. Done 2026-11-20.
+10. Send one line to builds for the owner of `docs/plans/sdlc-phases-design.md:85`: the refill tag is in `docs/direct/style_unit.md`.
+
+### Known limits
+
+- No rule covers source growth (+7,768 source lines each day; 4 to 12 tests for each 100 source lines). No rule covers `fix` and `feat` commits outside phases; they hold 48% of the net test growth of the last 14 days.
+- New tests add about 82 CPU s to each gate each day (computed: 316 tests at 0.259 s). Only the riser check and P1 to P5 act against this.
+- Not yet planned:
+  - `aws_target/test_ledger.py`: 1.8 to 28.4 s on natedev on 11-20, with one test of 67.6 s. `lib/test_session_move.py`: 33 to 44 s on natedev against 4 to 5 s on AWS.
+  - `review.sh` and assign_claude tests (about 200 s); unit_status tests (24 tests, 80 s). Largest single tests: copy_guard_sources 34 s; offload_cleanup 18.6 s.
+  - 176 uncalled functions (1,889 lines); style_ledger migrations that already ran, and their tests.
+  - Showrunner tree simplification (314 tests, 78 s); style mechanical-diff reader (628 tests, 65 s). The module split from 259 to 871 modules has no size rule.
+
+## Delegation Context
+
+- **Project:** `~/.claude` — the scripts, commands and config that run the user's productions. This plan records test times and lowers the CPU that the test gates use.
+- **Project started:** 2026-11-03T14:50:07.684+00:00
+- **Stack:** Python 3.13, standard library only (`unittest`, `sqlite3`, `json`); Markdown commands; `.conf` files read through `scripts/lib/conf.py`.
+- **Layout:**
+  - `scripts/test_times/` — natest owns it: `module_run.py`, `gate_record.py`, `show.py`, `module_cost.py`, `task_cpu.py`
+  - `scripts/<folder>/test_*.py` — the test modules that phases change; each folder has an owner unit
+  - `scripts/production/merge_gate.py`, `affected_modules.py`, `targeted_test.py` — the gate (owner: builds and natemerge); natest reads them
+  - `docs/plans/builds-natest-next.md` — Floors, Declined options, the order list, measured savings, dead-code answers
+- **Key files:** each line number in this plan is history from origin/main on 2026-11-20. Find the current line with `git grep`.
+  - `scripts/test_times/show.py` — `top`, `trend`, `suites`, `suite`, `module`, `test`; `--host aws` selects AWS records
+  - `scripts/test_times/module_cost.py` — `--tree <path> [--tests N] [--commands N] <folder>/<file> ...`: CPU, process starts, execs, wall time
+  - `scripts/buildlog/index.py` — `read_only()` opens the SQLite index under `~/.local/state/buildlog/`; tables `gate_runs`, `gate_suites`, `gate_modules`, `gate_tests` (owner: report-unit)
+  - `scripts/direct/verify.sh`, `scripts/direct/test_verify*.py` (owner: verify unit); `scripts/lib/shell_test_support.py` — `shell_functions` calls a real shell function from a test
+- **Test lanes:** none as `tests/` folders. Each module's tests sit beside it as `scripts/<folder>/test_<name>.py`.
+- **Build:** none (Python).
+- **Test:** for each named test file, `python3 -m unittest discover -s scripts/<folder> -p '<file>'` from the worktree root, only after natemerge's go. A worker's verification lists every test module that calls a changed function, unchanged callers and subprocess fixtures included.
+- **Lint:** `basedpyright <changed Python files>` passes when its output has the `0 errors, 0 warnings, 0 notes` line; the exit status says nothing.
+- **Invariants:**
+  - The rules of Standing work bind every phase.
+  - Tests use fixtures. They never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `~/.local/state/merge-gate`, `/tmp/claude` (the gate's as-built).
+  - Python is typed throughout, with no `Any` and no file-level type ignores (user, `~/.claude/CLAUDE.md`). All text uses Simplified Technical English (user, 2026-10-18).
+  - One place for each thing (user, 2026-10-30): reuse the build log store and index, `conf.py`, `user_zone.py`, `terminal_cells.py` and the gate's `discover_test_modules`; never copy a reader, a parser or a module list. A tunable lives in config and is read at use (user, 2026-10-31).
+  - Speed work keeps coverage (user mission, 2026-11-03). Every behavior a module checked before stays checked. The 2026-11-11 rule in Lane C limits test removal further.
+  - A speed gain that needs a change outside a phase's Files goes to builds as a proposal with the measured gain; the phase does not make the change (user mission, 2026-11-03). A change to another unit's file names that owner in the checkpoint notice (production doc, Production rules).
+  - A worker starts at most one detached run at a time, with at most 4 named test files (sdlc, 2026-11-03). No test run starts while a natedev build hold is in force (builds showrunner, 2026-11-03).
+  - Commit every new file in the disposable gate clone before the gate starts. The aws_target box replica copies only `git ls-files`.
+  - Each dispatch names one worker that runs the changed modules and their callers after the last edit.
+
+## Phases
 
 ### Phase 381 — fast_track builds the selected tree once  · status: done (no change)
 
@@ -6,6 +205,8 @@
 
 ### Phase 382 — the offload cleanup test halves its AWS CPU  · status: todo
 **Depends on:** none
+
+Parked 2026-11-20: at most 19 AWS s; reopen from the top list.
 
 #### Work Order
 
@@ -50,6 +251,8 @@
 ### Phase 384 — the stall watch test halves its AWS CPU  · status: todo
 **Depends on:** none
 
+Parked 2026-11-20: at most 14 AWS s; reopen from the top list.
+
 #### Work Order
 - **Goal:** production/test_stall_watch.py uses half its AWS gate CPU (AWS rank 22: 28.4 CPU s, 125 tests, 55.5 s wall; slowest test 10.3 s) with every assertion kept.
 - **Spec:**
@@ -70,6 +273,8 @@
 
 ### Phase 385 — the gate ledger test halves its AWS CPU  · status: todo
 **Depends on:** none
+
+Parked 2026-11-20: at most 14 AWS s; reopen from the top list.
 
 #### Work Order
 - **Goal:** production/test_merge_gate_ledger.py (AWS name test_gate_ledger.py, rank 22: 28.4 CPU s, 19 tests) uses half its AWS gate CPU with every assertion kept.
@@ -195,7 +400,9 @@
   4. Full natedev gate passes (reds that also occur on base do not count).
 
 ### Phase 391 — the gate wakes on child exit and reads job memory from its cgroup  · status: todo
-**Depends on:** Phase 392 (merge_gate.py job start and stop); 383 (bb1) lands first. Queue 44df is dropped (bob, List item 140): job memory comes from each module's own scope, with no gate scope.
+**Depends on:** Phase 392, Phase 383
+
+Phase 392 changes the gate job start and stop. The queue item 44df is dropped (bob, List item 140): job memory comes from each module's own scope, with no gate scope.
 
 #### Work Order
 - **Goal:** merge_gate.py stops timed polls of its jobs: it wakes on child exit (pidfd) and reads each job's memory from the job cgroup, so the gate supervisor uses less CPU on every gate run (proposal from 385: child runners were 45.3% of the base trace CPU; builds accepted 11-19).
@@ -206,7 +413,7 @@
   4. Keep the gate's stop, timeout and memory-stop order unchanged; keep 383 recovery records.
   5. Failing first: a test row shows the gate makes no wake while jobs run and nothing exits (count wakes), and one shows memory comes from the cgroup file.
   6. Tests read no /tune value; no signal handlers.
-- **Files:** `scripts/production/merge_gate.py` (or gate.py if 355 has landed); one gate test module for the rows.
+- **Files:** `scripts/production/merge_gate.py` (or gate.py if 355 is on main); one gate test module for the rows.
 - **Workers:** 1 writer.
   - impl: design note, then the code and rows.
 - **Constraints from prior phases:** 383 recovery and 388 allow list change merge_gate.py; 355 renames it to gate.py. User test hold: no test runs until natemerge ends it.
@@ -218,7 +425,9 @@
   5. Full natedev gate passes (reds that also occur on base do not count).
 
 ### Phase 392 — bubble-wrapped tests on natedev for each start path  · status: todo
-**Depends on:** Phase 389 (plan 6994708e9 and bob's review); 383 lands first
+**Depends on:** Phase 389, Phase 383
+
+It uses the Phase 389 plan (commit 6994708e9) and bob's review.
 
 #### Work Order
 - **Goal:** every claude_commands test on natedev runs inside one Bubblewrap launch that limits files, processes and network, or is refused (List item 141, delivery 1 of bob's reviewed route).
@@ -233,7 +442,7 @@
   8. No signal handlers, masks or dispositions; no lazy imports; tests read no /tune value.
 - **Files:** worker 1: scripts/lib/bubble_wrapped_tests.py, scripts/lib/direct_test_starts.py, config/bubble_wrapped_tests.conf, scripts/production/merge_gate.py, scripts/test_times/module_run.py, scripts/lib/python_startup/sitecustomize.py, scripts/test_times/coverage_overlap.py and their test rows. Worker 2: scripts/lib/test_bubble_wrapped_tests.py, scripts/hooks/pre-tool-use-build-hold-guard.py, scripts/build_hold/hold_enforcer.py and their hook tests.
 - **Workers:** 2 writers, no common file. Worker 2 codes against the bubble_wrapped_tests.py API in Spec 1.
-- **Constraints from prior phases:** 383 lands first; 355 renames merge_gate.py to gate.py (merge main before checkpoint). 388 lands no code (folded here). User test hold: write and review now; run tests only after natemerge releases units. NixOS entry for bubblewrap is asked of natedev; until then the config names the store path.
+- **Constraints from prior phases:** 383 is merged first; 355 renames merge_gate.py to gate.py (merge main before checkpoint). 388 merges no code (folded here). User test hold: write and review now; run tests only after natemerge releases units. NixOS entry for bubblewrap is asked of natedev; until then the config names the store path.
 - **Acceptance gate:**
   1. The proof module passes behind the guard and fails with the guard removed (refusal row).
   2. One full natedev gate inside Bubblewrap; a failing module is fixed or reported with its reason; record the gate time with and without the guard and the cold bytecode cost (compileall pass if any loss).
@@ -242,7 +451,9 @@
 
 ### Phase 393 — TERM stops a gate in a known time (no cleanup signal mask)  · status: todo
 
-**Depends on:** none. Ordered after the red main repair and the guard repair (builds); does not move queue 44dg.
+**Depends on:** none
+
+Ordered after the red main repair and the guard repair (builds). It does not move the queue item 44dg.
 
 #### Work Order
 
@@ -359,3 +570,256 @@
 - **Acceptance gate:**
   1. Each number names its source run or record.
   2. The fixed cost times 840 modules plus the outside work, compared with the 6,452 CPU s gate mean.
+
+### Phase 399 — each riser of the 11-16 to 11-19 rise has a cause  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** one report gives one cause for each named riser, and one cause or "not found" for the broad +24% rise in 798 unchanged modules. Predicted saving: 0 CPU in this phase (measure). The rise is about 1,410 CPU s for each green AWS full gate (measured means, AWS: 5,602 less 4,192). That is about 200,000 CPU s each day at 150 gates (computed).
+
+**Spec:**
+1. Change no repository file. Use read-only queries of the buildlog index and `git log` on origin/main.
+2. Open the index with `scripts/buildlog/index.py` `read_only()`. Read the column lists `GATE_RUN_COLUMNS`, `GATE_MODULE_COLUMNS` and `GATE_TEST_COLUMNS` in that file before the first query.
+3. Confirm the day table first. Mean CPU of green AWS full gates by day: 11-15 4,513; 11-16 4,192; 11-17 4,318; 11-18 5,055; 11-19 5,602. If your values differ, give the query and both values in the report.
+4. Named risers, AWS module median CPU s, 11-16 to 11-19: slot_order 0 to 155.6; statusline 36.7 to 153.5; list_page 0 to 97.2; verify_doc_checkout 7.7 to 59.2; offload_cleanup 7.1 to 37.4; verify_lint_repair_grant 0 to 28.1; test_copies 23.5 to 42.0; models_registry 8.1 to 26.1; worktrees 11.2 to 27.6. The top 30 risers sum to 744 s. The 45 new modules sum to 339 s.
+5. For each named riser, run `git log --since=2026-11-16 --until=2026-11-20 origin/main -- <test module> <its support> <its source>`. Name the commit that fits the first day of the rise. Class the cause: test file, source of another unit, or new module.
+6. For a new module (0 on 11-16), the cause is the commit that added it. List its tests of 0.5 s or more from `gate_tests`.
+7. statusline: Phase 365 commits 0fa6239249, ab170ab869, 5671102e4d and fd04c696b0 brought natedev back to 41 to 51 s on 11-20. AWS has no record after the fix. Record it as "fixed on natedev; AWS not confirmed".
+8. Broad rise. The 798 modules present on all five days went from 4,149 to 5,166 s. The median module ratio is 1.15. Of 510 modules above 1 s, 197 rose more than 20%. The box had 16 vCPU on both days.
+9. Test these causes from records, in this order. State for each the record that confirms it or rules it out.
+   - A fixed cost for each module: compare the rise in seconds with the test count of each module. A constant rise in small modules points to module start.
+   - Box load: count the gates that ran at the same time on one box, and compare CPU with wall time for each run.
+   - A commit in shared start code in the window: `scripts/test_times/module_run.py`, the gate's module environment in `merge_gate.py`, `sitecustomize`, and the `scripts/lib` modules that most tests import.
+   - A box image or Python change: commits under `scripts/aws_target` and its config in the window.
+   - Host check: compute the same 798-module ratio on natedev for the same days. A rise on both hosts points to code. A rise on AWS only points to the box.
+10. Run a module only when the records cannot separate two causes. Then measure one module with `module_cost.py` on the 11-16 tree and on the 11-19 tree. This run needs natemerge's go, the unit's one build-queue item, and `systemd-run --user --scope -p MemoryMax=2G`.
+11. Report: one row for each riser (module, two medians, commit, cause class). For each test-file cause, write the Goal line of a Lane A phase. For each cause in another unit's source, write the message to builds with the commit and the two numbers. For the broad rise, write one cause or "not found".
+
+**Files:**
+- none changed. The report goes in the session folder of this phase.
+- `scripts/buildlog/index.py`, `scripts/test_times/show.py`, `scripts/test_times/gate_record.py` — read only
+
+**Workers:** 1 writer. One set of queries; nothing splits.
+- `impl` — the queries and the report.
+
+**State:** none.
+
+**Constraints from prior phases:** The last AWS gate record is from 2026-11-19 09:08 UTC (AWS hold). `show.py top --host aws` reads 7 days, so query the index for the days by date. Never give an AWS number and a natedev number as before and after. Use Phase 398's split of one module start if its report exists. No test run starts without natemerge's go (rule 2).
+
+**Acceptance gate:** each number names its query or its commit; each of the nine risers has one cause with a commit hash, or "not found" with the checks made; the broad rise has one cause with its records, or "not found" with the record that rules out each cause of step 9; `git status` shows no changed file.
+
+### Phase 400 — the Lane A target from the top list halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the module that the director names at dispatch uses half its AWS gate CPU with every assertion kept, or has a floor result with its cause. Predicted saving (computed, AWS, half of the 11-19 median): 78 CPU s per gate for `copies/test_slot_order.py`, 57 for `review_links/test_list_page.py`, 30 for `direct/test_verify_doc_checkout.py`.
+
+**Spec:**
+1. Lane A target, chosen at dispatch from the current top list. Candidates on 2026-11-20: `copies/test_slot_order.py` (156.9 AWS, new on 11-18; two tests of 38.8 and 33.6 s), `review_links/test_list_page.py` (114.1 AWS, new on 11-17), `direct/test_verify_doc_checkout.py` (59.6).
+2. At dispatch, the director reads `show.py top` under the measure rule and takes the first candidate with no open phase. The director writes the module, its baseline, host and date into Goal and Files before the dispatch.
+3. Measure first: `module_cost.py --tree <tree> --tests 20 --commands 20 <folder>/<file>`, fresh TMPDIR on /tmp, bytecode on. Name the top commands and fixtures with their CPU share. Confirm the cause before any edit; use the Phase 399 row for this module if it exists.
+4. Cut the cost at its cause: repeated process starts, Git setup, fixed waits, polls. Share setup for each class where the tests only read it. Call the real function where the decision is in a function.
+5. Keep every assertion. Keep a full-entry test where the decision exists only in the dispatch branch. Never copy a production decision into a fixture.
+6. Change production code only when the same cost also hits production runs, and only with the owner's go.
+7. Add no test function. The phase changes how the tests start, not what they assert.
+8. If the floor is above half, report the floor, the operation that sets it, its owner, and the measure conditions. Write the Floors row for the next file.
+9. Write a map in the summary: each assertion, and the test that checks it after the phase.
+
+**Files:**
+- the chosen test module and its test support file — the cheaper start
+- one production file — only for a production cause, with its owner's go
+
+**Workers:** 1 writer. One module and its support; nothing splits.
+- `impl` — all files.
+
+**Constraints from prior phases:** The owner of each candidate file gives its go through builds before the first edit. `direct/test_verify_doc_checkout.py` is a verify unit file, and the Lane B limits apply to it. Tests read no tunable config value. Tests run on the Mac too. No test run starts without natemerge's go; the unit has one build-queue item.
+
+**Acceptance gate:** `module_cost.py` before and after shows CPU at half or less, labeled with its host, or the report gives a floor result; 20 repeated runs of the changed module and of each importer of changed support pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`; basedpyright gives zero errors and zero warnings on changed files; one blind review; the gate route that builds names for the merge passes. After the phase is merged to main, the director writes the AWS median from `show.py top --host aws` in the next file when AWS has a full gate in the last 2 days.
+
+### Phase 401 — the start cost of one verify.sh test is measured  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** one report splits the CPU of a verify.sh test into start cost and test work, and states whether one caller pair shows more than 10 CPU s per gate. Predicted saving: 0 CPU (measure). The result sets the target of Phase 402 or closes the verify lane.
+
+**Spec:**
+1. Read the Floors and Declined sections of `docs/plans/builds-natest-next.md` first. Do not propose startup reuse or a fork server.
+2. Records first, no run. From `show.py module <folder>/<file>` for 10 verify modules, give module CPU, tests, and CPU for each test. Take the 3 one-test final-pass modules, 3 mac modules, 2 lint modules and 2 token modules.
+3. After natemerge's go, run `module_cost.py --tree <tree> --tests 20 --commands 20` on the same 10 modules. Split the CPU of each test: Python fixture setup, each fake tool start, `bash verify.sh` up to its first step decision, the step, cleanup.
+4. Measure the smallest start alone: one `verify.sh` call that stops at an argument refusal, 20 times, with the same fixture environment.
+5. Count the full-script starts for each test in the mac, lint and token themes.
+6. For each theme, name the starts that a direct call of the real function through `shell_test_support.shell_functions` can replace. Name the starts that only a real process path can prove.
+7. The report must show more than 10 CPU s per gate in one caller pair, or the verify lane closes. State the pair, the two numbers and the host.
+8. When the lane closes, write one line for the next file, and the director drops Phase 402 with that line.
+9. When the lane stays open, give the target for the mac theme in CPU s, with the measure behind it.
+10. Change no repository file.
+
+**Files:**
+- none changed. The report goes in the session folder of this phase.
+- `docs/plans/builds-natest-next.md`, `scripts/direct/verify.sh`, `scripts/direct/test_verify*.py`, `scripts/lib/shell_test_support.py` — read only
+
+**Workers:** 1 writer. Records step at once; run steps after natemerge's go.
+- `impl` — the report.
+
+**State:** none.
+
+**Constraints from prior phases:** Verify tests on AWS: 1,452 CPU s in 147 modules. Recorded floors: "The tested verify harness changes are at a practical floor" (Phase 190). Phase 179 measured 496 full-script launches in 338 of 414 slow verify tests; at least 32 tests need the real process path. Phase 157 floor for `test_verify_mac_only.py`: 36 to 38 CPU s in AWS pairs. Past verify phases saved 0.4 to 11 s each; Phases 181 and 183 saved 1.37 s and 0.71 s, because the full entries held most of the cost. Declined: startup reuse (builds, 2026-11-12; reopen only above 10 CPU s per gate in a measured caller pair) and a preloaded Python fork server (builds, 2026-11-16). Use Phase 398's split of one module start if its report exists. The verify unit owns the verify files.
+
+**Acceptance gate:** each number names its run or its record, with host; the report states one of two results: "one caller pair shows more than 10 CPU s per gate" with the pair, or "none does; the verify lane closes"; `git status` shows no changed file.
+
+### Phase 402 — the verify mac theme reaches the target of Phase 401  · status: todo
+**Depends on:** Phase 401, Phase 386, Phase 390
+
+#### Work Order
+
+**Goal:** the mac theme of the verify.sh tests uses the AWS gate CPU that Phase 401 sets as target, with every assertion kept. Baseline: 323 s AWS (37 modules, 102 tests; measured medians, 11-19). Predicted saving: target set by Phase 401; no number before that measure.
+
+**Spec:**
+1. Take the route that the Phase 401 report names. Write its target into Goal before dispatch.
+2. Route 1, start cost holds the CPU: a test of one decision calls the real verify function through `shell_test_support.shell_functions`. Each module keeps its full-entry tests for dispatch and argument wiring.
+3. Route 2, test work holds the CPU: share one fixture start for each class where the tests only read it. Replace each timed wait with the event that the code gives.
+4. Keep a full-entry test where the decision exists only in the dispatch branch. Never copy the decision into a fixture.
+5. A missing callable boundary in `verify.sh` is a proposal to the verify unit through builds. Do not edit `verify.sh` in this phase.
+6. Add no test function. Map each assertion to the test that checks it after the phase; put the map in the summary.
+7. Measure with `module_cost.py` before and after, like the gate.
+
+**Files:**
+- `scripts/direct/test_verify_mac_*.py` — the cheaper start
+- `scripts/direct/verify_mac_offload_test_support.py` — shared fixture start
+
+**Workers:** 2 writers, split by module list: the first 19 mac modules by name, and the other 18.
+- `impl` — the first 19 modules; hub: `scripts/direct/verify_mac_offload_test_support.py` (each mac module imports it)
+- `test` — opens as impl; the other 18 modules
+
+**Constraints from prior phases:** The verify unit owns these files: get its go through builds for each file before the edit. Phase 386 changes `provider()` in `verify_mac_offload_test_support.py`, and Phase 390 changes `test_verify_mac_only.py`; start from a tip that holds both. Floor for `test_verify_mac_only.py`: 36 to 38 CPU s (Phase 157). Do not propose startup reuse or a fork server. Tests run on the Mac too. No test run starts without natemerge's go.
+
+**Acceptance gate:** the `module_cost.py` sum of the 37 modules is at the Phase 401 target or less, labeled with its host, or the report gives a floor result with its cause; 20 repeated runs of each changed module and of each importer of the support file pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`; basedpyright gives zero errors and zero warnings on changed files; one blind review; the gate route that builds names passes. After the phase is merged to main, the director writes the AWS sum in the next file when AWS has a full gate in the last 2 days.
+
+### Phase 403 — sibling tests that share one costly start fold into one test  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** each named group of sibling tests is one parametrized test that pays its costly start one time, with every assertion kept. Predicted saving (computed, AWS): at most 18 CPU s per gate for `test_unit_status_decisions.py` (7 of 8 starts of 2.6 s). The other three groups have no number before step 1.
+
+**Spec:**
+1. Fold only groups that share one costly start. First groups:
+   - `scripts/production/test_merge_gate_suites_signals.py:291-300` — four tests call `assert_gate_folder_removed` with "failure", "SIGTERM", "SIGHUP", "SIGINT" (module: 23.9 AWS s).
+   - `scripts/direct/test_verify_lint_cache_versions.py:122-175` — one test for each tool: mend, rustfmt, clippy, taplo (module: 14.9 AWS s).
+   - `scripts/direct/test_verify_ssh_targets.py:34-40` — three tests for a refusal at three points (module: 18.8 AWS s).
+   - `scripts/production/test_unit_status_decisions.py` — 8 tests, 20.9 AWS s through one fixture.
+2. Before each fold, measure the group with `module_cost.py --tests 20 --commands 20`. Name the start that the rows share.
+3. Fold a group only when its rows read one start and do not change it. When each row needs its own start, leave the group and say so in the summary.
+4. Use one test with a `subTest` table. The old test name is the row label. Build the shared start one time for the table.
+5. Keep every assertion of every old test. Delete no case.
+6. Write no new tool and no new test function.
+7. Check 3 folded rows: break one line of the code under each row on a temporary copy, and see that row fail.
+
+**Files:**
+- `scripts/production/test_merge_gate_suites_signals.py`, `scripts/production/test_unit_status_decisions.py` — folds
+- `scripts/direct/test_verify_lint_cache_versions.py`, `scripts/direct/test_verify_ssh_targets.py` — folds
+
+**Workers:** 1 writer. Four small groups; nothing splits.
+- `impl` — all files.
+
+**Constraints from prior phases:** Each file's owner gives its go through builds before the edit: the verify unit for the two `direct` files, the owner that builds names for the two `production` files. The user rule of 2026-11-11 stays in force: a fold keeps every assertion. A fold saves CPU only when the rows share one start (value report). Tests read no tunable config value. No test run starts without natemerge's go.
+
+**Acceptance gate:** each old test name is a row label in the new tables (compare the names before and after); the 3 broken-code checks of step 7 fail as stated; `module_cost.py` CPU of each changed module is not above its base, with both numbers and the host; 20 repeated runs of each changed module pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`; basedpyright gives zero errors and zero warnings on changed files; one blind review.
+
+### Phase 404 — each dead-code candidate has its owner's answer  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** each dead-code candidate has an evidence row and a recorded answer from its owner: delete, keep, or not yet. Predicted saving: 0 CPU (proposal and tracking). The answers set the list of Phase 405.
+
+**Spec:**
+1. This phase changes no code. Build the evidence table on present origin/main with an AST import graph and a text search of each file name.
+2. Roots of the graph: `commands/`, `config/`, `settings.json`, shell scripts, `/etc/nixos`, `~/.config/systemd/user`, `~/.codex/hooks.json`. `docs/plans` and `docs/as-built` are not roots.
+3. Group 1 (folders report: 164 tests, 60.6 CPU s): `style/selection_capture.py`, `style/refill_measure.py`, `direct/demo_refusals.sh`, `production/unit_run.py`, `style/order_waste.py`, `style/style_reader_tables.py`, `style/style_reader_oracle.py`, `style/style_reader_parity.py`, `direct/phase_process.py`, `production/roles_audit.py`.
+4. Group 2 (size report tier A, 5,337 lines): `lib/session_move.py` (changed 2026-11-19; ask first), `whoami/profile_notes_pass.py`, `whoami/worker_usage.py`, `usage/compaction_replay.py`, `lint/gate_folders_delete.py`, `agents/pane_restore.py` with `hooks/session-end-pane-record.py`, `mac_test/loopback_proof.py`, `lint/package_imports.py`, `statusline/statusline_rows.py`, `aws_target/terminal_table.py`.
+5. Group 2, tier B (2,957 lines, low to medium confidence): `mac_test/mac_gate.py`, `nix_env/heal.py`, `berth/work_order.py`, `test_times/coverage_overlap.py`, `accounts/pane_moves.py`, `message/repeats.py`, `history/routed.py`, `message/install_codex_agents.py`.
+6. Group 3, trials and one-time tools: `aws_target/gpu_size_trial.py`, `gpu_trial_wrapper.py`, `aws_trial.py`, `gate_probe.py`, `measurement.py` (`deploy.py` imports three of them), `buildlog/width_trial.py` (`lint/invoke.sh` calls it), `model_study/`, `issue_score/experiment.py`.
+7. Group 4, the style bulk batch path: `style/crate_run.py`, `style/bulk_run.py`, `style/bulk_constants.py`, most of `style/bulk_rename.py`. Keep `bulk_rename.cargo_output`; `style_plan.py` uses it. The style owner must answer.
+8. For each row give: lines, test files, tests, the median CPU of its test modules with host, the evidence, and one question.
+9. Send the rows to builds for routing to each owner. Record only the owner's own answer, with its date and who gave it.
+10. `test_times/coverage_overlap.py` is natest's file. Decide it in this phase and state the reason.
+
+**Files:**
+- `docs/plans/builds-natest-next.md` — new section "Dead-code answers"
+- the evidence table goes in the session folder of this phase
+
+**Workers:** 1 writer. One graph, one table, one set of questions.
+- `impl` — the table, the question texts and the new section.
+
+**State:** the section "Dead-code answers" in `docs/plans/builds-natest-next.md`.
+
+**Constraints from prior phases:** The pilot scripts `size_graph.py`, `size_reach.py` and `folders_dead.py` are in the evidence folder of instantiation step 5; read them, do not copy them into the repository. Totals from the reports (size report rows 3, 4, 7, 8): about 19,700 source lines, 24,000 test lines and 1,005 tests. A test of live code is not a candidate (user, 2026-11-11).
+
+**Acceptance gate:** each candidate has a row with evidence and one question; each sent question has its send result line; each answer in the next file names who gave it and the date; no code file changed.
+
+### Phase 405 — dead code with a "delete" answer is deleted with its tests  · status: todo
+**Depends on:** Phase 404
+
+#### Work Order
+
+**Goal:** each file that its owner answered "delete" in Phase 404 is gone from main with its tests, test support and config keys. Predicted saving: at most 60.6 CPU s per gate for group 1 (measured medians, folders report, natedev). At most 83.0 AWS CPU s more if the style owner answers "delete" for `style/test_crate_run.py` (49.3) and `style/test_bulk_run.py` (33.7) (measured medians, AWS, 11-19).
+
+**Spec:**
+1. Take only the rows with a recorded "delete" answer in the section "Dead-code answers". Make one commit for each owner group.
+2. Delete the source file, its `test_*.py` files, and each support file that has no other importer.
+3. Delete its config keys and their `config/README.md` lines. Before each key delete, grep every reader of the key and show that none remains.
+4. Correct each as-built doc line that names a deleted file, in the same commit.
+5. Where a kept file imports a deleted one (`deploy.py` imports `aws_trial` and `gate_probe`; `lint/invoke.sh` calls `width_trial.py`), remove the call only with that owner's answer. Without the answer, keep the file and say so.
+6. Delete a test only together with the dead code it tests. Delete no test of live code.
+7. Summary: each deleted test file with the reason "code deleted".
+
+**Files:**
+- the files of the "delete" rows — removed
+- `config/*.conf`, `config/README.md`, `docs/as-built/*.md` — the lines that name them
+
+**Workers:** 2 writers, split by folder group so that no file is common.
+- `impl` — the style, direct and production rows; hub: `config/README.md` (each key delete edits it)
+- `test` — opens as impl; the rows of the other folders
+
+**State:** file deletes; config key deletes.
+
+**Constraints from prior phases:** Phase 404 holds the answers; an answer of "keep" or "not yet" is final for this phase. For a merge that deletes code, ask builds for a full gate (rule 10): a delete on 11-12 with touched tests only broke 10 modules on main. A deleted config key goes to builds for the showrunner's go first. No test run starts without natemerge's go.
+
+**Acceptance gate:** a grep of each deleted name on the tree finds no reader; the full gate that builds runs for the merge passes on the tip; basedpyright gives zero errors and zero warnings on changed files; one blind review. After the phase is merged to main, the director writes the CPU of the removed modules, with host, in the next file.
+
+### Phase 406 — an AWS merge gate runs the affected modules, and one full gate runs each night  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** an AWS merge gate runs only the modules that the change affects, and one full gate runs each night. Predicted saving (computed, AWS): about 1,860 CPU s for each AWS gate (full about 4,940, affected about 3,080); at about 129 AWS gates each day this is about 240,000 CPU s each day.
+
+**Spec:**
+1. Start from a tip that holds Phase 355 (the gate code is `scripts/production/gate.py` there). Find each current line with `git grep`.
+2. Today a not-shared machine sets `FullSuite("whole machine")`, `scripts/aws_target/gate_box.py` records 'cloud gate', and the box has no certified base (`affected_modules.py`, "no certified base").
+3. natedev selects the affected modules against its certified base with `affected_modules.py`. Use the selection that the shared path already uses; write no second selector.
+4. The gate request to the box carries the module list. The box runs that list and records the selection reason and the module count in its `gate_run` record.
+5. When natedev has no certified base, or the selector returns the full suite, the box runs the full suite as today.
+6. One full gate runs each night on the tip of main. First find the nightly job that exists (`git grep -n nightly scripts config`); add the full gate to it and write no second scheduler.
+7. A red nightly full gate uses the existing nightly red route, so that it gets an assignee. The summary states how the nightly gate starts and where its red goes; the director sends this to builds before the hash.
+8. A nightly red in a module that no merge gate of that day selected is written to the record with the list of merges of that day.
+9. Each new tunable (the nightly time, any limit) is a key in config, read at use. Tests write a fixture config.
+10. Tests: one test that a request with a module list runs only that list on the box; one that no certified base gives the full suite; one that the nightly job starts a full gate; one that a nightly red reaches the red route. Use the gate's fixture; start no real box.
+
+**Files:**
+- `scripts/production/gate.py`, `scripts/production/affected_modules.py` — selection for a not-shared machine
+- `scripts/aws_target/gate_box.py`, `scripts/aws_target/cloud_gate.py` — the request field and the box run (aws reviews this side)
+- the nightly job file that step 6 finds, and its config
+- their test files and `docs/as-built` lines that say each merge gate is full
+
+**Workers:** 2 writers, split by folder.
+- `impl` — `scripts/production` and the nightly job; hub: the request record type
+- `test` — opens as impl; `scripts/aws_target`
+
+**Constraints from prior phases:** builds made natest the owner on 2026-11-20, because Phase 355 renames the gate code and one owner keeps the order. The user approved the change and its risk on 2026-11-20: a defect outside the selected modules reaches main, and the nightly gate finds it. The change is merged to main only after Phase 355 is on main. The box result reader merges before the writer: natedev reads with main and the box writes with candidate code, so keep the record readable by both. aws reviews the `gate_box.py` and `cloud_gate.py` side before the hash. No test run starts without natemerge's go.
+
+**Acceptance gate:** the four tests pass in 20 repeated runs with each importer of changed code, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`; basedpyright gives zero errors and zero warnings on changed files; one blind review and the aws review have no open finding; the full gate that builds runs for the merge passes. After the phase is merged to main, the director writes in the next file the mean modules for each AWS merge gate and the count of nightly reds that no merge gate selected.
