@@ -22,6 +22,7 @@ from typing import TextIO, cast, override
 
 from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_placement as hana
+from scripts.build_hold.build_hold import ProcessIdentity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue import admission_client as client, queue_snapshot
@@ -37,6 +38,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
+from scripts.production import land_runs
 
 
 SUBMITTING_SESSION = OwningSession("submitting-session")
@@ -1010,16 +1012,50 @@ class PlacementTests(unittest.TestCase):
             self.assertNotIn(head.owner.pid, fixture.queue_pids())
 
     def test_only_a_busy_mac_candidate_appears_in_the_mac_waits(self) -> None:
-        for pinned, reason in ((False, "busy"), (True, "off")):
-            with self.subTest(reason=reason), PlacementFixture() as fixture:
-                request = placement_request(fixture)
+        cases = ((False, "busy", False), (True, "off", False), (False, "busy", True))
+        for pinned, reason, landing_pass in cases:
+            with self.subTest(reason=reason, landing_pass=landing_pass), PlacementFixture() as fixture:
+                request = placement_request(fixture, since=fixture.clock.now() - 1 if landing_pass else None)
                 destination = request.constraints.candidates[0].destination
                 if pinned:
                     request = replace(request, constraints=replace(request.constraints,
                         selection=placement.PinnedHost(destination.target)))
+                if landing_pass:
+                    fixture.hold_starts()
+                    request = replace(request, prerequisite=placement.TokenNotRequired(), constraints=replace(
+                        request.constraints, candidates=(*request.constraints.candidates, local_candidate(fixture))))
                 _ = publish_candidate(fixture, request, placement.TemporaryExclusion(reason))
                 reply, = fixture.server.handle_request(request)
                 waits = published_mac_waits(fixture)
+                if landing_pass:
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    self.assertEqual([wait.episode for wait in waits], [request.episode])
+                    landing = fixture.request(step="merge-gate")
+                    land = wire.Owner(10, "10")
+                    with mock.patch.object(service, "landing_test", return_value=service.LandingTest(land)):
+                        waiting, = fixture.server.handle_request(landing)
+                    self.assertIsInstance(waiting, wire.Wait)
+                    write_pressure_reading(fixture.root / "pressure")
+                    with mock.patch.object(service, "landing_pass_limit", return_value=1), mock.patch.object(
+                            land_runs, "natemerge_land", return_value=ProcessIdentity(land.pid, land.start_time)):
+                        _ = fixture.run_pass()
+                    inputs, policy = fixture.server.last_inputs, fixture.server.last_policy
+                    assert isinstance(inputs, records.QueueInputs)
+                    assert isinstance(policy, records.AdmissionPolicy)
+                    preview = gate.admission_pass(inputs, inputs.now, policy)
+                    owner = records.run_owner(request.owner.pid, request.owner.start_time)
+                    self.assertTrue(any(row.owner == owner and isinstance(row.admission, gate.ProposedAdmission)
+                                        for row in preview.rows))
+                    self.assertEqual(set(fixture.caller_reservations()), {landing.episode})
+                    # Read both outputs before the next pass can change the result.
+                    with mock.patch.object(fixture.server, "_pass_gap_open", return_value=False):
+                        self.assertEqual([wait.episode for wait in published_mac_waits(fixture)], [request.episode])
+                    fixture.allow_next_start()
+                    _ = publish_candidate(fixture, request, placement.TemporaryExclusion("busy"))
+                    granted, = fixture.server.handle_request(request)
+                    self.assertIsInstance(granted, wire.LocalPlacementGranted)
+                    self.assertEqual(published_mac_waits(fixture), ())
+                    continue
                 if reason == "busy":
                     self.assertIsInstance(reply, wire.PlacementWait)
                     wait, = waits

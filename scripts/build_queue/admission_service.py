@@ -4359,7 +4359,6 @@ done
                     continue
                 if (initial_readiness_unchecked and destination.provider == "local"
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
-                    self._set_mac_wait(request.episode, placement.NoMacWait())
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
                     if can_record_mac_wait:
@@ -4389,7 +4388,6 @@ done
                         continue
                 if destination.provider == "local":
                     if owner in local_starts:
-                        self._set_mac_wait(request.episode, placement.NoMacWait())
                         break
                     continue
                 if destination.provider == "scaler":
@@ -4417,16 +4415,19 @@ done
                     removed.add(owner)
                 break
             else:
-                if (isinstance(mac_wait, placement.WaitingForMac)
-                        and isinstance(self._terminal_candidate_refusal(request, candidates), placement.DoNotRetry)):
-                    mac_wait = placement.NoMacWait()
-                self._set_mac_wait(request.episode, mac_wait)
                 for hold in waiting_for:
                     held.append(hold)
                     start = self.placement_holds.get((hold.episode, hold.destination))
                     # A hold lasts until the next probe of the older request; it never starts again on the same reading.
                     if start is not None and hold.observed_at < start:
                         holds[(hold.episode, hold.destination)] = start
+            if request.episode in self.current_assignments:
+                continue
+            if isinstance(mac_wait, placement.WaitingForMac) or request.episode in self.mac_waits:
+                if isinstance(self._terminal_candidate_refusal(request, candidates), placement.DoNotRetry):
+                    self._set_mac_wait(request.episode, placement.NoMacWait())
+                elif isinstance(mac_wait, placement.WaitingForMac):
+                    self._set_mac_wait(request.episode, mac_wait)
         self.placement_holds = holds
         self.placement_hold_answers = answers
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
