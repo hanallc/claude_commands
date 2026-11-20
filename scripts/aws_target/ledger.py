@@ -2950,6 +2950,145 @@ class CostLedger:
         return decision
 
 
+
+@dataclass(frozen=True)
+class SpendFileAbsent:
+    """The source path did not exist at capture."""
+
+
+@dataclass(frozen=True)
+class SpendFileStamp:
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True)
+class SpendSourceVersion:
+    path: str
+    stamp: SpendFileStamp | SpendFileAbsent
+
+
+@dataclass(frozen=True)
+class PageEvidenceRevision:
+    at: int
+    sources: tuple[SpendSourceVersion, ...]
+
+
+@dataclass(frozen=True)
+class SpendEvidenceUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class SpendRevisionVerified:
+    """The publication locks hold and the sources match the captured revision."""
+
+
+@dataclass(frozen=True)
+class UnreadableSpendBill:
+    path: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class SpendEvidenceAt:
+    revision: PageEvidenceRevision
+    state: LedgerEvidence
+    bill_records: tuple[SavedBillRecord | UnreadableSpendBill, ...]
+    refused_bills: tuple[RefusedBillRecord, ...]
+    launches: tuple[dict[str, object], ...]
+    hana_journal: remote.HanaStartJournal
+    settings: SpendingSettings
+    account_configuration: conf.ConfigRead
+    gate_configuration: conf.ConfigRead
+    builder_region: str
+
+    @property
+    def at(self) -> int:
+        return self.revision.at
+
+
+@dataclass(frozen=True)
+class SettledWatchAmount:
+    bill: ChargeRead
+    settlement: SettledChargeUnchanged
+
+
+@dataclass(frozen=True)
+class EstimatedUtcDaySpend:
+    intervals: tuple[ChargedInterval, ...]
+    groups: tuple[SpendGroupCost, ...]
+    carry_notes: tuple[str, ...] = ()
+
+    @property
+    def usd(self) -> Decimal:
+        return sum((interval.usd for interval in self.intervals), Decimal(0))
+
+
+@dataclass(frozen=True)
+class UnsettledAwsFloor:
+    bill: ChargeRead
+    settlement: ChargeNotSettled | SettledChargeChanged
+
+
+@dataclass(frozen=True)
+class UtcDayWithoutEvidence:
+    day: date
+    reason: str
+
+
+@dataclass(frozen=True)
+class UtcDaySpend:
+    day: date
+    source: SettledWatchAmount | EstimatedUtcDaySpend | UnsettledAwsFloor
+    groups: tuple[SpendGroupCost, ...]
+    intervals: tuple[ChargedInterval, ...]
+    estimate: EstimatedUtcDaySpend | UtcDayWithoutEvidence
+    gate_runs: int
+
+    @property
+    def usd(self) -> Decimal:
+        return sum((interval.usd for interval in self.intervals), Decimal(0))
+
+
+@dataclass(frozen=True)
+class UtcMonthSpend:
+    month: date
+    days: tuple[UtcDaySpend | UtcDayWithoutEvidence, ...]
+
+    @property
+    def usd(self) -> Decimal:
+        return sum((day.usd for day in self.days if isinstance(day, UtcDaySpend)), Decimal(0))
+
+
+@dataclass(frozen=True)
+class UtcAccountSpend:
+    days: tuple[UtcDaySpend | UtcDayWithoutEvidence, ...]
+    months: tuple[UtcMonthSpend, ...]
+    settlement_notes: tuple[WatchedChargeDay, ...]
+
+
+def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | None = None
+                           ) -> SpendEvidenceAt | SpendEvidenceUnavailable:
+    """Capture the sources for one spending report."""
+    raise NotImplementedError
+
+
+@contextmanager
+def verify_spend_revision(directory: Path, evidence: SpendEvidenceAt
+                          ) -> Iterator[SpendRevisionVerified | SpendEvidenceUnavailable]:
+    """Keep the publication locks through the caller's page replacement."""
+    yield SpendEvidenceUnavailable('Spend revision verification is unavailable')
+
+
+def utc_account_spend(evidence: SpendEvidenceAt) -> UtcAccountSpend | SpendEvidenceUnavailable:
+    """Calculate UTC spend from the captured sources."""
+    raise NotImplementedError
+
+
 def spending_guard(settings_path: Path, directory: Path, purpose: SpendingPurpose = "admission", *,
                    clock: Callable[[], float] = time.time,
                    notify: Callable[[LimitEvent], bool] = send_limit_event) -> SpendingDecision:
