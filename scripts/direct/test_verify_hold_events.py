@@ -80,38 +80,38 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         self.assertEqual(read_cycle_file(self.cycle_file)["entries"], [])
 
     def test_local_release_waiter_keeps_linux_notifications(self) -> None:
-        from scripts.direct import local_release_wait
+        from scripts.direct import release_events
 
         holders = self.fixture.root / "event-holders"
         release = self.fixture.root / "event-release"
         holders.mkdir()
         release.mkdir()
         with mock.patch.object(time, "sleep", side_effect=AssertionError("Linux must use notifications")), \
-             local_release_wait.local_release_waiter(holders, release) as waiter:
-            self.assertIsInstance(waiter, local_release_wait.LocalReleaseEvents)
+             release_events.local_release_waiter(holders, release) as waiter:
+            self.assertIsInstance(waiter, release_events.LocalReleaseEvents)
             waiter.arm()
             _ = (holders / "owner").write_text("released")
             waiter.wait(TEST_HANG_GUARD_SECS)
 
     def test_local_release_waiter_polls_when_kernel_lacks_inotify(self) -> None:
-        from scripts.direct import local_release_wait
+        from scripts.direct import release_events
 
         for unavailable in (errno.ENOSYS, errno.ENOTSUP):
             with self.subTest(errno=unavailable), \
                  mock.patch.object(local_release_wait, "LocalReleaseEvents", side_effect=OSError(unavailable, "unavailable")), \
                  mock.patch.object(time, "sleep") as polling:
-                with local_release_wait.local_release_waiter(self.fixture.root, self.fixture.root) as waiter:
-                    self.assertIsInstance(waiter, local_release_wait.IntervalReleasePolling)
+                with release_events.local_release_waiter(self.fixture.root, self.fixture.root) as waiter:
+                    self.assertIsInstance(waiter, release_events.IntervalReleasePolling)
                     waiter.arm()
                     waiter.wait(15)
                 polling.assert_called_once_with(15)
 
     def test_local_release_waiter_does_not_hide_resource_errors(self) -> None:
-        from scripts.direct import local_release_wait
+        from scripts.direct import release_events
 
         with mock.patch.object(local_release_wait, "LocalReleaseEvents", side_effect=OSError(errno.EMFILE, "exhausted")), \
              self.assertRaises(OSError) as failed:
-            _ = local_release_wait.local_release_waiter(self.fixture.root, self.fixture.root)
+            _ = release_events.local_release_waiter(self.fixture.root, self.fixture.root)
         self.assertEqual(failed.exception.errno, errno.EMFILE)
 
     def test_fixture_releases_a_call_when_a_scanned_directory_disappears(self) -> None:
