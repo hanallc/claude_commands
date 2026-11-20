@@ -144,7 +144,7 @@ same_path = False
 remote_output = ""
 remote_status = 0
 check_start_fence = mode in ("start-fence-confirmed", "start-fence-unconfirmed",
-                             "start-fence-interrupted", "start-release-unconfirmed")
+                             "start-fence-interrupted", "start-release-unconfirmed", "start-launch-failed")
 
 def run_start_fence(command):
     settled = real_run(["bash", "-c", command], capture_output=True,
@@ -175,7 +175,7 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if len(arguments) > 2 and arguments[2] == "release":
         parsed = mac_test.parser().parse_args(arguments[2:], namespace=mac_test.CliArguments())
         actions.append("release")
-        if mode == "start-release-unconfirmed":
+        if mode in ("start-release-unconfirmed", "takeover-release-unconfirmed"):
             return offload.CommandOutput(1, "", "release was not confirmed")
         return offload.CommandOutput(mac_test.command_release(parsed, mac_test.state_paths(parsed.target)), "", "")
     versions = {("rustc", "-V"): "rustc fixture",
@@ -227,6 +227,9 @@ def copy_source(*arguments):
 def stream(arguments):
     global remote_output, remote_status
     actions.append("run")
+    if mode == "start-launch-failed":
+        with mock.patch.object(subprocess, "Popen", side_effect=OSError("SSH could not start")):
+            return offload.ProcessController.stream_mac_run(controller, arguments)
     if mode in ("run-refusal", "after-probe"):
         wire, status = "linux_startup=unresolved\n", 75
         (root / (request.target + ".marker")).touch()
@@ -268,12 +271,12 @@ def commands(arguments, **options):
         if check_start_fence and isinstance(identity, claim_state.ClaimIdentity):
             command = offload.start_fence_command(identity, request.target, settle=True, scope_key=controller.claim_scope_key)
             settles_fence = arguments[-1].startswith(command + " || exit 1\n")
-            if mode == "start-fence-interrupted":
+            if mode in ("start-fence-interrupted", "start-launch-failed"):
                 if settles_fence:
                     actions.append("settle-start")
             else:
                 assert settles_fence
-            if mode in ("start-fence-confirmed", "start-release-unconfirmed"):
+            if settles_fence and mode not in ("start-fence-interrupted", "start-fence-unconfirmed"):
                 fence = run_start_fence(command)
         elif not unresolved and count == 0 and isinstance(identity, claim_state.ClaimIdentity):
             fence = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"

@@ -1072,6 +1072,7 @@ class ProcessController:
         return result
 
     def stream_mac_run(self, arguments: Sequence[str]) -> RemoteRunStatus:
+        before_launch = self.pending
         self.pending = PendingStartOperation()
         try:
             process = subprocess.Popen(
@@ -1080,7 +1081,7 @@ class ProcessController:
                 stderr=subprocess.STDOUT,
             )
         except OSError:
-            self.pending = SettledDispatchOperations()
+            self.pending = before_launch
             return MISSING_MAC_STATUS
         self.attempt_evidence.execution = execution_identity.ExecutionEvidenceUnavailable(
             "the remote start has no final observation", time.time())
@@ -1484,35 +1485,41 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig, leased_slots
 def release_claim(controller: ProcessController, target: str = "") -> ClaimReleaseConfirmed | ClaimReleaseUnconfirmed:
     if not isinstance(controller.pending, SettledDispatchOperations):
         return ClaimReleaseUnconfirmed("a claim or start operation remains pending")
-    identity = controller.claim_identity
-    if isinstance(identity, claim_state.NoClaimIdentity):
-        return ClaimReleaseUnconfirmed("the exact claim identity is unavailable")
-    result = controller.capture(
-        [
-            str(Path(__file__).resolve().parents[1] / "lib/py"),
-            str(Path(__file__).with_name("mac_test.py")),
-            "release",
-            "--pid",
-            str(os.getpid()),
-            "--claim-id", identity.claim_id,
-            "--episode", identity.episode,
-            "--attempt", identity.attempt,
-            *(["--settings", str(controller.claim_settings)] if isinstance(controller.claim_settings, Path) else []),
-            *(["--target", target] if target else []),
-        ]
-    )
-    if isinstance(result, CommandOutput):
-        if result.status == 0:
-            controller.claim_identity = claim_state.NO_CLAIM_IDENTITY
-        for line in result.stdout.splitlines():
-            if line.startswith("copy_bytes="):
-                transfers = cast(list[transfer_bytes.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
-                controller.attempt_evidence.traffic.transfers.extend(transfers)
-
-    if isinstance(result, CommandOutput) and result.status == 0:
-        pending_start_path(target, identity).unlink(missing_ok=True)
-        return ClaimReleaseConfirmed()
-    return ClaimReleaseUnconfirmed("the provider did not confirm exact release")
+    release: ClaimReleaseConfirmed | ClaimReleaseUnconfirmed = ClaimReleaseUnconfirmed(
+        "the provider did not confirm exact release")
+    try:
+        identity = controller.claim_identity
+        if isinstance(identity, claim_state.NoClaimIdentity):
+            release = ClaimReleaseUnconfirmed("the exact claim identity is unavailable")
+            return release
+        result = controller.capture(
+            [
+                str(Path(__file__).resolve().parents[1] / "lib/py"),
+                str(Path(__file__).with_name("mac_test.py")),
+                "release",
+                "--pid",
+                str(os.getpid()),
+                "--claim-id", identity.claim_id,
+                "--episode", identity.episode,
+                "--attempt", identity.attempt,
+                *(["--settings", str(controller.claim_settings)] if isinstance(controller.claim_settings, Path) else []),
+                *(["--target", target] if target else []),
+            ]
+        )
+        if isinstance(result, CommandOutput):
+            for line in result.stdout.splitlines():
+                if line.startswith("copy_bytes="):
+                    transfers = cast(list[transfer_bytes.TransferBytes], json.loads(line.removeprefix("copy_bytes=")))
+                    controller.attempt_evidence.traffic.transfers.extend(transfers)
+            if result.status == 0:
+                pending_start_path(target, identity).unlink(missing_ok=True)
+                controller.claim_identity = claim_state.NO_CLAIM_IDENTITY
+                release = ClaimReleaseConfirmed()
+        return release
+    finally:
+        if isinstance(release, ClaimReleaseUnconfirmed):
+            controller.pending = release
+            controller.attempt_evidence.cleanup = "unconfirmed"
 
 
 def assigned_claim_arguments(request: OffloadRequest) -> list[str]:
@@ -2557,14 +2564,7 @@ def finish_claimed_run(controller: ProcessController, config: OffloadConfig, req
         return
 
     evidence.unresolved_count = 0
-    released: ClaimReleaseConfirmed | ClaimReleaseUnconfirmed = ClaimReleaseUnconfirmed(
-        "release ended without confirmation")
-    try:
-        released = release_claim(controller, request.target)
-    finally:
-        if isinstance(released, ClaimReleaseUnconfirmed):
-            controller.pending = released
-            evidence.cleanup = "unconfirmed"
+    _ = release_claim(controller, request.target)
     if sync_after_release:
         from scripts.buildlog import sync as buildlog_sync
 
@@ -3258,8 +3258,8 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         if isinstance(controller.pending, PendingStartOperation):
             controller.attempt_evidence.cleanup = "unconfirmed"
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        _ = release_claim(controller, request.target)
-        if isinstance(request.placement, AssignedOffloadRequest):
+        released = release_claim(controller, request.target)
+        if isinstance(released, ClaimReleaseUnconfirmed) or isinstance(request.placement, AssignedOffloadRequest):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         claim = claim_for_run(controller, config, request, repository, tuple(leases))
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):

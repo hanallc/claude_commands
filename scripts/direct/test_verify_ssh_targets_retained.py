@@ -31,6 +31,31 @@ mac_test = eligibility_support.mac_test
 
 
 class VerifySshRetainedTests(VerifySshTargetsFixture):
+    def queue_requests(self) -> list[wire.Request]:
+        lines = (self.runner_state / "queue-events.jsonl").read_text().splitlines()
+        return [wire.parse_request(json.dumps(cast(dict[str, object], json.loads(line))["request"]))
+                for line in lines]
+
+    def test_ssh_launch_failure_settles_start_before_releasing_claim(self) -> None:
+        self.configure("natedev,linux")
+        result = self.verify("test", "sample", "--no-cache", "--target", "linux", extra={
+            "TEST_SSH_MODES": '{"linux":"start-launch-failed"}'})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        attempt, = self.ssh_events()
+        self.assertEqual(attempt["actions"][-4:], ["run", "cleanup", "settle-start", "release"], attempt)
+        self.assertEqual(attempt["result_type"], "LostMacRun")
+        requests = self.queue_requests()
+        report, = [request for request in requests if isinstance(request, wire.ExecutionReport)]
+        claims = {request.claim for request in requests if isinstance(request, wire.ConsumePermission)}
+        self.assertEqual(claims, {report.claim})
+        assert isinstance(report.claim, placement.ProviderClaimReference)
+        self.assertEqual(report.evidence, execution_identity.ExecutionNotStarted())
+        self.assertEqual(report.outcome, placement.AttemptDeclined("lost"))
+        self.assertIsInstance(report.path, placement.DispatchPathSettled)
+        self.assertEqual(attempt["adopted_claim_ids"], [report.claim.claim_id])
+        self.assertEqual(attempt["remaining_claim_ids"], [])
+        self.assertEqual(self.local_runs(), [])
+
     def test_lost_authorization_releases_the_exact_settled_start(self) -> None:
         self.check_lost_authorization("start-fence-confirmed")
 
@@ -92,10 +117,7 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
         identity = claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt)
         state = self.target_state("linux")
         journal = state / "pending-starts" / offload.pending_start_key(identity)
-        events = (self.runner_state / "queue-events.jsonl").read_text().splitlines()
-        requests = [wire.parse_request(json.dumps(cast(dict[str, object], json.loads(line))["request"]))
-                    for line in events]
-        report, = [request for request in requests if isinstance(request, wire.ExecutionReport)
+        report, = [request for request in self.queue_requests() if isinstance(request, wire.ExecutionReport)
                    and request.assignment == lost.assignment]
         self.assertEqual(report.claim, claim)
         self.assertEqual(report.evidence, execution_identity.ExecutionNotStarted())
@@ -231,6 +253,24 @@ if output_size:
         self.assertEqual((remaining.record["episode"], remaining.record["attempt"]),
                          old_claims[remaining.record["claim_id"]])
 
+    def test_unconfirmed_takeover_release_keeps_claim_and_exclusion(self) -> None:
+        self.configure("natedev,linux")
+        _ = self.retain_slots(old_capacity=1)
+        controls = caller_provider_controls(self, self.admission)
+        old, = controls.claims("linux")
+        result = self.verify("test", "sample", "--no-cache", "--target", "linux", extra={
+            "TEST_SSH_MODES": '{"linux":"takeover-release-unconfirmed"}'})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        attempt, = self.ssh_events()
+        self.assertEqual(attempt["actions"], ["claim:13", "cleanup", "release"], attempt)
+        self.assertEqual(attempt["result_type"], "BusyMacDecline")
+        self.assertEqual(attempt["adopted_claim_ids"], [old.record["claim_id"]])
+        self.assertEqual(attempt["remaining_claim_ids"], [old.record["claim_id"]])
+        remaining, = controls.claims("linux")
+        self.assertEqual(claim_state.claim_identity(remaining.record), claim_state.claim_identity(old.record))
+        self.assertTrue((self.runner_state / "provider-outcome-linux.json").is_file())
+        self.assertFalse(any(isinstance(request, wire.ClaimFailure) for request in self.queue_requests()))
+
     def test_retained_slots_stay_owned_when_retry_cannot_confirm_cleanup(self) -> None:
         self.configure("natedev,linux,spare")
         claims = self.retain_slots()
@@ -286,9 +326,7 @@ steps_path.write_text(json.dumps(steps))
         self.assertFalse((self.target_state("linux") / "unreachable_until").exists())
         self.assertEqual(json.loads((self.runner_state / "memory-steps.json").read_text()),
                          ["linux_attempt", "linux_cleanup_failed", "spare_retry", "spare_completed"])
-        requests = [wire.parse_request(json.dumps(cast(dict[str, object], json.loads(line))["request"]))
-                    for line in (self.runner_state / "queue-events.jsonl").read_text().splitlines()]
-        refusal, = [request for request in requests if isinstance(request, wire.ClaimFailure)
+        refusal, = [request for request in self.queue_requests() if isinstance(request, wire.ClaimFailure)
                     and request.assignment.destination.target == "linux"]
         self.assertIsInstance(refusal.claim, placement.ProviderClaimReference)
         assert isinstance(refusal.claim, placement.ProviderClaimReference)
