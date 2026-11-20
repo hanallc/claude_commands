@@ -566,13 +566,18 @@ log_push_pid=$!
 '''
 
 
-def boot_trap(cold: str, warm: str) -> str:
+BWRAP_UNAVAILABLE_STAGE = 'bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial'
+
+
+def boot_trap(cold: str, warm: str, *, production: bool) -> str:
     """Publish a shell failure before the tool shell can publish a result."""
     destination = f'destination="$box_dir/{cold}.curl"'
     if cold != warm:
         destination += f'\n        if [ -e "$box_dir/prepared" ]; then destination="$box_dir/{warm}.curl"; fi'
+    poweroff = '    shutdown -h now || :\n' if production else ''
     return fr'''boot_failed() {{
     status=$?
+    set +e
     trap - EXIT
     if [ -n "${{log_push_pid:-}}" ]; then kill "$log_push_pid" 2>/dev/null || :; fi
     if [ "$status" -ne 0 ]; then
@@ -581,16 +586,20 @@ def boot_trap(cold: str, warm: str) -> str:
         stage=$(sed -n 's/^[0-9T:Z-]\{{20\}} stage=//p' "$box_dir/boot.log" | tail -n 1)
         if [ "$stage" = 'tool preparation' ]; then
             message='Tool preparation failed'
+        elif [ "$stage" = '{BWRAP_UNAVAILABLE_STAGE}' ]; then
+            message="stage=$stage"
         else
             message="The box failed at stage ${{stage:-boot}}"
         fi
         message=$(printf '%s' "$message" | LC_ALL=C tr -d '[:cntrl:]' | sed 's/[\\"]/\\&/g')
         file="${{box_dir:-/var/lib/gate-trial}}/boot-error.json"
         printf '{{"verdict":"error","error":"%s (exit %s)"}}' "$message" "$status" > "$file"
-        safe_gate_record < "$file" |
-            gate_curl 'PUT boot error' --config "$destination" {shlex.join(BOX_CURL_RETRY)} --max-time 30 -X PUT --data-binary @- -o /dev/null || :
+        if [ "$?" -eq 0 ]; then
+            safe_gate_record < "$file" |
+                gate_curl 'PUT boot error' --config "$destination" {shlex.join(BOX_CURL_RETRY)} --max-time 30 -X PUT --data-binary @- -o /dev/null || :
+        fi
     fi
-    exit "$status"
+{poweroff}    exit "$status"
 }}
 trap boot_failed EXIT
 '''
@@ -620,6 +629,7 @@ def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_p
     downloads = download('guest', 'guest.py')
     if 'request' in links:
         downloads += download('request', 'request.json')
+    production = bool(links.get('production'))
     # The boot script's 077 protects its files; tests expect the normal umask.
     session = '''set +x +v
 umask 022
@@ -637,11 +647,15 @@ tool_path=$PATH
 unset __NIXOS_SET_ENVIRONMENT_DONE __ETC_PROFILE_SOURCED
 . /etc/profile
 export PATH="$tool_path:$PATH"
+if ! bwrap --ro-bind / / true; then
+    printf "%s stage={BWRAP_UNAVAILABLE_STAGE}\\n" "$(date -u +%FT%TZ)" >&2
+    exit 1
+fi
+printf "%s stage=bwrap ready\\n" "$(date -u +%FT%TZ)" >&2
 exec python3 "$box_dir/guest.py"'
-{('shutdown -h now' if links.get('production') else '')}
 '''
     deadline = (f'systemd-run --unit=cloud-gate-expiry --on-calendar=@{int(links["expires"])} /run/current-system/sw/bin/shutdown -h now'
-                if links.get('production') else f'shutdown -h +{lifetime_minutes}')
+                if production else f'shutdown -h +{lifetime_minutes}')
     return f'''#!/bin/sh
 set +x +v
 GATE_USER_DATA_STARTED_AT=$(date -u +%s)
@@ -679,7 +693,7 @@ printf '\\n}}\\n' >> "$box_dir/links.json"
 safe_gate_record() {{
     awk {shlex.quote(GATE_RECORD_FILTER)} "$box_dir/transfer-secrets" -
 }}
-{SHELL_CURL}{boot_trap(cold, warm)}printf '%s stage=boot\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+{SHELL_CURL}{boot_trap(cold, warm, production=production)}printf '%s stage=boot\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 {log_upload()}
 {log_push_loop(links, log_push_s)}touch "$box_dir/timeline.log"
 id -u gate-trial >/dev/null 2>&1 || useradd -m -g users gate-trial

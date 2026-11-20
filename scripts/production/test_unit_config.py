@@ -18,6 +18,7 @@ from scripts.lib import atomic_file, conf, git_exclude
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.git_exclude import ExcludeRefused
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff, unit_config as config
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
 from scripts.agents import remote
@@ -28,6 +29,16 @@ from scripts.production.unit_config_format_test_support import (
 
 
 class UnitPortSelectionTests(StaffTestCase):
+    def test_default_port_refuses_a_reversed_range(self) -> None:
+        atomic_file.write_text_atomic(self.root / "Cargo.toml", '[package]\nname = "hana"\n')
+        settings = self.root / "production.conf"
+        _ = write_config_fixture(settings, "unit_port_first=15789\nunit_port_last=15720\n")
+        settings_read = conf.read(settings)
+        with patch.object(conf, "read", return_value=settings_read):
+            with self.assertRaises(config.ConfigRefused) as refused:
+                _ = config.default_port(self.root, config.NoAppPort())
+        self.assertEqual(str(refused.exception), "unit_port_first (15789) must be at most unit_port_last (15720)")
+
     def test_port_range_excludes_recorded_reserved_and_bound_ports(self) -> None:
         atomic_file.write_text_atomic(self.root / "Cargo.toml", '[package]\nname = "hana"\n')
         peer = self.root / "peer"
@@ -40,9 +51,9 @@ class UnitPortSelectionTests(StaffTestCase):
                 held.bind(("127.0.0.1", 0))
                 number = cast(tuple[str, int], held.getsockname())[1]
                 settings = self.root / "production.conf"
-                atomic_file.write_text_atomic(settings, f"# whole: 1..\nunit_port_first={number}\n# whole: 1..\nunit_port_last={number}\n"
-                    + f"# whole: 1..\nmac_run_port={number if cause == 'mac' else 1}\n"
-                    + f"# whole: 1..\nsmoke_port={number if cause == 'smoke' else 2}\n")
+                _ = write_config_fixture(settings, f"unit_port_first={number}\nunit_port_last={number}\n"
+                    + f"mac_run_port={number if cause == 'mac' else 1}\n"
+                    + f"smoke_port={number if cause == 'smoke' else 2}\n")
                 atomic_file.write_text_atomic(peer / ".unit.toml", 'plan = "plan.md"\nresponsibilities = []\n'
                     + (f"port = {number}\n" if cause == "recorded" else ""))
                 if cause not in ("bound", "full"):

@@ -13,7 +13,6 @@ below is required; the implementation has no fallback values.
 
 | Key | Shipped value | Meaning |
 | --- | --- | --- |
-| `wait_seconds` | `1` | Required positive, finite value. The slot wait uses `slots.wait_seconds` in `build_folders.conf`. |
 | `git_timeout_seconds` | `600` | Positive, finite deadline in seconds for each Git subprocess. |
 | `guard_timeout_seconds` | `10` | Positive, finite deadline in seconds for the combined repository-copy and scratch guard. |
 
@@ -25,6 +24,7 @@ paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
 `config/build_folders.conf` sets the slot root and pool limits.
+The `slots.wait_seconds` setting limits the wait for a slot.
 The root uses `roots.slots.<machine>`, with `roots.slots` as the default.
 The limit uses `slots.<machine>.<repository>.max`, with `slots.<machine>.default_max` as the default.
 Owners on the same machine share the pool for a repository.
@@ -245,12 +245,13 @@ Callers must finish all checkout access before the context ends.
 `CopyError` represents a refusal.
 `PreparationError` represents an application or merge failure.
 
-`hold --repo R` holds a staged checkout until its standard input closes.
-It computes the staged tree through a private index before it prepares the checkout.
-It accepts no staged-tree argument.
-It prints the tree identity first and the checkout path second.
+`hold --repo R --tree T --scratch` holds a checkout of staged tree `T` until its standard input closes.
+It prints the checkout path.
+`hold --repo R --tree T` without `--scratch` runs one slot step in that tree.
+`hold` without `--tree` exits with status 2 and prints `copies: hold requires --tree. Run verify.sh again.` before it opens a checkout.
+That message reaches a `verify.sh` run that started before the `--tree` change.
 It reads the source owner, including the owner in a standing checkout's `.gate.json`.
-`verify.sh doc` reads both lines and retains the lease through descriptor 8.
+`verify.sh doc` reads the path line and retains the lease through a free descriptor.
 The source index and unchanged file modification times remain unchanged.
 `run` requires `--commit` and accepts no staged-source flags.
 

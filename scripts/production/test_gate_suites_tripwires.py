@@ -202,14 +202,17 @@ raise SystemExit(0)
                 module_statuses.append((job.path.name, status))
             return finish(job, status)
 
-        with mock.patch.object(gate, "finish_gate_job", side_effect=record_finish):
-            result = self.run_gate("--tests-only")
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(gate, "finish_gate_job", side_effect=record_finish), redirect_stdout(output):
+            run = gate.run_suites(self.checkout, type_dirs=("scripts",))
+        report = output.getvalue()
+        self.assertFalse(run.passed, report)
         self.assertIn(
             "test_first.py: a test read live memory /proc/pressure/memory: python3 'memory checker.py' check",
-            result.stdout)
-        self.assertNotIn("test_second.py: a test read live memory", result.stdout)
-        self.assertNotIn("Rerun alone:", result.stdout)
+            report)
+        self.assertNotIn("test_second.py: a test read live memory", report)
+        self.assertNotIn("Rerun alone:", report)
         self.assertCountEqual(module_statuses, [("test_first.py", 0), ("test_second.py", 0)])
         for name in ("test_first.py", "test_second.py"):
             events = [event["event"] for event in self.module_events() if event["module"] == name]

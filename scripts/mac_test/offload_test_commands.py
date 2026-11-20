@@ -155,10 +155,8 @@ if [[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]; then
         await_release continue-cleanup
     fi
     if [[ -n $selector_shell ]]; then
-        export PATH="$root/selectors:$PATH"
-        checks=''
+        printf -v checks 'export PATH=%q:"$PATH"\n' "$root/selectors"
         for name in pgrep lsof sleep; do
-            [[ $(command -v "$name") == "$root/selectors/$name" ]] || exit 99
             printf -v check '[ "$(command -v %s)" = %q ] || exit 99\n' "$name" "$root/selectors/$name"
             checks+=$check
         done

@@ -10,6 +10,7 @@ from typing import ClassVar, override
 from unittest import mock
 
 from scripts.production import gate
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib import build_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.affected_modules import NoCertifiedBase
@@ -30,8 +31,9 @@ class TargetedTestTests(MergeGateFixture):
     def test_targeted_runner_holds_and_removes_its_test_folder(self) -> None:
         allocated: list[Path] = []
 
-        def run(_args: gate.GateArguments, mode: gate.SuiteMode) -> int:
+        def run(args: gate.GateArguments, mode: gate.SuiteMode) -> int:
             self.assertIs(mode, gate.SuiteMode.TARGETED)
+            self.assertEqual(args.gate_job, StepJob("test-affected"))
             path = Path(os.environ["TMPDIR"])
             allocated.append(path)
             self.assertEqual(build_folders.build_folder_state(path), "held")

@@ -44,7 +44,7 @@ from scripts.direct import phase_reservation, phase_table, plan_history, progres
 # These regressions check the private verifier's semantic result before wait closure.
 from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.direct.findings_test_support import invoke_findings
+from scripts.direct.findings_test_support import STANDARD_CONFIG, invoke_findings
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -5332,6 +5332,20 @@ with patch.object(fcntl, "flock", admission):
         self.assertNotIn("today", finished)
 
 
+    def test_findings_refuses_fewer_than_two_stalled_rounds(self) -> None:
+        _ = self.config_file.write_text(
+            STANDARD_CONFIG.replace("STALLED_ROUNDS=2", "STALLED_ROUNDS=1"),
+            encoding="utf-8",
+        )
+        result = invoke_findings(
+            ["gate", "--session-dir", str(self.root / "session")],
+            {**os.environ, "CONF_DIR": str(self.root)},
+            self.working_dir,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("STALLED_ROUNDS", result.stderr)
+        self.assertIn("outside range 2..", result.stderr)
+
     def write_full_config(self) -> None:
         """findings.py refuses every convergence limit it cannot read."""
         _ = self.config_file.write_text(
@@ -5343,7 +5357,7 @@ with patch.object(fcntl, "flock", admission):
                     "# whole: 1..", "RUNAWAY_ROUNDS=5",
                     "# whole: 1..", "MAX_FIX_ATTEMPTS=2",
                     "# whole: 1..", "MAX_REOPENS=2",
-                    "# whole: 1..", "STALLED_ROUNDS=2",
+                    "# whole: 2..", "STALLED_ROUNDS=2",
                     "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=3",
                     "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1",
                     "# whole: 1..", "ROUTING_FROM_ROUND=4",
