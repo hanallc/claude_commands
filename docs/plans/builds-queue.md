@@ -3258,6 +3258,14 @@ Tests, in `test_only_a_busy_mac_candidate_appears_in_the_mac_waits` (test_placem
 2. A Mac-only lost attempt, then confirmed removal: `DoNotRetry("target is no longer configured")` and empty wait outputs.
 Keep the registry error and recovered omission rows. Item 2 keeps the 44cu rows green.
 
+### Phase 44dq — Task cleanup ends every hold when another cleanup changes a journal  · status: todo
+**From the 44dn closure (pass 2), 2026-11-19:** the builds landing rule moves these gaps out of 44dn. After 44dn merges.
+
+1. `checked_operation` refuses a journal that changed after the first scan with `FolderRecoveryRequired` (scratch.py:2118). Empty-pair removal catches only `UnreadableFolderOperation` (scratch.py:4045), so the refusal escapes. A second `scratch end` that marks an unrelated adoption journal after the first scan aborts the first cleanup before it saves the later hold changes (scratch.py:3970). Fix: a changed journal keeps only the folders its paths overlap; cleanup ends the other holds and reports the journal.
+2. A journal that the same `scratch end` makes is read again by each later removal and finalization (scratch.py:2112, :3368, :3103). Fix: add it to the one reading when it is first read.
+
+Tests: one row in `test_end_reports_held_work_and_continues_after_a_removal_error` (test_scratch.py:1849) for item 1, failing first. Item 2 needs no row (no user-visible result); the item 1 row covers the path.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
