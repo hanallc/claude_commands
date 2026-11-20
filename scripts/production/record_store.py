@@ -94,6 +94,12 @@ def review_folders(owner: staff.StaffId, kind: str) -> tuple[Path, ...]:
 PROPOSALS_FIELD = "Proposals"
 
 
+def _expand_proposals_folder(doc: Path, value: Path) -> Path:
+    folder = value.expanduser()
+    # A relative folder starts at the checkout that contains docs/plans.
+    return folder if folder.is_absolute() else doc.parent.parent.parent / folder
+
+
 def issues_folder(doc: Path, *, lines: list[str] | None = None) -> Path | None:
     """Return the configured folder, or None when the document has no proposals field."""
     if lines is None:
@@ -102,11 +108,10 @@ def issues_folder(doc: Path, *, lines: list[str] | None = None) -> Path | None:
         except UnicodeError as error:
             raise OSError(f"{doc}: {error}") from error
     try:
-        folder = Path(production_field(lines, PROPOSALS_FIELD)).expanduser()
+        value = Path(production_field(lines, PROPOSALS_FIELD))
     except Refusal:
         return None
-    # A relative folder starts at the checkout that contains docs/plans.
-    return folder if folder.is_absolute() else doc.parent.parent.parent / folder
+    return _expand_proposals_folder(doc, value)
 
 
 FileStamp = tuple[int, int, int, int, int, int]
@@ -128,7 +133,7 @@ class _FolderHistory:
     query: Path
     environment: tuple[tuple[str, str], ...]
     stamps: dict[Path, FileStamp]
-    folders: tuple[Path, ...]
+    values: tuple[Path, ...]
 
 
 _history_cache: OrderedDict[Path, _FolderHistory] = OrderedDict()
@@ -253,15 +258,25 @@ def _read_folder_history(doc: Path) -> tuple[Path, ...] | None:
             raise OSError(f"Cannot read folder history for {doc}: {result.stderr.strip()}")
         return None
     prefix = f"- **{PROPOSALS_FIELD}:**"
-    folders: list[Path] = []
+    values: list[Path] = []
     for line in result.stdout.split("\n"):
         if line.startswith(("+" + prefix, "-" + prefix)):
-            if (folder := issues_folder(doc, lines=[line[1:]])) is not None:
-                folders.append(folder)
-    return tuple(folders)
+            try:
+                value = production_field([line[1:]], PROPOSALS_FIELD)
+            except Refusal:
+                continue
+            values.append(Path(value))
+    return tuple(values)
 
 
-def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) -> Iterator[Path]:
+def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None,
+                             expand_paths: bool = True) -> Iterator[Path]:
+    """Return the historical paths, with optional expansion for each path."""
+    for value in _historical_folder_values(doc, sources):
+        yield _expand_proposals_folder(doc, value) if expand_paths else value
+
+
+def _historical_folder_values(doc: Path, sources: list[Path] | None) -> Iterator[Path]:
     """Reuse successful Git history until a repository input changes."""
     if os.environ.get("GIT_DIR"):
         yield from _read_folder_history(doc) or ()
@@ -278,7 +293,7 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
         if sources is not None:
             sources.extend(cached.stamps)
         if _stamps_match(cached.stamps):
-            yield from cached.folders
+            yield from cached.values
             return
 
     root = next((folder for folder in resolved.parents
@@ -295,16 +310,16 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
         except (OSError, RuntimeError, ValueError):
             # Git still reports the original result or error when metadata cannot be stamped.
             pass
-    folders = _read_folder_history(doc)
-    if folders is None:
+    values = _read_folder_history(doc)
+    if values is None:
         return
     if stamps and _stamps_match(stamps):
         with _history_lock:
-            _history_cache[resolved] = _FolderHistory(query, environment, stamps, folders)
+            _history_cache[resolved] = _FolderHistory(query, environment, stamps, values)
             _history_cache.move_to_end(resolved)
             if len(_history_cache) > _HISTORY_LIMIT:
                 _ = _history_cache.popitem(last=False)
-    yield from folders
+    yield from values
 
 
 def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path] = (),
@@ -325,8 +340,10 @@ def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path
 
     resolved: dict[Path, None] = {}
 
-    def add_resolved_folder(folder: Path, source: Path) -> None:
+    def add_resolved_folder(folder: Path, source: Path, *, expand_proposals_value: bool = False) -> None:
         try:
+            if expand_proposals_value:
+                folder = _expand_proposals_folder(source, folder)
             if "\x00" in str(folder):
                 raise ValueError("A folder path cannot contain NUL.")
             resolved[folder.resolve()] = None
@@ -374,13 +391,13 @@ def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path
                     if configured is not None:
                         add_resolved_folder(configured, document)
             if include_history:
-                historical: list[Path] = []
                 try:
-                    historical.extend(historical_issue_folders(document, sources=sources))
+                    historical = dict.fromkeys(historical_issue_folders(document, sources=sources, expand_paths=False))
                 except (OSError, ValueError, RuntimeError) as error:
                     source_failed(document, error, required=document_required or isinstance(error, RuntimeError))
-                for folder in historical:
-                    add_resolved_folder(folder, document)
+                else:
+                    for folder in historical:
+                        add_resolved_folder(folder, document, expand_proposals_value=True)
     return tuple(resolved)
 
 

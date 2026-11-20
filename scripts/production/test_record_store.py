@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 from scripts.agents.remote import local_machine
 from scripts.production import record_store, staff
@@ -41,6 +42,27 @@ class NumberedRecordsTests(unittest.TestCase):
             git.assert_called_once()
         _ = self.commit_folder(doc, new)
         self.assertEqual(set(record_store.historical_issue_folders(doc)), {old, new})
+
+        with self.subTest(history="unknown account"):
+            old.mkdir()
+            new.mkdir()
+            _ = self.commit_folder(doc, Path(f"~review-test-{uuid4().hex}/proposals"))
+            _ = self.commit_folder(doc, new)
+            notices: list[Path] = []
+
+            def skipped(source: Path, error: Exception) -> None:
+                self.assertIsInstance(error, RuntimeError)
+                notices.append(source)
+
+            with (patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(doc.parent / "state")}),
+                  patch.object(subprocess, "run", wraps=subprocess.run) as git):
+                for _ in range(2):
+                    notices.clear()
+                    folders = record_store.known_folders(record_store.RecordKind.PROPOSAL, staff.StaffId("owner"),
+                        document=doc, strict=True, on_source_error=skipped)
+                    self.assertEqual(folders, (new.resolve(), old.resolve()))
+                    self.assertEqual(notices, [doc])
+                git.assert_called_once()
 
     def test_history_follows_branches_and_detached_worktree_heads(self) -> None:
         doc = self.git_history_fixture()
