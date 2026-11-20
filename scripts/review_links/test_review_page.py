@@ -1962,16 +1962,16 @@ requestAnimationFrame(focusRow);
         with self.firefox_commands(page.as_uri()) as command:
             for theme in ('dark', 'light'):
                 for selector in ('#review-show-open', '#filter-show-open'):
-                    position = cast(dict[str, list[int]], command('WebDriver:ExecuteScript',
-                        args=[theme, selector], script=r"""
+                    for state in ('hover', 'active'):
+                        with self.subTest(theme=theme, selector=selector, state=state):
+                            position = cast(dict[str, list[int]], command('WebDriver:ExecuteScript',
+                                args=[theme, selector], script=r"""
 const [theme, selector] = arguments;
 document.documentElement.dataset.theme = theme;
 const {x, y, width, height} = document.querySelector(selector).getBoundingClientRect();
 return [Math.floor(x + width / 2), Math.floor(y + height / 2)];
 """))
-                    x, y = position['value']
-                    for state in ('hover', 'active'):
-                        with self.subTest(theme=theme, selector=selector, state=state):
+                            x, y = position['value']
                             actions: list[dict[str, int | str]] = [
                                 {'type': 'pointerMove', 'origin': 'viewport', 'x': x, 'y': y, 'duration': 0}]
                             if state == 'active':
@@ -2023,7 +2023,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         def command(name: str, **parameters: object) -> object:
             try:
                 return send(name, **parameters)
-            except (OSError, ValueError, AssertionError) as error:
+            except (OSError, ValueError, OverflowError, AssertionError) as error:
                 try:
                     session.close()
                 except Exception as cleanup_error:
@@ -2116,17 +2116,30 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 
     @contextmanager
     def firefox_commands(self, url: str) -> Generator[Callable[..., object]]:
-        command = self.firefox()
-        original = cast(dict[str, str], command('WebDriver:GetWindowHandle'))['value']
-        tab = cast(dict[str, str], command('WebDriver:NewWindow', type='tab'))
-        _ = command('WebDriver:SwitchToWindow', handle=tab['handle'])
+        def open_tab(send: Callable[..., object]) -> str:
+            original = cast(dict[str, str], send('WebDriver:GetWindowHandle'))['value']
+            tab = cast(dict[str, str], send('WebDriver:NewWindow', type='tab'))
+            _ = send('WebDriver:SwitchToWindow', handle=tab['handle'])
+            _ = send('WebDriver:Navigate', url=url)
+            return original
+
+        send = self.firefox()
+        opened = send, open_tab(send)
+
+        def command(name: str, **parameters: object) -> object:
+            nonlocal opened
+            send = self.firefox()
+            if send is not opened[0]:
+                opened = send, open_tab(send)
+            return send(name, **parameters)
+
         try:
-            _ = command('WebDriver:Navigate', url=url)
             yield command
         finally:
-            if type(self).browser_command is command:
-                _ = command('WebDriver:CloseWindow')
-                _ = command('WebDriver:SwitchToWindow', handle=original)
+            send, original = opened
+            if send is type(self).browser_command:
+                _ = send('WebDriver:CloseWindow')
+                _ = send('WebDriver:SwitchToWindow', handle=original)
 
     def run_browser_probe(self, handler: type[BaseHTTPRequestHandler], complete: threading.Event,
                           *, route: str = '/') -> None:
