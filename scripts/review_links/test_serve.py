@@ -3730,12 +3730,14 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(len(deliveries), 2)
 
             with self.subTest(recovery="live retry takes the claim"):
+                item = the_list.add(morty.id, "The retry item", owner=the_list.UnassignedOwner.NATE,
+                                    source="nate", changes={})
                 recovery_root = self.root.parent / "live-retry-recovery"
                 deliveries.clear()
                 started.clear()
                 release.clear()
                 request = uuid4().hex
-                body = urlencode({**fields, "request": request, "words": "Is the gate ready?",
+                body = urlencode({**fields, "id": item.id, "request": request, "words": "Is the gate ready?",
                     "token": list_page.request_token(recovery_root, morty.id, item.id, request)})
                 status = change_page.DeliveryStatus(recovery_root)
                 pending = list_page.submit(recovery_root, body, status)
@@ -3776,6 +3778,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                     first.result(TEST_HANG_GUARD_SECS)
 
             with self.subTest(recovery="result lock fails"):
+                item = the_list.add(morty.id, "The lock failure item", owner=the_list.UnassignedOwner.NATE,
+                                    source="nate", changes={})
                 recovery_root = self.root.parent / "lock-failure-recovery"
                 previous = change_page.DeliveryStatus(recovery_root)
                 pending_question = the_list.ask_question(morty.id, item.id,
@@ -3787,6 +3791,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                 deliveries.clear()
                 release.set()
                 lock = status.locked
+                accepted: set[tuple[staff.StaffId, str]] = set()
+
+                def send_with_receipt(recipient: staff.StaffId, message: str, message_id: str
+                                      ) -> tuple[send_result.ConfirmedSendOutcome, str]:
+                    key = recipient, message_id
+                    if key in accepted:
+                        return question_outcome("skipped", "The transport has a receipt.")
+                    result = send(recipient, message, message_id)
+                    accepted.add(key)
+                    return result
 
                 @contextmanager
                 def lock_before_send() -> Generator[None]:
@@ -3795,15 +3809,22 @@ class ReviewLinksServerTests(unittest.TestCase):
                     with lock():
                         yield
 
-                with (patch.object(status, "locked", side_effect=lock_before_send),
-                      redirect_stderr(StringIO()) as errors):
-                    change_page.recover_review_messages(status)
-                self.assertIn("The result lock is unavailable.", errors.getvalue())
                 path = status.path(pending_question.page, pending_question.row)
-                self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENDING)
-                self.assertFalse(status.question_jobs)
-                change_page.recover_review_messages(change_page.DeliveryStatus(recovery_root))
+                with patch.object(change_page, "send_question", side_effect=send_with_receipt) as transport:
+                    with (patch.object(status, "locked", side_effect=lock_before_send),
+                          redirect_stderr(StringIO()) as errors):
+                        change_page.recover_review_messages(status)
+                    interrupted = change_page.read_question_attempt(path)
+                    self.assertEqual(interrupted.state, delivery_state.QuestionSendState.SENDING)
+                    self.assertFalse(status.question_jobs)
+                    change_page.recover_review_messages(change_page.DeliveryStatus(recovery_root))
+                self.assertIn("The result lock is unavailable.", errors.getvalue())
+                self.assertEqual(transport.call_args_list, [
+                    call(morty.id, interrupted.message, interrupted.message_id),
+                    call(morty.id, interrupted.message, interrupted.message_id),
+                ])
                 self.assertEqual(len(deliveries), 1)
+                self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
                 self.assertEqual(status.request_attempts, {})
 
     def test_list_ask_preserves_unicode_separators(self) -> None:
