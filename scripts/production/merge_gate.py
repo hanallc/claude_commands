@@ -70,7 +70,7 @@ from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import read_step_names
+from scripts.lib.build_steps import gate_job_for_command, read_step_names
 from scripts.production import affected_modules, change_review, land_runs, session_staff, staff, unit_config, unit_names  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
@@ -87,6 +87,7 @@ from scripts.test_times import gate_record
 from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.queue_place import (  # noqa: E402
     QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix,
 )
@@ -159,6 +160,7 @@ class GateArguments(argparse.Namespace):
     full: bool = False
     nightly: bool = False
     modules: list[str] = field(default_factory=list)
+    gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
 
 
 class SuiteMode(Enum):
@@ -2155,7 +2157,7 @@ def merge_checkpoint(args: GateArguments) -> int:
         os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
             suites = run_gate_suites(repo, float(args.module_time_limit_s),
-                                source="checkpoint", full=args.full)
+                                     source="checkpoint", full=args.full, gate_job=args.gate_job)
         finally:
             if previous_unit is None:
                 _ = os.environ.pop(admission_records.BUILDLOG_UNIT, None)
@@ -2837,7 +2839,8 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
 class CloudGateRoute(Protocol):
     """Define the cloud route boundary without coupling the local runner to AWS."""
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
-              module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES) -> GateRun | str: ...
+              module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES,
+              gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun | str: ...
 
     def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
 
@@ -2845,7 +2848,8 @@ class CloudGateRoute(Protocol):
 def run_gate_suites(repo: Path,
                     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
-                    mode: SuiteMode = SuiteMode.MERGE_GATE) -> GateRun:
+                    mode: SuiteMode = SuiteMode.MERGE_GATE,
+                    gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
     """Use the scaler service and retain the permitted local fallback."""
     cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
     selected: AllModules | TreeSelection = ALL_MODULES
@@ -2868,7 +2872,8 @@ def run_gate_suites(repo: Path,
                             hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
                             max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
             return GateRun((), 0.0, 0.0, selection_certified=True)
-    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected)
+    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                          selected=selected, gate_job=gate_job)
     if isinstance(outcome, str):
         print('Cloud gate uses natedev: ' + outcome, flush=True)
         return run_suites(repo, module_time_limit_s=module_time_limit_s, source=source, full=full, mode=mode)
@@ -2907,7 +2912,8 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
             repo = Path(args.repo).resolve()
             with gate_recovery(repo):
                 run = (run_named_modules(repo, args.modules, args.module_time_limit_s, mode) if args.modules else
-                       run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode))
+                       run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
+                                       mode=mode, gate_job=args.gate_job))
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
@@ -2986,7 +2992,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
                             help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
-    args = cast(GateArguments, parser.parse_args(argv))
+    args = cast(GateArguments, parser.parse_args(arguments))
+    args.gate_job = gate_job_for_command(["merge_gate.py", *arguments])
     if args.promote_only and not args.merge_branch:
         parser.error("--promote-only needs --merge-branch")
     if args.nightly and not args.merge_branch:

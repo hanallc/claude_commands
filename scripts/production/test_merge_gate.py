@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.build_queue import admission_records
+from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
 
@@ -112,6 +113,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                             0, 0, tests_reused=True)
 
                     def merge(arguments: merge_gate.GateArguments) -> int:
+                        self.assertEqual(arguments.gate_job, StepJob("integrate", unit="fixture", branch="integration"))
                         try:
                             return checkpoint(arguments)
                         finally:

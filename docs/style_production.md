@@ -24,7 +24,7 @@ it joins; a tier A or E rule, local or global, has no family.
 
 | Family | B: listed rules | C: file reads | D: crate checks |
 | --- | --- | --- | --- |
-| `names` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
+| `names` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
 | `values` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
 | `types` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
 | `modules` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
@@ -127,8 +127,7 @@ every fix.
 5. Names: spell-out-names, dont-repeat-enum-domain-in-variant-names,
    name-submodules-after-anchor-types, prefer-type-named-fields-and-bindings,
    dont-repeat-type-name-in-fields, avoid-repeated-field-affixes,
-   name-bindings-to-match-parameters, comments-name-code-constructs,
-   forbidden-words.
+   name-bindings-to-match-parameters, comments-name-code-constructs.
 6. Layout, sort only: constants-file-organization, module-structure.
    workspace-dependencies takes any position after use-bevy_kana-in-all-bevy-crates.
 7. Tier A final: rustfmt, clippy, mend.

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import cast, final
 from collections.abc import Generator
 from unittest import mock
+from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.production import affected_modules, checkpoint_gate, merge_gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import process_group
@@ -197,9 +198,9 @@ class MergeGateSuitesTests(GateSuitesFixture):
                 routed: list[merge_gate.AllModules | merge_gate.TreeSelection] = []
 
                 def route(repo: Path, *, mode: merge_gate.SuiteMode, full: bool,
-                          module_time_limit_s: float,
-                          selected: merge_gate.AllModules | merge_gate.TreeSelection = merge_gate.ALL_MODULES
-                          ) -> merge_gate.GateRun | str:
+                          module_time_limit_s: float, selected: merge_gate.AllModules | merge_gate.TreeSelection,
+                          gate_job: StepJob | GateJobNotRecorded) -> merge_gate.GateRun | str:
+                    self.assertEqual(gate_job, StepJob("test-affected"))
                     self.assertEqual(repo, self.checkout)
                     self.assertEqual(mode, merge_gate.SuiteMode.TARGETED_TEST)
                     self.assertFalse(full)
