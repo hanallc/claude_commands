@@ -372,8 +372,6 @@ class CopyTests(TmpSweepCase):
     def test_copy_entries_are_individual_and_empty_pair_goes_after_last_copy(self) -> None:
         old = self.copy("old")
         live = self.copy("live", task="gate:live")
-        _ = subprocess.run(["git", "-C", str(live), "init", "-q"], check=True, capture_output=True)
-        scratch.exclude_copy_metadata(live)
         result = self.sweep()
         self.assertFalse(old.exists())
         self.assertTrue(live.exists())

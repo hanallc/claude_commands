@@ -2294,15 +2294,20 @@ print(scratch.target('gate:proof', 'tree', False))
                 self.assertEqual(scratch.record_lifetime(source, time.time()),
                                  scratch.Live(f"borrowed: {borrower} still uses its git objects"))
                 alternates.unlink()
+                if name == "one-store":
+                    self.assertEqual(scratch.record_lifetime(source, time.time()),
+                                     scratch.Live(f"borrowed: {borrower} still uses its git objects"))
+                    scratch.atomic_record(borrower / copy_record.RECORD, {"task": "gate:borrower"})
                 self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
 
         with self.subTest(borrower="setup"), tempfile.TemporaryDirectory(dir=source.parent) as directory:
             borrower = Path(directory)
             scratch.register_copy(borrower, task="gate:borrower", owner_unit="maker", source_path=str(source),
                                   source_commit="a" * 40, copy_commit="", target_mode="none",
-                                  seed_source="", borrows_from=str(source / ".git"))
+                                  seed_source="", borrows_from=f"{other}\n{source / '.git'}")
+            self.assertFalse((borrower / ".git").exists())
             self.assertEqual(scratch.record_lifetime(source, time.time()),
-                             scratch.Unknown(f"{borrower}: copy setup has no checkout yet"))
+                             scratch.Live(f"borrowed: {borrower} still uses its git objects"))
             self.assertEqual(scratch.end("gate:borrower"), [borrower])
             self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
 

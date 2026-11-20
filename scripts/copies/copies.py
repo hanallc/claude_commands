@@ -1713,7 +1713,7 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
         found.append((tree, record))
     selected = dict(found)
     try:
-        storage = {tree: scratch.checkout_storage(tree) for tree in selected}
+        storage = {tree: scratch.borrowed_storage(tree, record) for tree, record in selected.items()}
     except (OSError, ValueError, RuntimeError) as error:
         raise CopyError(f"cannot check borrowed objects: {error}") from error
     ordered: list[tuple[Path, copy_record.Registered]] = []

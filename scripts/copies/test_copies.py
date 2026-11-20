@@ -1624,7 +1624,10 @@ with patch.object(subprocess, 'run', pause_clone):
             **(record.fields if isinstance(record, copy_record.Registered) else {}),
             "borrows_from": str(link / ".git"),
         })
-        _ = (child / ".git/objects/info/alternates").write_text(str(link / ".git/objects") + "\n")
+        alternates = child / ".git/objects/info/alternates"
+        _ = alternates.write_text(str(link / ".git/objects") + "\n")
+        self.assertEqual([tree for tree, _ in copies.owned_workspaces(self.owner_id)], [child, parent])
+        alternates.unlink()
         self.assertEqual([tree for tree, _ in copies.owned_workspaces(self.owner_id)], [child, parent])
 
     def test_first_use_owns_git_and_never_changes_source_branch(self) -> None:

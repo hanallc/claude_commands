@@ -64,7 +64,7 @@ A clone of an active gate uses `--no-local` without sharing its object store.
 Worktree snapshots use a temporary object store while they read staged and working files.
 The new copy's alternates list does not include the worktree's intermediate store.
 Existing copies keep their alternates.
-Removal reads live Git directories and alternates before it deletes a store.
+Removal reads copy records and live Git storage before it deletes a store.
 The saved-work check trusts cached remote-tracking refs when they cover all local commits.
 Otherwise, removal runs `git ls-remote` in the clone once per named remote.
 Git uses the named remote's configured transport.
@@ -116,15 +116,15 @@ Writers must honor the removal locks through deletion, including during the remo
 A retry with Cargo work validates the source again after these helpers.
 A first removal records source evidence after these helpers.
 Linked checkout creation refuses a source with a removal mark.
-Recursive removal checks the busy locks and live Git alternates of existing descendant clones.
+Recursive removal checks the busy locks and borrow evidence for existing descendant clones.
 Busy marks and copy records must be regular files.
 Task cleanup removes the clone and clears the removal marks before it tries to remove the lease file and lock file.
 Cleanup holds the lock and checks the identities of those two files before it removes either file.
 Recovery leaves the files if the clone is already absent when recovery starts.
 
-The borrow check keeps sources that live Git alternates reference.
-It keeps a potential source while a registered copy has no published Git checkout.
-An idle copy with an ended task can leave even if setup did not publish a checkout.
+The borrow check keeps a source when a copy record or a live Git alternate names its storage.
+Workspace registration records the root stores before setup publishes the Git checkout.
+The recorded borrow ends when cleanup removes the copy and its record.
 It also keeps sources when it cannot read a copy record.
 It checks the copy folders in the registry and the adopted copies in the holds file.
 It skips an unregistered folder if the folder's parent is directly under the copies root and contains `.git`.

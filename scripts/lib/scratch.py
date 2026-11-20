@@ -985,7 +985,7 @@ def registered_copy_paths() -> Iterator[Path]:
         record = task_of(path)
         if (isinstance(record, copy_record.UnreadableRecord)
                 or isinstance(record, copy_record.Registered)
-                and (record.fields.get("test_hana_clone") is True
+                and ("borrows_from" in record.fields
                      or os.path.lexists(path / ".git") or (path / "HEAD").is_file())):
             paths.add(path)
     yield from sorted(paths)
@@ -1088,10 +1088,18 @@ def checkout_storage(checkout: Path) -> tuple[Path, ...]:
     except git_files.NotACheckout:
         objects = checkout / "objects"
         if (checkout / "HEAD").is_file() and objects.is_dir():
-            return (objects, *object_alternates(objects))
+            return tuple(object_alternates(objects))
         return ()
     objects = git.common_dir / "objects"
     return (git.git_dir, objects, *object_alternates(objects))
+
+
+def borrowed_storage(checkout: Path, record: copy_record.Registered) -> tuple[Path, ...]:
+    """Read the storage from the copy record and the live checkout."""
+    borrowed = record.fields.get("borrows_from", "")
+    if not isinstance(borrowed, str):
+        raise ValueError(f"{checkout / copy_record.RECORD}: invalid borrows_from")
+    return (*checkout_storage(checkout), *(Path(store) for store in borrowed.split("\n") if store))
 
 
 def storage_in_folder(storage: tuple[Path, ...], folder: Path) -> bool:
@@ -1105,7 +1113,6 @@ def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | 
     protection: Live | Ended | Unknown = Ended("no copy borrows from it")
     try:
         folder = path.resolve()
-        copies_root = copy_record.copies_root()
         children = set(registered_copy_paths())
         children.update(candidate.path for candidate in folders(scratch_settings=scratch_settings))
         for child in sorted(children):
@@ -1116,8 +1123,7 @@ def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | 
             if stat.S_ISLNK(mode):
                 protection = Unknown(f"{child}: cannot check borrowed objects through a link")
                 break
-            checkout = child.resolve()
-            if checkout == folder:
+            if child.resolve() == folder:
                 continue
             other = task_of(child, scratch_settings=scratch_settings)
             if isinstance(other, copy_record.NotRegistered):
@@ -1129,19 +1135,7 @@ def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | 
                 protection = Unknown(other.reason + "; cannot rule out borrowed objects")
                 break
             try:
-                storage = checkout_storage(child)
-                if not storage and (checkout.parent.parent == copies_root
-                                    or other.fields.get("test_hana_clone") is True):
-                    if task_has_end_evidence(other) or isinstance(task_end(other.task), Ended):
-                        with collector_lease(child, wait=False) as free, busy_locks(child, create=False) as idle:
-                            if free and idle:
-                                storage = checkout_storage(child)
-                                if not storage:
-                                    continue
-                    if not storage:
-                        protection = Unknown(f"{child}: copy setup has no checkout yet")
-                        break
-                borrowed = storage_in_folder(storage, folder)
+                borrowed = storage_in_folder(borrowed_storage(child, other), folder)
             except (OSError, ValueError, RuntimeError) as error:
                 protection = Unknown(f"{child}: cannot check borrowed objects: {error}")
                 break
