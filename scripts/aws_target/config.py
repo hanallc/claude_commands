@@ -10,6 +10,7 @@ import os
 import json
 from zoneinfo import ZoneInfo
 
+from scripts.aws_target import remote
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_targets import target_config
@@ -196,7 +197,7 @@ def deployment_record(directory: Path | None = None) -> dict[str, object]:
 
 
 def save_deployment_record(directory: Path, record: dict[str, object]) -> None:
-    write_text_atomic(directory / 'deployment.json', json.dumps(record, sort_keys=True) + '\n')
+    write_text_atomic(directory / 'deployment.json', remote.record_text(record))
 
 
 def deployment_outputs(directory: Path | None = None) -> dict[str, str]:

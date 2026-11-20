@@ -26,7 +26,7 @@ import time
 from typing import BinaryIO, Literal, cast, final
 from uuid import uuid4
 
-from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_presign
+from scripts.aws_target import admin_secrets, gate_box, ledger, remote, run_cost, s3_presign
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
@@ -127,7 +127,7 @@ def read(path: Path) -> dict[str, object]:
 
 
 def save(path: Path, row: dict[str, object]) -> None:
-    write_text_atomic(path, json.dumps(row, sort_keys=True) + '\n')
+    write_text_atomic(path, remote.record_text(row))
 
 
 def _saved_gate_job(record: dict[str, object]) -> StepJob | GateJobNotRecorded:

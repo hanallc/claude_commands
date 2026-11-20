@@ -53,11 +53,14 @@ Boxes receive signed URLs and no scaler credential file.
 
 1. Restore the AWS credentials on natedev, including `~/.config/aws-build/plan.gpg`.
 2. Run `github-warmup` if the GPG agent is cold.
-3. Run `deploy.py recover`.
+3. Restore the private Budget notification address.
+4. Run `deploy.py prepare` to create the local preparation bundle.
+5. Run `deploy.py recover`.
 
 Recovery uses the plan key to read the existing CloudFormation stacks, the scaler identity, and the network settings.
-It reads the gate's nixpkgs revision from the host lock file.
+It reports the nixpkgs revision from `/etc/nixos/flake.lock`.
 When every configured stack is complete, recovery can create `deployment.json` and `gate-deployment.json` under `~/.local/state/build-targets/aws`.
+`prepare` can create a provisional `deployment.json` after a wipe.
 If a record differs, review the reported fields and run `deploy.py recover --write` to accept the replacement.
 
 Restore the cost ledger, launch history, charges, timing history, and Hana lifecycle and setup records from the separate backup.

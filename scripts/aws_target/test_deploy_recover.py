@@ -3,6 +3,7 @@ from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import unittest
 from unittest import mock
 
 from scripts.aws_target import aws_trial, cloud_gate, deploy, ledger, plan_identity
-from scripts.aws_target.config import deployment_record, save_deployment_record
+from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, deployment_record, save_deployment_record
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -23,6 +24,7 @@ STACK = 'recover-fixture'
 REGIONAL_STACK = f'{STACK}-gates-{FALLBACK}'
 DEPLOYMENT = 'ab' * 16
 REVISION = 'cd' * 20
+FINGERPRINT = 'ef' * 32
 OWNER = plan_identity.PlanAccount('aws', '7' * 12)
 SCALER = 'fixture-scaler'
 SCALER_ARN = OWNER.iam(f'user/{SCALER}')
@@ -38,6 +40,7 @@ class DeploymentRecoveryTests(unittest.TestCase):
     state: Path = Path()
     foundation: Path = Path()
     manifest: Path = Path()
+    output: Path = Path()
 
     def __init__(self, methodName: str = 'runTest') -> None:
         super().__init__(methodName)
@@ -53,6 +56,10 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.state = root / 'state'
         self.foundation = self.state / 'deployment.json'
         self.manifest = self.state / 'gate-deployment.json'
+        self.output = root / 'output'
+        write_text_atomic(self.output / 'template.json', '{}\n')
+        write_text_atomic(self.output / 'parameters.json', '[]\n')
+        write_text_atomic(self.output / 'preflight.json', json.dumps({'fingerprint': FINGERPRINT}) + '\n')
         write_text_atomic(self.settings, f'region={HOME}\nstack_name={STACK}\ndeployment_timeout_s=3\n')
         gates = root / 'recovery-gates.conf'
         write_text_atomic(gates, f'regions={HOME} {FALLBACK}\n')
@@ -62,7 +69,7 @@ class DeploymentRecoveryTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value=REVISION))
 
     def deployment(self) -> deploy.Deployment:
-        return deploy.Deployment(self.settings, self.state, self.state.parent / 'output', execute=self.execute)
+        return deploy.Deployment(self.settings, self.state, self.output, execute=self.execute)
 
     @staticmethod
     def stack_arn(region: str, name: str) -> str:
@@ -132,7 +139,7 @@ class DeploymentRecoveryTests(unittest.TestCase):
               redirect_stdout(output), redirect_stderr(errors)):
             status = deploy.main()
         printed = output.getvalue() + errors.getvalue()
-        for private in (OWNER.account, 'arn:', DEPLOYMENT, REVISION, SCALER_ID, BUCKET, ROLE, 'regions',
+        for private in (OWNER.account, 'arn:', DEPLOYMENT, FINGERPRINT, SCALER_ID, BUCKET, ROLE, 'regions',
                         'subnet-fixture', 'sg-fixture', 'ami-fixture', 'fixture-private-budget'):
             self.assertNotIn(private, printed)
         return status, printed
@@ -140,9 +147,11 @@ class DeploymentRecoveryTests(unittest.TestCase):
     def test_creates_both_records_from_live_stack_values(self) -> None:
         status, output = self.recover()
         self.assertEqual(status, 0, output)
+        self.assertIn(f'nixpkgs revision from host lock {aws_trial.NIXOS_LOCK} is {REVISION}.', output)
         home = self.stack(HOME, STACK)
         self.assertEqual(deployment_record(self.state), {'account_id': OWNER.account, 'region': HOME, 'stack': STACK,
             'stack_id': self.stack_arn(HOME, STACK), 'deployment_id': DEPLOYMENT, 'budget_name': 'fixture-private-budget',
+            'fingerprint': FINGERPRINT,
             'scaler_user': {'name': SCALER, 'arn': SCALER_ARN, 'user_id': SCALER_ID},
             'outputs': {row['OutputKey']: row['OutputValue'] for row in ledger.rows(home, 'Outputs')}})
         self.assertEqual(cloud_gate.read(self.manifest), {'deployment_id': DEPLOYMENT, 'revision': REVISION,
@@ -160,15 +169,73 @@ class DeploymentRecoveryTests(unittest.TestCase):
 
     def test_matching_records_stay_unchanged(self) -> None:
         self.assertEqual(self.recover()[0], 0)
-        saved = deployment_record(self.state)
-        saved['fingerprint'] = 'fixture-local-preparation'
-        save_deployment_record(self.state, saved)
-        with mock.patch.object(deploy, 'save_deployment_record') as foundation, mock.patch.object(cloud_gate, 'save') as gates:
+        with mock.patch.object(deploy, 'publish_recovery_records') as publish:
             status, output = self.recover('--write')
         self.assertEqual(status, 0, output)
         self.assertEqual(output.count('already matches'), 2)
-        foundation.assert_not_called()
-        gates.assert_not_called()
+        publish.assert_not_called()
+
+    def test_foundation_equals_the_record_written_by_apply(self) -> None:
+        settings = DeploymentSettings(HOME, 'fixture-admin', STACK, 'fixture-image', 'fixture-owner',
+            'fixture-release', f'{HOME}a', 'fixture-vpc', 'fixture-subnet', '/dev/xvda', 10, 20, 30, 3, 300, SCALER)
+        identity: dict[str, object] = {'account_id': OWNER.account, 'region': HOME, 'stack': STACK,
+            'deployment_id': DEPLOYMENT, 'stack_id': self.stack_arn(HOME, STACK),
+            'scaler_user': {'name': SCALER, 'arn': SCALER_ARN, 'user_id': SCALER_ID}}
+        previous = {**identity, 'outputs': {'RetainedOutput': 'fixture-retained'}, 'fingerprint': 'fixture-old'}
+        save_deployment_record(self.state, previous)
+        outputs = {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue')
+                   for row in ledger.rows(self.stack(HOME, STACK), 'Outputs')}
+        subject = self.deployment()
+        with (mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs'),
+              mock.patch.object(subject, '_load', return_value=(settings, {})),
+              mock.patch.object(subject, '_stack', return_value=outputs), mock.patch.object(subject, '_deploy'),
+              mock.patch.object(subject, 'scaler_key'), mock.patch.object(deploy, 'read_budget_notification_address',
+                                                                         return_value=BudgetNotificationAddress('fixture'))):
+            self.assertEqual(subject.apply(approve_resources=True), outputs)
+        applied = self.foundation.read_bytes()
+        self.assertEqual(deployment_record(self.state), {**identity, 'fingerprint': FINGERPRINT,
+            'budget_name': outputs['BudgetName'], 'outputs': {**outputs, 'RetainedOutput': 'fixture-retained'}})
+        save_deployment_record(self.state, previous)
+        status, output = self.recover('--write')
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.foundation.read_bytes(), applied)
+
+    def test_missing_preparation_refuses_before_aws_or_record_publication(self) -> None:
+        (self.output / 'preflight.json').unlink()
+        with self.assertRaisesRegex(deploy.PreparationRequired, r'Run deploy\.py prepare first'):
+            _ = self.deployment().recover(write=True)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.foundation.exists())
+        self.assertFalse(self.manifest.exists())
+
+    def test_manifest_replace_failure_restores_both_records(self) -> None:
+        replace_record = os.replace
+
+        def fail_manifest(source: Path, target: Path) -> None:
+            if target == self.manifest:
+                self.assertEqual(deployment_record(self.state)['fingerprint'], FINGERPRINT)
+                raise OSError('fixture manifest replacement failure')
+            replace_record(source, target)
+
+        with self.subTest('Existing records'):
+            write_text_atomic(self.foundation, '{ "stack": "fixture-prior" }\n')
+            write_text_atomic(self.manifest, '{ "bucket": "fixture-prior" }\n')
+            before = self.foundation.read_bytes(), self.manifest.read_bytes()
+            with mock.patch.object(os, 'replace', side_effect=fail_manifest) as replace_call:
+                status, output = self.recover('--write')
+            self.assertEqual(status, 1, output)
+            self.assertEqual((self.foundation.read_bytes(), self.manifest.read_bytes()), before)
+            self.assertEqual(replace_call.call_count, 3)
+
+        with self.subTest('Missing records'):
+            self.foundation.unlink()
+            self.manifest.unlink()
+            with mock.patch.object(os, 'replace', side_effect=fail_manifest) as replace_call:
+                status, output = self.recover()
+            self.assertEqual(status, 1, output)
+            self.assertFalse(self.foundation.exists())
+            self.assertFalse(self.manifest.exists())
+            self.assertEqual(replace_call.call_count, 2)
 
     def test_different_records_require_write_and_report_only_field_labels(self) -> None:
         self.assertEqual(self.recover()[0], 0)

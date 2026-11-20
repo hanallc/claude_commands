@@ -11,7 +11,7 @@ import base64
 from configparser import ConfigParser
 from io import StringIO
 from collections.abc import Callable, Generator, Iterable, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_CEILING
@@ -41,7 +41,7 @@ from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, positive_seconds, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings, save_deployment_record
 from scripts.lib import conf
 from scripts.build_targets import target_config
-from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
+from scripts.lib.atomic_file import prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import LockResult
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
@@ -209,6 +209,10 @@ class MissingRecoveryStack(RecoveryStackRefused):
 
 class IncompleteRecoveryStack(RecoveryStackRefused):
     """The stack lacks complete evidence for recovery."""
+
+
+class PreparationRequired(DeploymentRefused):
+    """The local deployment preparation bundle is missing or incomplete."""
 
 
 class HanaControlRefused(DeploymentRefused):
@@ -2092,7 +2096,7 @@ class Deployment:
 
     def prepare(self) -> PreparedDeployment:
         admin_secrets.refuse_plain_admin(self.settings_path)
-        with self._require_hana_control('prepare'):
+        with self._require_account_stack('prepare'), self._require_hana_control('prepare'):
             settings = read_deployment_settings(self.settings_path)
             now = int(self.clock())
             notification = read_budget_notification_address(self.settings_path)
@@ -2292,10 +2296,20 @@ class Deployment:
         self._save_scaler_identity(settings)
         outputs = self._stack(settings)
         saved = deployment_record(self.directory)
-        saved['outputs'] = {**ledger.mapping(saved.get('outputs', {})), **outputs}
-        if outputs.get('BudgetName'):
-            saved['budget_name'] = outputs['BudgetName']
-        save_deployment_record(self.directory, saved)
+        save_deployment_record(self.directory, merge_foundation_outputs(saved, outputs))
+
+    def _prepared_fingerprint(self) -> str:
+        try:
+            for name in ('template.json', 'parameters.json'):
+                if not (self.output / name).is_file():
+                    raise FileNotFoundError(name)
+            preflight = remote.read_record(self.output / 'preflight.json')
+            digest = ledger.text(preflight, 'fingerprint')
+            if re.fullmatch(r'[a-f0-9]{64}', digest):
+                return digest
+        except (OSError, ValueError):
+            pass
+        raise PreparationRequired('Run deploy.py prepare first to save the deployment preparation bundle.')
 
     def _confirm_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], *, renew: bool = False) -> None:
         current = read_deployment_settings(self.settings_path)
@@ -2362,8 +2376,7 @@ class Deployment:
             self._deploy(settings, parameters)
             outputs = self._stack(settings)
             saved = deployment_record(self.directory)
-            saved['fingerprint'] = fingerprint(settings, parameters, TEMPLATE.read_bytes())
-            save_deployment_record(self.directory, saved)
+            save_deployment_record(self.directory, prepared_foundation_record(saved, outputs, self._prepared_fingerprint()))
             self.scaler_key()
             return outputs
 
@@ -3041,6 +3054,7 @@ class Deployment:
         regions = gate_regions(home)
         plan = plan_run.PlanRun(plan_identity.plan_credentials, self.execute, self.pause)
         with self._require_account_stack('recover'):
+            prepared_fingerprint = self._prepared_fingerprint()
             owner = plan.credential.owner
             api = plan.api(home, timeout)
             with recovery_stack_evidence(home, name):
@@ -3052,11 +3066,17 @@ class Deployment:
                 if not re.fullmatch(r'[a-f0-9]{32}', deployment):
                     raise IncompleteRecoveryStack(f'Stack {name} in {home} has no valid deployment identity.')
                 identity = recover_scaler_identity(api, owner, stack_id, outputs)
-                foundation: dict[str, object] = {'account_id': owner.account, 'region': home, 'stack': name,
-                    'stack_id': stack_id, 'deployment_id': deployment, 'outputs': outputs, 'scaler_user': identity,
-                    'budget_name': ledger.text(outputs, 'BudgetName')}
+                _ = ledger.text(outputs, 'BudgetName')
+                try:
+                    saved = deployment_record(self.directory)
+                except ValueError:
+                    saved = {}
+                foundation = saved if saved.get('stack_id') == stack_id else {}
+                foundation.update(account_id=owner.account, region=home, stack=name, stack_id=stack_id,
+                                  deployment_id=deployment, scaler_user=identity)
                 if parameters.get('BudgetName'):
-                    foundation['preserve_budget_name'] = True
+                    _ = foundation.setdefault('preserve_budget_name', True)
+                foundation = prepared_foundation_record(foundation, outputs, prepared_fingerprint)
                 launch_regions = [recover_gate_region(api, parameters, outputs)]
                 types = recovery_instance_types(ledger.text(parameters, 'GateInstanceTypes'))
                 if not types:
@@ -3077,6 +3097,7 @@ class Deployment:
                     launch['stack'] = regional_name
                     launch_regions.append(launch)
             revision = aws_trial.host_nixpkgs_revision()
+            print(f'nixpkgs revision from host lock {aws_trial.NIXOS_LOCK} is {revision}.')
             manifest = gate_launch_manifest(deployment, revision, types, gpu_types, outputs, launch_regions)
             return save_recovered_deployment(self.directory, foundation, manifest, write=write)
 
@@ -3302,6 +3323,17 @@ class Deployment:
                 self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
 
 
+def merge_foundation_outputs(saved: dict[str, object], outputs: dict[str, str]) -> dict[str, object]:
+    record = {**saved, 'outputs': {**ledger.mapping(saved.get('outputs', {})), **outputs}}
+    if outputs.get('BudgetName'):
+        record['budget_name'] = outputs['BudgetName']
+    return record
+
+
+def prepared_foundation_record(saved: dict[str, object], outputs: dict[str, str], digest: str) -> dict[str, object]:
+    return {**merge_foundation_outputs(saved, outputs), 'fingerprint': digest}
+
+
 def scaler_identity(api: AwsCli, name: str) -> dict[str, str]:
     user = ledger.mapping(api.call('get-user', '--user-name', name, service='iam').get('User'))
     return {'name': name, 'arn': ledger.text(user, 'Arn'), 'user_id': ledger.text(user, 'UserId')}
@@ -3384,63 +3416,101 @@ def recover_gate_region(api: AwsCli, parameters: dict[str, str], outputs: dict[s
 
 FOUNDATION_RECOVERY_FIELDS = {'account_id': 'account', 'region': 'home region', 'stack': 'stack name',
     'stack_id': 'stack identity', 'deployment_id': 'deployment identity', 'outputs': 'stack outputs',
-    'scaler_user': 'scaler user', 'budget_name': 'Budget name', 'preserve_budget_name': 'Budget name retention'}
+    'scaler_user': 'scaler user', 'budget_name': 'Budget name', 'preserve_budget_name': 'Budget name retention',
+    'fingerprint': 'preparation fingerprint'}
 GATE_RECOVERY_FIELDS = {'deployment_id': 'deployment identity', 'revision': 'nixpkgs revision',
     'instance_types': 'instance types', 'gpu_instance_types': 'GPU instance types', 'bucket': 'artifact bucket',
     'artifact_prefix': 'artifact prefix', 'regions': 'regional launch settings'}
 
 
 @dataclass(frozen=True)
-class RecoveryRecordReview:
-    name: str
-    changes: tuple[str, ...] = ()
-    missing: bool = False
+class MissingRecoveryRecord:
+    pass
 
-    def report(self) -> None:
-        if self.missing:
-            print(f'{self.name} is missing.')
-        elif self.changes:
-            print(f'{self.name} differs in ' + ', '.join(self.changes) + '.')
-        else:
-            print(f'{self.name} already matches.')
+
+@dataclass(frozen=True)
+class MatchingRecoveryRecord:
+    pass
+
+
+@dataclass(frozen=True)
+class ChangedRecoveryRecord:
+    fields: tuple[str, ...]
+
+
+type RecoveryRecordComparison = MissingRecoveryRecord | MatchingRecoveryRecord | ChangedRecoveryRecord
 
 
 def review_recovery_record(path: Path, recovered: dict[str, object],
-                           fields: dict[str, str]) -> RecoveryRecordReview:
+                           fields: dict[str, str]) -> RecoveryRecordComparison:
     try:
         saved = remote.read_record(path)
     except FileNotFoundError:
-        return RecoveryRecordReview(path.name, missing=True)
+        return MissingRecoveryRecord()
     except ValueError:
-        return RecoveryRecordReview(path.name, ('record format',))
-    if path.name == 'deployment.json' and saved.get('stack_id') == recovered['stack_id']:
-        # The preparation fingerprint records local approval evidence.
-        if 'fingerprint' in saved:
-            recovered['fingerprint'] = saved['fingerprint']
-    changes = tuple(label for key, label in fields.items() if saved.get(key) != recovered.get(key))
-    if (saved.keys() | recovered.keys()) - fields.keys() - {'fingerprint'}:
+        return ChangedRecoveryRecord(('record format',))
+    if saved == recovered:
+        return MatchingRecoveryRecord()
+    changed_keys = (saved.keys() ^ recovered.keys()) | {
+        key for key in saved.keys() & recovered.keys() if saved[key] != recovered[key]}
+    changes = tuple(label for key, label in fields.items() if key in changed_keys)
+    if changed_keys - fields.keys():
         changes += ('other record fields',)
-    return RecoveryRecordReview(path.name, changes)
+    return ChangedRecoveryRecord(changes)
+
+
+def publish_recovery_records(directory: Path, records: dict[Path, str]) -> None:
+    """Stage each replacement and restore the prior files if publication fails."""
+    with ExitStack() as staging:
+        replacements: list[tuple[Path, Path, Callable[[], None]]] = []
+        for path, content in records.items():
+            try:
+                mode = stat.S_IMODE(path.stat().st_mode)
+                previous = path.read_bytes()
+            except FileNotFoundError:
+                mode = 0o600
+                restore = lambda path=path: path.unlink(missing_ok=True)
+            else:
+                backup = staging.enter_context(prepared_replacement(path, previous, mode=mode))
+                restore = lambda path=path, backup=backup: os.replace(backup, path)
+            replacement = staging.enter_context(prepared_replacement(path, content, mode=mode))
+            replacements.append((path, replacement, restore))
+
+        with ExitStack() as rollback:
+            _ = rollback.callback(sync_folder, directory)
+            for path, replacement, restore in replacements:
+                os.replace(replacement, path)
+                _ = rollback.callback(restore)
+            sync_folder(directory)
+            _ = rollback.pop_all()
 
 
 def save_recovered_deployment(directory: Path, foundation: dict[str, object], manifest: dict[str, object],
                               *, write: bool) -> bool:
-    from scripts.aws_target import cloud_gate
-
+    foundation_path = directory / 'deployment.json'
     manifest_path = directory / 'gate-deployment.json'
-    account = review_recovery_record(directory / 'deployment.json', foundation, FOUNDATION_RECOVERY_FIELDS)
-    gates = review_recovery_record(manifest_path, manifest, GATE_RECOVERY_FIELDS)
-    for record in (account, gates):
-        record.report()
-    if (account.changes or gates.changes) and not write:
+    proposed = ((foundation_path, foundation, FOUNDATION_RECOVERY_FIELDS),
+                (manifest_path, manifest, GATE_RECOVERY_FIELDS))
+    records: dict[Path, str] = {}
+    differs = False
+    for path, record, fields in proposed:
+        match review_recovery_record(path, record, fields):
+            case MissingRecoveryRecord():
+                print(f'{path.name} is missing.')
+            case MatchingRecoveryRecord():
+                print(f'{path.name} already matches.')
+                continue
+            case ChangedRecoveryRecord(changed_fields):
+                print(f'{path.name} differs in ' + ', '.join(changed_fields) + '.')
+                differs = True
+        records[path] = remote.record_text(record)
+    if differs and not write:
         print('Run deploy.py recover --write to replace the deployment records.')
         return False
-    if account.missing or account.changes:
-        save_deployment_record(directory, foundation)
-        print('Saved deployment.json.')
-    if gates.missing or gates.changes:
-        cloud_gate.save(manifest_path, manifest)
-        print('Saved gate-deployment.json.')
+    if records:
+        publish_recovery_records(directory, records)
+        for path in records:
+            print(f'Saved {path.name}.')
     return True
 
 
