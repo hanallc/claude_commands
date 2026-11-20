@@ -1258,6 +1258,11 @@ class AdmissionPassInputs:
     queue_order: list[tuple[Path, records.RankedWaiter]]
 
 
+@dataclass(frozen=True)
+class NoTerminalCandidateRefusal:
+    """The candidates do not require a terminal refusal."""
+
+
 QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest
 
 
@@ -1612,6 +1617,10 @@ class AdmissionServer:
         self.execution_evidence: dict[str, execution_identity.ExecutionEvidence] = {}
         self.prerequisites: dict[str, placement.LocalExecutionPrerequisite] = {}
         self.placement_eligibility: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
+        self.mac_waits: dict[str, placement.WaitingForMac] = {}
+        self.mac_waits_changed: bool = False
+        self.published_mac_waits: tuple[records.MacSlotWait, ...] = ()
+        self.last_snapshot_inputs: records.QueueInputs | NoPass = NoPass()
         self.local_hold_holders: dict[str, placement.ResourceHolder] = {}
         self.host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = (
             host_probe if host_probe is not None else self._read_host_evidence)
@@ -2599,6 +2608,7 @@ class AdmissionServer:
             self.next_source_check = (self.clock.monotonic() + self.last_usable_configuration.source_check_seconds
                                       if isinstance(self.last_usable_configuration, records.MemoryConfig) else float("inf"))
             self.last_inputs = self.last_result = self.last_policy = NoPass()
+            self.last_snapshot_inputs = NoPass()
             self.published = NoPass()
             self.last_diagnostics = ()
             for episode, record in list(self.reservations.items()):
@@ -2737,14 +2747,11 @@ class AdmissionServer:
         held_rows = ((path, row) for path, row in captured.queue_order
                      if (owner := records.waiter_owner(row)) in held_owners and owner in remaining)
         ordered = list(heapq.merge(local_rows, held_rows, key=lambda item: gate.waiter_order(item[1])))
-        try:
-            queue_snapshot.write_queue_snapshot(self.state_dir,
-                replace(inputs, ordered=ordered, spacing=self.spacing,
-                        slots=tuple(slot for slot in inputs.slots
-                            if gate.between_steps(slot).reservation not in result.policy.returned_claims)), policy)
-        except OSError:
-            # An old snapshot expires without changing the admission result.
-            pass
+        self.last_snapshot_inputs = replace(inputs, ordered=ordered, spacing=self.spacing,
+            slots=tuple(slot for slot in inputs.slots
+                if gate.between_steps(slot).reservation not in result.policy.returned_claims))
+        self._capture_mac_waits()
+        self._write_queue_snapshot()
         self._publish_replies()
         if self.reader_requested:
             self.start_reader()
@@ -2964,6 +2971,67 @@ class AdmissionServer:
             return [wire.Refused("slot waiter owner no longer exists")]
         return [waiting.reply]
 
+    def _set_mac_wait(self, episode: str, wait: placement.NoMacWait | placement.WaitingForMac) -> None:
+        """Change one episode's active wait on the event loop."""
+        if isinstance(wait, placement.NoMacWait):
+            if episode in self.mac_waits:
+                del self.mac_waits[episode]
+                self.mac_waits_changed = True
+        elif self.mac_waits.get(episode) != wait:
+            if episode not in self.mac_waits and not isinstance(self.system_reader, NoSystemReader):
+                # The last process table can still contain an owner whose pidfd just became ready.
+                owner = self.placement_requests[episode].owner
+                identity = self.proc.owner_start(owner.pid)
+                if (isinstance(identity, OwnerProcessGone)
+                        or isinstance(identity, LiveOwnerIdentity) and identity.start_time != owner.start_time):
+                    return
+            self.mac_waits[episode] = wait
+            self.mac_waits_changed = True
+
+    def _capture_mac_waits(self) -> None:
+        """Capture active waits and attach attempt history for those episodes."""
+        self.mac_waits_changed = False
+        if not self.mac_waits:
+            self.published_mac_waits = ()
+            return
+        attempts: dict[str, list[records.MacBusyAttempt]] = {episode: [] for episode in self.mac_waits}
+        for saved in self.assignments.values():
+            assignment, report = saved.assignment, saved.terminal_report
+            active = self.mac_waits.get(assignment.episode)
+            if (active is not None and assignment.destination.provider == "mac"
+                    and assignment.destination.target == active.destination.target
+                    and isinstance(report, placement.TerminalAttemptReport)
+                    and report.outcome == placement.PrelaunchRefused("busy")):
+                attempts[assignment.episode].append(records.MacBusyAttempt(assignment.attempt, report.received_at))
+        rows: list[records.MacSlotWait] = []
+        for episode, wait in self.mac_waits.items():
+            request = self.placement_requests[episode]
+            row = self._placement_row(request)
+            row["since"] = wait.since
+            target = wait.destination.target
+            row["route"] = target_config.PinnedTarget(target)
+            busy = tuple(sorted(attempts[episode], key=lambda attempt: (attempt.reported_at, attempt.attempt)))
+            rows.append(records.MacSlotWait(episode, target, row, busy))
+        self.published_mac_waits = tuple(sorted(rows, key=lambda wait: (wait.waiter["since"], wait.episode)))
+
+    def _write_queue_snapshot(self) -> None:
+        """Publish the pass evidence with the same Mac waits as the socket view."""
+        if isinstance(self.last_snapshot_inputs, records.QueueInputs) and isinstance(self.last_policy, records.AdmissionPolicy):
+            try:
+                queue_snapshot.write_queue_snapshot(self.state_dir,
+                    replace(self.last_snapshot_inputs, mac_waits=self.published_mac_waits), self.last_policy)
+            except OSError:
+                # An old snapshot expires without changing the admission result.
+                pass
+
+    def _publish_mac_wait_change(self, *, refresh_view: bool = False) -> None:
+        if self.mac_waits_changed:
+            self._capture_mac_waits()
+            self._write_queue_snapshot()
+            refresh_view = True
+        if refresh_view:
+            self._publish_replies()
+
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
         remote: list[records.RunningStep] = []
         for key, saved in self.assignments.items():
@@ -3014,7 +3082,7 @@ class AdmissionServer:
                           diagnostics=self.last_diagnostics)
         waiting = tuple(replace(step, verify=row["verify"]) if "verify" in row else step
                         for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True))
-        reading = replace(reading, view=replace(reading.view, waiting=waiting))
+        reading = replace(reading, view=replace(reading.view, waiting=waiting, mac_waits=self.published_mac_waits))
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
@@ -3598,6 +3666,7 @@ done
         self.assignments = {key: saved for key, saved in self.assignments.items()
                             if saved.assignment.episode not in ended}
         for episode in ended:
+            self._set_mac_wait(episode, placement.NoMacWait())
             _ = self.placement_requests.pop(episode, None)
             _ = self.prerequisites.pop(episode, None)
             _ = self.placement_eligibility.pop(episode, None)
@@ -4014,10 +4083,13 @@ done
             if self.placement_requests.get(request.episode) is not request:
                 continue
             key = self.current_assignments.get(request.episode, "")
+            owner_live = self._placement_owner_live(request.owner)
+            if not owner_live:
+                self._set_mac_wait(request.episode, placement.NoMacWait())
             if key in self.placement_ends_awaiting_close:
                 continue
             saved = self.assignments.get(key)
-            if not self._placement_owner_live(request.owner):
+            if not owner_live:
                 if saved is not None:
                     if isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved):
                         self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"),
@@ -4061,7 +4133,31 @@ done
             assigned_settings_generation=placement.AssignedSettingsGeneration(evidence_key.configuration_generation),
             remote_start_hold=hold)
         self.current_assignments[request.episode] = key
+        self._set_mac_wait(request.episode, placement.NoMacWait())
         return assignment
+
+    def _terminal_candidate_refusal(self, request: wire.PlacementRequest,
+                                    candidates: tuple[placement.CandidateEligibility, ...]
+                                    ) -> placement.DoNotRetry | NoTerminalCandidateRefusal:
+        selection = request.constraints.selection
+        if isinstance(selection, placement.MacOnlyHost):
+            refusal = next((candidate.eligibility.reason for candidate in candidates
+                if candidate.destination.target == "mac"
+                and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
+                and candidate.eligibility.reason != "busy"), "")
+            if refusal:
+                return placement.DoNotRetry(refusal)
+        if isinstance(selection, placement.PinnedHost):
+            selected = tuple(candidate for candidate in candidates if candidate.destination.target == selection.target)
+            if selected and all(isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
+                    and isinstance(placement.retry_decision(candidate.destination, candidate.eligibility.reason, self.clock.now()),
+                        placement.DoNotRetry) for candidate in selected):
+                return placement.DoNotRetry("; ".join(candidate.eligibility.reason for candidate in selected
+                    if isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))))
+        if candidates and all(isinstance(candidate.eligibility, placement.FixedExclusion) for candidate in candidates):
+            return placement.DoNotRetry("; ".join(candidate.eligibility.reason for candidate in candidates
+                if isinstance(candidate.eligibility, placement.FixedExclusion)))
+        return NoTerminalCandidateRefusal()
 
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
@@ -4151,30 +4247,11 @@ done
         if terminal:
             return self._placement_status(terminal[-1].assignment)
         candidates = self.placement_eligibility.get(request.episode, ())
-        selection = request.constraints.selection
-        if isinstance(selection, placement.MacOnlyHost):
-            refusal = next((candidate.eligibility.reason for candidate in candidates
-                if candidate.destination.target == "mac"
-                and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
-                and candidate.eligibility.reason != "busy"), "")
-            if refusal:
-                return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""),
-                    placement.ClosedAssignment(refusal), placement.NoLaunchPermission(refusal),
-                    refusal, placement.DoNotRetry(refusal))
-        if isinstance(selection, placement.PinnedHost):
-            selected = tuple(candidate for candidate in candidates if candidate.destination.target == selection.target)
-            if selected and all(isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
-                    and isinstance(placement.retry_decision(candidate.destination, candidate.eligibility.reason, self.clock.now()),
-                        placement.DoNotRetry) for candidate in selected):
-                reason = "; ".join(candidate.eligibility.reason for candidate in selected
-                    if isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion)))
-                return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""), placement.ClosedAssignment(reason),
-                    placement.NoLaunchPermission(reason), reason, placement.DoNotRetry(reason))
-        if candidates and all(isinstance(candidate.eligibility, placement.FixedExclusion) for candidate in candidates):
-            reason = "; ".join(candidate.eligibility.reason for candidate in candidates
-                if isinstance(candidate.eligibility, placement.FixedExclusion))
+        refusal = self._terminal_candidate_refusal(request, candidates)
+        if isinstance(refusal, placement.DoNotRetry):
+            reason = refusal.reason
             return wire.DispatchStatus(placement.UnknownAssignment(request.episode, ""), placement.ClosedAssignment(reason),
-                placement.NoLaunchPermission(reason), reason, placement.DoNotRetry(reason))
+                placement.NoLaunchPermission(reason), reason, refusal)
         ordered, _priority = self._queue_order()
         owner = records.waiter_owner(self._placement_row(request))
         position = next((index for index, (_, row) in enumerate(ordered, 1)
@@ -4271,21 +4348,35 @@ done
             initial_readiness_unchecked = (isinstance(prerequisite, placement.TokenRequired)
                 and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             waiting_for: list[PlacementHold] = []
-            for candidate in self.placement_eligibility.get(request.episode, ()):
+            mac_wait: placement.WaitingForMac | placement.NoMacWait = placement.NoMacWait()
+            previous_mac_wait = self.mac_waits.get(request.episode, placement.NoMacWait())
+            candidates = self.placement_eligibility.get(request.episode, ())
+            for candidate in candidates:
                 destination = candidate.destination
+                can_record_mac_wait = destination.provider == "mac" and isinstance(mac_wait, placement.NoMacWait)
                 if destination.provider == "local" and (owner in inputs.landing_waiters
                         or request.constraints.cargo_folder in local_occupied):
                     continue
                 if (initial_readiness_unchecked and destination.provider == "local"
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
+                    self._set_mac_wait(request.episode, placement.NoMacWait())
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
+                    if can_record_mac_wait:
+                        if candidate.eligibility == placement.TemporaryExclusion("busy"):
+                            mac_wait = placement.WaitingForMac(destination, request.since, placement.MacProbeBusy())
+                        elif (isinstance(candidate.eligibility, placement.EvidenceNeeded)
+                                and isinstance(previous_mac_wait, placement.WaitingForMac)
+                                and previous_mac_wait.destination == destination):
+                            mac_wait = previous_mac_wait
                     hold = self._placement_hold(request, candidate, answers)
                     if hold is not None:
                         waiting_for.append(hold)
                     continue
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     if candidate.destination in held_copy_destinations:
+                        if can_record_mac_wait:
+                            mac_wait = placement.WaitingForMac(destination, request.since, placement.MacSlotContended())
                         continue
                     competing = [copy for copy in copies if any(
                         choice.destination == candidate.destination and isinstance(choice.eligibility, placement.AllowedHost)
@@ -4293,15 +4384,20 @@ done
                     newest = max(competing, key=lambda copy: placement.copy_order(
                         cast(placement.SpeculativeCopy, copy.purpose), copy.episode))
                     if newest.episode != request.episode:
+                        if can_record_mac_wait:
+                            mac_wait = placement.WaitingForMac(destination, request.since, placement.MacSlotContended())
                         continue
                 if destination.provider == "local":
                     if owner in local_starts:
+                        self._set_mac_wait(request.episode, placement.NoMacWait())
                         break
                     continue
                 if destination.provider == "scaler":
                     continue
                 if (any(same_remote_resource(other, destination) for other in taken)
                         or self._held_for_older(request, destination, held, holds)):
+                    if can_record_mac_wait:
+                        mac_wait = placement.WaitingForMac(destination, request.since, placement.MacSlotContended())
                     continue
                 assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
                 taken.append(destination)
@@ -4321,6 +4417,10 @@ done
                     removed.add(owner)
                 break
             else:
+                if (isinstance(mac_wait, placement.WaitingForMac)
+                        and isinstance(self._terminal_candidate_refusal(request, candidates), placement.DoNotRetry)):
+                    mac_wait = placement.NoMacWait()
+                self._set_mac_wait(request.episode, mac_wait)
                 for hold in waiting_for:
                     held.append(hold)
                     start = self.placement_holds.get((hold.episode, hold.destination))
@@ -4476,6 +4576,16 @@ done
                      else self.proc.processes())
         return holder.pid in gate.process_tree({owner.pid: owner.start_time}, processes)
 
+    def _record_mac_refusal(self, assignment: placement.PlacementAssignment, reason: str) -> None:
+        episode, destination = assignment.episode, assignment.destination
+        if (destination.provider != "mac" or self.current_assignments.get(episode)
+                != execution_identity.attempt_key(episode, assignment.attempt)):
+            return
+        if reason == "busy" and episode in self.placement_requests and self._placement_owner_live(assignment.owner):
+            self._set_mac_wait(episode, placement.WaitingForMac(destination, assignment.since, placement.MacClaimBusy()))
+        else:
+            self._set_mac_wait(episode, placement.NoMacWait())
+
     def _close_placement(self, saved: records.SavedPlacementAssignment, reason: str,
                          retry: placement.RetryDecision, *, record_wait_end: bool = True,
                          wait_key: records.PlacementWaitKey | records.NoPlacementWait = records.NO_PLACEMENT_WAIT) -> None:
@@ -4484,6 +4594,8 @@ done
         if key in self.placement_ends_awaiting_close:
             return
         if self.current_assignments.get(assignment.episode) == key:
+            if reason != "busy":
+                self._set_mac_wait(assignment.episode, placement.NoMacWait())
             request = self.placement_requests.get(assignment.episode)
             if request is not None:
                 if record_wait_end and assignment.destination.provider != "local" and isinstance(wait_key, records.NoPlacementWait):
@@ -4643,6 +4755,7 @@ done
                     return [wire.Ok()]
                 self.prerequisites[request.episode] = request.prerequisite
             else:
+                self._set_mac_wait(request.episode, placement.NoMacWait())
                 saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
                 attempt = saved.assignment.attempt if saved is not None and saved.assignment.destination.provider != "local" else ""
                 wait_key = self._finish_placement_wait(submitted, attempt=attempt, include_unassigned=True)
@@ -4683,6 +4796,9 @@ done
                         return [wire.PlacementWait(request.episode, request.since, 0, ())]
                 if request.owner in self.pending_coordinators:
                     del self.pending_coordinators[request.owner]
+                previous = self.placement_requests.get(request.episode)
+                if previous is not None and previous.owner == request.owner:
+                    self._set_mac_wait(request.episode, placement.NoMacWait())
                 return [wire.Refused("submitting owner is not live on the coordinator")]
             if request.owner in self.pending_coordinators:
                 del self.pending_coordinators[request.owner]
@@ -4751,6 +4867,7 @@ done
                 refused = replace(saved, terminal_report=terminal, provider=retained,
                                   refusal_settings=request.refusal_settings)
                 if not self._settle_hana_prelaunch(refused, terminal):
+                    self._record_mac_refusal(assignment, request.reason)
                     retry = placement.retry_decision(assignment.destination, request.reason, terminal.received_at)
                     if self._start_pending(saved):
                         self.assignments[key] = replace(refused, retry=retry)
@@ -4787,6 +4904,8 @@ done
                     elif isinstance(outcome, placement.PrelaunchRefused) and not isinstance(retry, placement.RetryAt):
                         retry = placement.retry_decision(assignment.destination, outcome.reason, terminal.received_at)
                     saved = replace(saved, terminal_report=terminal, provider=request.claim, retry=retry)
+                    if isinstance(outcome, placement.PrelaunchRefused):
+                        self._record_mac_refusal(assignment, outcome.reason)
                 elif previous.outcome == outcome:
                     terminal = (replace(previous, path=request.path)
                         if isinstance(request.path, placement.DispatchPathSettled) else previous)
@@ -4801,7 +4920,7 @@ done
                 self.assignments[key] = saved
                 self.persist()
                 self.next_pass = self.clock.monotonic()
-        self._publish_replies()
+        self._publish_mac_wait_change(refresh_view=True)
         return [self._placement_status(assignment, check_lifetime=False)]
 
     def _authorize(self, request: wire.Request, uid: int) -> str:
@@ -4901,6 +5020,7 @@ done
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
             replies = self._handle_placement(request, connection)
+            self._publish_mac_wait_change()
             if (isinstance(request, wire.ConsumePermission) and isinstance(connection, Connection)
                     and not any(isinstance(reply, wire.FirstAuthorization) for reply in replies)):
                 self.persist()
@@ -5493,6 +5613,10 @@ done
                         self._unwatch(descriptor)
                 else:
                     self._unwatch(descriptor)
+                    for episode in tuple(self.mac_waits):
+                        owner = self.placement_requests[episode].owner
+                        if (owner.pid, owner.start_time) == (watch.owner.pid, watch.owner.start_time):
+                            self._set_mac_wait(episode, placement.NoMacWait())
                 self._prune_places()
                 for episode, waiting in list(self.waiters.items()):
                     if not self._live(waiting.request.owner):
@@ -5502,6 +5626,7 @@ done
         self._finish_priority_roster()
         if self.clock.monotonic() >= self.next_pass and self._pass_gap_open():
             _ = self.run_pass()
+        self._publish_mac_wait_change()
         if self.clock.monotonic() >= self.next_source_check:
             self._check_sources()
         self._check_outage_alert()

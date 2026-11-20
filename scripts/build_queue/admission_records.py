@@ -1757,6 +1757,22 @@ def execution_group(step: RunningStep, fallback: str) -> str:
 
 
 @dataclass(frozen=True)
+class MacBusyAttempt:
+    """The Mac refused this attempt because its slot was busy."""
+    attempt: str
+    reported_at: float
+
+
+@dataclass(frozen=True)
+class MacSlotWait:
+    """The step waits for a slot on this Mac target."""
+    episode: str
+    target: str
+    waiter: Waiter
+    busy_attempts: tuple[MacBusyAttempt, ...]
+
+
+@dataclass(frozen=True)
 class QueueView:
     """The queue view holds waiting steps, running steps, and memory totals at one time."""
     waiting: tuple[WaitingStep, ...]
@@ -1765,6 +1781,7 @@ class QueueView:
     promised: int
     reserve: int
     now: float
+    mac_waits: tuple[MacSlotWait, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1929,6 +1946,8 @@ class QueueInputs:
     landing_waiters: frozenset[str] = field(default=frozenset(), kw_only=True)
     cloud_route_waiters: frozenset[str] = field(default=frozenset(), kw_only=True)
     cloud_route_waiters_past_deadline: frozenset[str] = field(default=frozenset(), kw_only=True)
+    mac_waits: tuple[MacSlotWait, ...] = field(default=(), kw_only=True,
+        metadata={"acquisition_unused": True})
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))

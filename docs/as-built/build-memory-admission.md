@@ -572,6 +572,13 @@ Importing `build_hold` or `build_targets` does not load the admission service.
 The service imports `argparse` inside `main()` and the reading alert message helpers inside `deliver_reading_alert()`.
 After each pass, the service publishes `admission/queue.json` atomically through `scripts/build_queue/queue_snapshot.py`.
 The snapshot contains the pass readings, its policy, and the remaining waiters.
+The event loop keeps one active Mac slot wait per placement episode.
+Busy provider evidence, contention for a slot, or an accepted busy claim failure can start the wait.
+An assignment, a terminal refusal, cancellation, or owner exit clears the wait.
+The assignment records retain busy attempts. The service adds this history only to active waits.
+The socket view and the snapshot publish the same `mac_waits` rows.
+A change between passes updates those rows with the previous pass readings and timestamp.
+Readers accept older data without `mac_waits` as an empty list.
 The AWS controller reads this snapshot without a live queue request.
 It refuses a start when the snapshot is missing, stale, or incomplete.
 Queue views continue to use the service.

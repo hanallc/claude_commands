@@ -237,6 +237,34 @@ class PlacementDestination:
 
 
 @dataclass(frozen=True)
+class NoMacWait:
+    """The episode has no active Mac wait."""
+
+
+@dataclass(frozen=True)
+class MacProbeBusy:
+    """The provider reported a busy Mac."""
+
+
+@dataclass(frozen=True)
+class MacSlotContended:
+    """The scheduler kept the slot for another episode."""
+
+
+@dataclass(frozen=True)
+class MacClaimBusy:
+    """The Mac refused the episode's attempt as busy."""
+
+
+@dataclass(frozen=True)
+class WaitingForMac:
+    """The episode waits for a slot on this destination."""
+    destination: PlacementDestination
+    since: float
+    cause: MacProbeBusy | MacSlotContended | MacClaimBusy
+
+
+@dataclass(frozen=True)
 class ConfiguredProviderSettings:
     """The provider uses its configured settings."""
 

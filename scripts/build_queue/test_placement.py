@@ -116,6 +116,16 @@ def assignment_for(fixture: AdmissionFixture, request: wire.PlacementRequest) ->
     return reply.assignment
 
 
+def published_mac_waits(fixture: PlacementFixture) -> tuple[records.MacSlotWait, ...]:
+    reply, = fixture.connect(wire.ViewRequest()).replies()
+    assert isinstance(reply, wire.ViewReply)
+    snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+    assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+    if reply.reading.view.mac_waits != snapshot.inputs.mac_waits:
+        raise AssertionError("the socket and snapshot contain different Mac waits")
+    return reply.reading.view.mac_waits
+
+
 def hana_policy_request(fixture: PlacementFixture) -> tuple[wire.PlacementRequest, hana.HanaControlTransport]:
     repository = fixture.root / "hana"
     repository.mkdir()
@@ -625,6 +635,13 @@ class PlacementTests(unittest.TestCase):
                                       if request.episode in fixture.server.current_assignments], selected)
                 self.assertEqual(set(fixture.server.reservations), {parent.episode})
                 self.assertEqual(fixture.server.reservations[parent.episode].reservation_id, grant.reservation)
+                waits = published_mac_waits(fixture)
+                self.assertEqual([wait.episode for wait in waits],
+                                 [episode for episode, _, live in candidates if live and episode != expected])
+                if waits:
+                    request = next(item for item in submitted if item.episode == waits[0].episode)
+                    fixture.end_owner(wire.Owner(request.owner.pid, request.owner.start_time))
+                    self.assertNotIn(request.episode, [wait.episode for wait in published_mac_waits(fixture)])
 
     def test_fixed_and_movable_waiters_share_order_and_priority_changes(self) -> None:
         for prioritize_movable in (False, True):
@@ -991,6 +1008,63 @@ class PlacementTests(unittest.TestCase):
             self.assertIsInstance(granted, wire.LocalPlacementGranted)
             self.assertEqual(set(fixture.caller_reservations()), {later.episode})
             self.assertNotIn(head.owner.pid, fixture.queue_pids())
+
+    def test_only_a_busy_mac_candidate_appears_in_the_mac_waits(self) -> None:
+        for pinned, reason in ((False, "busy"), (True, "off")):
+            with self.subTest(reason=reason), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                destination = request.constraints.candidates[0].destination
+                if pinned:
+                    request = replace(request, constraints=replace(request.constraints,
+                        selection=placement.PinnedHost(destination.target)))
+                _ = publish_candidate(fixture, request, placement.TemporaryExclusion(reason))
+                reply, = fixture.server.handle_request(request)
+                waits = published_mac_waits(fixture)
+                if reason == "busy":
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    wait, = waits
+                    self.assertEqual((wait.episode, wait.target, wait.waiter["since"]),
+                                     (request.episode, destination.target, request.since))
+                    self.assertEqual(wait.busy_attempts, ())
+                    self.assertNotIn(request.owner.pid, fixture.queue_pids())
+                    self.assertEqual(fixture.server.handle_request(
+                        wire.CancelPlacement("cancel", request.episode, request.owner, "the step ended")), [wire.Ok()])
+                    self.assertEqual(published_mac_waits(fixture), ())
+                else:
+                    assert isinstance(reply, wire.DispatchStatus)
+                    self.assertEqual(reply.retry, placement.DoNotRetry("off"))
+                    self.assertEqual(waits, ())
+
+    def test_busy_claim_failure_publishes_until_assignment_or_final_refusal(self) -> None:
+        for final_off in (False, True):
+            with self.subTest(final_off=final_off), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                destination = request.constraints.candidates[0].destination
+                request = replace(request, constraints=replace(request.constraints,
+                    selection=placement.PinnedHost(destination.target)))
+                _ = publish_candidate(fixture, request)
+                first = assignment_for(fixture, request)
+                with mock.patch.object(fixture.server, "_pass_gap_open", return_value=False):
+                    refusal, = fixture.connect(wire.ClaimFailure("busy", first, "busy")).replies()
+                    assert isinstance(refusal, wire.DispatchStatus)
+                    self.assertEqual(refusal.state, placement.ClosedAssignment("busy"))
+                    if not final_off:
+                        wait, = published_mac_waits(fixture)
+                        self.assertEqual(wait.episode, request.episode)
+                        self.assertEqual(wait.busy_attempts, (records.MacBusyAttempt(first.attempt, fixture.clock.now()),))
+
+                replacement = assignment_for(fixture, request)
+                self.assertNotEqual(replacement.attempt, first.attempt)
+                if final_off:
+                    refusal, = fixture.server.handle_request(wire.ClaimFailure("off", replacement, "off"))
+                    assert isinstance(refusal, wire.DispatchStatus)
+                    self.assertEqual(refusal.state, placement.ClosedAssignment("off"))
+                    refused, = fixture.server.handle_request(request)
+                    assert isinstance(refused, wire.DispatchStatus)
+                    self.assertEqual(refused.retry, placement.DoNotRetry("off"))
+                    first_key = execution_identity.attempt_key(first.episode, first.attempt)
+                    self.assertEqual(fixture.server.assignments[first_key].state, placement.ClosedAssignment("busy"))
+                self.assertEqual(published_mac_waits(fixture), ())
 
     def test_remote_refusal_gets_one_local_reservation_for_the_replacement(self) -> None:
         cases = ((offload.DeclinedMacRun("disk", 0), True, False),
