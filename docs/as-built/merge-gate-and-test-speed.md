@@ -711,6 +711,9 @@ The publisher checks for running lands while it holds the gap lock.
 Registration for a new land can wait for the push, the post-push hook, and local reconciliation.
 The publisher releases the gap before it requests the Mac pull over SSH.
 The notes timer starts the publisher again if a failed push leaves changes pending.
+The gap covers only pushes from natedev, where the lands and their records are.
+A publisher on the Mac, such as the Mac registry writer, pushes by its base route and does not wait for the gap.
+settings.json changes keep their base route.
 Ask natemerge for a gap before you push a hand commit to main during a land.
 
 ### Queued checkpoint batches
