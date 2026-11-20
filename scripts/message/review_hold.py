@@ -174,10 +174,10 @@ def keep_native_message(session: str, message: ReviewMessage) -> bool:
     path = _state_file(count)
     if not (count.exists() or path.exists()):
         return False
-    settings = conf.read("send")
-    if not _enabled(settings):
-        return False
     with _locked(path):
+        settings = conf.read("send")
+        if not _enabled(settings):
+            return False
         state = _read_state(count, path)
         if not _hold_open(count, state, message.sent, settings):
             return False
@@ -363,33 +363,31 @@ def route(session: str, message: ReviewMessage, *, urgent: bool,
     count = _count_file(session)
     path = _state_file(count)
     if count.exists() or path.exists():
-        settings = conf.read("send")
-        if not _enabled(settings):
-            yield ReleasedMessages(())
-            return
         with ExitStack() as delivery:
+            held: tuple[ReviewMessage, ...] = ()
+            messages: tuple[ReviewMessage, ...] = ()
             with _locked(path):
-                state = _read_state(count, path)
-                if _hold_open(count, state, message.sent, settings):
-                    if include_new and not urgent:
-                        saved = (*state.reserved, *state.messages)
-                        yield (AlreadyKeptForReview() if message.key and any(item.key == message.key for item in saved)
-                               else OpenReview(path, state))
-                        return
-                    held = (_reserve(path, state, delivery, key=message.key)
-                            if include_new and urgent and message.key else ())
-                    messages: tuple[ReviewMessage, ...] = ()
-                else:
-                    held = _reserve(path, _end_review(path, state), delivery)
-                    if not held:
-                        messages = ()
-                    elif not include_new:
-                        messages = held
-                    elif urgent:
-                        messages = (*[item for item in held if not message.key or item.key != message.key], message)
+                settings = conf.read("send")
+                if _enabled(settings):
+                    state = _read_state(count, path)
+                    if _hold_open(count, state, message.sent, settings):
+                        if include_new and not urgent:
+                            saved = (*state.reserved, *state.messages)
+                            yield (AlreadyKeptForReview() if message.key and any(item.key == message.key for item in saved)
+                                   else OpenReview(path, state))
+                            return
+                        if include_new and urgent and message.key:
+                            held = _reserve(path, state, delivery, key=message.key)
                     else:
-                        repeated = message.key and any(item.key == message.key for item in held)
-                        messages = held if repeated else (*held, message)
+                        held = _reserve(path, _end_review(path, state), delivery)
+                        if held:
+                            if not include_new:
+                                messages = held
+                            elif urgent:
+                                messages = (*[item for item in held if not message.key or item.key != message.key], message)
+                            else:
+                                repeated = message.key and any(item.key == message.key for item in held)
+                                messages = held if repeated else (*held, message)
             if held:
                 with _settle_release(count, path, ReleasedMessages(messages, held), record_keys) as batch:
                     yield batch
