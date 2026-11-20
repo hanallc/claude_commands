@@ -98,6 +98,9 @@ The history counts an older file of cloud gate runs under a box name as `aws` to
 Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
 The AWS state folder retains `cloud-gate-launches.jsonl`.
 Each launch call records its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+Launch, refusal, fallback, and finish rows record the queue's tagged job record in `gate_job`.
+The field contains `{"kind":"GateJobNotRecorded"}` when the job is unknown.
+Older rows can omit the field.
 A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
 Local fallback prints `Cloud gate uses natedev: <reason>`.
 These lines contain no account, instance, or subnet identifier.

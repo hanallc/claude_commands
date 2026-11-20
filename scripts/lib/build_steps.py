@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import MappingProxyType
 
-from scripts.build_queue.admission_jobs import StepJob as StepJob
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob as StepJob
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, CI_CARGO_FRONT, cargo_front_call
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
@@ -287,6 +287,11 @@ def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
     if "--tests-only" in arguments:
         return _test_job(arguments, affected=False)
     return StepJob("integrate", unit=_option(arguments, "--unit"), branch=branch)
+
+
+def gate_job_for_command(argv: Sequence[str]) -> StepJob | GateJobNotRecorded:
+    job = command_job(argv)
+    return job if isinstance(job, StepJob) else GATE_JOB_NOT_RECORDED
 
 
 # Show each step as the queue records it, for a caller that reads no configuration.
