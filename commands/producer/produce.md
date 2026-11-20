@@ -75,7 +75,7 @@ Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evi
 Write no time in `--source`.
 The List is shared. Each item has one producer, who keeps its status, next step, ETA and check time current.
 Add an item for your own work with `the_list.py add --producer <your staff ID> --owner <showrunner staff ID> --title <text> --source <source> --done-when <result that closes it>`. Name what to track, its owner, and the result that closes it.
-Park or close your own item only on nate's word. Without his word, set the state to Delivered.
+Park or close your own item only on nate's word. Without his word, set the state to Delivered only when the whole item is done and nate can check it. While more work follows, the state is Working.
 nate's words on a List page item come to its producer. Act on them and record them in the item in the same turn.
 Answer a List question saved for you with `the_list.py answer L<n> --question <id> --text "<answer>"`.
 morty assigns items to producers, takes `/recall` and New item requests, and reads every item at each round. Correct an item when morty says that its text is not clear.
