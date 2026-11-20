@@ -176,17 +176,17 @@ border:1px solid var(--line);border-radius:8px;padding:8px;min-width:0;max-width
 .list-count-chip{border:1px solid var(--line);border-radius:999px;background:var(--card);padding:5px 12px}
 [data-window-before],[data-window-after],[data-window-gap]{border:0!important;margin:0!important;border-radius:0!important}
 #record-item-dialog{margin:16px auto auto}
-#record-item-dialog .console-dialog-frame{grid-template-rows:auto 52px minmax(0,1fr) 70px}
+#record-item-dialog .console-dialog-frame{grid-template-rows:auto auto minmax(0,1fr) 70px}
 #record-item-dialog .console-dialog-body{scrollbar-gutter:stable}
 #record-item-dialog .console-dialog-frame>footer{overflow-y:auto;overscroll-behavior:contain}
-.record-dialog-status{padding-inline:24px;display:flex;align-items:center;gap:8px}
+.record-dialog-status{height:52px;box-sizing:border-box;padding-inline:24px;display:flex;align-items:center;gap:8px}
 .record-dialog-status [data-show-record-updates]{flex:none;margin:0;font:inherit;min-height:44px;padding:6px 14px;
 border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink)}
 .record-dialog-status [data-show-record-updates]:focus-visible{outline:2px solid currentColor;outline-offset:2px}
 @media(max-width:480px){.record-dialog-status{padding-inline:16px}}
 :is([data-record-missing],[data-record-error],[data-record-link-notice]){color:var(--warning)}
 :is([data-record-error],[data-record-link-notice]){padding-block:12px;border-top:1px solid var(--line);overflow-wrap:anywhere}
-[data-record-dialog-detail] button[aria-disabled="true"]{opacity:.5;cursor:default}
+:is([data-record-dialog-detail],[data-review-card]) button[aria-disabled="true"]{opacity:.5;cursor:default}
 [data-record-dialog-detail] :is(.list-panel,.review-panel){grid-template-columns:minmax(0,1fr);padding:0;border:0}
 [data-record-dialog-detail] .review-actions{display:grid;gap:16px}
 [data-record-dialog-detail] .review-action-group+.review-action-group{padding:0;border:0}
@@ -1184,7 +1184,7 @@ function bind(){
  }));
 }
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,queueItemUpdate,presentItemRevision,
- startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,itemUpdateRequired,setDialogTitle,showDraftCopy,suspendItemDialog,get dialogItem(){return dialogItem;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
+ startItemRequest,currentItemRequest,startDeliveryWindow,deliveryRequest,finishDeliveryWindow,installOwnItemResult,savedItemError,itemError,itemUpdateRequired,setDialogTitle,showDraftCopy,suspendItemDialog,get dialogItem(){return dialogItem;},get shownItemRevision(){return shownRevision;},followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,ownerChipSelection,get linkedItem(){return linkedItem;},
  canSubmit(form,key){
   return dialog?.open && location.hash===placeHash && dialogItem?.dataset.key===key &&
    opened.has(key) && dialogMissing.hidden && dialogDetail.contains(form) &&

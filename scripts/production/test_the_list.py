@@ -1127,8 +1127,6 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(the_list.close(MORTY.id, item.id, closed.closing_words, source="nate"), closed)
         self.assertEqual(self.command("answer", item.id, "--question", "Q2", "--text", "The report."),
                          (1, "", "the_list: Unknown question id.\n"))
-        self.assertIsInstance(the_list.resend_question(MORTY.id, item.id, "Q2", "retry", status),
-                              change_page.NoMessageDelivery)
         self.assertIsInstance(the_list.ask_question(MORTY.id, item.id, pending, status),
                               change_page.NoMessageDelivery)
         with self.assertRaisesRegex(question_record.AnswerRefused, "This item is Closed"):
@@ -1138,23 +1136,30 @@ class TheListTests(unittest.TestCase):
             list_page.deliver(list_page.ListQuestionDelivery(sent, status))
             change_page.deliver(claimed, status)
             path = status.path(claimed.page, claimed.row)
-            change_page.recover_page_question(status, path, change_page.read_question_attempt(path))
+            closed_attempt = change_page.read_question_attempt(path)
+            self.assertIs(closed_attempt.state, delivery_state.QuestionSendState.UNKNOWN)
+            self.assertIsInstance(closed_attempt.owner, delivery_state.NoQuestionSendOwner)
+            self.assertEqual(closed_attempt.error, "")
+            change_page.recover_page_question(status, path, closed_attempt)
             send.assert_not_called()
         _ = the_list.reopen(MORTY.id, item.id, source="nate")
         _ = the_list.ask_question(MORTY.id, item.id, replace(pending, request="new"), status)
         self.assertEqual([question.question_id for question in the_list.load(MORTY.id, item.id).questions],
                          ["Q1", "Q3"])
 
-    def test_close_stops_question_retries_and_retains_the_transport_result(self) -> None:
+    def test_close_stops_question_retries_and_keeps_confirmed_acceptance(self) -> None:
         status = change_page.DeliveryStatus(self.root / "reviews")
-        for expected in (delivery_state.QuestionSendState.SENT, delivery_state.QuestionSendState.FAILED):
-            with self.subTest(outcome=expected):
+        state = delivery_state.QuestionSendState
+        cases: tuple[tuple[send_result.Outcome, delivery_state.QuestionSendState], ...] = (
+            ("sent", state.SENT), ("failed", state.UNKNOWN), ("pending", state.UNKNOWN),
+        )
+        for outcome, expected in cases:
+            with self.subTest(outcome=outcome):
                 item = self.add()
                 delivery = the_list.ask_question(MORTY.id, item.id,
                     the_list.PageRequest("ask", "question", "Which check passed?"), status)
                 assert isinstance(delivery, change_page.PageQuestionSend)
-                header = send_result.OutcomeHeader(
-                    "sent" if expected is delivery_state.QuestionSendState.SENT else "failed", "Test result", "")
+                header = send_result.OutcomeHeader(outcome, "Test result", "")
 
                 def close_during_send(*_args: object) -> tuple[send_result.ConfirmedSendOutcome, str]:
                     _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
@@ -1168,7 +1173,12 @@ class TheListTests(unittest.TestCase):
                 send.assert_called_once()
                 alert.assert_not_called()
                 path = status.path(delivery.page, delivery.row)
-                self.assertEqual(change_page.read_question_attempt(path).state, expected)
+                saved = change_page.read_question_attempt(path)
+                self.assertEqual(saved.state, expected)
+                self.assertIsInstance(saved.owner, delivery_state.NoQuestionSendOwner)
+                self.assertFalse(saved.earlier_unconfirmed)
+                self.assertEqual(saved.error, "")
+                self.assertFalse(status.has_deferred_questions())
 
     def test_retry_read_error_preserves_the_confirmed_failure(self) -> None:
         status = change_page.DeliveryStatus(self.root / "reviews")

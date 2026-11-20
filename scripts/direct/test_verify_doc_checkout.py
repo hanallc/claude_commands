@@ -67,7 +67,7 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         admission = caller_admission(self, self.root, self.environment)
         settings = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
         _ = write_config_fixture(settings, f"# whole: 1..\nslots.{admission.server.host}.workspace.max=1\n")
-        with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
+        with mock.patch.dict(os.environ, self.environment, clear=True), build_slots.take_slot(
                 self.repo, "HEAD", showrunner="builds", unit="doc-test", work="competing copy", purpose="doc"):
             yield
 
@@ -343,7 +343,8 @@ else:
         self.assertFalse(call["notes_present"])
         checkout = Path(call["cwd"])
         self.assertTrue(checkout.is_relative_to(self.root / "slots"))
-        key = treekey.tree_key(str(checkout))
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            key = treekey.tree_key(str(checkout))
         assert key is not None
         self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(key))
         rows = (cast(dict[str, object], json.loads(line))
@@ -418,7 +419,7 @@ else:
 
     def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
         original = self.repo
-        with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
+        with mock.patch.dict(os.environ, self.environment, clear=True), build_slots.take_slot(
                 original, "HEAD", showrunner="builds", unit="doc-test", work="prepared copy", purpose="doc") as slot:
             self.repo: Path = slot.path
             self.environment["BUILDLOG_PREPARED_COPY"] = str(slot.path)

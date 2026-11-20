@@ -4811,18 +4811,28 @@ class NativeAgentProcess:
         return self.identity.id
 
 
+def process_exit_reason(pid: int) -> str:
+    return f"pid {pid}: process exited"
+
+
+def exited_process_pid(reason: str) -> int | None:
+    """Return the PID from an exact process exit reason."""
+    match = re.fullmatch(r"pid ([1-9][0-9]{0,9}): process exited", reason)
+    return int(match[1]) if match else None
+
+
 def _process_birth(pid: int) -> str:
     # A pane process can exit after herdr lists it; that process starts or exits, its pane is not unknown.
     if _platform() == "darwin":
         try:
             started = darwin_process_identity(pid).started
         except _DarwinProcessGone as error:
-            raise NativeRegistryChanging(f"pid {pid}: process exited") from error
+            raise NativeRegistryChanging(process_exit_reason(pid)) from error
     else:
         started = runtime_sessions.process_start(pid)
     if not started:
         if _platform() != "darwin" and not Path(f"/proc/{pid}").exists():
-            raise NativeRegistryChanging(f"pid {pid}: process exited")
+            raise NativeRegistryChanging(process_exit_reason(pid))
         raise ValueError(f"pid {pid}: process start is unavailable")
     return started
 

@@ -1288,7 +1288,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             (park_request,) = fields.get("park-request", [""])
             with server.list_store_access(), server.staff_read_scope():
                 current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
-                                                       park_request=park_request,
+                                                       park_request=park_request, include_detail=True,
                                                        review_records=server.list_review_records())
         except ValueError as error:
             self.browser_failure(400, "The List item is unavailable.", error)
@@ -1300,13 +1300,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def list_post(self) -> None:
         """Save List feedback before the shared sender starts."""
         server = cast(ReviewLinksServer, self.server)
+        fixture = server.mode is ServerMode.LIST_FIXTURE
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 100000:
                 raise ValueError("invalid List request size")
             body = self.rfile.read(length).decode("utf-8")
             fields = parse_qs(body)
-            if server.mode is ServerMode.LIST_FIXTURE and fields.get("action") != ["remove"]:
+            if fixture and fields.get("action") != ["remove"]:
                 raise ValueError("Only Remove is available in this demo.")
             with server.list_store_access():
                 submission, current = list_page.save_action(
@@ -1318,27 +1319,25 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError as error:
             self.browser_failure(503, "The List request could not be saved. Try again.", error)
             return
+        saved_fields: dict[str, object] = {"detail_unavailable": True} if current is None else dict(current)
+        if fixture:
+            self.json_response(200, {"state": "saved", "delivery_pending": False, **saved_fields})
+            return
         action = fields["action"][0]
         delivery = submission.delivery if isinstance(submission, list_page.ListUnparkSubmission) else submission
-        pending = server.mode is not ServerMode.LIST_FIXTURE and not isinstance(delivery, change_page.NoMessageDelivery)
+        pending = not isinstance(delivery, change_page.NoMessageDelivery)
         with server.item_delivery(pending) as check:
             try:
-                state = ("saved" if action.startswith("resend-") or server.mode is ServerMode.LIST_FIXTURE
-                         else {"read": "read", "question": "saved"}.get(action, "sent"))
-                reply: dict[str, object] = {"state": state, "delivery_pending": pending}
+                state = {"read": "read", "question": "saved"}.get(action, "sent")
+                reply = {"state": state, "delivery_pending": pending, **saved_fields}
                 if check:
                     reply["delivery"] = check
-                if current is not None:
-                    reply.update(current)
-                    if isinstance(submission, list_page.ListUnparkSubmission):
-                        reply["unpark_outcome"] = submission.response_outcome(current).value
-                else:
-                    reply["detail_unavailable"] = True
+                if current is not None and isinstance(submission, list_page.ListUnparkSubmission):
+                    reply["unpark_outcome"] = submission.response_outcome(current).value
                 self.json_response(200, reply)
             finally:
                 try:
-                    if server.mode is not ServerMode.LIST_FIXTURE:
-                        list_page.deliver(submission)
+                    list_page.deliver(submission)
                 except OSError as error:
                     print(f"review-links delivery status: {error}", file=sys.stderr)
 
@@ -1567,6 +1566,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.page_captures: PageCaptures = PageCaptures()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
+        self.question_recovery: threading.Thread | None = None
+        self.alert_recovery: threading.Thread | None = None
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
         self.module_stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = loaded_module_stamps()
         if mode is ServerMode.LIVE:
@@ -1777,6 +1778,16 @@ class ReviewLinksServer(ThreadingHTTPServer):
                             return
                     raise CodeChanged(f"code changed: {path}")
             self.module_stamps.update(stamps)
+            if (self.delivery_status.has_deferred_questions()
+                    and (self.question_recovery is None or not self.question_recovery.is_alive())):
+                self.question_recovery = threading.Thread(
+                    target=change_page.recover_deferred_questions, args=(self.delivery_status,), daemon=True)
+                self.question_recovery.start()
+            if (self.delivery_status.has_deferred_alerts()
+                    and (self.alert_recovery is None or not self.alert_recovery.is_alive())):
+                self.alert_recovery = threading.Thread(
+                    target=self.delivery_status.recover_deferred_alerts, daemon=True)
+                self.alert_recovery.start()
 
 
 def main(arguments: list[str]) -> int:

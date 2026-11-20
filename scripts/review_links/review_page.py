@@ -252,6 +252,39 @@ def retain_asset(item: ReviewItem, assets: dict[str, str]) -> None:
         assets['submission:'+item.key] = submission_assets(item.key, origin)
 
 
+def retain_question_delivery(item: ReviewItem, assets: dict[str, str], status: change_page.DeliveryStatus,
+                             sources: ReviewSourceStamps) -> None:
+    source = item.source
+    if isinstance(source, review_items.ChangeSource):
+        row = source.row['#']
+        page = change_page.ReviewPage(source.path, source.path.parent, (row,), '')
+        question = source.slots.question
+    elif item.state == ReviewState.WAITING and isinstance(
+            source, (review_items.QuestionSource, review_items.InvestigationSource,
+                     review_items.ProposalSource, review_items.EfficiencySource)):
+        page = review_actions.delivery_page(item, status)
+        row = page.rows[0]
+        path = status.path(page, row)
+        sources.append(path)
+        question = status.slots(page, row).question
+    else:
+        return
+    if not isinstance(question, change_page.OpenQuestion) or isinstance(question, change_page.OpenFeedback):
+        return
+    sources.append(status.closeout_path(page, row))
+    if change_page.review_question_failed(status, page, row, question):
+        assets['question-delivery:'+item.key] = change_page.question_failure_html(True)
+
+
+def retain_record_assets(item: ReviewItem, status: change_page.DeliveryStatus,
+                         sources: ReviewSourceStamps) -> dict[str, str]:
+    """Keep the assets and delivery notice for one Review record."""
+    assets: dict[str, str] = {}
+    retain_asset(item, assets)
+    retain_question_delivery(item, assets, status, sources)
+    return assets
+
+
 def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str:
     """Render the saved evidence and references for one lazy card."""
     evidence = origin.evidence
@@ -386,13 +419,13 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     assets: dict[str, str] = {}
     submission_keys: dict[str, str] = {}
     unavailable_cards: set[str] = set()
+    status = change_page.DeliveryStatus(root)
     for item in review_items.read(root, members=members, show='active', sources=sources, assign_ids=False):
         path = review_items.source_path(item)
         with guard_source(path, sources, entry=item.id):
             item = review_items.normalize_times(item, zone)
             try:
-                record_assets: dict[str, str] = {}
-                retain_asset(item, record_assets)
+                record_assets = retain_record_assets(item, status, sources)
                 validate_body_inputs(item, record_assets)
                 summary = card_entry(item, members, names)
             except (UnicodeError, TypeError, ValueError, OSError, RuntimeError) as error:
@@ -660,13 +693,13 @@ class ReviewSnapshotCache:
         started = time.perf_counter()
         records = current.records.copy()
         assets = current.assets.copy()
-        asset_keys = (key, 'image:'+key, 'submission:'+key)
+        asset_keys = (key, 'image:'+key, 'submission:'+key, 'question-delivery:'+key)
         previous_key = replaced_key or key
         previous = records.get(previous_key)
         if previous_key != key:
             _ = records.pop(previous_key, None)
         for removed in {previous_key, key}:
-            for asset in (removed, 'image:'+removed, 'submission:'+removed):
+            for asset in (removed, 'image:'+removed, 'submission:'+removed, 'question-delivery:'+removed):
                 _ = assets.pop(asset, None)
         submission_keys = current.submission_keys.copy()
         if previous is not None:
@@ -674,13 +707,15 @@ class ReviewSnapshotCache:
             if isinstance(previous_origin, new_item_dialog.ReviewSubmission):
                 _ = submission_keys.pop(previous_origin.request_id, None)
         names = staff_names.StaffNames(members)
+        sources = ReviewSourceStamps()
         if isinstance(item, ReviewRecordNotPublished) or item.state == ReviewState.DONE:
             _ = records.pop(key, None)
             entries = [entry for entry in current.entries if entry['key'] not in (key, previous_key)]
             record_version = key
         else:
             item = review_items.normalize_times(item, current.zone)
-            retain_asset(item, assets)
+            record_assets = retain_record_assets(item, change_page.DeliveryStatus(self.root), sources)
+            assets.update(record_assets)
             if (stamps is not None and current.records.get(key) == item and members == current.members
                     and key not in current.unavailable_cards
                     and all(assets.get(asset) == current.assets.get(asset) for asset in asset_keys)):
@@ -689,7 +724,7 @@ class ReviewSnapshotCache:
             origin = review_items.submission_origin(item)
             if isinstance(origin, new_item_dialog.ReviewSubmission):
                 submission_keys[origin.request_id] = key
-            validate_body_inputs(item, {asset: assets[asset] for asset in asset_keys if asset in assets})
+            validate_body_inputs(item, record_assets)
             updated_entry = card_entry(item, members, names)
             entries = [updated_entry if entry['key'] == previous_key else entry for entry in current.entries
                        if entry['key'] != key or key == previous_key]
@@ -698,7 +733,7 @@ class ReviewSnapshotCache:
             record_version = repr((item, tuple(assets.get(asset) for asset in asset_keys)))
         version = hashlib.sha256((current.version+record_version).encode()).hexdigest()[:20]
         fresh = pack_snapshot(replace(current, version=version, members=members, names=names, records=records, assets=assets, entries=entries,
-                                      source_stamps={**current.source_stamps, **stamps} if stamps is not None else current.source_stamps,
+                                      source_stamps={**current.source_stamps, **(stamps or {}), **sources.before_read},
                                       unavailable_cards=current.unavailable_cards-{key, previous_key},
                                       submission_keys=submission_keys),
                               index_json(entries), started)
@@ -941,6 +976,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     footer = ('' if response is not None else '<p class="review-source">Owner: '+names.html(item.owner, owner)
               +' · Source: '+names.html(item.source_unit, review_items.name(item.source_unit, inputs.members))+'</p>')
     fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
+    body += inputs.assets.get('question-delivery:'+item.key, '')
     body += inputs.assets.get('submission:'+item.key, '')
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div>'
             +'<div><section><h3>Log · newest first</h3>'
@@ -966,6 +1002,9 @@ def render_card(snapshot: ReviewSnapshot, entry: ReviewIndexEntry, body: str) ->
                            'requestTimeoutSeconds': snapshot.request_timeout_seconds})
     content = (record_table.STYLE + record_table.DATE_TIME_STYLE + STYLE + CARD_VIEW_STYLE
                + f'<div data-review-card class="list-table" {snapshot.card_motion.attributes()}>'
+               + '<div class="record-dialog-status" data-review-card-updates>'
+               + '<span role="status" data-review-card-notice></span>'
+               + '<button type="button" data-show-record-updates hidden>Show updates</button></div>'
                + '<table aria-label="Review card">'
                + CARD_COLUMNS + '</table></div>'
                + '<template data-card-icon>' + icon(entry['type']) + '</template>'
@@ -1266,7 +1305,8 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 </style>'''
 
 CARD_VIEW_STYLE = '''<style>
-:root{scrollbar-gutter:auto}
+:root{scrollbar-gutter:stable}
+[data-review-card-notice]{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 main{max-width:1060px;padding:0}
 [data-review-card] .list-row{cursor:default}
 @media(max-width:560px){:root:not(.layout-measuring) main{padding:0 12px 12px}}
@@ -1411,40 +1451,50 @@ function restoreReviewDraft(form,draft){
  if(form.elements.later) form.elements.later.value=draft.later;
  recordDetails(recordFromDetail(form)).querySelectorAll('input[name=choice]').forEach(choice=>choice.checked=choice.value===draft.choice);
 }
-async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true}){
+async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true,present=apply=>apply(),report}){
  const revision=form.elements.revision?.value,key=recordFromDetail(form).dataset.key;
  const atConflict=reviewDrafts.get(key) || rememberReviewDraft(form);
  const message='Not saved: '+reason;
- notice.textContent=message;notice.hidden=false;
+ const notify=report ?? (text=>{notice.textContent=text;notice.hidden=false;});
+ notify(message);
+ const refreshError=error=>{
+  if(current()) notify(message+' The card could not refresh. '+error.message);
+ };
  try{
   const next=await reload();
   if(!current()) return;
   if(next.deferred) return;
   if(revision && next.revision===revision) throw new Error('The current revision is not available yet.');
-  const row=await next.show();
-  if(!current()) return;
-  const latest=reviewDrafts.get(key);
-  const unchanged=latest?.stamp===atConflict?.stamp;
-  const draft=unchanged ? atConflict?.draft : latest?.draft;
-  const fresh=recordDetails(row)?.querySelector('[data-review-form]');
-  if(fresh?.elements.feedback){
-   if(atConflict && unchanged){
-    restoreReviewDraft(fresh,atConflict.draft);
-    reviewDrafts.set(key,atConflict);
+  const apply=async()=>{
+   const row=await next.show();
+   if(!current()) return;
+   const latest=reviewDrafts.get(key);
+   const unchanged=latest?.stamp===atConflict?.stamp;
+   const draft=unchanged ? atConflict?.draft : latest?.draft;
+   const fresh=recordDetails(row)?.querySelector('[data-review-form]');
+   if(fresh?.elements.feedback){
+    if(atConflict && unchanged){
+     restoreReviewDraft(fresh,atConflict.draft);
+     reviewDrafts.set(key,atConflict);
+    }
+    if(!report) fresh.querySelector('[data-send-status]').textContent=message;
+   }else if(row){
+    const detail=recordDetails(row);
+    if(!report){
+     const status=document.createElement('p');
+     status.setAttribute('role','status');status.textContent=message;detail.append(status);
+    }
+    if(draft?.feedback){
+     const label=document.createElement('label'),words=document.createElement('textarea');
+     label.textContent='Your unsaved words';
+     words.value=draft.feedback;words.readOnly=true;words.dataset.reviewDraft='';
+     label.append(words);detail.append(label);
+    }
    }
-   fresh.querySelector('[data-send-status]').textContent=message;
-  }else if(row){
-   const detail=recordDetails(row),status=document.createElement('p');
-   status.setAttribute('role','status');status.textContent=message;detail.append(status);
-   if(draft?.feedback){
-    const label=document.createElement('label'),words=document.createElement('textarea');
-    label.textContent='Your unsaved words';
-    words.value=draft.feedback;words.readOnly=true;words.dataset.reviewDraft='';
-    label.append(words);detail.append(label);
-   }
-  }
+  };
+  await present(()=>apply().catch(refreshError));
  }catch(error){
-  if(current()) notice.textContent=message+' The card could not refresh. '+error.message;
+  refreshError(error);
  }
 }
 async function saveReviewAction(data,{confirmedSave,saved,failed,displayFailed,recover,finished}){
@@ -1470,6 +1520,11 @@ async function saveReviewAction(data,{confirmedSave,saved,failed,displayFailed,r
 CARD_VIEW_SCRIPT = r'''(() => {
 const frame=window.frameElement;
 const card=document.querySelector('[data-review-card]'),table=card.querySelector('table');
+const notice=card.querySelector('[data-review-card-notice]'),showUpdates=card.querySelector('[data-show-record-updates]');
+function report(text){
+ notice.textContent=text;
+ notice.title=text;
+}
 const motion=createCardMotion(()=>card);
 function mountCard(page,replaceCard=false){
  const {entry,titleLimit,zone,later:settings,requestTimeoutSeconds}=JSON.parse(page.querySelector('[data-card-settings]').textContent);
@@ -1494,9 +1549,23 @@ function mountCard(page,replaceCard=false){
 }
 function bindCard(row,zone,settings,requestTimeoutSeconds){
  const form=row.querySelector('[data-review-form]');
+ showUpdates.onclick=null;
  if(!form?.elements.feedback) return row;
- const notice=form.querySelector('[data-send-status]');
- let conflict='';
+ form.querySelector('[data-send-status]')?.remove();
+ let conflict='',applyUpdate;
+ showUpdates.onclick=async()=>{
+  if(!applyUpdate) return;
+  const apply=applyUpdate;applyUpdate=null;
+  const hadFocus=document.activeElement===showUpdates;
+  showUpdates.disabled=true;
+  await apply();
+  showUpdates.disabled=false;
+  if(form.isConnected){applyUpdate=apply;return;}
+  const focus=document.activeElement;
+  showUpdates.hidden=true;
+  if(hadFocus && (focus===showUpdates || focus===document.body))
+   table.querySelector('[name="feedback"]')?.focus({preventScroll:true});
+ };
  const busy=active=>{
   setCardSubmitting(form,active);
   if(frame){
@@ -1506,7 +1575,13 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
  };
  const recover=reason=>{
   conflict=reason;
-  return recoverReviewRevision(reason,{form,notice,reload:async()=>{
+  const present=apply=>{
+   applyUpdate=apply;
+   showUpdates.hidden=false;
+   for(const button of form.querySelectorAll('button:is([type="submit"],:not([type]))'))
+    button.setAttribute('aria-disabled','true');
+  };
+  return recoverReviewRevision(reason,{form,report,present,reload:async()=>{
    const signal=AbortSignal.timeout(requestTimeoutSeconds*1000);
    const response=await fetch(location.href,{cache:'no-store',signal});
    if(!response.ok) throw new Error('HTTP '+response.status);
@@ -1520,7 +1595,7 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
   }});
  };
  const send=async(_outcome,data)=>{
-  if(cardSubmitBlocked(form)) return;
+  if(cardSubmitBlocked(form) || !showUpdates.hidden) return;
   rememberReviewDraft(form);
   busy(true);
   if(conflict){
@@ -1528,20 +1603,20 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
    busy(false);
    return;
   }
-  notice.textContent='Saving…';
+  report('Saving…');
   let saved=false;
   await saveReviewAction(data,{
    saved:result=>{
     saved=true;
-    notice.textContent='Saved: '+result.answer;
+    report('Saved: '+result.answer);
     if(frame){
      frame.removeAttribute('data-saving');
      frame.dispatchEvent(new Event('review-card-busy'));
      frame.dispatchEvent(new Event('review-card-saved'));
     }
    },
-   failed:reason=>{notice.textContent='Not saved: '+reason;},
-   displayFailed:()=>{notice.textContent='Saved; the item could not refresh.';},
+   failed:reason=>report('Not saved: '+reason),
+   displayFailed:()=>report('Saved; the item could not refresh.'),
    recover,
    finished:()=>{if(!saved) busy(false);}
   });
