@@ -51,7 +51,8 @@ def words_box(element_id: str, placeholder: str) -> str:
     identity = html.escape(element_id, quote=True)
     words = html.escape(placeholder, quote=True)
     return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words'
-            + f' aria-label="{words}" placeholder="{words}"></div>')
+            + f' autocomplete="off" aria-label="{words}" placeholder="{words}">'
+            + f'<button type="button" id="{identity}-clear" data-clear-filter-words aria-label="Clear filter">×</button></div>')
 
 
 CLOCK = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
@@ -89,9 +90,16 @@ main{font-size:15px;line-height:1.5}
 background:var(--card);color:var(--ink);border-radius:8px;max-width:100%;min-width:0}
 .list-filters input{width:260px}
 .list-search-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
-.record-filter-words{display:flex;justify-content:flex-end;margin-bottom:10px}
-.record-filter-words input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
-background:var(--card);color:var(--ink);width:300px;max-width:100%;min-width:0;box-sizing:border-box}
+.record-filter-words{position:relative;width:300px;max-width:100%;margin:0 0 10px auto}
+.record-filter-words input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);
+border-radius:8px;background:var(--card);color:var(--ink);width:100%;min-width:0;box-sizing:border-box}
+.record-filter-words input:not(:placeholder-shown){padding-inline-end:44px;border-color:var(--filter-selected-bg)}
+.record-filter-words input::-webkit-search-cancel-button{appearance:none}
+.record-filter-words input:placeholder-shown+[data-clear-filter-words]{display:none}
+@media(max-width:340px){.record-filter-words input::placeholder{font-size:14px}}
+[data-clear-filter-words]{position:absolute;inset-block:0;inset-inline-end:0;width:44px;margin:0;padding:0;
+border:0;border-radius:8px;background:none;color:var(--ink-2);font-size:22px;cursor:pointer}
+[data-clear-filter-words]:hover{color:var(--ink)}
 .record-filter-row{display:grid;grid-template-columns:5rem minmax(0,1fr);align-items:baseline;gap:8px;margin-bottom:8px}
 .record-filter-row>span{color:var(--ink-2);font-size:13px}
 .record-filter-row>div{display:flex;flex-wrap:wrap;gap:6px}
@@ -206,6 +214,12 @@ border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--
 
 
 SCRIPT = r'''const filterControl={
+ wordValues:new WeakMap(),
+ getWords(control){return this.wordValues.get(control) ?? '';},
+ setWords(control,value){
+  this.wordValues.set(control,value);
+  if(control.value!==value) control.value=value;
+ },
  buttons(row){return [...row.querySelectorAll('[data-filter-value]')];},
  setCounts(row,counts){
   for(const button of this.buttons(row)){
@@ -232,9 +246,22 @@ SCRIPT = r'''const filterControl={
   const emit=value=>control.dispatchEvent(new CustomEvent('filterchange',{bubbles:true,detail:value}));
   if(control.hasAttribute('data-filter-words')){
    let timer;
-   control.addEventListener('input',()=>{
+   const clear=()=>{
     clearTimeout(timer);
-    timer=setTimeout(()=>{if(control.isConnected) emit(control.value);},120);
+    this.setWords(control,'');
+    control.focus({preventScroll:true});
+    emit('');
+   };
+   control.addEventListener('input',()=>{
+    this.setWords(control,control.value);
+    clearTimeout(timer);
+    timer=setTimeout(()=>{if(control.isConnected) emit(this.getWords(control));},120);
+   });
+   control.parentElement.querySelector('[data-clear-filter-words]').addEventListener('click',clear);
+   control.addEventListener('keydown',event=>{
+    if(event.key!=='Escape' || event.defaultPrevented || event.isComposing || !control.value) return;
+    event.preventDefault();
+    clear();
    });
   }else{
    for(const button of this.buttons(control))
@@ -351,6 +378,8 @@ if(options.mount){
 const sortValues=data=>options.sortValues?.(data) ?? JSON.parse(data.sortValues);
 const words=()=>content.querySelector('[data-filter-words]') ?? content.querySelector('#list-search');
 const sharedWords=()=>words().hasAttribute?.('data-filter-words');
+const currentWords=()=>sharedWords() ? filterControl.getWords(words()) : words().value;
+if(sharedWords()) addEventListener('pageshow',()=>setTimeout(()=>filterControl.setWords(words(),currentWords()),0));
 const chipRow=name=>content.querySelector('[data-filter-row="'+name+'"]');
 const staffChipPrefix='staff:';
 const isStaffChipFilter=name=>options.staffChipFilters?.includes(name);
@@ -411,7 +440,7 @@ function readPlace(params,followingItemLink=false){
  const item=params.get('item');if(item && !followingItemLink){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
-   owner='';show=options.requiredShow?.(itemWithKey(item)?.dataset) ?? 'all';
+   owner='';show='all';
    query='';type='';for(const name of filterNames) filters[name]='';}
   if(options.single) opened.clear();opened.add(item);revealKey=item;
  }
@@ -425,7 +454,7 @@ function readPlace(params,followingItemLink=false){
   saved.opened.forEach(key=>opened.add(key));
  }
  owner=options.resolveOwner?.(owner) ?? owner;
- if(sharedWords()) words().value=query;
+ if(sharedWords()) filterControl.setWords(words(),query);
  return saved?.top;
 }
 function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}){
@@ -534,24 +563,27 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
 }
 function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
 function canRevealLinked(item,selection){
- const required=options.requiredShow?.(item.dataset);
- if(required && required!==selection.show) return false;
  return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
 }
-function matches(item,selection,counts){
+function matches(item,selection,counts,allowExpanded=false){
  if(!isSelected(item)) return false;
  if(!options.filterValues) return options.visible(item.dataset,selection);
- const values=options.filterValues(item.dataset,selection.query,selection);
+ const data=item.dataset;
+ const activeValues=options.filterValues(data,selection.query,selection);
+ const expanded=!activeValues && allowExpanded && opened.has(data.key) && options.expandedSelection?.(data,selection);
+ const values=activeValues || (expanded && options.filterValues(data,expanded.query,expanded));
  if(!values) return false;
  const selected={show:selection.show,owner:selection.owner,...selection.filters};
- const required=options.requiredShow?.(item.dataset);
  const excluded=Object.entries(values).filter(([name,choices])=>
-  filterChipValue(name,selected[name])==='all' ? name==='show' && required : !choices.includes(selected[name]));
+  filterChipValue(name,selected[name])!=='all' && !choices.includes(selected[name]));
  // A record counts for a row when it matches every other row.
  if(counts && excluded.length<2){
   for(const [name,choices] of Object.entries(values)){
-   if(excluded.length && excluded[0][0]!==name) continue;
-   for(const value of [...(name==='show' && required ? [] : ['all']),...choices.map(choice=>filterChipValue(name,choice))])
+   // A change to Show ends the exception for an open read row.
+   const sameShow=expanded && name==='show';
+   if(excluded.length && (excluded[0][0]!==name || sameShow)) continue;
+   const chipValues=sameShow ? [selection.show] : ['all',...choices.map(choice=>filterChipValue(name,choice))];
+   for(const value of chipValues)
     counts[name][value]=(counts[name][value] ?? 0)+1;
   }
  }
@@ -601,10 +633,10 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   const transition=windowMotions ? windowMotions.get(item.dataset.key) : rowMotion.get(item);
   return (transition?.sortValues ?? sortValues(item.dataset))[column];
  };
- const items=[...rows,...departingRows].sort((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
-  (compare(sortValue(a),sortValue(b)) ||
-   Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
- const table=content.querySelector('table');let count=0,expandedOutsideFilter=false;
+ const compareOrder=(a,b)=>compare(Number(a.dataset.order),Number(b.dataset.order));
+ const items=[...rows,...departingRows].sort((a,b)=>column<0 ? compareOrder(a,b) :
+  (compare(sortValue(a),sortValue(b)) || compareOrder(a,b))*(direction==='desc' ? -1 : 1));
+ const table=content.querySelector('table');let count=0;
  if(options.mount){
   const visibleKeys=new Set(rows.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
   count=visibleKeys.size;
@@ -645,13 +677,10 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   if(linkedSection) linkedSection.hidden=!linked && !leavingLinked;
   items.forEach(item=>{
    const expanded=opened.has(item.dataset.key);
-   const matched=matches(item,active,counts);
-   const selection=expanded && !matched && item!==linked && options.expandedSelection?.(item.dataset,active);
-   const keepExpanded=selection && matches(item,selection);
-   const showRow=matched || item===linked || keepExpanded,wasShown=!item.hidden;
+   const matched=matches(item,active,counts,item!==linked);
+   const showRow=matched || item===linked,wasShown=!item.hidden;
    if(motion && wasShown && !showRow) animateRow(item.parentElement,item,false);
    item.hidden=!showRow;if(matched) count++;
-   if(keepExpanded) expandedOutsideFilter=true;
    const expansionChanged=setExpanded(item,expanded);
    const transition=rowMotion.get(item);
    if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(item.parentElement,item,true);
@@ -674,7 +703,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
   notice.hidden=!missing.length;
  }
- empty.hidden=count>0 || expandedOutsideFilter || missing.length>0;
+ empty.hidden=count>0 || missing.length>0;
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
   const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
@@ -716,8 +745,8 @@ function restorePlace(event){
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
 }
 function saveDeparturePlace(){
- if(sharedWords() && query!==words().value){
-  query=words().value;
+ if(sharedWords() && query!==currentWords()){
+  query=currentWords();
   writePlace(false,scrollY);
  }else history.replaceState({recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top:scrollY}},'');
 }
@@ -731,16 +760,15 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
   opened.add(key);
   const selection=currentSelection();
   if(!preserveFilters && !canRevealLinked(target,selection) && !matches(target,selection)){
-   const targetShow=options.requiredShow?.(target.dataset) ?? 'all';
-   const unfiltered=currentSelection({owner:'',show:targetShow,query:'',type:'',sourceOwner:'',filters:{}});
+   const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
    if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
    if(!keepMatchingFilters || sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
-   if(!keepMatchingFilters || show!==targetShow && !matches(target,{...unfiltered,show})) show=targetShow;
+   if(!keepMatchingFilters || show!=='all' && !matches(target,{...unfiltered,show})) show='all';
    if(query && !matches(target,{...unfiltered,query:query.trim().toLowerCase()})) query='';
    if(type && !matches(target,{...unfiltered,type})) type='';
    for(const name of filterNames)
     if(filters[name] && !matches(target,{...unfiltered,filters:{[name]:filters[name]}})) filters[name]='';
-   if(sharedWords()) words().value=query;
+   if(sharedWords()) filterControl.setWords(words(),query);
   }
  }
  if(options.mount && target) revealKey=key;
@@ -780,7 +808,7 @@ function setRowsExpanded(items,expanded){
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
  const changePlace=(normalizeOwner=false)=>apply(true,{dismissMissingItem:true,normalizeOwner});
- const changeFilter=()=>{if(sharedWords()) query=words().value;changePlace(true);};
+ const changeFilter=()=>{if(sharedWords()) query=currentWords();changePlace(true);};
  content.querySelector('[data-clear-linked-reviews]')?.addEventListener('click',()=>{
   keys.clear();changeFilter();words().focus({preventScroll:true});
  });
@@ -816,13 +844,13 @@ function bind(){
 return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDeparturePlace,get linkedItem(){return linkedItem;},
  revealMatchingItem(key){
   const target=itemWithKey(key);
-  const selection=currentSelection({query:words().value.trim().toLowerCase()});
+  const selection=currentSelection({query:currentWords().trim().toLowerCase()});
   if(!target || !matches(target,selection)) return false;
   jump(key,{preserveFilters:true});
   return true;
  },
  setShownExpanded(expanded){
-  const currentQuery=words().value;
+  const currentQuery=currentWords();
   if(query!==currentQuery){
    query=currentQuery;
    apply(false,{dismissMissingItem:true});
@@ -863,11 +891,11 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  get hasActiveRowAnimations(){return rowMotion.size>0;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(draw=true){
-  const previous=words(),previousQuery=query;
+  const previous=currentWords(),previousQuery=query;
   for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
-  if(sharedWords()){query=previous.value;words().value=query;}
+  if(sharedWords()){query=previous;filterControl.setWords(words(),query);}
   bind();if(draw) applyRows(query!==previousQuery);
  }};
 }
@@ -920,7 +948,15 @@ function closeDateTimePicker(menu,focus){
  const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
  if(focus) toggle.focus();
 }
-function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=()=>{},retryTime=()=>NaN}){
+function pickerSummary(zone){
+ const date=new Intl.DateTimeFormat('en-GB',{timeZone:zone,weekday:'short',day:'numeric',month:'short'});
+ return at=>{
+  const {hour,minute}=zoneParts(zone,at);
+  return date.format(at)+' '+dateTimeClock(hour*60+minute);
+ };
+}
+function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummary=pickerSummary(zone),
+ prepareMenu=()=>{},retryTime=()=>NaN}){
  const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
  const custom=menu.querySelector('[data-later-custom]'),chooseItem=menu.querySelector('[data-later-choose]');
  const items=()=>[...menu.querySelectorAll('[role=menuitem]:not([hidden])')];
@@ -939,7 +975,6 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
  const dayText=date=>date.toISOString().slice(0,10);
  const monthText=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',year:'numeric'});
  const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
- const summary=new Intl.DateTimeFormat('en-GB',{timeZone:zone,weekday:'short',day:'numeric',month:'short'});
  let selected=new Date(),display=new Date();
  const today=()=>{const now=zoneParts(zone,Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
  const update=(normalize=false)=>{
@@ -951,9 +986,8 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
   field.dispatchEvent(new Event('input',{bubbles:true}));
   const retry=retryTime();
   const at=Number.isFinite(retry) ? retry : valid ? dateTimeEpoch(zone,selected,minutes) : NaN;
-  const resolved=Number.isFinite(at) ? zoneParts(zone,at) : null;
-  custom.querySelector('[data-later-summary]').textContent=resolved ? summaryPrefix+summary.format(at)+' '+
-   dateTimeClock(resolved.hour*60+resolved.minute) : 'Choose a time';
+  custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at)
+   ? summaryPrefix+formatSummary(at) : 'Choose a time';
   save.disabled=!Number.isFinite(retry) && !(at>Date.now());
  };
  const draw=()=>{

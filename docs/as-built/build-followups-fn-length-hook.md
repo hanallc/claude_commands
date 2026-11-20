@@ -153,7 +153,8 @@ Files: `scripts/hooks/pre-tool-use-tool-output-read.py`, `scripts/hooks/test_too
 
 ### Showrunner settings and stall watcher
 
-- `config/showrunners.json` (git-ignored; `SHOWRUNNERS_CONFIG` redirects it) holds five settings: `threshold_percent` 2, `repeat_minutes` 30, `stall_minutes` 5, `faults_to` `natedev` and `always` `["natedev"]`. `quota_alert.py` sends to `always`, then to each running showrunner by its name now, each name once.
+- `config/showrunners.conf` defines `threshold_percent`, `stall_minutes`, `faults_to`, and `always`.
+  `quota_alert.py` sends Claude five-hour notices, Claude no-room notices, and blocked account move notices to running showrunners and `always` recipients.
 
 - `scripts/production/stall_watch.py` runs each minute as the run-only notifier instance `stall-watch`. Per tick, under a non-blocking `flock` on `~/.local/state/stall-watch/lock` (a held lock exits 0 at once): for each running showrunner (`registered_showrunners()` with a `socket`), for each unit that `unit_lookup.labeled_sessions(<showrunner name>)` finds with a `LiveClaude`, take its pane and that Claude's pid, session id and socket, and track a stretch. A showrunner that is not running has no one to report to, so its units are not watched.
 
@@ -267,7 +268,8 @@ Run files keep staff references instead of copied native identities.
 
 - `settings.json` order: the `Edit|MultiEdit|Write` group keeps basedpyright first with the fn-length hook after it. An edit to either group keeps every entry.
 
-- `config/showrunners.json` holds settings only and no script writes it; readers call `load_settings` or `load_settings_from(CONFIG)` on the live checkout's machine-local file. The file stays untracked (`.gitignore` names it).
+- `load_settings` reads `showrunners.conf` from the live configuration folder.
+  Set `SHOWRUNNERS_CONFIG` to select a different file.
 
 - Stalled detection belongs to the stall watcher, not `unit_status.sh`. Idleness rests on the pane hash plus transcript and `subagents/` mtimes, never on status-file text.
 

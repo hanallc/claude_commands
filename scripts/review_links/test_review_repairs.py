@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from scripts.lib import conf, urgency
 from scripts.lib.user_zone import user_zone
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
 from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import fixture_member
@@ -87,18 +88,33 @@ class ReviewRepairsTests(unittest.TestCase):
                 self.assertEqual(item.state,review_items.ReviewState.DONE)
                 self.assertTrue(any('Keep these words.' in entry.words for entry in item.log))
 
-    def test_investigation_feedback_uses_the_shared_retry_and_owner_alert(self) -> None:
-        ready = self.case.investigation()
+    def test_investigation_feedback_uses_the_shared_retry_and_showrunner_alert(self) -> None:
+        producer = fixture_member("producer", name="bob")
+        runner = staff.snapshot().by_path("page-owner")
+        assert runner is not None
+        _ = write_config_fixture(conf.path("review_links"), "unrouted_alert_recipient=page-owner\n")
+        record = investigation.file(producer.id, "Why did the gate stop?", "Read the gate log.",
+                                    waiting_why="The owner must complete the investigation.")
+        ready = investigation.answer(record.owner, record.id, "The test failed. The repair is ready.")
         key = f'investigation/{ready.owner}/{ready.id}'
         delivery,_ = review_page.submit(self.case.root,self.case.body(key,'feedback','Check the next report.'),self.case.status)
         calls: list[str] = []
-        def send(_recipient: staff.StaffId, _sender: str, message: str) -> None:
+        targets: list[staff.StaffId] = []
+        keys: list[str] = []
+
+        def send(recipient: staff.StaffId, _sender: str, message: str, *, key: str) -> None:
             calls.append(message)
+            targets.append(recipient)
+            keys.append(key)
             if not message.startswith('Change review delivery needs attention'):
                 raise RuntimeError('fixture send failed')
+
         with patch.object(change_page,'send_to_staff',side_effect=send):
             change_page.deliver(delivery,self.case.status)
         self.assertEqual(len(calls),4)
+        self.assertEqual(targets, [producer.id] * 3 + [runner.id])
+        self.assertEqual(len(set(keys[:3])), 1)
+        self.assertNotEqual(keys[0], keys[-1])
         self.assertIn('Check the next report.',calls[-1])
         self.assertIn('Last error: fixture send failed',calls[-1])
         self.assertEqual(next(item.state for item in review_items.read(self.case.root) if item.key == key),review_items.ReviewState.DONE)
@@ -203,7 +219,7 @@ class ReviewRepairsTests(unittest.TestCase):
                         with self.assertRaisesRegex(question_record.AnswerRefused, 'already with the showrunner'):
                             _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'SECOND_REQUEST'), case.status)
                         expected_text, excluded_text = 'FIRST_REQUEST', 'SECOND_REQUEST'
-                        expected_state = review_items.ReviewState.VALIDATING
+                        expected_state = review_items.ReviewState.WAITING
                     else:
                         _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'SECOND_REQUEST'), case.status)
                         expected_text, excluded_text = 'SECOND_REQUEST', 'FIRST_REQUEST'
@@ -662,8 +678,9 @@ window.fetch=async(url,options={})=>{
   check(row('C1') && !row('C1').hidden && row('C1').dataset.state==='Validating',
    'Validating shows the saved check.');
   await show('all');
-  check(!row('C1').hidden && !row('C1').querySelector('button') &&
-   row('C1').textContent.includes('With page-owner since'),'All shows the active check without buttons.');
+  check(!row('C1').hidden && row('C1').querySelector('button.list-toggle') &&
+   row('C1').textContent.includes('With page-owner · Validating for'),
+   'All shows the elapsed time and a button to open the active check.');
   await show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
   row('C2').querySelector('.list-toggle').click();await readyReviewCard(row('C2'));
@@ -791,7 +808,7 @@ window.fetch=async(url,options={})=>{
         cases.extend({'url':'/console/investigations.html#'+urlencode({'owner':ready.owner,'show':old}),
                       'show':new,'count':count,'type':'investigation','item':'','owner':str(ready.owner)}
                      for old,new,count in (('not-read','open',1),('answer ready','open',1),
-                                           ('open','all',2),('read','open',1),('all','all',2)))
+                                           ('open','Waiting',1),('read','open',1),('all','all',2)))
         cases.extend(({'url':'/console/investigations.html#'+urlencode({'owner':owner.id,'show':'all'}),
                        'show':'all','count':1,'type':'investigation','item':'','owner':str(owner.id)},
                       {'url':'/console/investigations.html#'+urlencode({'owner':ready.owner}),

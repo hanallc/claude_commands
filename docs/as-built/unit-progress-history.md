@@ -31,6 +31,9 @@ The live session cache remains in
 `<run root>/<run-id>/progress_history_state.json`. The run root is `/session/<name>/run` for a run made in a session folder, else `/tmp/claude/unit` (`/tmp/claude/delegate` for a run started before the folder rename). Deleting `/tmp`
 does not remove the durable event stream.
 
+The guard refuses old recorder state with a root `phase_last_percent` key.
+The warning gives the path to the state file and names no command.
+
 ## Configuration digest
 
 `_config_digest` hashes the exact model registry text and `direct.conf` bytes once per recorder process.
@@ -232,8 +235,7 @@ whether the calibration helped and continue tuning that original estimate.
 Stable finding identities preserve accepted verdicts across reviews.
 
 State lives in `findings_state.json` beside the progress state and holds the
-ledger of the newest open phase. When the current phase changes, the ledger it
-displaces is copied to `findings_state-<instance_id>.json` and read back when
+ledger of the newest open phase. When the newest open phase changes, its previous ledger is copied to `findings_state-<instance_id>.json` and read back when
 that phase is current again; a phase with no ledger yet starts fresh. Every
 command takes `--phase <id>`: a named older open phase reads and writes its
 parked file, so its repair never moves the newest phase's ledger. A named phase
@@ -346,25 +348,34 @@ It refuses an unknown phase, a completed newest instance, or an empty reason.
 A repeat with the same reason changes nothing; a different reason adds a new event.
 The board shows no row for the dropped attempt.
 
-Phases can be open together. State holds the most recently started open phase
-under `phase` (what `progress`, `eta`, `start-pass`, `arm-review` and
-`findings.py` use) and the older open ones under `open_phases`, each carrying
-its own percent, calibration and early-review state under `parked`.
-An unchanged `start-phase` retry leaves the open phase and its records unchanged from any working directory.
-A changed title or explicit start time can trigger a restart refusal from another recorded worktree.
-Reopening a finished id removes its old worktree and baselines; the next claim records the worker's repository root, HEAD and status.
+The recorder stores all open phases in `open_phases`.
+Each entry owns its start, activity, early review, percent, and calibration.
+Passes, waits, and checkpoints identify the phase instance.
+The recorder retains the last closed phase for reports on work after closure.
+When it reads an older record, it moves the active phase and saved fields into the open list.
+
+Starting another phase leaves every open phase and its work unchanged.
+A retry with the same title and start keeps the existing phase instance.
+A changed title or start can cause a refusal from a different worktree.
+Reopening a phase clears its old worktree and baselines.
 A held reservation prevents this reset until its release is confirmed.
-Starting another id leaves every open phase open. A phase closes only by its own `finish-phase`:
-`--phase-id` names it, and without it the current one closes. Only that phase's
-passes close with it (each pass carries the phase it was opened in, under
-`phase`), and when the current phase closes, the newest older open phase is
-current again. `finish-run` closes every open phase, newest first. A back-fill
-is `start-phase --started-at` then `finish-phase --phase-id <id>
---finished-at`; both events carry `backfilled: true` and `recorded_at`, neither
-time may be in the future or the finish before the start, and the phase table's
-gap samples skip them. Findings recorded between the two calls go to the
-back-filled phase. A launcher names no phase, so a pass it starts belongs to
-the current phase.
+
+Use `--phase-id` to select a phase while several are open.
+An unnamed phase command selects the only open phase or lists the open IDs in its refusal.
+`finish-phase` closes only the selected phase, its passes, and its waits.
+`drop-phase` records the reason for a stopped attempt.
+`finish-run` finishes every open phase before it closes the run.
+Elapsed time spans each phase's own start and finish.
+
+Use `progress --all` to read each open phase's elapsed time, last recorded percent, and ETA.
+Use `progress --phase-id <id>` to assess one phase.
+Use `eta --phase-id <id>` to record a time for one phase.
+
+To record a past start or finish, use `--started-at` or `--finished-at`.
+Both events carry `backfilled: true` and `recorded_at`.
+The time must be in the past or present.
+The finish must follow the start.
+The phase table excludes those events from gap samples.
 
 For production plans, `start-phase`, every `progress` report, `finish-phase`,
 and `finish-run` end by asking `phase_table.py refresh` to rewrite the unit's

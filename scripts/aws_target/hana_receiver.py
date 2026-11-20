@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import fcntl
 import hashlib
 from http.client import HTTPException, HTTPResponse
@@ -44,12 +44,15 @@ BOOTSTRAP_COMMAND = (
 )
 MOUNTINFO = Path('/proc/self/mountinfo')
 RUNNER_ENVIRONMENT = Path('/etc/hana-aws/runner-environment')
+# The systemd journal identifies service deactivation for success and failure.
+UNIT_EXIT_MESSAGES = ('7ad2d189f7e94e70a38c781354912448', 'd9b373ed55a64feb8242e02dbe79a49c')
 
 
 @dataclass(frozen=True)
 class CommandDeparture:
     terminated: bool
     lease_free: bool
+    timing: hana_protocol.HanaCommandTiming = field(default_factory=hana_protocol.HanaCommandTiming)
 
 
 class CommandSupervisor(Protocol):
@@ -98,10 +101,12 @@ def source_update_directory(directory: Path) -> Path:
 class GuestCommandSupervisor:
     """Root supervises the unit while the unit owns all source and compiler processes."""
 
-    def __init__(self, settings: ReceiverSettings, *, slot_policy: Path = hana_payload.IMAGE_SLOT_POLICY) -> None:
+    def __init__(self, settings: ReceiverSettings, *, slot_policy: Path = hana_payload.IMAGE_SLOT_POLICY,
+                 clock: Callable[[], float] = time.time) -> None:
         self.settings: ReceiverSettings = settings
         self.slot_policy: Path = slot_policy
         self.timeout_s: int = settings.aws_timeout_s
+        self.clock: Callable[[], float] = clock
         self.children: dict[Path, subprocess.Popen[bytes]] = {}
 
     def mounted(self) -> bool:
@@ -125,7 +130,7 @@ class GuestCommandSupervisor:
             _ = (directory / 'input').write_bytes(payload)
             limit = hana_protocol.CONTROL_MAX_BYTES if action == 'source-update' else COMMAND_OUTPUT_MAX_BYTES
             command = [*CAPTURE_COMMAND, str(limit + 1),
-                       arguments[0], '--quiet', '--pipe', '--property=ExitType=cgroup',
+                       arguments[0], '--quiet', '--pipe', '--property=ExitType=main',
                        f'--property=EnvironmentFile={RUNNER_ENVIRONMENT}',
                        f'--property=RuntimeMaxSec={self.settings.command_timeout_s:g}',
                        f'--property=TemporaryFileSystem={hana_payload.PAYLOAD_MOUNT}:'
@@ -168,6 +173,46 @@ class GuestCommandSupervisor:
         except (OSError, ValueError, KeyError):
             return False
 
+    def _unit_exit_timing(self, directory: Path) -> hana_protocol.HanaCommandTiming:
+        """Read the unit exit time even after systemd unloads the service."""
+        try:
+            response = subprocess.run(['journalctl', '--boot', '--no-pager', '--lines=1', '--output=json',
+                '--output-fields=__REALTIME_TIMESTAMP', '_PID=1', 'UNIT=' + command_unit(directory),
+                *('MESSAGE_ID=' + message for message in UNIT_EXIT_MESSAGES)], capture_output=True,
+                timeout=self.timeout_s, check=True)
+            timestamp = hana_result.string_field(read_document(response.stdout), '__REALTIME_TIMESTAMP')
+            if timestamp.isascii() and timestamp.isdecimal():
+                return {'unit_exited_at': int(timestamp) / 1_000_000}
+        except (OSError, ValueError, OverflowError, subprocess.SubprocessError):
+            pass
+        return {}
+
+    def _record_unit_exit_timing(self, directory: Path,
+                                 departure: hana_protocol.HanaCommandTiming) -> hana_protocol.HanaCommandTiming:
+        path = directory / 'launcher-finished.json'
+        if not path.exists():
+            path = directory / 'launcher.json'
+        try:
+            record = read_document(path.read_bytes())
+            saved = hana_protocol.decode_command_timing(record)
+        except (OSError, ValueError):
+            return self._unit_exit_timing(directory)
+        if 'unit_exited_at' in saved:
+            return {'unit_exited_at': saved['unit_exited_at']}
+        if 'lease_free_at' in saved:
+            return {}
+        timing = self._unit_exit_timing(directory)
+        update: hana_protocol.HanaCommandTiming = {**timing}
+        if 'lease_free_at' in departure:
+            update['lease_free_at'] = departure['lease_free_at']
+        if update:
+            try:
+                guest.atomic_record(path, {**record, **update})
+            except OSError:
+                # A timing write does not affect departure proof.
+                pass
+        return timing
+
     def stop(self, directory: Path) -> None:
         """Keep an uncertain launcher owned until its unit confirms departure."""
         try:
@@ -201,18 +246,35 @@ class GuestCommandSupervisor:
             if fields.get('LoadState') == 'not-found':
                 empty_group = ((directory / 'launcher-finished.json').exists()
                                or (directory / 'stopped.json').exists())
-            ended = (launcher_ended and empty_group
-                and fields.get('ActiveState') in ('inactive', 'failed') and fields.get('Job', '') in ('', '0'))
-            if not ended:
+            if fields.get('ActiveState') not in ('inactive', 'failed') or fields.get('Job', '') not in ('', '0'):
                 return CommandDeparture(False, False)
-            policy = hana_payload.read_slot_policy(self.slot_policy)
-            timing = build_folder_lock.ProbeTiming(policy.probe_wait_seconds, policy.probe_retry_seconds)
-            lease_free = build_folder_lock.probe(policy.root / f'hana-slot{slot}', policy.root, lambda: timing) == 'free'
-            return CommandDeparture(True, lease_free)
+            timing: hana_protocol.HanaCommandTiming = {}
+            if empty_group:
+                timing['unit_exit_observed_at'] = self.clock()
+            terminated = empty_group and launcher_ended
+            lease_free = False
+            if terminated:
+                policy = hana_payload.read_slot_policy(self.slot_policy)
+                probe_timing = build_folder_lock.ProbeTiming(policy.probe_wait_seconds, policy.probe_retry_seconds)
+                lease_free = build_folder_lock.probe(
+                    policy.root / f'hana-slot{slot}', policy.root, lambda: probe_timing) == 'free'
+                if lease_free:
+                    timing['lease_free_at'] = self.clock()
+            if launcher_ended:
+                timing.update(self._record_unit_exit_timing(directory, timing))
+            return CommandDeparture(terminated, lease_free, timing)
         except (OSError, ValueError, subprocess.SubprocessError):
             return CommandDeparture(False, False)
 
     def outcome(self, directory: Path) -> hana_protocol.HanaRunOutcome:
+        if (directory / 'timed-out.json').exists():
+            try:
+                with (directory / 'output').open('rb') as output:
+                    if output.read(1) == b'\n':
+                        return hana_protocol.HanaExecutionLost('The Hana command exceeded its execution deadline')
+            except OSError:
+                pass
+            return hana_protocol.HanaExecutionRefused('Hana could not start the build before the execution deadline')
         started = False
         try:
             with (directory / 'output').open('rb') as output:
@@ -234,9 +296,6 @@ class GuestCommandSupervisor:
         except (OSError, ValueError, KeyError):
             reason = ('The Hana runner has no complete result' if started
                       else 'The Hana command unit exited before it could start the build')
-        if (directory / 'timed-out.json').exists():
-            reason = ('The Hana command exceeded its execution deadline' if started
-                      else 'Hana could not start the build before the execution deadline')
         return (hana_protocol.HanaExecutionLost(reason) if started else hana_protocol.HanaExecutionRefused(reason))
 
     def source_outcome(self, directory: Path) -> hana_protocol.HanaSourceUpdateOutcome:
@@ -384,6 +443,11 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
         accepted, fenced = record['accepted'] is True, record['fenced'] is True
         departure = (CommandDeparture(True, True) if not accepted or record['refused'] is True
                      else supervisor.departure(directory, slot))
+        saved_timing = hana_protocol.decode_command_timing(record.get('timing', {}))
+        timing: hana_protocol.HanaCommandTiming = {**departure.timing, **saved_timing}
+        if timing != saved_timing:
+            record['timing'] = timing
+            guest.atomic_record(record_path, record)
         reason = hana_protocol.COMMAND_RESULT_PENDING
         if record.get('source_update_started') is True:
             update_directory = source_update_directory(directory)
@@ -406,16 +470,16 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
                 else:
                     reason = (source_outcome.reason if isinstance(source_outcome, hana_protocol.HanaSourceUpdateRefused)
                               else 'The Hana source repair returned a different source identity')
-                    return confirmed_refusal(key, slot, fenced, clock(), reason)
+                    return confirmed_refusal(key, slot, fenced, clock(), reason, timing=timing)
         elif accepted and departure.terminated and departure.lease_free:
             if record['refused'] is True:
                 reason = hana_result.string_field(record, 'reason')
                 code = guest.CommandAdmissionRefusalCode(hana_result.string_field(record, 'refusal_code'))
-                return confirmed_refusal(key, slot, fenced, clock(), reason, code)
+                return confirmed_refusal(key, slot, fenced, clock(), reason, code, timing=timing)
             outcome = supervisor.outcome(directory)
             if isinstance(outcome, hana_protocol.HanaExecutionRefused):
                 if not outcome.reason.startswith('MissingBasis: '):
-                    return confirmed_refusal(key, slot, fenced, clock(), outcome.reason)
+                    return confirmed_refusal(key, slot, fenced, clock(), outcome.reason, timing=timing)
                 if not fenced:
                     reason = outcome.reason
             elif isinstance(outcome, hana_protocol.HanaExecutionLost) and not fenced:
@@ -424,14 +488,16 @@ def receive_execution(settings: guest.SafetySettings, descriptor: dict[str, obje
         evidence = (execution_identity.ExecutionEvidenceUnavailable(reason, observed_at) if accepted
                     else execution_identity.ExecutionNotStarted())
         return hana_protocol.HanaCommandObservation(key, slot, accepted, fenced, departure.terminated,
-                                departure.lease_free, observed_at, evidence, record.get('source_updated') is True)
+                                departure.lease_free, observed_at, evidence, record.get('source_updated') is True,
+                                timing)
 
 
 def confirmed_refusal(key: hana_result.HanaAttemptKey, slot: int, fenced: bool, observed_at: float, reason: str,
-                      code: guest.CommandAdmissionRefusalCode = guest.CommandAdmissionRefusalCode.PRE_COMMAND_FAILED
+                      code: guest.CommandAdmissionRefusalCode = guest.CommandAdmissionRefusalCode.PRE_COMMAND_FAILED, *,
+                      timing: hana_protocol.HanaCommandTiming
                       ) -> hana_protocol.ConfirmedCommandAdmissionRefusal:
     return hana_protocol.ConfirmedCommandAdmissionRefusal(key, slot, fenced, observed_at,
-        ' '.join(reason.splitlines())[:1024] or 'Hana could not start the build', code)
+        ' '.join(reason.splitlines())[:1024] or 'Hana could not start the build', code, timing)
 
 
 @dataclass(frozen=True)
@@ -501,29 +567,14 @@ def receive(settings: guest.SafetySettings, descriptor: dict[str, object], contr
         raise ValueError('The Hana permit is invalid')
     permit_fields = cast(dict[str, object], raw)
     generation = permit_fields.get('generation')
-    if (not isinstance(generation, str) or not generation.isdecimal()
-            or int(generation) <= 0 or permit_fields.get('boot_id') != boot
+    if (not isinstance(generation, str) or permit_fields.get('boot_id') != boot
             or not isinstance(control.get('token'), str) or not isinstance(control.get('execution'), str)):
         raise ValueError('The Hana permit identity is invalid')
+    expected = control.get('expected_generation')
+    if type(expected) is not int:
+        raise ValueError('The Hana permit generation changed')
     permit = guest.WorkPermit(hana_result.seconds_field(permit_fields, 'expires_at'), generation, boot)
-    with guest.guest_lock(paths):
-        if paths.fence.exists():
-            raise ValueError('Hana shutdown is fenced')
-        previous = guest.read_identity(paths.generation)
-        current = guest.read_permit(paths.permit)
-        if not (isinstance(current, guest.WorkPermit) and current == permit):
-            expected = control.get('expected_generation')
-            if type(expected) is not int or expected != int(previous or '0'):
-                raise ValueError('The Hana permit generation changed')
-            if not guest.fresh_permit(settings, permit, generation, boot, clock):
-                raise ValueError('The Hana permit is expired or exceeds its window')
-            if previous and int(generation) <= int(previous):
-                raise ValueError('The Hana permit generation did not increase')
-            # A failed partial write refuses permission until a controller recovery.
-            guest.atomic_record(paths.permit, asdict(permit))
-            _ = paths.generation.write_text(generation)
-        elif not guest.fresh_permit(settings, permit, generation, boot, clock):
-            raise ValueError('The Hana permit expired')
+    guest.write_permit(settings, permit, expected_generation=expected, paths=paths, clock=clock)
     reply.update(token=control['token'], generation=int(generation), execution=control['execution'])
     return reply
 
@@ -579,6 +630,13 @@ def _upload_window_loss(timeout: int) -> ResultUploadLost:
     return _upload_loss(f'The signed access window cannot fit a result upload of {timeout} s and settlement')
 
 
+def _read_upload_timing(path: Path) -> hana_protocol.HanaCommandTiming:
+    try:
+        return hana_protocol.decode_command_timing(read_document(path.read_bytes()))
+    except (OSError, ValueError):
+        return {}
+
+
 def _recover_result_upload(path: Path) -> ResultUploadNotStarted | ResultUploadOutcome:
     try:
         row = read_document(path.read_bytes())
@@ -590,13 +648,15 @@ def _recover_result_upload(path: Path) -> ResultUploadNotStarted | ResultUploadO
         return ResultUploadLost(hana_result.string_field(row, 'reason'))
     if row.get('state') == 'started':
         lost = _upload_loss('The receiver restarted before it confirmed the result upload')
-        _save_result_upload(path, lost)
+        _save_result_upload(path, lost, _read_upload_timing(path))
         return lost
     raise ValueError('The Hana result upload record is invalid')
 
 
-def _save_result_upload(path: Path, outcome: ResultUploadOutcome) -> None:
-    row = {'state': 'lost', 'reason': outcome.reason} if isinstance(outcome, ResultUploadLost) else {'state': 'uploaded'}
+def _save_result_upload(path: Path, outcome: ResultUploadOutcome, timing: hana_protocol.HanaCommandTiming) -> None:
+    row: dict[str, object] = ({'state': 'lost', 'reason': outcome.reason}
+                              if isinstance(outcome, ResultUploadLost) else {'state': 'uploaded'})
+    row.update(timing)
     guest.atomic_record(path, row)
 
 
@@ -618,25 +678,27 @@ def _result_upload(directory: Path, key: hana_result.HanaAttemptKey, access: han
     latest_start = min(boot_deadline, access.expires_at) - reserve - timeout
     if clock() < latest_start:
         url = signed_url(access.result_url)
-        guest.atomic_record(path, {'state': 'started'})
         try:
             with tempfile.TemporaryFile() as payload, tempfile.TemporaryFile() as config:
                 _ = payload.write(hana_result.encode_result(result.result))
                 _ = payload.seek(0)
                 _ = config.write(f'url = {json.dumps(url)}\n'.encode())
                 _ = config.seek(0)
-                if clock() < latest_start:
+                started_at = clock()
+                if started_at < latest_start:
                     fd = payload.fileno()
-                    uploads[key] = subprocess.Popen(['curl', '--disable', '--silent', '--fail', '--proto', '=https',
-                        '--max-time', str(timeout), '--upload-file', f'/proc/self/fd/{fd}', '--config', '-'],
-                        stdin=config, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(fd,))
-                    return ResultUploadRunning()
+                    guest.atomic_record(path, {'state': 'started', 'upload_started_at': started_at})
+                    if clock() < latest_start:
+                        uploads[key] = subprocess.Popen(['curl', '--disable', '--silent', '--fail', '--proto', '=https',
+                            '--max-time', str(timeout), '--upload-file', f'/proc/self/fd/{fd}', '--config', '-'],
+                            stdin=config, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(fd,))
+                        return ResultUploadRunning()
         except OSError:
             lost = _upload_loss('The receiver could not start the result upload')
-            _save_result_upload(path, lost)
+            _save_result_upload(path, lost, {})
             return lost
     refused = _upload_window_loss(timeout)
-    _save_result_upload(path, refused)
+    _save_result_upload(path, refused, {})
     return refused
 
 
@@ -674,7 +736,7 @@ def run_receiver(settings: guest.SafetySettings, transport: ReceiverSettings,
         return
     boot_deadline = hana_result.integer_field(descriptor, 'expires')
     timeout = transport.aws_timeout_s
-    supervisor = GuestCommandSupervisor(transport, slot_policy=slot_policy)
+    supervisor = GuestCommandSupervisor(transport, slot_policy=slot_policy, clock=clock)
     uploads: dict[hana_result.HanaAttemptKey, subprocess.Popen[bytes]] = {}
 
     def process_permit() -> None:
@@ -698,6 +760,7 @@ def run_receiver(settings: guest.SafetySettings, transport: ReceiverSettings,
         if clock() >= min(boot_deadline, envelope.access.expires_at):
             return
         observation = receive_execution(settings, descriptor, envelope, supervisor, paths=paths, clock=clock)
+        directory = command_directory(paths, observation.key)
         if observation.fenced:
             process = uploads.get(observation.key)
             if process is not None:
@@ -705,7 +768,6 @@ def run_receiver(settings: guest.SafetySettings, transport: ReceiverSettings,
                 del uploads[observation.key]
         elif (isinstance(observation, hana_protocol.HanaCommandObservation)
               and observation.accepted and observation.terminated and observation.lease_free):
-            directory = command_directory(paths, observation.key)
             result = _result_upload(directory, observation.key, envelope.access, boot_deadline,
                                     transport, supervisor, uploads, clock)
             if isinstance(result, ResultUploadRunning):
@@ -713,6 +775,11 @@ def run_receiver(settings: guest.SafetySettings, transport: ReceiverSettings,
             if isinstance(result, ResultUploadLost):
                 observation = replace(observation,
                     evidence=execution_identity.ExecutionEvidenceUnavailable(result.reason, observation.observed_at))
+        if observation.fenced or (observation.terminated and observation.lease_free):
+            upload_timing = _read_upload_timing(directory / 'result-upload.json')
+            if upload_timing:
+                timing: hana_protocol.HanaCommandTiming = {**observation.timing, **upload_timing}
+                observation = replace(observation, timing=timing)
         url = signed_url(envelope.access.observation_url)
         _ = fetch(Request(url, data=hana_protocol.encode_observation(observation), method='PUT'), timeout)
 
@@ -721,7 +788,7 @@ def run_receiver(settings: guest.SafetySettings, transport: ReceiverSettings,
         if status is None:
             return
         path = command_directory(paths, key) / 'result-upload.json'
-        _save_result_upload(path, _upload_outcome(status, transport.result_transfer_timeout_s))
+        _save_result_upload(path, _upload_outcome(status, transport.result_transfer_timeout_s), _read_upload_timing(path))
         del uploads[key]
 
     try:

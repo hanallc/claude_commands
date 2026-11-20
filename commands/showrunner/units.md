@@ -22,7 +22,7 @@ Its columns are `Unit | Director | Machine | Progress | Phase | ETA Next | ETA P
 - `Director` is the census status of the director's session; its values remain `busy`, `idle`, or the recorded session state.
 - `Machine` appears only when a unit uses another machine.
 - `Progress` shows one square per plan phase. The `Progress:` legend follows the table.
-- `Phase` names each open phase on its own row. With no open phase, it shows done and total phases.
+- `Phase` shows each open phase and its elapsed time. With no open phase, it shows done and total phases.
 - `ETA Next` is the stated ETA of the phase, with any delay.
 - `ETA Plan` appears only while a plan runs.
 The table omits a column whose cells are all `—`.
