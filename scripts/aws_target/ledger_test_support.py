@@ -13,7 +13,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.aws_target import ledger
@@ -70,6 +70,27 @@ def write_gate_config(path: Path) -> None:
     """Install fixed settings for gate and GPU trial tests."""
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = path.write_bytes((FIXTURES / 'cloud_gate.conf').read_bytes())
+
+
+def override_fixture_settings(path: Path, overrides: str) -> None:
+    """Apply values to the private file and keep its limits unless overrides supply limits."""
+    source = path.read_text()
+    lines = source.splitlines()
+    existing = conf.settings(source)
+    limit_prefixes = ('# whole:', '# range:', '# one of:')
+    for key, override in conf.settings(overrides).items():
+        line = f'{key}={override.value}'
+        current = existing.get(key)
+        if override.limit.startswith(limit_prefixes):
+            if current is not None and current.limit.startswith(limit_prefixes):
+                lines[current.line - 1] = override.limit
+            else:
+                line = f'{override.limit}\n{line}'
+        if current is None:
+            lines.append(line)
+        else:
+            lines[current.line] = line
+    _ = path.write_text('\n'.join(lines) + '\n')
 
 
 HANA_GUEST_RUNTIME_SETTINGS = """\
@@ -217,7 +238,7 @@ class CostFixture(unittest.TestCase):
             del os.environ[name]
 
     def configure(self, overrides: str) -> None:
-        _ = write_config_fixture(self.settings, overrides)
+        override_fixture_settings(self.settings, overrides)
 
     def costs(self, values: dict[str, str]) -> None:
         numeric_settings(self.settings, values)

@@ -21,9 +21,8 @@ from scripts.review_links.test_page_frame import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, override_fixture_settings, text_setting
 from scripts.lib import atomic_file, conf
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import push_texts
 from scripts.review_links import console_theme, review_link
 
@@ -64,7 +63,7 @@ class ControlTests(CostFixture):
         self.failure_reason = 'AccessDenied: account 123456789012'
         self.omitted = ''
         values_path = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(values_path, """spot_candidate_regions=us-east-1 us-west-1 us-east-1
+        override_fixture_settings(values_path, """spot_candidate_regions=us-east-1 us-west-1 us-east-1
 instance_types=c7a.4xlarge m7a.2xlarge
 price_compare_instance_types=m7a.8xlarge c7a.4xlarge
 gpu_instance_types=g6.2xlarge g4dn.xlarge

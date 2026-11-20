@@ -16,7 +16,6 @@ from unittest import mock
 from scripts.aws_target import aws_page, console_help, ledger, ledger_test_support, run_cost, spot_table
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import page_frame
 
 
@@ -256,7 +255,7 @@ class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
         candidate_only = 'eu-south-2'
         self.text_setting('region', east)
         config = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(config,
+        ledger_test_support.override_fixture_settings(config,
             f'regions={east} {west} {north}\nspot_candidate_regions={west} {east} {candidate_only}\n'
             + 'instance_types=c7a.4xlarge c7a.8xlarge m7a.4xlarge m7a.8xlarge\n'
             + 'gate_wait_usd_per_minute=0.02\nmax_gate_minutes=12\n'
