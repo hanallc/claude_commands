@@ -17,7 +17,7 @@ from unittest import mock
 from scripts.direct import phase_wait_holder
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY, VerifyTokenWaitFixture
-from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, wait_for_verify_state, wait_rows
+from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, recorded_holders, wait_for_verify_state, wait_rows
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.lint.memory_test_support import write_config_fixture
@@ -47,10 +47,6 @@ def named_holder(kind: str, resource: str, owner: str, *, unit: bool = False) ->
     return {"state": "NamedHolder", "resource_kind": kind, "resource": resource,
             "holder": {"state": "UnitHolder", "unit": owner} if unit else
                       {"state": "SessionHolder", "session_id": owner}}
-
-
-def recorded_holders(rows: list[dict[str, object]]) -> list[object]:
-    return [row["holder"] for row in rows if row["event_type"] in ("wait_started", "wait_holder_seen")]
 
 
 RECORDER_OBSERVER = '''import json, os, sys
@@ -640,6 +636,7 @@ def main():
         with (root / "reservation-results").open("a") as output:
             output.write(str(status) + "\\n")
     if inject and status == 11:
+        # Temporary hold for the stale evidence race in verify.sh:3174 and admission_service.py:4250.
         wait_for_file(root / "reservation-observed")
     return status
 
@@ -655,8 +652,6 @@ class VerifyTargetWaitHolderTests(_RecordedHoldWaitFixture):
         binaries = root / "bin"
         claims = Path(self.fixture.environment["MAC_TEST_STATE_DIR"]) / "claims"
         claims.mkdir(parents=True, exist_ok=True)
-        settings = Path(self.fixture.environment["MAC_TEST_CONFIG"])
-        _ = write_config_fixture(settings, f"probe_timeout_s={TEST_HANG_GUARD_SECS}\n", template="mac_test")
         local_wait = root / "target-local-wait.py"
         _ = local_wait.write_text(f"""import sys
 sys.path.insert(0, {str(VERIFY.parents[2])!r})
@@ -685,12 +680,12 @@ if "--assignment-file" in arguments:''', 1)
         source = source.replace('raise SystemExit(runner_status)', RUN_HISTORY + 'raise SystemExit(runner_status)')
         self.fixture.write_executable(runner, source)
 
-    def prepare_target_wait(self, *holders: dict[str, object]) -> Path:
+    def prepare_target_wait(self, *, pauses: int) -> Path:
         root = self.fixture.root
         admission = caller_admission(self.fixture, root, self.fixture.environment)
         controls = caller_provider_controls(self.fixture, admission)
         controls.starting["mac"] = root / "target-starting"
-        self.fixture.environment.update({"TEST_EXPECTED_HOLDERS": json.dumps(holders),
+        self.fixture.environment.update({"TEST_TARGET_PAUSES": str(pauses),
                                          "TEST_TARGET_ADMISSION": str(admission.state_dir)})
         return Path(self.fixture.environment["MAC_TEST_STATE_DIR"]) / "claims" / f"{root.name}.json"
 
@@ -727,11 +722,10 @@ if "--assignment-file" in arguments:''', 1)
         return snapshots
 
     def test_pinned_linux_reservation_race_waits_only_with_a_live_claim(self) -> None:
-        _ = self.prepare_target_wait(named_holder("slot", "linux-box", NEXT_SESSION))
+        _ = self.prepare_target_wait(pauses=1)
         root = self.fixture.root
         settings = root / "linux-box.conf"
-        _ = write_config_fixture(settings,
-                                 f"offload=on\nhost=fake-linux\nkinds=test,check\nslots=1\nprobe_timeout_s={TEST_HANG_GUARD_SECS}\n",
+        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\nslots=1\n",
                                  template="mac_test")
         _ = (root / "build_targets.conf").write_text(
             "targets=linux-box,natedev\nkind.linux-box=ssh\nplatform.linux-box=linux\n"
@@ -777,8 +771,7 @@ if "--assignment-file" in arguments:''', 1)
             self.assertEqual(self.fixture.local_runs(), [])
 
     def test_pinned_check_names_a_busy_claim_and_its_next_owner(self) -> None:
-        claim = self.prepare_target_wait(named_holder("slot", "mac", FIRST_SESSION),
-                                         named_holder("slot", "mac", NEXT_SESSION))
+        claim = self.prepare_target_wait(pauses=2)
         _ = self.claim(claim, FIRST_SESSION)
         process = self.start_pinned_route()
         rows = self.pause(process, 1)
@@ -797,8 +790,7 @@ if "--assignment-file" in arguments:''', 1)
         self.assertEqual(self.fixture.local_runs(), [])
 
     def test_pinned_final_names_both_busy_intervals_and_closes_each_before_running(self) -> None:
-        claim = self.prepare_target_wait(named_holder("slot", "mac", FIRST_SESSION),
-                                         named_holder("slot", "mac", NEXT_SESSION))
+        claim = self.prepare_target_wait(pauses=2)
         next_claim = self.claim(claim, NEXT_SESSION)
         _ = self.claim(claim, FIRST_SESSION)
         self.fixture.environment.update({"TEST_REHOLD_FINAL": "1", "TEST_CLAIM_FILE": str(claim),
@@ -823,7 +815,7 @@ if "--assignment-file" in arguments:''', 1)
                               cast(list[dict[str, object]], snapshot["waits"])) for snapshot in snapshots], [1, 2])
 
     def test_pinned_starting_target_records_an_unnamed_holder(self) -> None:
-        _ = self.prepare_target_wait({"state": "HolderNotNamed"})
+        _ = self.prepare_target_wait(pauses=1)
         starting = self.fixture.root / "target-starting"
         starting.touch()
         process = self.start_pinned_route()
@@ -837,8 +829,7 @@ if "--assignment-file" in arguments:''', 1)
         _ = self.assert_closed_before_remote_steps()
 
     def test_mac_only_wait_names_each_claim_owner(self) -> None:
-        claim = self.prepare_target_wait(named_holder("slot", "mac", FIRST_SESSION),
-                                         named_holder("slot", "mac", NEXT_SESSION))
+        claim = self.prepare_target_wait(pauses=2)
         _ = self.claim(claim, FIRST_SESSION)
         free = self.fixture.root / "mac-free"
         self.fixture.environment.update({"TEST_RUNNER_BUSY_UNTIL": str(free), "TEST_RUNNER_BUSY_REASON": "busy"})
@@ -857,8 +848,7 @@ if "--assignment-file" in arguments:''', 1)
         _ = self.assert_closed_before_remote_steps()
 
     def test_routing_hold_names_the_new_holder_on_the_next_pass(self) -> None:
-        claim = self.prepare_target_wait(named_holder("slot", "natedev", FIRST_SESSION),
-                                         named_holder("slot", "natedev", NEXT_SESSION))
+        claim = self.prepare_target_wait(pauses=2)
         self.hold(FIRST_SESSION)
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
         _ = self.claim(claim, FIRST_SESSION)

@@ -87,6 +87,10 @@ def wait_rows(session: Path) -> list[dict[str, object]]:
             and str((row := cast(dict[str, object], json.loads(line)))["event_type"]).startswith("wait_")]
 
 
+def recorded_holders(rows: list[dict[str, object]]) -> list[object]:
+    return [row["holder"] for row in rows if row["event_type"] in ("wait_started", "wait_holder_seen")]
+
+
 def wait_for_verify_state(ready: Callable[[], bool], directory: Path, process: subprocess.Popen[str],
                           what: str) -> None:
     """Wait for the fixture state or the caller's exit."""
@@ -96,10 +100,10 @@ def wait_for_verify_state(ready: Callable[[], bool], directory: Path, process: s
 
 
 def wait_for_target_holder(episode: str) -> None:
-    """Pause on the expected recorder event or wait for the next admission pass."""
+    """Pause when the recorder writes a new holder entry."""
     root = Path(os.environ["PACKAGE_ROOT"])
     session = Path(os.environ["UNIT_RUN_DIR"])
-    holders = cast(list[dict[str, object]], json.loads(os.environ["TEST_EXPECTED_HOLDERS"]))
+    pauses = int(os.environ["TEST_TARGET_PAUSES"])
     admission = Path(os.environ["TEST_TARGET_ADMISSION"])
     snapshot = admission / "queue.json"
     state = admission / "state.json"
@@ -112,19 +116,16 @@ def wait_for_target_holder(episode: str) -> None:
         return status.st_ino, status.st_mtime_ns
 
     previous = snapshot_version()
-    for number, holder in enumerate(holders, 1):
+    for number in range(1, pauses + 1):
         resume = root / f"target-resume-{number}"
         if resume.exists():
             continue
-        rows = wait_rows(session)
-        if rows and rows[-1]["event_type"] in ("wait_started", "wait_holder_seen"):
-            recorded = cast(dict[str, object], rows[-1]["holder"])
-            if all(recorded.get(key) == value for key, value in holder.items()):
-                (root / f"target-holder-{number}").touch()
-                wait_for_file(resume)
-                return
+        if len(recorded_holders(wait_rows(session))) >= number:
+            (root / f"target-holder-{number}").touch()
+            wait_for_file(resume)
+            return
         break
-    # The next pass can publish new evidence even if the last reply still names the old holder.
+    # The next pass can publish new provider evidence.
     wait_until(lambda: snapshot_version() != previous or episode_is_assigned(state, episode), admission)
 
 
