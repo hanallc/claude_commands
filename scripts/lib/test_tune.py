@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
-import json
 import os
 from pathlib import Path
 import shlex
@@ -120,60 +119,6 @@ class TuneTests(PublicationTestCase):
             with land_queue.landing([base]):
                 self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
             self.assertEqual(repo.head(), base)
-
-    @unittest.skipIf(sys.platform == "darwin", "publish-json runs on natedev")
-    def test_settings_json_is_live_before_its_commit_and_uses_the_same_gap(self) -> None:
-        repo = self.repository
-        settings = repo.checkout / "settings.json"
-        _ = settings.write_text('{"autoCompactWindow": 283800}\n')
-        _ = repo.git(repo.checkout, "add", settings.name)
-        _ = repo.git(repo.checkout, "commit", "-qm", "settings fixture")
-        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
-        base = repo.remote_tip()
-        _ = settings.write_text('{"autoCompactWindow": 308800}\n')
-        with mock.patch.dict(os.environ, repo.env, clear=True):
-            with land_runs.landing([base]), redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(live_settings.main(["publish-json", "--message", "Approved window"]), 0)
-                self.assertIn("live now: settings.json", output.getvalue())
-                self.assertFalse(repo.ssh_log.exists())
-                self.assertIn("main: waits for the land that runs now", output.getvalue())
-                self.assertEqual(repo.head(), base)
-                self.assertEqual(repo.remote_tip(), base)
-                self.assertIn("308800", settings.read_text())
-            repo.finish_waiter()
-            self.assertEqual(land_queue.listing(), "the land line is empty")
-        self.assertIn("308800", repo.git(repo.origin, "show", "main:settings.json"))
-        self.assertEqual(repo.git(repo.checkout, "log", "-1", "--format=%s"),
-                         "tune(settings.json): Approved window")
-        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
-
-    def seed_settings(self, text: str) -> Path:
-        repo = self.repository
-        settings = repo.checkout / "settings.json"
-        _ = settings.write_text(text)
-        _ = repo.git(repo.checkout, "add", settings.name)
-        _ = repo.git(repo.checkout, "commit", "-qm", "settings fixture")
-        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
-        return settings
-
-    @unittest.skipIf(sys.platform == "darwin", "publish-json runs on natedev")
-    def test_waiting_json_keeps_a_landed_sibling_path(self) -> None:
-        repo = self.repository
-        settings = self.seed_settings('{"permissions": {"allow": [], "deny": []}}\n')
-        with mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            with land_runs.landing([repo.head()]):
-                _ = settings.write_text('{"permissions": {"allow": ["Read"], "deny": []}}\n')
-                self.assertEqual(live_settings.main(["publish-json", "--message", "Allow Read"]), 0)
-                peer = repo.root / "peer"
-                _ = repo.git(repo.root, "clone", "-q", "-b", "main", str(repo.origin), str(peer))
-                _ = (peer / "settings.json").write_text('{"permissions": {"allow": [], "deny": ["Write"]}}\n')
-                _ = repo.git(peer, "-c", "user.name=Land fixture", "-c", "user.email=land@example.invalid",
-                             "commit", "-qam", "Deny Write")
-                _ = repo.git(peer, "push", "-q", "origin", "main")
-            repo.finish_waiter()
-        expected = {"permissions": {"allow": ["Read"], "deny": ["Write"]}}
-        self.assertEqual(cast(object, json.loads(repo.git(repo.origin, "show", "main:settings.json"))), expected)
-        self.assertEqual(cast(object, json.loads(settings.read_text())), expected)
 
     def test_only_a_saved_guest_key_prints_the_hana_image_notice(self) -> None:
         source = self.repository.checkout / 'hana_aws.conf'
@@ -563,7 +508,7 @@ class TuneTests(PublicationTestCase):
             repo.finish_waiter()
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
 
-    @unittest.skipIf(sys.platform == "darwin", "publish-json runs on natedev")
+    @unittest.skipIf(sys.platform == "darwin", "tune and zone forward from the Mac")
     def test_settings_publish_paths_leave_the_live_land_line_unchanged(self) -> None:
         repo = self.repository
 
@@ -571,7 +516,6 @@ class TuneTests(PublicationTestCase):
             self.assertTrue(path.resolve().is_relative_to(repo.root), f"write outside the fixture: {path}")
             write_text_atomic(path, text, new_file_mode=new_file_mode)
 
-        settings = self.seed_settings('{"autoCompactWindow": 208800}\n')
         config = repo.config.parent
         zone_file = config / "user_zone.conf"
         _ = zone_file.write_text("zone=America/New_York\n")
@@ -620,8 +564,6 @@ class TuneTests(PublicationTestCase):
                 self.assertIn("main: waits for the land that runs now", live_settings.publish_waiting())
                 contents = current.replace("model=old", "model=new")
                 self.assertEqual(models_registry.store_registry(registry, current, contents, "Set fixture model"), contents)
-                _ = settings.write_text('{"autoCompactWindow": 308800}\n')
-                self.assertEqual(live_settings.main(["publish-json", "--message", "Approve the window"]), 0)
                 land_queue.add("fixture phase", batch="", commits=[base], first=False, before=None)
                 self.assertEqual(land_queue.listing(), f"1. fixture phase: {base[:9]}")
                 self.assertEqual(repo.remote_tip(), base)
@@ -632,7 +574,7 @@ class TuneTests(PublicationTestCase):
             self.assertEqual(land_queue.listing(), "the land line is empty")
 
         for path, expected in (("config/example.conf", "amount=4"), ("config/user_zone.conf", "zone=Europe/Paris"),
-                               ("config/models.conf", "model=new"), ("settings.json", "308800")):
+                               ("config/models.conf", "model=new")):
             with self.subTest(path=path):
                 self.assertIn(expected, repo.git(repo.origin, "show", f"main:{path}"), errors.getvalue())
 

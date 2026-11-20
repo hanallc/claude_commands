@@ -10,7 +10,6 @@ from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from enum import StrEnum
-import argparse
 import json
 import os
 import platform
@@ -27,9 +26,8 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.main_push_lock import request_publication as request_publication
 from scripts.production import land_queue, land_runs
 from scripts.lib.waiting_rows import (
-    ORDER_PATH, SETTINGS_JSON, AcceptedSave, LockedJournal, NoSettingsJsonSave, SettingsJsonSave,
-    WaitingChange as WaitingChange, apply_settings_json_edits, clean_settings_json, settings_json_edits,
-    append_setting, apply_accepted_values, apply_move, check_move, checkout_orders, git, has_settings_json_edits,
+    ORDER_PATH, AcceptedSave, LockedJournal, WaitingChange as WaitingChange,
+    append_setting, apply_accepted_values, apply_move, check_move, checkout_orders, git,
     journal_path as journal_path, live_text, locked_checkout, locked_journal, model_color_host, model_color_key, model_color_value,
     move_target, published_orders, read_journal, recover_abandoned_move, replace_value,
     restore_live, tree_text,
@@ -177,12 +175,6 @@ def _publish_main(checkout: Path) -> PublishedSettings:
     changes = pending.changes
     head = git(checkout, "rev-parse", "HEAD").strip()
     tip, lines = _prepare_rows(checkout, head, pending)
-    settings_json = pending.settings_json
-    if isinstance(settings_json, dict):
-        baseline = tree_text(checkout, tip, SETTINGS_JSON) or "{}\n"
-        settings = apply_settings_json_edits(baseline, settings_json["edits"])
-        if has_settings_json_edits(settings_json_edits(baseline, settings)):
-            tip = _settings_commit(checkout, tip, {SETTINGS_JSON: settings}, settings_json["message"])
     if tip != head:
         _ = check_move(checkout, move_target(checkout, tip, fast_forward=True, expected_head=head))
     try:
@@ -195,8 +187,6 @@ def _publish_main(checkout: Path) -> PublishedSettings:
     if tip != head:
         apply_move(checkout, check_move(checkout, move_target(checkout, tip, fast_forward=True, expected_head=head)))
     names = [f"{change.stem}.{change.key}" for change in changes]
-    if not isinstance(settings_json, NoSettingsJsonSave):
-        names.append(SETTINGS_JSON)
     label = " ".join(names) or "main"
     if names:
         main_publish.queue_pull_only(label, "main has the Save",
@@ -204,10 +194,7 @@ def _publish_main(checkout: Path) -> PublishedSettings:
     lines.append(f"main: {detail}")
     with locked_journal(journal_path()) as pending:
         retained = [change for change in pending.changes if change not in changes]
-        finished_json = not isinstance(settings_json, NoSettingsJsonSave) and settings_json == pending.settings_json
-        if finished_json:
-            pending.settings_json = NoSettingsJsonSave()
-        if retained != pending.changes or finished_json:
+        if retained != pending.changes:
             pending.changes = retained
             pending.save()
     return PublishedSettings(checkout, label, lines)
@@ -232,11 +219,8 @@ def publish(checkout: Path) -> list[str]:
 def _waiting_checkout() -> Path | None:
     pending = read_journal(journal_path())
     first = next((change for change in pending.changes if change.publish_on_main), None)
-    has_settings_json = not isinstance(pending.settings_json, NoSettingsJsonSave)
     if first is not None:
         return main_publish.checkout_of(conf.path(first.stem).resolve())
-    if has_settings_json:
-        return _settings_checkout()
     return None
 
 
@@ -256,8 +240,7 @@ def _publication_pending() -> bool:
 
 def waiting_rows_for_main() -> bool:
     pending = read_journal(journal_path())
-    return (any(change.publish_on_main for change in pending.changes)
-            or not isinstance(pending.settings_json, NoSettingsJsonSave))
+    return any(change.publish_on_main for change in pending.changes)
 
 
 def _publish_waiting(descriptor: int) -> int:
@@ -331,53 +314,6 @@ def write_mac(stem: str, key: str, value: str, *, order: int) -> str | MacWriteS
     return f"mac: live now: {key}={value}"
 
 
-def _settings_checkout() -> Path:
-    return main_publish.checkout_of(conf.directory().parent / SETTINGS_JSON)
-
-
-def _stage_settings_json(checkout: Path, message: str) -> bool:
-    """Record the approved shared edits to the local settings file."""
-    recover_abandoned_move(checkout)
-    path = checkout / SETTINGS_JSON
-    while True:
-        head = tree_text(checkout, "HEAD", SETTINGS_JSON) or "{}\n"
-        source = path.read_text(encoding="utf-8")
-        shared = clean_settings_json(checkout, source)
-        with locked_journal(journal_path()) as pending:
-            if path.read_text(encoding="utf-8") != source:
-                continue
-            previous = pending.settings_json
-            edits = settings_json_edits(head, shared, unconfirmed=previous["edits"] if isinstance(previous, dict) else None)
-            if not has_settings_json_edits(edits):
-                return False
-            pending.last_order += 1
-            saved: SettingsJsonSave = {"order": pending.last_order,
-                                       "message": f"tune({SETTINGS_JSON}): {message}", "edits": edits}
-            pending.settings_json = saved
-            pending.save()
-            return True
-
-
-class PublishSettingsJsonArgs(argparse.Namespace):
-    message: str = ""
-
-
-def _publish_settings_json(arguments: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="live_settings.py publish-json")
-    _ = parser.add_argument("--message", required=True)
-    args = parser.parse_args(arguments, namespace=PublishSettingsJsonArgs())
-    if platform.system() == "Darwin":
-        raise ValueError("publish-json runs on natedev")
-    checkout = _settings_checkout()
-    if not _stage_settings_json(checkout, args.message):
-        print(f"main: {SETTINGS_JSON} has no shared changes")
-        return 0
-    print(f"live now: {SETTINGS_JSON}")
-    for line in publish(checkout):
-        print(line)
-    return 0
-
-
 def start_readers(stem: str) -> list[str]:
     """Run each notes part that reads this file now, in its own session; do not wait for it."""
     pairs = (pair.partition(":") for pair in conf.read_or_repository("live_settings").words("readers"))
@@ -398,13 +334,8 @@ def _seconds(key: str) -> int:
 def main(arguments: list[str] | None = None) -> int:
     argv = sys.argv[1:] if arguments is None else arguments
     try:
-        match argv:
-            case ["publish-waiting", descriptor]:
-                return _publish_waiting(int(descriptor))
-            case ["publish-json", *options]:
-                return _publish_settings_json(options)
-            case _:
-                pass
+        if len(argv) == 2 and argv[0] == "publish-waiting":
+            return _publish_waiting(int(argv[1]))
     except (OSError, ValueError, main_publish.Refusal) as error:
         print(f"live_settings: {error}", file=sys.stderr)
         return 1

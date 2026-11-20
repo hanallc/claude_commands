@@ -1034,7 +1034,7 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
             if unpushed:
                 return PromotionOriginPushed(tip)
             return PromotionAlreadyAtTip(tip)
-        if conflict := merge_gate.promotion_edit_conflict(checkout, tip, *waiting_rows.waiting_paths(checkout)):
+        if conflict := merge_gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
             raise checkpoint_gate.Stop("promote", "failed", conflict,
                        "clear the listed checkout paths and rerun this checkpoint")
         if refusal := merge_gate.live_state_refusal(checkout, tip):

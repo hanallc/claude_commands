@@ -1830,10 +1830,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     return run
 
 
-def promotion_edit_conflict(repo: Path, target: str, *waiting: str) -> str:
+def promotion_edit_conflict(repo: Path, target: str, waiting: str = "") -> str:
     """Name local edits on paths that the promotion changes.
 
-    The move keeps the waiting rows at these paths.
+    Files that the pathspec `waiting` names hold waiting rows; the move keeps them.
     """
     environment = dict(os.environ)
     _ = environment.pop("GIT_INDEX_FILE", None)
@@ -1853,7 +1853,7 @@ def promotion_edit_conflict(repo: Path, target: str, *waiting: str) -> str:
             files = git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", "--", index=index)
         promoted = git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", target, "--")
         kept: set[bytes] = set(git("diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", "HEAD", "--",
-                                   *waiting).split(b"\0")) if waiting else set()
+                                   waiting).split(b"\0")) if waiting else set()
         conflicts = sorted(set((staged + files).split(b"\0")) & set(promoted.split(b"\0")) - kept - {b""})
         if conflicts:
             return "promotion refused: tracked edits overlap promotion: " + "; ".join(
@@ -1906,7 +1906,7 @@ def live_state_refusal(repo: Path, target: str) -> str:
 # Send the same function to a Mac without repository Python modules.
 PROMOTION_TRACKED_CHECK = ("import json, os, subprocess, sys, tempfile\nfrom pathlib import Path\n"
                            + inspect.getsource(promotion_edit_conflict)
-                           + "reason = promotion_edit_conflict(Path.cwd(), sys.argv[1], *sys.argv[2:])\n"
+                           + "reason = promotion_edit_conflict(Path.cwd(), *sys.argv[1:3])\n"
                            + "if reason: print(reason)\nraise SystemExit(bool(reason))\n")
 
 
@@ -2000,7 +2000,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             target = record.commit
         if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
-        if conflict := promotion_edit_conflict(main_repo, target, *waiting_rows.waiting_paths(main_repo)):
+        if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
             raise GateRefused(conflict)
         if refusal := live_state_refusal(main_repo, target):
             raise GateRefused(refusal)
@@ -2019,7 +2019,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
     check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
-    waiting = shlex.join(waiting_rows.waiting_paths(main_repo))
+    waiting = shlex.quote(waiting_rows.WAITING_PATHS)
     remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
               "if [ -f scripts/lib/waiting_rows.py ]; "

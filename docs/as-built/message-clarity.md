@@ -535,7 +535,6 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 - **Changes to `questions()` keep calling `record_question_history`** with `question` and `reviewed`, so the nightly count matches the reply. Question detection elsewhere reuses `reply_questions`. Recipient context applies only to the Stop hook, through `user_reply_questions`. `reply_questions` and `sample` stay unchanged.
 - **Do not commit `settings.json` or `config/models.conf` from a unit worktree.**
   The showrunner applies the proposed lines to the live checkout.
-  For shared `settings.json` edits, use the publication command in [Land line](merge-gate-and-test-speed.md#land-line).
 
 ## Calibration and gotchas
 

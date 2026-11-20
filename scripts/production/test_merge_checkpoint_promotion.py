@@ -6,7 +6,6 @@ from scripts.production import checkpoint_gate
 
 import argparse
 import fcntl
-import json
 from collections.abc import Generator
 from contextlib import contextmanager, redirect_stdout
 from datetime import datetime, tzinfo
@@ -21,7 +20,7 @@ import time
 import unittest
 from unittest import mock
 from pathlib import Path, PurePosixPath
-from typing import cast, final
+from typing import final
 from scripts.production.cli_fixture import production_paths
 from scripts.agents import pane_record
 from zoneinfo import ZoneInfo
@@ -31,7 +30,7 @@ from scripts.lib import land_main, live_settings, main_publish
 from scripts.message import sessions
 
 from scripts.production.merge_checkpoint import promote, request_from
-from scripts.production import land_runs, merge_checkpoint
+from scripts.production import merge_checkpoint
 from scripts.production import change_review
 from scripts.production.production_doc import Production, ProductionDocument
 
@@ -53,19 +52,11 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
-    def assert_promotion_keeps_waiting_setting(self, *, json_file: bool, same_file: bool) -> None:
-        if json_file:
-            path = "settings.json"
-            baseline = json.dumps({"autoCompactWindow": 283800, "published": 1}) + "\n"
-            live = json.dumps({"autoCompactWindow": 308800, "published": 1}) + "\n"
-            incoming = json.dumps({"autoCompactWindow": 333800, "published": 2}) + "\n"
-            expected = {"autoCompactWindow": 308800, "published": 2 if same_file else 1}
-        else:
-            path = "config/example.conf"
-            baseline = "# whole: 1..10\namount=2\npublished=1\n"
-            live = "# whole: 1..10\namount=3\npublished=1\n"
-            incoming = "# whole: 1..10\namount=4\npublished=2\n"
-            expected = {"amount": 3, "published": 2 if same_file else 1}
+    def assert_promotion_keeps_waiting_setting(self, *, same_file: bool) -> None:
+        path = "config/example.conf"
+        baseline = "# whole: 1..10\namount=2\npublished=1\n"
+        live = "# whole: 1..10\namount=3\npublished=1\n"
+        incoming = "# whole: 1..10\namount=4\npublished=2\n"
         self.write(self.promote, path, baseline)
         _ = self.git("add", path, cwd=self.promote)
         _ = self.git("commit", "-m", "add the setting", cwd=self.promote)
@@ -81,37 +72,22 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                        "XDG_STATE_HOME": str(self.root / "publication-state"),
                        "MERGE_GATE_STATE_DIR": str(self.root / "land-state")}
         with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(StringIO()):
-            if json_file:
-                self.write(self.promote, path, live)
-                with (land_runs.landing([tip]),
-                      mock.patch.object(live_settings, "request_publication", return_value="main: waits")):
-                    self.assertEqual(live_settings.main(["publish-json", "--message", "Approved window"]), 0)
-            else:
-                _ = live_settings.stage_save(live_settings.WaitingChange(
-                    "example", "amount", "3", "tune(example): approved value"))
+            _ = live_settings.stage_save(live_settings.WaitingChange(
+                "example", "amount", "3", "tune(example): approved value"))
             self.assertEqual((self.promote / path).read_text(), live)
             self.assertEqual(merge_checkpoint.promote_local_checkout(self.promote, "production", tip),
                              merge_checkpoint.PromotionAdvanced(tip))
         text = (self.promote / path).read_text()
-        if json_file:
-            self.assertEqual(cast(object, json.loads(text)), expected)
-        else:
-            for key, value in expected.items():
-                self.assertIn(f"{key}={value}\n", text)
+        self.assertIn("amount=3\n", text)
+        self.assertIn("published=2\n" if same_file else "published=1\n", text)
         self.assertEqual(self.git("show", f"main:{path}", cwd=self.origin),
                          (incoming if same_file else baseline).strip())
 
     def test_promotion_keeps_waiting_conf_when_the_land_changes_that_file(self) -> None:
-        self.assert_promotion_keeps_waiting_setting(json_file=False, same_file=True)
+        self.assert_promotion_keeps_waiting_setting(same_file=True)
 
     def test_promotion_keeps_waiting_conf_when_the_land_changes_another_file(self) -> None:
-        self.assert_promotion_keeps_waiting_setting(json_file=False, same_file=False)
-
-    def test_promotion_keeps_waiting_json_when_the_land_changes_that_file(self) -> None:
-        self.assert_promotion_keeps_waiting_setting(json_file=True, same_file=True)
-
-    def test_promotion_keeps_waiting_json_when_the_land_changes_another_file(self) -> None:
-        self.assert_promotion_keeps_waiting_setting(json_file=True, same_file=False)
+        self.assert_promotion_keeps_waiting_setting(same_file=False)
 
     def test_hook_failure_warns_without_stopping_either_promotion_path(self) -> None:
         for advances in (False, True):
@@ -704,7 +680,6 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
         attempted = self.root / "fast-push-contended"
         child_script = '''import fcntl
-import json
 from pathlib import Path
 import subprocess
 import sys

@@ -24,7 +24,3 @@ Name the exact key, such as `sweep_free_floor_gib.mac`, to change that line.
 Report the script's result. Exit 0 can mean that main waits for the current land.
 Exit 2 means a refusal or a publication failure. The notes timer retries publication failures.
 Exit 1 means the Mac forwarding failed. An unchanged value can retry publication or a Mac pull.
-
-For an approved shared `settings.json` edit, apply it on natedev and run
-`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/live_settings.py" publish-json --message "<approved reason>"`.
-The Mac receives shared JSON changes on its next pull.

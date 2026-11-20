@@ -34,7 +34,7 @@ A child of a checkpoint uses the inherited hold for the same repository.
 Other branches take no main push lock.
 
 Ask natemerge for a gap before you push a hand commit to main during a land.
-For approved settings changes, use the tool publishers in [Land line](merge-gate-and-test-speed.md#land-line).
+For approved `.conf` changes, use the tool publishers in [Land line](merge-gate-and-test-speed.md#land-line).
 
 ### `cancel_prior_runs`
 
