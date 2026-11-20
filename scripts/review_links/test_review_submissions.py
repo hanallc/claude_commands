@@ -124,6 +124,25 @@ class ReviewSubmissionTests(unittest.TestCase):
         return [Issue(path, frontmatter(path)) for path in self.issues.glob("*.md")
                 if not path.name.startswith("question-")]
 
+    def test_answered_new_item_projects_one_response_from_the_same_question(self) -> None:
+        payload = request(submissions.SubmissionKind.QUESTION)
+        saved = submissions.submit(payload)
+        waiting = review_items.submission_item(saved, self.members)
+        self.assertEqual((waiting.type, waiting.state), (review_items.ReviewType.QUESTION, review_items.ReviewState.WAITING))
+
+        answer = 'Use the desktop layout.'
+        self.assertTrue(submissions.answer(saved.key, answer, saved.reply_token))
+        self.assertFalse(submissions.answer(saved.key, answer, saved.reply_token))
+        replay = submissions.submit(payload)
+        self.assertEqual((replay.key, replay.path, replay.owner), (saved.key, saved.path, OWNER))
+        native, = self.questions()
+        self.assertEqual(native.path, saved.path)
+        row = review_items.submission_item(replay, self.members)
+        self.assertEqual((row.key, row.type, row.state), (waiting.key, review_items.ReviewType.RESPONSE,
+                                                        review_items.ReviewState.OPEN))
+        self.assertEqual(row.log[-1].words, 'Answer: '+answer)
+        self.assertEqual(row.response, submissions.QuestionResponse(payload.words, answer, row.log[-1].time))
+
     def test_four_kinds_use_their_native_stores_and_ids(self) -> None:
         expected = ("Q1", "P1", "I1", "I2")
         for number, (kind, identity) in enumerate(zip(submissions.SubmissionKind, expected, strict=True), 1):
@@ -936,8 +955,9 @@ class ReviewSubmissionTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertTrue(submissions.answer(saved.key, 'Ready for review', saved.reply_token))
                 self.assertTrue(saved.path.exists())
-                found = review_items.read(self.root / 'review', members=self.members,
-                                          kinds=(review_items.ReviewType(kind.value),))
+                review_type = (review_items.ReviewType.RESPONSE if kind == submissions.SubmissionKind.QUESTION
+                               else review_items.ReviewType(kind.value))
+                found = review_items.read(self.root / 'review', members=self.members, kinds=(review_type,))
                 self.assertTrue(any(item.source_unit == OWNER and item.id == f'builds/{saved.id}'
                                     and item.state == review_items.ReviewState.OPEN for item in found))
         latest = self.root / 'third-issues'
