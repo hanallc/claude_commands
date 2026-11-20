@@ -138,7 +138,7 @@ class ReviewPageTests(unittest.TestCase):
             self.assertIn('class="staff-name"', markup)
             escaped_name = re.escape(html.escape(name, quote=True))
             self.assertRegex(owner_menu, rf'data-owner-name="{escaped_name}"[^>]* aria-pressed="false"'
-                                         rf'[^>]*>{re.escape(markup)} <b>')
+                                         + rf'[^>]*>{re.escape(markup)} <b>')
         body = ''.join(snapshot.body(item.key).decode() for item in snapshot.records.values())
         self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
