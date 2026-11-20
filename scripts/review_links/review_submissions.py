@@ -46,6 +46,10 @@ DRAFT_BINDING = re.compile(r"(r[26]-[0-9a-f]{32})-.+")
 PAGE_SCREENSHOT = ImageReference("000000000000", "image.png")
 
 
+def is_draft_id(value: object) -> bool:
+    return isinstance(value, str) and bool(DRAFT_ID.fullmatch(value) or BROWSER_DRAFT_ID.fullmatch(value))
+
+
 @dataclass(frozen=True)
 class SubmissionAddress:
     """The request identity and its original recipient."""
@@ -500,9 +504,14 @@ def _index_older_draft(folder: Path, kind: SubmissionKind, fingerprint: str,
 @contextmanager
 def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapshot | None, *,
                           page: str, fingerprint: str,
-                          page_recipient: new_item_dialog.PageRecipient) -> Generator[SubmissionLookup]:
+                          page_recipient: new_item_dialog.PageRecipient,
+                          refusal: SubmissionError | None) -> Generator[SubmissionLookup]:
     # Lock the content across page and standard Sends.
-    folder, existed = _prepare_request_folder(f"r4-{fingerprint}")
+    content_id = f"r4-{fingerprint}"
+    prepared = _prepare_request_folder(content_id) if refusal is None else None
+    folder = prepared[0] if prepared is not None else _request_folder(content_id)
+    if refusal is not None and not folder.is_dir():
+        raise refusal
     marker = f"page-{page}"
     if page_recipient == new_item_dialog.PageRecipient.LIST_OWNER:
         marker += f"-recipient-{address.recipient_id}"
@@ -510,7 +519,8 @@ def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapsh
     standard = _draft_address(address.kind, address.recipient_id, fingerprint)
     with exclusive(folder / ".lock"):
         indexed = folder / ".indexed"
-        if not indexed.is_file():
+        if prepared is not None and not indexed.is_file():
+            _, existed = prepared
             if existed:
                 _index_older_draft(folder, address.kind, fingerprint, members)
             atomic_file.write_text_atomic(indexed, "", new_file_mode=0o600)
@@ -524,6 +534,16 @@ def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapsh
                         atomic_file.sync_folder(folder)
                     yield lookup
                     return
+
+        if refusal is not None:
+            candidate = _read_draft_marker(folder / f"recipient-{address.recipient_id}", address.kind, fingerprint)
+            candidate = candidate or _draft_address(address.kind, address.recipient_id, fingerprint, page=page)
+            if candidate != previous:
+                with _locked_request(candidate, members, draft_fingerprint=fingerprint) as lookup:
+                    if _saved_draft(lookup) is not None:
+                        yield lookup
+                        return
+            raise refusal
 
         while True:
             recipient = _send_recipient(address, page, staff.snapshot(), page_recipient).id
@@ -938,20 +958,60 @@ def _prepare_request_folder(request_id: str) -> tuple[Path, bool]:
 
 @contextmanager
 def _locked_browser_request(address: SubmissionAddress, members: staff.StaffSnapshot | None, *,
-                            page: str, page_recipient: new_item_dialog.PageRecipient) -> Generator[SubmissionLookup]:
-    folder, _ = _prepare_request_folder(address.request_id)
+                            page: str, page_recipient: new_item_dialog.PageRecipient,
+                            refusal: SubmissionError | None) -> Generator[SubmissionLookup]:
+    if refusal is not None:
+        folder = _request_folder(address.request_id)
+        if not folder.is_dir():
+            raise refusal
+    else:
+        folder, _ = _prepare_request_folder(address.request_id)
     with exclusive(folder / ".lock"):
-        hint = _request_hint(address)
-        if isinstance(hint, NativeSubmissionDestination):
-            with _locked_request(hint.address, members) as lookup:
-                if _saved_draft(lookup) is not None:
-                    yield lookup
-                    return
-        elif isinstance(hint, UnreadableRequestFile):
-            raise hint.error
+        with _locked_filed_draft(folder, address.request_id, members) as lookup:
+            if isinstance(lookup, SubmissionLookup):
+                yield lookup
+                return
+        if refusal is not None:
+            raise refusal
         with _locked_request(address, members, for_send=True, page=page,
                              page_recipient=page_recipient, browser_draft=True) as lookup:
             yield lookup
+
+
+@contextmanager
+def _locked_filed_draft(folder: Path, request_id: str, members: staff.StaffSnapshot | None
+                        ) -> Generator[SubmissionLookup | NoNativeSubmission]:
+    hint = _read_request_file(folder / "receipt.json", request_id)
+    if isinstance(hint, NoRequestFile):
+        hint = _read_request_file(folder / "pending.json", request_id)
+    if isinstance(hint, NativeSubmissionDestination):
+        with _locked_request(hint.address, members) as lookup:
+            if _saved_draft(lookup) is not None:
+                yield lookup
+                return
+    yield NoNativeSubmission()
+
+
+@contextmanager
+def _locked_existing_draft(request_id: str, members: staff.StaffSnapshot | None
+                           ) -> Generator[SubmissionLookup | NoNativeSubmission]:
+    folder = _request_folder(request_id)
+    if folder.is_dir():
+        with exclusive(folder / ".lock"), _locked_filed_draft(folder, request_id, members) as lookup:
+            yield lookup
+    else:
+        yield NoNativeSubmission()
+
+
+def _recover_unverified_draft(request_id: str, members: staff.StaffSnapshot | None,
+                              error: SubmissionError) -> SavedSubmission:
+    if is_draft_id(request_id):
+        folder = _request_folder(request_id)
+        with _locked_existing_draft(request_id, members) as lookup:
+            if isinstance(lookup, SubmissionLookup) and isinstance(lookup.native, LocatedSubmission):
+                item = lookup.native
+                return _complete_receipt(folder, item.destination, lookup.hint, item.record, edited=True)
+    raise error
 
 
 def _discard_unfiled_send(folder: Path) -> None:
@@ -963,11 +1023,23 @@ def _discard_unfiled_send(folder: Path) -> None:
 
 
 def submit(
-    request: NewItemRequest, *, members: staff.StaffSnapshot | None = None,
+    request: NewItemRequest | new_item_dialog.UnverifiedDraftRetry, *, members: staff.StaffSnapshot | None = None,
     screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
-    capture_requested: bool = False,
+    capture_requested: bool = False, refusal: SubmissionError | None = None,
 ) -> SavedSubmission:
-    """Save the native item, or discard the files from the failed Send."""
+    """Save the native item or recover the first Send for this draft."""
+    if isinstance(request, new_item_dialog.UnverifiedDraftRetry):
+        return _recover_unverified_draft(request.request_id, members, request.error)
+    try:
+        return _submit(request, members=members, screenshot=screenshot,
+                       capture_requested=capture_requested, refusal=refusal)
+    except SubmissionError as error:
+        return _recover_unverified_draft(request.request_id, members, error)
+
+
+def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
+            screenshot: new_item_dialog.SubmissionScreenshot, capture_requested: bool,
+            refusal: SubmissionError | None) -> SavedSubmission:
     check_recipient_id(request.recipient_id)
     request_id = read_request_id(request.request_id)
     kind = read_kind(request.kind)
@@ -985,16 +1057,28 @@ def submit(
     evidence = read_evidence(asdict(request.evidence))
     uploads = _decode_images(request.images)
     state = request.page_state
-    payload_hash = _fingerprint([request_id, kind, words, _image_fingerprints(uploads)]) if legacy_draft else ""
-    if capture_requested and isinstance(screenshot, new_item_dialog.NoPageScreenshot):
-        raise new_item_dialog.SubmissionScreenshotExpired("The screenshot expired.")
-    filed_screenshot = isinstance(screenshot, new_item_dialog.FiledPageScreenshot)
-    if filed_screenshot and (not browser_draft or not _request_folder(request_id).is_dir()):
-        raise new_item_dialog.SubmissionScreenshotExpired("The screenshot expired.")
-    if browser_draft:
+    missing_capture = capture_requested and isinstance(screenshot, new_item_dialog.NoPageScreenshot)
+    unverified = refusal is not None or missing_capture
+    if refusal is None and (missing_capture or isinstance(screenshot, new_item_dialog.FiledPageScreenshot)):
+        refusal = new_item_dialog.SubmissionScreenshotExpired()
+    if refusal is not None and not (legacy_draft or browser_draft):
+        raise refusal
+
+    payload_hash = ""
+    image_hashes = _image_fingerprints(uploads) if legacy_draft or browser_draft else ()
+    if browser_draft or legacy_draft:
         digest = "" if isinstance(screenshot, new_item_dialog.NoPageScreenshot) else screenshot.digest
-        payload_hash = _fingerprint([kind, request.recipient_id, words, asdict(evidence), _image_fingerprints(uploads),
+        payload_hash = _fingerprint([kind, request.recipient_id, words, asdict(evidence), image_hashes,
                                      request.page, request.page_recipient, asdict(state) if state else None, digest])
+    if legacy_draft:
+        # Some r2 receipts use the raw draft ID and the full browser digest.
+        with _locked_existing_draft(request_id, members) as lookup:
+            if isinstance(lookup, SubmissionLookup) and isinstance(lookup.native, LocatedSubmission):
+                item = lookup.native
+                edited = unverified or item.destination.payload_hash != payload_hash
+                return _complete_receipt(_request_folder(request_id), item.destination, lookup.hint,
+                                         item.record, edited=edited)
+        payload_hash = _fingerprint([request_id, kind, words, image_hashes])
     if isinstance(screenshot, new_item_dialog.PageScreenshot):
         total = len(screenshot.png) + sum(len(upload.data) for upload in uploads)
         if len(uploads) >= MAX_IMAGES or total > MAX_TOTAL_IMAGE_BYTES:
@@ -1012,10 +1096,11 @@ def submit(
 
     try:
         if browser_draft:
-            locked = _locked_browser_request(address, members, page=request.page, page_recipient=request.page_recipient)
+            locked = _locked_browser_request(address, members, page=request.page,
+                                             page_recipient=request.page_recipient, refusal=refusal)
         elif legacy_draft:
             locked = _locked_draft_request(address, members, page=request.page, fingerprint=payload_hash,
-                                           page_recipient=request.page_recipient)
+                                           page_recipient=request.page_recipient, refusal=refusal)
         else:
             folder, request_exists = _prepare_request_folder(request_id)
             if request_exists:
@@ -1042,10 +1127,12 @@ def submit(
                 saved = located.destination
                 if not browser_draft:
                     _check_same_request(saved, request, payload_hash, draft=legacy_draft)
-                return _complete_receipt(folder, saved, hint, located.record,
-                                         edited=browser_draft and saved.payload_hash != payload_hash)
-            if filed_screenshot:
-                raise new_item_dialog.SubmissionScreenshotExpired("The screenshot expired.")
+                edited = browser_draft and (unverified or saved.payload_hash != payload_hash)
+                if legacy_draft:
+                    # The r4 and r5 digests do not include the screenshot.
+                    edited = (refusal is not None or not isinstance(screenshot, new_item_dialog.NoPageScreenshot)
+                              or PAGE_SCREENSHOT in located.details.images)
+                return _complete_receipt(folder, saved, hint, located.record, edited=edited)
             if (folder / "receipt.json").is_file():
                 raise OSError(f"Cannot find the native record for request {request_id}.")
             if isinstance(hint, UnreadableRequestFile):

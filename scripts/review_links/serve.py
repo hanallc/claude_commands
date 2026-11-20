@@ -53,6 +53,8 @@ LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 # Allow page state and rows in addition to the existing words and image budget.
 MAX_NEW_ITEM_BODY = (4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
                      + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES)
+SCREENSHOT_RELOAD = "Reload the page to send the screenshot."
+STALE_NEW_ITEM_TOKEN = "The New item token expired. Try Send again."
 ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
 
 
@@ -140,6 +142,7 @@ class PageCapture:
         default_factory=PageCapturePending)
     completed: threading.Event = field(default_factory=threading.Event)
     filing: bool = False
+    discard_after_filing: bool = False
 
 
 class PageCaptures:
@@ -165,7 +168,7 @@ class PageCaptures:
                 _ = self._active(key)
             if len(self._sessions) >= 8:
                 filed = next((key for key, capture in self._sessions.items()
-                              if isinstance(capture.state, new_item_dialog.FiledPageScreenshot)), "")
+                              if not capture.filing and isinstance(capture.state, new_item_dialog.FiledPageScreenshot)), "")
                 if not filed:
                     return ""
                 self._remove(filed)
@@ -176,7 +179,11 @@ class PageCaptures:
     def discard(self, key: str) -> None:
         with self._lock:
             capture = self._sessions.get(key)
-            if capture is not None and not capture.filing:
+            if capture is None:
+                return
+            if capture.filing:
+                capture.discard_after_filing = True
+            else:
                 self._remove(key)
 
     def mark_filed(self, key: str, image: new_item_dialog.PageScreenshot) -> None:
@@ -224,8 +231,11 @@ class PageCaptures:
             yield screenshot
         finally:
             with self._lock:
-                capture.expires = time.monotonic() + PAGE_CAPTURE_TTL_SECONDS
-                capture.filing = False
+                if capture.discard_after_filing:
+                    self._remove(key)
+                else:
+                    capture.expires = time.monotonic() + PAGE_CAPTURE_TTL_SECONDS
+                    capture.filing = False
 
     def complete(self, key: str, image: new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot) -> None:
         """Hold the finished image until Send files it."""
@@ -1031,8 +1041,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise new_item_dialog.SubmissionError("Invalid New item request.")
             fields = cast(dict[str, object], payload)
-            if not self.valid_new_item_token(fields.get("token")):
-                self.json_response(403, {"code": "stale_token", "error": "The New item token expired. Try Send again."})
+            token = fields.get("token")
+            valid_token = self.valid_new_item_token(token)
+            draft = fields.get("request_id")
+            legacy_draft = isinstance(draft, str) and bool(review_submissions.DRAFT_ID.fullmatch(draft))
+            browser_draft = isinstance(draft, str) and bool(review_submissions.BROWSER_DRAFT_ID.fullmatch(draft))
+            # The browser draft ID can recover an existing Send after a restart.
+            if not valid_token and (
+                    "capture_key" not in fields or "page_capture" in fields or "discard_capture" in fields
+                    or not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token)
+                    or not (legacy_draft or browser_draft)):
+                self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
                 return
             if "page_capture" in fields:
                 self.new_item_capture(new_item_dialog.read_page_capture(fields["page_capture"]))
@@ -1041,11 +1060,28 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server.page_captures.discard(new_item_dialog.read_capture_key(fields["discard_capture"]))
                 self.json_response(200, {})
                 return
-            key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
-            request = new_item_dialog.read_request(fields, has_capture=bool(key))
-            if key and (not request.page or not isinstance(
-                    request.evidence, (new_item_dialog.PageDataEvidence, new_item_dialog.NoEvidence))):
-                raise new_item_dialog.SubmissionError("Open the New item dialog from a page owner.")
+            key = ""
+            refusal: new_item_dialog.SubmissionError | None = None
+            if not valid_token:
+                refusal = (new_item_dialog.SubmissionScreenshotExpired() if browser_draft
+                           else new_item_dialog.SubmissionTokenExpired())
+            request: new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry
+            try:
+                key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
+                request = new_item_dialog.read_request(fields, has_capture=bool(key))
+                if not key and request.page_state is not None and request.page_state.include_screenshot:
+                    refusal = (new_item_dialog.SubmissionScreenshotExpired() if browser_draft
+                               else new_item_dialog.SubmissionScreenshotReload())
+                if key and (not request.page or not isinstance(
+                        request.evidence, (new_item_dialog.PageDataEvidence, new_item_dialog.NoEvidence))):
+                    raise new_item_dialog.SubmissionError("Open the New item dialog from a page owner.")
+            except (ValueError, RecursionError) as error:
+                if not isinstance(draft, str) or not review_submissions.is_draft_id(draft):
+                    raise
+                reason = error if isinstance(error, new_item_dialog.SubmissionError) else new_item_dialog.SubmissionError(
+                    "Invalid New item JSON.")
+                request = new_item_dialog.UnverifiedDraftRetry(draft, (refusal or reason) if legacy_draft else reason)
+                key = ""
         except (ValueError, RecursionError) as error:
             reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
             self.json_response(400, {"error": reason})
@@ -1054,8 +1090,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(400, {"error": "Could not read the New item request."})
             return
         try:
-            with server.page_captures.for_filing(key) as screenshot:
-                created = server.review_cache.create_submission(request, screenshot=screenshot, capture_requested=bool(key))
+            with server.page_captures.for_filing(key if valid_token else "") as screenshot:
+                created = server.review_cache.create_submission(
+                    request, screenshot=screenshot, capture_requested=bool(key), refusal=refusal)
                 saved = created.saved
                 edited = isinstance(saved, review_submissions.EditedSubmission)
                 if key and not edited and isinstance(screenshot, new_item_dialog.PageScreenshot):
@@ -1076,6 +1113,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 if not isinstance(message, change_page.ReviewMessagePage) or not message.saved.get("submission_delivered"):
                     self.json_response(503, {"error": "Could not deliver the item. Try Send again."})
                     return
+        except new_item_dialog.SubmissionTokenExpired:
+            self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
+            return
+        except new_item_dialog.SubmissionScreenshotReload:
+            self.json_response(409, {"code": "reload_page", "error": SCREENSHOT_RELOAD})
+            return
         except new_item_dialog.SubmissionScreenshotExpired as error:
             self.json_response(409, {"code": "screenshot_expired", "error": str(error)})
             return
@@ -1096,9 +1139,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 print(f"review-links Bug evidence for {saved.id}: {' '.join(str(error).splitlines())}", file=sys.stderr)
         if edited:
             self.json_response(409, {
-                "code": "already_filed", "id": saved.id,
-                "capture_expired": isinstance(screenshot, new_item_dialog.FiledPageScreenshot),
-                "error": f"Your first Send was filed as {saved.id}. Your changes were not sent.",
+                "code": "already_filed", "id": saved.id, "key": created.key, "version": created.version,
+                "error": f"This item was already filed as {saved.id}. Any change after that Send was not sent.",
             })
         else:
             self.json_response(200, {"id": saved.id, "key": created.key, "version": created.version})

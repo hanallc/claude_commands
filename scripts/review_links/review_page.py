@@ -514,9 +514,10 @@ class ReviewSnapshotCache:
         return self.publish_item(current, key, item, members), item
 
     def create_submission(
-        self, request: new_item_dialog.NewItemRequest, *,
+        self, request: new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry, *,
         screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
         capture_requested: bool = False,
+        refusal: new_item_dialog.SubmissionError | None = None,
     ) -> PublishedSubmission:
         """File the new record and publish it from its exact native path."""
         _ = self.get()
@@ -526,7 +527,7 @@ class ReviewSnapshotCache:
             members = staff.snapshot()
             with staff.supplied_snapshot(members) if remote_staff else nullcontext():
                 saved = review_submissions.submit(request, members=members, screenshot=screenshot,
-                                                  capture_requested=capture_requested)
+                                                  capture_requested=capture_requested, refusal=refusal)
             if not remote_staff:
                 members = staff.snapshot()
             path = saved.path
@@ -1172,7 +1173,7 @@ const pendingSaves=new Map();
 const scrollDepartures=new Set();
 const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
 let focusAfterLoad=null,firstRequest=firstReviewCard;
-let deferredLink=null,revealCreated=null;
+let deferredLink=null,revealCreated=null,newItemRefresh;
 function allEntries(){return [...index.values()];}
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
 const colored=(name,markup)=>markup || escapeText(name);
@@ -1538,7 +1539,7 @@ function revealNewItem(){
  revealCreated=null;
  if(view.revealMatchingItem(key)) return true;
  const notice=content.querySelector('[data-review-notice]');
- notice.textContent='Saved '+id+'.';notice.hidden=false;
+ notice.textContent='The current filters hide '+id+'.';notice.hidden=false;
  return false;
 }
 async function refresh(_supersede=false,current=()=>true){
@@ -1632,13 +1633,19 @@ setInterval(updateHandoffAges,5000);
 document.querySelector('[data-review-new]').addEventListener('click',event=>{
  window.reviewNewItem.open({trigger:event.currentTarget});
 });
+document.addEventListener('review-item-saved',()=>{
+ const notice=content.querySelector('[data-review-notice]');
+ notice.textContent='';notice.hidden=true;
+ newItemRefresh=pageRefresh.refresh(true);
+});
 document.addEventListener('review-item-created',event=>{
  const {key,id}=event.detail ?? {};
  if(typeof key!=='string' || typeof id!=='string') return;
- const notice=content.querySelector('[data-review-notice]');
- notice.textContent='';notice.hidden=true;
  revealCreated={key,id};
- void pageRefresh.refresh(true);
+ revealNewItem();
+ void newItemRefresh?.then(()=>{
+  if(revealCreated?.key===key) void pageRefresh.refresh(true);
+ });
 });
 function followItemLink(options){
  const applyLink=unappliedOnly=>view.followItemLink({...options,unappliedOnly,beforeJump:key=>{

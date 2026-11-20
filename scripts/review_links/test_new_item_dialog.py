@@ -79,6 +79,7 @@ const check = (ok, description) => { if (!ok) failures.push(description); };
 const dialog = document.querySelector('dialog'), body = dialog.querySelector('.new-item-body');
 const textarea = dialog.querySelector('textarea'), error = dialog.querySelector('[role="alert"]');
 const send = dialog.querySelector('[type="submit"]'), recipient = () => dialog.querySelector('[name="recipient_id"]');
+const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
 const launch = document.querySelector('#launcher');
 const capture = __CAPTURE__, png = '__PNG__';
 const open = (options = {}) => window.reviewNewItem.open({trigger: launch, kind: 'bug', evidence: capture, ...options});
@@ -102,6 +103,26 @@ function untilError() {
   });
   observer.observe(dialog, {attributes:true, subtree:true});
  });
+}
+async function sendSaved() {
+ const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+ const shown = new Promise((resolve, reject) => {
+  const observer = new MutationObserver(() => {
+   if (confirmation.hidden && error.hidden) return;
+   observer.disconnect();
+   if (confirmation.hidden) reject(new Error(error.textContent));
+   else resolve(confirmation.textContent);
+  });
+  observer.observe(dialog, {attributes:true, subtree:true, attributeFilter:['hidden']});
+ });
+ send.click();
+ const message = await shown;
+ check(dialog.open && document.activeElement === done && send.disabled,
+       'Send keeps the confirmation open with focus on Done.');
+ done.click();
+ const event = await created;
+ check(message === 'Saved ' + event.detail.id + '.', 'The dialog shows the saved ID.');
+ return event;
 }
 (async () => {
  try {
@@ -166,10 +187,8 @@ function untilError() {
          dialog.querySelectorAll('[data-previews] img').length === 1 &&
          error.textContent === 'Fixture rejected the first send.' && !send.disabled,
          'Reopen keeps the failed draft and its error.');
-   const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
-   send.click();
-   check((await created).detail.id === 'I1', 'The event reports the saved item ID.');
-   check(closeToLauncher(), 'A successful send closes the dialog and returns focus.');
+   check((await sendSaved()).detail.id === 'I1', 'The event reports the saved item ID.');
+   check(closeToLauncher(), 'Done closes the confirmation and returns focus.');
 
    await open({kind:'question', evidence:{kind:'none'}});
    check(document.activeElement.value === 'question' && evidence.hidden && !textarea.value &&
@@ -209,12 +228,6 @@ function untilError() {
     send.click();
     await rejected;
    };
-   const sendSaved = async () => {
-    const saved = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
-    const failed = untilError().then(() => { throw new Error(error.textContent); });
-    send.click();
-    return Promise.race([saved, failed]);
-   };
    recipient().click();
    type('Keep these words');
    await trySend();
@@ -238,23 +251,29 @@ function untilError() {
    const ownerPosts = [], ownerEndpoint = '/console/review/new-item?page=builds';
    let pngAvailable = true, discarded, useLiveSends = false, dropPageReply = true;
    let captureKey = 'd34db33fd34db33fd34db33fd34db33f';
+   let ownerToken = 'owner-token';
    let releasePreview, expireNextSend = false, failNextSend = false;
+   let captureNumber = 0, restartScenario = false, filedReply = false;
    let previewGate = new Promise(resolve => { releasePreview = resolve; });
    const json = (value, status = 200) => Promise.resolve(new Response(JSON.stringify(value), {status}));
    window.fetch = (url, options) => {
     if (url === ownerEndpoint) {
-     return json({token:'owner-token', page_owner:'builds-staff', recipients:[
+     return json({token:ownerToken, page_owner:'builds-staff', recipients:[
       {id:'builds-staff', name:'builds', proposal:false},
       {id:'fixture-list-producer', name:'morty', proposal:false}]});
     }
     if (url === '/console/review/new-item?capture_key=' + captureKey) {
-     check(options.headers['X-Review-Token'] === 'owner-token', 'The preview requests use the form token.');
+     check(options.headers['X-Review-Token'] === ownerToken, 'The preview requests use the form token.');
      return previewGate.then(() => originalFetch('data:image/png;base64,' + png));
     }
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
     const payload = JSON.parse(options.body);
     ownerPosts.push(payload);
     if (payload.page_capture) {
+     if (restartScenario) {
+      captureKey = (++captureNumber).toString(16).padStart(32, '0');
+      previewGate = Promise.resolve();
+     }
      return pngAvailable ? json({capture_key: captureKey}, 202) : json({error:'No Firefox.'}, 503);
     }
     if (payload.discard_capture) {
@@ -263,6 +282,7 @@ function untilError() {
     }
     if (expireNextSend) {
      expireNextSend = false;
+     ownerToken = 'restarted-owner-token';
      captureKey = 'e34db33fd34db33fd34db33fd34db33f';
      previewGate = new Promise(resolve => { releasePreview = resolve; });
      return json({code:'screenshot_expired', error:'The screenshot expired.'}, 409);
@@ -270,6 +290,10 @@ function untilError() {
     if (failNextSend) {
      failNextSend = false;
      return json({error:'Could not publish the item. Try Send again.'}, 503);
+    }
+    if (filedReply) {
+     filedReply = false;
+     return json({code:'already_filed', id:'I9', key:'first-item'}, 409);
     }
     if (useLiveSends) {
      const response = originalFetch(url, {...options, body: JSON.stringify({...payload, token: attempted[0].token})});
@@ -361,16 +385,18 @@ function untilError() {
    await whenShown(shot);
    const oldKey = captureKey, oldImage = shot.href, at = ownerPosts.length;
    const expired = dialog.querySelector('[data-capture-expired]');
-   type('Keep these words if the screenshot expires.');
+   type('Keep these Question words after a restart.');
    expireNextSend = true;
    dialog.querySelector('[type="submit"]').click();
    await whenShown(expired);
    check(dialog.open && !checkbox.disabled && !slot.querySelector('[data-taking]').hidden && shot.hidden &&
          dialog.querySelector('[type="submit"]').disabled, 'Expiration shows the placeholder and pauses Send.');
-   check(textarea.value === 'Keep these words if the screenshot expires.' &&
-         ownerPosts.length === at + 2 && ownerPosts[at].capture_key === oldKey &&
+   check(textarea.value === 'Keep these Question words after a restart.' &&
+         ownerPosts.length === at + 2 && ownerPosts[at].kind === 'question' &&
+         ownerPosts[at].capture_key === oldKey && ownerPosts[at].token !== ownerToken &&
+         ownerPosts[at + 1].token === ownerToken &&
          ownerPosts[at + 1].page_capture.place === ownerPosts[at - 1].page_capture.place,
-         'Expiration retains the words and takes a new screenshot of the same place.');
+         'The restart keeps the Question words and takes a screenshot with the new token.');
    releasePreview();
    await whenShown(shot);
    check(shot.href !== oldImage, 'The new preview replaces the expired image.');
@@ -421,7 +447,7 @@ function untilError() {
    recipient().click();
    await trySend();
    check(dialog.open && textarea.value === 'Keep this draft and its image.' &&
-         error.textContent === 'Your first Send was filed as I2. Your changes were not sent.',
+         error.textContent === 'This item was already filed as I2. Any change after that Send was not sent.',
          'A changed Send reports the first ID and keeps the draft open.');
    const standardRequest = ownerPosts.at(-1);
    check(!standardRequest.page && !standardRequest.capture_key && standardRequest.images[0].base64_data === png &&
@@ -441,7 +467,7 @@ function untilError() {
    to()[1].click();
    await trySend();
    check(dialog.open && textarea.value === 'The replacement item.' && to()[1].checked &&
-         error.textContent === 'Your first Send was filed as I4. Your changes were not sent.',
+         error.textContent === 'This item was already filed as I4. Any change after that Send was not sent.',
          'The notice keeps the changed words and recipient.');
    check(ownerPosts.at(-1).request_id === firstDraft.request_id, 'The first retry uses the original request ID.');
    const replacement = (await sendSaved()).detail;
@@ -494,6 +520,31 @@ function untilError() {
     check(retry.request_id === first.request_id && Boolean(retry.capture_key) === !checked &&
           retry.kind === 'bug' && retry.evidence.kind === 'page-data',
           'The retry uses the current kind and evidence for the same draft.');
+   }
+   restartScenario = true;
+   const alreadyFiled = 'This item was already filed as I9. Any change after that Send was not sent.';
+   for (const changed of [false, true]) {
+    await openOwner();
+    await whenShown(shot);
+    type('Keep these words after a restart.');
+    failNextSend = true;
+    await trySend();
+    const first = ownerPosts.at(-1);
+    if (changed) type('Keep these edited words after a restart.');
+    const wordsBeforeRetry = textarea.value;
+    filedReply = true;
+    await trySend();
+    const retry = ownerPosts.findLast(post => post.request_id);
+    check(retry.request_id === first.request_id && retry.capture_key === first.capture_key,
+          'The retry uses the same draft ID and capture key.');
+    check(dialog.open && confirmation.hidden && textarea.value === wordsBeforeRetry &&
+          error.textContent === alreadyFiled, 'The notice keeps the draft open with its words.');
+    await whenShown(shot);
+    const renewedKey = captureKey;
+    await sendSaved();
+    const next = ownerPosts.findLast(post => post.request_id);
+    check(renewedKey !== retry.capture_key && next.capture_key === renewedKey &&
+          next.request_id !== retry.request_id, 'The next Send uses a new capture and draft ID.');
    }
    window.fetch = originalFetch;
   }
@@ -549,10 +600,19 @@ const type = text => {
  words.value = text;
  words.dispatchEvent(new Event('input', {bubbles:true}));
 };
-const send = () => new Promise(resolve => {
- dialog.addEventListener('review-item-created', resolve, {once:true});
+const send = async () => {
+ const confirmation = dialog.querySelector('#new-item-saved');
+ const shown = new Promise(resolve => {
+  const observer = new MutationObserver(() => {
+   if (!confirmation.hidden) { observer.disconnect(); resolve(); }
+  });
+  observer.observe(confirmation, {attributes:true, attributeFilter:['hidden']});
+ });
  dialog.querySelector('[type="submit"]').click();
-});
+ await shown;
+ check(dialog.open && confirmation.textContent === 'Saved I1.', 'The Bug dialog shows the saved ID.');
+ dialog.querySelector('[data-done]').click();
+};
 (async () => {
  try {
   history.replaceState(null, '', location.pathname + location.search + '&view=queue#show=open&owner=builds');
@@ -607,7 +667,7 @@ const send = () => new Promise(resolve => {
    check(captured.script_errors.length === 20 && captured.script_errors[0].message === 'Error 2'
          && captured.script_errors[0].line === 9 && captured.script_errors[0].column === 3
          && captured.script_errors.at(-1).message === 'Rejected', 'The request keeps the last twenty script errors.');
-   check(dialog.open === false, 'Send closes the dialog.');
+   check(dialog.open === false, 'Done closes the confirmation.');
 
    await open();
    const fallback = dialog.querySelector('[data-fallback]');

@@ -480,6 +480,7 @@ Select the preview to open the image at full size.
 Send saves the item with the evidence shown in the dialog.
 If the native write fails, the server discards the staged evidence.
 The server holds the preview for the retry.
+If Cancel discards the preview during filing, the server releases it when filing ends.
 The draft stays available for edits after a failed Send.
 Send publishes the saved item and delivers its message before it confirms success.
 A retry with the same request ID resumes publication and delivery of the saved item.
@@ -491,13 +492,23 @@ Changing the type keeps the same capture.
 If the preview expires, the dialog keeps the draft and shows the placeholder while it takes a new screenshot.
 If the first Send fails because the preview expires, the checkbox stays available.
 Select **Send** again when the new screenshot appears.
+Send requests a reload if a legacy request for a checked Bug lacks both a capture key and a filed match.
+A retry can recover the filed item after a restart.
+The server confirms a screenshot retry only when a held capture proves the PNG matches.
+If the server cannot confirm a match, the dialog shows the filed item ID and keeps the edits.
+It replaces the old screenshot when the checkbox is selected.
+The next Send uses a new request ID.
 Clear **Include a screenshot** to omit the image.
 A Bug always includes up to 48 rows of visible text from when the dialog opened.
+The Bug card shows these rows under **Page data**, including when the screenshot is unavailable.
 It also includes the page title, address, filters, render time, error lines, and script errors.
 For other types, Send includes visible text when the block shows the fallback notice.
 A Bug with a screenshot also includes the viewport.
-A new item opens when it matches the current filters.
-Review shows a save confirmation when the current filters hide the new item.
+The New item dialog shows the saved item ID on every page that opens it.
+Select **Done** to close the confirmation.
+Review starts its refresh when Send succeeds.
+When the confirmation closes, Review opens the new item if it matches the current filters.
+Review tells you when the current filters hide the new item.
 A save conflict shows its reason and preserves the current filters.
 The Type, Show and Owner chip rows wrap at phone width.
 If a refresh hides the focused Owner chip, focus moves to the selected Owner chip.

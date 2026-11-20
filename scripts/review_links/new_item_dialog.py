@@ -41,6 +41,25 @@ class SubmissionConflict(SubmissionError):
 class SubmissionScreenshotExpired(SubmissionConflict):
     """A new Send needs a fresh screenshot."""
 
+    def __init__(self) -> None:
+        super().__init__("The screenshot expired.")
+
+
+class SubmissionTokenExpired(SubmissionError):
+    """The request can recover a filed item only."""
+
+
+class SubmissionScreenshotReload(SubmissionConflict):
+    """An unfiled Send needs a reload to include the screenshot."""
+
+
+@dataclass(frozen=True)
+class UnverifiedDraftRetry:
+    """A Send with a draft ID and fields that cannot be used to file."""
+
+    request_id: str
+    error: SubmissionError
+
 
 class SubmissionKind(StrEnum):
     QUESTION = "question"
@@ -482,12 +501,12 @@ def read_bug_page_state(value: object) -> BugPageState | None:
         cast(float | None, seconds),
         tuple(_text(line, "Notice", 512) for line in _entries(row.get("notices"), "Notices", 48)),
         tuple(_script_error(error) for error in _entries(row.get("script_errors"), "Script errors", 20)),
-        _text(row.get("filters", ""), "Page filters", 1024, allow_empty=True), screenshot and url == reported_url,
+        _text(row.get("filters", ""), "Page filters", 1024, allow_empty=True), screenshot,
         _text(row.get("title", ""), "Page title", 240, allow_empty=True))
 
 
 def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
-    """Decode the JSON fields after the route checks its form token."""
+    """Decode the JSON fields for Send."""
     data = _mapping(value, "New item")
     page = _text(data.get("page", ""), "Console page", 32, allow_empty=True)
     kind = read_kind(data.get("kind"))
@@ -646,7 +665,9 @@ def render() -> str:
   </div>
   <footer>
    <p class="new-item-error" role="alert" hidden></p>
-   <div><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
+   <p id="new-item-saved" role="status" hidden></p>
+   <div data-send-controls><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
+   <div data-saved-controls hidden><button type="button" data-done aria-describedby="new-item-saved">Done</button></div>
   </footer>
  </form>
 </dialog>
@@ -697,7 +718,7 @@ STYLE = '''
  border: 0; border-radius: 6px; background: transparent; width: 30px; height: 30px;
  color: var(--ink-2, #c3c2b7); font-size: 22px; line-height: 1;
 }
-#review-new-item .new-item-body {
+#review-new-item .new-item-body:not([hidden]) {
  display: grid; align-content: start; gap: 18px; min-width: 0; padding: 4px 24px 20px;
  overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin;
  scrollbar-color: var(--ink-3, #9a988f) var(--card, #1a1a19);
@@ -719,7 +740,9 @@ STYLE = '''
  font-size: 14px; overflow-wrap: anywhere; cursor: pointer;
 }
 #review-new-item .new-item-chip input:checked + span,
-#review-new-item button[type="submit"] { background: #2670c5; color: white; border-color: transparent; }
+#review-new-item button[type="submit"], #review-new-item [data-done] {
+ background: #2670c5; color: white; border-color: transparent;
+}
 #review-new-item .new-item-chip svg { width: 16px; height: 16px; flex: none; }
 #review-new-item .new-item-chip[data-kind="question"] { --item-icon: #af90ed; }
 #review-new-item .new-item-chip[data-kind="proposal"] { --item-icon: #ed7da9; }
@@ -821,6 +844,7 @@ STYLE = '''
  background: transparent; color: inherit;
 }
 #review-new-item .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
+#review-new-item #new-item-saved { margin: 0 0 12px; }
 @media (max-width: 480px) {
  #review-new-item header, #review-new-item footer, #review-new-item .new-item-body { padding-inline: 16px; }
  #review-new-item header { padding-block: 14px 12px; }
@@ -848,11 +872,13 @@ SCRIPT = r'''(() => {
  const fallbackText = fallback.textContent;
  const expired = sentDetails.querySelector('[data-capture-expired]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
+ const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
+ const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, evidence, token, recipients, images = [], sending = false;
  let draftId, keepDraft = false, ownerPage = '', pageOwnerId = '';
- let captureSession, pageContext;
+ let captureSession, pageContext, savedItem;
 
  function node(tag, text = '', css = '') {
   const element = document.createElement(tag);
@@ -918,7 +944,7 @@ SCRIPT = r'''(() => {
  }
 
  function updateSend() {
-  send.disabled = sending || (!slot.hidden && !taking.hidden) || !token || !recipientChips.querySelector('input:checked') ||
+  send.disabled = !!savedItem || sending || (!slot.hidden && !taking.hidden) || !token || !recipientChips.querySelector('input:checked') ||
                   !words.value.trim() || words.value.length > words.maxLength;
  }
 
@@ -1011,9 +1037,10 @@ SCRIPT = r'''(() => {
    const failure = new Error(data?.error || data?.reason || fallback);
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
    failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
-   failure.alreadyFiled = response.status === 409 && data?.code === 'already_filed' &&
-                          typeof data.id === 'string' && /^[QPI][1-9][0-9]*$/.test(data.id) ? data.id : '';
-   failure.refreshCapture = data?.capture_expired === true;
+   if (response.status === 409 && data?.code === 'already_filed' &&
+       typeof data.id === 'string' && /^[QPI][1-9][0-9]*$/.test(data.id)) {
+    failure.filedId = data.id;
+   }
    throw failure;
   }
   return data;
@@ -1150,7 +1177,7 @@ SCRIPT = r'''(() => {
  }
 
  function startCapture(renewed = false) {
-  if (!pageContext || !includePage.checked || !token || captureSession) return;
+  if ((savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
   const {place, viewport} = pageContext;
   const session = {token, renewed, controller: new AbortController()};
   captureSession = session;
@@ -1170,6 +1197,15 @@ SCRIPT = r'''(() => {
    showSentDetails();
    return image;
   });
+ }
+
+ async function renewCapture() {
+  if (!pageContext || !includePage.checked) return;
+  const signal = opening.signal;
+  const fresh = await loadOptions(signal).catch(() => null);
+  if (signal.aborted) return;
+  if (fresh) token = fresh.token;
+  startCapture(true);
  }
 
  function discardCapture(used = false) {
@@ -1210,14 +1246,25 @@ SCRIPT = r'''(() => {
   }
  }
 
- function close({sent = false, usedCapture = false} = {}) {
+ function showConfirmation(item) {
+  savedItem = item;
+  const saved = Boolean(item);
+  confirmation.textContent = saved ? 'Saved ' + item.id + '.' : '';
+  confirmation.hidden = savedControls.hidden = !saved;
+  body.hidden = sendControls.hidden = saved;
+  updateSend();
+  if (saved) done.focus();
+ }
+
+ function close() {
   if (!dialog.open || sending) return;
-  discardCapture(usedCapture);
+  const result = savedItem;
+  discardCapture();
   setError('');
   updateSend();
   opening.abort();
   dialog.close();
-  keepDraft = !sent && Boolean(words.value || images.length);
+  keepDraft = !result && Boolean(words.value || images.length);
   if (!keepDraft) {
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
@@ -1226,6 +1273,10 @@ SCRIPT = r'''(() => {
   }
   if (launcher?.isConnected) launcher.focus({preventScroll: true});
   launcher = null;
+  if (result) {
+   showConfirmation();
+   dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: result}));
+  }
  }
 
  function setSending(value) {
@@ -1288,7 +1339,7 @@ SCRIPT = r'''(() => {
   if (event.persisted && dialog.open) startCapture();
  });
  dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
- for (const control of dialog.querySelectorAll('[data-close], [data-cancel]')) {
+ for (const control of dialog.querySelectorAll('[data-close], [data-cancel], [data-done]')) {
   control.addEventListener('click', () => close());
  }
  form.addEventListener('submit', async event => {
@@ -1316,9 +1367,9 @@ SCRIPT = r'''(() => {
    setError('');
    setSending(true);
    const files = await Promise.all(images.map(image => pastedData(image.file)));
-   const sendItem = () => post({...payload, evidence: data, images: files, token,
-                                 ...(key && {capture_key: key}),
-                                 ...(state && {page_state: state})});
+   const item = {...payload, evidence: data, images: files,
+                 ...(key && {capture_key: key}), ...(state && {page_state: state})};
+   const sendItem = () => post({...item, token});
    let result;
    try {
     result = await sendItem();
@@ -1333,16 +1384,14 @@ SCRIPT = r'''(() => {
    }
    saved = result;
   } catch (failure) {
-   if (failure?.alreadyFiled) {
+   if (failure?.filedId) {
+    setError('This item was already filed as ' + failure.filedId + '. Any change after that Send was not sent.');
     draftId = undefined;
-    setError('Your first Send was filed as ' + failure.alreadyFiled + '. Your changes were not sent.');
-    if (failure.refreshCapture && key) {
-     discardCapture(true);
-     startCapture(true);
-    }
-   } else if (failure?.screenshotExpired && key) {
+    discardCapture();
+    void renewCapture();
+   } else if (failure?.screenshotExpired && includePage.checked) {
     discardCapture(true);
-    startCapture(true);
+    void renewCapture();
    } else {
     setError(failure?.message || 'Could not send this item.');
    }
@@ -1351,8 +1400,9 @@ SCRIPT = r'''(() => {
   }
   if (saved) {
    draftId = undefined;
-   close({sent: true, usedCapture: Boolean(key)});
-   dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
+   discardCapture(Boolean(key));
+   showConfirmation(saved);
+   dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
   } else {
    send.focus();
   }

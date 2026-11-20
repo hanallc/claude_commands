@@ -3990,7 +3990,18 @@ window.fetch=async(url,options={})=>{
   words.value=fixture.words;
   words.dispatchEvent(new Event('input',{bubbles:true}));
   const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
+  const confirmation=dialog.querySelector('#new-item-saved');
+  const confirmed=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(!confirmation.hidden){observer.disconnect();resolve();}
+   });
+   observer.observe(confirmation,{attributes:true,attributeFilter:['hidden']});
+  });
   dialog.querySelector('[type="submit"]').click();
+  await confirmed;
+  check(dialog.open && confirmation.textContent==='Saved '+fixture.id+'.',
+        'The shared dialog shows the saved ID.');
+  dialog.querySelector('[data-done]').click();
   await refreshed;
   const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
   check(Object.entries(selection).every(([key,value])=>params().get(key)===value),
@@ -4012,8 +4023,8 @@ window.fetch=async(url,options={})=>{
    }
   }else{
    check(!row && history.length===previous,'Send keeps a hidden item outside the view.');
-   check(review.querySelector('[data-review-notice]').textContent==='Saved '+fixture.id+'.',
-         'A hidden item has a save confirmation.');
+   check(review.querySelector('[data-review-notice]').textContent==='The current filters hide '+fixture.id+'.',
+         'Review explains why the saved item is hidden.');
   }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
