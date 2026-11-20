@@ -932,24 +932,54 @@ class ScratchTests(unittest.TestCase):
         self.assertEqual(scratch.end("gate:hana-view"), [])
 
     def test_a_failed_clone_still_has_a_task_that_removes_its_partial_files(self) -> None:
-        def interrupted_clone(checkout: Path, source: Path) -> None:
-            self.assertEqual(source, self.base / "source")
-            with scratch.judgment_lock(checkout) as available:
-                self.assertFalse(available)
-            _ = (checkout / "partial").write_text("partial clone")
-            record = scratch.task_of(checkout)
-            assert isinstance(record, copy_record.Registered)
-            self.assertEqual(record.task, "gate:clone-failure")
-            raise copies.CopyError("interrupted clone")
+        source = self.base / "source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        _ = (source / "tracked").write_text("saved source")
+        self.git(source, "add", "tracked")
+        self.git(source, "commit", "-qm", "source")
+        scratch.write_record(source, "until:2000-01-01T0000Z", time.time())
 
-        with mock.patch.object(copies, "initialize_git", side_effect=interrupted_clone):
-            with self.assertRaisesRegex(copies.CopyError, "clone failed"):
-                _ = copies.clone(self.base / "source", "gate:clone-failure")
-        paths = [item.path for item in scratch.folders() if item.task == "gate:clone-failure"]
-        self.assertEqual(len(paths), 1)
-        self.assertTrue((paths[0] / "partial").exists())
-        self.assertEqual(scratch.end("gate:clone-failure"), paths)
-        self.assertFalse(paths[0].exists())
+        for state in ("partial", "marked", "unmarked"):
+            task = "gate:clone-failure" if state == "partial" else f"gate:clone-failure-{state}"
+
+            def interrupted_clone(checkout: Path, repository: Path) -> None:
+                self.assertEqual(repository, source)
+                with scratch.judgment_lock(checkout) as available:
+                    self.assertFalse(available)
+                _ = (checkout / "partial").write_text("partial clone")
+                record = scratch.task_of(checkout)
+                assert isinstance(record, copy_record.Registered)
+                self.assertEqual(record.task, task)
+                if state != "partial":
+                    stage = checkout / scratch.CLONE_STAGE
+                    stage.mkdir()
+                    staged = stage / "checkout"
+                    self.git(source, "clone", "-q", "--shared", "--no-checkout", str(source), str(staged))
+                    if state == "marked":
+                        _ = (stage / scratch.CLONE_STAGE_OWNER).write_bytes(scratch.clone_stage_identity(stage.stat()))
+                    self.assertFalse((checkout / ".git").exists())
+                    self.assertFalse((staged / ".git/index").exists())
+                    self.assertEqual(scratch.repo_problem(staged), "it has uncommitted changes")
+                raise copies.CopyError("interrupted clone")
+
+            with self.subTest(stage=state):
+                with mock.patch.object(copies, "initialize_git", side_effect=interrupted_clone):
+                    with self.assertRaisesRegex(copies.CopyError, "clone failed"):
+                        _ = copies.clone(source, task)
+                paths = [item.path for item in scratch.folders() if item.task == task]
+                self.assertEqual(len(paths), 1)
+                checkout = paths[0]
+                self.assertTrue((checkout / "partial").exists())
+                if state == "unmarked":
+                    self.assertEqual(scratch.end(task), [])
+                    self.assertTrue(checkout.is_dir())
+                else:
+                    self.assertEqual(scratch.record_lifetime(source, time.time()),
+                                     scratch.Live(f"borrowed: {checkout} still uses its git objects"))
+                    self.assertEqual(scratch.end(task), paths)
+                    self.assertFalse(checkout.exists())
+                    self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
 
     def test_main_ends_a_session_clone_and_reports_each_retained_clone(self) -> None:
         from scripts.accounts import accounts
@@ -2309,6 +2339,21 @@ print(scratch.target('gate:proof', 'tree', False))
             self.assertEqual(scratch.record_lifetime(source, time.time()),
                              scratch.Live(f"borrowed: {borrower} still uses its git objects"))
             self.assertEqual(scratch.end("gate:borrower"), [borrower])
+            self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
+
+        with self.subTest(borrower="bare objects link"), tempfile.TemporaryDirectory(dir=source.parent) as directory:
+            borrower = Path(directory)
+            self.git(borrower, "init", "-q", "--bare")
+            scratch.atomic_record(borrower / copy_record.RECORD, {"task": "gate:borrower"})
+            self.assertEqual(scratch.checkout_storage(borrower), ())
+            objects = borrower / "objects"
+            shutil.rmtree(objects)
+            store = source / ".git/objects"
+            objects.symlink_to(os.path.relpath(store, borrower), target_is_directory=True)
+            self.assertEqual(scratch.checkout_storage(borrower), (store,))
+            self.assertEqual(scratch.record_lifetime(source, time.time()),
+                             scratch.Live(f"borrowed: {borrower} still uses its git objects"))
+            objects.unlink()
             self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
 
         with tempfile.TemporaryDirectory(dir=source.parent) as directory:

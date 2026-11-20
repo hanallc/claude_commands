@@ -700,8 +700,16 @@ source_check_seconds=1
         task = "gate:clone-setup"
         ended = time.time()
         initialize = copies.initialize_git
+        scratch.write_record(self.source, "until:2000-01-01T0000Z", ended)
 
         def end_during_setup(path: Path, source: Path) -> None:
+            with self.subTest(setup="registered before Git publication"):
+                self.assertFalse((path / ".git").exists())
+                self.assertEqual(scratch.record_lifetime(source, ended),
+                                 scratch.Live(f"borrowed: {path} still uses its git objects"))
+                record = scratch.task_of(path)
+                assert isinstance(record, copy_record.Registered)
+                self.assertEqual(record.fields.get("borrows_from"), str(source / ".git"))
             self.assertEqual(scratch.end(task, now=ended), [])
             self.assertTrue(path.is_dir())
             initialize(path, source)
@@ -3086,6 +3094,7 @@ with patch.object(subprocess, 'run', pause_clone):
             import os, sys
             from pathlib import Path
             from scripts.copies import copies
+            from scripts.lib import scratch
 
             source, commit, stop = sys.argv[1:]
             git = copies.git
@@ -3094,7 +3103,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
             def interrupt_git(repo, *arguments, **options):
                 result = git(repo, *arguments, **options)
-                in_stage = repo.parent.name == copies.CLONE_STAGE
+                in_stage = repo.parent.name == scratch.CLONE_STAGE
                 if arguments[0] == stop and (in_stage or stop == "checkout"):
                     os._exit(19)
                 return result
@@ -3106,7 +3115,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
             def interrupt_rename(path, destination):
                 result = rename(path, destination)
-                if path.parent.parent.name == copies.CLONE_STAGE and stop == "rename":
+                if path.parent.parent.name == scratch.CLONE_STAGE and stop == "rename":
                     os._exit(19)
                 return result
 
@@ -3119,27 +3128,27 @@ with patch.object(subprocess, 'run', pause_clone):
         for stop in ("init", "alternates", "fetch", "rename", "checkout"):
             with self.subTest(stop=stop):
                 if stop == "checkout":
-                    user_directory = source / copies.CLONE_STAGE
+                    user_directory = source / scratch.CLONE_STAGE
                     user_directory.mkdir()
                     _ = (user_directory / "keep.txt").write_text("tracked workspace file\n")
-                    _ = self.git(source, "add", copies.CLONE_STAGE)
+                    _ = self.git(source, "add", scratch.CLONE_STAGE)
                     _ = self.git(source, "commit", "-qm", "track the user directory")
                     commit = self.git(source, "rev-parse", "HEAD")
                 interrupted = self.python_run(program, str(source), commit, stop)
                 self.assertEqual(interrupted.returncode, 19, interrupted.stderr)
                 path = copies.workspace_path(self.owner_id, source, stop)
-                self.assertTrue((path / copies.CLONE_STAGE).is_dir())
+                self.assertTrue((path / scratch.CLONE_STAGE).is_dir())
                 old_stage = path / ".gate-clone-retry"
                 old_alternates = old_stage / "template/objects/info/alternates"
                 old_alternates.parent.mkdir(parents=True)
                 _ = old_alternates.write_text(str(self.source / ".git/objects") + "\n")
-                _ = (old_stage / copies.CLONE_STAGE_OWNER).write_bytes(copies.clone_stage_identity(old_stage.stat()))
+                _ = (old_stage / scratch.CLONE_STAGE_OWNER).write_bytes(scratch.clone_stage_identity(old_stage.stat()))
                 with copies.workspace(self.owner_id, source, commit, name=stop, branch="worker") as tree:
                     self.assertEqual(tree, path)
                     self.assertEqual(self.git(tree, "rev-parse", "HEAD"), commit)
                     self.assertEqual(self.git(tree, "status", "--porcelain"), "")
                     if stop == "checkout":
-                        user_directory = tree / copies.CLONE_STAGE
+                        user_directory = tree / scratch.CLONE_STAGE
                         self.assertEqual((user_directory / "keep.txt").read_text(), "tracked workspace file\n")
                         self.assertEqual(list(tree.glob(".gate-clone*")), [user_directory])
                     else:

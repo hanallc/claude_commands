@@ -113,6 +113,8 @@ UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 BUSY_REASON = "busy: a lease or .claude-busy lock is held"
+CLONE_STAGE = ".gate-clone"
+CLONE_STAGE_OWNER = ".copies-stage-owner"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 REMOVAL_VERSION = 1
 
@@ -1087,8 +1089,11 @@ def checkout_storage(checkout: Path) -> tuple[Path, ...]:
         git = git_files.at(checkout)
     except git_files.NotACheckout:
         objects = checkout / "objects"
-        if (checkout / "HEAD").is_file() and objects.is_dir():
-            return tuple(object_alternates(objects))
+        if (checkout / "HEAD").is_file():
+            if objects.is_symlink():
+                return (objects.resolve(), *object_alternates(objects))
+            if objects.is_dir():
+                return tuple(object_alternates(objects))
         return ()
     objects = git.common_dir / "objects"
     return (git.git_dir, objects, *object_alternates(objects))
@@ -2107,6 +2112,25 @@ def _repos(path: Path, depth: int, skipped: tuple[str, ...]) -> list[Path]:
     return found
 
 
+def clone_stage_identity(status: os.stat_result) -> bytes:
+    return f"{status.st_dev}:{status.st_ino}\n".encode("ascii")
+
+
+def owns_clone_stage(stage: Path) -> bool:
+    """Require a marker that identifies this directory."""
+    try:
+        status = stage.lstat()
+        marker_path = stage / CLONE_STAGE_OWNER
+        if not stat.S_ISDIR(status.st_mode) or marker_path.is_symlink():
+            return False
+        descriptor = os.open(marker_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    with os.fdopen(descriptor, "rb") as marker:
+        return (stat.S_ISREG(os.fstat(descriptor).st_mode)
+                and marker.read(128) == clone_stage_identity(status))
+
+
 def verified_mirror_metadata(repo: Path) -> tuple[str, ...]:
     """Return generated filenames only when the mirror record, session, and marker agree."""
     from scripts.mac_test import floor_claims
@@ -2440,8 +2464,12 @@ def repo_problem(repo: Path) -> str | None:
 
 def _removal_work(path: Path, scratch_settings: conf.ConfigRead, *,
                   publication: PublicationCheck) -> RemovalWorkSaved | KeptFolder:
-    repositories = tuple(repos(path, scratch_settings=scratch_settings))
-    for repo in repositories:
+    repositories: list[Path] = []
+    for repo in repos(path, scratch_settings=scratch_settings):
+        stage = repo.parent
+        if (repo.name == "checkout" and stage.parent == path and stage.name.startswith(CLONE_STAGE)
+                and owns_clone_stage(stage)):
+            continue
         problem = _repo_problem(repo, publication=publication)
         if isinstance(problem, RemotePublicationUnproven):
             return RemoteKeptFolder(path, f"{repo}: {problem.reason}")
@@ -2449,7 +2477,8 @@ def _removal_work(path: Path, scratch_settings: conf.ConfigRead, *,
             return problem
         if isinstance(problem, RepositoryWorkKept):
             return KeptFolder(path, f"{repo}: {problem.reason}")
-    return RemovalWorkSaved(repositories)
+        repositories.append(repo)
+    return RemovalWorkSaved(tuple(repositories))
 
 
 def unsaved_work(path: Path, *,

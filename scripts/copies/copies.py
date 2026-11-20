@@ -59,8 +59,6 @@ if TYPE_CHECKING:
 RSYNC_RECEIVER_WRITE_TIME_FLAGS = "-rlpc"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
-CLONE_STAGE = ".gate-clone"
-CLONE_STAGE_OWNER = ".copies-stage-owner"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
 
 
@@ -752,41 +750,27 @@ def initialize_shared_git(stage: Path, source: Path, roots: tuple[Path, ...]) ->
         _ = git(stage, "config", f"branch.{name}.merge", branch)
 
 
-def clone_stage_identity(status: os.stat_result) -> bytes:
-    return f"{status.st_dev}:{status.st_ino}\n".encode("ascii")
-
-
-def owns_clone_stage(stage: Path) -> bool:
-    """Require a marker that identifies this directory."""
-    try:
-        status = stage.lstat()
-        marker_path = stage / CLONE_STAGE_OWNER
-        if not stat.S_ISDIR(status.st_mode) or marker_path.is_symlink():
-            return False
-        descriptor = os.open(marker_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    with os.fdopen(descriptor, "rb") as marker:
-        return (stat.S_ISREG(os.fstat(descriptor).st_mode)
-                and marker.read(128) == clone_stage_identity(status))
+def clones_without_alternates(source: Path) -> bool:
+    """Use private objects when the source is an active gate."""
+    return any(active.tree == source for active in ACTIVE_GATES.get())
 
 
 def initialize_git(tree: Path, source: Path) -> None:
     """Create private Git metadata while the caller holds the busy mark."""
-    for leftover in tree.glob(CLONE_STAGE + "*"):
-        if owns_clone_stage(leftover):
+    for leftover in tree.glob(scratch.CLONE_STAGE + "*"):
+        if scratch.owns_clone_stage(leftover):
             shutil.rmtree(leftover)
     if (tree / ".git").exists():
         prepare_git_metadata(tree, source, new_checkout=False)
         return
-    stage = tree / CLONE_STAGE
+    stage = tree / scratch.CLONE_STAGE
     if os.path.lexists(stage):
-        stage = tree / f"{CLONE_STAGE}-{uuid4().hex}"
+        stage = tree / f"{scratch.CLONE_STAGE}-{uuid4().hex}"
     stage.mkdir()
     try:
-        _ = (stage / CLONE_STAGE_OWNER).write_bytes(clone_stage_identity(stage.stat()))
+        _ = (stage / scratch.CLONE_STAGE_OWNER).write_bytes(scratch.clone_stage_identity(stage.stat()))
         checkout = stage / "checkout"
-        if any(active.tree == source for active in ACTIVE_GATES.get()):
+        if clones_without_alternates(source):
             _ = git(source, "clone", "--no-local", "--no-checkout", "--quiet", "--", str(source), str(checkout))
         else:
             source_objects = git_object_store(source)
@@ -839,10 +823,13 @@ class CloneSource(Enum):
 
 
 def register_scratch_clone(path: Path, source: CloneSourceCommit | CloneSource, *,
+                           borrows_from: str = "",
                            generated_from: CloneSourceCommit | CloneSource = CloneSource.UNAPPROVED,
                            scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
     """Record a scratch clone and the source commit used to check its envrc."""
     fields: dict[str, object] = {"test_hana_clone": True}
+    if borrows_from:
+        fields["borrows_from"] = borrows_from
     if isinstance(source, CloneSourceCommit):
         fields.update(source_path=source.repository, source_commit=source.commit)
     if isinstance(generated_from, CloneSourceCommit):
@@ -867,8 +854,11 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
         scratch.write_record(path, task, moment, scratch_settings=scratch_settings)
         if scratch.in_session_folder(path):
             _ = scratch.hold(path, task, "task clone in the session folder", scratch_settings=scratch_settings)
-        register_scratch_clone(path, CloneSource.UNAPPROVED, scratch_settings=scratch_settings)
         try:
+            repository = source.resolve()
+            borrowed = borrowed_root_record(repository)
+            register_scratch_clone(path, CloneSource.UNAPPROVED, borrows_from=borrowed,
+                                   scratch_settings=scratch_settings)
             # The task folder is the checkout, so its cargo build folder has the task folder's name.
             descriptors = [build_folders.build_folder_lock_fd(path)]
             with ExitStack() as locks:
@@ -877,10 +867,10 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                     raise CopyError(f"{path}: task folder is busy")
                 token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *descriptors))
                 _ = locks.callback(COMMAND_LOCKS.reset, token)
-                initialize_git(path, source.resolve())
+                initialize_git(path, repository)
                 scratch.exclude_copy_metadata(path)
                 _ = git(path, "reset", "--hard", "--quiet")
-                register_scratch_clone(path, CloneSourceCommit(str(source.resolve()), commit_at(path, "HEAD")),
+                register_scratch_clone(path, CloneSourceCommit(str(repository), commit_at(path, "HEAD")),
                                        scratch_settings=scratch_settings)
                 from scripts.accounts import accounts
 
@@ -923,7 +913,7 @@ def apply_changes(tree: Path, worktree: Path, base: str, *, private_snapshot: bo
                 if not name:
                     continue
                 changed.append(os.fsdecode(name))
-                if Path(os.fsdecode(name)).parts[0] in (scratch.BUSY, ".git", CLONE_STAGE):
+                if Path(os.fsdecode(name)).parts[0] in (scratch.BUSY, ".git", scratch.CLONE_STAGE):
                     raise CopyError(f"{os.fsdecode(name)}: path conflicts with gate metadata")
             snapshot = staged_tree(worktree, include_worktree=True)
             envrc_changed = git(worktree, "diff", "--name-only", "-z", "HEAD", snapshot, "--", ".envrc")
@@ -1010,6 +1000,13 @@ def borrowed_store_record(stores: Sequence[Path]) -> str:
     return "\n".join(str(store.parent if store.name == "objects" else store) for store in stores)
 
 
+def borrowed_root_record(source: Path) -> str:
+    """Record the root stores that setup will use as alternates."""
+    if clones_without_alternates(source):
+        return ""
+    return borrowed_store_record(root_object_stores(git_object_store(source)))
+
+
 @contextmanager
 def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: str,
               task: str = "", path: Path | None = None, run_manifest: Path | None = None) -> Generator[Path]:
@@ -1052,10 +1049,9 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
 
                 def register(copy_commit: str) -> None:
                     if (tree / ".git").is_dir():
-                        stores = alternate_object_stores(git_object_store(tree))
+                        borrowed = borrowed_store_record(alternate_object_stores(git_object_store(tree)))
                     else:
-                        stores = root_object_stores(git_object_store(source))
-                    borrowed = borrowed_store_record(stores)
+                        borrowed = borrowed_root_record(source)
                     if legacy:
                         _ = scratch.hold(tree, task, LEGACY_WORKER_HOLD_REASON)
                         fields: dict[str, object] = dict(owner_unit=owner, source_path=str(source),

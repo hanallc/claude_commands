@@ -59,6 +59,7 @@ The stage records only the root stores as alternates.
 The fetch gives upload-pack direct access to every store in the source chain.
 Git fetches objects that the root stores lack, including a requested commit that only the source reflog holds.
 The next use clears a stage only when its marker identifies that directory.
+Task cleanup skips the saved-work check for a private stage with a matching marker.
 Removing an intermediate copy leaves those objects available in the new copy.
 A clone of an active gate uses `--no-local` without sharing its object store.
 Worktree snapshots use a temporary object store while they read staged and working files.
@@ -122,8 +123,9 @@ Task cleanup removes the clone and clears the removal marks before it tries to r
 Cleanup holds the lock and checks the identities of those two files before it removes either file.
 Recovery leaves the files if the clone is already absent when recovery starts.
 
-The borrow check keeps a source when a copy record or a live Git alternate names its storage.
-Workspace registration records the root stores before setup publishes the Git checkout.
+The borrow check keeps a source when a copy record or live Git metadata names its storage.
+Live Git metadata includes alternates and a bare copy's symbolic link to its object store.
+Workspace and task clone registration record the root stores before setup publishes the Git checkout.
 The recorded borrow ends when cleanup removes the copy and its record.
 It also keeps sources when it cannot read a copy record.
 It checks the copy folders in the registry and the adopted copies in the holds file.
