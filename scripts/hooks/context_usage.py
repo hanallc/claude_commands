@@ -223,7 +223,7 @@ def parse_window(text: str) -> int | None:
         multiplier, value = 1_000_000, value[:-1]
     try:
         number = int(float(value) * multiplier)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     # Bare small numbers are the CLI's k-shorthand ("200" means 200k).
     if multiplier == 1 and number < 10_000:

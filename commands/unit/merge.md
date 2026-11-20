@@ -124,7 +124,6 @@ Other <WorkerRuns/> cancellation rules apply after rollout.
 | sdlc `land.sh`, `land_mac_ok.sh`, `queue_runner.sh` | Retained merge worker |
 | `merge_checkpoint.py --production sdlc` | Merge worker |
 | `merge_gate.py --checkout . --tests-only` | Gate worker |
-| `basedpyright scripts/direct scripts/production` | Gate worker |
 | Hana gate scripts through `copies.py run --commit <sha>` | Gate worker at the recorded commit |
 | `verify.sh check`, `test`, `lint` | Gate worker |
 | `cargo fmt`, `cargo test`, `cargo nextest` | Gate worker under the production's existing build rules |
@@ -147,6 +146,7 @@ Existing wrappers retain their production rules.
 
 <MergeGates>
 Dispatch the production's gate commands against the exact staged commit.
+The nightly run checks types.
 Require the reply to name the tested commit, commands, exit codes, and logs.
 Do not transfer a green result to a later tree without the production's existing proof rules.
 Return failures to the owning unit and showrunner with the failed command and evidence.
