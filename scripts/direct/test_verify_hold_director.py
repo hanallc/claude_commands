@@ -14,7 +14,8 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_director_verification_uses_its_claude_owner_and_single_active_phase(self) -> None:
         self.set_hold_routing("natedev_only")
         history = self.record_phase()
-        self.fixture.environment.update({"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "claude-director"})
+        self.fixture.environment.update({"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "claude-director",
+                                         "UNIT_PHASE_ID": ""})
         self.hold()
         process = self.start("check", "sample")
         self.wait_for_call(process)
@@ -33,7 +34,8 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         result = invoke_recorder(["start-phase", "--session-dir", session, "--phase-id", "7", "--phase-title", "Concurrent"],
                                  self.fixture.environment, self.fixture.root)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.fixture.environment.update({"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "claude-director"})
+        self.fixture.environment.update({"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "claude-director",
+                                         "UNIT_PHASE_ID": ""})
         self.hold()
         process = self.start("check", "sample")
         self.wait_for_call(process)

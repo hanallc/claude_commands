@@ -338,20 +338,25 @@ class ReviewSubmissionTests(unittest.TestCase):
                 self.assertEqual(submissions.submit(submissions.read_request(payload)), submitted)
                 self.assertEqual(list(submissions.image_folder(submitted).iterdir()), [folder])
 
-    def test_interrupted_write_discards_the_images_and_allows_edits(self) -> None:
+    def test_interrupted_write_keeps_the_images_and_skips_the_reserved_number(self) -> None:
         payload = replace(request(), images=(IMAGE,))
         folder = self.root / "review-attachments" / payload.request_id
         with patch.object(record_store.NumberedRecords, "write", side_effect=OSError("interrupted")):
             with self.assertRaisesRegex(OSError, "interrupted"):
                 _ = submissions.submit(payload)
-        self.assertEqual(list(folder.iterdir()), [])
+        self.assertFalse((folder / "receipt.json").exists())
         self.assertFalse(investigation.records(OWNER))
-        edited = replace(payload, words="Different words", images=())
-        saved = submissions.submit(edited)
+        image, = (folder / "images").glob("*/image.png")
+        before = image.stat()
+        self.assertEqual(image.read_bytes(), base64.b64decode(PNG))
+        with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
+            _ = submissions.submit(replace(payload, words="Different words"))
+        saved = submissions.submit(payload)
         self.assertEqual(saved.id, "I2")
-        self.assertEqual(saved.details.images, ())
-        self.assertEqual(saved.words, edited.words)
-        self.assertEqual(submissions.submit(edited), saved)
+        self.assertEqual(len(saved.details.images), 1)
+        self.assertEqual(image.stat().st_ino, before.st_ino)
+        self.assertEqual(image.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertEqual(image.read_bytes(), base64.b64decode(PNG))
 
     def test_retry_uses_the_next_id_after_another_request_filed(self) -> None:
         bug = replace(request(), images=(IMAGE,))
@@ -367,7 +372,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         image, = saved.details.images
         self.assertEqual((submissions.image_folder(saved) / image.id / image.file).read_bytes(), base64.b64decode(PNG))
 
-    def test_retry_files_images_after_rolling_back_a_published_record(self) -> None:
+    def test_retry_keeps_the_images_after_rolling_back_a_published_record(self) -> None:
         payload = replace(request(), images=(IMAGE,))
         sync = atomic_file.sync_folder
 

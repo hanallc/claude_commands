@@ -211,7 +211,7 @@ class WaitingTests(unittest.TestCase):
         # as its name. Tests that call the tool in this process read the same stand-ins.
         (self.root / "sessions").mkdir()
         self.write(self.root / "showrunners.json", json.dumps({
-            "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "natedev",
+            "threshold_percent": 2, "stall_minutes": 5, "faults_to": "natedev",
             "always": []}))
         self.write(self.root / "herdr-responses.json", json.dumps({
             "default": CommandResponse(stdout="", code=1),

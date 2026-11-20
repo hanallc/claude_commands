@@ -59,7 +59,7 @@ nate evaluates each one.
 
 ## Rust design
 
-If one of your items is in a Rust project, load `~/.claude/docs/producer/rust_design.md` at startup and after compaction. Keep it in context.
+If one of your items is in a Rust project, load `~/.claude/docs/producer/rust_design.md` at startup, after compaction, and when you get the item. Keep it in context.
 Use it when you read a plan or a design call. Do not review code lines with it.
 Ask the style unit about a hard case.
 

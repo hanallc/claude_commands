@@ -1,6 +1,8 @@
 """Check the published AWS table and quota case instructions."""
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from html import unescape
 import json
 from pathlib import Path
@@ -11,12 +13,16 @@ from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_page, console_help, ledger, ledger_test_support
+from scripts.aws_target import aws_page, cloud_gate, console_help, ledger, ledger_test_support, run_cost, spot_table
+from scripts.aws_target.aws_cli import AwsCli
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.review_links import page_frame
 
 
 class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
-    def test_quota_help_is_closed_and_contains_the_ordered_steps_and_links(self) -> None:
+    def test_quota_help_is_closed_and_contains_the_ordered_steps_and_case_link(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
         section = page.read_text().split('<section class="card" id="prices-quotas">', 1)[1].split('</section>', 1)[0]
@@ -27,17 +33,16 @@ class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
         self.assertRegex(block, r'<ol><li>.*</li></ol>')
         steps = tuple(match[1] for match in re.finditer(r'<li>(.*?)</li>', block))
         self.assertEqual(tuple(unescape(re.sub(r'<[^>]+>', '', step)) for step in steps), console_help.QUOTA_CASE_STEPS)
-        for index, url in ((0, console_help.SETTINGS_URL), (4, console_help.CASE_LIST_URL)):
-            self.assertIn(f'<a href="{url}">{url}</a>', steps[index])
-        self.assertIn(console_help.WRONG_ACCOUNT, unescape(block))
-        self.assertIn(console_help.PASSKEY_NOTE, unescape(block))
+        url = console_help.CASE_LIST_URL
+        self.assertIn(f'<a href="{url}">{url}</a>', steps[2])
+        self.assertEqual(block.count('<a href='), 1)
+        self.assertEqual(re.findall(r'<p>(.*?)</p>', unescape(block)), [console_help.WRONG_ACCOUNT])
 
     def test_quota_help_uses_the_shared_words(self) -> None:
         with (mock.patch.object(console_help, 'QUOTA_CASE_STEPS', ('Open the test console.',)),
-              mock.patch.object(console_help, 'WRONG_ACCOUNT', 'Choose the test account.'),
-              mock.patch.object(console_help, 'PASSKEY_NOTE', 'Unlock the test manager.')):
+              mock.patch.object(console_help, 'WRONG_ACCOUNT', 'Choose the test account.')):
             self.assertEqual(aws_page.quota_help(), '<ol><li>Open the test console.</li></ol>'
-                             + '\n<p>Choose the test account.</p>\n<p>Unlock the test manager.</p>')
+                             + '\n<p>Choose the test account.</p>')
 
 
 @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the AWS table checks")
@@ -48,18 +53,21 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
         standard = ('c7a.4xlarge', 'm7a.8xlarge')
         gpu = 'g6.2xlarge'
         config = self.root / 'cloud_gate.conf'
-        _ = config.write_bytes((Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf').read_bytes())
+        _ = write_config_fixture(config, 'max_gate_minutes=60\n')
         for key, value in (
-            ('spot_candidate_regions', ' '.join(reversed(regions))), ('instance_types', standard[0]),
+            ('spot_candidate_regions', ' '.join(reversed(regions))), ('instance_types', ' '.join(standard)),
             ('price_compare_instance_types', standard[1]), ('gpu_instance_types', gpu),
             ('hana_gpu_instance_types', gpu), ('gate_wait_usd_per_minute', '0'),
         ):
             ledger_test_support.text_setting(config, key, value)
         prices = [
-            {'region': region, 'instance_type': size, 'usd_per_hour': usd}
+            {'region': region, 'instance_type': size, 'zone': region + 'a', 'usd_per_hour': usd, 'read_at': now - 240}
             for region, row in zip(regions, (('0.1', '0.6', '0.7'), ('0.2', '0.5', '0.8'), ('0.3', '', '0.9')), strict=True)
             for size, usd in zip((*standard, gpu), row, strict=True) if usd
         ]
+        _ = (self.state / 'gate-deployment.json').write_text(json.dumps({'regions': [
+            {'region': region, 'subnets': [{'id': 'subnet-' + region, 'zone': region + 'a'}]} for region in regions
+        ]}))
         readings = [
             {'region': region, 'read_at': now - age, 'standard_vcpus': '137', 'gpu_vcpus': '32'}
             for region, age in zip(regions, (240, 7201, 240), strict=True)
@@ -138,6 +146,9 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
     check(table().tBodies[0].rows[2].cells[3].classList.contains("dearest"), "Highest Gate cost");
     check(table().tBodies[0].rows[2].cells[2].classList.contains("end"), "Column box");
     check(table().tBodies[0].rows[2].cells[5].title === "Not sold here", "Unavailable type icon");
+    const missingGate = table().tBodies[0].rows[2].cells[6];
+    check(missingGate.title === "no current gate price"
+          && missingGate.getAttribute("aria-label") === missingGate.title, "Unavailable Gate price note");
     const merge = gate().textContent;
     click("#runs-chips [data-scope='targeted-test']");
     check(gate().textContent !== merge, "Runs chips change the Gate values");
@@ -164,9 +175,12 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
     check(innerWidth === 760 && scroller().scrollWidth > scroller().clientWidth, "Narrow scroll container");
     scroller().scrollLeft = 150;
     check(scroller().scrollLeft === 150, "Set scroll position before refresh");
-    const refreshed = JSON.stringify({...data, render_seconds: 12});
+    const prices = JSON.parse(document.getElementById("aws-prices-data").textContent);
+    const refreshed = JSON.stringify({...prices, render_seconds: 12});
+    const gateTime = document.getElementById("aws-gate-time-data").textContent;
     window.fetch = async () => ({ok: true, text: async () =>
-      `<script type="application/json" id="aws-prices-data">${refreshed}</scr` + "ipt>"});
+      `<script type="application/json" id="aws-prices-data">${refreshed}</scr` + "ipt>"
+      + `<script type="application/json" id="aws-gate-time-data">${gateTime}</scr` + "ipt>"});
     const status = await loadAws();
     check(status.renderSeconds === 12 && scroller().scrollLeft === 150, "Refresh keeps scroll position");
     check(params().get("show") === "spot,cost" && params().get("types") === "standard"
@@ -240,3 +254,257 @@ class AwsPagePlacementScoresTests(ledger_test_support.CostFixture):
         self.assertIn('data.placement_scores', source)
         self.assertIn('AWS scores a request with fewer than three instance types lower. '
                       + 'Compare the 32-vCPU column with recorded launch results.', source)
+
+
+class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
+    def test_page_compares_the_lowest_run_cost_for_each_size_in_each_region(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        east, west, north = 'us-east-2', 'us-west-2', 'eu-north-1'
+        candidate_only = 'eu-south-2'
+        undeployed_type = 'c7i.4xlarge'
+        unmeasured_type = 'c7a.2xlarge'
+        slow_type = 'm7a.4xlarge'
+        deployed_types = ('c7a.4xlarge', 'c7a.8xlarge', slow_type, 'm7a.8xlarge', unmeasured_type)
+        self.text_setting('region', east)
+        config = self.root / 'cloud_gate.conf'
+        _ = write_config_fixture(config,
+            f'regions={east} {west} {north}\nspot_candidate_regions={west} {east} {candidate_only}\n'
+            + f'instance_types={" ".join((*deployed_types, undeployed_type))}\n'
+            + 'gate_wait_usd_per_minute=0.02\nmax_gate_minutes=12\n'
+            + f'region_transfer_usd={json.dumps({east: 0.30, west: 0.08})}\n'
+            + f'region_extra_gate_seconds={json.dumps({west: 30})}\n')
+        deployment = self.state / 'gate-deployment.json'
+        deployed_regions = [
+            {'region': east, 'subnets': [{'id': 'subnet-east-a', 'zone': east + 'a'},
+                                         {'id': 'subnet-east-c', 'zone': east + 'c'}]},
+            {'region': west, 'subnets': [{'id': 'subnet-west', 'zone': west + 'a'}]},
+        ]
+        _ = deployment.write_text(json.dumps({'instance_types': deployed_types, 'regions': deployed_regions}))
+        history: list[dict[str, object]] = []
+        prices: list[ledger.RegionalSpotPrice] = []
+        for size, rate, seconds in (('c7a.4xlarge', '0.6', 600), (slow_type, '0.6', 780),
+                                    ('c7a.8xlarge', '2.4', 360), ('m7a.8xlarge', '1.8', 300)):
+            base = {'attempt': size, 'instance_type': size, 'region': east, 'mode': 'merge-gate'}
+            history.extend(({**base, 'result': 'launched', 'time': now - 1000},
+                            {**base, 'result': 'finished', 'time': now - 1000 + seconds, 'gate_s': seconds - 60}))
+            prices.append(ledger.RegionalSpotPrice(east, east + 'a', size, Decimal(rate), now))
+        prices.extend((
+            ledger.RegionalSpotPrice(east, east + 'b', 'c7a.4xlarge', Decimal('0.006'), now),
+            ledger.RegionalSpotPrice(east, east + 'c', 'c7a.4xlarge', Decimal('0.72'), now),
+            ledger.RegionalSpotPrice(east, east + 'a', undeployed_type, Decimal('0.012'), now),
+            ledger.RegionalSpotPrice(east, east + 'a', unmeasured_type, Decimal('0.1'), now),
+            ledger.RegionalSpotPrice(east, east + 'b', 'm7a.4xlarge', Decimal('0.01'), now - 99999),
+            ledger.RegionalSpotPrice(east, east + 'b', 'c7a.8xlarge', Decimal('0.01'), now),
+            ledger.RegionalSpotPrice(east, east + 'b', 'm7a.8xlarge', Decimal('2'), now),
+            ledger.RegionalSpotPrice(west, west + 'a', 'c7a.4xlarge', Decimal('0.6'), now),
+            ledger.RegionalSpotPrice(west, west + 'a', 'm7a.8xlarge', Decimal('0.01'), now - 99999),
+            ledger.RegionalSpotPrice(north, north + 'a', 'c7a.4xlarge', Decimal('0.01'), now),
+        ))
+        ledger.write_spot_prices(self.state, prices)
+        history_path = self.state / 'cloud-gate-launches.jsonl'
+        _ = history_path.write_text(
+            ''.join(json.dumps(row) + '\n' for row in sorted(history, key=lambda row: int(str(row['time'])))))
+        def publish() -> str:
+            return aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings).read_text()
+
+        def payload(source: str, name: str) -> object:
+            raw = source.split(f'<script id="{name}" type="application/json">', 1)[1].split('</script>', 1)[0]
+            return cast(object, json.loads(raw))
+
+        source = publish()
+        data = ledger.mapping(payload(source, 'aws-gate-time-data'))
+        table = cast(aws_page.TableData, data['table'])
+        self.assertEqual(table['region_axis'], 'rows')
+        self.assertEqual(data['regions'], [east, west, north, candidate_only])
+        self.assertEqual([row[0] for row in table['rows']], [east, west, north])
+        self.assertEqual(table['rows'][0], [east, 'c7a.4xlarge', '0.6000', '10.0', '0.1000',
+                                           'm7a.8xlarge', '1.8000', '5.0', '0.1500', '0.0100 or more'])
+        self.assertEqual(table['rows'][1], [west, 'c7a.4xlarge', '0.6000', '10.0', '0.1900',
+                                           *(['—'] * 4), 'no current price'])
+        self.assertEqual(table['rows'][2], [north, *(['—'] * 8), 'no current price'])
+
+        page = cast(aws_page.PageData, payload(source, 'aws-prices-data'))
+        merge_gates = next(costs for costs in page['runs'] if costs['scope'] == 'merge-gate')
+        gate_prices = merge_gates['prices'][0]
+        size = 'c7a.4xlarge'
+        column = gate_prices['headers'].index(size)
+        prices_by_region = {row[0]: row[column] for row in gate_prices['rows']}
+        end = datetime.fromtimestamp(now, UTC)
+        days = conf.read(self.settings).whole('run_cost_days')
+        evidence = run_cost.run_evidence(history, end - timedelta(days=days), end, east)
+        pricing = run_cost.GateRunPricing.from_config(conf.read(config), evidence, east, ('merge-gate',))
+        for row in table['rows'][:2]:
+            region = row[0]
+            with self.subTest(region=region):
+                self.assertEqual(prices_by_region[region], row[4])
+                self.assertEqual(prices_by_region[region], f'{pricing.expected_usd(Decimal("0.6"), size, region):.4f}')
+                self.assertIn({'region': region, 'summary': f'Cheapest merge gate: {size} in {region}, {row[4]} USD (estimate)'},
+                              merge_gates['estimates'])
+        spot_prices = page['prices'][0]
+        for region, instance_type, spot, gate in (
+            (east, size, 0.006, '0.1000'),
+            (east, undeployed_type, 0.012, 'no current gate price'),
+            (west, 'm7a.8xlarge', 0.01, 'no current gate price'),
+        ):
+            with self.subTest(region=region, instance_type=instance_type):
+                index = next(index for index, row in enumerate(spot_prices['rows']) if row[0] == region)
+                self.assertEqual(spot_prices['values'][index][spot_prices['headers'].index(instance_type)], spot)
+                self.assertEqual(gate_prices['rows'][index][gate_prices['headers'].index(instance_type)], gate)
+        for region, instance_type in ((east, undeployed_type), (west, 'm7a.8xlarge')):
+            self.assertFalse(any(entry['region'] == region and instance_type in entry['summary']
+                                 for entry in merge_gates['estimates']))
+        self.assertLess(source.index('id="placement-scores"'), source.index('id="gate-time-price"'))
+        self.assertIn('fill(document.getElementById("gate-time-price"), data.gateTimePrice,', source)
+
+        east_index = next(index for index, row in enumerate(gate_prices['rows']) if row[0] == east)
+        with self.subTest(gate='13 minutes above the 12-minute limit'):
+            slow_column = gate_prices['headers'].index(slow_type)
+            self.assertEqual(gate_prices['rows'][east_index][slow_column], 'too slow')
+            self.assertIsNone(gate_prices['values'][east_index][slow_column])
+            self.assertFalse(any(slow_type in entry['summary'] for entry in merge_gates['estimates']))
+        with self.subTest(gate='current price with no run history'):
+            empty_column = gate_prices['headers'].index(unmeasured_type)
+            self.assertEqual(gate_prices['rows'][east_index][empty_column], 'no runs')
+            self.assertIsNone(gate_prices['values'][east_index][empty_column])
+            self.assertNotIn([east_index, empty_column], gate_prices['not_sold'])
+
+        with self.subTest(prices='snapshot changes between reads'):
+            updated_prices = tuple(replace(price, usd_per_hour=price.usd_per_hour * Decimal('1.5'))
+                                   for price in prices)
+            with mock.patch.object(ledger, 'read_spot_prices', side_effect=(tuple(prices), updated_prices)) as read:
+                updated_source = publish()
+            updated_page = cast(aws_page.PageData, payload(updated_source, 'aws-prices-data'))
+            updated_gate = updated_page['runs'][0]['prices'][0]['rows'][east_index][column]
+            updated_data = ledger.mapping(payload(updated_source, 'aws-gate-time-data'))
+            updated_card = cast(aws_page.TableData, updated_data['table'])
+            self.assertEqual(updated_gate, '0.1000')
+            self.assertEqual(updated_card['rows'][0][4], updated_gate)
+            read.assert_called_once_with(self.state)
+
+        values, policy = conf.read(config), conf.read(self.settings)
+        with self.subTest(deployment='valid types with a null entry'):
+            _ = deployment.write_text(json.dumps({'instance_types': [None, *deployed_types], 'regions': deployed_regions}))
+            comparisons = run_cost.merge_gate_comparisons(self.state, now, values, policy)
+            small = comparisons[0].small
+            self.assertIsInstance(small, run_cost.GateRunEstimate)
+            assert isinstance(small, run_cost.GateRunEstimate)
+            self.assertEqual(small.instance_type, size)
+            self.assertEqual(small.usd_per_run, Decimal('0.1'))
+            gates = spot_table.spot_tables(self.state, now, settings_path=self.settings).runs[0]
+            self.assertEqual(next(row[column] for row in gates.gate_prices.rows if row[0] == east), '0.1000')
+        _ = deployment.write_text(json.dumps({'instance_types': deployed_types, 'regions': deployed_regions}))
+
+        with self.subTest(history='launch before the cutoff and finish inside it'):
+            cutoff = now - days * 86400
+            crossing = {'attempt': 'cutoff', 'instance_type': size, 'region': east, 'mode': 'merge-gate'}
+            recent = [{**row, 'time': now - 460, 'gate_s': 480}
+                      if row['attempt'] == slow_type and row['result'] == 'finished' else row for row in history]
+            ordered = sorted(recent, key=lambda row: int(str(row['time'])))
+            _ = history_path.write_text(
+                json.dumps({**crossing, 'result': 'launched', 'time': cutoff - 120}) + '\n'
+                + json.dumps({**crossing, 'result': 'finished', 'time': cutoff + 180, 'gate_s': 240}) + '\n'
+                + ''.join(json.dumps(row) + '\n' for row in ordered))
+            api = AwsCli('fixture', east, 1, execute=mock.Mock(side_effect=AssertionError('Unexpected AWS call')))
+            worker = cloud_gate.GateWorker(api, ledger.CostLedger(self.state), self.settings, self.root / 'sidecar',
+                                           clock=lambda: now)
+            variants = run_cost.read_deployed_gate_variants(self.state, deployed_types, east)
+            ranked = worker.rank_variants([row for row in variants if row.region == east
+                                           and row.instance_type in (size, slow_type)], 'merge-gate')
+            self.assertEqual(ranked[0].instance_type, slow_type)
+            gates = spot_table.spot_tables(self.state, now, settings_path=self.settings).runs[0]
+            east_prices = next(row for row in gates.gate_prices.rows if row[0] == east)
+            self.assertEqual(east_prices[column], '0.1000')
+            self.assertEqual(east_prices[gates.gate_prices.headers.index(slow_type)], '0.0900')
+            cheapest = next(entry for entry in gates.estimates if entry.region == east)
+            self.assertEqual((cheapest.size, cheapest.usd), (ranked[0].instance_type, Decimal('0.09')))
+            small = run_cost.merge_gate_comparisons(self.state, now, values, policy)[0].small
+            self.assertIsInstance(small, run_cost.GateRunEstimate)
+            assert isinstance(small, run_cost.GateRunEstimate)
+            self.assertEqual((small.instance_type, small.usd_per_run), (cheapest.size, cheapest.usd))
+            recorded = next(table for table in gates.tables if table.title == size)
+            self.assertEqual(next(row[2:4] for row in recorded.rows if row[0] == east), ('7.5', '2'))
+
+        deployment.unlink()
+        unpriced = run_cost.NoPricedGateVariant()
+        expected = tuple(run_cost.GateTimeComparison(region, unpriced, unpriced) for region in (east, west, north))
+        for label in ('missing', 'malformed'):
+            with self.subTest(deployment=label):
+                if label == 'malformed':
+                    _ = deployment.write_text('{"regions":[{"region":"us-east-2","subnets":"invalid"}]}')
+                tables = spot_table.spot_tables(self.state, now, settings_path=self.settings)
+                self.assertFalse(tables.runs[0].estimates)
+                self.assertTrue(all(cell == 'no current gate price' for row in tables.runs[0].gate_prices.rows
+                                    for cell in row[1:]))
+                comparisons = run_cost.merge_gate_comparisons(self.state, now, conf.read(config), conf.read(self.settings))
+                self.assertEqual(comparisons, expected)
+
+    def test_page_refresh_redraws_the_break_even_table_and_region_filter(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        before = spot_table.Table('Break-even', ('Region', 'USD/min'), frozenset({1}),
+                                  (('us-east-2', '0.0100'),), 'rows')
+        after = replace(before, rows=(('us-east-2', '0.0900'), ('test-new-region', 'no current price')))
+        with mock.patch.object(aws_page, 'gate_time_price_table', side_effect=(before, after)):
+            first = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings).read_text()
+            second = aws_page.publish(self.state, now + 1, self.root / 'page', settings_path=self.settings).read_text()
+        script = first.rsplit('<script>', 1)[1].split('</script>', 1)[0].replace(page_frame.REFRESH_SCRIPT, '')
+        fixture = r'''
+const assert = require("node:assert/strict");
+const ids = new Map();
+class Element {
+  children = [];
+  dataset = {};
+  classList = {add() {}, toggle() {}};
+  style = {};
+  textContent = "";
+  append(...children) { this.children.push(...children); }
+  appendChild(child) { this.append(child); return child; }
+  replaceChildren(...children) { this.children = children; }
+  createTHead() { return this.appendChild(new Element()); }
+  createTBody() { return this.appendChild(new Element()); }
+  insertRow() { return this.appendChild(new Element()); }
+  querySelector() { return null; }
+  setAttribute() {}
+  addEventListener() {}
+}
+function parse(html) {
+  return {getElementById(id) {
+    const start = '<script id="' + id + '" type="application/json">';
+    return {textContent: html.split(start)[1].split("</script>")[0]};
+  }};
+}
+const document = {
+  getElementById(id) {
+    if (id.endsWith("-data")) return parse(first).getElementById(id);
+    if (!ids.has(id)) ids.set(id, new Element());
+    return ids.get(id);
+  },
+  createElement: () => new Element(),
+  createElementNS: () => new Element(),
+  querySelectorAll: () => [],
+};
+const location = {pathname: "/", search: ""};
+const fetch = async () => ({ok: true, text: async () => second});
+class DOMParser { parseFromString(html) { return parse(html); } }
+function addEventListener() {}
+let reload;
+function createPageRefresh(load) { reload = load; }
+function words(node) {
+  return typeof node === "string" ? node : [node.textContent, ...node.children.map(words)].join(" ");
+}
+'''
+        check = r'''
+(async () => {
+  const table = ids.get("gate-time-price");
+  assert.match(words(table), /0\.0100/);
+  const result = await reload();
+  assert.equal(result.readAt, data.read_at);
+  assert.doesNotMatch(words(table), /0\.0100/);
+  assert.match(words(table), /0\.0900/);
+  assert.match(words(table), /test-new-region/);
+  assert.match(words(ids.get("regions")), /test-new-region/);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
+        source = f'const first = {json.dumps(first)};\nconst second = {json.dumps(second)};\n' + fixture + script + check
+        result = subprocess.run([node, '-'], input=source, capture_output=True, text=True, timeout=20, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

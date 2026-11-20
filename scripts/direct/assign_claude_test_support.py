@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.agents import remote
 
 from scripts.lib import test_hang_guard
+from scripts.lib.fork_test_support import ForkChildren
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import isolated_staff_file
 
@@ -284,7 +285,8 @@ class AssignClaudeLauncherFixture(LauncherFixture):
                 "# whole: 1..", "CLAUDE_WORKER_REGISTER_WAIT_SECS=30",
                 "# range: 0..", "CLAUDE_WORKER_POLL_SECS=15",
                 "# whole: 1..", "UNIT_COMPACT_ABOVE_TOKENS=100000",
-                "# whole: 1..", "MAX_FIX_ATTEMPTS=3", "# whole: 1..", "MAX_REOPENS=3", "# whole: 1..", "STALLED_ROUNDS=3",
+                "# whole: 1..", "MAX_FIX_ATTEMPTS=3", "# whole: 1..", "MAX_REOPENS=3",
+                "# whole: 2..", "STALLED_ROUNDS=3",
                 "# whole: 1..", "RUNAWAY_ROUNDS=10", "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=2",
                 "# whole: 1..", "MIN_REPAIR_BUDGET=2", "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
                 "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1", "# whole: 1..", "ROUTING_FROM_ROUND=4",
@@ -357,10 +359,8 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             "check = assign.call([assign.PYTHON, str(assign.SCRIPTS / 'progress_history.py'), 'check-launch', '--session-dir', str(run), '--pass-kind', role, '--phase-id', phase, '--prompt-file', str(prompt), '--fix-cause', args.fix_cause], env, check=False)",
             "if check.returncode: raise SystemExit(3 if check.returncode == 3 else 2)",
             "slot = args.to or args.new_worker or role",
-            "before = assign.pass_start_count(run, slot)",
             "worker = assign_claude.ClaudeFollowUp(args.to) if args.to else assign_claude.NewClaudeWorker()",
             "code = assign_claude.run(assign_claude.ClaudeLaunch(run, phase, cwd, prompt, role, slot, args.fix_cause, args.pass_number, model[1], model[2], worker, ('bash', str(assign.SCRIPTS / 'assign.sh'), *sys.argv[1:]), env))",
-            "if code and assign.pass_start_count(run, slot) > before: assign.end_failed_launch(run, slot, env)",
             "raise SystemExit(code)",
         )) + "\n"
         if self.direct_cli_calls:
@@ -460,13 +460,21 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             _ = runpy.run_path(str(entry), run_name="__main__")
             return 0
 
-        with (patch.object(direct_package, "__path__", list(cast(Sequence[str], getattr(direct_package, "__path__")))),
-              patch.object(assign, "SCRIPTS", direct),
-              patch.object(assign, "PYTHON", str(direct.parent / "lib/py")),
-              patch.object(assign_claude, "SCRIPTS", direct),
-              patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py")),
-              direct_launcher_helpers()):
-            return invoke_cli(module, child_main, arguments, environment, self.working_dir)
+        def run_warm() -> int:
+            with (patch.object(direct_package, "__path__", list(cast(Sequence[str], getattr(direct_package, "__path__")))),
+                  patch.object(assign, "SCRIPTS", direct),
+                  patch.object(assign, "PYTHON", str(direct.parent / "lib/py")),
+                  patch.object(assign_claude, "SCRIPTS", direct),
+                  patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py")),
+                  direct_launcher_helpers()):
+                result = invoke_cli(module, child_main, arguments, environment, self.working_dir)
+            _ = sys.stdout.write(result.stdout)
+            _ = sys.stderr.write(result.stderr)
+            return result.returncode
+
+        with ForkChildren() as children:
+            result = children.start(run_warm).result()
+        return subprocess.CompletedProcess(command, result.returncode, result.stdout, result.stderr)
 
     def launch_records(self, session: Path, kind: str) -> list[dict[str, object]]:
         path = self.history_dir / "runs" / f"{session.name}.jsonl"

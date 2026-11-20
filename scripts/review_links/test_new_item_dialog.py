@@ -11,7 +11,7 @@ import unittest
 from dataclasses import asdict, replace, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -468,8 +468,8 @@ async function sendSaved() {
    await trySend();
    check(dialog.open && textarea.value === 'The replacement item.' && to()[1].checked &&
          error.textContent === 'This item was already filed as I4. Any change after that Send was not sent.',
-         'The notice keeps the changed words and recipient.');
-   check(ownerPosts.at(-1).request_id === firstDraft.request_id, 'The first retry uses the original request ID.');
+         'The notice shows the saved ID and keeps the changed words.');
+   check(ownerPosts.at(-1).request_id === firstDraft.request_id, 'The retry uses the original draft ID.');
    const replacement = (await sendSaved()).detail;
    check(replacement.id === 'I5' && ownerPosts.at(-1).request_id !== firstDraft.request_id,
          'The next Send files the changed words for the selected recipient.');
@@ -516,7 +516,7 @@ async function sendSaved() {
     checkbox.click();
     dialog.querySelector('[name="kind"][value="bug"]').click();
     await sendSaved();
-    const retry = ownerPosts.at(-1);
+    const retry = ownerPosts.findLast(post => post.request_id);
     check(retry.request_id === first.request_id && Boolean(retry.capture_key) === !checked &&
           retry.kind === 'bug' && retry.evidence.kind === 'page-data',
           'The retry uses the current kind and evidence for the same draft.');
@@ -546,6 +546,57 @@ async function sendSaved() {
     check(renewedKey !== retry.capture_key && next.capture_key === renewedKey &&
           next.request_id !== retry.request_id, 'The next Send uses a new capture and draft ID.');
    }
+   const listPosts = [];
+   let listToken = 'list-token-before-restart';
+   window.fetch = (url, options) => {
+    if (url === '/console/review/new-item?page=list') {
+     return json({token:listToken,recipients:[{id:'fixture-list-producer',name:'morty'}]});
+    }
+    if (url === '/console/review/new-item' && options?.method === 'POST') {
+     const payload = JSON.parse(options.body);
+     if (payload.page_capture) return json({error:'No Firefox.'}, 503);
+     listPosts.push(payload);
+    }
+    return originalFetch(url, options);
+   };
+   await open({page:'list',kind:'investigation'});
+   await whenShown(dialog.querySelector('[data-fallback]'));
+   type('Keep these List words.');
+   listToken = attempted[0].token;
+   await trySend();
+   check(dialog.open && textarea.value === 'Keep these List words.' && listPosts.length === 1 &&
+         error.textContent === 'The New item token expired. Try Send again.',
+         'The List keeps the words and shows the failure after a restart.');
+   const listCreated = new Promise(resolve =>
+    document.addEventListener('review-item-created', resolve, {once:true}));
+   send.click();
+   await listCreated;
+   check(!dialog.open && listPosts.length === 2 && listPosts[0].request_id.startsWith('r2-') &&
+         listPosts[1].request_id === listPosts[0].request_id && listPosts[1].words === listPosts[0].words &&
+         listPosts[1].token === listToken, 'The second Send files the List draft with the current token.');
+
+   window.fetch = (url, options) => {
+    if (url === '/console/review/new-item?page=list') {
+     return json({token:'', recipients:[{id:'list-staff',name:'morty'}],
+                  send_disabled:'Sending is off on a practice List.'});
+    }
+    if (url === '/console/review/new-item' && options?.method === 'POST') {
+     ownerPosts.push(JSON.parse(options.body));
+     return json({});
+    }
+    return originalFetch(url, options);
+   };
+   const beforePractice = ownerPosts.length;
+   await open({page:'list',kind:'question'});
+   const notice = dialog.querySelector('[data-send-disabled]');
+   check(dialog.open && to()[0].checked && to()[0].value === 'list-staff', 'The practice dialog shows the List owner.');
+   type('A practice item.');
+   check(!notice.hidden && notice.textContent === 'Sending is off on a practice List.',
+         'The practice dialog shows one reason.');
+   check(send.disabled && checkbox.closest('label').hidden, 'The practice dialog disables Send and hides capture.');
+   send.click();
+   check(ownerPosts.length === beforePractice, 'The practice dialog makes no POST.');
+   dialog.querySelector('[data-cancel]').click();
    window.fetch = originalFetch;
   }
  } catch (failure) {
@@ -865,6 +916,13 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertLess(markup.index('data-evidence'), markup.index('name="words"'))
         self.assertIn('name="include_page" checked', markup)
         self.assertIn('data-sent-details aria-labelledby="sent-details-title" hidden', markup)
+        self.assertIn('data-capture-slot hidden', markup)
+        buttons: tuple[tuple[Literal["review", "list"], str], ...] = (("review", "New"), ("list", "New item"))
+        for page, label in buttons:
+            with self.subTest(page=page):
+                button = new_item_dialog.title_button(page)
+                self.assertIn(f'aria-label="New item" title="New item" data-{page}-new>', button)
+                self.assertIn(f'<span aria-hidden="true">+</span><span class="review-new-label">{label}</span>', button)
 
     def test_page_data_and_capture_size_are_checked(self) -> None:
         fields = {"kind": "page-data", "title": "The List", "rows": [["Item", "State"], ["Console", "Open"]]}
@@ -911,14 +969,16 @@ class NewItemDialogTests(unittest.TestCase):
                     self.assertEqual(evidence.title, title)
                 changed, = investigation.records(OTHER_RECIPIENT)
                 self.assertEqual((changed.id, changed.question), ("I5", "The replacement item."))
-                for_morty, = investigation.records(LIST_PRODUCER)
+                for_morty, list_retry = investigation.records(LIST_PRODUCER)
                 self.assertEqual((for_morty.owner, for_morty.question), (morty.id, "Check the queue for morty."))
+                self.assertEqual((list_retry.owner, list_retry.question), (morty.id, "Keep these List words."))
                 self.assertEqual(original.question, "The first item before replacement.")
                 self.assertEqual(fixture.recipient_reads, 8)
-                expired, refreshed, reopened, *owner_sends = fixture.wire_posts
+                expired, refreshed, reopened, *owner_sends, list_expired, list_sent = fixture.wire_posts
                 self.assertEqual(expired["token"], FORM_TOKEN)
                 self.assertEqual(refreshed, {**expired, "token": RESTARTED_TOKEN})
                 self.assertEqual(reopened, refreshed)
+                self.assertEqual(list_sent, {**list_expired, "token": RESTARTED_TOKEN})
                 self.assertEqual(len(owner_sends), 11)
                 owner_ids = [post["request_id"] for post in owner_sends]
                 self.assertEqual([owner_ids[0], owner_ids[3], owner_ids[6]], [owner_ids[1], owner_ids[4], owner_ids[7]])
