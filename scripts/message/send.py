@@ -24,7 +24,7 @@ Pane workers use worker:<unit>/<worker>.
 Delivery. A Claude recipient is tried through the postmaster outbox first when
 its heartbeat is fresh. A proved miss permits a headless `claude -p` relay.
 Unconfirmed postmaster delivery starts no relay and creates no queued copy.
-The relay makes one SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
+The relay can forward one SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
 with hooks, MCP and slash commands off and the caller's CLAUDE_* variables
 removed, so it never passes for the session that ran this. Its relay
 name is separate from the sender, who is named in the message. Delivery is read from the
@@ -3358,11 +3358,16 @@ def read_relay(observed: RelayTransportResponse, text: str) -> CheckedRelayAccep
     sends = [part for event in events if event.get("type") == "assistant"
              for value in as_list(as_dict(event.get("message")).get("content"))
              if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
-    if len(sends) != 1:
+    if len(sends) == 1:
+        call = sends[0]
+    elif sends and isinstance(forward, RelayRequestForwarded):
+        call = next((part for part in sends if part.get("id") == forward.tool_use_id), None)
+        if call is None:
+            return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
+    else:
         said = next((as_str(event.get("result")) for event in reversed(events) if event.get("type") == "result"), "")
         reason = f"{len(sends)} SendMessage calls" if sends else f"the relay made no SendMessage call: {one_line(said) or 'no output'}"
         return _unaccepted_relay(forward, reason, queue_if_unsent=not sends)
-    call = sends[0]
     inputs = as_dict(call.get("input"))
     if inputs.get("to") != observed.target or inputs.get("message") != text:
         return _unaccepted_relay(forward, "SendMessage used a different target or payload")
@@ -3380,7 +3385,8 @@ def read_relay(observed: RelayTransportResponse, text: str) -> CheckedRelayAccep
                                  queue_if_unsent=rejected)
     if forward != RelayRequestForwarded(tool_id, text):
         return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
-    return CheckedRelayAcceptance(tool_id, f"mode {mode}; verbatim; {describe(answer)}")
+    note = ", duplicate relay call" if len(sends) > 1 else ""
+    return CheckedRelayAcceptance(tool_id, f"mode {mode}; verbatim; {describe(answer)}{note}")
 
 
 def _unaccepted_relay(forward: RelayForward, reason: str, *, queue_if_unsent: bool = False) -> Result:
@@ -4030,11 +4036,11 @@ def relay(message: Message, timeout: float) -> Result:
         write_atomic(raw, out + err)
     except OSError as error:
         print(f"message relay log: {error}", file=sys.stderr)
-    if code is None:
-        return _unaccepted_relay(observed.forward, f"relay timed out after {timeout:g} s")
     result = read_relay(observed, agent_text(message, via_relay=True))
     if isinstance(result, CheckedRelayAcceptance):
         return Result("sent", result.detail)
+    if code is None:
+        return _unaccepted_relay(observed.forward, f"relay timed out after {timeout:g} s")
     if result.outcome == "queued" and code != 0:
         return Result("queued", f"relay exit {code}: {result.detail}; {one_line(err, 200)}")
     return result
@@ -5033,7 +5039,10 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     if not text.strip() and not options.text_id:
         usage_error("the message is empty")
     first = next(iter(text.strip().splitlines()), options.summary or "")
-    summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
+    if not options.summary and len(first) > 60:
+        boundary = re.match(r".{1,59}(?=\s)", first)
+        first = (boundary[0].rstrip() if boundary else first[:59]) + "…"
+    summary = options.summary or first
     # A forwarded display is authoritative; only recipient lookup may read the receiver's roster.
     forwarded_conversation = isinstance(options.selection, ForwardedConversation)
     target = (staff_queue_key(options.selection.staff_id)
