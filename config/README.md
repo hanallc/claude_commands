@@ -434,7 +434,10 @@ Deployment settings require the account inputs before preparation.
 Run `deploy.py secrets` in a terminal to create or update it.
 The command removes imported plain administrator credentials after encryption succeeds.
 Deployment reads the passphrase once through `/dev/tty` and disables the GPG symmetric passphrase cache.
-`stack_name`, `availability_zone`, `vpc_id`, and `subnet_id` select the deployment location.
+`stack_name` names the foundation stack, and `availability_zone` selects the deployment zone.
+Deployment uses the home foundation stack's VPC when the stack exists.
+A new foundation and each fallback region use the default VPC.
+Deployment finds an available public subnet in the configured zone.
 `ami_id`, `ami_owner_id`, `nixos_release`, and `root_device_name` identify the official x86_64 NixOS image.
 `notification_email_file` names a private file with one address for Budget notices.
 The default path is `~/.config/aws-build/notification-email`.

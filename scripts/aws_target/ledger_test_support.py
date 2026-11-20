@@ -124,8 +124,6 @@ fallback_instance_types=c7a.4xlarge,m7i.4xlarge,m6a.4xlarge
 stack_name=fixture-hana
 ami_id=fixture-image
 ami_owner_id=000000000000
-vpc_id=fixture-vpc
-subnet_id=fixture-subnet
 # range: 0.001..
 spot_max_usd_per_hour=0.25
 # range: 5e-324..

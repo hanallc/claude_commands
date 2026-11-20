@@ -12,7 +12,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_trial, cloud_gate, deploy, ledger, plan_identity, remote
+from scripts.aws_target import admin_secrets, aws_trial, cloud_gate, deploy, ledger, plan_identity, remote
 from scripts.aws_target.config import deployment_record, read_budget_notification_address, save_deployment_record
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import install_cost_settings, override_fixture_settings
@@ -35,6 +35,8 @@ BUCKET = 'fixture-private-bucket'
 ROLE = 'fixture-private-role'
 GATE_PROFILE = OWNER.iam('instance-profile/fixture-profile')
 PLAN_CREDENTIAL = plan_identity.PlanCredentials('AKIA' + 'X' * 16, 'x' * 40, OWNER)
+ADMIN_CREDENTIAL = admin_secrets.AdminCredentials(
+    'fixture-admin-access', 'fixture-admin-secret', 'fixture-tailnet-client', 'fixture-tailnet-secret')
 
 
 class DeploymentRecoveryTests(unittest.TestCase):
@@ -49,6 +51,7 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.calls: list[tuple[str, str, str]] = []
         self.missing: set[str] = set()
         self.statuses: dict[str, str] = {}
+        self.missing_vpc: set[str] = set()
         self.regional_deployment: str = DEPLOYMENT
         self.clock: TestClock = TestClock()
 
@@ -73,8 +76,10 @@ class DeploymentRecoveryTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value=REVISION))
 
     def deployment(self) -> deploy.Deployment:
-        return deploy.Deployment(self.settings, self.state, self.output, execute=self.execute, clock=self.clock,
-                                 notify=lambda _event: False)
+        subject = deploy.Deployment(self.settings, self.state, self.output, execute=self.execute, clock=self.clock,
+                                    notify=lambda _event: False)
+        subject.admin.credentials = ADMIN_CREDENTIAL
+        return subject
 
     def configure_preparation(self) -> None:
         root = self.state.parent
@@ -94,7 +99,9 @@ class DeploymentRecoveryTests(unittest.TestCase):
     def stack(self, region: str, name: str) -> dict[str, object]:
         outputs = {'GateLaunchTemplate': f'lt-fixture-{region}', 'GateLaunchVersion': '4',
                    'GateSecurityGroup': f'sg-fixture-{region}'}
-        parameters = {'VpcId': f'vpc-fixture-{region}', 'GateImage': f'ami-fixture-{region}'}
+        parameters = {'GateImage': f'ami-fixture-{region}'}
+        if region not in self.missing_vpc:
+            parameters['VpcId'] = f'vpc-fixture-{region}'
         if region == HOME:
             outputs.update(ScalerUserName=SCALER, BudgetName='fixture-private-budget', GateBucket=BUCKET,
                            GateRoleId=ROLE, GateProfileArn=GATE_PROFILE)
@@ -114,12 +121,19 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.assertEqual(timeout, 3)
         self.assertIsNotNone(env)
         assert env is not None
-        self.assertEqual(env['AWS_ACCESS_KEY_ID'], PLAN_CREDENTIAL.access_key_id)
-        self.assertEqual(env['AWS_SHARED_CREDENTIALS_FILE'], '/dev/null')
         self.assertEqual(arguments[:2], ['aws', '--region'])
         region, service, operation, option, value = arguments[2:7]
-        self.assertIn(region, (HOME, FALLBACK))
-        self.assertEqual(arguments[7:], ['--output', 'json'])
+        if env['AWS_ACCESS_KEY_ID'] == ADMIN_CREDENTIAL.aws_access_key_id:
+            self.assertEqual(region, HOME)
+            self.assertIn(operation, ('describe-stacks', 'describe-route-tables', 'describe-subnets', 'describe-images'))
+        else:
+            self.assertEqual(env['AWS_ACCESS_KEY_ID'], PLAN_CREDENTIAL.access_key_id)
+            self.assertEqual(env['AWS_SHARED_CREDENTIALS_FILE'], '/dev/null')
+            self.assertIn(region, (HOME, FALLBACK))
+        if operation == 'describe-images':
+            self.assertEqual(arguments[7:], ['--owners', '0' * 12, '--output', 'json'])
+        else:
+            self.assertEqual(arguments[7:], ['--output', 'json'])
         self.calls.append((region, service, operation))
         reply: dict[str, object]
         match service, operation, option:
@@ -136,6 +150,11 @@ class DeploymentRecoveryTests(unittest.TestCase):
             case 'iam', 'get-user', '--user-name':
                 self.assertEqual((region, value), (HOME, SCALER))
                 reply = {'User': {'Arn': SCALER_ARN, 'UserId': SCALER_ID}}
+            case 'ec2', 'describe-images', '--image-ids':
+                self.assertEqual(env['AWS_ACCESS_KEY_ID'], ADMIN_CREDENTIAL.aws_access_key_id)
+                self.assertEqual(value, 'ami-fixture')
+                reply = {'Images': [{'ImageId': value, 'OwnerId': '0' * 12, 'Architecture': 'x86_64',
+                                     'State': 'available', 'Name': 'nixos-26.05-x86_64', 'RootDeviceName': '/dev/xvda'}]}
             case 'ec2', 'describe-route-tables', '--filters':
                 self.assertEqual(value, f'Name=vpc-id,Values=vpc-fixture-{region}')
                 reply = {'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
@@ -152,6 +171,8 @@ class DeploymentRecoveryTests(unittest.TestCase):
         output, errors = StringIO(), StringIO()
         arguments = ['deploy.py', 'recover', '--settings', str(self.settings), '--directory', str(self.state), *options]
         with (mock.patch.object(sys, 'argv', arguments), mock.patch.object(deploy, 'Deployment', return_value=self.deployment()),
+              mock.patch.object(admin_secrets.AdminSecretSession, 'get',
+                                side_effect=AssertionError('Recovery must use the plan identity.')),
               redirect_stdout(output), redirect_stderr(errors)):
             status = deploy.main()
         printed = output.getvalue() + errors.getvalue()
@@ -202,7 +223,7 @@ class DeploymentRecoveryTests(unittest.TestCase):
                    for row in ledger.rows(self.stack(HOME, STACK), 'Outputs')}
         subject = self.deployment()
         prepared = subject.prepare()
-        with (mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs'),
+        with (mock.patch.object(subject, '_authorize'),
               mock.patch.object(subject, '_stack', return_value=outputs), mock.patch.object(subject, '_deploy'),
               mock.patch.object(subject, 'scaler_key')):
             self.assertEqual(subject.apply(approve_resources=True), outputs)
@@ -262,7 +283,7 @@ class DeploymentRecoveryTests(unittest.TestCase):
         outputs = {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue')
                    for row in ledger.rows(self.stack(HOME, STACK), 'Outputs')}
         recovered_files = [path.read_bytes() for path in files]
-        with (mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs'),
+        with (mock.patch.object(subject, '_authorize'),
               mock.patch.object(subject, '_stack', return_value=outputs), mock.patch.object(subject, '_deploy'),
               mock.patch.object(subject, 'scaler_key')):
             self.assertEqual(subject.apply(approve_resources=True), outputs)
@@ -401,6 +422,14 @@ class DeploymentRecoveryTests(unittest.TestCase):
         with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.IncompleteRecoveryStack, REGIONAL_STACK):
             _ = self.deployment().recover(write=True)
         self.assertEqual((self.foundation.read_bytes(), self.manifest.read_bytes()), before)
+
+    def test_regional_stack_without_a_vpc_refuses_recovery(self) -> None:
+        self.missing_vpc.add(FALLBACK)
+        status, output = self.recover('--write')
+        self.assertEqual(status, 1, output)
+        self.assertIn(f'Stack {REGIONAL_STACK} in {FALLBACK} lacks complete recovery evidence.', output)
+        self.assertFalse(self.foundation.exists())
+        self.assertFalse(self.manifest.exists())
 
     def test_regional_stack_from_another_deployment_refuses(self) -> None:
         self.regional_deployment = 'ef' * 16
