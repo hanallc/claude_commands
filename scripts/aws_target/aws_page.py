@@ -9,7 +9,6 @@ import argparse
 from collections import defaultdict
 from collections.abc import Sequence, Set
 import json
-import os
 import sys
 import time
 from dataclasses import replace
@@ -22,6 +21,7 @@ from statistics import median
 from typing import Literal, NotRequired, TypedDict
 
 from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
+from scripts.aws_target.aws_page_location import output_folder as output_folder
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
@@ -530,10 +530,6 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
     }
 
 
-def output_folder() -> Path:
-    return Path(os.path.expandvars(conf.read('aws_page').text('output_folder'))).expanduser()
-
-
 def quota_help() -> str:
     """Render the shared instructions with a link to the case list."""
     link = escape(console_help.CASE_LIST_URL)
@@ -601,10 +597,13 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
 
 
 def publish_configured() -> int:
-    """Publish the page from the AWS target state folder; the hourly job calls this."""
+    """Publish both pages from the AWS target state folder."""
+    from scripts.aws_target import machines_page
     from scripts.build_targets.target_config import ssh_target_state_directory
 
-    _ = publish(ssh_target_state_directory('aws'), int(time.time()), output_folder(), settings_path=conf.path('aws_target'))
+    directory, now, folder = ssh_target_state_directory('aws'), int(time.time()), output_folder()
+    _ = publish(directory, now, folder, settings_path=conf.path('aws_target'))
+    _ = machines_page.publish(directory, now, folder)
     return 0
 
 

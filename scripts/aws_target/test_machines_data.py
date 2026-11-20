@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import StringIO
@@ -159,6 +160,24 @@ faster_box_max_cost_ratio=1.50
             self.assertEqual(workload.name, name)
             self.assertEqual(workload.mode, 'targeted-test' if name == 'Named tests' else 'test-affected')
             self.assertEqual(workload.sentence, 'The records hold 1 completed check on 1 machine size in this period.')
+
+    def test_one_size_merge_checks_have_no_comparison(self) -> None:
+        path = self.book.launch_history_path
+        rows = [row for row in path.read_text().splitlines()
+                if FAST.region not in row and FASTER.region not in row]
+        _ = path.write_text('\n'.join(rows) + '\n')
+        merge = self.read().workloads[0]
+        self.assertIsInstance(merge, machines_data.WorkloadWithoutComparison)
+        self.assertEqual(merge.sentence, 'The records hold 1 completed check on 1 machine size in this period.')
+
+    def test_live_cost_uses_the_live_ratio_between_slider_values(self) -> None:
+        path = self.configuration.gate.source
+        _ = path.write_text(path.read_text().replace('faster_box_max_cost_ratio=1.50', 'faster_box_max_cost_ratio=1.26'))
+        self.configuration = replace(self.configuration, gate=conf.read(path))
+        merge = self.merge()
+        self.assertEqual(merge.live_ratio, Decimal('1.26'))
+        self.assertEqual(merge.live_extra_usd_per_month, merge.steps[1].extra_usd_per_month)
+        self.assertGreater(merge.live_extra_usd_per_month, 0)
 
     def test_removed_deployment_region_stays_measured_and_leaves_the_projection(self) -> None:
         self.write_deployment(SMALL.region, FASTER.region)

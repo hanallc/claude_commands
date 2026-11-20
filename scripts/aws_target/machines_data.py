@@ -110,8 +110,14 @@ class MeasuredWorkload:
     reference_usd_per_month: Decimal
     concurrent_starts: tuple[tuple[int, int], ...]
     live_ratio: Decimal
+    live_extra_usd_per_month: Decimal
     steps: tuple[MachineStep, ...]
     assumptions: tuple[str, ...]
+
+    @property
+    def sentence(self) -> str:
+        sizes = len({choice.vcpus for choice in self.choices if choice.checks})
+        return _measurement_sentence(self.checks, sizes)
 
 
 @dataclass(frozen=True)
@@ -282,6 +288,12 @@ def _steps(rows: Sequence[cloud_gate.GateRankedChoice], types: tuple[str, ...], 
     return tuple(steps)
 
 
+def _measurement_sentence(checks: int, sizes: int) -> str:
+    check_word = 'check' if checks == 1 else 'checks'
+    size_word = 'size' if sizes == 1 else 'sizes'
+    return f'The records hold {checks} completed {check_word} on {sizes} machine {size_word} in this period.'
+
+
 def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], intervals: Sequence[_GateInterval],
                       prices: _SavedPrices, start: datetime, end: datetime, configuration: MachinesConfiguration,
                       ratios: Sequence[Decimal], deployed: Mapping[ledger.GateRateCandidate, run_cost.GateLaunchVariant]
@@ -353,10 +365,8 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
             refused[machine], launched[machine], len(times) < small_sample_checks, quota_vcpus, assumed,
             fits, granted, fits * granted)
     measured_sizes = {choice.vcpus for choice in choices.values() if choice.checks}
-    if mode != 'merge-gate' and len(measured_sizes) == 1:
-        check_word = 'check' if checks == 1 else 'checks'
-        sentence = f'The records hold {checks} completed {check_word} on 1 machine size in this period.'
-        return WorkloadWithoutComparison(name, mode, sentence, tuple(choices.values()))
+    if len(measured_sizes) == 1:
+        return WorkloadWithoutComparison(name, mode, _measurement_sentence(checks, 1), tuple(choices.values()))
     if not ranked_rows:
         return WorkloadWithoutComparison(name, mode,
             'No deployed choice has a measurement within the gate time limit.', tuple(choices.values()))
@@ -367,11 +377,16 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
             'No eligible measured choice has a saved price.', tuple(choices.values()))
     assert isinstance(reference.estimate, run_cost.GatePlacementEstimate)
     monthly_checks = Decimal(checks * _DAYS_PER_WEEK * _WEEKS_PER_YEAR) / (_MONTHS_PER_YEAR * (end - start).days)
+    steps = _steps(ranked_rows, types, ratios, reference, choices, monthly_checks)
+    live_ratio = gate.value('faster_box_max_cost_ratio', conf.decimal)
+    live_extra = next((step.extra_usd_per_month for step in steps if any(
+        limit.ratio == live_ratio for limit in step.limits)), None)
+    if live_extra is None:
+        live_extra = _steps(ranked_rows, types, (live_ratio,), reference, choices, monthly_checks)[0].extra_usd_per_month
     return MeasuredWorkload(name, mode, tuple(choices.values()),
         ledger.GateRateCandidate(reference.variant.instance_type, reference.variant.region), checks,
         monthly_checks, reference.estimate.aws_spend_usd * monthly_checks, concurrency,
-        gate.value('faster_box_max_cost_ratio', conf.decimal),
-        _steps(ranked_rows, types, ratios, reference, choices, monthly_checks), tuple(assumptions))
+        live_ratio, live_extra, steps, tuple(assumptions))
 
 
 def read_machines_data(directory: Path, now: int,

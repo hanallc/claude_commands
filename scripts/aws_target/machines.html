@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AWS Machines</title>
+<style>
+/*__CONSOLE_THEME__*/
+__PAGE_FRAME_STYLE__
+h2 {font-size:1.18rem}
+h3 {font-size:1rem; margin:18px 0 4px}
+.price-pill {background:var(--card); border:1px solid var(--line); border-radius:20px; padding:5px 12px;
+ color:var(--ink-2); font-size:.83rem}
+.price-pill time {white-space:nowrap}
+.rule {margin:0 0 18px; color:var(--ink-2)}
+.machine-controls,.machine-breakdown {display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:24px}
+.machine-controls {align-items:center; margin-top:16px}
+.machine-tiles {display:grid; grid-template-columns:1.4fr 1fr 1fr; gap:10px; margin:14px 0}
+.machine-tiles>div {padding:12px; border:1px solid var(--line); border-radius:8px; background:var(--bg)}
+.machine-tiles>div:first-child {background:color-mix(in srgb,var(--accent) 10%,var(--bg))}
+.machine-tiles span {display:block; color:var(--ink-2); font-size:.84rem}
+.machine-tiles strong {display:block; font-size:1.5rem; font-variant-numeric:tabular-nums}
+.machine-tiles>div:first-child strong {font-size:2rem}
+.monthly-cap {padding:9px 12px; border:1px dashed var(--line); border-radius:8px; margin:0 0 12px; color:var(--ink-2)}
+.machine-breakdown {grid-template-columns:minmax(0,2fr) minmax(0,3fr); align-items:start;
+ padding-top:16px; margin-top:16px; border-top:1px solid var(--line)}
+figure {min-width:0; margin:0}
+figcaption {font-size:.88rem; font-weight:600; margin-bottom:4px}
+canvas {display:block; width:100%; height:174px; cursor:pointer}
+.chart-key {display:flex; flex-wrap:wrap; gap:4px 12px; font-size:.78rem; color:var(--ink-2)}
+.chart-key span::before {content:""; display:inline-block; width:16px; border-top:2px solid var(--accent);
+ margin-right:5px; vertical-align:middle}
+.chart-key span+span::before {border-top:2px dashed var(--ink-3)}
+table {width:100%; border-collapse:collapse; margin-top:8px; font-size:.85rem; font-variant-numeric:tabular-nums}
+th,td {padding:7px 6px; text-align:right; border-bottom:1px solid var(--line); overflow-wrap:anywhere}
+thead th {color:var(--ink-2); vertical-align:bottom}
+th:first-child {text-align:left; padding-left:0}
+small {display:block; color:var(--ink-3); font-weight:400}
+.sample {color:var(--warning)}
+#machine-steps {margin-top:0}
+#machine-steps :is(th,td):nth-child(2) {text-align:left}
+#machine-steps tbody tr {cursor:pointer}
+#machine-steps tbody tr:hover {background:var(--hover)}
+#machine-steps tr[data-selected] {background:color-mix(in srgb,var(--accent) 12%,var(--card))}
+#machine-steps button {width:100%; padding:4px; background:transparent; color:var(--ink); font:inherit;
+ border:1px solid var(--line); border-radius:5px; cursor:pointer; white-space:nowrap}
+.assumptions {padding-inline-start:20px; color:var(--ink-2); font-size:.87rem; margin:6px 0 0}
+.other-workloads p {margin:4px 0 0; color:var(--ink-2)}
+@media(max-width:900px) {
+ .machine-breakdown {grid-template-columns:minmax(0,1fr)}
+}
+@media(max-width:600px) {
+ .machine-controls {grid-template-columns:minmax(0,1fr); gap:14px}
+ .machine-tiles {grid-template-columns:repeat(2,minmax(0,1fr))}
+ .machine-tiles>div:first-child {grid-column:1/-1}
+ .machine-tiles strong {font-size:1.18rem}
+ table,tbody,tr,th,td {display:block}
+ thead {position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%)}
+ tbody tr {padding:8px; border-top:1px solid var(--line)}
+ tbody th,tbody td {border:0; padding:3px 0}
+ tbody td, #machine-steps tbody td:nth-child(2) {display:grid; grid-template-columns:1fr 1fr; gap:8px; text-align:right}
+ td::before {content:attr(data-label); color:var(--ink-2); text-align:left}
+ #machine-steps button {width:auto}
+}
+</style>
+__PAGE_SETTING_CONTROLS__
+</head>
+<body>
+<main>
+__PAGE_TITLE__
+<p class="rule">The limit compares the cost of one merge check with the lowest-cost measured machine.
+ A check takes the cheapest allowed faster machine that is free. At 1.00, the faster machine rule is off.</p>
+<section class="card">
+<h2>Merge checks</h2>
+__MERGE_CHECKS__
+<section class="card other-workloads">
+<h2>Other workloads</h2>
+__OTHER_WORKLOADS__
+</section>
+</main>
+<script>
+__PAGE_REFRESH_SCRIPT__
+let previewOpen = () => '';
+const published = pageRefreshFacts();
+async function refreshMachines(_supersede, current) {
+ const response = await fetch(location.pathname, {cache:'no-store'});
+ if (!response.ok) throw new Error('HTTP ' + response.status);
+ const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+ const next = pageRefreshFacts(page);
+ if (current() && !previewOpen() && next.readAt > published.readAt) location.reload();
+ return published;
+}
+if (location.protocol !== 'file:') createPageRefresh(refreshMachines, () => 0, () => previewOpen(), published);
+
+const model = document.getElementById('machines-model');
+if (model) {
+ const {choices, projections, liveExtra} = JSON.parse(model.textContent);
+ const slider = pageSettingControls.connectSlider(document.getElementById('cost-limit'));
+ const amount = document.getElementById('monthly-limit');
+ const goRoot = document.getElementById('save-limit');
+ const goButton = goRoot.querySelector('[data-setting-go]');
+ const steps = [...document.querySelectorAll('[data-step]')];
+ const machines = [...document.querySelectorAll('[data-choice]')];
+ const chart = document.getElementById('machine-chart');
+ const paint = chart.getContext('2d');
+ const currency = new Intl.NumberFormat('en-US', {style:'currency', currency:'USD'});
+ const decimal = new Intl.NumberFormat('en-US', {maximumFractionDigits:1});
+ const percent = new Intl.NumberFormat('en-US', {style:'percent', maximumFractionDigits:1});
+ const first = choices[0].ratio;
+ const last = choices.at(-1).ratio;
+ const stop = ratio => choices.find(item => item.ratio === ratio);
+ const projection = item => projections[item.step_index];
+ const monthlyCeiling = item => (item.ceiling_cents / 100).toFixed(2);
+ const originalLive = slider.live;
+ const estimateAtLive = () => {
+  const live = stop(slider.live);
+  return live ? projection(live).extra : slider.live === originalLive ? liveExtra : NaN;
+ };
+ const go = pageSettingControls.connectGo(goRoot, slider, amount, () => ({
+  newValue:slider.format(slider.value),
+  monthlyChange:projection(stop(slider.value)).extra - estimateAtLive(),
+  liveNote:slider.value === first ? 'off' : '',
+ }));
+ previewOpen = () => slider.input.disabled || slider.value !== slider.live ||
+  amount.value !== monthlyCeiling(stop(slider.value)) ? 'The cost limit preview is open.' : '';
+
+ function chartBounds() {
+  return {left:66, right:chart.clientWidth - 15, top:13, bottom:chart.clientHeight - 28};
+ }
+
+ function drawChart() {
+  const width = chart.clientWidth;
+  const height = chart.clientHeight;
+  const density = window.devicePixelRatio || 1;
+  chart.width = width * density;
+  chart.height = height * density;
+  paint.scale(density, density);
+  const {left, right, top, bottom} = chartBounds();
+  const colors = getComputedStyle(chart);
+  const color = name => colors.getPropertyValue(name).trim();
+  const highest = Math.max(choices.at(-1).ceiling_cents / 100, ...projections.map(row => row.extra));
+  const x = ratio => first === last ? left : left + (right - left) * (ratio - first) / (last - first);
+  const y = usd => highest === 0 ? bottom : bottom - (bottom - top) * usd / highest;
+  paint.font = '11px system-ui';
+  paint.fillStyle = color('--ink-2');
+  for (const dollars of highest === 0 ? [0] : [0, highest / 2, highest]) {
+   paint.strokeStyle = color('--line');
+   paint.beginPath();
+   paint.moveTo(left, y(dollars));
+   paint.lineTo(right, y(dollars));
+   paint.stroke();
+   paint.textAlign = 'right';
+   paint.fillText(currency.format(dollars), left - 6, y(dollars) + 4, left - 9);
+  }
+  paint.textAlign = 'center';
+  for (const ratio of new Set([first, slider.value, last])) {
+   if (ratio !== first && ratio !== last &&
+       Math.min(x(ratio)-left, right-x(ratio)) < 30) continue;
+   paint.fillText(slider.format(ratio), x(ratio), bottom + 16);
+  }
+
+  paint.strokeStyle = color('--ink-3');
+  paint.setLineDash([5, 4]);
+  paint.beginPath();
+  choices.forEach((item, index) => {
+   const point = [x(item.ratio), y(item.ceiling_cents / 100)];
+   if (index) paint.lineTo(...point);
+   else paint.moveTo(...point);
+  });
+  paint.stroke();
+  paint.setLineDash([]);
+  paint.strokeStyle = color('--accent');
+  paint.lineWidth = 2;
+  paint.beginPath();
+  paint.moveTo(left, y(projection(choices[0]).extra));
+  for (let index = 1; index < choices.length; index++) {
+   const item = choices[index];
+   paint.lineTo(x(item.ratio), y(projection(choices[index - 1]).extra));
+   paint.lineTo(x(item.ratio), y(projection(item).extra));
+  }
+  paint.stroke();
+  paint.fillStyle = color('--accent');
+  paint.beginPath();
+  paint.arc(x(slider.value), y(projection(stop(slider.value)).extra), 4, 0, 2 * Math.PI);
+  paint.fill();
+ }
+
+ function draw() {
+  const item = stop(slider.value);
+  const {extra, hours, cost_per_hour, shares} = projection(item);
+  const ratio = slider.format(item.ratio);
+  document.getElementById('extra-cost').textContent = currency.format(extra);
+  document.getElementById('saved-hours').textContent = decimal.format(hours) + ' h';
+  document.getElementById('saved-hour-cost').textContent =
+   cost_per_hour === null ? '—' : currency.format(cost_per_hour);
+  document.getElementById('monthly-cap').textContent = 'At this check count, the limit allows up to ' +
+   currency.format(item.ceiling_cents / 100) + ' more a month. More checks can raise the monthly cost.';
+  document.getElementById('where-ratio').textContent = ratio;
+  steps.forEach((row, index) => {
+   const selected = index === item.step_index;
+   row.toggleAttribute('data-selected', selected);
+   row.querySelector('button').setAttribute('aria-pressed', String(selected));
+  });
+  machines.forEach((row, index) => {
+   const allowed = Object.hasOwn(shares, index);
+   row.querySelector('[data-allowed]').textContent = allowed ? 'Yes' : 'No';
+   row.querySelector('[data-share]').textContent = percent.format(allowed ? shares[index] : 0);
+  });
+  go.setLabel('Set the limit to ' + ratio + ' for merge checks');
+  goButton.disabled = slider.value === slider.live || !Number.isFinite(estimateAtLive()) || !amount.validity.valid;
+  drawChart();
+ }
+
+ function select(item) {
+  go.cancelConfirmation();
+  slider.setValue(item.ratio);
+  amount.value = monthlyCeiling(item);
+  draw();
+ }
+ slider.input.addEventListener('input', () => select(stop(slider.value)));
+ amount.required = true;
+ amount.addEventListener('input', () => {
+  if (amount.validity.valid) {
+   const cents = Math.round(amount.valueAsNumber * 100);
+   const item = choices.findLast(item => item.ceiling_cents <= cents);
+   if (item) slider.setValue(item.ratio);
+  }
+  draw();
+ });
+ steps.forEach((row, index) => row.addEventListener('click', () => {
+  if (!slider.input.disabled) select(choices.find(item => item.step_index === index));
+ }));
+ chart.addEventListener('click', event => {
+  if (slider.input.disabled) return;
+  const {left, right} = chartBounds();
+  const position = Math.max(0, Math.min(1, (event.offsetX - left) / (right - left)));
+  select(choices[Math.round(position * (choices.length - 1))]);
+ });
+ goRoot.addEventListener('setting-saved', draw);
+ new MutationObserver(draw).observe(goRoot.querySelector('[data-setting-error]'), {childList:true});
+ new ResizeObserver(drawChart).observe(chart);
+ const dark = matchMedia('(prefers-color-scheme: dark)');
+ dark.addEventListener('change', drawChart);
+ new MutationObserver(drawChart).observe(document.documentElement, {attributeFilter:['data-theme']});
+ draw();
+}
+</script>
+</body>
+</html>

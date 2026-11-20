@@ -136,9 +136,9 @@ def rendered(content: bytes, started: float, read_at: float) -> bytes:
     return content.replace(b'data-page-facts', facts.encode(), 1)
 
 
-def template(source: str, text: str, page: str) -> str:
+def template(source: str, text: str, page: str, *, action: str = "") -> str:
     """Fill the shared title, style and script in a static page template."""
-    return (source.replace("__PAGE_FRAME_STYLE__", STYLE).replace("__PAGE_TITLE__", title(text, page))
+    return (source.replace("__PAGE_FRAME_STYLE__", STYLE).replace("__PAGE_TITLE__", title(text, page, action=action))
             .replace("__PAGE_REFRESH_SCRIPT__", REFRESH_SCRIPT)
             .replace("__PAGE_SETTING_CONTROLS__", setting_controls.ASSETS))
 

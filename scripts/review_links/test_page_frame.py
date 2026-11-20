@@ -27,6 +27,7 @@ NO_DATA_FILE: dict[str, object] = {}
 STATUS_PAGES = (
     ("accounts", "Accounts", "users", "Accounts", 45),
     ("aws", "AWS", "cloud", "AWS", 3900),
+    ("aws_machines", "AWS Machines", "server", "AWS Machines", 3900),
     ("builds", "Builds", "hammer", "Builds", 15),
     ("disks", "Disks", "hard-drive", "Disks", 600),
     ("images", "Images", "image", "Images", 45),
@@ -73,6 +74,7 @@ class PageStatusTests(unittest.TestCase):
         scripts = Path(__file__).resolve().parents[1]
         for page, path in (('builds', 'build_queue/memory_live.html'),
                            ('aws', 'aws_target/aws_prices.html'),
+                           ('aws_machines', 'aws_target/machines.html'),
                            ('disks', 'disks/disks.html')):
             with self.subTest(page=page):
                 source = (scripts / path).read_text(encoding='utf-8')

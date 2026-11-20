@@ -29,6 +29,8 @@ def slider(identity: str, label: str, *, minimum: Decimal, maximum: Decimal, ste
 
 
 def _position(value: Decimal, minimum: Decimal, maximum: Decimal) -> str:
+    if maximum == minimum:
+        return "0%"
     percent = Decimal(100) * (value - minimum) / (maximum - minimum)
     return f"{min(Decimal(100), max(Decimal(0), percent)):.8f}".rstrip("0").rstrip(".") + "%"
 
@@ -108,7 +110,7 @@ const pageSettingControls=(()=>{
   const min=Number(input.min),max=Number(input.max),decimals=Number(root.dataset.decimals);
   let live=Number(root.dataset.live);
   const format=value=>Number(value).toFixed(decimals);
-  const position=value=>Math.min(100,Math.max(0,(value-min)/(max-min)*100))+'%';
+  const position=value=>max===min ? '0%' : Math.min(100,Math.max(0,(value-min)/(max-min)*100))+'%';
   function draw(){
    const value=input.valueAsNumber;
    output.value=format(value);

@@ -1,5 +1,6 @@
 """Publish settings from the shared Go button."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
@@ -34,7 +35,20 @@ class TunableSetting:
         return number
 
 
-SETTINGS: dict[tuple[str, str], TunableSetting] = {}
+AWS_MACHINES_PAGE = "aws_machines"
+FASTER_BOX_RATIO_KEY = "faster_box_max_cost_ratio"
+
+
+def _machines_ratio_setting() -> TunableSetting:
+    page = conf.read_or_repository("aws_page")
+    return TunableSetting("cloud_gate", "AWS Machines", Decimal("1.00"),
+                          page.value("machines.ratio_max", conf.decimal),
+                          page.value("machines.ratio_step", conf.decimal))
+
+
+SETTINGS: dict[tuple[str, str], TunableSetting | Callable[[], TunableSetting]] = {
+    (AWS_MACHINES_PAGE, FASTER_BOX_RATIO_KEY): _machines_ratio_setting,
+}
 
 
 @dataclass(frozen=True)
@@ -47,9 +61,13 @@ class TuneOutcome:
 
 def save(page: str, key: str, value: str) -> TuneOutcome:
     """Check the registered setting, publish it, and read its live value."""
-    if (setting := SETTINGS.get((page, key))) is None:
+    if (entry := SETTINGS.get((page, key))) is None:
         reason = "This page cannot change that setting."
         return TuneOutcome(Refused(reason), conf.UnavailableValue(reason))
+    try:
+        setting = entry() if callable(entry) else entry
+    except conf.Unusable as error:
+        return TuneOutcome(Refused("The limit range is unavailable."), conf.UnavailableValue(str(error)))
     checked = setting.validate(value)
     result = checked if isinstance(checked, Refused) else _publish(setting, key, format(checked, "f"))
     live = conf.read(setting.document).origin(key, _live_decimal)

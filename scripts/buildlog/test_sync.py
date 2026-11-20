@@ -392,18 +392,20 @@ class SyncTests(unittest.TestCase):
         read.assert_called_once_with(conf.path("aws_target"), folder)
 
     def test_aws_page_publishes_from_the_installed_settings_and_state_directory(self) -> None:
-        from scripts.aws_target import aws_page
+        from scripts.aws_target import aws_page, machines_page
         from scripts.build_targets import target_config
         from scripts.lib import conf
 
         folder = self.root / "aws"
         with (mock.patch.object(target_config, "ssh_target_state_directory", return_value=folder) as state,
               mock.patch.object(aws_page, "output_folder", return_value=self.root / "page"),
-              mock.patch.object(aws_page, "publish", return_value=self.root / "page" / aws_page.PAGE_NAME) as publish):
+              mock.patch.object(aws_page, "publish", return_value=self.root / "page" / aws_page.PAGE_NAME) as publish,
+              mock.patch.object(machines_page, "publish") as machines):
             self.assertEqual(cli.aws_page(), 0)
         state.assert_called_once_with("aws")
         self.assertEqual(publish.call_args.args[::2], (folder, self.root / "page"))
         self.assertEqual(publish.call_args.kwargs, {"settings_path": conf.path("aws_target")})
+        machines.assert_called_once_with(*publish.call_args.args)
 
     def test_screenshot_hourly_invokes_report_hourly_once(self) -> None:
         commands: list[tuple[list[str], bool, int]] = []
