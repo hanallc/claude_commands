@@ -5440,6 +5440,57 @@ window.fetch=async(path,options={})=>{
                 with self.subTest(body=body), self.assertRaises(ValueError):
                     _ = list_page.submit(root, body)
 
+    def test_tell_accepts_a_stored_producer_id_with_a_period(self) -> None:
+        root = self.root / "reviews"
+        producer = staff.StaffId("producer." + "a" * 32)
+        item = self.add("The assigned item")
+        _ = the_list.update(MORTY.id, item.id, {"producer": producer}, source="morty")
+        stored = the_list.load(MORTY.id, item.id)
+        self.assertEqual(stored.producer, producer)
+        fields = self.fields(stored, "tell", words="Keep these words.")
+        for suffix in ("", "." + "b" * 32):
+            with self.subTest(suffix=suffix):
+                request = fields["request"] + suffix
+                delivery = list_page.submit(root, urlencode({**fields, "request": request}))
+                self.assertEqual(delivery, list_page.ListFeedbackDelivery(MORTY.id, item.id, request))
+                saved = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[request]
+                self.assertEqual(saved.recipient, producer)
+
+    def test_tell_reloads_and_delivers_for_a_stored_producer_id_with_a_space(self) -> None:
+        root = self.root / "reviews"
+        producer = staff.StaffId("old producer")
+        item = self.add("The assigned item")
+        item = the_list.update(MORTY.id, item.id, {"producer": producer}, source="morty")
+        fields = self.fields(item, "tell", words="Keep these words.")
+        delivery = list_page.submit(root, urlencode(fields))
+        request = fields["request"]
+        pending = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[request]
+        self.assertEqual((pending.state, pending.recipient), ("pending", producer))
+        with patch.object(change_page, "send_to_staff") as send:
+            list_page.deliver(delivery)
+            send.assert_called_once()
+            self.assertEqual(send.call_args.args,
+                             (producer, change_page.SENDER, f"List page: nate's words for item {item.number}\nKeep these words."))
+        saved = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[request]
+        self.assertEqual((saved.state, saved.recipient, saved.words), ("sent", producer, "Keep these words."))
+
+    def test_tell_uses_one_request_for_equivalent_recipient_encodings(self) -> None:
+        root = self.root / "reviews"
+        producer = staff.StaffId("old.producer")
+        item = self.add("The assigned item")
+        item = the_list.update(MORTY.id, item.id, {"producer": producer}, source="morty")
+        fields = self.fields(item, "tell", words="Keep these words.")
+        request = fields["request"] + "." + "b" * 32
+        alternate = request.replace("%2E", "%2e")
+        self.assertNotEqual(alternate, request)
+        first = list_page.submit(root, urlencode({**fields, "request": alternate}))
+        second = list_page.submit(root, urlencode({**fields, "request": request}))
+        self.assertEqual(first, list_page.ListFeedbackDelivery(MORTY.id, item.id, request))
+        self.assertEqual(first, second)
+        feedback = the_list.feedback_requests(the_list.load(MORTY.id, item.id))
+        self.assertEqual(list(feedback), [request])
+        self.assertEqual(feedback[request].recipient, producer)
+
     def test_tell_uses_the_signed_recipients_current_session_after_reassignment(self) -> None:
         root = self.root / "reviews"
         item = self.add("The assigned item")

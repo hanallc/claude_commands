@@ -607,9 +607,11 @@ def source_without_clock(source: str) -> str:
     return text[:clock.start()].rstrip(" ,\t") if clock else source
 
 
-def _staff_id(value: str, name: str) -> None:
+def staff_id(value: str, name: str) -> staff.StaffId:
+    """Read a staff ID in a List record."""
     if not value or Path(value).name != value or value in (".", ".."):
         raise ListError(f"invalid {name} staff id")
+    return staff.StaffId(value)
 
 
 def _field_text(value: object, name: str) -> str:
@@ -670,8 +672,8 @@ def _validate(item: ListItem) -> None:
     if item.number < 1:
         raise ListError("number must be positive")
     _line(item.title, "title")
-    _staff_id(item.owner, "owner")
-    _staff_id(item.producer, "producer")
+    _ = staff_id(item.owner, "owner")
+    _ = staff_id(item.producer, "producer")
     _validate_unit(item.unit)
     _ = _item_state(item.state)
     _ = _requester(item.requested_by)
@@ -737,6 +739,8 @@ def _review_keys(value: object) -> tuple[str, ...]:
 
 def _log_fields(fields: LogFields) -> dict[str, object]:
     values: dict[str, object] = dict(fields)
+    if "producer" in fields:
+        values["producer"] = staff_id(fields["producer"], "producer")
     if "eta" in fields:
         eta = fields["eta"]
         values["eta"] = {"value": eta_text(eta), "kind": _eta_kind(eta)}
@@ -778,11 +782,10 @@ def _read_log_fields(raw: object, number: int) -> LogFields:
             text = _field_text(value, field)
             match field:
                 case "owner":
-                    _staff_id(text, field)
-                    values[field] = UnassignedOwner(text) if text in UnassignedOwner else staff.StaffId(text)
+                    identity = staff_id(text, field)
+                    values[field] = UnassignedOwner(text) if text in UnassignedOwner else identity
                 case "producer":
-                    _staff_id(text, field)
-                    values[field] = staff.StaffId(text)
+                    values[field] = staff_id(text, field)
                 case "state":
                     values[field] = _item_state(text)
                 case "requested_by":
@@ -950,7 +953,7 @@ def _log_content(content: LogContent) -> dict[str, object]:
         if isinstance(content.read_update, UnreadUpdate):
             fields["read_update"] = content.read_update.fingerprint
         if content.recipient is not LegacyFeedbackRecipient.KEEPER:
-            fields["recipient"] = content.recipient
+            fields["recipient"] = staff_id(content.recipient, "feedback recipient")
         return {"feedback": fields}
     if isinstance(content, QuestionRequestReceipt):
         return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id)}}
@@ -1123,8 +1126,7 @@ def _producer_records(keeper: staff.StaffId, producer: staff.StaffId, *, include
     def read_visible(identity: str) -> ListItem | ProducerRecordOmission:
         try:
             fields, body = store.read(identity)
-            assigned = fields.get("producer", keeper)
-            _staff_id(assigned, "producer")
+            assigned = staff_id(fields.get("producer", keeper), "producer")
             if assigned != producer:
                 return ProducerRecordOmission.OUTSIDE_SCOPE
             return _read_item(store, identity, fields, body)
@@ -1252,7 +1254,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             item = load(keeper, identity)
         else:
             fields, body = store.read(identity)
-            if fields.get("producer", keeper) != assigned_to:
+            if staff_id(fields.get("producer", keeper), "producer") != assigned_to:
                 raise ListError(f"{identity} is assigned to another producer")
             item = _read_item(store, identity, fields, body)
         request = page_action
@@ -1655,12 +1657,10 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
         raise ListError("invalid List feedback log")
     if action not in ("tell", "remove", "park", "unpark") or not words.strip():
         raise ListError("invalid List feedback action")
-    recipient = fields.get("recipient", "")
-    if not isinstance(recipient, str) or any(char.isspace() for char in recipient):
-        raise ListError("invalid List feedback recipient")
+    recipient = _field_text(fields.get("recipient", ""), "feedback recipient")
     return PageFeedback(request, words, state, alerted_to,
                         UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT, action, form_words, parked_until,
-                        recipient=staff.StaffId(recipient) if recipient else LegacyFeedbackRecipient.KEEPER)
+                        recipient=staff_id(recipient, "feedback recipient") if recipient else LegacyFeedbackRecipient.KEEPER)
 
 
 def _page_requests(item: ListItem) -> dict[str, PageActivity]:

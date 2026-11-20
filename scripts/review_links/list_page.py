@@ -16,7 +16,7 @@ from datetime import UTC, date, datetime, tzinfo
 from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode
 
 from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
@@ -301,21 +301,32 @@ class ListFormRequestPrefix:
     recipient: the_list.FeedbackRecipient = the_list.LegacyFeedbackRecipient.KEEPER
 
     @classmethod
-    def parse(cls, request: str) -> ListFormRequestPrefix:
+    def parse(cls, request: str) -> tuple[ListFormRequestPrefix, str]:
+        """Read the signed prefix and its optional retry suffix."""
         match = re.fullmatch(r"(?P<nonce>[a-f0-9]{32})(?P<update>[a-f0-9]{64})?" +
-                             r"(?:~(?P<recipient>[^.\s]+))?(?:\.[a-f0-9]{32})?", request)
+                             r"(?:~(?P<escaped>\.)?(?P<recipient>[^.\s]+))?(?P<retry>\.[a-f0-9]{32})?", request)
         if match is None:
             raise question_record.AnswerRefused("the List request does not match this page")
         fingerprint = match["update"]
-        recipient = match["recipient"]
-        return cls(match["nonce"], the_list.UnreadUpdate(fingerprint) if fingerprint else the_list.NoUnreadUpdate.ABSENT,
-                   staff.StaffId(recipient) if recipient else the_list.LegacyFeedbackRecipient.KEEPER)
+        recipient: the_list.FeedbackRecipient = the_list.LegacyFeedbackRecipient.KEEPER
+        if value := match["recipient"]:
+            try:
+                recipient = the_list.staff_id(unquote(value) if match["escaped"] else value, "producer")
+            except the_list.ListError as error:
+                raise question_record.AnswerRefused("the List request does not match this page") from error
+        update = the_list.UnreadUpdate(fingerprint) if fingerprint else the_list.NoUnreadUpdate.ABSENT
+        return cls(match["nonce"], update, recipient), match["retry"] or ""
 
     def format(self) -> str:
         update = self.seen_update
         unread = update.fingerprint if isinstance(update, the_list.UnreadUpdate) else ""
-        recipient = "" if self.recipient is the_list.LegacyFeedbackRecipient.KEEPER else f"~{self.recipient}"
-        return self.nonce + unread + recipient
+        if self.recipient is the_list.LegacyFeedbackRecipient.KEEPER:
+            return self.nonce + unread
+        recipient = self.recipient
+        # Keep the retry suffix separate from the recipient.
+        if "." in recipient or any(char.isspace() for char in recipient):
+            recipient = "." + quote(recipient, safe="").replace(".", "%2E")
+        return f"{self.nonce}{unread}~{recipient}"
 
 
 def signed_token(secret: str, keeper: str, identity: str, prefix: str) -> str:
@@ -725,6 +736,13 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                                "open_question": str(open_question).lower(),
                                "unread_delivery": str(the_list.unread_delivery(item)).lower()}
     if park_request:
+        try:
+            prefix, retry = ListFormRequestPrefix.parse(park_request)
+        except question_record.AnswerRefused:
+            # Older receipts can have opaque request IDs.
+            pass
+        else:
+            park_request = prefix.format() + retry
         saved["park_request_saved"] = the_list.has_park_receipt(item, park_request)
     if waiting:
         members = staff.snapshot()
@@ -758,14 +776,16 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"} or any(len(values) != 1 for values in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
-    keeper, identity, request = fields["keeper"][0], fields["id"][0], fields["request"][0]
+    keeper, identity = fields["keeper"][0], fields["id"][0]
     if re.fullmatch(r"L[1-9]\d*", identity) is None:
         raise question_record.AnswerRefused("the List request does not match this page")
-    prefix = ListFormRequestPrefix.parse(request)
-    expected = signed_token(form_secret(root), keeper, identity, prefix.format())
+    prefix, retry = ListFormRequestPrefix.parse(fields["request"][0])
+    signed_prefix = prefix.format()
+    request = signed_prefix + retry
+    expected = signed_token(form_secret(root), keeper, identity, signed_prefix)
     token = fields["token"][0].encode()
     if not secrets.compare_digest(token, expected.encode()):
-        bootstrap = signed_token(bootstrap_form_secret(root), keeper, identity, prefix.format())
+        bootstrap = signed_token(bootstrap_form_secret(root), keeper, identity, signed_prefix)
         if not secrets.compare_digest(token, bootstrap.encode()):
             raise question_record.AnswerRefused("the List token does not match this page")
     members = staff.snapshot()
