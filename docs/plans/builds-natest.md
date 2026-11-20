@@ -814,7 +814,10 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **Acceptance gate:** the report gives both numbers for each of the 6 modules with host and tree; it names one commit with the command group that holds the rise, or states "no rise between the trees on natedev" with the numbers; `git status` shows no changed file.
 
-### Phase 408 — the lint repair grant test halves its AWS CPU  · status: todo
+### Phase 408 — the lint repair grant test halves its AWS CPU  · status: done (no change; floor)
+
+**As built:** no code change. The module is at its floor: 29.1 CPU s on natedev (base e332b0e70b). The trial (commit 558f820cd2, not merged) moved three grant rejection cases to direct lint function calls and saved 2.2 CPU s (7.7%). The blind review found that the direct call skips rustfmt and the Taplo check, so the exit status assertion proved less. The trial also named 19 internal functions of `verify.sh` in the fixture. Ruling: 2.2 s does not pay for less coverage and that coupling; the trial is dropped. The Floors row is in the next file. The cost is in production starts: the verify helper and the admission clients (13.9 CPU s) and the module runner (6.6).
+
 **Depends on:** none
 
 #### Work Order
