@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.agents import detached_runs
 from scripts.build_hold.build_hold_test_support import write_holder
+from scripts.buildlog.test_holds import write_mac_block
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
 from scripts.lib.process_group import send_process_group
@@ -2500,20 +2501,32 @@ runpy.run_path(str(script), run_name='__main__')
                     path.unlink()
 
     def test_holding_statuses_log_each_pass_without_any_delivery(self) -> None:
+        _ = (self.root / "build_targets.conf").write_text(
+            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        (self.root / "mac_test.conf").touch()
+        mac_state = self.root / "mac-state"
+        self.environment["MAC_TEST_STATE_DIR"] = str(mac_state)
         cases = (
-            ("— holding: no work until the showrunner restarts it on your word", False, True),
-            ("holding: waiting on your confirmed values", False, True),
-            ("— holding: waiting for the fps hold release", True, True),
-            ("holding: the build hold ended; waiting for my tests", True, False),
+            ("— holding: no work until the showrunner restarts it on your word", "", True),
+            ("holding: waiting on your confirmed values", "", True),
+            ("— holding: waiting for the fps hold release", "natedev", True),
+            ("holding: the build hold ended; waiting for my tests", "natedev", False),
+            ("holding: waiting for the build hold log", "natedev", False),
+            ("— holding: waiting on the natedev hold release", "mac", False),
         )
-        for status, build_hold, holding in cases:
+        for status, held_target, holding in cases:
             with self.subTest(status=status):
                 holders = Path(self.environment["BUILD_HOLD_DIR"])
                 holder = holders / "fps"
-                if build_hold:
+                for path in (holder, mac_state / "block.json", self.send_log):
+                    path.unlink(missing_ok=True)
+                if held_target == "natedev":
                     holders.mkdir(exist_ok=True)
                     _ = write_holder(holders, "fps", "2026-10-06T18:59:00+00:00", "Build tests")
-                self.send_log.unlink(missing_ok=True)
+                if held_target == "mac":
+                    with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(mac_state)}):
+                        write_mac_block(datetime.fromisoformat("2026-10-06T18:59:00+00:00"))
                 self.state.mkdir(exist_ok=True)
                 for path in self.state.glob("*.json"):
                     path.unlink()
@@ -2527,15 +2540,14 @@ runpy.run_path(str(script), run_name='__main__')
                         path = self.watches["unit-one"].stretch_path
                         self.assertFalse(stall_watch.saved_stretch(path)["tell_sent"])
                         self.assertFalse(stall_watch.saved_stretch(path)["bump_sent"])
-                if build_hold and holding:
+                if held_target == "natedev" and holding:
                     holder.unlink()
                     result = self.tick(START + 601)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                if build_hold:
+                if held_target:
                     sent = self.sent()
                     self.assertEqual(len(sent), 2)
                     self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
-                    holder.unlink(missing_ok=True)
 
     def test_own_work_order_and_own_names_do_not_hold_the_unit(self) -> None:
         self.configure({"showrunner": ["unit-one"], "sdlc": ["style"]})

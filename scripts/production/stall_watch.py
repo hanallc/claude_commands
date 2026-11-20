@@ -36,7 +36,7 @@ from uuid import uuid4
 
 from scripts.agents import detached_runs
 from scripts.build_targets.targets import (
-    ConfigError, Held, SshTarget, StateUnreadable, local_hold_states, read_targets, ssh_target_state,
+    ConfigError, Held, LocalTarget, StateUnreadable, local_hold_states, read_targets, ssh_target_state,
 )
 from scripts.lib import conf_reads
 from scripts.lib import conf as tunables
@@ -69,7 +69,11 @@ WATCH_DEFAULTS = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 COMPACTION_WAKE_KIND = "blocked"
 HOLDING_KIND = "holding"
-BUILD_HOLD_WAIT = re.compile(r"\bwait(?:s|ing)?\s+(?:for|on)\s+(?:[\w-]+\s+){0,3}hold\b", re.IGNORECASE)
+BUILD_HOLD_WAIT = re.compile(
+    r"\bwait(?:s|ing)?\s+(?:for|on)\s+(?:\w+(?:[.-]\w+)*\s+){0,3}"
+    + r"hold\s+(?:releases?|ends|to\s+(?:end|lift))\b",
+    re.IGNORECASE,
+)
 TURN_END = re.compile(rf"^\s*(?:[●⏺]\s+)?(?P<status>(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*)$",
                       re.MULTILINE)
 # A time a holding line names: a date, with or without its year, is optional, and UTC or GMT marks a time
@@ -702,17 +706,37 @@ def status_defers_bump(status: str, peers: Iterable[str], own_names: tuple[str, 
     return names_outside(owner, fields["external_owner_pattern"].strip(), peers, own_names, at_start=True)
 
 
-def build_hold_is_live() -> bool:
-    states = local_hold_states()
+class BuildHolds(NamedTuple):
+    configured_targets: frozenset[str]
+    held_targets: frozenset[str]
+
+    def status_waits_on_hold(self, status: str) -> bool:
+        if not self.held_targets or BUILD_HOLD_WAIT.search(status) is None:
+            return False
+        named = {target for target in self.configured_targets if name_spans(status, target)}
+        return not named or bool(named & self.held_targets)
+
+
+def read_build_holds() -> BuildHolds:
     try:
-        states += tuple(ssh_target_state(target) for target in read_targets()
-                        if isinstance(target, SshTarget) and target.platform == "macos")
+        targets = read_targets()
     except ConfigError as error:
-        states += (StateUnreadable(str(error)),)
-    for state in states:
-        if isinstance(state, StateUnreadable):
-            print(f"stall-watch: build hold state unreadable: {state.reason}", file=sys.stderr)
-    return any(isinstance(state, Held) for state in states)
+        print(f"stall-watch: build targets unreadable: {error}", file=sys.stderr)
+        return BuildHolds(frozenset(), frozenset())
+    held_targets: set[str] = set()
+    for target in targets:
+        if isinstance(target, LocalTarget):
+            states = local_hold_states()
+        elif target.platform == "macos":
+            states = (ssh_target_state(target),)
+        else:
+            continue
+        for state in states:
+            if isinstance(state, StateUnreadable):
+                print(f"stall-watch: {target.name}: build hold state unreadable: {state.reason}", file=sys.stderr)
+            elif isinstance(state, Held):
+                held_targets.add(target.name)
+    return BuildHolds(frozenset(target.name for target in targets), frozenset(held_targets))
 
 
 def holding_names_outside(status: str, peers: Iterable[str], own_names: tuple[str, ...]) -> bool:
@@ -1415,7 +1439,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
     busy_pane_workers: PaneWorkersUnread | BusyPaneWorkerParents = PaneWorkersUnread()
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
-    live_build_hold = bool(work) and build_hold_is_live()
+    build_holds = read_build_holds() if work else BuildHolds(frozenset(), frozenset())
     for production_name, configured, zone, peers, name, unit, claude, row in inspection_order(work):
         if isinstance(rows, ProcessSnapshotFailure):
             continue
@@ -1543,7 +1567,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 deferred = bool(turn) and status_defers_bump(last, peers, own_names)
                 holding = (turn is not None and turn.group("kind") == HOLDING_KIND
                            and (holding_names_outside(last, peers, own_names)
-                                or (live_build_hold and BUILD_HOLD_WAIT.search(last) is not None)))
+                                or build_holds.status_waits_on_hold(last)))
             except (OSError, UnicodeError, KeyError, ValueError, re.error, IndexError) as error:
                 print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
                 continue
