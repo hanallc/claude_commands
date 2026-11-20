@@ -22,6 +22,7 @@ the user's go.
 
 If `<key>.<host>` also exists, the script refuses `<key>` and names both lines.
 Name the exact key, such as `sweep_free_floor_gib.mac`, to change that line.
+Machine switches in `build_targets` use exact keys and accept only `on` or `off`.
 
 Report the script's result. Exit 2 means a refusal, or a value that is live but
 not on main yet: the notes timer commits it when main is free. Exit 1 means the

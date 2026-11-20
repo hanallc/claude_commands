@@ -92,6 +92,25 @@ class TuneTests(PublicationTestCase):
                 self.assertFalse(self.repository.ssh_log.exists())
                 self.assertFalse((self.repository.root / "state").exists())
 
+    def test_machine_switch_save_edits_only_its_exact_key_and_checks_its_limit(self) -> None:
+        repo = self.repository
+        source = repo.config.with_name("build_targets.conf")
+        original = "# one of: on, off\nenabled.mac=on\nenabled.mac.mac=on\nenabled.hana-aws=off\n"
+        _ = source.write_text(original)
+        _ = repo.git(repo.checkout, "add", "config/build_targets.conf")
+        _ = repo.git(repo.checkout, "commit", "-qm", "Add fixture machine switches")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
+        for value, status in (("invalid", 2), ("off", 0), ("on", 0)):
+            with self.subTest(value=value):
+                result = self.run_tune("build_targets", "enabled.mac", value,
+                                       "--why", "Change placement", "--user-words", "yes")
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                if status == 2:
+                    self.assertIn("expected one of on, off", result.stderr)
+                    self.assertEqual(source.read_text(), original)
+                else:
+                    self.assertEqual(source.read_text(), original.replace("enabled.mac=on", f"enabled.mac={value}"))
+
     def test_approved_change_commits_only_its_file_with_reason_and_user_trailer_then_pulls_mac(self) -> None:
         repo = self.repository
         before = repo.config.read_text()

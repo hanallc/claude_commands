@@ -23,6 +23,10 @@ _CONF_HOST="${_CONF_HOST%%.*}"
 conf_value() {
     local file="$1" key="$2" folder="${CONF_DIR:-$HOME/.claude/config}"
     conf_record "$file"
+    local host_key="$key.$_CONF_HOST"
+    case "$file:$key" in
+        build_targets:enabled|build_targets:enabled.*) host_key="" ;;
+    esac
     local raw line name value previous="" limit=""
     local base="" base_limit="" host_value="" host_limit="" base_seen=0 host_seen=0 found=0
     local low high choices choice numeric valid=1
@@ -42,7 +46,7 @@ conf_value() {
                 value="${line#*=}"; value="${value#"${value%%[![:space:]]*}"}"
                 if [[ "$name" == "$key" && "$base_seen" == 0 ]]; then
                     base="$value"; base_limit="$previous"; base_seen=1
-                elif [[ "$name" == "$key.$_CONF_HOST" && "$host_seen" == 0 ]]; then
+                elif [[ -n "$host_key" && "$name" == "$host_key" && "$host_seen" == 0 ]]; then
                     host_value="$value"; host_limit="$previous"; host_seen=1
                 fi
             fi

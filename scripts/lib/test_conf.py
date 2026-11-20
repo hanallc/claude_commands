@@ -308,6 +308,24 @@ conf_reads.record('disabled')
         with mock.patch("socket.gethostname", return_value="unknown.example.invalid"):
             self.assertEqual(conf.read("example").whole("count"), 1)
 
+    def test_machine_switches_read_exact_keys_in_python_and_shell(self) -> None:
+        source = self.directory / "build_targets.conf"
+        _ = source.write_text("enabled.mac=off\nenabled.mac.mac=on\nenabled.mac.hana-aws=on\n"
+                              + "enabled.hana-aws=on\nenabled.hana-aws.hana-aws=off\n")
+        shell = Path(__file__).with_name("conf.sh")
+        for host in ("mac", "hana-aws", "other"):
+            with self.subTest(host=host), mock.patch("socket.gethostname", return_value=f"{host}.example"):
+                config = conf.read("build_targets")
+                self.assertEqual(config.text("enabled.mac"), "off")
+                self.assertEqual(config.text("enabled.hana-aws"), "on")
+                self.assertEqual(config.value("enabled", str, default="absent"), "absent")
+                result = subprocess.run(["bash", "-c",
+                    'source "$1"; _CONF_HOST="$2"; conf_value build_targets enabled.mac'
+                    + '; conf_value build_targets enabled.hana-aws', "conf-test", str(shell), host],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ["off", "on"])
+
     def test_home_config_is_used_when_conf_dir_is_not_set(self) -> None:
         home_config = self.root / "home/.claude/config"
         home_config.mkdir(parents=True)
