@@ -3265,6 +3265,7 @@ Tests: the module passes 24 runs, 8 at a time, with no read of another process's
 2. Find every other admission fixture that writes a partial `build_admission.conf` and so reads a tunable from the repository config. Fix it where it lives: one shared fixture writer in admission_test_support that sets every timing key a test depends on, not a copy in each module.
 
 3. **From builds, 06:54 EST (found by aws):** `config_environment` in scripts/lint/memory_test_support.py (about :145) copies every checkout `config/*.conf` except build_admission.conf into the fixture folder through `_template`. So build queue tests read admission, folder and lock values that /tune can change. Make the fixture write fixed test values for each conf the tests read. It copies no live tunable.
+4. **From builds, 07:19 EST:** `test_idle_eligible_wait_without_a_leave_hook_gets_one_row` in test_mac_idle.py failed once under the gate layout (notify_showrunner called 1 time, expected 0) and passed 6 of 6 alone. Find what leaks the notice, shared state or live config, and fix the cause.
 
 Tests: test_mac_idle.py passes 24 runs, 8 at a time, under CPU load. No admission or build queue test reads a value from a checkout `config/*.conf`.
 
