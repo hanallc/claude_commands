@@ -3101,22 +3101,26 @@ print(scratch.target('gate:proof', 'tree', False))
                 path = scratch.new(ROW, f"final-stop-{index}", visible=True)
                 other = scratch.new(RUN, "kept")
                 real_unlink = os.unlink
-                real_rmdir = Path.rmdir
+                real_rmdir = os.rmdir
+                parent = path.parent.stat()
 
                 def stop_after_record(child: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
                     real_unlink(child, dir_fd=dir_fd)
                     if boundary == "record removed" and Path(child).name == copy_record.RECORD:
                         raise KeyboardInterrupt
 
-                def stop_at_folder(folder: Path) -> None:
-                    if folder == path and boundary == "before rmdir":
+                def stop_at_folder(folder: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
+                    target = Path(folder)
+                    removing_source = (target == path or (dir_fd is not None and target == Path(path.name)
+                                       and os.path.samestat(os.fstat(dir_fd), parent)))
+                    if removing_source and boundary == "before rmdir":
                         raise KeyboardInterrupt
-                    real_rmdir(folder)
-                    if folder == path and boundary == "after rmdir":
+                    real_rmdir(folder, dir_fd=dir_fd)
+                    if removing_source and boundary == "after rmdir":
                         raise KeyboardInterrupt
 
                 with (mock.patch.object(os, "unlink", side_effect=stop_after_record),
-                      mock.patch.object(Path, "rmdir", autospec=True, side_effect=stop_at_folder),
+                      mock.patch.object(os, "rmdir", side_effect=stop_at_folder),
                       self.assertRaises(KeyboardInterrupt)):
                     _ = scratch.end(ROW)
                 self.assertFalse((path / copy_record.RECORD).exists())
