@@ -746,6 +746,12 @@ class ClaudeUnknown(NamedTuple):
     reason: str
 
 
+class PaneHeldByNonAgents(ClaudeUnknown):
+    """Non-agent processes block the pane. The pane has no other local ownership blocks."""
+
+    __slots__: tuple[str, ...] = ()
+
+
 Claude = LiveClaude | ClaudeNotRunning | ClaudeUnknown
 
 
@@ -873,6 +879,11 @@ class UnknownUnit:
     reason: str
 
 
+@dataclass(frozen=True)
+class NonAgentPaneHolders(UnknownUnit):
+    """Resume can wait for the pane holders to exit."""
+
+
 type UnitOwner = ProvedLiveUnit | ProvedAbsentUnit | UnknownUnit
 
 
@@ -888,6 +899,8 @@ def checked_unit_owner(pane: LabeledSession | None, failures: tuple[str, ...] = 
             return UnknownUnit("the registry identity differs from the pane evidence")
         if isinstance(pane.identity, LiveSession) and isinstance(pane.process, ProvedCodexPaneProcess):
             return ProvedLiveUnit(pane)
+        if isinstance(pane.claude, PaneHeldByNonAgents):
+            return NonAgentPaneHolders(pane.claude.reason)
         if isinstance(pane.claude, ClaudeUnknown):
             return UnknownUnit(pane.claude.reason)
         if not isinstance(pane.empty, ShellNotObserved):

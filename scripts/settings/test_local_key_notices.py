@@ -91,7 +91,7 @@ class LocalKeyNoticeTests(unittest.TestCase):
 
     def test_each_confirmed_send_outcome_keeps_the_notice_delivery_policy(self) -> None:
         for code, header, status in ((0, "SENT", "accepted"), (0, "SKIPPED", "accepted"),
-                                     (1, "QUEUED", "accepted"), (0, "KEPT", "pending"),
+                                     (1, "QUEUED", "accepted"), (0, "KEPT", "accepted"),
                                      (0, "REPLACED", "pending"), (3, "FAILED", "pending"),
                                      (2, "REFUSED", "pending"), (4, "HELD", "pending"), (5, "PENDING", "pending")):
             with self.subTest(header=header):
@@ -103,7 +103,7 @@ class LocalKeyNoticeTests(unittest.TestCase):
 
     def test_inconsistent_send_exits_and_missing_headers_leave_notices_pending(self) -> None:
         notices.record(self.root, "fixture", ["firstKey"])
-        for code, output in ((3, "SENT: fixture"), (1, "SKIPPED: fixture"), (0, "QUEUED: fixture"),
+        for code, output in ((3, "SENT: fixture"), (1, "SKIPPED: fixture"), (0, "QUEUED: fixture"), (1, "KEPT: fixture"),
                              (0, ""), (1, ""), (-15, "SENT: fixture")):
             with self.subTest(code=code, output=output):
                 with patch("subprocess.run", return_value=subprocess.CompletedProcess([], code, output, "")), redirect_stderr(io.StringIO()):

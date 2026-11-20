@@ -26,18 +26,22 @@ from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts, new_account
+from scripts.for_you.action import ActionStore
 from scripts.hooks import showrunner_footer
 from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import footer_counts, investigation, session_labels, staff
 from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
+from scripts.hooks import review_hold_delivery
+from scripts.message import review_hold
+from scripts.review_links import for_you
 from scripts.agents import remote
-from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
+from scripts.statusline import adhoc_items, assignment, counts_row, for_you_count, rebuild_row
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
-CONSOLE_HOST_SHELL = "uname() { echo Linux; }; "
+CONSOLE_HOST_SHELL = "export STATUSLINE_SYSTEM=Linux; "
 USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # Preserve the fixture PATH when NixOS starts a child shell.
@@ -45,6 +49,11 @@ SHELL_ENVIRONMENT = {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED"
 SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 # Where NixOS's glibc finds zone files; Claude Code's environment carries it.
 ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
+
+
+def fixture_actions(home: Path) -> Path:
+    """Return the private action store for one test."""
+    return home / ".local/state/for-you/actions"
 
 
 def fixture_account_label(label: str, configuration: Path) -> str:
@@ -449,16 +458,16 @@ class ColorTests(unittest.TestCase):
 
 class ForYouStatusTests(unittest.TestCase):
     def test_global_count_uses_the_shared_reader_and_refuses_incomplete_sources(self) -> None:
-        from scripts.review_links import for_you
+        config = Path("fixture/statusline.conf")
         row = for_you.ForYouRow("action/fixture", "action", "Restore access", "github-warmup", "mac",
                                 "/fixture", "sdlc", "Login", "Release", "", "open", "manual", "")
         for rows, failures, expected in (((row,), (), "1"), ((), (), "0"),
                                           ((row,), (for_you.UnavailableSource("fixture", "Failed."),), "unavailable")):
             with self.subTest(expected=expected), patch.object(for_you, "read", return_value=for_you.ForYouSnapshot(rows, failures)) as read:
-                self.assertEqual(counts_row.global_action_count(), expected)
+                self.assertEqual(for_you_count.global_action_count(config), expected)
                 self.assertEqual(read.call_count, 1)
         with patch.object(for_you, "read", side_effect=OSError("Fixture read failed.")):
-            self.assertEqual(counts_row.global_action_count(), "unavailable")
+            self.assertEqual(for_you_count.global_action_count(config), "unavailable")
 
     def test_mac_default_uses_the_console_peers_tailscale_address(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -469,8 +478,8 @@ class ForYouStatusTests(unittest.TestCase):
             connection = Mock(getresponse=Mock(return_value=response))
             with (patch.dict(os.environ, {"CONF_DIR": directory}, clear=True),
                   patch.object(subprocess, "check_output", return_value="100.64.0.42\n") as address,
-                  patch.object(counts_row, "HTTPConnection", return_value=connection) as connect):
-                self.assertEqual(counts_row.console_action_count(), "3")
+                  patch.object(for_you_count, "HTTPConnection", return_value=connection) as connect):
+                self.assertEqual(for_you_count.console_action_count(), "3")
                 connect.assert_called_once_with("100.64.0.42", 8765, timeout=2)
                 address.assert_called_once_with(
                     ["tailscale", "ip", "-4", "fixture-console"], text=True, stderr=subprocess.DEVNULL, timeout=2)
@@ -504,12 +513,13 @@ class ForYouStatusTests(unittest.TestCase):
                 '#!/bin/sh\n[ "$*" = "ip -4 fixture-console" ] || exit 1\necho 127.0.0.1\n')
             tailscale.chmod(0o755)
             config = home / "config"
-            command = "uname() { echo Darwin; }; " + fixture_command(home)
+            command = fixture_command(home)
             seed_rebuild_cache(home, config / "statusline.conf")
             _ = write_config_fixture(config / "console.conf", "for_you.host=fixture-console\n")
             with ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHost) as server:
                 _ = write_config_fixture(config / "review_links.conf", f"server_port={server.server_port}\n")
-                env = {**SHELL_ENVIRONMENT, "HOME": directory, "CONF_DIR": str(config),
+                env = {**SHELL_ENVIRONMENT, "HOME": directory, "CONF_DIR": str(config), "STATUSLINE_SYSTEM": "Darwin",
+                       "FOR_YOU_ACTIONS_DIR": str(fixture_actions(home)),
                        "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
                 thread = Thread(target=server.serve_forever, daemon=True)
                 thread.start()
@@ -563,6 +573,66 @@ class AdhocItemsTests(unittest.TestCase):
                         self.assertEqual(path.read_text(encoding="utf-8"), str(remaining))
                     else:
                         self.assertFalse(path.exists())
+
+    def test_zero_prints_one_list_in_sent_order_and_removes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config"
+            config.mkdir()
+            _ = write_config_fixture(config / "send.conf", "review_hold_idle_minutes=30")
+            env = {"HOME": directory, "CONF_DIR": str(config), "USER_ZONE": "America/New_York",
+                   "CLAUDE_CODE_SESSION_ID": "review-session"}
+            first = datetime(2026, 11, 19, 17, 5, tzinfo=timezone.utc).timestamp()
+            with patch.dict(os.environ, env):
+                review_hold.set_count("review-session", 3, first, self.fail,
+                    record_keys=review_hold_delivery.record_keys)
+                for item in (review_hold.ReviewMessage("Pat · build", first + 60, "Second report.", "codex:pat"),
+                             review_hold.ReviewMessage("Lee · test", first, "First report.\nMore detail.", "session:lee")):
+                    with review_hold.route("review-session", item, urgent=False,
+                             record_keys=review_hold_delivery.record_keys) as result:
+                        assert isinstance(result, review_hold.OpenReview)
+                        result.keep(item)
+                command = [sys.executable, str(Path(adhoc_items.__file__)), "0"]
+                result = subprocess.run(command, text=True, capture_output=True, check=True)
+                self.assertEqual(result.stdout, "Messages from the review\n\n"
+                    + "1. Lee · test\n   Sent: 12:05 EST\n   Sender native id: session:lee\n   First report.\n   More detail.\n\n"
+                    + "2. Pat · build\n   Sent: 12:06 EST\n   Sender native id: codex:pat\n   Second report.\n")
+                self.assertEqual(result.stderr, "")
+                again = subprocess.run(command, text=True, capture_output=True, check=True)
+                self.assertEqual(again.stdout + again.stderr, "")
+
+    def test_session_start_recovers_the_saved_list_once_as_hook_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config"
+            config.mkdir()
+            _ = write_config_fixture(config / "send.conf", "review_hold_idle_minutes=30")
+            with patch.dict(os.environ, {"HOME": directory, "CONF_DIR": str(config), "USER_ZONE": "UTC"}):
+                repo = Path(adhoc_items.__file__).parents[2]
+                settings = cast(dict[str, object], json.loads((repo / "settings.json").read_text()))
+                hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
+                group = next(item for item in hooks["SessionStart"] if item["matcher"] == "startup|resume|clear|compact")
+                registered = cast(list[dict[str, str]], group["hooks"])
+                self.assertTrue(any(command["command"].endswith('/session-start-review-hold.py"')
+                                    for command in registered))
+                at = datetime(2026, 11, 19, 16, 20, tzinfo=timezone.utc).timestamp()
+                review_hold.set_count("review-session", 3, at, self.fail,
+                    record_keys=review_hold_delivery.record_keys)
+                message = review_hold.ReviewMessage("Drew", at, "A saved report.")
+                with review_hold.route("review-session", message, urgent=False,
+                         record_keys=review_hold_delivery.record_keys) as result:
+                    assert isinstance(result, review_hold.OpenReview)
+                    result.keep(message)
+                command = [sys.executable, str(repo / "scripts/hooks/session-start-review-hold.py")]
+                payload = json.dumps({"session_id": "review-session", "source": "resume",
+                                      "hook_event_name": "SessionStart"})
+                reply = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
+                self.assertEqual(cast(object, json.loads(reply.stdout)), {"hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": ("Messages from the review\n\n1. Drew\n   Sent: 16:20 UTC\n"
+                                          + "   Sender native id: unavailable\n   A saved report."),
+                }})
+                self.assertEqual(reply.stderr, "")
+                again = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
+                self.assertEqual(again.stdout + again.stderr, "")
 
     def test_row_omits_invalid_or_nonpositive_counts_and_an_empty_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": directory}):
@@ -759,6 +829,7 @@ class RoleTests(ConfiguredShellTests):
                                Path(marks.get("SHOWRUNNER_STATE_DIR", self.home / ".local/state/showrunner")))
         read_log = {"CONF_READ_LOG": os.environ["CONF_READ_LOG"]} if "CONF_READ_LOG" in os.environ else {}
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home),
+               "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
                "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf"), **read_log, **marks}
         command = command or self.shell_command
         result = subprocess.run(
@@ -768,9 +839,8 @@ class RoleTests(ConfiguredShellTests):
         return result.stdout.splitlines()
 
     def test_global_action_count_reaches_the_shell_in_each_role(self) -> None:
-        from scripts.for_you.action import ActionStore
         _ = self.write_staff(OWNER, UNIT, WORKER)
-        store = ActionStore(self.home / ".local/state/for-you/actions")
+        store = ActionStore(fixture_actions(self.home))
         _ = store.add(title="Restore access", command="github-warmup", machine="mac", cwd="/fixture",
                       requested_by="sdlc", reason="Login", waits="Release", concerns="console", dedupe_key="access")
         for identity in (OWNER.current_session, UNIT.current_session, WORKER.current_session, ""):
@@ -1191,6 +1261,7 @@ class CountsRowTests(ConfiguredShellTests):
 
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+               "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
                "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
                "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
         result = subprocess.run([shell, "-c", self.shell_command], input=json.dumps({"session_id": session_id}),
@@ -1230,6 +1301,7 @@ class CountsRowTests(ConfiguredShellTests):
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": "/nonexistent/herdr",
+               "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
                "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
                "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
         result = subprocess.run(["/bin/sh", "-c", self.shell_command], input=json.dumps({"session_id": OWNER.id}),
@@ -1439,6 +1511,9 @@ class CountsRowTests(ConfiguredShellTests):
 
         self.questions({"since": "2026-10-16T19:00", "text": "A"})
         environment = {"HOME": str(self.home),
+                       "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
+                       "REBUILD_NEEDS_DIR": str(self.home / ".local/state/rebuild/needs"),
+                       "STATUSLINE_SYSTEM": "Linux",
                        "CONF_DIR": str(self.configuration), "XDG_CONFIG_HOME": str(self.home / ".config"),
                        "USER_ZONE": USER_ZONE.key,
                        "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"),
@@ -2373,16 +2448,23 @@ class RebuildRowTests(unittest.TestCase):
             staff_file = home / "staff.json"
             _ = staff_file.write_text(staff_text(), encoding="utf-8")
             built = cache.stat().st_mtime_ns
-            for unreadable in (False, True):
-                if unreadable:
+            for source in ("ready", "actions", "needs"):
+                actions = fixture_actions(home)
+                if source == "actions":
+                    actions = actions.with_name("malformed-actions")
+                    actions.mkdir(parents=True)
+                    depth = 2 * sys.getrecursionlimit()
+                    _ = (actions / "action.json").write_text("[" * depth + "]" * depth, encoding="utf-8")
+                elif source == "needs":
                     (home / ".local/state/rebuild/needs/unreadable.json").mkdir(parents=True)
                 for shell in SHELLS:
-                    with self.subTest(shell=shell, unreadable=unreadable):
+                    with self.subTest(shell=shell, source=source):
                         result = subprocess.run([shell, "-c", command], input="{}", capture_output=True, text=True,
                                                 check=True, env={**SHELL_ENVIRONMENT, "HOME": directory,
+                                                                 "FOR_YOU_ACTIONS_DIR": str(actions),
                                                                  "PATH": os.environ["PATH"],
                                                                  "STAFF_FILE": str(staff_file)}, cwd=home)
-                        expected = "For you: Unavailable" if unreadable else "For you: \x1b[1m1\x1b[22m action"
+                        expected = "For you: \x1b[1m1\x1b[22m action" if source == "ready" else "For you: Unavailable"
                         self.assertEqual(result.stdout.splitlines()[-1], expected)
                         self.assertEqual(result.stderr, "")
                         self.assertEqual(cache.stat().st_mtime_ns, built)

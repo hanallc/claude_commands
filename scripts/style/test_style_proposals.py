@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from scripts.agents import remote
 
+from scripts.style.ledger_test_support import legacy_overlapping_tickets
 from scripts.style.ledger_test_support import ticket_owner_id
 
 import errno
@@ -2568,11 +2569,13 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             assigned = self.assign_ticket(ledger, "assigned")
             waiting = (self.hold(ledger, ticket=assigned), self.hold(ledger, ticket=assigned, line=2))
-            merged = self.assign_ticket(ledger, "merged")
+            with legacy_overlapping_tickets():
+                merged = self.assign_ticket(ledger, "merged")
             ready = self.hold(ledger, ticket=merged, line=3)
             ledger.ticket_checkpoint(merged, self.tip)
             _ = ledger.ticket_merge(merged)
-            dropped = self.assign_ticket(ledger, "dropped")
+            with legacy_overlapping_tickets():
+                dropped = self.assign_ticket(ledger, "dropped")
             dropped_finding = self.hold(ledger, ticket=dropped, line=4)
             ledger.ticket_drop(dropped)
             output = io.StringIO()
