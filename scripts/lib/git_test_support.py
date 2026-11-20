@@ -1,11 +1,17 @@
 """Configure disposable Git fixtures and commit changes with one synthetic identity."""
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+def git_fixture_environment() -> dict[str, str]:
+    """Keep inherited Git overrides out of disposable repositories."""
+    return {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
 
 
 def write_fixture_git_config(directory: Path) -> Path:

@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from collections.abc import Mapping
 from typing import override
+from scripts.lib.git_test_support import git_fixture_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -52,8 +53,8 @@ class ScriptRepositoryTestCase(unittest.TestCase):
         if real_git is None:
             self.fail("git is required")
         self.environment = {
-            key: value for key, value in os.environ.items()
-            if not key.startswith(("GIT_", "CARGO_", "RUST", "VALIDATE_"))
+            key: value for key, value in git_fixture_environment().items()
+            if not key.startswith(("CARGO_", "RUST", "VALIDATE_"))
         }
         self.environment.update(
             HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / ".config"),

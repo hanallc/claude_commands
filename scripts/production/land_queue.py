@@ -501,11 +501,8 @@ def take_next() -> str:
                 wake.unlink(missing_ok=True)
         _publish_claim(gap)
         with edited() as items:
-            if items and _settings_item(items[0]):
-                settings = items.pop(0)
-                following = _take_land_item(items)
-                items.insert(0, settings)
-                return following
+            if next((line_path().parent / "settings-wake").glob("*"), None) is not None:
+                return ""
             return _take_land_item(items)
 
 

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib.git_test_support import git_fixture_environment
 from scripts.lib import live_settings, main_publish, zone, user_zone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -106,7 +107,7 @@ class SetTests(unittest.TestCase):
         _ = ssh.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{self.fakes / "ssh.py"}" "$@"\n', encoding="utf-8")
         ssh.chmod(0o755)
         _ = (self.fakes / "broadcast.py").write_text(FAKE_BROADCAST, encoding="utf-8")
-        self.env = {key: value for key, value in os.environ.items() if key not in ("USER_ZONE", "XDG_STATE_HOME")}
+        self.env = {key: value for key, value in git_fixture_environment().items() if key != "USER_ZONE"}
         self.env.update({
             "HOME": str(self.root), "MODELS_CONFIG_FILE": str(self.checkout / "config/models.conf"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",

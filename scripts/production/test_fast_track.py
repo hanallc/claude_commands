@@ -467,13 +467,15 @@ class FastTrackTests(MergeCheckpointFixture):
 
     def test_settings_publish_paths_leave_the_live_land_line_unchanged(self) -> None:
         live_line = Path(pwd.getpwuid(os.getuid()).pw_dir, ".local/state/merge-gate/land_queue.json")
-        try:
-            with live_line.open("rb") as source:
-                before = (source.read(), os.fstat(source.fileno()).st_mtime_ns)
-        except FileNotFoundError:
-            pass
-        else:
-            self.addCleanup(lambda: self.assertEqual((live_line.read_bytes(), live_line.stat().st_mtime_ns), before))
+        def live_snapshot() -> tuple[bytes, int] | None:
+            try:
+                with live_line.open("rb") as source:
+                    return source.read(), os.fstat(source.fileno()).st_mtime_ns
+            except FileNotFoundError:
+                return None
+
+        before = live_snapshot()
+        self.addCleanup(lambda: self.assertEqual(live_snapshot(), before))
 
         checkout = self.promote
         config = checkout / "config"

@@ -84,6 +84,23 @@ class LandQueueTests(unittest.TestCase):
             self.assertEqual(self.run_line("next"), (0, "builds next\n", "settings publication stopped with exit -15\n"))
         self.assertEqual(land_queue.listing(), "the land line is empty")
 
+    def test_next_publishes_a_new_settings_request_before_the_following_land(self) -> None:
+        land_queue.add("builds next", batch="", commits=["a" * 40], first=False, before=None)
+        _ = land_queue.enqueue_settings()
+        publishes: list[str] = []
+
+        def publish(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(options["pass_fds"], (int(command[-1]),))
+            publishes.append("settings")
+            if len(publishes) == 1:
+                _ = land_queue.enqueue_settings()
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch.object(subprocess, "run", publish):
+            self.assertEqual(self.run_line("next"), (0, "", ""))
+            self.assertEqual(self.run_line("next"), (0, "builds next\n", ""))
+        self.assertEqual(publishes, ["settings", "settings"])
+
     def test_next_prints_the_batch_path_stored_for_the_label(self) -> None:
         batch = self.batch("setupwait2", "aws hana-setup-wait " + "a" * 40)
         self.assertEqual(self.run_line("add", "builds setupwait3", "--batch", os.path.relpath(batch)), (0, "", ""))

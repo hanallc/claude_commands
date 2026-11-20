@@ -7,7 +7,8 @@ except FileNotFoundError:
     pass
 
 from collections.abc import Callable, Generator, Iterable, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 import fcntl
 import json
@@ -29,6 +30,7 @@ REGISTRY_PATH = "config/models.conf"
 SETTINGS_JSON = "settings.json"
 ORDER_PATH = "config/settings-orders.json"
 RegistryReplay = Callable[[str, str, str], str]
+_CHECKOUT_LOCKS = ContextVar("checkout_locks", default=frozenset[Path]())
 
 
 def model_color_host(key: str) -> str:
@@ -151,6 +153,8 @@ class NoSettingsJsonSave:
 class MacSettingsBaseline(TypedDict):
     order: int
     text: str
+    attempt_order: NotRequired[int]
+    unconfirmed: NotRequired[SettingsJsonEdits]
 
 
 @dataclass(frozen=True)
@@ -367,26 +371,32 @@ def has_settings_json_edits(edits: SettingsJsonEdits) -> bool:
     return bool(edits["values"] or edits["removed"] or edits.get("objects"))
 
 
-def _json_changes(old: dict[str, object], new: dict[str, object]) -> SettingsJsonEdits:
+def _json_changes(old: dict[str, object], new: dict[str, object],
+                  unconfirmed: SettingsJsonEdits | None = None) -> SettingsJsonEdits:
     values: dict[str, object] = {}
     objects: dict[str, SettingsJsonEdits] = {}
+    whole = unconfirmed["values"].keys() | set(unconfirmed["removed"]) if unconfirmed else set[str]()
+    children = unconfirmed.get("objects", {}) if unconfirmed else {}
     for key, value in new.items():
         prior = old.get(key)
-        if isinstance(value, dict) and (isinstance(prior, dict) or (key not in old and value)):
+        if key in whole:
+            values[key] = value
+        elif isinstance(value, dict) and (isinstance(prior, dict) or (key not in old and value) or key in children):
             child = _json_changes(cast(dict[str, object], prior) if isinstance(prior, dict) else {},
-                                  cast(dict[str, object], value))
+                                  cast(dict[str, object], value), children.get(key))
             if has_settings_json_edits(child):
                 objects[key] = child
-        elif key not in old or json.dumps(prior, sort_keys=True) != json.dumps(value, sort_keys=True):
+        elif key in children or key not in old or json.dumps(prior, sort_keys=True) != json.dumps(value, sort_keys=True):
             values[key] = value
-    edits: SettingsJsonEdits = {"values": values, "removed": [key for key in old if key not in new]}
+    removed = [key for key in dict.fromkeys((*old, *sorted(whole), *children)) if key not in new]
+    edits: SettingsJsonEdits = {"values": values, "removed": removed}
     if objects:
         edits["objects"] = objects
     return edits
 
 
-def settings_json_edits(before: str, after: str) -> SettingsJsonEdits:
-    return _json_changes(_settings_object(before), _settings_object(after))
+def settings_json_edits(before: str, after: str, *, unconfirmed: SettingsJsonEdits | None = None) -> SettingsJsonEdits:
+    return _json_changes(_settings_object(before), _settings_object(after), unconfirmed)
 
 
 def _apply_json_changes(settings: dict[str, object], edits: SettingsJsonEdits) -> None:
@@ -408,9 +418,10 @@ def apply_settings_json_edits(text: str, edits: SettingsJsonEdits) -> str:
     return json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
 
 
-def clean_settings_json(checkout: Path) -> str:
+def clean_settings_json(checkout: Path, snapshot: str | None = None) -> str:
     """Read the shared values through the checkout's Git filter."""
-    snapshot = (checkout / SETTINGS_JSON).read_text(encoding="utf-8")
+    if snapshot is None:
+        snapshot = (checkout / SETTINGS_JSON).read_text(encoding="utf-8")
     blob = git(checkout, "hash-object", "-w", f"--path={SETTINGS_JSON}", "--stdin", input_text=snapshot).strip()
     return git(checkout, "cat-file", "blob", blob)
 
@@ -660,12 +671,19 @@ def recover_move(checkout: Path, head: str) -> None:
     elif head == plan["source"]:
         rollback_move(checkout, plan, writes)
     else:
-        for path, after in plan["after"].items():
-            current = live_text(checkout / path)
-            if current != after and (current != plan["before"][path]
-                                     or file_version(checkout / path) != writes["files_before"][path]):
-                raise worktree_edit(path)
-        write_files(checkout, plan["after"])
+        with locked_journal(journal_path()) as pending:
+            saves = pending_files(checkout, pending)
+            restored = dict(plan["after"])
+            for path, after in restored.items():
+                current = live_text(checkout / path)
+                before = plan["before"][path]
+                if current == after or (current == before and file_version(checkout / path) == writes["files_before"][path]):
+                    continue
+                keys = saves.get(path)
+                if not keys or current != apply_accepted_values(before or "", keys):
+                    raise worktree_edit(path)
+                restored[path] = apply_accepted_values(after or "", keys)
+            write_files(checkout, restored)
     marker.unlink()
 
 
@@ -841,12 +859,33 @@ def apply_move(checkout: Path, rows: WaitingRows) -> None:
 
 
 @contextmanager
-def locked_checkout(checkout: Path) -> Generator[None]:
-    """Serialize changes to the live files and the checkout index."""
+def locked_checkout(checkout: Path, *, wait: bool = True) -> Generator[None]:
+    """Serialize moves of the checkout index and HEAD."""
     path = move_marker(checkout).with_suffix(".lock")
-    with path.open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    held = _CHECKOUT_LOCKS.get()
+    if path in held:
         yield
+        return
+    with path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        token = _CHECKOUT_LOCKS.set(held | {path})
+        try:
+            yield
+        finally:
+            _CHECKOUT_LOCKS.reset(token)
+
+
+def recover_abandoned_move(checkout: Path) -> None:
+    """Recover an interrupted move if no checkout worker holds its lock."""
+    marker = move_marker(checkout)
+    if not marker.exists() or marker.with_suffix(".lock") in _CHECKOUT_LOCKS.get():
+        return
+    with ExitStack() as locks:
+        try:
+            locks.enter_context(locked_checkout(checkout, wait=False))
+        except BlockingIOError:
+            return
+        restore_checkout(checkout, "HEAD")
 
 
 def move_to(checkout: Path, target: str, *, fast_forward: bool = False, expected_head: str = "") -> None:
@@ -861,25 +900,33 @@ def restore_checkout(checkout: Path, head: str) -> None:
     recover_move(checkout, head)
     if (checkout / "config").resolve() != conf.directory().resolve():
         return
+    orders, legacy = checkout_orders(checkout, head)
+    with locked_journal(journal_path()) as pending:
+        pending.settle(orders, legacy)
+        files: dict[str, str] = {}
+        for relative, keys in pending_files(checkout, pending).items():
+            files[relative] = apply_accepted_values(live_text(checkout / relative) or "", keys)
+        write_files(checkout, files)
+
+
+def checkout_orders(checkout: Path, head: str) -> tuple[SaveOrders, dict[tuple[str, str], str | None]]:
+    """Read published orders and legacy values before taking the journal lock."""
     orders = published_orders(checkout, head)
-    path = journal_path()
-    snapshot = read_journal(path)
+    snapshot = read_journal(journal_path())
     old_keys = {(stem, key) for stem, keys in snapshot.accepted.items() for key, save in keys.items()
                 if isinstance(save, AcceptedSave) and not save.order and not orders.get(stem, {}).get(key)}
     old_keys.update((row.stem, row.key) for row in snapshot.changes if not row.publish_on_main and not row.save_order)
     legacy = {(stem, key): tree_value(checkout, head, stem, key) for stem, key in old_keys}
-    with locked_journal(path) as pending:
-        pending.settle(orders, legacy)
-    files: dict[str, str] = {}
-    for relative, keys in pending_files(checkout, pending).items():
-        contents = live_text(checkout / relative) or ""
-        for key, save in keys.items():
-            if isinstance(save, AcceptedSave):
-                setting = conf.settings(contents).get(key)
-                contents = (replace_value(contents, setting.line, save.value) if setting
-                            else append_setting(contents, key, save.value))
-        files[relative] = contents
-    write_files(checkout, files)
+    return orders, legacy
+
+
+def apply_accepted_values(contents: str, keys: Mapping[str, AcceptedOrder]) -> str:
+    for key, save in keys.items():
+        if isinstance(save, AcceptedSave):
+            setting = conf.settings(contents).get(key)
+            contents = (replace_value(contents, setting.line, save.value) if setting
+                        else append_setting(contents, key, save.value))
+    return contents
 
 
 def restore_live(checkout: Path) -> None:

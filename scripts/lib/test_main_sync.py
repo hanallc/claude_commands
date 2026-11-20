@@ -16,6 +16,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import override
 
+from scripts.lib.git_test_support import git_fixture_environment
 from scripts.lib import live_settings, main_sync, waiting_rows
 from scripts.message import session_send
 
@@ -33,6 +34,7 @@ class MainSyncTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(unittest.mock.patch.dict(os.environ, git_fixture_environment(), clear=True))
         _ = self.enterContext(redirect_stdout(io.StringIO()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(unittest.mock.patch.dict(os.environ, {main_sync.STATE_ENV: str(self.root / "state")}))

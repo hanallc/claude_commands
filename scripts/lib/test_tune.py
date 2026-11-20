@@ -570,6 +570,19 @@ class TuneTests(PublicationTestCase):
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
         self.assertEqual(self.waiting(), [])
 
+    def test_tune_records_a_save_while_checkout_work_holds_the_lock(self) -> None:
+        repo = self.repository
+        base = repo.head()
+        with mock.patch.dict(os.environ, repo.env, clear=True), waiting_rows.locked_checkout(repo.checkout):
+            saved = self.save_amount("3")
+            self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+            self.assertIn("main: waits", saved.stdout)
+            self.assertEqual(repo.head(), base)
+            self.assertIn("amount=3", repo.config.read_text())
+        with mock.patch.dict(os.environ, repo.env, clear=True):
+            self.assertEqual(land_queue.take_next(), "")
+        self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
+
     def test_notes_notify_the_runner_without_waiting_on_the_journal(self) -> None:
         repo = self.repository
         base = repo.remote_tip()
@@ -597,6 +610,31 @@ class TuneTests(PublicationTestCase):
         deliveries = [shlex.split(line)[-1] for line in repo.ssh_log.read_text().splitlines() if "apply-json" in line]
         edits = cast(waiting_rows.SettingsJsonEdits, json.loads(deliveries[-1]))
         self.assertEqual(edits["values"], {"x": 2, "y": 2})
+
+    def test_mac_delivery_resends_reversed_fields_after_a_lost_reply(self) -> None:
+        repo = self.repository
+        initial = '{"permissions": {"allow": [], "deny": ["Write"]}}\n'
+        settings = self.seed_settings(initial)
+        mac_text = initial
+        deliveries = 0
+
+        def deliver(command: str, **options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal mac_text, deliveries
+            edits = cast(waiting_rows.SettingsJsonEdits, json.loads(shlex.split(command)[-1]))
+            mac_text = waiting_rows.apply_settings_json_edits(mac_text, edits)
+            deliveries += 1
+            return subprocess.CompletedProcess([str(options["ssh_program"]), command],
+                                               255 if deliveries == 1 else 0, "", "lost reply")
+
+        with (mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()),
+              mock.patch.object(main_publish, "ssh", deliver), land_runs.landing([repo.head()])):
+            _ = settings.write_text(initial.replace('"allow": []', '"allow": ["Read"]'))
+            self.assertEqual(live_settings.main(["publish-json", "--message", "Allow Read"]), 0)
+            self.assertIn('"Read"', mac_text)
+            _ = settings.write_text(initial)
+            self.assertEqual(live_settings.main(["publish-json", "--message", "Restore allow"]), 0)
+        self.assertEqual(deliveries, 2)
+        self.assertEqual(cast(object, json.loads(mac_text)), cast(object, json.loads(initial)))
 
     def test_a_refused_main_keeps_the_value_live_for_the_runner(self) -> None:
         repo = self.repository

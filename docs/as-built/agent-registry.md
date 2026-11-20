@@ -101,7 +101,8 @@ The quota alert's `edit_registry` uses this mode for its role routing.
 The Mac forwards its edits to natedev and records the acceptance of each edit.
 `publish_pending(registry)` commits and pushes the rows that HEAD does not have.
 It returns `False` when another process holds the main push lock or a land runs.
-Each quota part of the notes timer calls it through `live_settings.publish_waiting()`.
+The notes timer requests a gap for pending registry rows through `live_settings.publish_waiting()`.
+The land runner publishes those rows when it takes the gap.
 Exhaustion reports that the file is edited but not shared.
 Local integration uses fast-forward only.
 A successful push with failed local reconciliation reports both facts.

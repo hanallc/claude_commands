@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.copies.copies_test_support import copies_environment
+from scripts.lib.git_test_support import git_fixture_environment
 from scripts.lib import build_folders
 
 import fcntl
@@ -200,7 +201,7 @@ class CiPointsTests(unittest.TestCase):
         for relative in (".claude/scripts/message/send.py", ".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py", ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
-        self.env = {**os.environ, **copies_environment(self.root, repository="origin"), "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
+        self.env = {**git_fixture_environment(), **copies_environment(self.root, repository="origin"), "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "CI_POINTS_REVIEW_REGIME": str(self.bin / "review_regime.py"),
                     "MODELS_CONFIG_FILE": str(self.root / "config/models.conf"),

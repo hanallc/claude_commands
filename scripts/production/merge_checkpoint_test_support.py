@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import IO, ClassVar, NamedTuple, cast, override
 
 from scripts.lib import process_group
-from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lib.git_test_support import git_fixture_environment, write_fixture_git_config
 
 from scripts.production import merge_checkpoint
 from scripts.production import change_review
@@ -323,7 +323,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         home = self.root / "home"
         private = copies_environment(root, repository="origin")
         _ = shutil.copyfile(Path(private["CONF_DIR"]) / "build_folders.conf", root / "build_folders.conf")
-        self.env = {**os.environ, **private, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
+        self.env = {**git_fixture_environment(), **private, **interpreter_cache_environment(root.parent / "interpreter-cache"), "CONF_DIR": str(self.root), "REVIEW_LINKS_ROOT": str(self.root / "links"), "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
                     "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root.parent)), "GIT_CONFIG_NOSYSTEM": "1",
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
                     "MERGE_CHECKPOINT_STYLE_LEDGER": str(self.bin / "style_ledger.py"),

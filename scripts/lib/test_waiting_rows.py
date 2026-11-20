@@ -17,6 +17,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib.git_test_support import git_fixture_environment
 from scripts.lib import conf, live_settings, main_publish, main_sync, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -35,7 +36,7 @@ class WaitingRowsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="waiting-rows-")))
-        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment = git_fixture_environment()
         environment.update(HOME=str(self.root), XDG_STATE_HOME=str(self.root / "state"),
                            GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                            GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="Rows Test", GIT_AUTHOR_EMAIL="rows@example.invalid",
@@ -203,6 +204,27 @@ class WaitingRowsTests(unittest.TestCase):
         waiting_rows.move_to(self.checkout, target)
         with pending_rows() as changes:
             self.assertEqual(changes, [])
+
+    def test_move_restores_a_new_save_that_arrives_after_preflight(self) -> None:
+        relative = "config/example.conf"
+        self.edit(relative, "amount=2", "amount=3")
+        target = self.peer_change(relative, "limit=5", "limit=7")
+        give = waiting_rows.give
+        saved: list[live_settings.StagedSave | live_settings.UnchangedSave] = []
+
+        def save_during_move(checkout: Path, rows: waiting_rows.WaitingRows,
+                             environment: dict[str, str] | None = None) -> None:
+            if environment is None:
+                saved.append(live_settings.stage_save(live_settings.WaitingChange(
+                    "example", "amount", "4", "tune(example): change amount")))
+            give(checkout, rows, environment)
+
+        with mock.patch.object(waiting_rows, "give", save_during_move):
+            waiting_rows.move_to(self.checkout, target)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
+        self.assertEqual((self.checkout / relative).read_text(),
+                         SETTINGS.replace("amount=2", "amount=4").replace("limit=5", "limit=7"))
 
     def test_the_registry_fast_forward_restores_a_save_after_its_check(self) -> None:
         path = "config/statusline.conf"

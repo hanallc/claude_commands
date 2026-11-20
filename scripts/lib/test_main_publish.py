@@ -18,6 +18,7 @@ from typing import final, override
 import unittest
 from unittest import mock
 
+from scripts.lib.git_test_support import git_fixture_environment
 from scripts.lib import land_main, live_settings, main_publish, main_push_lock, main_sync, waiting_rows
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -59,7 +60,7 @@ class PublicationRepository:
         registry = root / "models.conf"
         _ = registry.write_text("[codex.agents]\ngpt-6.2-sol=high\n", encoding="utf-8")
         self.env = {
-            **os.environ, "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
+            **git_fixture_environment(), "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
             "MODELS_CONFIG_FILE": str(registry),
             "ZONE_SSH": str(self.ssh), "ZONE_STATE": str(root / "state"),
             "SSH_LOG": str(self.ssh_log), "OFFLINE": str(root / "OFFLINE"),
@@ -116,6 +117,21 @@ class MainPublishTests(PublicationTestCase):
     @override
     def setUp(self) -> None:
         self.enterContext(mock.patch.dict(os.environ, self.repository.env, clear=True))
+
+    def test_fixture_setup_keeps_an_inherited_index_and_repository_untouched(self) -> None:
+        repo = self.repository
+        index = repo.checkout / ".git/index"
+        snapshot = index.read_bytes()
+        overrides = {
+            "GIT_DIR": str(index.parent), "GIT_WORK_TREE": str(repo.checkout), "GIT_INDEX_FILE": str(index),
+            "GIT_OBJECT_DIRECTORY": str(index.parent / "objects"), "GIT_COMMON_DIR": str(index.parent),
+        }
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir=repo.root)))
+        with mock.patch.dict(os.environ, overrides):
+            other = PublicationRepository(root)
+        self.assertEqual(index.read_bytes(), snapshot)
+        self.assertEqual(other.git(other.checkout, "rev-parse", "--show-toplevel"), str(other.checkout))
+        self.assertEqual(other.git(other.checkout, "log", "-1", "--format=%s"), "initial")
 
     def test_publish_reports_only_completed_or_failed_hooks(self) -> None:
         repo = self.repository
@@ -206,6 +222,26 @@ class MainPublishTests(PublicationTestCase):
         self.assertIsNotNone(receipt)
         assert receipt is not None
         self.assertEqual(repo.remote_tip(), receipt["commit"])
+        self.assertIn("308800", repo.git(repo.origin, "show", "main:settings.json"))
+
+    def test_direct_push_records_a_save_while_checkout_work_holds_the_lock(self) -> None:
+        repo = self.repository
+        settings = repo.checkout / "settings.json"
+        _ = settings.write_text('{"autoCompactWindow": 308800}\n')
+        _ = repo.git(repo.checkout, "add", settings.name)
+        _ = repo.git(repo.checkout, "commit", "-qm", "Approve the window")
+        candidate = repo.head()
+        script = Path(__file__).resolve().parents[1] / "validate_and_push/push_direct.sh"
+        with waiting_rows.locked_checkout(repo.checkout):
+            result = subprocess.run(["bash", str(script), "--publish-only", candidate], cwd=repo.checkout,
+                                    env={**repo.env, "PUSH_TARGET_BRANCH": "main"}, capture_output=True, text=True,
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(f"{candidate} queued", result.stdout)
+            self.assertTrue(live_settings.waiting_rows_for_main())
+            self.assertEqual(repo.head(), candidate)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(land_queue.take_next(), "")
         self.assertIn("308800", repo.git(repo.origin, "show", "main:settings.json"))
 
     def test_setting_save_can_enter_the_journal_during_git_commit_creation(self) -> None:

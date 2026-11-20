@@ -13,6 +13,7 @@ from typing import cast, override
 
 from unittest.mock import patch
 
+from scripts.lib.git_test_support import git_fixture_environment
 from scripts.lib import file_lock, main_push_lock
 from scripts.production import land_queue
 
@@ -23,6 +24,7 @@ class MainPushLockRecordTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(patch.dict(os.environ, git_fixture_environment(), clear=True))
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.checkout = Path(folder.name)
