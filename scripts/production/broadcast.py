@@ -173,6 +173,8 @@ def _send(session: str, sender: str, text: str, *options: str) -> tuple[Outcome,
             return "kept", "in a review"
         if result.header.outcome in ("sent", "skipped", "replaced"):
             return "sent", ""
+    if SEND != session_send.SEND_SCRIPT and done.returncode == 0 and not done.stdout.strip():
+        return "sent", ""
     return "NOT sent", (done.stdout or done.stderr).strip() or f"exit {done.returncode}"
 
 
