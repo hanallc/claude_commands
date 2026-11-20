@@ -41,6 +41,12 @@ The prefix also applies after leading spaces. Generated stamp lines keep their o
 Queue records and logs keep the raw caller text.
 These fields do not change the recipient, reply name, or message key.
 
+### Messages during an ad hoc review
+
+`review_hold=off` in `config/send.conf` disables message holding for all sessions.
+The next user prompt or session start delivers any messages still held.
+Use `/tune` to set `review_hold=on` when message holding can resume.
+
 ### Replies to relay sockets
 
 The headless Claude relay uses the session name `relay/<sender>`. Before Claude starts, the launcher records the sender and process start in `message/relay_senders/<pid>.identity`.

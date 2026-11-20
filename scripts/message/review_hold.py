@@ -155,13 +155,17 @@ def _write_state(path: Path, state: ReviewState) -> None:
     write_text_atomic(path, json.dumps(record), new_file_mode=0o600)
 
 
-def _idle(active_at: float, at: float) -> bool:
-    return at - active_at >= conf.read("send").number("review_hold_idle_minutes") * 60
+def _enabled(settings: conf.ConfigRead) -> bool:
+    value = settings.origin("review_hold", str)
+    return isinstance(value, conf.UsableLiveValue) and value.value == "on"
 
 
 def _hold_open(count: Path, state: ReviewState, at: float) -> bool:
     activity = state.last_activity
-    return not isinstance(activity, EndedReview) and _read_count(count) > 0 and not _idle(activity, at)
+    if isinstance(activity, EndedReview) or not _read_count(count):
+        return False
+    settings = conf.read("send")
+    return _enabled(settings) and at - activity < settings.number("review_hold_idle_minutes") * 60
 
 
 def keep_native_message(session: str, message: ReviewMessage) -> bool:
@@ -276,7 +280,9 @@ def set_count(session: str, remaining: int, at: float, emit: Callable[[str], Non
         with _locked(path):
             state = _read_state(count, path)
             if remaining > 0:
-                if item_count(session) == 0:
+                if not _enabled(conf.read("send")):
+                    _write_state(path, replace(state, last_activity=EndedReview.HOLD_ENDED))
+                elif item_count(session) == 0:
                     _write_state(path, replace(state, last_activity=_last_prompt(path, at), release_pending=False))
                 elif not path.exists():
                     _write_state(path, state)
