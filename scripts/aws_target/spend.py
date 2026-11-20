@@ -20,6 +20,7 @@ class Spend:
     days: tuple[ledger.DailySpend, ...]
     daily_limit: Decimal
     monthly_limit: Decimal
+    refused_bills: tuple[ledger.RefusedBillRecord, ...] = ()
 
 
 NO_SPEND = Spend((), Decimal(0), Decimal(0))
@@ -37,7 +38,8 @@ class MonthSpend:
 
 
 def spend_from(inputs: measurement.MeasurementInputs, snapshot: measurement.AwsMeasurement | aws_config.MeasurementUnavailable,
-               directory: Path, instant: int, last_day: str) -> Spend | aws_config.MeasurementUnavailable:
+               book: ledger.CostLedger, instant: int, last_day: str,
+               refused: tuple[ledger.RefusedBillRecord, ...]) -> Spend | aws_config.MeasurementUnavailable:
     """The shown spend days from measurement inputs that the caller already read."""
     if isinstance(snapshot, aws_config.MeasurementUnavailable):
         return snapshot
@@ -45,8 +47,7 @@ def spend_from(inputs: measurement.MeasurementInputs, snapshot: measurement.AwsM
         return aws_config.MeasurementUnavailable(snapshot.costs.reason)
     if isinstance(inputs.settings, aws_config.MeasurementUnavailable):
         return inputs.settings
-    book = ledger.CostLedger(directory)
-    refused_days = {record.day.isoformat(): record.day for record in book.refused_bill_records(instant)
+    refused_days = {record.day.isoformat(): record.day for record in refused
                     if isinstance(record.day, date) and record.day.isoformat() <= last_day}
     spends = book.spend_days(inputs.settings, instant, estimate_days=tuple(refused_days.values()))
     newest_bill_day = max((spend.day for spend in spends if spend.source == 'AWS bill'), default='')
@@ -60,15 +61,16 @@ def spend_from(inputs: measurement.MeasurementInputs, snapshot: measurement.AwsM
 
     days = sorted((spend for spend in spends if shown(spend)),
                   key=lambda spend: spend.day, reverse=True)
-    return Spend(tuple(days), inputs.settings.daily_limit_usd, inputs.settings.monthly_limit_usd)
+    return Spend(tuple(days), inputs.settings.daily_limit_usd, inputs.settings.monthly_limit_usd, refused)
 
 
 def read_spend(settings_path: Path, directory: Path, instant: int, last_day: str) -> Spend | aws_config.MeasurementUnavailable:
     """Read the ledger and return the shown spend days through the last day."""
     try:
-        inputs = measurement.read_inputs(aws_config.account_settings_path(), directory)
+        book = ledger.CostLedger(directory)
+        inputs = measurement.read_inputs(settings_path, directory)
         snapshot = measurement.read_measurement(settings_path, directory, instant, inputs=inputs)
-        return spend_from(inputs, snapshot, directory, instant, last_day)
+        return spend_from(inputs, snapshot, book, instant, last_day, book.refused_bill_records(instant))
     except (OSError, ValueError, ArithmeticError) as error:
         return aws_config.MeasurementUnavailable(str(error))
 

@@ -18,7 +18,7 @@ from unittest import mock
 import unittest
 from zoneinfo import ZoneInfo
 
-from scripts.aws_target import aws_trial, config, ledger, run_cost, spend
+from scripts.aws_target import aws_trial, config, ledger, measurement, run_cost, spend
 from scripts.aws_target.ledger_test_support import CostFixture, charge_readings, git_only, instant
 from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
@@ -1094,7 +1094,7 @@ class LedgerTests(CostFixture):
                 path = self.state / 'charges' / name
                 if change:
                     _ = path.write_text('{' + change + path.read_text()[1:])
-                self.assertEqual(ledger.read_saved_bill(path, now).usable_bill, reason)
+                self.assertEqual(ledger.read_saved_bill(path, now).validation_result, reason)
                 self.assertEqual(self.book.read_bills(), (bill,))
                 self.assertEqual(self.book.validated_bills(now), ())
                 published = spend.read_spend(self.settings, self.state, now, '2026-01-16')
@@ -1168,6 +1168,51 @@ class LedgerTests(CostFixture):
         assert isinstance(page, spend.Spend)
         estimate = next(row for row in page.days if row.day == '2026-01-31')
         self.assertEqual((estimate.source, estimate.usd), ('estimated from the newest bill', Decimal(3)))
+
+    def test_refused_day_keeps_gate_compute_and_hana_storage_in_spend_and_usage(self) -> None:
+        january = date(2026, 1, 31)
+        start = instant('2026-01-31T00:00:00Z')
+        end = start + 86400
+        now = end + 86400
+        self.inventory(start)
+        self.observe(start, 'terminated')
+        self.write_complete_bill_fixture(ledger.ChargeRead(january.isoformat(), now, start, end,
+            Decimal(5), Decimal(0), Decimal(0)), 'alias.json')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-02-01', now, end, now,
+            Decimal(2), Decimal(0), Decimal(0)))
+        storage = ledger.HanaStorageExposure(start, Decimal(90), ledger.HanaExposureClosed(end))
+        gate = ledger.GateReservation('fixture-gate', end - 3 * 3600, end, Decimal(1), Decimal(0),
+            ledger.GateTerminated(end, 'fixture'), region='us-east-2')
+        for storage_rows, gate_rows, amount in (([storage], [], 3), ([], [gate], 3), ([storage], [gate], 6)):
+            with self.subTest(storage=bool(storage_rows), gate=bool(gate_rows)):
+                with self.book.transaction() as state:
+                    state.hana_storage = storage_rows
+                    state.gate_reservations = gate_rows
+                page = spend.read_spend(self.settings, self.state, now, '2026-02-02')
+                assert isinstance(page, spend.Spend)
+                estimate = next(row for row in page.days if row.day == january.isoformat())
+                self.assertEqual((estimate.source, estimate.usd), ('estimated from the newest bill', Decimal(amount)))
+                self.assertEqual(measurement.daily_usage(self.settings, self.state, january.isoformat(), now),
+                                 measurement.DailyUsage(0, Decimal(amount)))
+
+    def test_unreadable_and_malformed_bills_refuse_admission_without_saving_a_reservation(self) -> None:
+        now = self.start + 3600
+        self.inventory(self.start)
+        self.observe(self.start, 'terminated')
+        path = self.state / 'charges' / '2026-01-14.json'
+        path.parent.mkdir()
+        attempt = ledger.GateReservation('fixture-gate', now, now + 60, Decimal(0), Decimal(0), region='us-east-2')
+        _ = path.write_text('{broken')
+        with self.assertRaises(json.JSONDecodeError):
+            _ = self.book.reserve_gate(self.settings, attempt)
+        self.assertEqual(self.book.read_snapshot().gate_reservations, [])
+        path.unlink()
+        path.mkdir()
+        with self.assertRaises(IsADirectoryError):
+            _ = self.book.reserve_gate(self.settings, attempt)
+        self.assertEqual(self.book.read_snapshot().gate_reservations, [])
+        path.rmdir()
+        self.assertIsInstance(self.book.reserve_gate(self.settings, attempt), ledger.GateReserved)
 
     def test_n01_admission_refuses_wrong_name_bill_and_local_compute_at_four_dollars(self) -> None:
         self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'monthly_limit_usd': '4'})

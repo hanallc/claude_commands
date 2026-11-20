@@ -99,6 +99,15 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 .tile-usd { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .tile-note { color: var(--ink-3); font-size: 0.82rem; }
 #spend .note { margin-top: 12px; }
+#bill-refusals { position: relative; width: fit-content; }
+#bill-refusal-summary { padding: 0; border: 0; background: none; color: inherit; font: inherit;
+  text-align: left; text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
+#bill-refusal-tip { display: none; position: absolute; z-index: 10; inset-inline-start: 0; inset-block-start: 100%;
+  grid-template-columns: max-content minmax(0, 1fr); gap: 2px 24px; margin: 0; width: max-content;
+  max-width: min(24rem, calc(100vw - 80px)); padding: 10px 12px; border-radius: 8px;
+  background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.45; }
+#bill-refusal-tip dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+#bill-refusals:not([data-dismissed]):is(:hover, :focus-within) #bill-refusal-tip { display: grid; }
 #quota-help { margin-top: 10px; font-size: 0.86rem; }
 #quota-help summary { font-weight: 600; cursor: pointer; }
 #quota-help li + li { margin-top: 4px; }
@@ -117,6 +126,10 @@ __PAGE_TITLE__
   <h2>Spend <span class="unit">(USD)</span></h2>
   <div class="tiles" id="spend-tiles"></div>
   <p class="note" id="spend-note"></p>
+  <div class="note" id="bill-refusals" hidden>
+    <button type="button" id="bill-refusal-summary" aria-describedby="bill-refusal-tip"></button>
+    <dl id="bill-refusal-tip" role="tooltip" aria-label="Refused AWS bills by UTC day"></dl>
+  </div>
   <div id="settled-notes"></div>
 </section>
 <nav class="regions" aria-label="AWS table filters">
@@ -356,6 +369,16 @@ function drawLaunchState() {
 }
 drawLaunchState();
 
+const billRefusals = document.getElementById("bill-refusals");
+const billRefusalSummary = document.getElementById("bill-refusal-summary");
+const billRefusalTip = document.getElementById("bill-refusal-tip");
+for (const event of ["pointerenter", "focusin"]) {
+  billRefusals.addEventListener(event, () => billRefusals.removeAttribute("data-dismissed"));
+}
+addEventListener("keydown", event => {
+  if (event.key === "Escape") billRefusals.setAttribute("data-dismissed", "");
+});
+
 function drawSpend() {
   const tiles = data.spend.tiles.map(tile => {
     const box = element("div", undefined, "tile");
@@ -364,6 +387,12 @@ function drawSpend() {
   });
   document.getElementById("spend-tiles").replaceChildren(...tiles);
   document.getElementById("spend-note").textContent = data.spend.unavailable || data.spend.forecast;
+  const refused = data.spend.refused_bills ?? [];
+  billRefusals.hidden = refused.length === 0;
+  billRefusalSummary.textContent = refused.length === 0 ? "" : refused.length === 1
+    ? "1 AWS bill record refused; that day shows our estimate."
+    : `${refused.length} AWS bill records refused; those days show our estimate.`;
+  billRefusalTip.replaceChildren(...refused.flatMap(record => [element("dt", record.day), element("dd", record.reason)]));
   const settled = (data.settled_notes ?? []).map(note => element("p", note, "note"));
   document.getElementById("settled-notes").replaceChildren(...settled);
 }

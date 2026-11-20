@@ -1427,9 +1427,11 @@ class RefusedBillRecord:
     day: date | BillDayUnavailable
     reason: BillRecordRejection
 
+    def day_label(self) -> str:
+        return self.day.isoformat() if isinstance(self.day, date) else 'UTC day unavailable'
+
     def display_line(self) -> str:
-        day = self.day.isoformat() if isinstance(self.day, date) else 'UTC day unavailable'
-        return f'{day}: {self.reason.value}'
+        return f'{self.day_label()}: {self.reason.value}'
 
 
 def _refused_bill_day(name: str, label: str = '') -> date | BillDayUnavailable:
@@ -1448,7 +1450,7 @@ class SavedBillRecord:
     """A pricing read and its eligibility for the account bill."""
 
     pricing_read: ChargeRead
-    usable_bill: _ChargeReadHistory | BillRecordRejection
+    validation_result: _ChargeReadHistory | BillRecordRejection
 
 
 def read_saved_bill(path: Path, now: int) -> SavedBillRecord:
@@ -1936,10 +1938,13 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
     for charge in gate_compute_intervals(state, now, settings.box_minimum_seconds, reserve=reserve):
         gate_compute.setdefault(charge.source, []).append(charge)
     hana_readings = () if reserve else readings
-    # Older storage is already in the newest bill's account-wide storage estimate.
+    # The newest bill supplies storage costs on ordinary unbilled days.
     hana_storage = [r for r in state.hana_storage if latest is None or reserve or r.at >= latest.period_end]
     hana = hana_intervals(replace(state, hana_storage=hana_storage), now,
         settings.box_minimum_seconds, reserve=reserve, readings=hana_readings)
+    earlier_storage = hana_intervals(replace(state, hana_compute=[],
+        hana_storage=[r for r in state.hana_storage if r.at < latest.period_end]), now,
+        settings.box_minimum_seconds) if estimate_days and latest is not None and not reserve else ()
     saved_days = {r.day for r in readings if r.account_bill and r.period_end <= now}
     exposures = tuple(state.run_exposures(settings.observation_max_age_seconds)) if latest is not None else ()
     hana_by_region = {(kind, region): hana_intervals(replace(state, hana_storage=[],
@@ -1949,7 +1954,8 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
     if hana:
         last = max(last, datetime.fromtimestamp(max(r.end for r in hana) - 1, zone).date())
     days: list[DailySpend] = []
-    requested_days = sorted({day for day in estimate_days if day < first})
+    local_estimate_days = set(estimate_days)
+    requested_days = sorted(day for day in local_estimate_days if day < first)
     report_days = (first + timedelta(days=offset) for offset in range((last - first).days + 1))
     for day in chain(requested_days, report_days):
         key = day.isoformat()
@@ -1971,6 +1977,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
                 include(charge)
         query_usd = period_cost(tuple(row for row in base.intervals if row.kind == 'explorer'), start, end)
         bill = bills.get(key)
+        use_local_charges = day in local_estimate_days
         runs = sum(start <= r.at < end and isinstance(r.state, (GateRunning, GateTerminated))
                    for r in state.gate_reservations)
         if bill is not None:
@@ -1989,7 +1996,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             source = 'AWS bill'
         else:
             source = 'estimated from the newest bill' if latest is not None else 'estimated from configured prices'
-            if latest is not None:
+            if latest is not None and not use_local_charges:
                 idle = _uses_idle_bill_carry(key, start, end, latest, saved_days, exposures)
                 for group in _carried_bill_groups(latest, idle=idle):
                     groups[group.group] += group.usd
@@ -2010,13 +2017,13 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
                     groups[spend_group('SpotUsage:' + reservation.instance_type)] += _overlap(charge, start, end)
                     include(charge)
         if bill is None:
-            for charge in hana:
+            for charge in chain(hana, earlier_storage if use_local_charges else ()):
                 groups['storage' if charge.kind == 'fixed' else 'kept-machine compute'] += _overlap(charge, start, end)
                 include(charge)
         for reservation in state.gate_reservations:
             if isinstance(reservation.state, GateAbsent) or not start <= reservation.at < end:
                 continue
-            if ((bill is None and latest is None) or
+            if ((bill is None and (latest is None or use_local_charges)) or
                     (reserve and gate_is_open(reservation))):
                 allowance = gate_allowance(reservation)
                 groups['other'] += allowance.usd
@@ -2309,20 +2316,20 @@ class CostLedger:
     def validated_bills(self, now: int) -> tuple[ChargeRead, ...]:
         """Read the usable account amount for each canonical UTC day."""
         return tuple(bill.latest for record in self._saved_bill_records(now)
-                     if isinstance(bill := record.usable_bill, _ChargeReadHistory))
+                     if isinstance(bill := record.validation_result, _ChargeReadHistory))
 
     def read_complete_day_amounts(self, settings: SpendingSettings, now: int) -> tuple[CompleteDayAmount, ...]:
         """Read amounts that qualify to replace a full UTC day."""
         return tuple(CompleteDayAmount(bill.latest.period_start, bill.latest.period_end, bill.latest.actual_usd)
                      for record in self._saved_bill_records(now)
-                     if isinstance(bill := record.usable_bill, _ChargeReadHistory)
+                     if isinstance(bill := record.validation_result, _ChargeReadHistory)
                      and _bill_is_complete(bill, settings, now))
 
     def read_charge_watch(self, settings: SpendingSettings, now: int) -> tuple[WatchedChargeDay, ...]:
         """Read the settlement status of each usable account bill."""
         return tuple(WatchedChargeDay(history.latest.day, history.latest.at, _charge_settlement(history, settings))
                      for record in self._saved_bill_records(now)
-                     if isinstance(history := record.usable_bill, _ChargeReadHistory))
+                     if isinstance(history := record.validation_result, _ChargeReadHistory))
 
     def refused_bill_records(self, now: int) -> tuple[RefusedBillRecord, ...]:
         """List the records that fail the account bill checks."""
@@ -2335,7 +2342,7 @@ class CostLedger:
             except (ValueError, ArithmeticError):
                 refused.append(RefusedBillRecord(_refused_bill_day(path.name), BillRecordRejection.MALFORMED))
             else:
-                if isinstance(reason := record.usable_bill, BillRecordRejection):
+                if isinstance(reason := record.validation_result, BillRecordRejection):
                     day = _refused_bill_day(path.name, record.pricing_read.day)
                     refused.append(RefusedBillRecord(day, reason))
         return tuple(refused)
@@ -2418,7 +2425,7 @@ class CostLedger:
                 unavailable = unavailable or CostEvidenceUnavailable(str(error))
                 continue
             pricing_reads.append(record.pricing_read)
-            history = record.usable_bill
+            history = record.validation_result
             if isinstance(history, BillRecordRejection):
                 continue
             read = history.latest

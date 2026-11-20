@@ -2375,9 +2375,11 @@ class ReportDaySelection(Enum):
 def aws_section(connection: sqlite3.Connection, day: str, *,
                 day_selection: ReportDaySelection = ReportDaySelection.EXPLICIT_DATE) -> list[str]:
     """Render local costs and comparison estimates without contacting AWS or a peer."""
-    settings = conf.path('aws_target')
+    configuration = conf.read(aws_config.account_settings_path())
     directory = ssh_target_state_directory('aws')
     instant = int(time.time())
+    book = ledger.CostLedger(directory)
+    refused = book.refused_bill_records(instant)
     today = datetime.fromtimestamp(instant, UTC).date().isoformat()
     current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
     last_estimate_day = today if current_report else day
@@ -2386,14 +2388,14 @@ def aws_section(connection: sqlite3.Connection, day: str, *,
     usage_day = today if use_current_day else day
     spend: aws_spend.Spend | measurement.MeasurementUnavailable = aws_spend.NO_SPEND
     try:
-        inputs = measurement.read_inputs(aws_config.account_settings_path(), directory)
+        inputs = measurement.read_inputs(configuration, directory)
         if isinstance(inputs.settings, aws_config.SpendingSettings):
             usage_zone = inputs.settings.accounting_zone
             if use_current_day:
                 usage_day = datetime.fromtimestamp(instant, usage_zone).date().isoformat()
-        snapshot = measurement.read_measurement(settings, directory, instant, inputs=inputs)
-        usage = measurement.daily_usage(settings, directory, usage_day, instant, inputs=inputs)
-        spend = aws_spend.spend_from(inputs, snapshot, directory, instant, last_estimate_day)
+        snapshot = measurement.read_measurement(configuration, directory, instant, inputs=inputs)
+        usage = measurement.daily_usage_from(inputs, book, usage_day, instant, refused)
+        spend = aws_spend.spend_from(inputs, snapshot, book, instant, last_estimate_day, refused)
     except (OSError, ValueError, ArithmeticError) as error:
         snapshot = measurement.MeasurementUnavailable(str(error))
         usage = measurement.MeasurementUnavailable(str(error))
@@ -2403,13 +2405,12 @@ def aws_section(connection: sqlite3.Connection, day: str, *,
     start, end = measurement.accounting_day_bounds(date.fromisoformat(usage_day), instant, usage_zone)
     saving = aws_report.estimate_wait_saved(connection, usage_day, 'aws', bounds=(store.utc_iso(start), store.utc_iso(end)))
     lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, spend.daily_limit, today)]
-    refused = ledger.CostLedger(directory).refused_bill_records(instant)
     if refused:
         lines.extend(('**AWS bill records excluded from daily spend**', ''))
         lines.extend(f'- {record.display_line()}' for record in refused)
         lines.append('')
     try:
-        pace_days = conf.read(settings).whole('spend_pace_days')
+        pace_days = configuration.whole('spend_pace_days')
         lines.extend(spend_analysis(shown, spend.monthly_limit, date.fromisoformat(today), pace_days))
     except (OSError, ValueError, KeyError) as error:
         lines.extend((f'Month forecast unavailable: {error}.', ''))
@@ -2443,8 +2444,8 @@ def aws_section(connection: sqlite3.Connection, day: str, *,
         notes.append(f'{bill_read}Ledger query fees for these days: ${fees:.2f}.')
     notes.append('Spot compute can include the older Spot builder.')
     try:
-        days = conf.read(settings).whole('gate_type_window_days')
-        comparison = aws_report.gate_type_report(directory, day, days)
+        days = configuration.whole('gate_type_window_days')
+        comparison = aws_report.gate_type_report(directory, day, days, home=configuration.text('region'))
         lines.extend(comparison.tables)
         notes.append(comparison.source)
     except (OSError, ValueError, ArithmeticError, KeyError) as error:
