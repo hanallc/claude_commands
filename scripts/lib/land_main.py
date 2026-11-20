@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 
@@ -138,14 +139,19 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         rerun = (f"cd {shlex.quote(str(root))} && LANDED_SHA={shlex.quote(sha)} "
                  + f"LANDED_BRANCH={shlex.quote(branch)} bash {shlex.quote(str(hook))}")
         try:
-            result = subprocess.run(["bash", str(hook)], cwd=root,
-                                    env={**os.environ, "LANDED_SHA": sha, "LANDED_BRANCH": branch}, check=False,
-                                    timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
-            if result.returncode:
-                return Landed(sha, branch, pushed, HookFailed(result.returncode, rerun))
+            with subprocess.Popen(["bash", str(hook)], cwd=root, start_new_session=True,
+                                  env={**os.environ, "LANDED_SHA": sha, "LANDED_BRANCH": branch}) as process:
+                try:
+                    code = process.wait(timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    return Landed(sha, branch, pushed, HookFailed(124, rerun))
+            if code:
+                return Landed(sha, branch, pushed, HookFailed(code, rerun))
             write_text_atomic(record, sha + "\n")
-        except subprocess.TimeoutExpired:
-            return Landed(sha, branch, pushed, HookFailed(124, rerun))
         except OSError:
             return Landed(sha, branch, pushed, HookFailed(1, rerun))
         return Landed(sha, branch, pushed, HookDone())

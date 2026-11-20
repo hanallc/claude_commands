@@ -157,18 +157,19 @@ def drain(checkout: Path | None, *, pulled: PurePosixPath | None) -> list[str]:
     if isinstance(change, main_publish.NoPendingMacPull):
         return []
     for pull in change.pulls:
-        if pull.mac != pulled:
+        if pull.mac != pulled or pull.tip:
             source = pull.source if isinstance(pull.source, Path) else checkout
             if source is None:
                 return [f"mac: the {change.label} change waits since {change.since}; run /zone on natedev"]
             outcome = main_publish.pull_mac(source, mac=pull.mac, ssh_program=os.environ.get("ZONE_SSH") or "ssh")
             if isinstance(outcome, main_publish.MacPullFailed):
                 return [f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}"]
-        main_publish.clear_pull_only(pull.mac)
+        main_publish.clear_pull_only(pull.mac, confirmed=pull)
     delivered, summary = broadcast_on_mac(change.text) if change.text else (True, "no message")
     if not delivered:
         return [f"mac: pulled the {change.label} change; its message still waits: {summary}"]
-    main_publish.clear_pull_only(notice_delivered=True)
+    if change.text:
+        main_publish.clear_notice(change)
     return [f"mac: took the {change.label} change queued at {change.since}; message {summary}"]
 
 
@@ -205,7 +206,7 @@ def set_zone(name: str) -> int:
                 delivered, summary = broadcast(text, here=True)
             print(f"broadcast: {summary}")
     try:
-        lines = live_settings.publish(checkout, wait=True) or []
+        lines = live_settings.publish(checkout)
     except (Refusal, OSError) as error:
         print(f"zone: {' '.join(str(error).split())}", file=sys.stderr)
         print(f"zone: {zone} stays live; main does not have it; the notes timer tries again", file=sys.stderr)

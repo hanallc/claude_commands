@@ -708,7 +708,8 @@ Tune, zone, and the registry writer apply their changes before publication.
 When the gap is free, these tools can publish immediately.
 Otherwise, one detached publisher waits for the running lands to finish.
 The publisher checks for running lands while it holds the gap lock.
-Registration for a new land waits on that lock until the push ends.
+Registration for a new land can wait for the push, the post-push hook, and local reconciliation.
+The publisher releases the gap before it requests the Mac pull over SSH.
 The notes timer starts the publisher again if a failed push leaves changes pending.
 Ask natemerge for a gap before you push a hand commit to main during a land.
 

@@ -107,7 +107,8 @@ class SetTests(unittest.TestCase):
         _ = ssh.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{self.fakes / "ssh.py"}" "$@"\n', encoding="utf-8")
         ssh.chmod(0o755)
         _ = (self.fakes / "broadcast.py").write_text(FAKE_BROADCAST, encoding="utf-8")
-        self.env = {key: value for key, value in git_fixture_environment().items() if key != "USER_ZONE"}
+        self.env = {key: value for key, value in git_fixture_environment().items()
+                    if key not in ("USER_ZONE", "MAC_WAKE_PROGRAM")}
         self.env.update({
             "HOME": str(self.root), "MODELS_CONFIG_FILE": str(self.checkout / "config/models.conf"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
@@ -247,7 +248,7 @@ class SetTests(unittest.TestCase):
             self.assertIn("broadcast.py", calls[-1][-1])
             self.assertFalse(self.queued().exists())
 
-    def test_a_promotion_that_pulled_the_mac_sends_only_the_message(self) -> None:
+    def test_a_promotion_without_a_tip_receipt_retries_the_saved_pull(self) -> None:
         _ = (self.fakes / "OFFLINE").write_text("", encoding="utf-8")
         _ = self.run_zone("set", "Curacao")
         (self.fakes / "OFFLINE").unlink()
@@ -255,8 +256,9 @@ class SetTests(unittest.TestCase):
         drained = self.run_zone("drain", "--pulled", "~/.claude")
         self.assertIn("mac: took the America/Curacao change", drained.stdout)
         calls = self.log("ssh.log")[before:]
-        self.assertEqual(len(calls), 1)
-        self.assertIn("broadcast.py", calls[0][-1])
+        self.assertEqual(len(calls), 2)
+        self.assertIn("git fetch -q --no-write-fetch-head", calls[0][-1])
+        self.assertIn("broadcast.py", calls[1][-1])
         self.assertEqual(self.run_zone("drain", "--pulled", "~/.claude").stdout, "")
 
         with self.subTest(pulled="~/custom checkout"):

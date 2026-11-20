@@ -11,11 +11,12 @@ import json
 from pathlib import Path, PurePosixPath
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import textwrap
-from typing import final, override
+from typing import cast, final, override
 import unittest
 from unittest import mock
 
@@ -60,7 +61,8 @@ class PublicationRepository:
         registry = root / "models.conf"
         _ = registry.write_text("[codex.agents]\ngpt-6.2-sol=high\n", encoding="utf-8")
         self.env = {
-            **git_fixture_environment(), "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
+            **{key: value for key, value in git_fixture_environment().items() if key != "MAC_WAKE_PROGRAM"},
+            "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
             "MODELS_CONFIG_FILE": str(registry),
             "ZONE_SSH": str(self.ssh), "ZONE_STATE": str(root / "state"),
             "SSH_LOG": str(self.ssh_log), "OFFLINE": str(root / "OFFLINE"),
@@ -247,8 +249,30 @@ class MainPublishTests(PublicationTestCase):
         self.assertFalse(live_settings.waiting_rows_for_main())
         request = main_publish.read_queue()
         assert isinstance(request, main_publish.PendingMacPull)
-        self.assertEqual(request.pulls, (main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), repo.checkout),))
+        self.assertEqual(request.pulls,
+                         (main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), repo.checkout, repo.head()),))
         self.assertEqual(repo.mac_pulls(), 0)
+
+    def test_an_older_mac_pull_preserves_the_newer_publisher_request(self) -> None:
+        repo = self.repository
+        _ = live_settings.stage_save(live_settings.WaitingChange("example", "amount", "3", "tune(example): first Save"))
+
+        def pull_before_second_save(_checkout: Path, **_options: object) -> main_publish.MacPulled:
+            _ = live_settings.stage_save(live_settings.WaitingChange("example", "amount", "4", "tune(example): second Save"))
+            with mock.patch.object(live_settings, "pull_mac", side_effect=RuntimeError("publisher stopped")):
+                with self.assertRaisesRegex(RuntimeError, "publisher stopped"):
+                    _ = live_settings.publish(repo.checkout)
+            return main_publish.MacPulled()
+
+        with mock.patch.object(main_publish, "pull_mac", side_effect=pull_before_second_save):
+            self.assertIn("mac: pulled", live_settings.publish(repo.checkout))
+        self.assertFalse(live_settings.waiting_rows_for_main())
+        request = main_publish.read_queue()
+        assert isinstance(request, main_publish.PendingMacPull)
+        self.assertEqual(request.pulls,
+                         (main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), repo.checkout, repo.head()),))
+        self.assertEqual(live_settings.pull_mac(repo.checkout, request.label), "mac: pulled")
+        self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)
 
     def test_push_refuses_to_publish_unrelated_local_commits(self) -> None:
         repo = self.repository
@@ -422,6 +446,28 @@ class MainPublishTests(PublicationTestCase):
         self.assertIsInstance(result.hook, land_main.HookFailed)
         self.assertFalse((repo.checkout / ".git/post-push-completed").exists())
         self.assertEqual(repo.remote_tip(), repo.head())
+
+    def test_hook_timeout_stops_a_child_that_keeps_the_hook_open(self) -> None:
+        repo = self.repository
+        hook = repo.checkout / ".claude/config/post_push.sh"
+        hook.parent.mkdir(parents=True)
+        _ = repo.change()
+        _ = repo.git(repo.checkout, "commit", "-qam", "tune(example): change amount")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(TEST_HANG_GUARD_SECS)
+            _, port = cast(tuple[str, int], listener.getsockname())
+            child = (f"import socket; connection = socket.create_connection(('127.0.0.1', {port})); "
+                     "connection.sendall(b'1'); connection.recv(1)")
+            _ = hook.write_text(f"{shlex.quote(sys.executable)} -S -c {shlex.quote(child)} &\nwait\n")
+            result = land_main.land(repo.checkout, repo.head(), time_limit=land_main.CommandTimeLimit(2))
+            self.assertIsInstance(result.hook, land_main.HookFailed)
+            child_connection, _ = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
+            with child_connection:
+                child_connection.settimeout(2)
+                self.assertEqual(child_connection.recv(1), b"1")
+                self.assertEqual(child_connection.recv(1), b"")
 
     def test_ready_refuses_a_checkout_off_main_before_any_publication(self) -> None:
         repo = self.repository

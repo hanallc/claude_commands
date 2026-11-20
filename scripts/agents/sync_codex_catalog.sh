@@ -13,7 +13,7 @@ CHECK_ONLY=false
 # writes every row it does know, but it must not close the freshness gate.
 CATALOG_INCOMPLETE=false
 # On natedev the rows are live at once; the notes timer commits them when main is free.
-# The Mac sends its live rows to the natedev publisher.
+# The Mac publishes its rows through its local Git checkout.
 if [[ "$(uname -s)" == Linux ]]; then
     export MODELS_CONFIG_PUBLISH="${MODELS_CONFIG_PUBLISH:-later}"
 fi

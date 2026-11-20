@@ -14,13 +14,13 @@ import argparse
 import json
 import os
 import platform
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Literal, NamedTuple
+from typing import NamedTuple
 
 from scripts.lib import conf, land_main, mac_wake, main_publish, main_push_lock, models_registry
 from scripts.lib.atomic_file import write_text_atomic
@@ -200,7 +200,7 @@ def _publish_main(checkout: Path) -> PublishedSettings:
     label = " ".join(names) or "main"
     if names:
         main_publish.queue_pull_only(label, "main has the Save",
-                                     pulls=(main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), checkout),))
+                                     pulls=(main_publish.MacCheckoutPull(main_publish.DEFAULT_MAC_CHECKOUT, checkout, tip),))
     lines.append(f"main: {detail}")
     with locked_journal(journal_path()) as pending:
         retained = [change for change in pending.changes if change not in changes]
@@ -213,9 +213,8 @@ def _publish_main(checkout: Path) -> PublishedSettings:
     return PublishedSettings(checkout, label, lines)
 
 
-def publish(checkout: Path, *, wait: Literal[True] = True) -> list[str]:
+def publish(checkout: Path) -> list[str]:
     """Publish in a confirmed gap or start the detached waiter."""
-    _ = wait  # Keep the keyword for the tune and zone callers.
     result = None
     with main_push_lock.settings_push(checkout) as gap, ExitStack() as locks:
         if isinstance(gap, land_queue.SettingsGap):
@@ -295,13 +294,18 @@ def _publish_in_gap() -> PublishedSettings | None:
 
 
 def pull_mac(checkout: Path, label: str) -> str:
+    pending = main_publish.read_queue()
+    request = next((pull for pull in pending.pulls if pull.mac == main_publish.DEFAULT_MAC_CHECKOUT
+                    and (pull.source == checkout or isinstance(pull.source, main_publish.MacPullSourceUnrecorded))),
+                   None) if isinstance(pending, main_publish.PendingMacPull) else None
     outcome = main_publish.pull_mac(checkout, ssh_program=os.environ.get("ZONE_SSH") or "ssh",
                                     time_limit=main_publish.CommandTimeLimit(_seconds("mac_pull_seconds")))
     if isinstance(outcome, main_publish.MacPulled):
-        main_publish.clear_pull_only()
+        if request is not None:
+            main_publish.clear_pull_only(confirmed=request)
         return "mac: pulled"
     main_publish.queue_pull_only(label, outcome.reason,
-                                 pulls=(main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), checkout),))
+                                 pulls=(main_publish.MacCheckoutPull(main_publish.DEFAULT_MAC_CHECKOUT, checkout),))
     _ = mac_wake.start()
     return f"mac: queued ({outcome.reason}); it goes out as soon as the Mac answers"
 

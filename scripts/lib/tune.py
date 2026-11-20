@@ -72,7 +72,7 @@ def change(args: RequestedValueChange) -> int:
             print(line)
         print(live_settings.write_mac(args.file, args.key, args.value, order=saved.order))
     try:
-        lines = live_settings.publish(checkout, wait=True) or []
+        lines = live_settings.publish(checkout)
     except (main_publish.Refusal, OSError) as error:
         print(f"tune: {' '.join(str(error).split())}", file=sys.stderr)
         print(f"tune: {args.key}={args.value} stays live; main does not have it; the notes timer tries again",
