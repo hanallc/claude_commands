@@ -87,3 +87,67 @@ def month_spend(days: Sequence[ledger.DailySpend], today: date, pace_days: int) 
     forecast = sum((spend.usd for spend in month if spend.day < today.isoformat()), Decimal(0)) + pace * days_left
     gates = sum((group.usd for spend in billed for group in spend.groups if group.group == ledger.SPEND_GROUPS[0]), Decimal(0))
     return MonthSpend(sum((spend.usd for spend in month), Decimal(0)), forecast, pace, len(billed), gates / billed_usd)
+
+
+REPORT_ATTEMPTS = 3
+
+
+@dataclass(frozen=True)
+class UtcSpendReport:
+    evidence: ledger.SpendEvidenceAt
+    account: ledger.UtcAccountSpend | ledger.SpendEvidenceUnavailable
+
+
+def read_utc_spend(directory: Path, instant: int, *, settings_path: Path | None = None
+                   ) -> UtcSpendReport | ledger.SpendEvidenceUnavailable:
+    """Read and evaluate one revision for both reports."""
+    evidence = ledger.capture_spend_evidence(directory, instant, settings_path=settings_path)
+    if isinstance(evidence, ledger.SpendEvidenceUnavailable):
+        return evidence
+    return UtcSpendReport(evidence, ledger.utc_account_spend(evidence))
+
+
+def utc_day_label(day: ledger.UtcDaySpend) -> str:
+    if isinstance(day.source, ledger.SettledWatchAmount):
+        return 'accepted bill (AWS provisional)' if day.source.bill.provisional else 'accepted bill'
+    if isinstance(day.source, ledger.UnsettledAwsFloor):
+        return 'unsettled AWS amount so far'
+    return 'estimate'
+
+
+def utc_month_to_date(account: ledger.UtcAccountSpend, today: date) -> ledger.UtcMonthSpend:
+    month_start = today.replace(day=1)
+    return ledger.UtcMonthSpend(month_start, tuple(day for day in account.days if month_start <= day.day <= today))
+
+
+@dataclass(frozen=True)
+class UtcMonthForecast:
+    forecast: Decimal
+    pace: Decimal
+    accepted_days: int
+    gate_share: Decimal
+
+    def display_line(self) -> str:
+        days = 'day' if self.accepted_days == 1 else 'days'
+        return (f'Month forecast: ${self.forecast:.2f} at ${self.pace:.2f} a day. '
+                f'The pace uses {self.accepted_days} accepted bill {days}.')
+
+
+@dataclass(frozen=True)
+class NoAcceptedBillPace:
+    """No accepted bills supply a pace for the forecast."""
+
+
+def utc_month_forecast(account: ledger.UtcAccountSpend, today: date, pace_days: int
+                      ) -> UtcMonthForecast | NoAcceptedBillPace:
+    accepted = sorted((day for day in account.days if isinstance(day, ledger.UtcDaySpend)
+                       and isinstance(day.source, ledger.SettledWatchAmount) and day.day <= today),
+                      key=lambda day: day.day)[-pace_days:]
+    billed_usd = sum((day.usd for day in accepted), Decimal(0))
+    if billed_usd <= 0:
+        return NoAcceptedBillPace()
+    pace = billed_usd / len(accepted)
+    days_left = calendar.monthrange(today.year, today.month)[1] - today.day + 1
+    forecast = utc_month_to_date(account, today - date.resolution).usd if today.day > 1 else Decimal(0)
+    gates = sum((group.usd for day in accepted for group in day.groups if group.group == ledger.SPEND_GROUPS[0]), Decimal(0))
+    return UtcMonthForecast(forecast + pace * days_left, pace, len(accepted), gates / billed_usd)

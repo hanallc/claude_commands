@@ -8,11 +8,13 @@ except FileNotFoundError:
 import argparse
 from collections import defaultdict
 from collections.abc import Sequence, Set
+import hashlib
 import json
 import os
+import re
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum, StrEnum
@@ -21,7 +23,7 @@ from pathlib import Path
 from statistics import median
 from typing import Literal, NotRequired, TypedDict
 
-from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, measurement, quota_requests, run_cost, spend as aws_spend, spot_table
+from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
 from scripts.build_queue import memory_files
 from scripts.disks.disks_page import shared_step_tip
 from scripts.lib import conf
@@ -379,6 +381,44 @@ def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: 
     return {'unavailable': '', 'tiles': tiles, 'forecast': forecast, 'refused_bills': refused}
 
 
+def utc_spend_data(report: aws_spend.UtcSpendReport) -> SpendData:
+    """Show the captured UTC amounts and their sources."""
+    account, evidence = report.account, report.evidence
+    if isinstance(account, ledger.SpendEvidenceUnavailable):
+        return {'unavailable': f'AWS spend unavailable: {account.reason}.', 'tiles': [],
+                'forecast': '', 'refused_bills': []}
+    today = datetime.fromtimestamp(evidence.at, UTC).date()
+    yesterday = today - timedelta(days=1)
+    days = {row.day: row for row in account.days}
+    tiles: list[SpendTile] = []
+    for label, day in (('Today', today), ('Yesterday', yesterday)):
+        row = days.get(day)
+        if isinstance(row, ledger.UtcDaySpend):
+            limit = f'${evidence.settings.daily_limit_usd:.2f}'
+            note = f'UTC {day}, {aws_spend.utc_day_label(row)} of the {limit} daily limit. {row.gate_runs} gate runs.'
+            tiles.append({'label': label, 'usd': f'${row.usd:.2f}', 'note': note})
+        else:
+            reason = row.reason if isinstance(row, ledger.UtcDayWithoutEvidence) else 'no spend evidence'
+            tiles.append({'label': label, 'usd': '—', 'note': f'UTC {day}. {reason}.'})
+    month = aws_spend.utc_month_to_date(account, today)
+    has_amount = any(isinstance(day, ledger.UtcDaySpend) for day in month.days)
+    tiles.append({'label': 'Month to date', 'usd': f'${month.usd:.2f}' if has_amount else '—',
+                  'note': f'UTC {today:%Y-%m}, of the ${evidence.settings.monthly_limit_usd:.2f} monthly limit.'
+                  if has_amount else f'UTC {today:%Y-%m}. No spend evidence.'})
+    forecast = aws_spend.utc_month_forecast(account, today, evidence.account_configuration.whole('spend_pace_days'))
+    forecast_line = ''
+    if isinstance(forecast, aws_spend.UtcMonthForecast):
+        forecast_line = (f'{forecast.display_line()} '
+                         f'32-CPU gate compute is {forecast.gate_share:.0%} of the spend on those days.')
+    estimate_dates = {row.day for row in (*month.days, days.get(yesterday))
+                      if isinstance(row, ledger.UtcDaySpend) and isinstance(row.source, ledger.EstimatedUtcDaySpend)}
+    refused: list[RefusedBillData] = [
+        {'days': labels, 'reason': record.reason.value}
+        for record in evidence.refused_bills
+        if (labels := [day.isoformat() for day in record.days if day in estimate_dates])]
+    return {'unavailable': '', 'tiles': tiles, 'forecast': forecast_line, 'refused_bills': refused}
+
+
 def launch_state(records: Sequence[dict[str, object]], gate_switch: cloud_gate.CloudGateSetting) -> LaunchState:
     """Show the switch state or the latest launch evidence."""
     if gate_switch is cloud_gate.CloudGateSwitch.OFF:
@@ -579,35 +619,55 @@ def settled_amount_notes(watched: Sequence[ledger.WatchedChargeDay]) -> tuple[st
     return (summary, *changes)
 
 
-def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
-    """Write the page with the tables of the local snapshot and run ledger."""
-    started = time.perf_counter()
-    configuration = conf.read(settings_path if settings_path is not None else aws_config.account_settings_path())
-    today = datetime.fromtimestamp(now, UTC).date().isoformat()
-    book = ledger.CostLedger(directory)
-    watched: tuple[ledger.WatchedChargeDay, ...] = ()
+@dataclass(frozen=True)
+class PageAbsent:
+    """The destination has no published page."""
+
+
+@dataclass(frozen=True)
+class LegacyPageRevision:
+    stamp: ledger.SpendFileStamp
+
+
+@dataclass(frozen=True)
+class PublishedPageRevision:
+    at: int
+    source_digest: str
+    stamp: ledger.SpendFileStamp
+
+
+class PagePublicationDeferred(RuntimeError):
+    """The sources do not support the first publication yet."""
+
+
+def published_revision(path: Path) -> PageAbsent | LegacyPageRevision | PublishedPageRevision:
     try:
-        inputs = measurement.read_inputs(configuration, directory)
-        snapshot = measurement.read_measurement(configuration, directory, now, inputs=inputs)
-        read = aws_spend.spend_from(inputs, snapshot, book, now, today, book.refused_bill_records(now))
-    except (OSError, ValueError, ArithmeticError) as error:
-        read = aws_config.MeasurementUnavailable(str(error))
-    else:
-        if isinstance(inputs.settings, aws_config.SpendingSettings):
-            try:
-                watched = book.read_charge_watch(inputs.settings, now)
-            except (OSError, ValueError):
-                pass
-    spend = spend_data(read, now, configuration.whole('spend_pace_days'))
+        with path.open('rb') as page:
+            info = os.fstat(page.fileno())
+            stamp = ledger.SpendFileStamp(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            _ = page.seek(max(0, info.st_size - 128))
+            footer = page.read()
+    except FileNotFoundError:
+        return PageAbsent()
+    metadata = re.search(rb'\n<!-- aws-spend-revision ([0-9]{1,20}) ([0-9a-f]{64}) -->\n$', footer)
+    if metadata is None:
+        return LegacyPageRevision(stamp)
+    return PublishedPageRevision(int(metadata[1]), metadata[2].decode('ascii'), stamp)
+
+
+def render_report_page(directory: Path, report: aws_spend.UtcSpendReport, started: float) -> str:
+    evidence = report.evidence
+    now, values, configuration = evidence.at, evidence.gate_configuration, evidence.account_configuration
+    spend = utc_spend_data(report)
+    watched = report.account.settlement_notes if isinstance(report.account, ledger.UtcAccountSpend) else ()
     try:
         placement = ledger.read_spot_placement_scores(directory)
     except (OSError, ValueError, KeyError) as error:
         print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
         placement = ()
-    values = cloud_gate.settings()
     gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
     tables = spot_table.spot_tables_from(directory, now, values, configuration, gate_pricing=gate_pricing)
-    data = page_data(tables, spend, now, placement, launch_records=book.launches(),
+    data = page_data(tables, spend, now, placement, launch_records=evidence.launches,
                      settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
     comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
@@ -617,14 +677,44 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     tip = shared_step_tip(memory_files.PAGE_SOURCE.read_text(encoding='utf-8'))
     data['render_seconds'] = time.perf_counter() - started
     # Escape closing tags inside JSON values.
-    page = (page_frame.template(source, 'AWS', 'aws')
+    return (page_frame.template(source, 'AWS', 'aws')
             .replace('__STEP_TIP_STYLE__', tip.style, 1)
             .replace('__AWS_QUOTA_HELP__', quota_help(), 1)
             .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/'))
             .replace('__AWS_GATE_TIME_DATA__', json.dumps(gate_time_data).replace('</', '<\\/')))
+
+
+def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
+    """Replace the page while the captured sources and the page revision match."""
+    started = time.perf_counter()
     page_path = folder / PAGE_NAME
-    folder.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(page_path, page, new_file_mode=0o644)
+    account_path = settings_path if settings_path is not None else aws_config.account_settings_path()
+    reason = 'The AWS page revision changed during publication.'
+    for attempt in range(aws_spend.REPORT_ATTEMPTS):
+        before = published_revision(page_path)
+        report = aws_spend.read_utc_spend(directory, now, settings_path=account_path)
+        if isinstance(report, ledger.SpendEvidenceUnavailable):
+            reason = report.reason
+            continue
+        evidence = report.evidence
+        digest = hashlib.sha256(repr(evidence.revision.sources).encode()).hexdigest()
+        page = render_report_page(directory, report, started)
+        with ledger.verify_spend_revision(directory, evidence) as verified:
+            if isinstance(verified, ledger.SpendEvidenceUnavailable):
+                reason = verified.reason
+                continue
+            current = published_revision(page_path)
+            if current != before:
+                continue
+            if isinstance(current, PublishedPageRevision) and (
+                current.at > evidence.at or (attempt > 0 and (current.at, current.source_digest) == (evidence.at, digest))
+            ):
+                return page_path
+            folder.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(page_path, page + f'\n<!-- aws-spend-revision {evidence.at} {digest} -->\n', new_file_mode=0o644)
+            return page_path
+    if isinstance(published_revision(page_path), PageAbsent):
+        raise PagePublicationDeferred(reason)
     return page_path
 
 
@@ -632,7 +722,11 @@ def publish_configured() -> int:
     """Publish the page from the AWS target state folder; the hourly job calls this."""
     from scripts.build_targets.target_config import ssh_target_state_directory
 
-    _ = publish(ssh_target_state_directory('aws'), int(time.time()), output_folder())
+    try:
+        _ = publish(ssh_target_state_directory('aws'), int(time.time()), output_folder())
+    except PagePublicationDeferred as error:
+        print(f'aws_page: {error}', file=sys.stderr)
+        return 1
     return 0
 
 
@@ -653,7 +747,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Publish the AWS page, or print its link.')
     _ = parser.add_argument('command', choices=('publish', 'link'))
     if parser.parse_args(argv, namespace=Arguments()).command == 'publish':
-        _ = publish_configured()
+        if status := publish_configured():
+            return status
     print(page_url())
     return 0
 

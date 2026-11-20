@@ -2367,6 +2367,42 @@ def spend_analysis(spends: Sequence[ledger.DailySpend], monthly_limit: Decimal, 
             '', f'32-CPU gate compute is {month.gate_share:.0%} of the spend on those days.', '']
 
 
+def utc_spend_summary(report: aws_spend.UtcSpendReport, today: date) -> list[str]:
+    """Show the UTC report amounts and the source of each amount."""
+    account, evidence = report.account, report.evidence
+    if isinstance(account, ledger.SpendEvidenceUnavailable):
+        return [f'AWS spend unavailable: {account.reason}.', '']
+    days = sorted((row for row in account.days if isinstance(row, ledger.UtcDaySpend) and row.day <= today),
+                  key=lambda row: row.day, reverse=True)
+    if not days:
+        return ['No spend days.', '']
+    latest = days[0]
+    label = 'Today' if latest.day == datetime.fromtimestamp(evidence.at, UTC).date() else 'Latest day'
+    source = aws_spend.utc_day_label(latest)
+    lines = [f'**{label} (UTC {latest.day}, {source}): ${latest.usd:.2f} of the ${evidence.settings.daily_limit_usd:.2f} daily limit. '
+             + f'{latest.gate_runs} gate runs.**', '',
+             '| Day (UTC) | Total | 32-CPU compute | 16-CPU compute | Kept-machine compute | Storage | Other | Gate runs | Source |',
+             '|---|---:|---:|---:|---:|---:|---:|---:|---|']
+    groups = (*ledger.SPEND_GROUPS[:2], 'kept-machine compute', 'storage')
+    for row in days:
+        amounts = {group.group: group.usd for group in row.groups}
+        named = [amounts.get(group, Decimal(0)) for group in groups]
+        other = row.usd - sum(named, Decimal(0))
+        cells = ' | '.join(f'${amount:.2f}' for amount in (*named, other))
+        lines.append(f'| {row.day} | ${row.usd:.2f} | {cells} | {row.gate_runs} | {aws_spend.utc_day_label(row)} |')
+    lines.append('')
+    month = aws_spend.utc_month_to_date(account, today)
+    if any(isinstance(day, ledger.UtcDaySpend) for day in month.days):
+        total = f'Month to date (UTC {today:%Y-%m}): ${month.usd:.2f} of the ${evidence.settings.monthly_limit_usd:.2f} monthly limit.'
+        lines.extend((f'**{total}**', ''))
+        pace_days = evidence.account_configuration.whole('spend_pace_days')
+        forecast = aws_spend.utc_month_forecast(account, today, pace_days)
+        if isinstance(forecast, aws_spend.UtcMonthForecast):
+            lines.extend((forecast.display_line(), '',
+                          f'32-CPU gate compute is {forecast.gate_share:.0%} of the spend on those days.', ''))
+    return lines
+
+
 class ReportDaySelection(Enum):
     EXPLICIT_DATE = 'explicit_date'
     CURRENT_DAY = 'current_day'
@@ -2375,45 +2411,51 @@ class ReportDaySelection(Enum):
 def aws_section(connection: sqlite3.Connection, day: str, *,
                 day_selection: ReportDaySelection = ReportDaySelection.EXPLICIT_DATE) -> list[str]:
     """Render local costs and comparison estimates without contacting AWS or a peer."""
-    configuration = conf.read(aws_config.account_settings_path())
+    account_path = aws_config.account_settings_path()
     directory = ssh_target_state_directory('aws')
     instant = int(time.time())
     book = ledger.CostLedger(directory)
-    refused = book.refused_bill_records(instant)
+    spend_report = aws_spend.read_utc_spend(directory, instant, settings_path=account_path)
+    for _attempt in range(1, aws_spend.REPORT_ATTEMPTS):
+        if isinstance(spend_report, aws_spend.UtcSpendReport):
+            break
+        spend_report = aws_spend.read_utc_spend(directory, instant, settings_path=account_path)
+    if isinstance(spend_report, aws_spend.UtcSpendReport):
+        measurement_source = spend_report.evidence
+        configuration = measurement_source.account_configuration
+        refused = measurement_source.refused_bills
+    else:
+        configuration = conf.read(account_path)
+        measurement_source = configuration
+        refused = book.refused_bill_records(instant)
     today = datetime.fromtimestamp(instant, UTC).date().isoformat()
     current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
     last_estimate_day = today if current_report else day
     usage_zone = ZoneInfo('UTC')
     use_current_day = day_selection is ReportDaySelection.CURRENT_DAY
     usage_day = today if use_current_day else day
-    spend: aws_spend.Spend | measurement.MeasurementUnavailable = aws_spend.NO_SPEND
     try:
-        inputs = measurement.read_inputs(configuration, directory)
+        inputs = measurement.read_inputs(measurement_source, directory)
         if isinstance(inputs.settings, aws_config.SpendingSettings):
             usage_zone = inputs.settings.accounting_zone
             if use_current_day:
                 usage_day = datetime.fromtimestamp(instant, usage_zone).date().isoformat()
-        snapshot = measurement.read_measurement(configuration, directory, instant, inputs=inputs)
+        snapshot = measurement.read_measurement(measurement_source, directory, instant, inputs=inputs)
         usage = measurement.daily_usage_from(inputs, book, usage_day, instant, refused)
-        spend = aws_spend.spend_from(inputs, snapshot, book, instant, last_estimate_day, refused)
     except (OSError, ValueError, ArithmeticError) as error:
         snapshot = measurement.MeasurementUnavailable(str(error))
         usage = measurement.MeasurementUnavailable(str(error))
-    if isinstance(spend, measurement.MeasurementUnavailable):
-        spend = aws_spend.NO_SPEND
-    shown = list(spend.days)
     start, end = measurement.accounting_day_bounds(date.fromisoformat(usage_day), instant, usage_zone)
     saving = aws_report.estimate_wait_saved(connection, usage_day, 'aws', bounds=(store.utc_iso(start), store.utc_iso(end)))
-    lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, spend.daily_limit, today)]
+    lines = ['### AWS', '']
+    if isinstance(spend_report, aws_spend.UtcSpendReport):
+        lines.extend(utc_spend_summary(spend_report, date.fromisoformat(last_estimate_day)))
+    else:
+        lines.extend((f'AWS spend unavailable: {spend_report.reason}.', ''))
     if refused:
         lines.extend(('**AWS bill records excluded from daily spend**', ''))
         lines.extend(f'- {record.display_line()}' for record in refused)
         lines.append('')
-    try:
-        pace_days = configuration.whole('spend_pace_days')
-        lines.extend(spend_analysis(shown, spend.monthly_limit, date.fromisoformat(today), pace_days))
-    except (OSError, ValueError, KeyError) as error:
-        lines.extend((f'Month forecast unavailable: {error}.', ''))
     notes: list[str] = []
     if saving.steps > 0:
         dollars = uptime = 'unavailable'
@@ -2436,11 +2478,16 @@ def aws_section(connection: sqlite3.Connection, day: str, *,
     if isinstance(snapshot, measurement.MeasurementUnavailable):
         notes.append(f'AWS measurement unavailable: {snapshot.reason}.')
     else:
-        fees = sum((spend.query_usd for spend in shown), Decimal(0))
         bill_read = ''
-        if snapshot.charge_reads:
-            at = max(reading.at for reading in snapshot.charge_reads)
-            bill_read = datetime.fromtimestamp(at, user_zone()).strftime('Bill read %Y-%m-%d %H:%M %Z. ')
+        if isinstance(spend_report, aws_spend.UtcSpendReport):
+            reads = [row.pricing_read.at for row in spend_report.evidence.bill_records
+                     if isinstance(row, ledger.SavedBillRecord) and not isinstance(row.validation_result, ledger.BillRecordRejection)]
+            if reads:
+                bill_read = datetime.fromtimestamp(max(reads), user_zone()).strftime('Bill read %Y-%m-%d %H:%M %Z. ')
+        fees = Decimal(0)
+        if isinstance(snapshot.costs, ledger.CostEstimate):
+            fees = sum((row.usd for row in snapshot.costs.intervals if row.kind == 'explorer'
+                        and datetime.fromtimestamp(row.start, UTC).date().isoformat() <= last_estimate_day), Decimal(0))
         notes.append(f'{bill_read}Ledger query fees for these days: ${fees:.2f}.')
     notes.append('Spot compute can include the older Spot builder.')
     try:

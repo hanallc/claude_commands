@@ -29,6 +29,8 @@ from scripts.review_links import page_frame
 class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
     def test_quota_help_is_closed_and_contains_the_ordered_steps_and_case_link(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        with ledger.CostLedger(self.state).transaction():
+            pass
         page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
         section = page.read_text().split('<section class="card" id="prices-quotas">', 1)[1].split('</section>', 1)[0]
         details = re.search(r'<details id="quota-help">(.*?)</details>\s*$', section, flags=re.S)
@@ -89,11 +91,28 @@ gpu_spot_quota_request_vcpus=32
 """)
 
 
+def save_published_bill(book: ledger.CostLedger, bill: ledger.ChargeRead,
+                        reads: tuple[tuple[int, Decimal], ...] = ()) -> None:
+    with book.transaction() as state:
+        charges = book.directory / 'charges'
+        charges.mkdir(exist_ok=True)
+        record = ledger.charge_record(bill)
+        if reads:
+            record['amount_reads'] = [{'at': at, 'actual_usd': str(amount)} for at, amount in reads]
+        _ = (charges / (bill.day + '.json')).write_text(json.dumps(record))
+        state.reconciliations = [row for row in state.reconciliations if row.period_start != bill.period_start]
+        state.reconciliations.append(ledger.CostReconciliation(
+            bill.at, bill.period_start, bill.period_end, bill.actual_usd, 'Cost Explorer', bill.query_usd))
+        state.charge_refresh_at = max(state.charge_refresh_at, bill.at)
+
+
 class PageCostFixture(ledger_test_support.CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
         configure_page_costs(self)
+        with ledger.CostLedger(self.state).transaction():
+            pass
 
 
 class AwsGpuQuotaSummaryTests(PageCostFixture):
@@ -268,17 +287,17 @@ class AwsPageLaunchStateTests(PageCostFixture):
         self.assertEqual(conf.read('cloud_gate').words('spot_candidate_regions'), ('us-east-1',))
 
 
-class AwsPageSettledAmountsTests(ledger_test_support.CostFixture):
+class AwsPageSettledAmountsTests(PageCostFixture):
     def test_spend_shows_the_settled_summary_and_changed_amounts(self) -> None:
         self.text_setting('accounting_zone', 'America/Los_Angeles')
         checked = ledger_test_support.instant('2026-11-19T00:15:00Z')
         start = ledger_test_support.instant('2026-11-04T00:00:00Z')
         end = start + 9 * 86400
-        charges = self.state / 'charges'
-        charges.mkdir()
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(start, (), 'fixture', builder_removed=True))
         settled = Decimal('7.73')
         unsettled = ledger.ChargeRead('2026-11-13', checked, end, end + 86400, settled, Decimal(0), Decimal(0))
-        _ = (charges / '2026-11-13.json').write_text(json.dumps(ledger.charge_record(unsettled)))
+        save_published_bill(book, unsettled)
 
         def settled_notes() -> list[str]:
             page = aws_page.publish(self.state, checked, self.root / 'page', settings_path=self.settings)
@@ -288,22 +307,16 @@ class AwsPageSettledAmountsTests(ledger_test_support.CostFixture):
 
         self.assertEqual(settled_notes(), [])
         reads = ledger_test_support.charge_readings(start, end, settled, Decimal(0))
+        history = ((checked - 2 * 86400, settled), (checked - 86400, settled))
         for bill in reads:
-            record = ledger.charge_record(replace(bill, at=checked - 86400))
-            record['amount_reads'] = [
-                {'at': checked - 2 * 86400, 'actual_usd': '7.73'},
-                {'at': checked - 86400, 'actual_usd': '7.73'},
-            ]
-            _ = (charges / (bill.day + '.json')).write_text(json.dumps(record))
+            save_published_bill(book, replace(bill, at=checked - 86400), history)
         self.assertEqual(settled_notes(), [
             'Settled AWS amounts: 9 of 9 did not change after they settled (checked Nov 19).',
         ])
 
-        path = charges / '2026-11-12.json'
-        changed = ledger.mapping(cast(object, json.loads(path.read_text())))
-        changed.update(at=checked, actual_usd='7.81')
-        changed['amount_reads'] = [*ledger.rows(changed, 'amount_reads'), {'at': checked, 'actual_usd': '7.81'}]
-        _ = path.write_text(json.dumps(changed))
+        revised = Decimal('7.81')
+        latest = replace(reads[-1], at=checked, actual_usd=revised)
+        save_published_bill(book, latest, (*history, (checked, revised)))
         self.assertEqual(settled_notes(), [
             'Settled AWS amounts: 8 of 9 did not change after they settled (checked Nov 19).',
             '2026-11-12 changed from USD 7.73 to USD 7.81 (+0.08).',
@@ -375,18 +388,13 @@ class AwsPageSpendReferenceTests(ledger_test_support.SpendReferenceFixture):
 
     def test_row_57_formats_the_month_after_summing_the_bills(self) -> None:
         checked = self.midnight + 7200
-        directory = self.state / 'charges'
-        directory.mkdir()
         for offset in (1, 2):
             start = self.midnight - 86400 * offset
             day = datetime.fromtimestamp(start, UTC).date().isoformat()
             usd = Decimal('1.004')
             reading = ledger.ChargeRead(day, checked, start, start + 86400, usd, Decimal(0), Decimal(0),
                                         (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', usd),), False)
-            record = ledger.charge_record(reading)
-            record['amount_reads'] = [{'at': reading.period_end + 1, 'actual_usd': str(usd)},
-                                      {'at': checked, 'actual_usd': str(usd)}]
-            _ = (directory / f'{day}.json').write_text(json.dumps(record))
+            save_published_bill(self.book, reading, ((reading.period_end + 1, usd), (checked, usd)))
         actual = spend.read_spend(self.settings, self.state, checked, '2026-01-15')
         assert isinstance(actual, spend.Spend)
         self.assertEqual([(row.day, row.usd) for row in actual.days if row.source == 'AWS bill'],
@@ -433,35 +441,44 @@ class AwsPageSpendReferenceTests(ledger_test_support.SpendReferenceFixture):
         self.assert_spend_tiles(self.publish(now), '$0.00', '$5.00', '$5.00')
         self.assert_month_guard(now, Decimal(5))
 
-    def test_row_n03_page_reads_the_new_bill_before_reconciliation(self) -> None:
+    def test_row_n03_page_keeps_the_prior_bill_until_reconciliation(self) -> None:
         self.refresh(self.midnight, '2')
         self.assert_spend_tiles(self.publish(self.midnight), '$0.00', '$2.00', '$2.00')
+        path = self.folder / aws_page.PAGE_NAME
+        earlier = path.read_bytes()
         now = self.midnight + 60
         self.assert_month_guard(self.midnight, Decimal(2))
         self.assert_month_admission(self.midnight, Decimal(2))
+        interrupted: list[Decimal] = []
         reconcile = self.book._reconcile_charge  # pyright: ignore[reportPrivateUsage]
-        seen: list[Decimal] = []
 
-        def publish_before_reconciliation(state: ledger.LedgerEvidence, bill: ledger.ChargeRead) -> None:
-            if bill.actual_usd == 5:
-                saved, = self.book.read_snapshot().reconciliations
-                self.assertEqual(saved.usd, Decimal(2))
-                self.assert_month_guard(now, Decimal(2))
-                self.assert_spend_tiles(self.publish(now), '$0.00', '$5.00', '$5.00')
-                self.assert_month_admission(now, Decimal(5))
-                seen.append(bill.actual_usd)
-            reconcile(state, bill)
+        def interrupt_refresh(state: ledger.LedgerEvidence, bill: ledger.ChargeRead) -> None:
+            if bill.actual_usd == 2:
+                reconcile(state, bill)
+                return
+            self.assertEqual(bill.actual_usd, Decimal(5))
+            saved, = self.book.read_snapshot().reconciliations
+            self.assertEqual(saved.usd, Decimal(2))
+            self.assert_spend_tiles(self.publish(now), '$0.00', '$2.00', '$2.00')
+            self.assertEqual(path.read_bytes(), earlier)
+            interrupted.append(bill.actual_usd)
+            raise OSError('fixture interrupted refresh')
 
-        with mock.patch.object(self.book, '_reconcile_charge', side_effect=publish_before_reconciliation):
-            self.refresh(now, '5')
-        self.assertEqual(seen, [Decimal(5)])
+        with mock.patch.object(self.book, '_reconcile_charge', side_effect=interrupt_refresh):
+            with self.assertRaisesRegex(OSError, 'fixture interrupted refresh'):
+                self.refresh(now, '5')
+        self.assertEqual(interrupted, [Decimal(5)])
+        self.assert_spend_tiles(self.publish(now), '$0.00', '$2.00', '$2.00')
+        self.assertEqual(path.read_bytes(), earlier)
+
+        self.refresh(now, '5')
         saved, = self.book.read_snapshot().reconciliations
         self.assertEqual(saved.usd, Decimal(5))
         self.assert_spend_tiles(self.publish(now), '$0.00', '$5.00', '$5.00')
         self.assert_month_guard(now, Decimal(5))
         self.assert_month_admission(now, Decimal(5))
 
-    def test_row_n04_page_can_read_a_launch_after_measuring_spend(self) -> None:
+    def test_row_n04_page_retries_when_a_launch_changes_the_revision(self) -> None:
         self.refresh(self.midnight, '2')
         now = self.midnight + 3600
         proposal = ledger.GateReservation('fixture-zero', now, now + 3600, Decimal(0), Decimal(0),
@@ -470,25 +487,25 @@ class AwsPageSpendReferenceTests(ledger_test_support.SpendReferenceFixture):
         earlier = self.publish(now)
         self.assert_spend_tiles(earlier, '$0.00', '$2.00', '$2.00')
         self.assertEqual(earlier['launch_state'], {'kind': 'no-evidence'})
-        read_spend = spend.read_spend
+        path = self.folder / aws_page.PAGE_NAME
+        prior_bytes = path.read_bytes()
+        quota_help = aws_page.quota_help
+        rendered: list[bytes] = []
 
-        def append_after_spend(path: Path, directory: Path, at: int, day: str
-                               ) -> spend.Spend | aws_config.MeasurementUnavailable:
-            result = read_spend(path, directory, at, day)
-            cloud_gate.append_launch(directory, {'attempt': proposal.attempt, 'time': now, 'result': 'launched',
-                'instance_type': proposal.instance_type, 'region': proposal.region, 'mode': 'merge-gate'},
-                gate_job=GATE_JOB_NOT_RECORDED)
-            return result
+        def append_after_capture() -> str:
+            rendered.append(path.read_bytes())
+            if len(rendered) == 1:
+                cloud_gate.append_launch(self.state, {'attempt': proposal.attempt, 'time': now,
+                    'result': 'launched', 'instance_type': proposal.instance_type, 'region': proposal.region,
+                    'mode': 'merge-gate'}, gate_job=GATE_JOB_NOT_RECORDED)
+            return quota_help()
 
-        with mock.patch.object(spend, 'read_spend', side_effect=append_after_spend):
-            mixed = self.publish(now)
-        self.assertEqual(mixed['spend'], earlier['spend'])
-        self.assertEqual(mixed['launch_state'], {'kind': 'working', 'last_good_at': now, 'latest_attempt_at': now})
-        following = self.publish(now)
+        with mock.patch.object(aws_page, 'quota_help', side_effect=append_after_capture):
+            following = self.publish(now + 1)
+        self.assertEqual(rendered, [prior_bytes, prior_bytes])
         self.assert_spend_tiles(following, '$0.00', '$2.00', '$2.00')
-        self.assertEqual(following['launch_state'], mixed['launch_state'])
+        self.assertEqual(following['launch_state'], {'kind': 'working', 'last_good_at': now, 'latest_attempt_at': now})
         self.assertTrue(following['spend']['tiles'][0]['note'].endswith('1 gate runs.'))
-        self.assertTrue(mixed['spend']['tiles'][0]['note'].endswith('0 gate runs.'))
 
         priced = replace(proposal, attempt='fixture-priced', region='us-east-2')
         self.assertIsInstance(self.book.reserve_gate(self.settings, priced), ledger.GateReserved)
@@ -506,34 +523,94 @@ class AwsPageSpendReferenceTests(ledger_test_support.SpendReferenceFixture):
         self.assertEqual(self.book.reserve_gate(self.settings, replace(proposal, attempt='fixture-cap-probe')),
                          ledger.GateCapReached('daily_limit'))
 
-    def test_row_n14_earlier_publisher_can_replace_a_newer_page(self) -> None:
+    def test_row_n14_earlier_publisher_keeps_the_newer_page(self) -> None:
         for seconds in (0, 60):
             with self.subTest(newer_evaluation=seconds != 0):
                 now = self.midnight + seconds * 10 + 120
                 self.refresh(now - 60, '2')
                 self.assert_spend_tiles(self.publish(now - 60), '$0.00', '$2.00', '$2.00')
-                self.assert_month_guard(now - 60, Decimal(2))
-                self.assert_month_admission(now - 60, Decimal(2))
-                publications: list[Path] = []
+                path = self.folder / aws_page.PAGE_NAME
+                quota_help = aws_page.quota_help
+                newer_pages: list[bytes] = []
+                rendering_earlier = True
 
-                def publish_newer_first(path: Path, source: str, *, new_file_mode: int | None = None) -> None:
-                    if not publications:
-                        publications.append(path)
+                def publish_newer_first() -> str:
+                    nonlocal rendering_earlier
+                    if rendering_earlier:
+                        rendering_earlier = False
                         self.refresh(now, '5')
                         newer = self.publish(now + seconds)
                         self.assert_spend_tiles(newer, '$0.00', '$5.00', '$5.00')
                         self.assertEqual(newer['read_at'], now + seconds)
-                        self.assert_month_guard(now + seconds, Decimal(5))
-                        self.assert_month_admission(now + seconds, Decimal(5))
-                    write_text_atomic(path, source, new_file_mode=new_file_mode)
+                        newer_pages.append(path.read_bytes())
+                    return quota_help()
 
-                with mock.patch.object(aws_page, 'write_text_atomic', side_effect=publish_newer_first):
-                    overwritten = self.publish(now)
-                self.assertEqual(publications, [self.folder / aws_page.PAGE_NAME])
-                self.assert_spend_tiles(overwritten, '$0.00', '$2.00', '$2.00')
-                self.assertEqual(overwritten['read_at'], now)
+                with mock.patch.object(aws_page, 'quota_help', side_effect=publish_newer_first):
+                    visible = self.publish(now)
+                self.assertEqual(newer_pages, [path.read_bytes()])
+                self.assertEqual(visible['read_at'], now + seconds)
+                self.assert_spend_tiles(visible, '$0.00', '$5.00', '$5.00')
                 self.assert_month_guard(now + seconds, Decimal(5))
                 self.assert_month_admission(now + seconds, Decimal(5))
+
+    def test_shows_a_month_amount_without_an_accepted_bill(self) -> None:
+        now = self.midnight + 10800
+        self.book.observe(ledger.InstanceObservation(self.midnight, 'running', 'fixture builder'))
+        self.book.observe(ledger.InstanceObservation(now, 'stopped', 'fixture builder'))
+        published = self.publish(now)
+        tiles = published['spend']['tiles']
+        self.assertEqual((tiles[0]['usd'], tiles[2]['usd']), ('$3.00', '$3.00'))
+        self.assertIn('estimate', tiles[0]['note'])
+        self.assertEqual(published['spend']['forecast'], '')
+
+    def test_final_verification_holds_the_ledger_lock_through_replacement(self) -> None:
+        self.refresh(self.midnight, '2')
+        _ = self.publish(self.midnight)
+        path = self.folder / aws_page.PAGE_NAME
+        earlier = path.read_bytes()
+        at = self.midnight + 60
+        writes: list[int] = []
+
+        def try_second_publication(destination: Path, source: str, *, new_file_mode: int | None = None) -> None:
+            writes.append(new_file_mode or 0)
+            if len(writes) == 1:
+                with mock.patch.object(ledger, 'capture_spend_evidence', wraps=ledger.capture_spend_evidence) as capture:
+                    _ = self.publish(at + 1)
+                self.assertEqual(capture.call_count, 3)
+                self.assertEqual(path.read_bytes(), earlier)
+            write_text_atomic(destination, source, new_file_mode=new_file_mode)
+
+        with mock.patch.object(aws_page, 'write_text_atomic', side_effect=try_second_publication):
+            published = self.publish(at)
+        self.assertEqual(writes, [0o644])
+        self.assertEqual(published['read_at'], at)
+
+    def test_repeated_source_changes_leave_the_page_bytes_intact(self) -> None:
+        _ = self.publish(self.midnight)
+        path = self.folder / aws_page.PAGE_NAME
+        earlier = path.read_bytes()
+        quota_help = aws_page.quota_help
+        renders: list[int] = []
+        at = self.midnight + 60
+
+        def change_source() -> str:
+            self.book.observe(ledger.InstanceObservation(at - len(renders), 'stopped', 'fixture'))
+            renders.append(at)
+            return quota_help()
+
+        with mock.patch.object(aws_page, 'quota_help', side_effect=change_source):
+            _ = self.publish(at)
+        self.assertEqual(len(renders), 3)
+        self.assertEqual(path.read_bytes(), earlier)
+
+    def test_failed_first_capture_creates_no_page_or_lock(self) -> None:
+        empty = self.root / 'empty-state'
+        empty.mkdir()
+        destination = self.root / 'first-page'
+        with self.assertRaises(aws_page.PagePublicationDeferred):
+            _ = aws_page.publish(empty, self.midnight, destination, settings_path=self.settings)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(empty.iterdir()), [])
 
 
 @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the AWS table checks")
@@ -651,7 +728,7 @@ class AwsCombinedTableTests(PageCostFixture):
             '2026-01-14', end, start, end, Decimal(1), Decimal(0), Decimal(0),
             (ledger.UsageTypeCost('USE1-SpotUsage:c7a.4xlarge', Decimal('.75'), Decimal(1), 'Hrs'),
              ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.25'), Decimal('.01'), 'Hrs')))
-        _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(charge)))
+        save_published_bill(ledger.CostLedger(self.state), charge)
         self.run_browser_checks('', """
     const sizes = () => [...document.querySelectorAll("#hours tbody tr")].map(row => row.cells[0].textContent);
     check(sizes().includes("c7a.4xlarge") && sizes().includes("m7a.8xlarge"), "Both active sizes show");
@@ -674,7 +751,7 @@ class AwsCombinedTableTests(PageCostFixture):
         charges = self.state / 'charges'
         charges.mkdir()
         bill = ledger.ChargeRead('2026-01-13', now, start, start + 86400, Decimal(4), Decimal(0), Decimal(0))
-        _ = (charges / '2026-01-13.json').write_text(json.dumps(ledger.charge_record(bill)))
+        save_published_bill(book, bill)
         _ = (charges / 'alias.json').write_text(json.dumps(ledger.charge_record(bill)))
         self.run_browser_checks('', """
     check(document.querySelector("#bill-refusals").hidden, "The valid bill still supplies the day");
@@ -917,7 +994,7 @@ class AwsCombinedTableTests(PageCostFixture):
 """)
 
 
-class AwsPagePlacementScoresTests(ledger_test_support.CostFixture):
+class AwsPagePlacementScoresTests(PageCostFixture):
     def test_page_shows_latest_median_count_and_missing_or_stale_scores(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         region, missing_region = 'us-east-2', 'eu-north-1'
@@ -962,7 +1039,7 @@ class AwsPagePlacementScoresTests(ledger_test_support.CostFixture):
                       + 'Compare the 32-vCPU column with recorded launch results.', source)
 
 
-class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
+class AwsPageGateTimePriceTests(PageCostFixture):
     def test_page_compares_the_lowest_run_cost_for_each_size_in_each_region(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         east, west, north = 'us-east-2', 'us-west-2', 'eu-north-1'

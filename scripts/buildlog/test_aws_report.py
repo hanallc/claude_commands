@@ -12,6 +12,7 @@ import time
 from typing import cast, override
 from unittest import mock
 import unittest
+from zoneinfo import ZoneInfo
 
 from scripts.buildlog import aws_report, index
 from scripts.buildlog import mac_outcome
@@ -26,6 +27,24 @@ use_test_log()
 from scripts.aws_target import config as aws_config, ledger, measurement, run_cost
 from scripts.aws_target.ledger_test_support import numeric_settings
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
+
+
+def utc_fixture(spends: tuple[ledger.DailySpend, ...]) -> ledger.UtcAccountSpend:
+    """Make a UTC result for the report layout tests."""
+    days: list[ledger.UtcDaySpend] = []
+    for spend in spends:
+        day = date.fromisoformat(spend.day)
+        start, end = ledger.period_bounds(day, ZoneInfo('UTC'))
+        intervals = (ledger.ChargedInterval(start, end, spend.usd, 'fixture', 'fixed'),)
+        estimate = ledger.EstimatedUtcDaySpend(intervals, spend.groups)
+        source: ledger.EstimatedUtcDaySpend | ledger.SettledWatchAmount = estimate
+        if spend.source == 'AWS bill':
+            bill = ledger.ChargeRead(spend.day, end, start, end, spend.usd, Decimal(0), spend.query_usd,
+                                     provisional=spend.provisional_bill)
+            source = ledger.SettledWatchAmount(bill, ledger.SettledChargeUnchanged(spend.usd))
+        days.append(ledger.UtcDaySpend(day, source, spend.groups, intervals, estimate, spend.runs))
+    month = ledger.UtcMonthSpend(date(2026, 1, 1), tuple(days))
+    return ledger.UtcAccountSpend(tuple(days), (month,), ())
 
 
 class AwsReportTests(MeasurementFixture):
@@ -220,6 +239,10 @@ class AwsReportTests(MeasurementFixture):
                 # A us-east-1 usage type has no region prefix; the runs have no region, so they ran in the home region.
                 ledger.UsageTypeCost('SpotUsage:m7a.8xlarge', Decimal('.30'), Decimal('.1'), 'Hrs'),))
         _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
+        with self.book().transaction() as state:
+            state.reconciliations.append(ledger.CostReconciliation(
+                reading.at, reading.period_start, reading.period_end, reading.actual_usd, 'Cost Explorer', reading.query_usd))
+            state.charge_refresh_at = reading.at
         idle = ledger.ChargeRead('2026-01-13', NOW, MIDNIGHT - 2 * 86400, MIDNIGHT - 86400,
                                  Decimal('.006'), Decimal(0), Decimal(0))
         _ = (charges / '2026-01-13.json').write_text(json.dumps(ledger.charge_record(idle)))
@@ -235,13 +258,13 @@ class AwsReportTests(MeasurementFixture):
             events.extend(({**row, 'time': at - box_s, 'result': 'launched'},
                            {**row, 'time': at, 'result': 'finished', 'gate_s': gate_s}))
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
-        with mock.patch.object(ledger.CostLedger, 'spend_days', return_value=spends), \
+        with mock.patch.object(ledger, 'utc_account_spend', return_value=utc_fixture(spends)), \
              mock.patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}):
             output = self.render()
         section = output.split('### AWS\n', 1)[1].split('Mac copies:', 1)[0]
         self.assertTrue(section.startswith('\n**Today (UTC 2026-01-15, estimate): $0.35 of the $20.00 daily limit. 2 gate runs.**\n\n'))
         today = '| 2026-01-15 | $0.35 | $0.10 | $0.00 | $0.00 | $0.20 | $0.05 | 2 | estimate |'
-        bill = '| 2026-01-14 | $1.10 | $0.30 | $0.20 | $0.00 | $0.40 | $0.20 | 2 | bill |'
+        bill = '| 2026-01-14 | $1.10 | $0.30 | $0.20 | $0.00 | $0.40 | $0.20 | 2 | accepted bill |'
         self.assertIn(today, section)
         self.assertIn(bill, section)
         self.assertIn('- 2026-01-13: amount below USD 0.01 uses the estimate', section)
@@ -250,7 +273,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertLess(section.index(today), section.index(bill))
         self.assertEqual(section.count('\n|---'), 3)
         self.assertIn('| All shown days | 2 | 0m 52s | 1m 45s | 2 | 0m 22s | 0m 45s | $0.1500 |', section)
-        self.assertIn('\n\n- Bill read 2026-01-15 07:00 EST. Ledger query fees for these days: $0.06.\n', section)
+        self.assertIn('\n\n- Bill read 2026-01-15 07:00 EST. Ledger query fees for these days: $0.02.\n', section)
         self.assertEqual(section.count('- Spot compute can include the older Spot builder.'), 1)
         self.assertNotIn('Spot cost can include the older builder', section)
         self.assertEqual(section.count('- Source:'), 1)
@@ -278,7 +301,7 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn('32-CPU gate compute is 67% of the spend on those days.', lines)
         self.assertEqual(report.spend_analysis(spends[:1], Decimal(100), date(2026, 1, 15), 2), [])
 
-    def test_daily_spend_shows_estimates_after_the_newest_bill(self) -> None:
+    def test_daily_spend_shows_estimates_between_and_before_bills(self) -> None:
         spends = tuple(
             ledger.DailySpend(day, source, (ledger.SpendGroupCost('storage', Decimal('1')),), 1, Decimal(0))
             for day, source in (
@@ -288,10 +311,10 @@ class AwsReportTests(MeasurementFixture):
                 ('2026-01-15', 'estimated from the newest bill'),
                 ('2026-01-13', 'AWS bill'),
             ))
-        with mock.patch.object(ledger.CostLedger, 'spend_days', return_value=spends):
+        with mock.patch.object(ledger, 'utc_account_spend', return_value=utc_fixture(spends)):
             for day, expected_days in (
-                (DAY, ('2026-01-15', '2026-01-14', '2026-01-13', '2026-01-12')),
-                ('2026-01-14', ('2026-01-14', '2026-01-13', '2026-01-12')),
+                (DAY, ('2026-01-15', '2026-01-14', '2026-01-13', '2026-01-12', '2026-01-10')),
+                ('2026-01-14', ('2026-01-14', '2026-01-13', '2026-01-12', '2026-01-10')),
             ):
                 with self.subTest(day=day):
                     output = self.render(day)
@@ -299,13 +322,17 @@ class AwsReportTests(MeasurementFixture):
                     rows = [line for line in table.splitlines() if line.startswith('| 2026-')]
                     self.assertEqual(rows, [
                         f'| {at} | $1.00 | $0.00 | $0.00 | $0.00 | $1.00 | $0.00 | 1 | '
-                        + ('estimate' if at > '2026-01-13' else 'bill') + ' |'
+                        + ('accepted bill' if at in ('2026-01-13', '2026-01-12') else 'estimate') + ' |'
                         for at in expected_days])
-                    self.assertNotIn('2026-01-10', table)
                     self.assertEqual(output.count('Spot compute can include the older Spot builder.'), 1)
                     self.assertNotIn('Spot cost can include the older builder', output)
                     if day == DAY:
                         self.assertIn('**Today (UTC 2026-01-15, estimate): $1.00', output)
+
+    def test_month_to_date_uses_estimates_when_no_bill_supplies_a_forecast(self) -> None:
+        output = self.render()
+        self.assertIn('**Month to date (UTC 2026-01): $2.00 of the $400.00 monthly limit.**', output)
+        self.assertNotIn('Month forecast:', output)
 
     def test_gate_type_comparison_uses_finished_times_and_billed_days_in_the_window(self) -> None:
         numeric_settings(self.settings, {'gate_type_window_days': '2'})
@@ -499,7 +526,8 @@ class AwsReportTests(MeasurementFixture):
             {'time': NOW, 'instance_type': 'm7a.8xlarge', 'result': 'finished', 'gate_s': 10},
             {'time': MIDNIGHT + 86400, 'instance_type': 'm7a.4xlarge', 'result': 'launched'},
         ]
-        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in launches))
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(
+            json.dumps({**row, 'attempt': f'fixture-{index}'}) + '\n' for index, row in enumerate(launches)))
         usage = (ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('0.06'), Decimal('.1'), 'Hrs'),
                  ledger.UsageTypeCost('USW2-SpotUsage:m7a.8xlarge', Decimal('0.02'), Decimal('.1'), 'Hrs'),
                  ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('0.03'), Decimal('.1'), 'Hrs'),
@@ -509,7 +537,7 @@ class AwsReportTests(MeasurementFixture):
                  ledger.UsageTypeCost('USE2-Lambda-Request', Decimal('.3')))
         for provisional in (False, True):
             with self.subTest(provisional=provisional):
-                label = 'provisional bill' if provisional else 'bill'
+                label = 'unsettled AWS amount so far'
                 reading = ledger.ChargeRead(reading.day, at, reading.period_start, reading.period_end,
                                            Decimal(3), reading.estimated_usd, reading.query_usd, usage, provisional)
                 _ = (self.state / 'charges' / f'{reading.day}.json').write_text(json.dumps(ledger.charge_record(reading)))
@@ -525,7 +553,7 @@ class AwsReportTests(MeasurementFixture):
                 self.assertNotIn('**Today (UTC', output)
                 with mock.patch.object(time, 'time', return_value=float(at)):
                     current = self.render('2026-01-16')
-                self.assertIn('**Today (UTC 2026-01-16, estimate): $2.89 of the $20.00 daily limit. 1 gate runs.**', current)
+                self.assertIn('**Today (UTC 2026-01-16, estimate): $1.14 of the $20.00 daily limit. 1 gate runs.**', current)
                 self.assertIn(f'| 2026-01-15 | $3.00 | $0.08 | $0.03 | $0.00 | $2.29 | $0.60 | 3 | {label} |', current)
         for amount in (Decimal('-0.0000036'), Decimal('0.0000036')):
             with self.subTest(amount=amount):
