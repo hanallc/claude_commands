@@ -85,6 +85,10 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 
 ### Hana console
 
+Rule: the same control has one name and one code on every console page.
+A control that two pages show comes from one shared function, never a copy.
+A console phase reads this section before it starts.
+
 Staff names use the current role colors from the Accounts reader.
 `staff_names.StaffNames` shares one staff snapshot and one color reading across each server render.
 It resolves fixed IDs, session IDs, and unambiguous staff names.
