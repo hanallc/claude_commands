@@ -403,18 +403,24 @@ def old_console_link(root: Path, path: str) -> str:
     return f"/{change_page.CONSOLE_FOLDER}/{page}" + (f"?{parts.query}" if parts.query else "")
 
 
-def accepts_gzip(header: str) -> bool:
+def accepts_gzip(header: str, *, allow_wildcard: bool = False) -> bool:
     """Accept gzip when its encoding token has a positive quality."""
+    wildcard = False
     for part in header.split(','):
         encoding, *parameters = part.split(';')
-        if encoding.strip().lower() != 'gzip':
+        encoding = encoding.strip().lower()
+        if encoding != 'gzip' and not (allow_wildcard and encoding == '*'):
             continue
+        accepted = True
         for parameter in parameters:
             key, _, value = parameter.partition('=')
             if key.strip().lower() == 'q':
-                return re.fullmatch(r'(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)', value.strip()) is not None and float(value) > 0
-        return True
-    return False
+                accepted = re.fullmatch(r'(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)', value.strip()) is not None and float(value) > 0
+                break
+        if encoding == 'gzip':
+            return accepted
+        wildcard = accepted
+    return wildcard
 
 
 class ReviewLinksHandler(SimpleHTTPRequestHandler):
@@ -648,7 +654,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 raise FileNotFoundError("outside root or not a file")
             if any(private_name(part) for part in file.relative_to(root).parts):
                 raise FileNotFoundError("private publisher file")
-            stream = file.open("rb")
+            stream: BinaryIO = file.open("rb")
         except (OSError, ValueError, RuntimeError):
             self.html_response(404, change_page.document("<p>This review page is not available.</p>"))
             return None
@@ -660,16 +666,47 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         try:
             stat = os.fstat(stream.fileno())
-            self.send_response(200)
-            self.send_header("Content-Type", self.guess_type(str(file)))
-            self.send_header("Content-Length", str(stat.st_size))
-            self.send_header("Last-Modified", self.date_time_string(stat.st_mtime))
-            self.send_header("X-Content-Type-Options", "nosniff")
+            json_file = file.suffix.lower() == ".json"
+            accepts = ",".join(self.headers.get_all("Accept-Encoding", []))
+            compressed = json_file and accepts_gzip(accepts, allow_wildcard=True)
+            encoding = "-gzip" if compressed else ""
+            etag = (f'"{stat.st_dev:x}-{stat.st_ino:x}-{stat.st_size:x}'
+                    f'-{stat.st_mtime_ns:x}-{stat.st_ctime_ns:x}{encoding}"')
+            modified = stat.st_mtime_ns // 1_000_000_000
+            unchanged = self.static_file_unchanged(etag)
+            size = stat.st_size
+            if compressed and not unchanged:
+                with stream:
+                    wire = gzip.compress(stream.read(), compresslevel=1, mtime=0)
+                stream = BytesIO(wire)
+                size = len(wire)
+            self.send_response(304 if unchanged else 200)
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", self.date_time_string(modified))
+            if json_file:
+                self.send_header("Vary", "Accept-Encoding")
+            if not unchanged:
+                self.send_header("Content-Type", self.guess_type(str(file)))
+                self.send_header("Content-Length", str(size))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                if compressed:
+                    self.send_header("Content-Encoding", "gzip")
             self.end_headers()
+            if unchanged:
+                stream.close()
+                return None
         except BaseException:
             stream.close()
             raise
         return stream
+
+    def static_file_unchanged(self, etag: str) -> bool:
+        """Check If-None-Match for the selected static representation."""
+        return any(
+            value.strip() == "*"
+            or any(tag.strip().removeprefix("W/") == etag for tag in value.split(","))
+            for value in self.headers.get_all("If-None-Match", [])
+        )
 
     def html_response(self, status: int, content: bytes) -> None:
         self.send_response(status)

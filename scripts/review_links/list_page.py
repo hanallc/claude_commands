@@ -157,10 +157,27 @@ def eta_text(eta: the_list.Eta, today: datetime) -> str:
     return the_list.eta_text(eta)
 
 
+def short_list_time(moment: datetime, zone: tzinfo | None) -> str:
+    local = moment.astimezone(zone)
+    return f"{local:%b} {local.day} {local:%H:%M %Z}"
+
+
+def check_row_html(check: the_list.NextCheck, today: datetime, *, parked: bool) -> str:
+    if parked:
+        return ""
+    if isinstance(check, datetime):
+        value = html.escape(short_list_time(check, today.tzinfo))
+        if check < today:
+            return f'<small data-list-check><span class="warning">Check overdue {value}</span></small>'
+        return f'<small data-list-check>Check {value}</small>'
+    if isinstance(check, the_list.CheckCondition):
+        return f'<small data-list-check>Check: {html.escape(check.text)}</small>'
+    return ""
+
+
 def eta_cell_text(eta: the_list.Eta, today: datetime) -> str:
     if isinstance(eta, datetime):
-        local = eta.astimezone(today.tzinfo)
-        return f"{local:%b} {local.day} {local:%H:%M %Z}"
+        return short_list_time(eta, today.tzinfo)
     if isinstance(eta, date):
         return f"{eta:%b} {eta.day}"
     if isinstance(eta, the_list.EtaRange):
@@ -169,6 +186,10 @@ def eta_cell_text(eta: the_list.Eta, today: datetime) -> str:
 
 
 def parked_label(moment: datetime | the_list.ParkUntilDelivered, zone: tzinfo) -> str:
+    return moment.value if moment is the_list.ParkUntilDelivered.DELIVERED else short_list_time(moment, zone)
+
+
+def parking_notice_label(moment: datetime | the_list.ParkUntilDelivered, zone: tzinfo) -> str:
     if moment is the_list.ParkUntilDelivered.DELIVERED:
         return moment.value
     local = moment.astimezone(zone)
@@ -190,6 +211,8 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
         assert zone is not None
         return parked_label(value, zone)
     if isinstance(value, datetime):
+        if field == "next_check":
+            return html.escape(short_list_time(value, today.tzinfo))
         return html.escape(list_time(value, today))
     if isinstance(value, the_list.CheckCondition):
         return html.escape(value.text)
@@ -214,27 +237,44 @@ def time_html(moment: datetime, today: datetime) -> str:
     return f'<time datetime="{moment.isoformat()}">{html.escape(list_time(moment, today))}</time>'
 
 
-def log_row(index: str, moment: datetime, body: str, today: datetime) -> str:
-    return f'<li data-log-index="{index}">' + time_html(moment, today) + '<div>' + body + '</div></li>'
+def log_row(index: str, moment: datetime, body: str, today: datetime, *,
+            question: Literal["Question", "Answer"] | None = None) -> str:
+    color_class = ''
+    if question is not None:
+        color_class = ' class="question"'
+        body = f'<strong>{question}</strong>' + body
+    return f'<li{color_class} data-log-index="{index}">' + time_html(moment, today) + '<div>' + body + '</div></li>'
+
+
+def log_field_html(field: str, value: object, today: datetime, names: staff_names.StaffNames, evidence_id: str) -> str:
+    if field == "evidence":
+        text = html.escape(cast(str, value)) or "Not recorded"
+        return f'<details class="log-evidence"><summary id="{evidence_id}">Details</summary><div>{text}</div></details>'
+    return field_html(field, value, today, names)
 
 
 def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames,
-                   keeper: staff.StaffId) -> str:
+                   fields: Mapping[str, object], evidence_id: str, keeper: staff.StaffId) -> str:
     content = change.what
     by = log_source_html(the_list.source_without_clock(change.source), names)
+    question: Literal["Question", "Answer"] | None = None
     if isinstance(content, the_list.FieldChange):
         heading = content.action + by
-        fields = ''.join(f'<dt>{FIELD_LABELS[field]}</dt><dd>{field_html(field, value, today, names)}</dd>'
-                         for field, value in content.fields.items())
-        body = f'<strong>{heading}</strong><dl>{fields}</dl>'
+        body = f'<strong>{heading}</strong>'
+        if fields:
+            body += '<dl>' + ''.join(
+                f'<dt>{FIELD_LABELS[field]}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
+                for field, value in fields.items()) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
         label = {"pending": "Feedback for", "sent": "Feedback sent to", "alerted": "Feedback could not reach"}[content.state]
         recipient = owner_name(names.members, content.recipient_id(keeper))
         body = label + " " + html.escape(recipient) + by + change_browser.question_paragraphs(content.words)
     elif isinstance(content, the_list.QuestionAnswered):
-        body = "Answered question " + html.escape(content.question_id) + by
+        question = "Answer"
+        body = " to question " + html.escape(content.question_id) + by
     elif isinstance(content, the_list.QuestionClosed):
-        body = ("Question " + html.escape(content.question.question_id) + " closed with the item" + by
+        question = "Question"
+        body = (" " + html.escape(content.question.question_id) + " closed with the item" + by
                 + change_browser.question_paragraphs(content.question.words))
     elif isinstance(content, the_list.MarkedRead):
         body = "Marked read" + by
@@ -256,37 +296,41 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = html.escape(content) + by
     else:
         return ""
-    return log_row(str(index), change.time, body, today)
+    return log_row(str(index), change.time, body, today, question=question)
 
 
-def item_log_html(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
+def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffNames,
                   unread_answers: frozenset[str]) -> str:
-    item = entry.item
+    item = record.item
+    row_id = html.escape(record.key.replace("/", "-"), quote=True)
     answers = {question.question_id for question in item.questions if question.answer is not None}
     answer_entries: dict[str, the_list.ItemChange] = {}
     rows: list[tuple[datetime, str]] = []
-    for index, change in enumerate(item.log):
+    for index, (change, fields) in enumerate(zip(item.log, the_list.log_field_changes(item), strict=True)):
         content = change.what
         if isinstance(content, the_list.QuestionAnswered) and content.question_id in answers:
             answer_entries[content.question_id] = change
         elif not the_list.is_page_request_receipt(change):
-            rows.append((change.time, log_entry_html(change, index, today, names, entry.keeper)))
+            rows.append((change.time, log_entry_html(change, index, today, names, fields,
+                                                    f"list-evidence-{row_id}-{index}", record.keeper)))
     for question in item.questions:
         answer = question.answer
         identity = question.question_id
         if answer is None or identity in unread_answers:
             continue
         asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
-        question_body = "Question " + html.escape(identity) + log_source_html("nate", names)
+        question_body = " " + html.escape(identity) + log_source_html("nate", names)
         answer_entry = answer_entries.get(identity)
         answered = answer_entry.time if answer_entry is not None else datetime.fromisoformat(answer.answered_at).astimezone(UTC)
         source = (the_list.source_without_clock(answer_entry.source) if answer_entry is not None
-                  else question.recipient_id(entry.keeper))
-        answer_body = "Answer" + log_source_html(source, names)
+                  else question.recipient_id(record.keeper))
+        answer_body = log_source_html(source, names)
         rows.append((asked, log_row(f"{identity}-asked", asked,
-                                   question_body + change_browser.question_paragraphs(question.words), today)))
+                                   question_body + change_browser.question_paragraphs(question.words), today,
+                                   question="Question")))
         rows.append((answered, log_row(f"{identity}-answered", answered,
-                                       answer_body + change_browser.question_paragraphs(answer.text), today)))
+                                       answer_body + change_browser.question_paragraphs(answer.text), today,
+                                       question="Answer")))
     if not answers.difference(unread_answers):
         return ''.join(markup for _, markup in reversed(rows))
     # Use reverse record order for events with the same time.
@@ -638,14 +682,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if open_question:
         state += f'<small data-open-question-note>{ListChip.PRODUCER_ANSWERING.label}</small>'
-    if isinstance(item.next_check, datetime):
-        check = field_html("next_check", item.next_check, today, names)
-        if item.next_check < today:
-            state += f'<small><span class="warning">Check overdue {check}</span></small>'
-        else:
-            state += f'<small>Check {check}</small>'
-    elif isinstance(item.next_check, the_list.CheckCondition):
-        state += '<small>Check: ' + field_html("next_check", item.next_check, today, names) + '</small>'
+    state += check_row_html(item.next_check, today, parked=parked)
     parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
     if parking_label:
         state += '<small data-parked-note>Parked until ' + parking_label + '</small>'
@@ -673,7 +710,9 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     eta_cell = (f'<span class="{eta_class}" id="list-eta-{row_id}" tabindex="0" title="{full_eta}">'
                 + f'<span class="list-eta-text">{short_eta}</span>'
                 + f'<span class="list-eta-full" aria-hidden="true">{full_eta}</span></span>')
-    cells = (number, field_html("owner", item.owner, today, names), field_html("producer", item.producer, today, names),
+    owner_cell = ('<span class="list-owner-name">' + '<wbr>'.join(
+        f'<span>{names.html(item.owner, part[0])}</span>' for part in re.finditer(r"[^-]*-|[^-]+", owner)) + '</span>')
+    cells = (number, owner_cell, field_html("producer", item.producer, today, names),
              title, state, field_html("next_step", item.next_step, today, names), eta_cell, update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
@@ -725,6 +764,7 @@ class SavedActionState(TypedDict):
     item_state: str
     parked: str
     parked_until: str
+    check_html: str
     waiting_for_answer: str
     open_question: str
     unread_delivery: NotRequired[str]
@@ -740,9 +780,11 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     item = the_list.load(owner, identity)
     zone = user_zone()
     today = the_list.now()
+    local_today = today.astimezone(zone)
     parking = item.parked_until
     parked_until = (parked_label(parking, zone)
                     if parking is not the_list.NoTimestamp.UNSET and the_list.parking_active(parking, today) else "")
+    parked = bool(parked_until)
     unread = item.unread_since
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
     open_question = item.state != the_list.ItemState.CLOSED and has_open_question(item)
@@ -750,7 +792,8 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
-                               "parked": str(bool(parked_until)).lower(), "parked_until": parked_until,
+                               "parked": str(parked).lower(), "parked_until": parked_until,
+                               "check_html": check_row_html(item.next_check, local_today, parked=parked),
                                "waiting_for_answer": str(waiting).lower(),
                                "open_question": str(open_question).lower(),
                                "unread_delivery": str(the_list.unread_delivery(item)).lower()}
@@ -776,7 +819,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                     reviews = review_records
             saved["review_summary_html"] = review_summary(item, reviews, today)
         saved["waiting_details_html"] = waiting_details(
-            ListRecord(owner, item), today.astimezone(zone), names, the_list.unread_answer_ids(item),
+            ListRecord(owner, item), local_today, names, the_list.unread_answer_ids(item),
             form_secret(reading.root), reviews, parked_until)
     return saved
 
@@ -836,7 +879,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
             raise question_record.AnswerRefused("choose Until delivered, a parking date, or a time with a UTC offset")
         parked_until = the_list.parking_value(until)
         assert parked_until is not the_list.NoTimestamp.UNSET
-        label = parked_label(parked_until, user_zone())
+        label = parking_notice_label(parked_until, user_zone())
         notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words,
                                         recipient=prefix.recipient)
         changed = the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
@@ -1026,8 +1069,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     linked_headers = ''.join(f'<th scope="col">{label}</th>' for label in HEADERS)
-    columns = ('<colgroup><col class="list-number-column"><col style="width:8%"><col style="width:10%">'
-               '<col style="width:17%"><col style="width:14%"><col style="width:23%"><col style="width:14%">'
+    columns = ('<colgroup><col class="list-number-column"><col class="list-owner-column"><col style="width:10%">'
+               '<col><col style="width:14%"><col class="list-next-step-column"><col style="width:14%">'
                '<col style="width:8%"></colgroup>')
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
@@ -1042,10 +1085,6 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    expansion = ''.join(f'<button type="button" id="list-{action}-all" data-list-expansion="{action}"'
-                        + f' aria-label="{label}" title="{label}">' + page_frame.icon_svg(icon) + '</button>'
-                        for action, label, icon in (("expand", "Expand all", "chevrons-up-down"),
-                                                    ("collapse", "Collapse all", "chevrons-down-up")))
     content = (STYLE + page_frame.title("The List", "list", action=new_item_dialog.title_button("list"), compact_actions=True)
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}"'
@@ -1064,8 +1103,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<p data-hidden-action-status role="status" hidden></p></div>'
                + '</div>'
                + '<p data-missing-item role="status" hidden></p>'
-               + '<div class="list-table-tools"><div class="list-expansion">' + expansion + '</div>'
-               + '<span data-list-count role="status" aria-live="polite"></span></div>'
+               + '<div data-list-count role="status" aria-live="polite"></div>'
                + '<div class="list-table"><table aria-label="The List">' + columns + '<thead><tr>' + headers + '</tr></thead>'
                + ''.join(rows) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>'
@@ -1080,7 +1118,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
-STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
+STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
 [data-list-review-dialog]{width:min(1060px,calc(100% - 48px));max-width:none;max-height:none;padding:0;
 border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);overflow:hidden;box-sizing:border-box}
 [data-list-review-dialog]::backdrop{background:#0009}
@@ -1117,20 +1155,20 @@ background:var(--ink-2);border-radius:50%}
 [data-record-filters] .record-filter-row{grid-template-columns:minmax(0,1fr)}
 .list-show-filter [data-hidden-action-status]{margin-inline-start:0}
 }
-.list-table-tools{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
-.list-table-tools [data-list-count]{min-width:0;color:var(--ink-2);font-size:13px;text-align:right;overflow-wrap:anywhere}
+[data-list-count]{margin-bottom:8px;color:var(--ink-2);font-size:13px;text-align:right;overflow-wrap:anywhere}
 [data-linked-item]{margin-top:16px}
 [data-linked-item] h2{font-size:14px;margin:0 0 8px}
 [data-linked-item] th{padding:8px}
 .list-number-column{width:6%}
 @media(960px < width <= 1100px){.list-number-column{width:62px}}
-.list-expansion{display:flex;flex:none;gap:6px}
-.list-expansion button{box-sizing:border-box;display:grid;place-items:center;width:26px;height:26px;min-height:0;padding:0;cursor:pointer}
-.list-expansion svg{width:16px;height:16px}
+.list-owner-column{width:var(--list-owner-width,4.5rem)}
+.list-next-step-column{width:var(--list-next-step-width,23%)}
+.list-owner-name{display:block;overflow-wrap:anywhere;hyphens:none}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
 .list-actions{position:relative}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
 .list-park [data-later-menu] [data-later-preset]{display:block;width:calc(100% - 12px);margin:6px 6px 4px}
+.list-table [data-parked]:not([data-parked="false"]) [data-list-check]{display:none}
 .list-table tbody:has([data-parked-detail]:not([hidden])) .list-row.open [data-parked-note]{display:none}
 .list-table:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible),
 .list-table tbody:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible){overflow:visible}
@@ -1141,6 +1179,10 @@ background:var(--ink-2);border-radius:50%}
 .list-log dt{color:var(--ink-3)}.list-log dd{margin:0;overflow-wrap:anywhere}
 .list-log dd>:last-child{margin-bottom:0}
 .list-log dl li{display:list-item;padding:0;border:0}
+.list-log>li.question{border-inline-start:3px solid var(--type-color);padding-inline-start:6px}
+.list-log .log-evidence{margin:0}
+.list-log .log-evidence summary{min-height:24px}
+.list-log .log-evidence div{white-space:pre-wrap}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 .page-question time{color:var(--ink-3);font-size:13px}
 .page-question .question-unread{margin-inline-start:6px;color:var(--accent);text-transform:none}
@@ -1156,7 +1198,6 @@ width:max-content;max-width:min(28rem,calc(100vw - 4rem));padding:6px 8px;backgr
 border:1px solid var(--line);border-radius:6px;overflow-wrap:anywhere}
 .list-eta:focus-visible .list-eta-full{display:block}
 @media(max-width:960px){
-.list-expansion button{width:34px;height:34px}
 .list-table .list-row .record-id{width:auto}
 .list-table .list-row td[data-label="Producer"]{font-size:inherit}.list-table .list-row td[data-label="Item"]{font-size:17px}
 .list-table .list-row td[data-label="State"]::before{content:none}
@@ -1233,6 +1274,21 @@ function restoreLogPositions(){
   if(!position || !log.clientHeight) continue;
   const entry=log.querySelector('[data-log-index="'+position.index+'"]');
   if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-position.offset;
+ }
+}
+function restoreEvidenceDetails(fresh){
+ const opened=new Map();
+ for(const details of content.querySelectorAll('.log-evidence[open]')){
+  const key=details.closest('[data-list-item]').dataset.key;
+  if(!opened.has(key)) opened.set(key,new Set());
+  opened.get(key).add(details.closest('[data-log-index]').dataset.logIndex);
+ }
+ if(!opened.size) return;
+ for(const row of fresh.querySelectorAll('[data-list-item]')){
+  const entries=opened.get(row.dataset.key);
+  if(!entries) continue;
+  for(const details of row.querySelectorAll('.log-evidence'))
+   details.open=entries.has(details.closest('[data-log-index]').dataset.logIndex);
  }
 }
 function matchesWords(data,search){
@@ -1405,11 +1461,42 @@ function focusAfterQuestion(item){
  }
  content.querySelector('#list-search').focus();
 }
+let ownerNameWidth=0;
+function sizeListColumns(){
+ const table=content.querySelector('table');
+ const numberWidth=table.querySelector('.list-number-column').getBoundingClientRect().width;
+ if(!numberWidth) return;
+ const tableWidth=table.getBoundingClientRect().width;
+ const headingWidth=4.5*parseFloat(getComputedStyle(document.documentElement).fontSize);
+ const ownerWidth=Math.min(Math.max(headingWidth,ownerNameWidth+16),tableWidth*.24);
+ // Producer, State, ETA, and Update use 46% of the table.
+ const nextStepWidth=(tableWidth*.54-numberWidth-ownerWidth)*23/40;
+ content.style.setProperty('--list-owner-width',ownerWidth+'px');
+ content.style.setProperty('--list-next-step-width',nextStepWidth+'px');
+}
+addEventListener('resize',sizeListColumns);
 function bindListControls(){
- content.querySelectorAll('[data-list-expansion]').forEach(button=>button.addEventListener('click',()=>{
-  tableView.setShownExpanded(button.dataset.listExpansion==='expand');
- }));
+ const ownerNames=content.querySelectorAll('.list-owner-name');
+ ownerNameWidth=0;
+ if(ownerNames.length){
+  const measure=document.createElement('canvas').getContext('2d');
+  if(measure){
+   measure.font=getComputedStyle(ownerNames[0]).font;
+   const names=new Set(Array.from(ownerNames,name=>name.textContent));
+   for(const name of names) ownerNameWidth=Math.max(ownerNameWidth,measure.measureText(name).width);
+   ownerNameWidth=Math.ceil(ownerNameWidth);
+  }
+ }
+ sizeListColumns();
  content.querySelectorAll('[data-feedback-form]').forEach(bindFeedbackForm);
+}
+function listPickerSummary(zone){
+ const format=new Intl.DateTimeFormat('en-US',{timeZone:zone,month:'short',day:'numeric',
+  hour:'2-digit',minute:'2-digit',hourCycle:'h23',timeZoneName:'short'});
+ return at=>{
+  const parts=Object.fromEntries(format.formatToParts(at).map(part=>[part.type,part.value]));
+  return parts.month+' '+parts.day+' '+parts.hour+':'+parts.minute+' '+parts.timeZoneName;
+ };
 }
 function bindFeedbackForm(form){
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
@@ -1469,6 +1556,12 @@ function bindFeedbackForm(form){
      state.after(note);
     }
    }else questionNote?.remove();
+   if(typeof result.check_html==='string'){
+    const check=item.querySelector('[data-list-check]');
+    if(check) check.outerHTML=result.check_html;
+    else if(result.check_html)
+     (item.querySelector('[data-open-question-note]') ?? state).insertAdjacentHTML('afterend',result.check_html);
+   }
    const waiting=result.waiting_for_answer==='true';
    if(waiting){
     item.dataset.waitingForAnswer='true';
@@ -1522,7 +1615,7 @@ function bindFeedbackForm(form){
   const zone=content.dataset.zone;
   const parkToggle=form.querySelector('[data-later-toggle]');
   if(!waitingForm) bindDateTimePicker(form,{zone,defaultMinutes:()=>Number(content.dataset.parkMorning),summaryPrefix:'Parks until ',
-   retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
+   formatSummary:listPickerSummary(zone),retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(cardSubmitBlocked(form,tableView.rowFading(key))) return;
    const submitter=event.submitter,action=submitter?.value || 'tell';
@@ -1623,7 +1716,7 @@ function bindFeedbackForm(form){
       if(pendingRead) pendingRead.keepOpen=true;
      }
     }
-    if(refused || hidUnread) tableView.opened.add(key);
+    if((refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
     const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
     tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
     // The return animation now has the confirmed sort keys.
@@ -1745,6 +1838,7 @@ async function refresh(_supersede=false,current=()=>true){
  for(const key of priorWatches.keys()) stopWatchingOpenedAnswer(key);
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
  if(footer && nextFooter) nextFooter.replaceChildren(...footer.childNodes);
+ restoreEvidenceDetails(fresh);
  content.replaceWith(fresh);content=fresh;
  void loadListCounts();
  closedKeys=new Set(JSON.parse(content.dataset.closedKeys));

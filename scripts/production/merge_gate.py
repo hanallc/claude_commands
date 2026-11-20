@@ -15,11 +15,12 @@ builds.slice scope when its probe succeeds, unless disabled or already in that s
 Clean trees reuse full passes on the same host. Merge gates run all modules.
 Targeted tests select affected modules from a certified ancestor. --nightly validates a shared clone.
 SharedMachine is the default. WholeMachine uses one job per CPU without shared admission or failure reruns.
-Merge and tests-only runs omit type checks unless --type-dirs names folders.
+Merge and tests-only runs omit type checks.
 The daily --nightly run checks all scripts, including hooks.
 A nightly type failure reports the checker output without requiring full test runs.
 A green nightly sends a result push unless merge_gate.conf disables it.
-A red nightly records its result and notifies sdlc. Only its assignment sends the user push.
+A red nightly records its result and notifies sdlc. It sends type diagnostics to their author units.
+The user receives a push after the nightly run or sdlc assigns the fix.
 A failure before the checks start sends the reason. Silence keeps the newest result.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
@@ -67,10 +68,10 @@ from typing import Literal, Protocol, TextIO, cast
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, waiting_rows
+from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import read_step_names
-from scripts.production import affected_modules, change_review, land_runs  # noqa: E402
+from scripts.lib.build_steps import gate_job_for_command, read_step_names
+from scripts.production import affected_modules, change_review, land_runs, session_staff, staff, unit_config, unit_names  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -86,6 +87,7 @@ from scripts.test_times import gate_record
 from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.queue_place import (  # noqa: E402
     QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix,
 )
@@ -105,6 +107,7 @@ RELEASE_LOCK_WAIT_S = 60
 TYPECHECK_REQUIREMENTS = ("fake-bpy-module==20260822",)
 NIGHTLY_TYPE_DIRS = ("scripts",)
 NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
+NIGHTLY_TYPE_LINE_BYTES = 512
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
 TYPES_MEMORY_MIB = 3072
 MEMORY_PEAK_MARGIN = 1.2
@@ -146,7 +149,6 @@ class GateArguments(argparse.Namespace):
     unit: str = ""
     phase: str = ""
     body: str = ""
-    type_dirs: list[str] = field(default_factory=list)
     promote: bool = False
     main_repo: str = ""
     ssh: str = ""
@@ -158,6 +160,7 @@ class GateArguments(argparse.Namespace):
     full: bool = False
     nightly: bool = False
     modules: list[str] = field(default_factory=list)
+    gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
 
 
 class SuiteMode(Enum):
@@ -2153,8 +2156,8 @@ def merge_checkpoint(args: GateArguments) -> int:
         previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
         os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
-            suites = run_gate_suites(repo, args.type_dirs, float(args.module_time_limit_s),
-                                source="checkpoint", full=args.full)
+            suites = run_gate_suites(repo, float(args.module_time_limit_s),
+                                     source="checkpoint", full=args.full, gate_job=args.gate_job)
         finally:
             if previous_unit is None:
                 _ = os.environ.pop(admission_records.BUILDLOG_UNIT, None)
@@ -2431,11 +2434,14 @@ def send_nightly_red(directory: Path, result: NightlyRedResult, assignment: Nigh
 
     if isinstance(result.delivery, NightlyPushAccepted) or conf.read("merge_gate").text("nightly_result_push") == "off":
         return False
-    row = staff.snapshot().by_id(staff.StaffId(assignment.unit))
-    rendered = push_texts.render("nightly.assigned", branch=result.branch, time=nightly_time(result.finished),
-        types=result.types, tests=result.tests, outcome="failed",
-        unit=row.name if row is not None else assignment.unit, assigned=nightly_time(assignment.at),
-        received=nightly_time(result.received.at if isinstance(result.received, NightlyNoticeReceived) else assignment.at))
+    values = dict(branch=result.branch, time=nightly_time(result.finished),
+                  types=result.types, tests=result.tests, outcome="failed")
+    if isinstance(result.received, NightlyNoticeReceived):
+        row = staff.snapshot().by_id(staff.StaffId(assignment.unit))
+        rendered = push_texts.render("nightly.assigned", **values, unit=row.name if row is not None else assignment.unit,
+                                    assigned=nightly_time(assignment.at), received=nightly_time(result.received.at))
+    else:
+        rendered = push_texts.render("nightly.result", **values)
     command = push_texts.user_send_argv(rendered, key=f"nightly-result:{result.id}")
     # This window exceeds the complete datetime range. Accepted results never expire.
     command.extend(["--repeat-minutes", str(timedelta.max.days * 1440)])
@@ -2514,6 +2520,8 @@ def check_nightly_assignments() -> int:
                 result = read_nightly_red(path)
                 if isinstance(result.assignment, NightlyFixUnassigned):
                     changed = alert_nightly_unassigned(directory, result) or changed
+                elif isinstance(result.delivery, NightlyPushPending):
+                    changed = send_nightly_red(directory, result, result.assignment) or changed
             except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"Nightly result check: {error}", file=sys.stderr)
                 failed = True
@@ -2521,8 +2529,192 @@ def check_nightly_assignments() -> int:
     return int(failed)
 
 
+@dataclass(frozen=True)
+class NightlyMergeReceipt:
+    checkpoint: str
+    merge: str
+    at: float
+    issue: str
+
+
+@dataclass(frozen=True)
+class NoNightlyAuthor:
+    """The blamed commit has no identified author unit."""
+
+
+@dataclass(frozen=True)
+class NightlyTypeNotices:
+    details: tuple[str, ...] = ()
+    assignment: NightlyFixAssigned | NightlyFixUnassigned = NightlyFixUnassigned()
+
+
+def _nightly_merge_receipts() -> list[NightlyMergeReceipt]:
+    path = unit_runs.history_root() / "merge_receipts.jsonl"
+    receipts: list[NightlyMergeReceipt] = []
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    raw = cast(object, json.loads(line))
+                except ValueError:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                record = cast(dict[str, object], raw)
+                if record.get("event_type") != "merge_receipt":
+                    continue
+                source, merge, at = (record.get(key) for key in ("source_checkpoint", "merge_commit", "timestamp_epoch"))
+                issue = record.get("issue")
+                if isinstance(source, str) and isinstance(merge, str) and isinstance(at, (int, float)):
+                    receipts.append(NightlyMergeReceipt(source, merge, at, issue if isinstance(issue, str) else ""))
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as error:
+        print(f"Nightly merge receipts could not be read: {error}", flush=True)
+    return sorted(receipts, key=lambda receipt: receipt.at)
+
+
+def _nightly_plan_author(issue: str, production: staff.StaffId,
+                         members: staff.StaffSnapshot) -> staff.StaffRow | NoNightlyAuthor:
+    from scripts.agents import remote
+
+    if not issue:
+        return NoNightlyAuthor()
+    plan = Path(issue)
+    resolver = session_staff.RowResolver(members)
+    machine = remote.local_machine()
+    matches: list[staff.StaffRow] = []
+    for row in members.find(kind="unit", parent=production):
+        if not isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) or row.worktree.machine != machine:
+            continue
+        try:
+            config = resolver.unit_config(row)
+        except (OSError, ValueError):
+            continue
+        if isinstance(config, unit_config.UnitConfig) and isinstance(config.plan, unit_config.PlanFile) and config.plan.path == plan:
+            matches.append(row)
+    return matches[0] if len(matches) == 1 else NoNightlyAuthor()
+
+
+def _nightly_author(repo: Path, tip: str, blamed: str, receipts: Sequence[NightlyMergeReceipt],
+                    members: staff.StaffSnapshot, production: staff.StaffId) -> staff.StaffRow | NoNightlyAuthor:
+    subject = checked_git(repo, "show", "-s", "--format=%s", blamed)
+    match = re.fullmatch(rf"fast-track\(({unit_names.NAME.pattern})\):\s+.+", subject)
+    if match:
+        rows = [row for row in members.find(kind="unit") if row.name == match[1]]
+        return rows[0] if len(rows) == 1 else NoNightlyAuthor()
+    if not receipts:
+        return NoNightlyAuthor()
+
+    descendants = set(checked_git(repo, "rev-list", "--ancestry-path", f"{blamed}..{tip}").splitlines())
+    descendants.add(blamed)
+    for receipt in receipts:
+        if receipt.checkpoint not in descendants or receipt.merge not in descendants:
+            continue
+        parents, _, merge_subject = checked_git(repo, "show", "-s", "--format=%P%n%s", receipt.merge).partition("\n")
+        if len(parents.split()) < 2 or merge_subject.startswith("Merge origin/main into "):
+            continue
+        ancestry = git(repo, "merge-base", "--is-ancestor", blamed, f"{receipt.merge}^1")
+        if ancestry.returncode == 0:
+            continue
+        if ancestry.returncode != 1:
+            raise GateRefused(f"Could not check the first parent of {receipt.merge}. {failure_detail(ancestry)}")
+        producer = change_review.merge_producer(receipt.merge)
+        if isinstance(producer, str):
+            row = members.by_id(producer)
+            return row if row is not None and row.kind == "unit" else NoNightlyAuthor()
+        return _nightly_plan_author(receipt.issue, production, members)
+    return NoNightlyAuthor()
+
+
+@dataclass(frozen=True)
+class NightlyUnitDiagnostic:
+    text: str
+    path: Path
+
+
+def _nightly_diagnostic_line(line: str) -> str:
+    encoded = line.encode()
+    if len(encoded) <= NIGHTLY_TYPE_LINE_BYTES:
+        return line
+    return encoded[:NIGHTLY_TYPE_LINE_BYTES - 3].decode(errors="ignore") + "..."
+
+
+def _nightly_type_recheck(diagnostics: Sequence[NightlyUnitDiagnostic]) -> str:
+    files = sorted({item.path.as_posix() for item in diagnostics})
+    arguments = shlex.join("./" + path if path.startswith("-") else path for path in files)
+    listed = _nightly_diagnostic_line(arguments)
+    if listed != arguments:
+        return f"Files include {listed} Run `basedpyright scripts` to see every diagnostic."
+    return f"Run `basedpyright {listed}` to see every diagnostic in these files."
+
+
+def _nightly_diagnostic_excerpt(lines: Sequence[str]) -> str:
+    shown = "\n".join(_nightly_diagnostic_line(line) for line in lines[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
+    omitted = len(lines) - NIGHTLY_TYPE_DIAGNOSTIC_LINES
+    return f"{shown}\n{omitted} other diagnostic lines omitted." if omitted > 0 else shown
+
+
+def _notify_nightly_type_authors(repo: Path, tip: str, result_id: str, type_failures: Sequence[GateJobResult],
+                                 tests_passed: bool, production: staff.StaffId) -> NightlyTypeNotices:
+    from scripts.production import showrunners
+
+    pattern = re.compile(r"\s*(.+):([1-9]\d*):\d+ - (?:error|warning|information|note):.*")
+    diagnostics = [[(line.strip(), match[1], match[2]) for line in job.output.splitlines()
+                    if (match := pattern.fullmatch(line))] for job in type_failures]
+    if not any(diagnostics):
+        return NightlyTypeNotices()
+    try:
+        members = staff.snapshot()
+    except (OSError, ValueError) as error:
+        return NightlyTypeNotices((f"Could not read staff for type diagnostics. {error}",))
+    receipts = _nightly_merge_receipts()
+    authors: dict[str, staff.StaffRow | NoNightlyAuthor] = {}
+    by_unit: dict[staff.StaffId, tuple[staff.StaffRow, list[NightlyUnitDiagnostic]]] = {}
+    complete = all(diagnostics)
+    for lines in diagnostics:
+        for line, filename, number in lines:
+            try:
+                path = Path(filename)
+                if path.is_absolute():
+                    path = path.relative_to(repo)
+                blame = checked_git(repo, "blame", "--porcelain", "-L", f"{number},{number}", tip, "--", str(path))
+                blamed = blame.split(" ", 1)[0]
+                if blamed not in authors:
+                    authors[blamed] = _nightly_author(repo, tip, blamed, receipts, members, production)
+                author = authors[blamed]
+            except (GateRefused, OSError, ValueError, KeyError, subprocess.SubprocessError):
+                complete = False
+                continue
+            if isinstance(author, NoNightlyAuthor):
+                complete = False
+                continue
+            by_unit.setdefault(author.id, (author, []))[1].append(NightlyUnitDiagnostic(line, path))
+    details: list[str] = []
+    for author, items in by_unit.values():
+        lines = [item.text for item in items]
+        diagnostics_text = _nightly_diagnostic_excerpt(lines)
+        try:
+            notice = showrunners.send_to_address(f"session:{author.current_session}",
+                f"merge-gate-nightly:{result_id}:{author.id}",
+                "The nightly type check is red on your change. Fix it in your next phase.\n"
+                + diagnostics_text + "\n" + _nightly_type_recheck(items),
+                recipient=author.name, sender="merge_gate")
+            delivered = not notice.failed
+        except (OSError, ValueError, subprocess.SubprocessError):
+            delivered = False
+        complete = complete and delivered
+        heading = f"Sent to {author.name}" if delivered else f"Could not send to {author.name}"
+        details.extend([f"{heading}:", *lines])
+    if tests_passed and complete and by_unit:
+        first = max(by_unit.values(), key=lambda entry: len(entry[1]))[0]
+        return NightlyTypeNotices(tuple(details), NightlyFixAssigned(first.id, datetime.now(UTC).isoformat()))
+    return NightlyTypeNotices(tuple(details))
+
+
 def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
-                     type_failures: Sequence[GateJobResult] = (), result_id: str = "") -> NightlyNoticeReceived | NightlyNoticeUnreceived:
+                     type_failures: Sequence[GateJobResult] = (), result_id: str = "",
+                     author_notices: Sequence[str] = ()) -> NightlyNoticeReceived | NightlyNoticeUnreceived:
     from scripts.production import showrunners
 
     requires_full = bool(failed) or not type_failures
@@ -2534,10 +2726,13 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
             lines = [line for job in type_failures for line in job.output.splitlines()]
             summaries = type_check_summaries("\n".join(lines))
             diagnostics = [line for line in lines if line not in summaries]
-            detail += "\nType check failed:\n" + "\n".join(diagnostics[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
+            detail += "\nType check failed:\n" + "\n".join(
+                _nightly_diagnostic_line(line) for line in diagnostics[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
             detail += f"\n{max(0, len(diagnostics) - NIGHTLY_TYPE_DIAGNOSTIC_LINES)} other diagnostic lines omitted."
             if summaries:
                 detail += "\n" + summaries[-1]
+        if author_notices:
+            detail += "\n" + _nightly_diagnostic_excerpt(author_notices)
         if result_id:
             detail += f"\nAssign the fix, then run merge_gate.py nightly-assigned --result {result_id} --unit UNIT."
         owner = nightly_owner_name(args)
@@ -2571,10 +2766,11 @@ def nightly(args: GateArguments) -> int:
         _ = nightly_git(repo, "fetch", "origin",
                         f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
         commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
-        with copies.standing(nightly_owner(args), repo, copies.CommittedSource(commit), step="test-nightly") as clone:
+        owner = nightly_owner(args)
+        with copies.standing(owner, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
-                run = run_suites(clone, args.type_dirs,
+                run = run_suites(clone, NIGHTLY_TYPE_DIRS,
                                  module_time_limit_s=args.module_time_limit_s, full=True)
             except (GateRefused, OSError, subprocess.SubprocessError) as error:
                 print(f"Nightly suite runner failed: {error}", flush=True)
@@ -2611,10 +2807,18 @@ def nightly(args: GateArguments) -> int:
             result = NightlyRedResult(identity, args.merge_branch, tree, at, failures, values["types"], values["tests"])
             with nightly_red_lock(wait=True) as directory:
                 save_nightly_red(directory, result)
+                notices = _notify_nightly_type_authors(clone, commit, identity, type_failures,
+                                                       not failed and not run.time_limit_report, staff.StaffId(owner))
+                assignment = notices.assignment
                 received = tell_nightly_red(args, tree, [*failed, run.time_limit_report] if run.time_limit_report else failed,
-                                            type_failures=type_failures, result_id=identity)
-                save_nightly_red(directory, replace(result, received=received))
-                print(f"Assign the fix: merge_gate.py nightly-assigned --result {identity} --unit UNIT", flush=True)
+                                            type_failures=type_failures, author_notices=notices.details,
+                                            result_id=identity if isinstance(assignment, NightlyFixUnassigned) else "")
+                result = replace(result, received=received, assignment=assignment)
+                save_nightly_red(directory, result)
+                if isinstance(assignment, NightlyFixAssigned):
+                    _ = send_nightly_red(directory, result, assignment)
+                else:
+                    print(f"Assign the fix: merge_gate.py nightly-assigned --result {identity} --unit UNIT", flush=True)
             return 1
     except (Exception, KeyboardInterrupt) as error:
         if not result_sent and not (isinstance(run, GateRun) and not run.passed):
@@ -2625,8 +2829,6 @@ def nightly(args: GateArguments) -> int:
 
 def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
-    _ = parser.add_argument("--type-dirs", "--type-dir", nargs="+", default=[],
-                            help="check these folders by hand; nightly always checks scripts")
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
@@ -2637,19 +2839,18 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
 class CloudGateRoute(Protocol):
     """Define the cloud route boundary without coupling the local runner to AWS."""
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
-              module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES) -> GateRun | str: ...
+              module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES,
+              gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun | str: ...
 
     def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
 
 
-def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
+def run_gate_suites(repo: Path,
                     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
-                    mode: SuiteMode = SuiteMode.MERGE_GATE) -> GateRun:
+                    mode: SuiteMode = SuiteMode.MERGE_GATE,
+                    gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
     """Use the scaler service and retain the permitted local fallback."""
-    absent = [name for name in type_dirs if not (repo / name).exists()]
-    if absent:
-        raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
     selected: AllModules | TreeSelection = ALL_MODULES
     if mode is SuiteMode.TARGETED_TEST and not full:
@@ -2664,8 +2865,6 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
         selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
         if isinstance(selection, AffectedSelection) and not selection.modules:
-            if type_dirs:
-                return run_suites(repo, type_dirs, module_time_limit_s, source=source, mode=mode)
             reused = ledger.reuse()
             if not reused:
                 ledger.record_pass(selection)
@@ -2673,18 +2872,12 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                             hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
                             max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
             return GateRun((), 0.0, 0.0, selection_certified=True)
-    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected)
+    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                          selected=selected, gate_job=gate_job)
     if isinstance(outcome, str):
         print('Cloud gate uses natedev: ' + outcome, flush=True)
-        return run_suites(repo, type_dirs, module_time_limit_s, source=source, full=full, mode=mode)
-    remote = outcome
-    if not type_dirs or remote.time_limit_report:
-        return remote
-    local = run_suites(repo, type_dirs, module_time_limit_s, source=source, full=True,
-                       mode=mode, selected=SelectedModules(()))
-    return GateRun(remote.jobs + local.jobs, remote.seconds + local.seconds,
-                   max(remote.peak_memory_mib, local.peak_memory_mib), selection_certified=True,
-                   executions=remote.executions + local.executions, time_limit_report=remote.time_limit_report or local.time_limit_report)
+        return run_suites(repo, module_time_limit_s=module_time_limit_s, source=source, full=full, mode=mode)
+    return outcome
 
 
 def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
@@ -2719,8 +2912,8 @@ def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
             repo = Path(args.repo).resolve()
             with gate_recovery(repo):
                 run = (run_named_modules(repo, args.modules, args.module_time_limit_s, mode) if args.modules else
-                       run_gate_suites(repo, args.type_dirs,
-                                       module_time_limit_s=args.module_time_limit_s, full=args.full, mode=mode))
+                       run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
+                                       mode=mode, gate_job=args.gate_job))
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
@@ -2799,7 +2992,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
                             help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
-    args = cast(GateArguments, parser.parse_args(argv))
+    args = cast(GateArguments, parser.parse_args(arguments))
+    args.gate_job = gate_job_for_command(["merge_gate.py", *arguments])
     if args.promote_only and not args.merge_branch:
         parser.error("--promote-only needs --merge-branch")
     if args.nightly and not args.merge_branch:
@@ -2808,8 +3002,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--nightly cannot be combined with --tests-only or promotion")
     if args.modules and not args.tests_only:
         parser.error("--module needs --tests-only")
-    if args.nightly:
-        args.type_dirs = list(NIGHTLY_TYPE_DIRS)
     if not args.tests_only and not args.promote_only and not args.nightly:
         required = ("merge_branch", "unit_branch", "checkpoint", "previous_checkpoint", "unit", "phase")
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]

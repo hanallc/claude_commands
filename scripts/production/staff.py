@@ -11,10 +11,11 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -22,7 +23,7 @@ from enum import Enum
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, NewType, Protocol, Self, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast
 from uuid import UUID
 
 from scripts.lib import git_files
@@ -618,6 +619,13 @@ class StaffSnapshot:
     def parent_of(self, row: StaffRow) -> StaffRow | None:
         return self.by_id(row.parent.id) if isinstance(row.parent, ReportsTo) else None
 
+    def qualified_name(self, row: StaffRow) -> str:
+        names = [row.name]
+        while (parent := self.parent_of(row)) is not None:
+            names.append(parent.name)
+            row = parent
+        return "/".join(reversed(names))
+
     def owner_of(self, reference: str) -> StaffRow | None:
         """Return the member, or the parent unit when the member is a worker."""
         row = self.by_member_reference(reference)
@@ -876,6 +884,34 @@ def row_operation(reference: str) -> Generator[None]:
         yield
 
 
+def _write_slot_holder(lock: IO[bytes]) -> None:
+    holder = {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+    with suppress(OSError):
+        os.ftruncate(lock.fileno(), 0)
+        _ = lock.write((json.dumps(holder) + "\n").encode("utf-8"))
+
+
+def _clear_slot_holder(lock: IO[bytes]) -> None:
+    with suppress(OSError):
+        os.ftruncate(lock.fileno(), 0)
+
+
+def _slot_holder_suffix(lock: IO[bytes]) -> str:
+    try:
+        _ = lock.seek(0)
+        line = lock.read(4096).partition(b"\n")[0]
+        holder = cast(object, json.loads(line))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(holder, dict):
+        return ""
+    record = cast(dict[str, object], holder)
+    pid, command = record.get("pid"), record.get("command")
+    if type(pid) is not int or pid <= 0 or not isinstance(command, str) or not command:
+        return ""
+    return f" (pid {pid}: {command})"
+
+
 @contextmanager
 def slot_operation(key: str, name: str) -> Generator[None]:
     """Lock a row or a named worker slot across inherited children."""
@@ -884,20 +920,93 @@ def slot_operation(key: str, name: str) -> Generator[None]:
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as lock:
+    with path.open("a+b", buffering=0) as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise StaffRefused(f"{name}: another operation holds this row") from error
+            raise StaffRefused(f"{name}: another operation holds this row{_slot_holder_suffix(lock)}") from error
         previous = os.environ.get(variable)
-        os.environ[variable] = str(lock.fileno())
+        _write_slot_holder(lock)
         try:
+            os.environ[variable] = str(lock.fileno())
             yield
         finally:
+            _clear_slot_holder(lock)
             if previous is None:
                 _ = os.environ.pop(variable, None)
             else:
                 os.environ[variable] = previous
+
+
+@dataclass(frozen=True)
+class RowAvailable:
+    """No operation holds the staff row."""
+
+
+@dataclass(frozen=True)
+class RowBusy:
+    """An operation holds the row without a proved move target."""
+
+
+@dataclass(frozen=True)
+class RowMoving:
+    target: str
+
+
+def _move_fields(descriptor: int) -> dict[str, object]:
+    try:
+        value = cast(object, json.loads(os.pread(descriptor, 1024, 0)))
+    except (ValueError, UnicodeError):
+        return {}
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def row_activity(key: str) -> RowAvailable | RowBusy | RowMoving:
+    """Read the row lock without creating it or joining its owner."""
+    from scripts.lib import process_start
+
+    path, _ = _row_lock(key)
+    try:
+        stream = path.open("rb")
+    except FileNotFoundError:
+        return RowAvailable()
+    with stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fields = _move_fields(stream.fileno())
+            pid, start, target = fields.get("pid"), fields.get("start"), fields.get("target")
+            if isinstance(pid, int) and isinstance(start, str) and isinstance(target, str):
+                owner = process_start.process_start(pid)
+                if isinstance(owner, process_start.Started) and owner.start == start:
+                    return RowMoving(target)
+            return RowBusy()
+        return RowAvailable()
+
+
+@contextmanager
+def mark_row_move(key: str, target: str) -> Generator[None]:
+    """Publish the move while the caller holds the row lock."""
+    from scripts.lib import process_start
+
+    path, variable = _row_lock(key)
+    if not _joined_operation(path, variable):
+        raise StaffRefused("the move does not hold the row")
+    with path.open("r+b") as stream:
+        def write(fields: dict[str, object]) -> None:
+            _ = stream.seek(0)
+            _ = stream.write(json.dumps(fields).encode())
+            _ = stream.truncate()
+            stream.flush()
+
+        pid = os.getpid()
+        owner = process_start.process_start(pid)
+        write({"pid": pid, "start": owner.start, "target": target}
+              if isinstance(owner, process_start.Started) else {})
+        try:
+            yield
+        finally:
+            write({})
 
 
 def _joined_operation(path: Path, variable: str = "STAFF_OPERATION_FD") -> bool:

@@ -20,6 +20,11 @@
 __PAGE_FRAME_STYLE__
 body { container-type: inline-size; }
 h2 .unit { font-size: 0.82rem; font-weight: 400; color: var(--ink-3); }
+#launch-state { padding: 10px 18px; }
+#launch-state p { margin: 0; color: var(--ink-2); font-size: 0.9rem; }
+#launch-state strong { color: var(--ink); }
+#launch-state[data-kind="refused"] { border-inline-start: 3px solid var(--error); }
+#launch-state[data-kind="refused"] strong { color: var(--error); }
 .card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
 .answer { font-size: 1.05rem; font-weight: 600; margin: 12px 0 0; }
 table { border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; min-width: 100%; }
@@ -51,6 +56,10 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 #price-table .measures th:first-child { position: static; padding-left: 18px; box-shadow: none; }
 #price-table .region-quota { width: 1%; color: var(--ink); font-weight: 600;
   background: color-mix(in srgb, var(--accent) 12%, var(--card)); }
+#price-table .quota-request { display: block; font-size: 0.76rem; font-weight: 400; color: var(--ink-2); }
+@media (max-width: 600px) {
+  #price-table .quota-request { min-width: 18ch; white-space: normal; }
+}
 #price-table .spot-status { margin-left: 6px; color: var(--ink-3); }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 10px 0 0; font-size: 0.82rem; color: var(--ink-2); }
 .swatch { display: inline-block; width: 30px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
@@ -101,10 +110,14 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 <body>
 <main>
 __PAGE_TITLE__
+<section class="card" id="launch-state" aria-label="AWS launch state">
+  <p role="status"></p>
+</section>
 <section class="card" id="spend">
   <h2>Spend <span class="unit">(USD)</span></h2>
   <div class="tiles" id="spend-tiles"></div>
   <p class="note" id="spend-note"></p>
+  <div id="settled-notes"></div>
 </section>
 <nav class="regions" aria-label="AWS table filters">
   <span class="regions-label" id="geographies-label">Geography</span>
@@ -120,7 +133,9 @@ __PAGE_TITLE__
 </nav>
 <section class="card" id="prices-quotas">
   <h2>Prices and quotas</h2>
+  <p class="note" id="gpu-quota-summary" hidden></p>
   <div id="price-table"></div>
+  <p class="note" id="quota-request-note" hidden></p>
   <p class="note" id="gpu-gate-note" hidden>GPU types have no gate runs.</p>
   <p class="legend">
     <span><span class="swatch scale" aria-hidden="true"></span>Each price column: green is the cheapest, red the most expensive.</span>
@@ -135,6 +150,7 @@ __PAGE_TITLE__
   </details>
 </section>
 <section class="card" id="placement-scores"></section>
+<section class="card" id="gate-time-price"></section>
 <section class="card" id="runs">
   <div class="card-head">
     <h2>Cost per run</h2>
@@ -149,10 +165,16 @@ __PAGE_TITLE__
 <section class="card" id="hours"></section>
 </main>
 <script id="aws-prices-data" type="application/json">__AWS_PRICES_DATA__</script>
+<script id="aws-gate-time-data" type="application/json">__AWS_GATE_TIME_DATA__</script>
 <script>
 "use strict";
 __PAGE_REFRESH_SCRIPT__
-let data = JSON.parse(document.getElementById("aws-prices-data").textContent);
+function readAwsPage(page) {
+  const prices = JSON.parse(page.getElementById("aws-prices-data").textContent);
+  const gateTime = JSON.parse(page.getElementById("aws-gate-time-data").textContent);
+  return {...prices, regions: gateTime.regions, gateTimePrice: gateTime.table};
+}
+let data = readAwsPage(document);
 const REGIONS_KEY = "aws-prices-regions";
 const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
 const NO_REGION = "No region chosen.";
@@ -202,7 +224,9 @@ function visible(table) {
   const columns = table.headers.map((_header, index) => index)
     .filter(index => index === 0 || table.region_axis !== "columns" || shown.has(table.headers[index]));
   const rows = table.rows.map((_row, index) => index)
-    .filter(index => table.region_axis !== "rows" || shown.has(table.rows[index][0]));
+    .filter(index => table.region_axis !== "rows" || shown.has(table.rows[index][0]))
+    .filter(index => !table.active_regions_by_size
+      || table.active_regions_by_size[table.rows[index][0]].some(region => shown.has(region)));
   return { columns, rows };
 }
 
@@ -310,6 +334,40 @@ function fill(section, table, note) {
   return section;
 }
 
+const launchTime = new Intl.DateTimeFormat("en-US", {month: "numeric", day: "numeric", year: "2-digit",
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short"});
+
+function drawLaunchState() {
+  const section = document.getElementById("launch-state");
+  const state = data.launch_state;
+  section.dataset.kind = state.kind;
+  if (state.kind === "off") {
+    section.querySelector("p").replaceChildren(
+      element("strong", "Cloud gates are off"), " (cloud_gate.conf enabled=off). Gates run on natedev.");
+    return;
+  }
+  if (state.kind === "invalid") {
+    section.querySelector("p").replaceChildren(
+      element("strong", "cloud_gate.conf enabled is not valid."), " Gates run on natedev.");
+    return;
+  }
+  const last = state.last_good_at === undefined ? "" : launchTime.format(state.last_good_at * 1000);
+  const label = state.kind === "refused" ? `AWS refuses launches (${state.code}).`
+    : state.kind === "working" ? "AWS launches work." : "AWS launch state is unknown.";
+  let details = last ? `Last good launch: ${last}.` : "No good launch recorded.";
+  if (state.kind === "refused") {
+    const count = `${state.count} ${state.count === 1 ? "refusal" : "refusals"}`;
+    const since = last ? `since the last good launch (${last}).` : "recorded. No good launch recorded.";
+    details = `${state.reason} First refusal: ${launchTime.format(state.first_at * 1000)}. ${count} ${since}`;
+  }
+  if (state.latest_attempt_at !== undefined) {
+    const latest = `Latest attempt: ${launchTime.format(state.latest_attempt_at * 1000)}.`;
+    details = state.kind === "working" && state.latest_attempt_at === state.last_good_at ? latest : `${details} ${latest}`;
+  }
+  section.querySelector("p").replaceChildren(element("strong", label), " ", details);
+}
+drawLaunchState();
+
 function drawSpend() {
   const tiles = data.spend.tiles.map(tile => {
     const box = element("div", undefined, "tile");
@@ -318,6 +376,8 @@ function drawSpend() {
   });
   document.getElementById("spend-tiles").replaceChildren(...tiles);
   document.getElementById("spend-note").textContent = data.spend.unavailable || data.spend.forecast;
+  const settled = (data.settled_notes ?? []).map(note => element("p", note, "note"));
+  document.getElementById("settled-notes").replaceChildren(...settled);
 }
 drawSpend();
 
@@ -359,10 +419,10 @@ function priceCell(row, source, rowIndex, column, className, marks) {
       if (marks.ends.has(place)) cell.classList.add("end");
     }
   }
-  row.appendChild(cell);
+  return row.appendChild(cell);
 }
 
-function pricesAndQuotas(quota, spot, sources, rows) {
+function pricesAndQuotas(quota, spot, sources, rows, requests) {
   const wrap = element("div", undefined, "scroll");
   const grid = element("table");
   const typeHeaders = sources.length ? quota.headers.slice(2) : [];
@@ -393,7 +453,8 @@ function pricesAndQuotas(quota, spot, sources, rows) {
     if (status && measures.has("spot") && spot.values[index].some(value => typeof value === "number")) {
       name.appendChild(element("small", status, "spot-status"));
     }
-    priceCell(row, quota, index, 1, "n edge region-quota");
+    const applied = priceCell(row, quota, index, 1, "n edge region-quota");
+    if (requests[region]) applied.appendChild(element("small", requests[region].text, "quota-request"));
     for (let type = 2; type < quota.headers.length; type++) {
       sources.forEach(({table, marks}, position) => {
         priceCell(row, table, index, table === quota ? type : type - 1, position ? "n" : "n edge", marks);
@@ -427,11 +488,33 @@ function drawPrices() {
       return {table, label, unit, marks};
     });
   const regionRows = new Map(quota.rows.map(([region], index) => [region, index]));
-  const rows = data.regions.filter(region => shown.has(region) && regionRows.has(region))
-    .map(region => regionRows.get(region));
+  const visibleRegions = new Set(data.regions.filter(region => shown.has(region) && regionRows.has(region)));
+  const rows = [...visibleRegions].map(region => regionRows.get(region));
   const holder = document.getElementById("price-table");
   const scrollLeft = holder.querySelector(".scroll")?.scrollLeft || 0;
-  const content = rows.length ? pricesAndQuotas(quota, tables.spot, sources, rows)
+  const requests = data.quota_history?.[types] || {};
+  const summary = document.getElementById("gpu-quota-summary");
+  const progress = data.quota_history?.gpu_summary;
+  const gpuRequests = Object.values(data.quota_history?.gpu || {});
+  const missingHistory = gpuRequests.length > 0 && gpuRequests.every(request => request.history_missing);
+  const outcomes = [];
+  for (const [outcome, regions] of Object.entries(progress?.regions_by_outcome || {})) {
+    const count = regions.filter(region => visibleRegions.has(region)).length;
+    if (!missingHistory || (outcome === "granted" && count)) outcomes.push(`${count} ${outcome}`);
+  }
+  if (missingHistory) outcomes.push("request history not measured yet");
+  summary.textContent = progress && outcomes.length
+    ? `G and VT quota (${progress.target_vcpus} vCPUs): ${outcomes.join(" · ")}` : "";
+  summary.hidden = !summary.textContent;
+  const note = document.getElementById("quota-request-note");
+  const visibleRequests = [...visibleRegions].map(region => requests[region]);
+  const causes = new Set(visibleRequests.map(request => request?.note).filter(Boolean));
+  if (visibleRequests.length && visibleRequests.every(request => request?.history_missing)) {
+    causes.add("The snapshot has no quota request history.");
+  }
+  note.textContent = [...causes].join(" ");
+  note.hidden = !note.textContent;
+  const content = rows.length ? pricesAndQuotas(quota, tables.spot, sources, rows, requests)
     : element("p", shown.size ? NOTHING_SHOWN : NO_REGION, "note");
   holder.replaceChildren(content);
   content.scrollLeft = scrollLeft;
@@ -463,7 +546,16 @@ function drawScope() {
 function draw() {
   drawPrices();
   drawPlacementScores();
-  fill(document.getElementById("hours"), data.hours, data.hours_note);
+  fill(document.getElementById("gate-time-price"), data.gateTimePrice,
+    "Compare the lowest estimated run cost for each box size. Box times include boot and can use runs from other regions.");
+  const hours = document.getElementById("hours");
+  fill(hours, data.hours, data.hours_note);
+  for (const region of data.hours.headers.slice(1)) {
+    const reserved = data.hours_reserved_by_region?.[region];
+    if (reserved && shown.has(region)) {
+      hours.appendChild(element("p", `${region}: ${reserved} Hana reserved hours.`, "note"));
+    }
+  }
   drawScope();
   markOverflow();
 }
@@ -513,6 +605,7 @@ for (const group of scopeFilters) {
 // The geography row above it groups the regions by the first word of their names, in the order of the region list.
 function chipRow(id, labels) {
   const row = document.getElementById(id);
+  row.replaceChildren();
   const chip = (label, className) => {
     const button = element("button", label, className);
     button.type = "button";
@@ -525,11 +618,6 @@ function chipRow(id, labels) {
   return {all, each, none};
 }
 const geographyOf = region => region.split("-", 1)[0];
-const geographies = [...new Set(data.regions.map(geographyOf))];
-const geographyRow = chipRow("geographies", geographies);
-const regionRow = chipRow("regions", data.regions);
-const regionChips = regionRow.each;
-regionChips.forEach((chip, index) => { chip.dataset.region = data.regions[index]; });
 // A geography is pressed when all its regions are chosen, and mixed when some are.
 function geographyState(geography) {
   const regions = data.regions.filter(region => geographyOf(region) === geography);
@@ -538,47 +626,67 @@ function geographyState(geography) {
 }
 function showRegions(next) {
   shown = next;
-  for (const row of [geographyRow, regionRow]) {
-    row.all.setAttribute("aria-pressed", String(shown.size === data.regions.length));
-    row.none.setAttribute("aria-pressed", String(shown.size === 0));
-  }
-  geographyRow.each.forEach((chip, index) => chip.setAttribute("aria-pressed", geographyState(geographies[index])));
-  for (const chip of regionChips) chip.setAttribute("aria-pressed", String(shown.has(chip.dataset.region)));
+  markRegions();
   draw();
   remember(REGIONS_KEY, JSON.stringify([...shown]));
 }
-for (const row of [geographyRow, regionRow]) {
-  row.all.addEventListener("click", () => showRegions(new Set(data.regions)));
-  row.none.addEventListener("click", () => showRegions(new Set()));
-}
-// A geography chip chooses all its regions, or clears them when all are already chosen.
-geographyRow.each.forEach((chip, index) => chip.addEventListener("click", () => {
-  const geography = geographies[index];
-  const next = new Set(shown);
-  const choose = geographyState(geography) !== "true";
-  for (const region of data.regions) if (geographyOf(region) === geography) { if (choose) next.add(region); else next.delete(region); }
-  showRegions(next);
-}));
-for (const chip of regionChips) {
-  chip.addEventListener("click", () => {
+function configureRegionFilter() {
+  const geographies = [...new Set(data.regions.map(geographyOf))];
+  const geographyRow = chipRow("geographies", geographies);
+  const regionRow = chipRow("regions", data.regions);
+  for (const row of [geographyRow, regionRow]) {
+    row.all.addEventListener("click", () => showRegions(new Set(data.regions)));
+    row.none.addEventListener("click", () => showRegions(new Set()));
+  }
+  geographyRow.each.forEach((chip, index) => chip.addEventListener("click", () => {
+    const geography = geographies[index];
     const next = new Set(shown);
-    if (next.has(chip.dataset.region)) next.delete(chip.dataset.region); else next.add(chip.dataset.region);
+    const choose = geographyState(geography) !== "true";
+    for (const region of data.regions) if (geographyOf(region) === geography) { if (choose) next.add(region); else next.delete(region); }
     showRegions(next);
+  }));
+  regionRow.each.forEach((chip, index) => {
+    const region = data.regions[index];
+    chip.dataset.region = region;
+    chip.addEventListener("click", () => {
+      const next = new Set(shown);
+      if (next.has(region)) next.delete(region); else next.add(region);
+      showRegions(next);
+    });
   });
+  return () => {
+    for (const row of [geographyRow, regionRow]) {
+      row.all.setAttribute("aria-pressed", String(shown.size === data.regions.length));
+      row.none.setAttribute("aria-pressed", String(shown.size === 0));
+    }
+    geographyRow.each.forEach((chip, index) => chip.setAttribute("aria-pressed", geographyState(geographies[index])));
+    for (const chip of regionRow.each) chip.setAttribute("aria-pressed", String(shown.has(chip.dataset.region)));
+  };
 }
 
+let markRegions = configureRegionFilter();
 let saved = [];
 try { saved = JSON.parse(remembered(REGIONS_KEY) || "[]"); } catch (error) { saved = []; }
 const known = Array.isArray(saved) ? data.regions.filter(region => saved.includes(region)) : [];
 showRegions(new Set(known.length ? known : data.regions));
-async function loadAws(supersede=false,current=()=>true){
- const response=await fetch(location.pathname,{cache:'no-store'});
- if(!response.ok) throw new Error('HTTP '+response.status);
- const page=new DOMParser().parseFromString(await response.text(),'text/html');
- const next=JSON.parse(page.querySelector('#aws-prices-data').textContent);
- if(!current()) return;data=next;
- drawSpend();draw();
- return {readAt:data.read_at,renderSeconds:data.render_seconds};
+async function loadAws(supersede = false, current = () => true) {
+  const response = await fetch(location.pathname, {cache: "no-store"});
+  if (!response.ok) throw new Error("HTTP " + response.status);
+  const page = new DOMParser().parseFromString(await response.text(), "text/html");
+  const next = readAwsPage(page);
+  if (!current()) return;
+  const allShown = shown.size === data.regions.length;
+  const regionsChanged = next.regions.join() !== data.regions.join();
+  data = next;
+  if (regionsChanged) {
+    shown = new Set(allShown ? data.regions : data.regions.filter(region => shown.has(region)));
+    markRegions = configureRegionFilter();
+    markRegions();
+  }
+  drawLaunchState();
+  drawSpend();
+  draw();
+  return {readAt: data.read_at, renderSeconds: data.render_seconds};
 }
 createPageRefresh(loadAws,()=>0,()=>'',{readAt:data.read_at,renderSeconds:data.render_seconds});
 </script>

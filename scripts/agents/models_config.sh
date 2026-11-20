@@ -219,13 +219,17 @@ _agents_function_families_inline_from_table() {
     done
 }
 
-# Print the sole family of a function with exactly one configured set.
+# Print the family a function must use to launch agents.
 _agents_pinned_family() {
     _models_registry_read _agents_pinned_family_from_table "$@"
 }
 
 _agents_pinned_family_from_table() {
     local function="$1" family found=""
+    if [[ "$function" == production ]] && _models_config_has_section production.claude; then
+        printf '%s' claude
+        return 0
+    fi
     for family in codex claude; do
         _models_config_has_section "$function.$family" || continue
         [[ -n "$found" ]] && return 0
