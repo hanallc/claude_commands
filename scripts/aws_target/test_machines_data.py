@@ -67,6 +67,7 @@ faster_box_max_cost_ratio=1.50
         _ = self.account_path.write_text('region=fixture-home\n# whole: 1..\nprice_max_age_seconds=7200\n')
         self.configuration = machines_data.MachinesConfiguration(
             conf.read(page_path), conf.read(gate_path), conf.read(self.account_path))
+        self.write_deployment(SMALL.region, FAST.region, FASTER.region)
         self.book = ledger.CostLedger(self.directory)
         self.spot = tuple(ledger.RegionalSpotPrice(machine.region, 'zone-a', machine.instance_type, Decimal(price), READ_AT)
                           for machine, price in ((SMALL, '0.36'), (FAST, '0.60'), (FASTER, '1.08')))
@@ -93,6 +94,12 @@ faster_box_max_cost_ratio=1.50
                      'error_code': 'InsufficientInstanceCapacity'})
         _ = self.book.launch_history_path.write_text(''.join(json.dumps(row) + '\n'
             for row in sorted(rows, key=lambda row: float(str(row['time'])))))
+
+    def write_deployment(self, *deployed_regions: str) -> None:
+        regions = [{'region': region, 'subnets': [{'id': 'subnet-fixture', 'zone': 'zone-a'}]}
+                   for region in deployed_regions]
+        _ = (self.directory / 'gate-deployment.json').write_text(json.dumps(
+            {'regions': regions, 'instance_types': [machine.instance_type for machine in (SMALL, FAST, FASTER)]}))
 
     def write_prices(self, *, closed: bool = False) -> None:
         prices = [{'instance_type': row.instance_type, 'region': row.region, 'zone': row.zone,
@@ -148,9 +155,34 @@ faster_box_max_cost_ratio=1.50
 
     def test_one_size_workloads_report_the_recorded_count(self) -> None:
         for workload, name in zip(self.read().workloads[1:], ('Named tests', 'Affected tests'), strict=True):
-            self.assertEqual(workload, machines_data.WorkloadWithoutComparison(
-                name, 'targeted-test' if name == 'Named tests' else 'test-affected',
-                'The records hold 1 completed check on 1 machine size in this period.'))
+            assert isinstance(workload, machines_data.WorkloadWithoutComparison)
+            self.assertEqual(workload.name, name)
+            self.assertEqual(workload.mode, 'targeted-test' if name == 'Named tests' else 'test-affected')
+            self.assertEqual(workload.sentence, 'The records hold 1 completed check on 1 machine size in this period.')
+
+    def test_removed_deployment_region_stays_measured_and_leaves_the_projection(self) -> None:
+        self.write_deployment(SMALL.region, FASTER.region)
+        merge = self.merge()
+        fast = next(choice for choice in merge.choices if choice.machine == FAST)
+        self.assertEqual(fast.checks, 1)
+        self.assertFalse(fast.in_deployment)
+        self.assertEqual((merge.steps[0].last_ratio, merge.steps[0].added), (Decimal('1.25'), ()))
+        self.assertEqual(merge.steps[1].added, (FASTER,))
+
+    def test_cost_per_check_distinguishes_missing_measurements_and_prices(self) -> None:
+        unmeasured = ledger.GateRateCandidate('c7a.4xlarge', FASTER.region)
+        self.spot = tuple(row for row in self.spot if row.region != FAST.region) + (
+            ledger.RegionalSpotPrice(unmeasured.region, 'zone-a', unmeasured.instance_type, Decimal('.40'), READ_AT),)
+        self.write_prices()
+        with self.book.launch_history_path.open('a') as stream:
+            _ = stream.write(json.dumps({'attempt': 'fixture-unmeasured', 'mode': 'merge-gate',
+                'region': unmeasured.region, 'instance_type': unmeasured.instance_type,
+                'time': WEEK_START + 3500, 'result': 'launched'}) + '\n')
+        choices = {row.machine: row for row in self.merge().choices}
+        self.assertEqual(choices[unmeasured].usd_per_hour, Decimal('.40'))
+        self.assertIsInstance(choices[unmeasured].usd_per_check, machines_data.NoCompletedChecks)
+        self.assertEqual(choices[FAST].checks, 1)
+        self.assertIsInstance(choices[FAST].usd_per_check, run_cost.NoPricedGateVariant)
 
     def test_closed_aws_marks_the_last_saved_price_read(self) -> None:
         self.write_prices(closed=True)

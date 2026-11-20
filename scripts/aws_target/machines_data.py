@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
@@ -52,13 +52,19 @@ class NoHoursSaved:
 
 
 @dataclass(frozen=True)
+class NoCompletedChecks:
+    """The choice has no completed checks in the measurement window."""
+
+
+@dataclass(frozen=True)
 class MachineChoice:
     machine: ledger.GateRateCandidate
     vcpus: int
     checks: int
     median_seconds: Decimal | run_cost.NoBoxTimeMeasurement
     usd_per_hour: Decimal | run_cost.NoPricedGateVariant
-    usd_per_check: Decimal | run_cost.NoPricedGateVariant
+    usd_per_check: Decimal | run_cost.NoPricedGateVariant | NoCompletedChecks
+    in_deployment: bool
     capacity_refusals: int
     launched: int
     small_sample: bool
@@ -113,6 +119,7 @@ class WorkloadWithoutComparison:
     name: str
     mode: str
     sentence: str
+    choices: tuple[MachineChoice, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -277,14 +284,11 @@ def _steps(rows: Sequence[cloud_gate.GateRankedChoice], types: tuple[str, ...], 
 
 def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], intervals: Sequence[_GateInterval],
                       prices: _SavedPrices, start: datetime, end: datetime, configuration: MachinesConfiguration,
-                      ratios: Sequence[Decimal]) -> MeasuredWorkload | WorkloadWithoutComparison:
+                      ratios: Sequence[Decimal], deployed: Mapping[ledger.GateRateCandidate, run_cost.GateLaunchVariant]
+                      ) -> MeasuredWorkload | WorkloadWithoutComparison:
     checks = len(intervals)
-    sizes = len({ledger.gate_vcpus(row.machine.instance_type) for row in intervals})
-    if not checks or (mode != 'merge-gate' and sizes < 2):
-        check_word = 'check' if checks == 1 else 'checks'
-        size_word = 'size' if sizes == 1 else 'sizes'
-        return WorkloadWithoutComparison(name, mode, f'The records hold {checks} completed {check_word} '
-                                                    + f'on {sizes} machine {size_word} in this period.')
+    if not checks:
+        return WorkloadWithoutComparison(name, mode, 'The records hold 0 completed checks in this period.')
     home = configuration.account.text('region')
     gate = configuration.gate
     types = gate.words('instance_types')
@@ -312,7 +316,8 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
         'This workload has the quota for itself. Other workloads can reduce its available quota.',
         'Each successful launch and each capacity refusal counts as one Spot request.',
         'Prices use the median of saved daily means, or the lowest saved zone price when daily means are absent.',
-        'The projection uses measured choices within the gate time limit and includes configured transfer cost.',
+        'The projection uses deployed choices with measurements within the gate time limit.',
+        'The projection includes configured transfer cost.',
     ]
     for machine in sorted(samples.keys() | launched.keys() | refused.keys(),
                           key=lambda item: (item.instance_type, item.region)):
@@ -334,21 +339,32 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
         hourly = prices.hourly.get(machine, run_cost.NoPricedGateVariant())
         times = samples.get(machine, [])
         typical = median(times) if times else run_cost.NoBoxTimeMeasurement()
-        estimate = (pricing.placement_estimate(hourly, size, region)
-                    if isinstance(hourly, Decimal) and times else run_cost.NoPricedGateVariant())
-        cost = estimate.aws_spend_usd if isinstance(estimate, run_cost.GatePlacementEstimate) else estimate
-        choices[machine] = MachineChoice(machine, cpus, len(times), typical, hourly, cost,
+        variant = deployed.get(machine)
+        cost: Decimal | run_cost.NoPricedGateVariant | NoCompletedChecks = NoCompletedChecks()
+        if isinstance(typical, Decimal):
+            estimate = (pricing.placement_estimate(hourly, size, region)
+                        if isinstance(hourly, Decimal) else hourly)
+            cost = estimate.aws_spend_usd if isinstance(estimate, run_cost.GatePlacementEstimate) else estimate
+            if variant is not None and typical <= max_seconds:
+                ranked_rows.append(cloud_gate.GateRankedChoice(variant, len(times), typical, estimate,
+                    cloud_gate.NoComparableSpendRatio(), cloud_gate.GateCapacity(False, False, False),
+                    cloud_gate.DefaultOrder()))
+        choices[machine] = MachineChoice(machine, cpus, len(times), typical, hourly, cost, variant is not None,
             refused[machine], launched[machine], len(times) < small_sample_checks, quota_vcpus, assumed,
             fits, granted, fits * granted)
-        if size in types and isinstance(typical, Decimal) and typical <= max_seconds:
-            ranked_rows.append(cloud_gate.GateRankedChoice(run_cost.GateLaunchVariant(region, size, '', ''),
-                len(times), typical, estimate, cloud_gate.NoComparableSpendRatio(),
-                cloud_gate.GateCapacity(False, False, False), cloud_gate.DefaultOrder()))
+    measured_sizes = {choice.vcpus for choice in choices.values() if choice.checks}
+    if mode != 'merge-gate' and len(measured_sizes) == 1:
+        check_word = 'check' if checks == 1 else 'checks'
+        sentence = f'The records hold {checks} completed {check_word} on 1 machine size in this period.'
+        return WorkloadWithoutComparison(name, mode, sentence, tuple(choices.values()))
+    if not ranked_rows:
+        return WorkloadWithoutComparison(name, mode,
+            'No deployed choice has a measurement within the gate time limit.', tuple(choices.values()))
     ranking = cloud_gate.rank_gate_choices(ranked_rows, types, _RULE_OFF)
     reference = ranking.reference
     if not isinstance(reference, cloud_gate.GateRankedChoice):
         return WorkloadWithoutComparison(name, mode,
-            f'The records hold {checks} completed checks, with no saved price for an eligible measured choice.')
+            'No eligible measured choice has a saved price.', tuple(choices.values()))
     assert isinstance(reference.estimate, run_cost.GatePlacementEstimate)
     monthly_checks = Decimal(checks * _DAYS_PER_WEEK * _WEEKS_PER_YEAR) / (_MONTHS_PER_YEAR * (end - start).days)
     return MeasuredWorkload(name, mode, tuple(choices.values()),
@@ -382,9 +398,12 @@ def read_machines_data(directory: Path, now: int,
             WorkloadWithoutComparison(name, mode, 'The cost ledger is unavailable.') for mode, name in _WORKLOADS))
     launches = ledger.recent_gate_launches(directory, start.timestamp())
     home = configuration.account.text('region')
+    deployed: dict[ledger.GateRateCandidate, run_cost.GateLaunchVariant] = {}
+    for variant in run_cost.read_deployed_gate_variants(directory, configuration.gate.words('instance_types'), home):
+        _ = deployed.setdefault(ledger.GateRateCandidate(variant.instance_type, variant.region), variant)
     workloads: list[MeasuredWorkload | WorkloadWithoutComparison] = []
     for mode, name in _WORKLOADS:
         rows = tuple(row for row in launches if _workload(row) == mode)
         workloads.append(_project_workload(name, mode, rows, _intervals(rows, reservations, home, start, end),
-                                           prices, start, end, configuration, ratios))
+                                           prices, start, end, configuration, ratios, deployed))
     return MachinesPageData(start, end, ratio_max, ratio_step, prices.read, tuple(workloads))
