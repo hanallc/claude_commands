@@ -28,7 +28,7 @@ from tempfile import TemporaryFile
 import time
 from typing import Protocol, cast
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from scripts.aws_target.gate_box import (
     GUEST as GUEST, user_data as user_data,
@@ -186,15 +186,17 @@ class GitRecovery:
     def read(cls, path: Path) -> GitRecovery:
         try:
             record = cloud_gate.read(path)
+            boot = ledger.text(record, 'boot')
             unit = ledger.text(record, 'unit')
             owner = ledger.instant(record, 'owner')
             deadline = record.get('deadline')
             if (record.keys() != cls.__dataclass_fields__.keys()
+                    or str(UUID(boot)) != boot
                     or not re.fullmatch(r'cloud-trial-git-[0-9a-f]{32}\.scope', unit)
                     or not 0 < owner < 2 ** 31 or type(deadline) is not float
                     or not isfinite(deadline) or deadline <= 0):
                 raise ValueError('invalid Git recovery fields')
-            return cls(ledger.text(record, 'boot'), owner, ledger.text(record, 'owner_start'), unit, deadline)
+            return cls(boot, owner, ledger.text(record, 'owner_start'), unit, deadline)
         except (ValueError, RecursionError) as error:
             raise GateRefused(f'UNRESOLVED: invalid Git recovery record {path}: {error}') from error
 

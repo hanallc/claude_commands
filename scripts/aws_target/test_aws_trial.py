@@ -43,10 +43,13 @@ from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.boot_identity import boot_identity
-from scripts.lib.process_start import Gone
+from scripts.lib.process_start import Gone, Started, process_start
 from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+FIXTURE_BOOT = '01234567-89ab-cdef-0123-456789abcdef'
 
 
 def assert_term_during_cleanup(test: unittest.TestCase, action: Callable[[Callable[[], Never]], int],
@@ -970,10 +973,10 @@ signal.pause()
         unit = 'cloud-trial-git-' + 'a' * 32 + '.scope'
         scope = Path('/sys/fs/cgroup/fixture/builds.slice') / unit
         owner = Owner(101, 'original')
-        cloud_gate.save(path, {'boot': 'fixture', 'owner': owner.pid, 'owner_start': owner.start_time,
+        cloud_gate.save(path, {'boot': FIXTURE_BOOT, 'owner': owner.pid, 'owner_start': owner.start_time,
                                'unit': unit, 'deadline': 60.0})
         published = queue_place.ProgramStart(owner, Owner(102, 'original'), str(scope))
-        with (mock.patch.object(trial, 'boot_identity', return_value='fixture'),
+        with (mock.patch.object(trial, 'boot_identity', return_value=FIXTURE_BOOT),
               mock.patch.object(trial, 'process_start', return_value=Gone()) as identity,
               mock.patch.object(queue_place, 'read_program_start', return_value=published) as read_start,
               mock.patch.object(queue_place, 'stop_scope') as stop,
@@ -1027,7 +1030,7 @@ print('Git read the published scope')
         path = self.root / trial.GIT_RECOVERY
         for unit in ({}, {'unit': ''}, {'unit': 5}, {'unit': 'unrelated.scope'}):
             with self.subTest(unit=unit):
-                row: dict[str, object] = {'boot': 'earlier-boot', 'owner': 101, 'owner_start': 'original',
+                row: dict[str, object] = {'boot': FIXTURE_BOOT, 'owner': 101, 'owner_start': 'original',
                                           'deadline': 60.0, **unit}
                 cloud_gate.save(path, row)
                 with (mock.patch.object(trial, 'boot_identity') as boot,
@@ -1039,6 +1042,62 @@ print('Git read the published scope')
                 command.assert_not_called()
                 stop.assert_not_called()
                 self.assertEqual(cloud_gate.read(path), row)
+
+    def test_git_recovery_keeps_a_record_with_a_truncated_boot_id(self) -> None:
+        path = self.root / trial.GIT_RECOVERY
+        row: dict[str, object] = {
+            'boot': FIXTURE_BOOT[:-1], 'owner': 101, 'owner_start': 'original',
+            'unit': 'cloud-trial-git-' + 'a' * 32 + '.scope', 'deadline': 60.0,
+        }
+        cloud_gate.save(path, row)
+        with (mock.patch.object(trial, 'boot_identity', return_value=FIXTURE_BOOT),
+              mock.patch.object(trial, 'query_git_scope') as query,
+              self.assertRaisesRegex(GateRefused, 'UNRESOLVED: invalid Git recovery record')):
+            trial.recover_git(path, 1, 0.05)
+        query.assert_not_called()
+        self.assertEqual(cloud_gate.read(path), row)
+
+    @unittest.skipUnless(sys.platform == 'linux', 'The trial controller uses Linux scopes')
+    def test_late_scope_exits_without_starting_git_after_supervisor_exit(self) -> None:
+        path = self.root / trial.GIT_RECOVERY
+        published = path.with_suffix('.scope.json')
+        sidecar = path.with_suffix('.cgroup')
+        unit = 'cloud-trial-git-' + 'a' * 32 + '.scope'
+        started = self.root / 'git-started'
+        git = self.root / 'git'
+        _ = git.write_text(f'#!{sys.executable}\nfrom pathlib import Path\nPath({str(started)!r}).touch()\n')
+        git.chmod(0o700)
+
+        with ForkChildren() as children:
+            reader, writer = children.pipe()
+
+            def authorize() -> int:
+                owner = os.getpid()
+                identity = process_start(owner)
+                assert isinstance(identity, Started)
+                cloud_gate.save(path, {'boot': boot_identity(), 'owner': owner, 'owner_start': identity.start,
+                                       'unit': unit, 'deadline': time.monotonic() + TEST_HANG_GUARD_SECS})
+                _ = os.write(writer, b'1')
+                return 0
+
+            supervisor = children.start(authorize, pass_fds=(writer,))
+            exited = supervisor.result()
+            self.assertEqual(exited.returncode, 0, exited.stderr)
+            record = trial.GitRecovery.read(path)
+            with mock.patch.object(trial, 'query_git_scope', return_value=None):
+                trial.recover_git(path, 1, 0.05)
+            self.assertFalse(path.exists())
+
+            result = subprocess.run([
+                'systemd-run', '--unit=' + unit, '--', sys.executable, queue_place.__file__,
+                '--scope-start', str(sidecar), str(record.owner), record.owner_start, str(published),
+                str(reader), str(TEST_HANG_GUARD_SECS), str(git),
+            ], pass_fds=(reader,), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertTrue((self.root / 'fake-scopes' / unit).is_dir())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('the queue place holder exited before scope startup', result.stderr)
+        self.assertFalse(published.exists())
+        self.assertFalse(started.exists())
 
     @unittest.skipUnless(sys.platform == 'linux', 'The trial controller uses Linux scopes')
     def test_scope_launch_refusal_uses_the_saved_unit_and_clears_after_absence(self) -> None:
@@ -1078,10 +1137,10 @@ raise SystemExit(1)
         path = self.root / trial.GIT_RECOVERY
         unit = 'cloud-trial-git-' + 'b' * 32 + '.scope'
         group = '/fixture/builds.slice/' + unit
-        cloud_gate.save(path, {'boot': 'fixture', 'owner': 101, 'owner_start': 'original',
+        cloud_gate.save(path, {'boot': FIXTURE_BOOT, 'owner': 101, 'owner_start': 'original',
                                'unit': unit, 'deadline': 60.0})
         reply = 0, f'LoadState=loaded\nActiveState=active\nControlGroup={group}\nJob=0\n'
-        with (mock.patch.object(trial, 'boot_identity', return_value='fixture'),
+        with (mock.patch.object(trial, 'boot_identity', return_value=FIXTURE_BOOT),
               mock.patch.object(trial, 'process_start', return_value=Gone()),
               mock.patch.object(trial, 'bounded_systemctl', return_value=reply) as show,
               mock.patch.object(queue_place, 'stop_scope') as stop,
