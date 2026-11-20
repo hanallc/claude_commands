@@ -3250,6 +3250,14 @@ Tests: the three modules pass 20 times in a row under load, and each fix has a r
 
 Tests: one row in the existing placement retry test for a busy local refusal with a cached free reading: no second assignment until a newer reading. It fails first. Item 2 makes the natest row the end-to-end check.
 
+### Phase 44du — Slot-order test cleanup reads only its own processes  · status: todo
+**Follow-up from the 44dt closure review and the group review (G6), 2026-11-20.** Not a regression: main has the same reads, and the tests pass under load. Starts after the group merges.
+
+1. `copies/test_slot_order.py` still calls `reap` (scripts/direct/verify_mac_offload_test_support.py:120) in the seven-folder test (:719) and two other cleanup sites. `reap` reads `/proc/*/environ` of every process before it checks the fixture marker. Change each cleanup to collect only the processes the fixture started, as 44dt did for the full-folder test (:471).
+2. When no caller of `reap` is left, delete it.
+
+Tests: the module passes 24 runs, 8 at a time, with no read of another process's `/proc` entries.
+
 ### Phase 44dn — The sweep and scratch end keep going past a bad backlink or journal  · status: todo
 **Hold (builds, 2026-11-19 21:29):** these are removal sites under item 152 (user rule 20:42: no automatic deletion until the bubblewrap proof exists). resources owns them now: phase 181 (scratch task end) and phase 178 (the sweep). After 181 and 178 merge, merge main in, check with resources that nothing removes more than 178 and 181 allow, then send the hash. No more work until then.
 **From the 44de reviews (pass 1 and closure pass 2), 2026-11-19:** the builds landing rule moves these gaps out of 44de. After 44de merges.
