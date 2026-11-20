@@ -678,7 +678,15 @@ exit 1
 class StepRecoveryTests(VerifyLintScopeFixture):
     @override
     def build_fixture(self) -> None:
+        copies_config = self.root / "copies.conf"
+        _ = copies_config.write_text(
+            f"remote_registry={self.root / 'remote-mirrors'}\n"
+            + "wait_seconds=0.01\ngit_timeout_seconds=10\nguard_timeout_seconds=10\n"
+            + "guard_choice_limit=32\nowner.verify=verify\n",
+            encoding="utf-8",
+        )
         super().build_fixture()
+        self.environment["COPIES_CONFIG"] = str(copies_config)
         _ = write_config_fixture(self.root / "build_admission.conf", PINNED_ADMISSION_CONFIG)
 
     def test_each_compiling_lint_command_has_one_placement_episode(self) -> None:
