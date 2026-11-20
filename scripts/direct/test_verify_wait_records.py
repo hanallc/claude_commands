@@ -370,8 +370,9 @@ from scripts.lint import nextest_tokens
 
 if sys.argv[1:] == ["hold-tokens"]:
     run = nextest_tokens.SizedTestRun(
-        (sys.executable, __file__, "verify-command", "--call-id", "blocked-writer", "--", "./cargo"), 1, ())
-    sys.exit(nextest_tokens.run_with_tokens(run, Path("pool"), 1, None, lambda _width: None))
+        ("./cargo", "nextest", "run"), 1, (),
+        command_prefix=(sys.executable, __file__, "verify-command", "--call-id", "blocked-writer", "--"))
+    sys.exit(nextest_tokens.run_with_tokens(run, Path("pool"), 1, None, lambda _width: None, nested_tokens=0))
 
 def blocked_writer(*args):
     if "--no-run" not in sys.argv:
@@ -386,7 +387,20 @@ with patch.object(admission_records, "stamp_verify_command", side_effect=blocked
             launcher = root / "launcher.py"
             _ = launcher.write_text(script)
             cargo = root / "cargo"
-            _ = cargo.write_text('#!/bin/sh\n[ "$1" != --no-run ] || exit 0\nread -r release < cargo-exit || exit 97\nexit 23\n')
+            _ = cargo.write_text("""#!/bin/sh
+case "$2" in
+    list)
+        printf '%s\\n' '{"rust-suites":{"fixture":{"testcases":{"test":{"filter-match":{"status":"matches"}}}}}}'
+        exit 0
+        ;;
+    run)
+        [ "$3" != --no-run ] || exit 0
+        read -r release < cargo-exit || exit 97
+        exit 23
+        ;;
+esac
+exit 2
+""")
             cargo.chmod(0o700)
             pool = root / "pool"
             cargo_exit = root / "cargo-exit"
@@ -520,6 +534,8 @@ run_step_attempt cargo nextest run --test-threads 2
         holder.assert_called_once()
         run = cast(nextest_tokens.SizedTestRun, holder.call_args.args[0])
         self.assertEqual(holder.call_args.args[1:4], (Path("/fixture/pool"), 2, Path("/fixture/width")))
+        self.assertEqual(holder.call_args.kwargs, {"nested_tokens": 2})
+        self.assertEqual(run.list_selected(), ["cargo", "nextest", "list", "--message-format", "json", "-p", "foo"])
         self.assertEqual(run.build_only()[2:],
                          ["verify-command", "--call-id", "pooled", "--", "cargo", "nextest", "run", "--no-run", "-p", "foo"])
         self.assertEqual(run.with_threads(4)[2:],

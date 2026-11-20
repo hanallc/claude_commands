@@ -83,11 +83,12 @@ class SizedTestRun:
     head: tuple[str, ...]
     width: int
     rest: tuple[str, ...]
+    command_prefix: tuple[str, ...] = ()
 
     def build_only(self) -> list[str]:
         """Build every test binary the run needs; run-only and test binary arguments do not apply."""
         selection = self.rest[:self.rest.index("--")] if "--" in self.rest else self.rest
-        return [*self.head, "--no-run", *build_selection(selection)]
+        return [*self.command_prefix, *self.head, "--no-run", *build_selection(selection)]
 
     def list_selected(self) -> list[str]:
         # The filter-matched count bounds rerun tests before the launcher applies the width limit.
@@ -95,7 +96,7 @@ class SizedTestRun:
         return [*self.head[:2], "list", "--message-format", "json", *selection]
 
     def with_threads(self, threads: int) -> list[str]:
-        return [*self.head, "--test-threads", str(threads), *self.rest]
+        return [*self.command_prefix, *self.head, "--test-threads", str(threads), *self.rest]
 
 
 @dataclass(frozen=True)

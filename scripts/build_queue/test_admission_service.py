@@ -3178,6 +3178,9 @@ class RunnerAuthorizationTests(unittest.TestCase):
         held = records.NatedevHeld("fps", "Phase 3 timing")
         with AdmissionFixture() as fixture, fixture.loop_turn():
             request = fixture.service_request()
+            priority = records.QueuePriority(({"unit": request.runner, "why": "fixture",
+                "set_at": fixture.clock.now(), "set_by": "fixture"},))
+            fixture.server.priority = priority
             with mock.patch.object(build_targets, "hold_waited_on", return_value=holder):
                 waiting, = fixture.server.handle_request(request)
                 assert isinstance(waiting, wire.Wait)
@@ -3187,6 +3190,11 @@ class RunnerAuthorizationTests(unittest.TestCase):
                 assert isinstance(view, wire.ViewReply)
                 step, = view.reading.view.waiting
                 self.assertEqual(step.reason, held)
+                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [request.owner.pid])
+                self.assertEqual(snapshot.inputs.priority, priority)
+                self.assertEqual(list(snapshot.inputs.waiter_orders.values()), [records.PriorityUnit(request.runner)])
             fixture.allow_next_start()
             fixture.release(only_admitted(fixture.server.handle_request(request)))
 
@@ -5614,6 +5622,41 @@ class ServiceTests(unittest.TestCase):
             assert isinstance(fixture.server.last_policy, records.AdmissionPolicy)
             reading = gate.queue_read_from(snapshot.inputs, snapshot.policy)
             self.assertEqual([row["pid"] for _, row in reading.ordered], [second.owner.pid, first.owner.pid])
+
+    def test_snapshot_keeps_the_pass_order_when_staff_labels_change_after_admission(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            starter, older, chosen, removed = (fixture.request(since=fixture.clock.now() - age)
+                                                for age in (90, 60, 30, 10))
+            labels = {starter.identity.session_id: UnitLabels("starter", unit="urgent"),
+                      older.identity.session_id: UnitLabels("older", unit="other"),
+                      chosen.identity.session_id: UnitLabels("chosen", unit="urgent")}
+            admit = cast(Callable[..., None], getattr(fixture.server, "_admit"))
+
+            def admit_and_change_labels(waiters: list[service.WaitingAdmission], config: records.MemoryConfig,
+                                        share_percent: int, *,
+                                        cargo_folder: placement.CargoFolder | placement.NoCargoFolder,
+                                        landing: service.LandingAdmission | service.NoLandingAdmission) -> None:
+                admit(waiters, config, share_percent, cargo_folder=cargo_folder, landing=landing)
+                labels[older.identity.session_id] = UnitLabels("older", unit="urgent")
+                labels[chosen.identity.session_id] = UnitLabels("chosen", unit="other")
+                del fixture.server.waiters[removed.episode]
+
+            with mock.patch.object(gate, "priority_labels", return_value=labels):
+                for request in (starter, older, chosen, removed):
+                    _ = fixture.server.handle_request(request)
+                _ = fixture.completed_queue_change(wire.PrioritySetRequest("ranked-snapshot", "urgent", "urgent", "director"))
+                fixture.free(60 * GIB)
+                write_pressure_reading(fixture.root / "pressure")
+                with mock.patch.object(fixture.server, "_admit", side_effect=admit_and_change_labels):
+                    _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {starter.episode})
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [chosen.owner.pid, older.owner.pid])
+            self.assertEqual([records.waiter_priority(row) for _, row in gate.ranked_queue_waiters(snapshot.inputs)],
+                             [records.PriorityUnit("urgent"), records.NormalOrder()])
 
     def test_snapshot_replacement_failure_keeps_the_last_complete_snapshot(self) -> None:
         with AdmissionFixture() as fixture:

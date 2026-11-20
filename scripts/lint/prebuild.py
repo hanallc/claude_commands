@@ -291,7 +291,7 @@ def run_verified_nextest(argv: list[str]) -> int:
             nextest_tokens.record_reservation_width(args.reservation, threads)
 
     configuration = conf.read("build_admission")
-    measured = replace(run, head=tuple(verify_command_argv(args.call_id, run.head)))
+    measured = replace(run, command_prefix=tuple(verify_command_argv(args.call_id, ())))
     return nextest_tokens.run_with_tokens(measured, args.pool, configuration.whole("test_token_floor"),
         args.width_file, record_width, nested_tokens=configuration.whole("nested_tokens"))
 

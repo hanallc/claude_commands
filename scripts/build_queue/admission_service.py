@@ -1251,6 +1251,13 @@ class ParkedPlacement:
     connection: Connection
 
 
+@dataclass(frozen=True)
+class AdmissionPassInputs:
+    """Keep the local inputs and the queue order that includes held CI waiters."""
+    local: records.QueueInputs
+    queue_order: list[tuple[Path, records.RankedWaiter]]
+
+
 QueueChange = wire.PrioritySetRequest | wire.PriorityClearRequest
 
 
@@ -2198,7 +2205,7 @@ class AdmissionServer:
         return self.proc.lifetime(reservation_row(record), self._live(record.owner))
 
     def _inputs(self, config: records.MemoryConfig, profile_rank: int, profile_share: int,
-                sweep_seconds: float) -> records.QueueInputs:
+                sweep_seconds: float) -> AdmissionPassInputs:
         now = self.clock.now()
         plan = self._reading_plan(config)
         if isinstance(self.system_reader, NoSystemReader):
@@ -2297,8 +2304,9 @@ class AdmissionServer:
             self.progress_history.prune(now - step_estimator.HISTORY_DAYS * 86400, sweep_seconds,
                 rank=profile_rank, share_percent=profile_share)
             self.next_progress_sweep = self.clock.monotonic() + config.running_pass_seconds
-        return self._progress_inputs(self._inputs_with_current_slots(inputs), evidence, config,
-                                     profile_rank, profile_share)
+        local = self._progress_inputs(self._inputs_with_current_slots(inputs), evidence, config,
+                                      profile_rank, profile_share)
+        return AdmissionPassInputs(local, ordered)
 
     def _capture_test_decay(self, reservation: str, memory: records.MeasuredMemory, use: gate.AttributedStepUse,
                             read_at: float, margin: float) -> records.MeasuredMemory:
@@ -2617,11 +2625,12 @@ class AdmissionServer:
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
         cloud_started = self._cloud_pass(self.clock.now(), self.configuration)
-        inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
-                              self.configuration.progress_profile_sweep_seconds)
+        captured = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
+                                self.configuration.progress_profile_sweep_seconds)
+        inputs = captured.local
         ci_holds = self._ci_hold_reasons()
-        if ci_holds:
-            held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
+        held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
+        if held_owners:
             inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
                                              if records.waiter_owner(row) not in held_owners])
         if self.configuration.hold_for_merge_test:
@@ -2722,10 +2731,15 @@ class AdmissionServer:
         self.next_pass = min(self.clock.monotonic() + interval, next_route_retry, route_deadline)
         if starts or cloud_started:
             self.next_pass = self.clock.monotonic()
+        remaining = {owner for owner, episode in by_owner.items() if episode in self.waiters}
+        local_rows = ((path, gate.rank_waiter(row, inputs.waiter_orders[owner])) for path, row in inputs.ordered
+                      if (owner := records.waiter_owner(row)) in remaining)
+        held_rows = ((path, row) for path, row in captured.queue_order
+                     if (owner := records.waiter_owner(row)) in held_owners and owner in remaining)
+        ordered = list(heapq.merge(local_rows, held_rows, key=lambda item: gate.waiter_order(item[1])))
         try:
-            ordered, priority = self._queue_order()
             queue_snapshot.write_queue_snapshot(self.state_dir,
-                replace(inputs, ordered=ordered, spacing=self.spacing, priority=priority,
+                replace(inputs, ordered=ordered, spacing=self.spacing,
                         slots=tuple(slot for slot in inputs.slots
                             if gate.between_steps(slot).reservation not in result.policy.returned_claims)), policy)
         except OSError:
