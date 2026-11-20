@@ -87,9 +87,13 @@ Codex review prompts also include section 3's command block.
    1. For a fix, add a table row to the existing test of the same behavior.
       Add a new test only when no test covers the behavior.
       A table row is a new entry in an existing `subTest` table. A new `def test_` is a new test.
+      For a drawn defect, add the check to the existing render test of the same scene.
+      Make a new render test only when none exists.
+      The check reads the rendered pixels. A check of components, constants or hand-written pointer hits does not count.
    2. Write or keep a rare-case test only when the defect cannot be undone: it deletes or corrupts user work or saved state that no later run repairs. A refusal that only prints a message and exits gets no test. A rare case that a main-path test of the same function already reaches gets no test.
 
       Keep every main-path test, except one that the deletion rule above allows.
+   3. State the measured time of each new test in your summary.
    </TestRules>
 
    For tests, include this instruction verbatim: "Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after."

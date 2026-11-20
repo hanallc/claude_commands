@@ -193,8 +193,7 @@ ninth argument remains its slot, and it gets its own
 `fix_prompt_${FIX_ROUND}[_<slot>].md`. Each worker repairs its findings.
 A finding gets a test only when test rule 2 in write_prompt_contract.md item 6 allows one. Then add a table row, and the row must fail without the repair. Every other finding closes by the reviewer's read of the diff; say `no test: <reason>` in the summary.
 For a finding about what is drawn, use the live pixel check the prompt names.
-Use a test instead if rule 2 allows one. Render the view and read its pixels in that test.
-A test of components, constants or hand-written pointer hits does not count.
+Use a test instead if test rule 2 allows one. Test rule 1 says where it goes and what it reads.
 Name each test for the behavior it checks. Put the finding id only in the summary.
 <ClosureReview/> is the cold read, so no worker is spent
 on one here. A worker's file set is its findings' files plus their test targets;
