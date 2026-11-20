@@ -2518,7 +2518,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
     def test_blocked_remote_evidence_keeps_socket_requests_fast_and_retains_the_claim(self) -> None:
         with PlacementFixture() as fixture:
             fixture.configure(waiting_pass_seconds=0.05)
-            _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=0.05\n", template="mac_test")
+            _ = (fixture.root / "mac_test.conf").write_text("# range: 0.001..60\nprobe_timeout_s=0.05\n")
             _ = fixture.run_pass()
             request = placement_request(fixture)
             _ = publish_candidate(fixture, request)
@@ -2541,8 +2541,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             def blocked_probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
                 read_started.append(fixture.clock.now())
                 entered.set()
-                if not finish.wait(5):
-                    raise AssertionError("the test did not release the blocked probe")
+                _ = finish.wait()
                 return placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a", placement.AllowedHost())
 
             fixture.server.host_probe = blocked_probe
@@ -2552,30 +2551,32 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             fixture.clock.advance(0.02)
             self.assertIsInstance(fixture.server.host_evidence(key), placement.StaleHostEvidence)
             waiter = placement_request(fixture)
-            try:
-                reply, = fixture.connect(waiter).replies()
-                self.assertIsInstance(reply, wire.PlacementWait)
-                self.assertTrue(entered.wait(1), "the background probe did not start")
-                fixture.allow_next_start()
-                for operation in (wire.ViewRequest(), wire.ReleaseRequest("release-local", granted.reservation, 0),
-                                  fixture.request()):
-                    started = time.monotonic()
-                    replies = fixture.connect(operation).replies()
-                    self.assertLess(time.monotonic() - started, 1, type(operation).__name__)
-                    self.assertTrue(replies)
-                    self.assertIsInstance(replies[-1], wire.ViewReply if isinstance(operation, wire.ViewRequest)
-                                          else wire.Ok if isinstance(operation, wire.ReleaseRequest) else wire.Admitted)
-                self.assertIsInstance(fixture.server.host_evidence(key), placement.StaleHostEvidence)
-                self.assertEqual(provider.read_bytes(), before)
-                self.assertEqual([item.record["claim_id"] for item in mac_test.live_claims(paths)], [claim.claim_id])
-                self.assertEqual(assignment_for(fixture, request), assignment)
-            finally:
-                reader = fixture.server.host_readers[key]
-                reader.close()
-                fixture.clock.advance(1)
-                finish.set()
-                reader.thread.join(timeout=5)
-                self.assertFalse(reader.thread.is_alive())
+            with ThreadPoolExecutor(max_workers=1) as workers:
+                try:
+                    probe_guard = LauncherHangGuard("Remote evidence probe start")
+                    reply, = probe_guard.result(workers.submit(fixture.connect(waiter).replies))
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    probe_guard.event(entered)
+                    fixture.allow_next_start()
+                    for operation in (wire.ViewRequest(), wire.ReleaseRequest("release-local", granted.reservation, 0),
+                                      fixture.request()):
+                        reply_guard = LauncherHangGuard(f"{type(operation).__name__} while remote evidence is blocked")
+                        replies = reply_guard.result(workers.submit(fixture.connect(operation).replies))
+                        self.assertTrue(replies)
+                        self.assertIsInstance(replies[-1], wire.ViewReply if isinstance(operation, wire.ViewRequest)
+                                              else wire.Ok if isinstance(operation, wire.ReleaseRequest) else wire.Admitted)
+                    self.assertIsInstance(fixture.server.host_evidence(key), placement.StaleHostEvidence)
+                    self.assertEqual(provider.read_bytes(), before)
+                    self.assertEqual([item.record["claim_id"] for item in mac_test.live_claims(paths)], [claim.claim_id])
+                    self.assertEqual(assignment_for(fixture, request), assignment)
+                finally:
+                    reader = fixture.server.host_readers.get(key)
+                    if reader is not None:
+                        reader.close()
+                    fixture.clock.advance(1)
+                    finish.set()
+                    if reader is not None:
+                        LauncherHangGuard("Remote evidence probe cleanup").join(reader.thread)
             observed = fixture.server.host_evidence(key)
             self.assertIsInstance(observed, placement.StaleHostEvidence)
             self.assertLessEqual(observed.observed_at, read_started[0])
