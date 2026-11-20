@@ -1,25 +1,30 @@
 """Test The List page with private records and a real browser."""
 from __future__ import annotations
-from scripts.lint.memory_test_support import write_config_fixture
 
+import base64
 import html
 import io
 import json
 import os
 import re
+import select
 import shutil
+import signal
+import socket
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import BinaryIO, cast, override
+from types import SimpleNamespace
+from typing import BinaryIO, ClassVar, cast, override
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
@@ -28,6 +33,7 @@ from xml.etree import ElementTree
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
 from scripts.lib import atomic_file, conf, file_lock
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
@@ -52,10 +58,372 @@ OTHER = staff.StaffRow(staff.StaffId("f5636030-6745-4ff4-aeda-4c2773d18da8"), "s
 DWIGHT = staff.StaffRow(staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"), "producer", "dwight", staff.StaffRoot(),
                         current_session=staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"))
 NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
+FIREFOX_MIN_SHARED_WIDTH = 500
+
+
+def _private_firefox_command(profile: Path, width: int, height: int, *, dark: bool) -> tuple[list[str], dict[str, str]]:
+    profile.mkdir()
+    if dark:
+        _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+    command = ["firefox", "--headless", "--no-remote", "--profile", str(profile), "--window-size", f"{width},{height}"]
+    return command, {**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)}
+
+
+def _stop_browser(process: subprocess.Popen[bytes]) -> None:
+    try:
+        with suppress(ProcessLookupError):
+            send_process_group(process.pid, signal.SIGTERM)
+        with suppress(subprocess.TimeoutExpired):
+            _ = process.wait(timeout=10)
+        # The browser can exit before its child processes.
+        with suppress(ProcessLookupError):
+            send_process_group(process.pid, signal.SIGKILL)
+        _ = process.wait(timeout=10)
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+class _Browser:
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self.process: subprocess.Popen[bytes] = process
+        self.closed: bool = False
+        self.resources: ExitStack = ExitStack()
+        _ = self.resources.callback(_stop_browser, process)
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.resources.close()
+
+    @contextmanager
+    def stop_on_error(self) -> Generator[None]:
+        try:
+            yield
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                error.add_note(f"Browser cleanup failed: {cleanup_error}")
+            raise
+
+
+class _Chrome(_Browser):
+    """Keep one Chrome target and start each probe in a new document."""
+
+    def __init__(self, root: Path) -> None:
+        self.root: Path = root
+        self.pending: bytearray = bytearray()
+        self.loaded: set[tuple[str, str]] = set()
+        self.sequence: int = 0
+        with (root / "chrome.log").open("wb") as log:
+            process = subprocess.Popen(
+                ["sh", "-c", 'exec 3<&0 4>&1; exec "$@" 1>&2', "chrome-fixture",
+                 "google-chrome", "--headless", "--no-sandbox", "--disable-gpu", "--disable-background-networking",
+                 "--no-first-run", "--allow-file-access-from-files", "--remote-debugging-pipe",
+                 f"--user-data-dir={root / 'chrome'}", "about:blank"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0,
+                start_new_session=True)
+        super().__init__(process)
+        with self.stop_on_error():
+            writer = process.stdin
+            assert writer is not None
+            os.set_blocking(writer.fileno(), False)
+            context = self.command("Target.createBrowserContext", {})["browserContextId"]
+            target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": context})
+            self.session: str = cast(str, self.command("Target.attachToTarget",
+                {"targetId": target["targetId"], "flatten": True})["sessionId"])
+            _ = self.command("Page.enable", {}, self.session)
+            _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, self.session)
+
+    def read(self, deadline: float) -> dict[str, object]:
+        reader = self.process.stdout
+        assert reader is not None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Chrome did not answer")
+            end = self.pending.find(b"\0")
+            if end >= 0:
+                reply = cast(dict[str, object], json.loads(self.pending[:end]))
+                del self.pending[:end + 1]
+                if reply.get("method") == "Page.lifecycleEvent":
+                    parameters = cast(dict[str, str], reply["params"])
+                    if parameters["name"] == "DOMContentLoaded":
+                        self.loaded.add((cast(str, reply["sessionId"]), parameters["loaderId"]))
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Chrome did not answer")
+                return reply
+            if not select.select([reader], [], [], remaining)[0]:
+                raise TimeoutError("Chrome did not answer")
+            chunk = os.read(reader.fileno(), 65536)
+            if not chunk:
+                raise RuntimeError((self.root / "chrome.log").read_text(errors="replace"))
+            self.pending.extend(chunk)
+
+    def command(self, method: str, parameters: dict[str, object], session: str = "") -> dict[str, object]:
+        self.sequence += 1
+        request: dict[str, object] = {"id": self.sequence, "method": method, "params": parameters}
+        if session:
+            request["sessionId"] = session
+        writer = self.process.stdin
+        assert writer is not None
+        data = memoryview(json.dumps(request).encode() + b"\0")
+        deadline = time.monotonic() + 20
+        while data:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([], [writer], [], remaining)[1] or time.monotonic() >= deadline:
+                raise TimeoutError(f"{method}: Chrome did not accept the command")
+            try:
+                written = os.write(writer.fileno(), data)
+            except BlockingIOError:
+                continue
+            data = data[written:]
+        while True:
+            reply = self.read(deadline)
+            if reply.get("id") == self.sequence:
+                if "error" in reply:
+                    raise RuntimeError(f"{method}: {reply['error']}")
+                return cast(dict[str, object], reply["result"])
+
+    def navigate(self, destination: str) -> None:
+        navigation = self.command("Page.navigate", {"url": destination}, self.session)
+        if "errorText" in navigation:
+            raise RuntimeError(f"Page.navigate: {navigation['errorText']}")
+        load = (self.session, cast(str, navigation["loaderId"]))
+        deadline = time.monotonic() + 20
+        while load not in self.loaded:
+            _ = self.read(deadline)
+
+    def dom(self, page: Path, marker: str, *, reduced_motion: bool,
+            window_size: tuple[int, int] | None) -> subprocess.CompletedProcess[str]:
+        with self.stop_on_error():
+            session = self.session
+            if window_size is not None:
+                width, height = window_size
+                _ = self.command("Emulation.setDeviceMetricsOverride",
+                    {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False}, session)
+            else:
+                _ = self.command("Emulation.clearDeviceMetricsOverride", {}, session)
+            features = [{"name": "prefers-reduced-motion", "value": "reduce"}] if reduced_motion else []
+            _ = self.command("Emulation.setEmulatedMedia", {"features": features}, session)
+            destination = page.as_uri()
+            # Evaluate the promise in the new document, after the navigation.
+            marker_literal = json.dumps(marker)
+            script = (
+                "try { sessionStorage.clear(); localStorage.clear(); }"
+                "catch (error) { if (error.name !== 'SecurityError') throw error; }"
+                "globalThis.fixtureDOM = new Promise(resolve => {"
+                "const observer = new MutationObserver(() => {"
+                f"const result = document.getElementById({marker_literal});"
+                "if (result) { observer.disconnect(); resolve(document.documentElement.outerHTML); }"
+                "});"
+                "observer.observe(document, {childList: true, subtree: true});"
+                "});"
+            )
+            hook = self.command("Page.addScriptToEvaluateOnNewDocument", {"source": script}, session)
+            self.navigate(destination)
+            try:
+                response = self.command("Runtime.evaluate",
+                    {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session)
+            except TimeoutError as error:
+                raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
+            result = cast(dict[str, object], response["result"])
+            _ = self.command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hook["identifier"]}, session)
+            self.navigate("about:blank")
+            _ = self.command("Page.resetNavigationHistory", {}, session)
+            self.loaded.clear()
+            return subprocess.CompletedProcess(destination, 0, str(result.get("value", "")), "")
+
+
+class _Firefox(_Browser):
+    """Keep Firefox open and control its private profile through Marionette."""
+
+    def __init__(self, root: Path) -> None:
+        profile = root / "firefox"
+        profile.mkdir()
+        _ = (profile / "user.js").write_text(
+            'user_pref("marionette.port", 0);\n'
+            + 'user_pref("browser.sessionhistory.max_total_viewers", 0);\n')
+        with (root / "firefox.log").open("wb") as log:
+            process = subprocess.Popen(
+                ["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                 "--marionette", "--remote-allow-system-access", "about:blank"],
+                stdout=log, stderr=log, start_new_session=True)
+        super().__init__(process)
+        with self.stop_on_error():
+            port_file = profile / "MarionetteActivePort"
+            deadline = time.monotonic() + 30
+            while not port_file.exists():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError((root / "firefox.log").read_text(errors="replace"))
+                time.sleep(0.02)
+            address = ("127.0.0.1", int(port_file.read_text()))
+            self.connection: socket.socket = self.resources.enter_context(socket.create_connection(address, timeout=45))
+            self.stream: BinaryIO = self.resources.enter_context(self.connection.makefile("rb"))
+            _ = self.read()
+            self.sequence: int = 0
+            _ = self.command("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "none"}}})
+            initial = cast(dict[str, str], self.command("WebDriver:GetWindowHandle"))
+            self.initial: str = initial["value"]
+
+    def read(self) -> object:
+        size = bytearray()
+        while (byte := self.stream.read(1)) != b":":
+            if not byte or not byte.isdigit():
+                raise RuntimeError("Firefox closed the Marionette connection")
+            size.extend(byte)
+        return cast(object, json.loads(self.stream.read(int(size))))
+
+    def command(self, method: str, parameters: dict[str, object] | None = None) -> object:
+        self.sequence += 1
+        message = json.dumps([0, self.sequence, method, parameters or {}]).encode()
+        self.connection.sendall(str(len(message)).encode() + b":" + message)
+        kind, sequence, error, result = cast(list[object], self.read())
+        if kind != 1 or sequence != self.sequence or error is not None:
+            raise RuntimeError(f"{method}: {error}")
+        return result
+
+    def script(self, source: str, arguments: list[object]) -> object:
+        result = cast(dict[str, object], self.command("WebDriver:ExecuteScript", {"script": source, "args": arguments}))
+        return result["value"]
+
+    @contextmanager
+    def page(self, destination: str, width: int, height: int, *, dark: bool = False,
+             reduced_motion: bool = False) -> Generator[None]:
+        with self.stop_on_error():
+            _ = self.command("Marionette:SetContext", {"value": "chrome"})
+            cleared = cast(dict[str, object], self.command("WebDriver:ExecuteAsyncScript", {
+                "script": """
+Services.prefs.setIntPref("ui.systemUsesDarkTheme", arguments[0]);
+Services.prefs.setIntPref("ui.prefersReducedMotion", arguments[1]);
+const flags = Ci.nsIClearDataService;
+Services.clearData.deleteData(
+    flags.CLEAR_COOKIES | flags.CLEAR_DOM_STORAGES | flags.CLEAR_ALL_CACHES | flags.CLEAR_HISTORY,
+    arguments[2]);
+""", "args": [int(dark), int(reduced_motion)],
+            }))
+            if cleared["value"] != 0:
+                raise RuntimeError(f"Firefox could not clear profile data: {cleared['value']}")
+            _ = self.command("Marionette:SetContext", {"value": "content"})
+            window = cast(dict[str, str], self.command("WebDriver:NewWindow", {"type": "tab", "focus": True}))
+            # If the switch fails, close the group to close the new tab.
+            _ = self.command("WebDriver:SwitchToWindow", {"handle": window["handle"]})
+            dimensions = cast(list[int], self.script("return [outerWidth - innerWidth, outerHeight - innerHeight];", []))
+            _ = self.command("WebDriver:SetWindowRect", {"width": width + dimensions[0], "height": height + dimensions[1]})
+            _ = self.command("WebDriver:Navigate", {"url": destination})
+            yield
+            _ = self.command("WebDriver:CloseWindow")
+            _ = self.command("WebDriver:SwitchToWindow", {"handle": self.initial})
+
+    def screenshot(self, path: Path) -> None:
+        result = cast(dict[str, str], self.command("WebDriver:TakeScreenshot", {"full": False}))
+        _ = path.write_bytes(base64.b64decode(result["value"]))
+
+    def wait_for_load(self, destination: str) -> None:
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            if self.script("""
+// The console can change the query with history.replaceState.
+const navigation = performance.getEntriesByType('navigation')[0];
+return navigation?.name.split('#', 1)[0] === arguments[0] && document.readyState === 'complete';
+""", [destination.partition("#")[0]]) is True:
+                return
+            time.sleep(0.02)
+        raise TimeoutError(f"Firefox did not load {destination}")
 
 
 class ListPageTests(unittest.TestCase):
     root: Path = Path()
+    browser_root: ClassVar[Path]
+    _chrome: ClassVar[_Chrome | None] = None
+    _firefox: ClassVar[_Firefox | None] = None
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        cls.browser_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="list-page-class-")))
+        cls._chrome = None
+        cls._firefox = None
+        config = cls.browser_root / "config"
+        config.mkdir()
+        _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
+        _ = (config / "statusline.conf").write_text(
+            "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
+            + "role.producer=#90fe42\nrole.worker=#ff0404\n")
+        _ = (config / "review_links.conf").write_text(
+            "# whole: 1..20\ndelivery_tries=3\n# range: 0..300\ndelivery_pause_seconds=0\n"
+            + "# whole: 1..20\nfeedback_rows=5\n# whole: 1..20\nreview_words_rows=4\n"
+            + "# whole: 1..1440\nlater_soon_minutes=60\n"
+            + "later_evening=18:00\nlater_evening_until=17:00\nlater_morning=09:00\n"
+            + "later_week_day=Monday\nlater_week_time=09:00\n"
+            + "# range: 5..300\npage_refresh_seconds=15\n# whole: 1..80\nlist_log_max_height_rem=16\n"
+            + "# whole: 1..300\npage_request_timeout_seconds=15\n"
+            + "# whole: 1..5000\ncard_fade_out_ms=450\n# whole: 1..5000\ncard_fade_in_ms=600\n"
+            + "# range: 0.5..60\nframe_retry_seconds=2\n"
+            + "# range: 0.001..\ntailscale_check_seconds=60\n"
+            + "# range: 0.001..\nsnapshot_sweep_seconds=3600\n"
+            + "# range: 0..\nsnapshot_retention_seconds=604800\n"
+            + "# range: 0..365\nchange_image_unclaimed_days=14\n"
+            + "# range: 1..600\nstaff_snapshot_seconds=60\n"
+            + "# range: 0.001..\ncode_check_seconds=5\n"
+            + "# whole: 1..65535\nserver_port=8765\n"
+            + "changes_first_root=natedev\nreview_attachments_root=review-attachments\n")
+        _ = (config / "console.conf").write_text(
+            "page.list.label=List\npage.list.icon=list-checks\npage.list.title=The List\n"
+            + "page.list.url=python:scripts.review_links.list_page:page_url\n"
+            + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
+            + "# range: 0.001..86400\nstatus.round_trip_limit_seconds=1\n"
+            + "# range: 0.001..86400\nstatus.render_limit_seconds=1\n"
+            + "# range: 0.001..86400\nstatus.reading_delay_seconds=1\n"
+            + "# range: 0.001..86400\nstatus.list.age_limit_seconds=45\n"
+            + "# range: 0.001..86400\nstatus.review.age_limit_seconds=45\n")
+
+    @classmethod
+    def chrome(cls) -> _Chrome:
+        if cls._chrome is not None:
+            if not cls._chrome.closed and cls._chrome.process.poll() is None:
+                return cls._chrome
+            cls._chrome.close()
+        root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="chrome-"))
+        cls._chrome = _Chrome(root)
+        cls.addClassCleanup(cls._chrome.close)
+        return cls._chrome
+
+    @classmethod
+    def firefox(cls) -> _Firefox:
+        if cls._firefox is not None:
+            if not cls._firefox.closed and cls._firefox.process.poll() is None:
+                return cls._firefox
+            cls._firefox.close()
+        root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="firefox-"))
+        cls._firefox = _Firefox(root)
+        cls.addClassCleanup(cls._firefox.close)
+        return cls._firefox
+
+    def firefox_view(self, destination: str, path: Path | None, width: int, height: int,
+                     complete: threading.Event | None = None, *, dark: bool = False
+                     ) -> subprocess.CompletedProcess[str]:
+        if width < FIREFOX_MIN_SHARED_WIDTH:
+            with tempfile.TemporaryDirectory(dir=self.root, prefix="firefox-view-") as temporary:
+                root = Path(temporary)
+                command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
+                screenshot = path if path is not None else root / "page.png"
+                return subprocess.run([*command, "--screenshot", str(screenshot), destination],
+                                      capture_output=True, text=True, timeout=45, env=environment)
+        try:
+            browser = self.firefox()
+            with browser.page(destination, width, height, dark=dark):
+                if complete is None:
+                    browser.wait_for_load(destination)
+                elif not complete.wait(45):
+                    raise TimeoutError("Firefox did not report the page result")
+                if path is not None:
+                    browser.screenshot(path)
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(f"Firefox could not show {destination}") from error
+        return subprocess.CompletedProcess(destination, 0, "", "")
 
     def test_review_links_use_the_card_body_for_every_state(self) -> None:
         source = review_items.ProposalLedgerSource(self.root / "proposals.md")
@@ -276,7 +644,7 @@ window.fetch=async (path,options={})=>{
         for status, body in ((200, {"item_state": "Working"}), (409, {"reason": "The row save failed."})):
             with self.subTest(status=status):
                 self.browser_actions(initial, setup, probe.replace("__ROW_REPLY__", json.dumps({
-                    "status": status, "body": body})), virtual_time_ms=3000)
+                    "status": status, "body": body})))
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_list_title_actions_fit_at_320_pixels(self) -> None:
@@ -429,8 +797,11 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         waiting_key = f"investigation/{waiting.owner}/{waiting.id}"
         waiting_item = self.add("Check the linked reviews that are waiting", number=113)
         _ = the_list.link(MORTY.id, waiting_item.id, (waiting_key,), source="morty")
-        _ = write_config_fixture(self.root / "config/review_links.conf",
-                                 "page_request_timeout_seconds=7\ncard_fade_out_ms=180\ncard_fade_in_ms=260\n")
+        settings = self.root / "config/review_links.conf"
+        overlay_settings = settings.read_text()
+        for key, value in (("page_request_timeout_seconds", 7), ("card_fade_out_ms", 180), ("card_fade_in_ms", 260)):
+            overlay_settings = re.sub(rf"(?m)^{key}=.*$", f"{key}={value}", overlay_settings)
+        _ = settings.write_text(overlay_settings)
         pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
                  console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
         shell = console.render(pages, console.UnavailablePage()).decode()
@@ -740,7 +1111,11 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
 </script>'''.replace('WAITING_KEY', json.dumps(waiting_key))
         shell = shell.replace('</body>', probe + '</body>')
         proof = os.environ.get("LIST_OVERLAY_SCREENSHOT")
-        _ = write_config_fixture(self.root / "config/scratch.conf", f"visible_root={self.root / 'scratch'}\n")
+        _ = (self.root / "config/scratch.conf").write_text(
+            f"visible_root={self.root / 'scratch'}\nholds_file={self.root / 'holds.json'}\n"
+            + "# whole: 1..\ndefault_life_seconds=86400\n# whole: 1..\nrepo_depth=3\n"
+            + "# whole: 1..\nsuffix_length=6\nrepo_skip=target node_modules .git\n"
+            + "# whole: 1..\nrecord_lock_attempts=3\n# whole: 1..\nremoval_remote_timeout_seconds=30\n")
         for size in ("1440,1000", "600,900", "430,900", *(("screenshot",) if proof else ())):
             with self.subTest(size=size):
                 _ = listing.write_text(original)
@@ -795,31 +1170,31 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
-                        profile = self.root / f'overlay-profile-{size}'
-                        profile.mkdir()
-                        _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        viewport = '1440,1000' if size == "screenshot" else size
-                        width, height = viewport.split(',')
-                        browser_env = {**os.environ, "MOZ_HEADLESS_WIDTH": width, "MOZ_HEADLESS_HEIGHT": height}
-                        command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', viewport]
-                        url = f'http://127.0.0.1:{server.server_port}' + destination
+                        viewport = "1440,1000" if size == "screenshot" else size
+                        width, height = map(int, viewport.split(","))
+                        route = destination
                         if size == "430,900":
-                            url = f'http://127.0.0.1:{server.server_port}' + list_place.replace('#', '?direct=1#', 1)
+                            route = list_place.replace("#", "?direct=1#", 1)
+                        elif size == "600,900":
+                            route += "&phone=1"
+                        url = f"http://127.0.0.1:{server.server_port}" + route
                         if size == "screenshot":
                             assert proof is not None
-                            result = subprocess.run([*command, '--screenshot', proof, url + '&shot=1'],
-                                                    capture_output=True, text=True, timeout=45, env=browser_env)
+                            result = self.firefox_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
-                        else:
-                            if size == "600,900":
-                                url += '&phone=1'
+                        elif size == "430,900":
+                            command, environment = _private_firefox_command(
+                                self.root / f"overlay-profile-{size}", width, height, dark=True)
                             with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL,
-                                                  stderr=subprocess.DEVNULL, env=browser_env) as browser:
+                                                  stderr=subprocess.DEVNULL, env=environment) as browser:
                                 try:
                                     self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
                                 finally:
                                     browser.terminate()
                                     _ = browser.wait(timeout=10)
+                        else:
+                            with self.firefox().page(url, width, height, dark=True):
+                                self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
                     finally:
                         complete.set()
                         server.shutdown()
@@ -1070,9 +1445,6 @@ frame.addEventListener('load',async()=>{
                     with self.subTest(link=case):
                         complete.clear()
                         results.clear()
-                        profile = self.root / f"list-jump-{case}"
-                        profile.mkdir()
-                        _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
                         filters = {"sort": "#", "item": f"{MORTY.id}/{source.id}"}
                         if case in ("open", "closed", "producer", "missing"):
                             filters.update(owner=OWNER.id, producer=MORTY.id, q="linked item")
@@ -1081,19 +1453,12 @@ frame.addEventListener('load',async()=>{
                         place = list_page.PAGE_PATH + "?show=working#" + urlencode(filters)
                         url = "/console/" + console.place_query("list", place)
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
-                        command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', '1440,1100']
                         if case == "proof" and proof:
-                            result = subprocess.run([*command, '--screenshot', proof, destination],
-                                                    capture_output=True, text=True, timeout=45)
+                            result = self.firefox_view(destination, Path(proof), 1440, 1100, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         else:
-                            with subprocess.Popen([*command, destination], stdout=subprocess.DEVNULL,
-                                                  stderr=subprocess.DEVNULL) as browser:
-                                try:
-                                    self.assertTrue(complete.wait(30), "The browser must report the result of the link click.")
-                                finally:
-                                    browser.terminate()
-                                    _ = browser.wait(timeout=10)
+                            with self.firefox().page(destination, 1440, 1100, dark=True):
+                                self.assertTrue(complete.wait(30), "The browser must report the result of the link click.")
                         self.assertEqual(results, [[]])
             finally:
                 complete.set()
@@ -1502,9 +1867,11 @@ document.body.append(result);
         item = self.add("Long log for a narrow view", number=1)
         for update in range(18):
             _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
+        settings = self.root / "config/review_links.conf"
+        original = settings.read_text()
         for limit in (8, 12):
             with self.subTest(limit=limit):
-                _ = write_config_fixture(self.root / "config/review_links.conf", f"list_log_max_height_rem={limit}\n")
+                _ = settings.write_text(re.sub(r"(?m)^list_log_max_height_rem=.*$", f"list_log_max_height_rem={limit}", original))
                 with patch.object(list_page, "counts_strip", return_value=""):
                     markup = list_page.render(self.root / "reviews").decode()
                 probe = r'''<script>
@@ -1527,16 +1894,15 @@ document.body.append(result);
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="list-page-test-")))
         config = self.root / "config"
-        config.mkdir()
-        _ = write_config_fixture(config / "change_review.conf")
-        _ = write_config_fixture(config / "review_links.conf", "page_refresh_seconds=15\ndelivery_pause_seconds=0\n")
-        _ = write_config_fixture(config / "console.conf",
-            "page.list.url=python:scripts.review_links.list_page:page_url\n"
-            + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
+        changes = self.root / "change-reviews"
+        _ = shutil.copytree(self.browser_root / "config", config)
+        _ = (config / "change_review.conf").write_text(
+            f"lists_directory={changes}\nreview_links_directory={self.root / 'reviews'}\n")
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        environment.update({"CONF_DIR": str(config), "CHANGE_REVIEW_DIR": str(changes),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "STAFF_FILE": str(self.root / "staff.json"),
-            "USER_ZONE": "America/New_York", "REVIEW_LINKS_ROOT": str(self.root / "reviews"),
-            "CHANGE_REVIEW_DIR": str(self.root / "change-reviews")})))
+            "USER_ZONE": "America/New_York", "REVIEW_LINKS_ROOT": str(self.root / "reviews")})
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment, clear=True)))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
             row.to_json() for row in (MORTY, DWIGHT, OWNER, OTHER)]}))
         _ = self.enterContext(patch.object(the_list, "now", return_value=NOW))
@@ -2201,7 +2567,9 @@ window.fetch=async (url,options)=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_refresh_keeps_the_follow_up_request_and_retries_after_timeout(self) -> None:
-        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\n")
+        settings = conf.path("review_links")
+        _ = settings.write_text(settings.read_text().replace(
+            "page_request_timeout_seconds=15\n", "page_request_timeout_seconds=4\n"))
         root = self.root / "reviews"
         changed = self.add("Keep the changed row usable")
         counts_only = list_page.render(root, defer_counts=True, review_records={}).decode()
@@ -2682,7 +3050,7 @@ window.fetch=async(_path,options={})=>{
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, setup, probe, virtual_time_ms=3000)
+        self.browser_actions(markup, setup, probe)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_opens_the_shared_picker_and_submits_the_chosen_time(self) -> None:
@@ -3278,7 +3646,7 @@ const observer=new MutationObserver(()=>{
 });
 observer.observe(original.parentNode,{childList:true});
 </script>'''
-        self.browser_actions(markup, setup, probe, virtual_time_ms=2000)
+        self.browser_actions(markup, setup, probe)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_retries_a_lost_tell_after_a_refused_park(self) -> None:
@@ -3404,7 +3772,11 @@ observer.observe(original.parentNode,{childList:true});
             _ = self.add(f"List item {number}", number=number)
         with patch.object(list_page, "counts_strip", return_value=""):
             page = list_page.render(self.root / "reviews")
-        self.assertEqual(save_notice_failures(page, 'remove'), [[]])
+        def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            return self.firefox_view(arguments[-1], None, 1366, 768)
+
+        with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
+            self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_keeps_the_question_request_after_a_service_failure(self) -> None:
@@ -5030,7 +5402,12 @@ window.fetch=async(_url,options)=>{
                 console_shell = console_shell.replace(b"</body>", b'<img hidden src="/complete"></body>')
         host_page = (f'<!doctype html><style>iframe{{border:0;width:100%;height:{height}}}'
                      + 'iframe[hidden]{display:block;visibility:hidden}</style>'
-                     + f'<iframe src="{html.escape(frame_url)}"></iframe><img hidden src="/complete">').encode()
+                     + f'<iframe data-src="{html.escape(frame_url)}"></iframe><img hidden src="/complete">'
+                     + """<script>
+// Set the frame size before the List starts its observers.
+const frame=document.querySelector('iframe');
+requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src;}));
+</script>""").encode()
         results: list[list[str]] = []
         complete = threading.Event()
 
@@ -5072,14 +5449,10 @@ window.fetch=async(_url,options)=>{
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                profile = self.root / "answer-profile"
-                profile.mkdir(exist_ok=True)
                 window_height = max(900, (viewport_height or 0) + 32)
-                start_path = frame_url if console_fragment or viewport_width is not None else "/"
-                browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                    '--window-size', f'{viewport_width or 1280},{window_height}', '--screenshot',
-                    str(self.root / 'answer.png'), f'http://127.0.0.1:{server.server_port}{start_path}'],
-                    capture_output=True, text=True, timeout=45)
+                destination = frame_url if console_fragment or viewport_width is not None else "/"
+                browser = self.firefox_view(f"http://127.0.0.1:{server.server_port}{destination}",
+                                           None, viewport_width or 1280, window_height, complete)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:
@@ -5274,11 +5647,8 @@ const change=async path=>{
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                profile = self.root / "ask-profile"
-                profile.mkdir()
-                browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                    '--window-size', '1440,900', '--screenshot', str(self.root / 'ask.png'),
-                    f'http://127.0.0.1:{server.server_port}/proof'], capture_output=True, text=True, timeout=45)
+                browser = self.firefox_view(f'http://127.0.0.1:{server.server_port}/proof',
+                                            None, 1440, 900, complete)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:
@@ -5354,7 +5724,7 @@ window.fetch=async(path,options={})=>{
                              window_size=window_size, in_frame=in_frame)
 
     def browser_actions(self, markup: str, setup: str, probe: str, *,
-                        reduced_motion: bool = False, virtual_time_ms: int = 1500,
+                        reduced_motion: bool = False,
                         window_size: tuple[int, int] | None = None, in_frame: bool = False) -> None:
         page = self.root / 'actions.html'
         _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
@@ -5362,12 +5732,7 @@ window.fetch=async(path,options={})=>{
             page = self.root / 'actions-console.html'
             _ = page.write_text('<!doctype html><button id="console-nav">Console navigation</button>'
                                 + '<iframe title="The List" src="actions.html"></iframe>')
-        result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
-            *(['--force-prefers-reduced-motion'] if reduced_motion else []),
-            *([f'--window-size={window_size[0]},{window_size[1]}'] if window_size else []),
-            *(['--allow-file-access-from-files'] if in_frame else []),
-            '--user-data-dir=' + str(self.root / 'chrome-actions'), f'--virtual-time-budget={virtual_time_ms}',
-            '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
+        result = self.chrome().dom(page, "probe-results", reduced_motion=reduced_motion, window_size=window_size)
         self.assertEqual(result.returncode, 0, result.stderr)
         marker = '<p id="probe-results">'
         self.assertIn(marker, result.stdout[-3000:], 'The browser must complete the item action checks.')
@@ -5601,9 +5966,7 @@ window.fetch=async(_path,options={})=>{
                 page = self.root / f"{action}-{unread}.html"
                 _ = page.write_text(markup.replace('<head>', '<head>' + setup.replace('UNREAD', unread), 1).replace('</body>',
                     probe.replace('ACTION', action).replace('NOTICE', notice).replace('EXPECTED_UNREAD', unread) + '</body>'))
-                result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
-                    '--user-data-dir=' + str(self.root / f'chrome-{action}-{unread}'), '--virtual-time-budget=1000',
-                    '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
+                result = self.chrome().dom(page, "probe-result", reduced_motion=False, window_size=None)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue('<p id="probe-result">PASS</p>' in result.stdout,
                                 f"The {action} action must show the saved unread state and apply the Unread filter.")
@@ -5736,7 +6099,14 @@ window.fetch=async(_path,options={})=>{
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_shared_page_status_uses_the_real_list_loader(self) -> None:
         _ = self.fixture_items()
-        assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
+
+        def screenshot(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            path = Path(arguments[arguments.index("--screenshot") + 1])
+            width, _, height = arguments[arguments.index("--window-size") + 1].partition(",")
+            return self.firefox_view(arguments[-1], path, int(width), int(height))
+
+        with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
+            assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_sort_filters_hash_refresh_open_rows_and_phone_cards(self) -> None:
@@ -6256,7 +6626,9 @@ try{
  check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===5,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
- if(innerWidth<960){
+ check((innerWidth<960)===(FIXTURE_WIDTH<960),'the browser uses the requested layout');
+ if(FIXTURE_WIDTH===390) check(innerWidth===390,'The phone cards use the 390 px viewport.');
+ if(FIXTURE_WIDTH<960){
   check(getComputedStyle(visible()[0]).display==='block','a phone row is a card');
   const card=number=>rows().find(row=>row.dataset.number===number);
   const cell=(number,label,part=null)=>getComputedStyle(card(number).querySelector('td[data-label="'+label+'"]'),part);
@@ -6276,7 +6648,8 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                         {"latest_status": f"The fixture uses a width of {width} pixels."}, source="morty")
                 markup = list_page.render(self.root / "reviews").decode()
                 setup_for_width = setup.replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
-                page = markup.replace('<head>', '<head>' + setup_for_width, 1).replace('</body>', probe + '</body>').encode()
+                probe_for_width = probe.replace('FIXTURE_WIDTH', str(width))
+                page = markup.replace('<head>', '<head>' + setup_for_width, 1).replace('</body>', probe_for_width + '</body>').encode()
                 root = self.root / "reviews"
                 results: list[list[str]] = []
                 complete = threading.Event()
@@ -6318,12 +6691,9 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
-                        profile = self.root / f'profile-{width}'
-                        profile.mkdir()
                         with patch.object(change_page, "send_to_staff") as sends:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                                '--window-size', f'{width},900', '--screenshot', str(self.root / f'page-{width}.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                            done = self.firefox_view(f'http://127.0.0.1:{server.server_port}/',
+                                                     None, width, 900, complete)
                             self.assertEqual(done.returncode, 0, done.stderr)
                             self.assertEqual(results, [[]])
                             sends.assert_called_once()
