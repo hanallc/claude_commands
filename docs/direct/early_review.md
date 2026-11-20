@@ -60,3 +60,7 @@ The hook submits Stage 2 once both the Stage 1 reply and the sentinel exist.
 
 Keep the numbered artifacts when an early review fails.
 </EarlyReviewArm>
+
+For a standalone early review, `arm-review` returns the reserved pass ID.
+Pass that ID to `review.sh --early-review-pass-id` with the ready file.
+The recorder adds the early review time to the reserved pass.
