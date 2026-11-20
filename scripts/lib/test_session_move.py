@@ -1,8 +1,10 @@
 """Check the cutover with private roots and one live process."""
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Generator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import ctypes
+import errno
 import io
 import json
 import os
@@ -77,6 +79,19 @@ class SessionMoveTests(unittest.TestCase):
             status = session_move.main(list(args))
         return status, output.getvalue(), errors.getvalue()
 
+    @contextmanager
+    def other_mount(self, path: Path) -> Generator[None]:
+        mounted = path.stat()
+        mount_identity = scratch.mount_identity
+
+        def identity(fd: int) -> int:
+            if os.path.samestat(os.fstat(fd), mounted):
+                return -2
+            return mount_identity(fd)
+
+        with mock.patch.object(session_move, "mount_identity", side_effect=identity):
+            yield
+
     def test_dry_run_prints_the_copy_and_changes_nothing(self) -> None:
         source = self.leaf("recorded")
         target = self.index("recorded", "demo")
@@ -92,6 +107,218 @@ class SessionMoveTests(unittest.TestCase):
         self.assertEqual(list(target.iterdir()), [target / session_folder.RECORD])
         self.assertFalse((self.root / session_folder.LOCK).exists())
         self.assertFalse(self.holds.with_name(self.holds.name + ".lock").exists())
+
+    def test_real_run_moves_both_entries_after_a_missing_transcript(self) -> None:
+        refused = self.leaf("a-missing-transcript")
+        first = self.leaf("b-movable")
+        second = self.leaf("c-movable")
+        folder = self.index(first.name, "demo")
+        _ = self.index(second.name, folder.name)
+        target = folder / self.claude / self.project
+
+        status, output, errors = self.invoke()
+
+        self.assertEqual(status, 1, errors)
+        self.assertIn(f"{refused.name}: no working folder in a transcript", errors)
+        self.assertEqual((refused / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual(output.splitlines()[-1],
+                         "session_move: moved 2 folders (0.00 GiB), kept 0 live, refused 1 other")
+        for source in (first, second):
+            self.assertFalse(source.exists())
+            self.assertEqual((target / source.name / "draft.md").read_bytes(), b"scratch content\n")
+
+    def test_unreadable_project_keeps_later_projects_in_the_scan(self) -> None:
+        unreadable = self.leaf("unreadable").parent
+        unreadable = unreadable.rename(unreadable.with_name("-unreadable"))
+        movable = self.leaf("movable")
+        target = self.index(movable.name, "demo") / self.claude / self.project / movable.name
+        iterdir = Path.iterdir
+
+        def discover(path: Path) -> Generator[Path]:
+            if path == unreadable:
+                raise PermissionError(errno.EACCES, "cannot list project")
+            yield from iterdir(path)
+
+        with mock.patch.object(Path, "iterdir", autospec=True, side_effect=discover):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertEqual(dry_status, real_status)
+        self.assertEqual(dry_errors, real_errors)
+        self.assertIn(f"kept {unreadable}: [Errno {errno.EACCES}] cannot list project", real_errors)
+        self.assertEqual(dry_output.replace("would move", "moved"), real_output)
+        self.assertEqual(real_output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 0 live, refused 1 other")
+        self.assertTrue((unreadable / "unreadable" / "draft.md").is_file())
+        self.assertFalse(movable.exists())
+        self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
+
+    def test_source_removal_permissions_refuse_before_printing_or_writing(self) -> None:
+        nested_source = self.leaf("a-readonly-tree")
+        nested = nested_source / "nested"
+        nested.mkdir()
+        _ = (nested_source / "draft.md").rename(nested / "draft.md")
+        shared = self.leaf("b-readonly-parent", shared=True)
+        movable = self.leaf("c-movable")
+        target = self.index(movable.name, "demo") / self.claude / self.project / movable.name
+        for folder in (nested, shared.parent):
+            self.addCleanup(folder.chmod, stat.S_IMODE(folder.stat().st_mode))
+            folder.chmod(0o555)
+
+        with mock.patch.object(session_move, "transcript_cwd", return_value=str(self.base / "unindexed")):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        for source, parent in ((nested_source, nested), (shared, shared.parent)):
+            self.assertNotIn(f" {source} -> ", dry_output)
+            self.assertIn(f"kept {source}: {parent}: directory needs write and search permission", real_errors)
+            self.assertFalse((self.root / session_folder.INDEX / source.name).is_symlink())
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertEqual(dry_status, real_status)
+        self.assertEqual(dry_errors, real_errors)
+        self.assertEqual(dry_output.replace("would move", "moved"), real_output)
+        self.assertEqual(real_output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 0 live, refused 2 other")
+        self.assertFalse((self.root / "unindexed").exists())
+        self.assertEqual((nested / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual((shared / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
+
+    def test_publish_error_keeps_the_pending_copy_and_stops(self) -> None:
+        source = self.leaf("a-copy")
+        waiting = self.leaf("b-waiting")
+        folder = self.index(source.name, "demo")
+        _ = self.index(waiting.name, folder.name)
+        target = folder / self.claude / self.project / source.name
+        sync = os.fsync
+
+        def fail_publication_sync(fd: int) -> None:
+            if target.is_dir() and os.path.samestat(os.fstat(fd), target.parent.stat()):
+                raise OSError("cannot sync the published copy")
+            sync(fd)
+
+        with mock.patch.object(os, "fsync", side_effect=fail_publication_sync):
+            status, output, errors = self.invoke()
+
+        self.assertEqual(status, 1, errors)
+        self.assertIn(f"kept {source}: cannot sync the published copy", errors)
+        self.assertEqual(output.splitlines()[-1],
+                         "session_move: moved 0 folders (0.00 GiB), kept 0 live, refused 1 other")
+        self.assertEqual((source / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertTrue((self.root / session_move.JOURNAL / session_move.MOVE_RECORD).is_file())
+        self.assertTrue(waiting.is_dir())
+        self.assertFalse((target.parent / waiting.name).exists())
+
+    def test_read_error_leaves_dry_and_real_counts_and_order_equal(self) -> None:
+        first = self.leaf("a-movable")
+        refused = self.leaf("b-unreadable")
+        last = self.leaf("c-movable")
+        for source in (first, refused, last):
+            _ = self.index(source.name, "demo")
+        scan = session_move.read_manifest
+        refused_info = refused.stat()
+
+        def read(fd: int, identities: session_move.EntryIdentities | None = None, *,
+                 removal: session_move.SourceRemoval | session_move.ReadManifestOnly =
+                 session_move.ReadManifestOnly.NO_REMOVAL_CHECK) -> session_move.TreeManifest:
+            if os.path.samestat(os.fstat(fd), refused_info):
+                raise PermissionError("cannot read scratchpad")
+            return scan(fd, identities, removal=removal)
+
+        with mock.patch.object(session_move, "read_manifest", side_effect=read):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        self.assertEqual(dry_status, 1, dry_errors)
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertIn(f"kept {refused}: cannot read scratchpad", dry_errors)
+        self.assertEqual(real_errors, dry_errors)
+        self.assertEqual(real_output, dry_output.replace("would move", "moved"))
+        self.assertEqual(real_output.splitlines()[-1],
+                         "session_move: moved 2 folders (0.00 GiB), kept 0 live, refused 1 other")
+        self.assertIn(str(first), real_output.splitlines()[0])
+        self.assertIn(str(last), real_output.splitlines()[1])
+        self.assertTrue(refused.is_dir())
+
+    def test_unreadable_file_refuses_the_source_before_printing_or_writing(self) -> None:
+        refused = self.leaf("a-unreadable")
+        movable = self.leaf("b-movable")
+        target = self.index(movable.name, "demo") / self.claude / self.project / movable.name
+        refused_info = refused.stat()
+        open_file = os.open
+
+        def deny_source_file(name: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if name == "draft.md" and dir_fd is not None and os.path.samestat(os.fstat(dir_fd), refused_info):
+                raise PermissionError(errno.EACCES, "cannot open source file", name)
+            return open_file(name, flags, mode, dir_fd=dir_fd)
+
+        with (mock.patch.object(os, "open", side_effect=deny_source_file),
+              mock.patch.object(session_move, "transcript_cwd", return_value=str(self.base / "unindexed"))):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        self.assertNotIn(f" {refused} -> ", dry_output)
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertEqual(dry_status, real_status)
+        self.assertEqual(dry_errors, real_errors)
+        self.assertIn(f"kept {refused}: [Errno {errno.EACCES}] cannot open source file", real_errors)
+        self.assertEqual(dry_output.replace("would move", "moved"), real_output)
+        self.assertEqual(real_output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 0 live, refused 1 other")
+        self.assertFalse((self.root / session_folder.INDEX / refused.name).is_symlink())
+        self.assertFalse((self.root / "unindexed").exists())
+        self.assertEqual((refused / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertFalse(movable.exists())
+        self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
+
+    def test_index_mount_refuses_each_candidate_before_printing(self) -> None:
+        first = self.leaf("a-unindexed")
+        second = self.leaf("b-indexed")
+        folder = self.index(second.name, "demo")
+        index = self.root / session_folder.INDEX
+
+        with (self.other_mount(index),
+              mock.patch.object(session_move, "transcript_cwd", return_value=str(self.base / "unindexed"))):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertEqual(real_errors.count(".id: entry is on another mount"), 2)
+        self.assertEqual(real_output, "session_move: moved 0 folders (0.00 GiB), kept 0 live, refused 2 other\n")
+        self.assertEqual(dry_status, real_status)
+        self.assertEqual(dry_errors, real_errors)
+        self.assertEqual(dry_output.replace("would move", "moved"), real_output)
+        self.assertEqual(list(index.iterdir()), [index / second.name])
+        self.assertEqual(list(folder.iterdir()), [])
+        self.assertFalse((self.root / "unindexed").exists())
+        self.assertFalse((self.root / session_move.JOURNAL).exists())
+        self.assertTrue(first.is_dir())
+        self.assertTrue(second.is_dir())
+
+    def test_source_parent_mount_refuses_the_same_candidate_in_both_modes(self) -> None:
+        refused = self.leaf("a-mounted")
+        movable = self.leaf("b-movable", shared=True)
+        folder = self.index(refused.name, "demo")
+        _ = self.index(movable.name, folder.name)
+        target = folder / self.claude / self.project
+
+        with self.other_mount(refused.parent):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertIn(f"kept {refused}: {self.project}: entry is on another mount", real_errors)
+        self.assertNotIn(str(refused), real_output)
+        self.assertEqual(real_output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 0 live, refused 1 other")
+        self.assertEqual(dry_status, real_status)
+        self.assertEqual(dry_errors, real_errors)
+        self.assertEqual(dry_output.replace("would move", "moved"), real_output)
+        self.assertEqual((refused / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertFalse(movable.exists())
+        self.assertEqual((target / movable.name / "draft.md").read_bytes(), b"scratch content\n")
 
     def test_open_holds_report_the_owner_and_keep_the_tree_until_release(self) -> None:
         source = self.leaf("held")
@@ -503,9 +730,11 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         registry = session_records.RegistryRead((), ())
         resumed = self.live_registry(source.name)
 
-        def resume_during_scan(fd: int, identities: session_move.EntryIdentities | None = None) -> session_move.TreeManifest:
+        def resume_during_scan(fd: int, identities: session_move.EntryIdentities | None = None, *,
+                               removal: session_move.SourceRemoval | session_move.ReadManifestOnly =
+                               session_move.ReadManifestOnly.NO_REMOVAL_CHECK) -> session_move.TreeManifest:
             nonlocal registry
-            manifest = scan(fd, identities)
+            manifest = scan(fd, identities, removal=removal)
             if target.exists() and os.path.samestat(source_info, os.fstat(fd)):
                 registry = resumed
             return manifest
@@ -660,9 +889,11 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         scan = session_move.read_manifest
 
         def remove_destination_during_source_scan(
-            fd: int, identities: session_move.EntryIdentities | None = None,
+            fd: int, identities: session_move.EntryIdentities | None = None, *,
+            removal: session_move.SourceRemoval | session_move.ReadManifestOnly =
+            session_move.ReadManifestOnly.NO_REMOVAL_CHECK,
         ) -> session_move.TreeManifest:
-            manifest = scan(fd, identities)
+            manifest = scan(fd, identities, removal=removal)
             if os.path.samestat(original, os.fstat(fd)) and destination.exists():
                 destination.unlink()
             return manifest

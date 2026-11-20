@@ -41,8 +41,10 @@ for arg in "${@:subcommand_index+1}"; do
     case "$arg" in
         --) break ;;
         -h|--help) exec "$real_cargo" "$@" ;;
-        -V|--version)
-            [[ "$subcommand" == install ]] || exec "$real_cargo" "$@"
+        -V|--version|--build-info)
+            if [[ "$subcommand" != install && ( "$arg" != --build-info || "$subcommand" == mend ) ]]; then
+                exec "$real_cargo" "$@"
+            fi
             ;;
     esac
 done
