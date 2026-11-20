@@ -538,11 +538,16 @@ class PlacementTests(unittest.TestCase):
     def test_blocked_provider_claim_and_cleanup_keep_local_socket_requests_responsive(self) -> None:
         for operation in ("claim", "cleanup"):
             with self.subTest(operation=operation), PlacementFixture() as fixture:
+                fixture.enter_context(mock.patch.dict(os.environ, {
+                    "MAC_TEST_STATE_DIR": str(fixture.root / "blocked-provider"),
+                }))
+                _ = (fixture.root / "build_targets.conf").write_text(
+                    "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
                 request = placement_request(fixture)
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
                 reference = adopt_assignment(fixture, request, assignment)
-                paths = mac_test.StatePaths(fixture.root / "blocked-provider")
+                paths = claim_state.state_paths(assignment.destination.target)
                 paths.directory.mkdir()
                 record: mac_test.RemoteJobClaim = {"claim_id": reference.claim_id, "episode": reference.episode,
                     "attempt": reference.attempt, "submitting_session": "submitting-session",
