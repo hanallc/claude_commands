@@ -2175,7 +2175,7 @@ def free_now(
     paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
-    origin: placement.MacCommandOrigin = placement.PlacedMacWork(),
+    origin: placement.MacCommandOrigin = placement.PLACED_MAC_WORK,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 

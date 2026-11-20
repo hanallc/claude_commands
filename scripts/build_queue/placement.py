@@ -276,6 +276,7 @@ class ManualMacCommand:
 
 
 MacCommandOrigin = PlacedMacWork | ManualMacCommand
+PLACED_MAC_WORK = PlacedMacWork()
 
 
 @dataclass(frozen=True)

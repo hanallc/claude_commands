@@ -162,7 +162,7 @@ class MacRoutes:
             kind = step if step in step_record.KINDS else build_targets.recorded_step_kind(step)
             if isinstance(mac, targets.TargetSnapshot) and not isinstance(kind, build_targets.KindNotOffloaded):
                 policy = self.policy(mac, folder, package, kind)
-                if policy == NotAllowed(MAC_DISABLED_REASON):
+                if isinstance(policy, NotAllowed) and policy.reason == MAC_DISABLED_REASON:
                     return policy
             return (self.state_fit(mac.states[0]) if isinstance(mac, targets.TargetSnapshot)
                     else FitUnreadable("Mac state unreadable, " + mac.reason)
