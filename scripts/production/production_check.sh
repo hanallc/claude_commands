@@ -9,10 +9,7 @@ for line in "${(@f)$(<$doc)}"; do
   if [[ $line == *'Status: PRODUCTION — '* ]]; then
     doc_status=${${line#*'Status: PRODUCTION — '}%%[^a-z]*}
     case $doc_status in
-      running)
-        # Copy a changed LOG during this check. A failed copy does not change the result.
-        "${0:A:h:h}/lib/py" "${0:A:h}/log_backup.py" "$1" >/dev/null || true
-        exit 0 ;;
+      running) exit 0 ;;
       wrapped) exit 2 ;;
       *) exit 1 ;;
     esac
