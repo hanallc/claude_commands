@@ -1631,6 +1631,23 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 95 — The review hold turns off by config  · status: todo
+**Depends on:** Phase 89
+
+#### Work Order
+
+**Goal:** nate, 09:52 EST Nov 20 (via dwight and sdlc): "yes - hold goes off until it works". Name: holdoff.
+**Spec:**
+1. New key `review_hold=off` in `config/send.conf` (values on, off). review_hold.py reads it at each call.
+2. When off, `_hold_open` is false. So no message is kept (native or send.py), no hold opens, and a held message is delivered at the next hook call.
+3. The hold comes back only by /tune with nate's word, never by a merge.
+**Files:** `config/send.conf`, `scripts/message/review_hold.py`, its tests, `docs/as-built/message-clarity.md`.
+**Acceptance gate:** targeted tests of the review_hold and hook modules pass; basedpyright 0/0.
+
+**Workers:** 1 writer.
+
+**Order:** first; phase 94 builds on it.
+
 ### Phase 94 — A native SendMessage to another session goes through send.py  · status: todo
 **Depends on:** Phase 89
 
