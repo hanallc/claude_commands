@@ -2005,7 +2005,7 @@ def complete_postmaster_fallback(message: Message, recipient: StableRecipient, e
             marker["postmaster"] = RelayAcceptanceUnconfirmed(stage="relay-unconfirmed", entry_id=entry_id,
                 owner_pid=reservation["owner_pid"], owner_start=reservation["owner_start"])
             return True
-        if result.outcome in ("failed", "retry"):
+        if result.outcome in ("failed", "retry") or isinstance(result, RefusedRelayRequest):
             release_postmaster_claim(state, message.to, marker)
             return True
         if result.outcome not in ("sent", "queued"):
@@ -3460,7 +3460,10 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
         call = forwarded_calls[0]
     inputs = as_dict(call.get("input"))
     if inputs.get("to") != observed.target or inputs.get("message") != text:
-        return _unaccepted_relay(forward, "SendMessage used a different target or payload")
+        reason = "SendMessage used a different target or payload"
+        if isinstance(forward, RelayRequestNotForwarded):
+            return RefusedRelayRequest("refused", reason)
+        return _unaccepted_relay(forward, reason)
     tool_id = as_str(call.get("id"))
     results = [part for event in events if event.get("type") == "user"
                for value in as_list(as_dict(event.get("message")).get("content"))
@@ -5460,7 +5463,9 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                 else:
                     delivery_message, relayed_result = relay_socket(relay_message, timeout, selection=options.selection)
                 if isinstance(options.selection, FixedStaffLookup):
-                    if options.review_delivery and isinstance(relayed_result, (ConfirmedSocketMiss, SendNotStarted)):
+                    if options.review_delivery and isinstance(
+                        relayed_result, (ConfirmedSocketMiss, RefusedRelayRequest, SendNotStarted)
+                    ):
                         return SendNotStarted("retry", relayed_result.detail)
                     if relayed_result.outcome == "queued":
                         return Result("retry" if options.review_delivery else "failed", relayed_result.detail)
