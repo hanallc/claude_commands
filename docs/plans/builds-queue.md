@@ -3231,6 +3231,13 @@ Tests: one row in the existing bare copy removal test, failing first.
 
 Tests: one row each in the existing Mac offload busy-mirror test and the existing dispatch test, each failing first.
 
+### Phase 44dn — A FIFO worktree backlink does not stop the sweep  · status: todo
+**From the 44de review (pass 1), 2026-11-19:** the builds landing rule moves this gap out of 44de. After 44de merges.
+
+1. The 44de backlink check reads `gitdir` with `read_text()` (tmp_sweep.py:1107, scratch.py:1617). A FIFO with no writer blocks the read, and the sweep does not reach later folders. Fix: read the backlink only when it is a regular file; any other kind keeps the folder.
+
+Tests: one row in the existing live Git registration sweep test, failing first.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
