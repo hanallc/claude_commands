@@ -23,7 +23,7 @@ from typing import NamedTuple, TypedDict, cast, override
 from scripts.lib.atomic_file import write_bytes_atomic
 
 from scripts.lib import conf as tunables
-from scripts.message import send_budget, session_send
+from scripts.message import session_send
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or tunables.path("showrunners"))
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -558,10 +558,8 @@ def deliver(production_name: str, key: str, text: str, *,
 
 
 def tell(production_name: str, key: str, text: str, *, sender: str = "showrunners",
-         bounded: bool = False, deadline: float | None = None) -> str:
+         deadline: float | None = None) -> str:
     """Send one line and preserve the existing human-readable delivery report."""
-    if bounded:
-        deadline = min(deadline if deadline is not None else math.inf, notice_deadline(send_budget.seconds()))
     return deliver(production_name, key, text, sender=sender, deadline=deadline).lines[0]
 
 
