@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -20,6 +21,7 @@ from unittest import mock
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
+from scripts.aws_target import plan_identity, quota_requests
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.buildlog import aws_report
@@ -86,6 +88,8 @@ region_transfer_usd={"us-west-1":0.00015}
             'AWS_PROFILE': 'fixture-admin', 'AWS_DEFAULT_PROFILE': 'fixture-admin',
             'AWS_SHARED_CREDENTIALS_FILE': str(self.root / 'private-scaler'),
         }))
+        _ = self.enterContext(mock.patch.object(plan_identity, 'plan_credentials',
+                                                side_effect=plan_identity.PlanIdentityRefused('The AWS plan key is missing.')))
 
     def execute(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                 timeout: float, check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -142,6 +146,195 @@ region_transfer_usd={"us-west-1":0.00015}
         _ = (self.state / 'gate-deployment.json').write_text(json.dumps({'regions': [
             {'region': region, 'subnets': [{'id': 'subnet-' + region, 'zone': region + 'a'}]} for region in self.regions
         ]}))
+
+    def test_snapshot_saves_each_quota_request_history_with_the_plan_identity(self) -> None:
+        calls: list[tuple[str, str]] = []
+        credential = mock.Mock(spec=plan_identity.PlanCredentials, environment=mock.Mock(
+            return_value={'AWS_FIXTURE_IDENTITY': 'plan'}))
+        expected_timeout = conf.read(self.settings).number('aws_timeout_s')
+
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                    check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if 'list-requested-service-quota-change-history-by-quota' not in arguments:
+                return self.execute(arguments, capture_output=capture_output, text=text, timeout=timeout,
+                                    check=check, env=env)
+            self.assertEqual(env, {'AWS_FIXTURE_IDENTITY': 'plan'})
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, expected_timeout)
+            self.assertNotIn('--profile', arguments)
+            self.assertNotIn('--no-paginate', arguments)
+            region = arguments[arguments.index('--region') + 1]
+            code = arguments[arguments.index('--quota-code') + 1]
+            calls.append((region, code))
+            if code == 'L-34B43A08' and region == self.regions[0]:
+                history = [{'Status': 'APPROVED', 'DesiredValue': 16, 'Created': '2026-01-01T03:00:00Z',
+                            'LastUpdated': '2026-01-04T05:00:00Z'},
+                           {'Status': 'CASE_OPENED', 'DesiredValue': 32, 'Created': '2026-01-02T03:00:00Z',
+                            'LastUpdated': '2026-01-03T04:00:00Z'}]
+            elif code == 'L-34B43A08':
+                history = [{'Status': 'arn:aws:iam::123456789012:user/private', 'DesiredValue': 64,
+                            'LastUpdated': '2026-01-03T05:00:00+01:00'}]
+            elif region == self.regions[0]:
+                history = []
+            else:
+                return subprocess.CompletedProcess(arguments, 1, '',
+                    'An error occurred (AccessDeniedException) when calling the '
+                    + 'ListRequestedServiceQuotaChangeHistoryByQuota operation: Private error detail')
+            return subprocess.CompletedProcess(arguments, 0, json.dumps({'RequestedQuotas': history}), '')
+
+        with mock.patch.object(plan_identity, 'plan_credentials', return_value=credential) as load:
+            status = aws_target.snapshot(self.settings, self.state, execute=execute, clock=self.clock,
+                                         notify=self.notify)
+        load.assert_called_once_with()
+        self.assertCountEqual(calls, [(region, code) for region in self.regions for code in ('L-34B43A08', 'L-3819A6DF')])
+        document = aws_target.read_snapshot(self.state)
+        histories = ledger.rows(document, 'quota_requests')
+        standard = {'state': 'requested', 'status': 'CASE_OPENED', 'requested_vcpus': '32',
+                    'created_at': '2026-01-02T03:00:00+00:00', 'updated_at': '2026-01-03T04:00:00+00:00'}
+        self.assertEqual(histories, (
+            {'region': self.regions[0], 'standard': standard, 'gpu': {'state': 'no_request'}},
+            {'region': self.regions[1], 'standard': {'state': 'requested', 'status': 'unknown',
+                'requested_vcpus': '64', 'updated_at': '2026-01-03T04:00:00+00:00'},
+             'gpu': {'state': 'read_failed', 'reason': 'AccessDeniedException'}},
+        ))
+        self.assertEqual(status, 0)
+        self.assertEqual(len(ledger.read_spot_prices(self.state)), len(self.regions) * len(self.sizes) * 2)
+        self.assertEqual(len(ledger.rows(document, 'regions')), len(self.regions))
+        self.assertEqual(aws_target.snapshot_failures(document), ())
+        self.assertEqual(self.notices, [])
+        first, second = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).quota_requests
+        self.assertEqual(first.standard, quota_requests.QuotaRequest(quota_requests.QuotaRequestStatus.CASE_OPENED,
+            Decimal(32), datetime(2026, 1, 2, 3, tzinfo=UTC), datetime(2026, 1, 3, 4, tzinfo=UTC)))
+        self.assertEqual(first.gpu, quota_requests.NoQuotaRequest())
+        self.assertEqual(second.standard, quota_requests.QuotaRequest(quota_requests.QuotaRequestStatus.UNKNOWN,
+            Decimal(64), quota_requests.QuotaRequestTimeUnavailable(), datetime(2026, 1, 3, 4, tzinfo=UTC)))
+        self.assertEqual(second.gpu, quota_requests.QuotaRequestReadFailed('AccessDeniedException'))
+
+    def test_snapshot_publishes_prices_when_a_history_worker_cannot_start(self) -> None:
+        credential = mock.Mock(spec=plan_identity.PlanCredentials)
+        with (mock.patch.object(plan_identity, 'plan_credentials', return_value=credential),
+              mock.patch.object(ThreadPoolExecutor, '_adjust_thread_count',
+                                side_effect=RuntimeError('Private thread startup detail'))):
+            self.assertEqual(self.snapshot(), 0)
+        document = aws_target.read_snapshot(self.state)
+        self.assertEqual(len(ledger.rows(document, 'regions')), len(self.regions))
+        self.assertEqual(len(ledger.rows(document, 'prices')), len(self.regions) * len(self.sizes) * 2)
+        self.assertEqual(ledger.rows(document, 'quota_requests'), tuple(
+            {'region': region, 'standard': {'state': 'read_failed', 'reason': 'QuotaHistoryUnavailable'},
+             'gpu': {'state': 'read_failed', 'reason': 'QuotaHistoryUnavailable'}} for region in self.regions))
+
+    def test_snapshot_validates_quota_request_values_before_publication(self) -> None:
+        credential = mock.Mock(spec=plan_identity.PlanCredentials, environment=mock.Mock(return_value={}))
+        rejected = {'state': 'read_failed', 'reason': 'QuotaHistoryUnavailable'}
+        requested = {'state': 'requested', 'status': 'PENDING', 'requested_vcpus': '128'}
+        rows: tuple[tuple[str, object, dict[str, str]], ...] = (
+            ('DesiredValue', '000000000128', rejected),
+            ('DesiredValue', True, rejected),
+            ('DesiredValue', 128.5, rejected),
+            ('DesiredValue', 0, rejected),
+            ('DesiredValue', -1, rejected),
+            ('DesiredValue', 10_000_000_001, rejected),
+            ('DesiredValue', 10_000_000_000, {**requested, 'requested_vcpus': '10000000000'}),
+            ('DesiredValue', 128.0, requested),
+            ('Created', '000000000128', rejected),
+            ('LastUpdated', '000000000128', rejected),
+        )
+        for field, value, expected in rows:
+            with self.subTest(field=field, value=value):
+                def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                            check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    if 'list-requested-service-quota-change-history-by-quota' not in arguments:
+                        return self.execute(arguments, capture_output=capture_output, text=text,
+                                            timeout=timeout, check=check, env=env)
+                    history = [{'Status': 'PENDING', 'DesiredValue': 128, field: value}]
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps({'RequestedQuotas': history}), '')
+
+                self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+                with mock.patch.object(plan_identity, 'plan_credentials', return_value=credential):
+                    self.assertEqual(aws_target.snapshot(self.settings, self.state, execute=execute,
+                                                         clock=self.clock, notify=self.notify), 0)
+                document = aws_target.read_snapshot(self.state)
+                self.assertEqual(ledger.rows(document, 'quota_requests'), tuple(
+                    {'region': region, 'standard': expected, 'gpu': expected} for region in self.regions))
+
+    def test_snapshot_does_not_retry_prices_for_history_errors(self) -> None:
+        credential = mock.Mock(spec=plan_identity.PlanCredentials, environment=mock.Mock(return_value={}))
+        failures = (
+            subprocess.TimeoutExpired('private command detail', 1),
+            RuntimeError('Private executor detail'),
+            'An error occurred (PrivateAccount123456789012) when calling the '
+            + 'ListRequestedServiceQuotaChangeHistoryByQuota operation: Private error detail',
+        )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
+                            check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                    if 'list-requested-service-quota-change-history-by-quota' not in arguments:
+                        return self.execute(arguments, capture_output=capture_output, text=text,
+                                            timeout=timeout, check=check, env=env)
+                    if isinstance(failure, str):
+                        return subprocess.CompletedProcess(arguments, 1, '', failure)
+                    raise failure
+
+                self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+                with mock.patch.object(plan_identity, 'plan_credentials', return_value=credential):
+                    self.assertEqual(aws_target.snapshot(self.settings, self.state, execute=execute,
+                                                         clock=self.clock, notify=self.notify), 0)
+                document = aws_target.read_snapshot(self.state)
+                self.assertEqual(len(ledger.rows(document, 'regions')), len(self.regions))
+                self.assertTrue(all(row.read_at == self.clock.now for row in ledger.read_spot_prices(self.state)))
+                self.assertEqual(aws_target.snapshot_failures(document), ())
+                self.assertEqual(ledger.rows(document, 'quota_requests'), tuple(
+                    {'region': region, 'standard': {'state': 'read_failed', 'reason': 'QuotaHistoryUnavailable'},
+                     'gpu': {'state': 'read_failed', 'reason': 'QuotaHistoryUnavailable'}} for region in self.regions))
+
+    def test_snapshot_history_shares_one_deadline_across_quota_calls(self) -> None:
+        credential = mock.Mock(spec=plan_identity.PlanCredentials, environment=mock.Mock(return_value={}))
+        clock = TestClock()
+        timeout_seen: list[float] = []
+
+        def execute(arguments: Sequence[str], *, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            timeout_seen.append(timeout)
+            clock.advance(1 if len(timeout_seen) == 1 else 9)
+            return subprocess.CompletedProcess(arguments, 0, '{"RequestedQuotas": []}', '')
+
+        with (mock.patch.object(plan_identity, 'plan_credentials', return_value=credential),
+              mock.patch.object(aws_target, 'monotonic', clock),
+              mock.patch.object(aws_target, 'ThreadPoolExecutor', return_value=ThreadPoolExecutor(max_workers=1))):
+            first, second = aws_target.read_snapshot_quota_requests(self.regions, 10, execute)
+        self.assertEqual(timeout_seen, [10, 9])
+        self.assertEqual(first.standard, quota_requests.NoQuotaRequest())
+        missing = quota_requests.QuotaRequestsNotMeasured('The quota request history deadline expired.')
+        self.assertEqual(first.gpu, missing)
+        self.assertEqual(second, quota_requests.RegionalQuotaRequests(self.regions[1], missing, missing))
+
+    def test_snapshot_keeps_prices_when_the_plan_identity_cannot_load(self) -> None:
+        for error in (plan_identity.PlanAgentCold('The AWS plan key is locked.'),
+                      plan_identity.PlanIdentityRefused('The AWS plan key is missing.')):
+            with self.subTest(error=error), mock.patch.object(plan_identity, 'plan_credentials', side_effect=error) as load:
+                self.calls.clear()
+                self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+                self.assertEqual(self.snapshot(), 0)
+                load.assert_called_once_with()
+                self.assertEqual(len(self.calls), len(self.regions) * 3)
+                self.assertEqual(len(ledger.read_spot_prices(self.state)), len(self.regions) * len(self.sizes) * 2)
+                document = aws_target.read_snapshot(self.state)
+                self.assertEqual(len(ledger.rows(document, 'regions')), len(self.regions))
+                missing = quota_requests.QuotaRequestsNotMeasured(str(error))
+                self.assertEqual(spot_table.spot_tables(self.state, int(self.clock.now),
+                    settings_path=self.settings).quota_requests, tuple(
+                        quota_requests.RegionalQuotaRequests(region, missing, missing) for region in self.regions))
+
+    def test_spot_table_marks_legacy_snapshots_as_not_measured(self) -> None:
+        self.assertEqual(self.snapshot(), 0)
+        document = aws_target.read_snapshot(self.state)
+        del document['quota_requests']
+        _ = (self.state / 'spot-prices.json').write_text(json.dumps(document))
+        tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
+        missing = quota_requests.QuotaRequestsNotMeasured('The snapshot has no quota request history for this region.')
+        self.assertEqual(tables.quota_requests, tuple(
+            quota_requests.RegionalQuotaRequests(region, missing, missing) for region in self.regions))
+        self.assertEqual(tables.quotas[0].rows[0][1], f'{self.quota} vCPUs')
 
     def test_snapshot_writes_prices_and_quotas_with_one_atomic_write_and_limits_repeats(self) -> None:
         self.assertFalse((self.state / 'gate-deployment.json').exists())

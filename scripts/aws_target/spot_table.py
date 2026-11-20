@@ -11,6 +11,7 @@ from typing import Literal
 
 from scripts.aws_target import ledger, run_cost
 from scripts.aws_target.aws_target import SnapshotFailure, gpu_price_sizes, hours_check_scope, largest_gate_vcpus, read_snapshot, snapshot_failures
+from scripts.aws_target.quota_requests import RegionalQuotaRequests, snapshot_quota_requests
 from scripts.lib import conf
 
 
@@ -29,7 +30,7 @@ class Table:
     right: frozenset[int]
     rows: tuple[tuple[str, ...], ...]
     region_axis: RegionAxis
-    # The number of each cell, row by row, for the page's color scale; None for a cell without a number.
+    # The number of each cell, row by row. Use None for a cell without a number.
     values: tuple[tuple[Decimal | None, ...], ...] = ()
     # The (row, column) cells of a type that the region does not sell; they read NOT_SOLD.
     not_sold: frozenset[tuple[int, int]] = frozenset()
@@ -121,6 +122,8 @@ class SpotTables:
     runs: tuple[RunCosts, ...]
     hours: Table
     hours_note: str
+    gpu_quota_needed: int
+    quota_requests: tuple[RegionalQuotaRequests, ...]
 
     @property
     def snapshot_rows(self) -> tuple[tuple[str, str], ...]:
@@ -172,7 +175,7 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None,
         (quota_table('Standard quota', 'standard_vcpus', standard, regions, readings, notes),
          quota_table('G and VT quota', 'gpu_vcpus', gpu, regions, readings, notes)),
         run_costs(directory, now, standard, regions, minimum, values, configuration, inputs),
-        hours, hours_note)
+        hours, hours_note, values.whole('gpu_spot_quota_request_vcpus'), snapshot_quota_requests(document, regions))
 
 
 def price_table(sizes: tuple[str, ...], regions: tuple[str, ...], minimum: Mapping[tuple[str, str], Decimal],
@@ -202,15 +205,14 @@ def quota_table(label: str, field: str, sizes: tuple[str, ...], regions: tuple[s
 
     The quotas come from the same read as the prices, so the snapshot age shows only with the prices."""
     fits = tuple((size, largest_gate_vcpus((size,))) for size in sizes)
-    rows: list[tuple[str, ...]] = []
-    for region in regions:
-        reading = readings.get(region)
-        note = notes[region]
-        rows.append((region, f'{conf.decimal(ledger.text(reading, field)).normalize():f} vCPUs' if reading else note,
-                     *(f'{int(conf.decimal(ledger.text(reading, field)) // vcpus)} boxes'
-                       if reading and vcpus else note or 'unknown vCPU count' for _size, vcpus in fits)))
+    applied = {region: conf.decimal(ledger.text(readings[region], field)) for region in regions if region in readings}
+    rows = tuple((region, f'{value.normalize():f} vCPUs' if (value := applied.get(region)) is not None else notes[region],
+                  *(f'{int(value // vcpus)} boxes' if value is not None and vcpus
+                    else notes[region] or 'unknown vCPU count' for _size, vcpus in fits))
+                 for region in regions)
+    values = tuple((None, applied.get(region), *(None for _size in sizes)) for region in regions)
     return Table('', ('region', label, *(f'{size} ({vcpus or "?"} vCPUs)' for size, vcpus in fits)),
-                 frozenset(range(1, 2 + len(fits))), tuple(rows), 'rows')
+                 frozenset(range(1, 2 + len(fits))), rows, 'rows', values)
 
 
 def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[str, ...],
