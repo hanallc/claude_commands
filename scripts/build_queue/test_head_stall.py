@@ -76,14 +76,17 @@ class FindStallTests(unittest.TestCase):
         assert isinstance(stall, head_stall.HeadStall)
         self.assertEqual((stall.last_start, stall.need, round(stall.waited), round(stall.quiet)),
                          (NOW - 2 * 3600, 15 * GIB, 3 * 3600, 2 * 3600))
-        self.assertEqual(stall.holders, (head_stall.Holder("check", "/home/u/rust/devtools-chooserux", 706237,
-                                                         12 * GIB, GIB // 10, 3 * 3600.0),))
+        self.assertEqual(stall.holders, (head_stall.Holder((STALLED.inputs.running[0],),
+            records.RunMemory("706237-706237", 12 * GIB, records.AnonymousRunUse(GIB // 10)),
+            12 * GIB - GIB // 10, 3 * 3600.0),))
         self.assertEqual(head_stall.builds_text(stall).splitlines(), [
             "The build queue head has waited 180 min. No step started for 120 min.",
             "Head: nextest in lfo-trigger-fires-bc6b76 (pid 1618939) needs 15.0 GiB.",
+            "Admission room: 10.1 GiB for 15.0 GiB of need.",
             "Holders:",
-            "- check in devtools-chooserux (pid 706237): promise 12.0 GiB, uses 0.1 GiB, held for 180 min",
-            "The head starts only when a holder ends. Check each holder that uses much less than its promise."])
+            "- check in devtools-chooserux (pid 706237): effective need 12.0 GiB, keep-aside 11.9 GiB, "
+            + "uses 0.1 GiB, original grant 12.0 GiB, held for 180 min",
+            "Memory shortfall: 4.9 GiB."])
 
     def test_two_compiling_holders_count_their_own_sccache_jobs(self) -> None:
         first_scope = Path("/cgroup/builds.slice/first.scope")
@@ -128,41 +131,43 @@ class FindStallTests(unittest.TestCase):
             _ = self.enterContext(mock.patch.object(head_stall, "PROC", proc))
             _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(builds)})))
             one_unreadable = ("sccache: 1 compiler not readable; uses can be low",)
-            for name, second_holder, service, amounts, header in (
+            for name, second_holder, service, amounts, keep_asides, header in (
                 ("both jobs", second, (compiler_service(first_job, second_job, source=COMPILER_SCOPE),),
-                 ("10.2 GiB", "12.3 GiB"), ()),
+                 ("10.2 GiB", "12.3 GiB"), ("2.3 GiB", "1.6 GiB"), ()),
                 ("unreadable job", second, (compiler_service(first_job, unreadable_job, source=unreadable_status),),
-                 ("10.2 GiB", "unknown"), one_unreadable),
+                 ("10.2 GiB", "unknown"), ("2.3 GiB", "13.9 GiB"), one_unreadable),
                 ("two unreadable compilers in one job", second,
                  (compiler_service(first_job, unreadable_job, source=two_unreadable_statuses),),
-                 ("10.2 GiB", "unknown"), ("sccache: 2 compilers not readable; uses can be low",)),
+                 ("10.2 GiB", "unknown"), ("2.3 GiB", "13.9 GiB"), ("sccache: 2 compilers not readable; uses can be low",)),
                 ("first holder has two compilers with one unreadable environment", second, (compiler_service(first_job),),
-                 ("10.2 GiB", "0.3 GiB"), one_unreadable),
+                 ("10.2 GiB", "0.3 GiB"), ("2.3 GiB", "13.6 GiB"), one_unreadable),
                 ("missing job", second_tree,
                  (compiler_service(first_job, second_job, source=COMPILER_SCOPE),),
-                 ("10.2 GiB", "0.3 GiB"), ()),
+                 ("10.2 GiB", "0.3 GiB"), ("2.3 GiB", "13.6 GiB"), ()),
                 ("complete read with no job for the second holder", second,
                  (compiler_service(first_job, source=COMPILER_SCOPE),),
-                 ("10.2 GiB", "0.3 GiB"), ()),
+                 ("10.2 GiB", "0.3 GiB"), ("2.3 GiB", "13.6 GiB"), ()),
                 ("the process-tree holder owns no compiler job with an unreadable memory reading", second_tree,
                  (compiler_service(unreadable_job, source=unreadable_status),),
-                 ("0.2 GiB", "0.3 GiB"), one_unreadable),
+                 ("0.2 GiB", "0.3 GiB"), ("12.3 GiB", "13.6 GiB"), one_unreadable),
                 ("the process-tree holder can rule out a job assigned to another holder", second_tree,
                  (compiler_service(first_job, source=COMPILER_SCOPE),),
-                 ("10.2 GiB", "0.3 GiB"), ()),
+                 ("10.2 GiB", "0.3 GiB"), ("2.3 GiB", "13.6 GiB"), ()),
                 ("missing service", second, (),
-                 ("0.2 GiB", "0.3 GiB"), ("sccache: compiler scan incomplete; uses can be low",)),
+                 ("0.2 GiB", "0.3 GiB"), ("12.3 GiB", "13.6 GiB"), ("sccache: compiler scan incomplete; uses can be low",)),
             ):
                 with self.subTest(name=name):
                     queue = snapshot([waiter(NOW - 3600)], (first, second_holder, *service))
                     write_queue_snapshot(paths.admission, queue.inputs, queue.policy)
                     stall = head_stall.current_stall(paths, NOW, LIMIT, 120)
                     assert isinstance(stall, head_stall.HeadStall)
-                    self.assertEqual(head_stall.builds_text(stall).splitlines()[2:-1], [
+                    self.assertEqual(head_stall.builds_text(stall).splitlines()[3:-1], [
                         *header,
                         "Holders:",
-                        f"- nextest in first (pid 4094003): promise 12.5 GiB, uses {amounts[0]}, held for 60 min",
-                        f"- nextest in second (pid 1090772): promise 13.9 GiB, uses {amounts[1]}, held for 45 min",
+                        f"- nextest in first (pid 4094003): effective need 12.5 GiB, keep-aside {keep_asides[0]}, "
+                        + f"uses {amounts[0]}, original grant 12.5 GiB, held for 60 min",
+                        f"- nextest in second (pid 1090772): effective need 13.9 GiB, keep-aside {keep_asides[1]}, "
+                        + f"uses {amounts[1]}, original grant 13.9 GiB, held for 45 min",
                     ])
 
     def test_process_tree_holder_with_no_compiler_jobs_has_no_warning(self) -> None:
@@ -172,8 +177,9 @@ class FindStallTests(unittest.TestCase):
         queue = snapshot([waiter(NOW - 3600)], (step, compiler_service(source=COMPILER_SCOPE)))
         stall = head_stall.find_stall(queue, 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertEqual(head_stall.builds_text(stall).splitlines()[3],
-                         "- check in devtools-chooserux (pid 706237): promise 12.0 GiB, uses 0.1 GiB, held for 60 min")
+        self.assertEqual(head_stall.builds_text(stall).splitlines()[4],
+                         "- check in devtools-chooserux (pid 706237): effective need 12.0 GiB, keep-aside 11.9 GiB, "
+                         + "uses 0.1 GiB, original grant 12.0 GiB, held for 60 min")
 
     def test_short_waits_recent_starts_and_empty_queues_are_not_stalls(self) -> None:
         cases = {
@@ -192,13 +198,14 @@ class FindStallTests(unittest.TestCase):
         gate = replace(holder(NOW - 60), step="merge-gate", promise=0)
         stall = head_stall.find_stall(snapshot([waiter(NOW - 3600)], (holder(NOW - 3600), gate)), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertEqual([row.step for row in stall.holders], ["check"])
+        self.assertEqual([step.step for row in stall.holders for step in row.steps], ["check"])
 
     def test_a_holder_without_a_reading_shows_unknown_use(self) -> None:
         queue = snapshot([waiter(NOW - 3600)], (holder(NOW - 3600, measured=records.GoneMemory()),))
         stall = head_stall.find_stall(queue, 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertIn("promise 12.0 GiB, uses unknown", head_stall.builds_text(stall))
+        self.assertIn("effective need 12.0 GiB, keep-aside 12.0 GiB, uses unknown, original grant 12.0 GiB",
+                      head_stall.builds_text(stall))
 
     def test_unreadable_child_scope_makes_parent_use_unknown(self) -> None:
         parent = replace(holder(NOW - 3600, measured=records.MeasuredMemory(
@@ -211,9 +218,11 @@ class FindStallTests(unittest.TestCase):
         queue = snapshot([waiter(NOW - 3600)], (parent, child, compiler_service(source=COMPILER_SCOPE)))
         stall = head_stall.find_stall(queue, 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertEqual(head_stall.builds_text(stall).splitlines()[3:5], [
-            "- check in parent (pid 706237): promise 12.0 GiB, uses unknown, held for 60 min",
-            "- check in child (pid 706238): promise 12.0 GiB, uses unknown, held for 60 min",
+        self.assertEqual(head_stall.builds_text(stall).splitlines()[4:6], [
+            "- check in parent (pid 706237): effective need 12.0 GiB, keep-aside 12.0 GiB, "
+            + "uses unknown, original grant 12.0 GiB, held for 60 min",
+            "- check in child (pid 706238): effective need 12.0 GiB, keep-aside 12.0 GiB, "
+            + "uses unknown, original grant 12.0 GiB, held for 60 min",
         ])
 
     def test_a_holder_without_a_start_time_shows_unknown_duration(self) -> None:
@@ -321,6 +330,29 @@ class WatchTests(unittest.TestCase):
         assert isinstance(stall, head_stall.HeadStall)
         self.assertEqual(self.sent_recipients(), ["builds", "bob"])
         self.assertEqual([text for _, text in self.sent], [head_stall.builds_text(stall)] * 2)
+
+    def test_test_phase_reduces_the_alert_charge_while_nextest_stays_active(self) -> None:
+        memory = records.MeasuredMemory(GIB, anonymous=records.AnonymousRunUse(GIB))
+        nextest = replace(holder(NOW - 3600, measured=memory), step="nextest", folder="/build/hana-slot1")
+        queued = [waiter(NOW - 3600)]
+        queue = snapshot(queued, (nextest,))
+        inputs = replace(queue.inputs, host=records.HostMemory(20 * GIB, 60 * GIB))
+        before = head_stall.find_stall(replace(queue, inputs=inputs), 0.0, NOW, LIMIT)
+        assert isinstance(before, head_stall.HeadStall)
+        self.assertIn("effective need 12.0 GiB, keep-aside 11.0 GiB", head_stall.builds_text(before))
+        self.assertIn("Memory shortfall: 9.0 GiB.", head_stall.builds_text(before))
+
+        need = records.TestPhaseNeed(5 * GIB, 10, 8, 8, "same_width", margin=1.2)
+        phase = records.TestPhaseStarted(NOW - 10, 4 * GIB, need)
+        active = replace(nextest, measured=replace(memory, peak_history=phase))
+        after = replace(queue, inputs=replace(inputs, running=(active,)))
+        self.assertIsInstance(self.observe(after, NOW), head_stall.HeadStall)
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+        for _, report in self.sent:
+            self.assertIn("Admission room: 12.0 GiB for 15.0 GiB of need.", report)
+            self.assertIn("- nextest in hana-slot1 (pid 706237): effective need 6.0 GiB, keep-aside 5.0 GiB, "
+                          + "uses 1.0 GiB, original grant 12.0 GiB, held for 60 min", report)
+            self.assertIn("Memory shortfall: 3.0 GiB.", report)
 
     def test_a_hold_that_starts_during_a_reported_stall_sends_no_second_alert(self) -> None:
         self.assertIsInstance(self.observe(STALLED, NOW), head_stall.HeadStall)

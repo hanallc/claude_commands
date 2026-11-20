@@ -57,11 +57,9 @@ class HolderAdmissionUnavailable:
 
 @dataclass(frozen=True)
 class Holder:
-    step: str
-    folder: str
-    pid: int | records.PidNotRecorded
-    promise: int
-    used: int | records.RunUseUnavailable
+    steps: tuple[records.RunningStep, ...]
+    memory: records.RunMemory
+    keep_aside: int | records.ReadingUnavailable
     held_for: float | HolderAdmissionUnavailable
 
 
@@ -73,6 +71,7 @@ class HeadStall:
     folder: str
     pid: int
     need: int
+    room: records.RoomCheck | records.ReadingUnavailable
     waited: float
     quiet: float
     holders: tuple[Holder, ...]
@@ -169,12 +168,40 @@ def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: floa
     quiet = now - last_start
     if waited < limit or quiet < limit:
         return NoStall()
-    holders = tuple(Holder(step.step, step.folder, step.pid, step.promise,
-                           attributed.use.bytes if isinstance(attributed.use, records.AnonymousRunUse) else attributed.use,
-                           max(0.0, now - step.started_at) if step.started_at > 0 else HolderAdmissionUnavailable())
-                    for _, step, attributed in gate.attributed_step_uses(inputs) if step.promise > 0)
+    policy = snapshot.policy
+    admission = gate.head_policy(inputs, inputs.now, policy, gate.start_spacing_after(inputs.now, policy))
+    room = admission.room
+    owner = records.waiter_owner(head)
+    head_room = (next(entry.decision.room for entry in admission.walk
+                      if records.waiter_owner(entry.waiter) == owner)
+                 if isinstance(room, records.MemoryRoom) else room)
+    holders = active_holders(inputs, room, now)
     return HeadStall(last_start, head.get("step", "step"), head.get("folder", ""),
-                     head["pid"], head["need"], waited, quiet, holders, _compiler_scan(inputs.running))
+                     head["pid"], head["need"], head_room, waited, quiet, holders, _compiler_scan(inputs.running))
+
+
+def active_holders(inputs: records.QueueInputs, room: records.MemoryRoom | records.ReadingUnavailable,
+                   now: float) -> tuple[Holder, ...]:
+    """Name the active steps for each run that admission charges."""
+    steps_by_owner: dict[str, list[records.RunningStep]] = {}
+    reserved_steps = (step for step in inputs.running if gate.running_has_reservation(step))
+    for row, step in zip(inputs.reservations, reserved_steps, strict=True):
+        if step.promise <= 0:
+            continue
+        owner = gate.reservation_owner(row, step)
+        steps_by_owner.setdefault(owner, []).append(step)
+    charges = (tuple((run.memory, run.bytes) for run in room.runs)
+               if isinstance(room, records.MemoryRoom) else
+               tuple((memory, room) for memory in gate.run_memories(inputs)))
+    holders: list[Holder] = []
+    for memory, keep_aside in charges:
+        steps = steps_by_owner.get(memory.owner, [])
+        if not steps:
+            continue
+        started_at = min(step.started_at for step in steps)
+        held_for = max(0.0, now - started_at) if started_at > 0 else HolderAdmissionUnavailable()
+        holders.append(Holder(tuple(steps), memory, keep_aside, held_for))
+    return tuple(holders)
 
 
 def current_stall(paths: StallPaths, now: float, limit: float, freshest: float) -> HeadStall | NoStall:
@@ -188,9 +215,19 @@ def _folder_name(folder: str) -> str:
     return folder.rstrip("/").rpartition("/")[2] or "unknown folder"
 
 
+def _holder_step(step: records.RunningStep) -> str:
+    pid = f"pid {step.pid}" if isinstance(step.pid, int) else "pid unknown"
+    return f"{step.step} in {_folder_name(step.folder)} ({pid})"
+
+
 def builds_text(stall: HeadStall) -> str:
     lines = [f"The build queue head has waited {stall.waited / 60:.0f} min. No step started for {stall.quiet / 60:.0f} min.",
              f"Head: {stall.step} in {_folder_name(stall.folder)} (pid {stall.pid}) needs {gib(stall.need)}."]
+    room = stall.room
+    if isinstance(room, records.RoomCheck):
+        lines.append(f"Admission room: {gib(room.room)} for {gib(room.need)} of need.")
+    else:
+        lines.append("Admission room: unavailable.")
     scan = stall.compiler_scan
     if isinstance(scan, UnreadableCompilers):
         compilers = "compiler" if scan.count == 1 else "compilers"
@@ -199,12 +236,17 @@ def builds_text(stall: HeadStall) -> str:
         lines.append("sccache: compiler scan incomplete; uses can be low")
     lines.append("Holders:")
     for holder in stall.holders:
-        used = gib(holder.used) if isinstance(holder.used, int) else "unknown"
-        pid = f"pid {holder.pid}" if isinstance(holder.pid, int) else "pid unknown"
+        memory = holder.memory
+        used = gib(memory.use.bytes) if isinstance(memory.use, records.AnonymousRunUse) else "unknown"
+        keep_aside = gib(holder.keep_aside) if isinstance(holder.keep_aside, int) else "unknown"
+        original_grant = sum(step.promise for step in holder.steps)
         duration = f"{holder.held_for / 60:.0f} min" if isinstance(holder.held_for, float) else "unknown"
-        lines.append(f"- {holder.step} in {_folder_name(holder.folder)} ({pid}): "
-                     + f"promise {gib(holder.promise)}, uses {used}, held for {duration}")
-    lines.append("The head starts only when a holder ends. Check each holder that uses much less than its promise.")
+        steps = " + ".join(_holder_step(step) for step in holder.steps)
+        lines.append(f"- {steps}: effective need {gib(memory.need)}, keep-aside {keep_aside}, "
+                     + f"uses {used}, original grant {gib(original_grant)}, held for {duration}")
+    if isinstance(room, records.RoomCheck):
+        shortfall = 0 if room.passes else max(0, room.need - room.room)
+        lines.append(f"Memory shortfall: {gib(shortfall)}.")
     return "\n".join(lines)
 
 
