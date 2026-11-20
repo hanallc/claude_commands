@@ -23,7 +23,9 @@ from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_browser, change_page, console, for_you, investigations_page, page_frame, review_link
+from scripts.review_links import (
+    change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
+)
 
 
 class ConsoleMarkup(HTMLParser):
@@ -106,13 +108,13 @@ class ConsoleTests(unittest.TestCase):
         retry = conf.read("review_links").number("frame_retry_seconds")
         self.assertIn(f'data-frame-retry-seconds="{retry}"', source)
         self.assertIn("try { loaded = frame.contentWindow.location.origin === location.origin; } catch (_) {}", source)
-        self.assertIn("setTimeout(() => { frame.src = place; }, Number(shell.dataset.frameRetrySeconds) * 1000);", source)
         self.assertIn('<a class="rebuild-link" id="rebuild-link" href="?page=rebuilds" data-page="rebuilds"', source)
         self.assertIn("const pages = [...entries, rebuildLink];", source)
         self.assertIn("if (shown) shown.replaceWith(shown.ownerDocument.importNode(parsed, true));", source)
         self.assertIn("open: current === rebuildLink ? '' : current.dataset.page", source)
         self.assertNotIn("<iframe", source)
         self.assertIn(".frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}", source)
+
         self.assertIn("const placeKey = identity => 'at.' + identity;", source)
         self.assertIn("target.pathname === new URL(base, location.href).pathname", source)
         self.assertIn("event.data !== 'console-place'", source)
@@ -135,9 +137,21 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('aria-label="Open navigation"', source)
         self.assertIn('class="lucide lucide-menu"', source)
         self.assertIn('.sidebar .brand,.collapsed .sidebar{display:none}', source)
+        self.assertEqual(source.count(f'@media {console.PHONE_QUERY}'), 2)
+        self.assertIn(f"matchMedia('{console.PHONE_QUERY}')", source)
         self.assertNotIn('page-header', source)
         self.assertIn('.workspace{flex:1;width:100%}', source)
         self.assertIn("mobileToggle.setAttribute('aria-expanded', String(!value))", source)
+
+    def test_repository_config_names_staff_for_every_console_page(self) -> None:
+        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        settings = conf.read(path).values()
+        pages = {key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")}
+        self.assertEqual(pages | {"rebuilds"}, page_frame.OWNER_PAGES)
+        for page in page_frame.OWNER_PAGES:
+            with self.subTest(page=page):
+                self.assertRegex(settings[f"page.{page}.owner"], r"^[a-f0-9-]{36}$")
+        self.assertEqual(settings["owner.default"], settings["page.review.owner"])
 
     def test_builds_url_resolves_from_its_public_function(self) -> None:
         folder = self.root / "snapshots/builds"
@@ -407,6 +421,13 @@ try{
  check(reads===queued+2 && trigger.dataset.state==='quiet','completion queues one read after a read in progress');
  mode='good';dispatchEvent(new Event('focus'));await flush();
  const collapsed=shell.classList.contains('collapsed');
+ const escapeInFrame=()=>new frame.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true});
+ const frameSearch=frame.contentDocument.querySelector('[data-filter-words]');
+ frameSearch.value='auto';
+ frameSearch.focus();
+ frameSearch.dispatchEvent(escapeInFrame());
+ check(!panel.hidden && frameSearch.value==='' && frame.contentDocument.activeElement===frameSearch,
+  'Escape clears the List filter and keeps For you open.');
  const frameButton=frame.contentDocument.querySelector('button');
  frameButton.focus();
  check(document.activeElement===frame && frame.contentDocument.activeElement===frameButton,'focus enters the page frame');
@@ -496,12 +517,35 @@ try{
   layout.dispatchEvent(new fixture.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
   check(box.hidden && layout.activeElement===mobile,'Escape restores focus to the visible button after resizing');
   fixture.remove();
+
+  const listLoaded=()=>new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const loaded=listLoaded();
+  frame.src='/page?filter=mine&restart=1#q=auto';
+  await loaded;
+  const list=frame.contentWindow;
+  const cleared=new Promise(resolve=>list.addEventListener('hashchange',resolve,{once:true}));
+  list.location.hash='q=';
+  await cleared;
+  const saved=new URL(location.href).searchParams.get('at.list');
+  check(saved==='/page?filter=mine&restart=1#q=','The console saves the cleared List address.');
+  const failedLoad=listLoaded();
+  frame.src='data:text/html,Unavailable';
+  await failedLoad;
+  await listLoaded();
+  check(list.location.pathname+list.location.search+list.location.hash===saved,
+   'The frame retry opens the last saved List address with the words cleared.');
  }
 }catch(error){failures.push(String(error));}
 await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
     layout = source.replace('</head>', setup + '</head>')
     page = layout.replace('</body>', probe + '<img hidden src="/complete"></body>').encode()
+    list_fixture = (
+        '<!doctype html><title>List fixture</title><button>Fixture control</button>'
+        + record_table.words_box('list-search', 'Filter by words')
+        + '<script>' + record_table.SCRIPT
+        + "filterControl.bind(document.querySelector('[data-filter-words]'),()=>{});</script>"
+    ).encode()
     results: list[list[str]] = []
     complete = threading.Event()
 
@@ -516,6 +560,8 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 _ = self.wfile.write(layout.encode())
             elif self.path.startswith('/?'):
                 _ = self.wfile.write(page)
+            elif self.path.startswith('/page?'):
+                _ = self.wfile.write(list_fixture)
             else:
                 _ = self.wfile.write(b'<!doctype html><title>Fixture</title><button>Fixture control</button>')
 

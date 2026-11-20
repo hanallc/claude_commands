@@ -69,7 +69,7 @@ HoldEnd = ExpiresAt | ReleaseEstimated | ReleaseOverdue | UntilReleased | Awaiti
 
 @dataclass(frozen=True)
 class Free:
-    pass
+    kept_claims: int = 0
 
 
 @dataclass(frozen=True)
@@ -258,14 +258,15 @@ def ssh_target_snapshot(target: SshTarget) -> TargetSnapshot:
             return snapshot(Held(mac_test.holder_name(block.holder), block.reason, block.since, block_end, session))
         if isinstance(eligibility.read_failed_probe(target.name), eligibility.FailedProbe):
             return snapshot(Unreachable("failed probe"))
-        jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
+        jobs = tuple(running_job(claim) for claim in claims
+                     if mac_test.run_holds_work(claim.record))
         if jobs:
             return snapshot(Running(jobs))
         if isinstance(backoff, eligibility.UnreadableBackoff):
             return snapshot(StateUnreadable("retry backoff: " + backoff.reason))
         if isinstance(backoff, eligibility.ActiveBackoff):
             return snapshot(Unreachable("retry backoff"))
-        return snapshot(Free())
+        return snapshot(Free(sum(mac_test.run_is_kept(claim.record) for claim in claims)))
     except build_hold.ReleaseRecordReadError as error:
         return snapshot(StateUnreadable(build_hold.release_record_error_line(error)))
     except (OSError, UnicodeError, mac_test.StateReadError, ConfigError) as error:

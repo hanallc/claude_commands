@@ -19,7 +19,8 @@
   buildlog snapshot                 record slice and zram counters now
   buildlog memory START END         report memory between offset-bearing instants
   buildlog usage-hours [YYYY-MM-DD]  measured memory, CPU, disk and free pool tokens over 24 h
-  buildlog hourly                   sync, vault pull, ci, screenshot scan, Rust release check, then AWS snapshot
+  buildlog hourly                   sample sccache, sync, and run the hourly collectors
+  buildlog sccache [START END]       Rust cache hit rate for inclusive local dates, default today
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
 Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
@@ -175,7 +176,30 @@ def day_report(args: list[str]) -> int:
     _ = index.update()
     connection = index.read_only()
     try:
-        print(report.report(connection, day, usage_day=day if args else ""))
+        day_selection = report.ReportDaySelection.EXPLICIT_DATE if args else report.ReportDaySelection.CURRENT_DAY
+        print(report.report(connection, day, day_selection=day_selection))
+    finally:
+        connection.close()
+    return 0
+
+
+def sccache_report(args: list[str]) -> int:
+    from scripts.buildlog import index
+    from scripts.buildlog import report
+
+    usage = "usage: buildlog sccache [YYYY-MM-DD YYYY-MM-DD]"
+    today = date.today().isoformat()
+    try:
+        first, last = map(date.fromisoformat, args or [today, today])
+        if not date(2000, 1, 1) <= first <= last < date.max:
+            raise ValueError("Invalid date range.")
+    except ValueError:
+        print(usage, file=sys.stderr)
+        return 2
+    _ = index.update()
+    connection = index.read_only()
+    try:
+        print(report.sccache_hit_rate(connection, first, last))
     finally:
         connection.close()
     return 0
@@ -228,12 +252,13 @@ def hourly() -> int:
     from scripts.buildlog import ci
     from scripts.buildlog import index
     from scripts.buildlog import rust_release
+    from scripts.buildlog import sample
     from scripts.buildlog import store
     from scripts.buildlog import sync
     from scripts.buildlog import vault_pull
 
     status = 0
-    for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
+    for name, job in (("sccache", sample.sccache_sample), ("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
                       ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release),
                       ("AWS snapshot", aws_snapshot), ("AWS page", aws_page)):
         try:
@@ -250,16 +275,57 @@ def hourly() -> int:
     return status
 
 
-def run_in_user_zone() -> None:
-    """Make the user's zone this process's zone: every printed time and every `localtime` day in the SQL follows it."""
-    from scripts.lib.user_zone import user_zone_name
+def process_zone_file(zone_key: str) -> Path:
+    import atexit
+    from contextlib import ExitStack
+    from importlib.resources import as_file, files
+    from zoneinfo import TZPATH
 
-    os.environ["TZ"] = user_zone_name()
+    for directory in TZPATH:
+        zone_file = Path(directory) / zone_key
+        if zone_file.is_file():
+            return zone_file
+
+    try:
+        packaged = files("tzdata.zoneinfo").joinpath(*zone_key.split("/"))
+        if packaged.is_file():
+            with ExitStack() as cleanup:
+                zone_file = cleanup.enter_context(as_file(packaged))
+                # Keep an extracted zone file while libc can still read it.
+                _ = atexit.register(cleanup.pop_all().close)
+            return zone_file
+    except ModuleNotFoundError:
+        pass
+    raise ValueError(f"{zone_key!r}: no zone file for the process in zoneinfo.TZPATH or tzdata")
+
+
+def run_in_user_zone() -> None:
+    """Set the process zone for report times and SQLite local dates."""
+    from datetime import UTC, datetime, timedelta
+
+    from scripts.lib.user_zone import user_zone
+
+    zone = user_zone()
+    os.environ["TZ"] = f":{process_zone_file(zone.key)}"
     time.tzset()
+    year = datetime.now(UTC).year
+    for month in (1, 7):
+        at = datetime(year, month, 15, 12, tzinfo=UTC)
+        process_offset = timedelta(seconds=time.localtime(at.timestamp()).tm_gmtoff)
+        expected_offset = at.astimezone(zone).utcoffset()
+        if process_offset != expected_offset:
+            raise ValueError(
+                f"{zone.key!r}: process offset {process_offset} differs from zoneinfo offset "
+                + f"{expected_offset} at {at.isoformat()}"
+            )
 
 
 def main(argv: list[str]) -> int:
-    run_in_user_zone()
+    try:
+        run_in_user_zone()
+    except (OSError, ValueError) as error:
+        print(f"buildlog: {error}", file=sys.stderr)
+        return 2
     command, rest = (argv[0], argv[1:]) if argv else ("", [])
     if command == "query":
         return query(rest)
@@ -267,6 +333,8 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
+    if command == "sccache":
+        return sccache_report(rest)
     if command == "moments":
         return moments_report(rest)
     if command == "usage-hours":

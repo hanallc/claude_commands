@@ -317,7 +317,18 @@ Both modes keep folders with a running session or an active process when they ch
 The real run checks again after it writes the session index and just before it saves the journal.
 If that check finds a live source, the next run can reuse its index entry.
 Both modes continue with other candidates and return status 0 if they only skip live entries before copying.
-A destination conflict or a failed copy stops a real run and returns status 1.
+Both modes check the source, its parent, the destination, and the session index before they print each move.
+The source check reads file contents, symbolic link targets, and metadata.
+It checks write and search permission on the parent of each source entry, including the source folder.
+It also checks whether sticky directory permissions prevent removal.
+The destination check includes write and search permission where the move must create entries.
+If discovery cannot read a project or an entry, both modes report the refusal and continue with the next entry.
+Both modes keep entries that fail these checks and continue in the same order.
+A destination conflict found during these checks counts as a refusal.
+The command returns status 1 if it records a refusal.
+An error at or after the first write to the session index or the journal stops the real run.
+A source that becomes live before journal publication is an exception.
+If the journal names a live source, the run keeps the journal and returns status 1.
 The dry run reads the session index and folder records without creating a preview directory.
 It reads compressed transcripts through a pipe.
 The command checks the scratchpad copy after it scans the source for deletion.

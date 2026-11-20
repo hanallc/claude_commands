@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import cast, final
 from collections.abc import Generator
 from unittest import mock
+from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.production import affected_modules, checkpoint_gate, merge_gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import process_group
@@ -203,9 +204,9 @@ class MergeGateSuitesTests(GateSuitesFixture):
                 routed: list[merge_gate.AllModules | merge_gate.TreeSelection] = []
 
                 def route(repo: Path, *, mode: merge_gate.SuiteMode, full: bool,
-                          module_time_limit_s: float,
-                          selected: merge_gate.AllModules | merge_gate.TreeSelection = merge_gate.ALL_MODULES
-                          ) -> merge_gate.GateRun | str:
+                          module_time_limit_s: float, selected: merge_gate.AllModules | merge_gate.TreeSelection,
+                          gate_job: StepJob | GateJobNotRecorded) -> merge_gate.GateRun | str:
+                    self.assertEqual(gate_job, StepJob("test-affected"))
                     self.assertEqual(repo, self.checkout)
                     self.assertEqual(mode, merge_gate.SuiteMode.TARGETED_TEST)
                     self.assertFalse(full)
@@ -302,6 +303,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         output = io.StringIO()
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(os, "cpu_count", return_value=2),
+              mock.patch.object(os, "getloadavg", side_effect=[(1.25, 4.0, 5.0), (2.5, 6.0, 7.0)]),
               mock.patch.object(merge_gate, "typecheck_python", return_value=Path(sys.executable)),
               contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
             for name in ("BuildHoldWait", "gate_reservation", "queue_place", "shared_cpu_pool",
@@ -313,6 +315,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertTrue(run.passed, output.getvalue())
         self.assertEqual(len(run.jobs), 3)
         self.assertIn("at most 2 modules at once", output.getvalue())
+        self.assertIn("One-minute load: start=1.25 max=2.50 end=2.50", output.getvalue())
         active: set[int] = set()
         peak = 0
         for event in self.module_events():

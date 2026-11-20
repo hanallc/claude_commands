@@ -31,7 +31,7 @@ SNAPSHOT_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
 def private_name(name: str) -> bool:
     """Identify publisher metadata and unfinished writes in any letter case."""
     folded = name.casefold()
-    return (folded in (".index.json", ".index.lock") or folded.startswith(".review-link-")
+    return (folded in (".index.json", ".index.lock", "page-states") or folded.startswith(".review-link-")
             or atomic_file.temporary_target(folded) is not None)
 
 
