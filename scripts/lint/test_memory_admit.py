@@ -5559,7 +5559,7 @@ class QueueLeaveTests(unittest.TestCase):
     def run_step(self, hook: str | None, sleep: str, step: str = 'run_once touch "$2"') -> subprocess.CompletedProcess[str]:
         self.admission.free(0)
         self.admission.hold_starts()
-        environment = dict(self.environment)
+        environment = {name: value for name, value in self.environment.items() if name != "NEXTEST_TEST_THREADS"}
         if hook is not None:
             environment["LINT_QUEUE_LEAVE_HOOK"] = f'echo poll >> "{self.calls}"; {hook}'
         waits = 0
@@ -5651,9 +5651,19 @@ class QueueLeaveTests(unittest.TestCase):
     def test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width(self) -> None:
         with (self.root / "build_admission.conf").open("a", encoding="utf-8") as configuration:
             _ = configuration.write("\n# whole: 0..\nnested_tokens=3\n")
-        pool, calls = self.root / "pool", self.root / "cargo-calls"
-        ran_args, reservation, waited = self.root / "args", self.root / "reservation", self.root / "waited"
-        listing = self.root / "test-list.json"
+        for inherited_width in ("", "1"):
+            with self.subTest(inherited_width=inherited_width), patch.dict(self.environment):
+                case = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.root)))
+                if inherited_width:
+                    self.environment["NEXTEST_TEST_THREADS"] = inherited_width
+                elif "NEXTEST_TEST_THREADS" in self.environment:
+                    del self.environment["NEXTEST_TEST_THREADS"]
+                self.assert_waiting_run_reserves_token_width(case)
+
+    def assert_waiting_run_reserves_token_width(self, case: Path) -> None:
+        pool, calls = case / "pool", case / "cargo-calls"
+        ran_args, reservation, waited = case / "args", case / "reservation", case / "waited"
+        listing = case / "test-list.json"
         _ = listing.write_text(json.dumps({"rust-suites": {"suite": {"testcases": {
             f"test_{index}": {"filter-match": {"status": "matches"}} for index in range(12)
         }}}}), encoding="utf-8")
@@ -5661,7 +5671,7 @@ class QueueLeaveTests(unittest.TestCase):
         keeper = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, keeper)
         _ = os.write(keeper, bytes(6))
-        bin_dir = self.root / "bin"
+        bin_dir = case / "bin"
         bin_dir.mkdir()
         cargo = bin_dir / "cargo"
         _ = cargo.write_text("#!/usr/bin/env bash\n"
@@ -5673,7 +5683,7 @@ class QueueLeaveTests(unittest.TestCase):
         cargo.chmod(0o755)
         self.environment["PATH"] = f"{bin_dir}{os.pathsep}{self.environment['PATH']}"
         self.environment["CARGO_MAKEFLAGS"] = f"--jobserver-auth=fifo:{pool}"
-        self.environment["TMPDIR"] = str(self.root)
+        self.environment["TMPDIR"] = str(case)
         free = (f'[[ -e "{calls}" ]] && echo built >> "{waited}"; echo waited >> "{waited}"; '
                 + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";')
         step = 'nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; LINT_TEST_WIDTH=logical; run_nextest --workspace'

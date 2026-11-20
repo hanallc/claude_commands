@@ -373,9 +373,11 @@ placement_once
             self.assertEqual(preparation.owner.pid, process.pid)
             self.assertGreater(preparation.need, 0)
             self.queue.free(0)
-        self.waiting.clear()
-        _ = os.write(proceed_fd, b"x")
-        first = self.next_step(process)
+        # Keep the held slot alive across the handoff, independent of scheduling.
+        with mock.patch.object(self.queue.clock, "advance", return_value=None):
+            self.waiting.clear()
+            _ = os.write(proceed_fd, b"x")
+            first = self.next_step(process)
         self.assertEqual(first["phase"], 0)
         self.assertFalse(self.waiting.is_set(), "the first command step entered the memory queue again")
         self.assertTrue(first["run"].startswith(f"{process.pid}:"), first)
@@ -394,8 +396,9 @@ placement_once
         self.waiting.clear()
         with self.queue.loop_turn():
             self.queue.free(0)
-        self.finish_step(process)
-        second = self.next_step(process)
+        with mock.patch.object(self.queue.clock, "advance", return_value=None):
+            self.finish_step(process)
+            second = self.next_step(process)
         self.assertEqual((second["phase"], second["cwd"], second["run"]), (1, first["cwd"], first["run"]))
         self.assertFalse(self.waiting.is_set(), "the next step entered the memory queue again")
         self.assertEqual(build_folders.build_folder_state(tree), "held")
@@ -465,12 +468,17 @@ placement_once
             self.assertEqual(Path(started["cwd"]), self.slot_root / "origin-slot1")
             self.finish(process)
 
+    def drain_full_folder_callers(self) -> None:
+        self.queue.free(60 * 1024**3)
+        # Close the gate's stdin before waiting for the step that needs its folder.
+        for process in self.processes:
+            if process.returncode is None:
+                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
     def test_full_folder_returns_memory_until_the_gate_releases_it(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
-        marker = f"COPY_SLOT_TEST_ROOT={self.root}"
-        environment["COPY_SLOT_TEST_ROOT"] = str(self.root)
-        self.addCleanup(reap, marker)
+        self.addCleanup(self.drain_full_folder_callers)
         _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
             f"# whole: 1..\nslots.{self.queue.server.host}.{tools.root.name}.max=1\nslots.wait_seconds=120\n")
         environment.update(fake_memory_readings(self.queue.root, available_kib=60 * 1024**2))
@@ -774,6 +782,8 @@ placement_once
         def start_verify(variant: str = "") -> subprocess.Popen[str]:
             caller = len(self.processes)
             board = boards[caller] = self.root / f"board-{caller}"
+            temporary = self.root / f"caller-{caller}-tmp"
+            temporary.mkdir()
             local = ("test", "sample", "--local", "fixture", "--no-cache")
             command = ("bash", verify, *local)
             if variant == "env":
@@ -784,7 +794,7 @@ placement_once
                 command = ("bash", "-c", remote + " && " + local_command)
             options = ("--publish", "report.txt") if caller == 0 else ()
             with locked_environment({**os.environ, "COPY_SLOT_TEST_CALLER": str(caller), "UNIT_RUN_DIR": str(board),
-                                     "VERIFY_SCRIPT": verify}, self.queue.loop_access):
+                                     "VERIFY_SCRIPT": verify, "TMPDIR": str(temporary)}, self.queue.loop_access):
                 return self.start(command, *options)
 
         def held_folders() -> set[Path]:
