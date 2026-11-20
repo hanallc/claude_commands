@@ -704,7 +704,7 @@ class LedgerEvidence:
     hana_lifecycle_fence: HanaLifecycleFence | HanaLifecycleUnfenced = HanaLifecycleUnfenced()
     hana_attempts: list[hana_result.HanaAttemptCharge] = field(default_factory=list)
     gate_quota_refusals: list[GateQuotaRefusal] = field(default_factory=list)
-    cancelled_hana_generations: frozenset[int] = frozenset()
+    unstarted_hana_generations: frozenset[int] = frozenset()
 
     def live_gate_vcpus(self, now: float) -> dict[SpotQuotaPool, int]:
         counts: dict[SpotQuotaPool, int] = {}
@@ -1162,7 +1162,7 @@ def costs_from_evidence(state: LedgerEvidence, settings: SpendingSettings, now: 
         gate_reservations=[r for r in state.gate_reservations if r.at <= pricing_end],
         hana_compute=[r for r in state.hana_compute if r.at <= pricing_end],
         hana_storage=[r for r in state.hana_storage if r.at <= pricing_end],
-        cancelled_hana_generations=state.cancelled_hana_generations)
+        unstarted_hana_generations=state.unstarted_hana_generations)
     return _charges(snapshot, settings, now, current_window=current_window, require_fresh=False,
                     window=window, pricing_end=pricing_end)
 
@@ -1728,9 +1728,9 @@ def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int
 
 
 def hana_compute_counts(state: LedgerEvidence, exposure: HanaComputeExposure) -> bool:
-    """Skip a closed exposure only when the journal proves it never started."""
+    """Skip a closed exposure only when the journal proves refusal or cancellation before a start."""
     return (isinstance(exposure.state, HanaExposureOpen) or exposure.observed_active
-            or exposure.generation not in state.cancelled_hana_generations)
+            or exposure.generation not in state.unstarted_hana_generations)
 
 
 def hana_intervals(state: LedgerEvidence, now: int, minimum_seconds: int, *,
@@ -2127,7 +2127,7 @@ class CostLedger:
             state = _decode(mapping(cast(object, json.loads(self.path.read_text()))))
             if any(isinstance(row.state, HanaExposureClosed) and not row.observed_active for row in state.hana_compute):
                 journal = remote.read_hana_start_journal(self.directory)
-                state.cancelled_hana_generations = journal.cancelled_exposures([row.generation for row in state.hana_compute])
+                state.unstarted_hana_generations = journal.unstarted_exposures([row.generation for row in state.hana_compute])
             return state
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
             raise LedgerUnavailable(f"ledger evidence is unavailable: {error}") from error

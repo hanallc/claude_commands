@@ -15,28 +15,45 @@ def read_record(path: Path) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
+# These EC2 replies reject StartInstances before it can start the instance.
+START_REFUSAL_CODES = frozenset((
+    'Blocked', 'OptInRequired', 'UnauthorizedOperation', 'Client.UnauthorizedOperation',
+    'AccessDenied', 'AccessDeniedException', 'AuthFailure', 'InsufficientInstanceCapacity',
+    'MaxSpotInstanceCountExceeded', 'VcpuLimitExceeded',
+))
+
+
+def start_was_refused(record: dict[str, object]) -> bool:
+    """Read a definite refusal from the dispatched START record."""
+    code = record.get('start_refusal_code')
+    return (record.get('action') == 'start' and record.get('dispatched') is True
+            and isinstance(code, str) and code in START_REFUSAL_CODES
+            and record.get('accepted') is not True and 'accepted_at' not in record
+            and 'observed_active_at' not in record)
+
+
 @dataclass(frozen=True)
 class HanaStartJournal:
-    cancelled_generations: frozenset[int] = frozenset()
+    unstarted_generations: frozenset[int] = frozenset()
     possible_starts: tuple[int, ...] = ()
 
-    def cancelled_exposures(self, exposure_generations: Sequence[int]) -> frozenset[int]:
-        """Find cancellations with no possible start in the same exposure."""
-        cancelled: set[int] = set()
+    def unstarted_exposures(self, exposure_generations: Sequence[int]) -> frozenset[int]:
+        """Find refusals and cancellations with no possible start in the same exposure."""
+        unstarted: set[int] = set()
         previous = 0
         for generation in sorted(exposure_generations):
             # Each closed exposure ends a range of permit generations.
             first = bisect_right(self.possible_starts, previous)
-            if (generation in self.cancelled_generations
+            if (generation in self.unstarted_generations
                     and (first == len(self.possible_starts) or self.possible_starts[first] > generation)):
-                cancelled.add(generation)
+                unstarted.add(generation)
             previous = generation
-        return frozenset(cancelled)
+        return frozenset(unstarted)
 
 
 def read_hana_start_journal(directory: Path) -> HanaStartJournal:
-    """Read proof of cancellation and evidence that can keep an exposure chargeable."""
-    cancelled: set[int] = set()
+    """Read proof of refusal, cancellation, and possible acceptance."""
+    unstarted: set[int] = set()
     possible: set[int] = set()
     try:
         paths = tuple((directory / 'hana' / 'provider').iterdir())
@@ -51,13 +68,17 @@ def read_hana_start_journal(directory: Path) -> HanaStartJournal:
             return HanaStartJournal()
         action = record.get('action')
         generation = record.get('generation')
+        if start_was_refused(record):
+            if type(generation) is int and generation > 0:
+                unstarted.add(generation)
+            continue
         if action not in ('bootstrap', 'stop', 'observe') and (
                 record.get('dispatched') is True or 'dispatched_at' in record
-                or record.get('accepted') is True or 'accepted_at' in record):
+                or record.get('accepted') is True or 'accepted_at' in record or 'observed_active_at' in record):
             if type(generation) is not int or generation < 1:
                 return HanaStartJournal()
             possible.add(generation)
         if (action in (None, 'start', 'bootstrap') and record.get('cancelled') is True
                 and type(generation) is int and generation > 0):
-            cancelled.add(generation)
-    return HanaStartJournal(frozenset(cancelled), tuple(sorted(possible)))
+            unstarted.add(generation)
+    return HanaStartJournal(frozenset(unstarted), tuple(sorted(possible)))

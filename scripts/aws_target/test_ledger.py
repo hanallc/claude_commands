@@ -40,7 +40,7 @@ class LedgerTests(CostFixture):
         self.book.record_inventory(ledger.ResourceInventory(
             at, (ledger.PricedResource("retained-storage", Decimal(monthly)),), "priced fixture inventory"))
 
-    def test_november_20_carries_storage_after_cancellations_before_dispatch(self) -> None:
+    def test_november_20_carries_storage_when_the_dispatch_record_proves_refusal(self) -> None:
         self.replace('limit_reserve_usd', '0')
         bill_start = instant('2026-11-18T00:00:00+00:00')
         today = bill_start + 2 * 86400
@@ -60,15 +60,37 @@ class LedgerTests(CostFixture):
             )))
         journal = self.state / 'hana' / 'provider'
         journal.mkdir(parents=True)
+        starts: list[tuple[Path, dict[str, object]]] = []
         with self.book.transaction() as evidence:
             for generation in range(1, 27):
                 at = today + 142 * generation
                 evidence.hana_compute.append(ledger.HanaComputeExposure(at, at + 600, generation,
                     Decimal('.288'), ledger.HanaExposureClosed(at + 136), region='us-east-2'))
-                _ = (journal / f'start-{generation}.json').write_text(json.dumps({
-                    'action': 'start', 'generation': generation, 'cancelled': True}))
+                _ = (journal / f'bootstrap-{generation}.json').write_text(json.dumps({
+                    'version': 1, 'token': f'bootstrap-{generation}', 'deployment': 'fixture',
+                    'action': 'bootstrap', 'generation': generation, 'dispatched': True,
+                    'dispatched_at': at, 'accepted': True, 'accepted_at': at + 1, 'acceptance_source': 'direct',
+                    'bootstrap_puts': 3, 'descriptor': {},
+                }))
+                path = journal / f'start-{generation}.json'
+                start: dict[str, object] = {'version': 1, 'token': f'start-{generation}', 'deployment': 'fixture',
+                         'action': 'start', 'generation': generation, 'dispatched': True,
+                         'dispatched_at': at + 2, 'cancelled': True,
+                         'cancellation_at': at + 122, 'cancelled_at': float(at + 122)}
+                starts.append((path, start))
+                _ = path.write_text(json.dumps(start))
             evidence.gate_reservations.append(ledger.GateReservation('refused', today, today + 600,
                 Decimal(3), Decimal(1), state=ledger.GateAbsent(today + 60), region='us-east-2'))
+
+        legacy = spend.read_spend(self.settings, self.state, now, '2026-11-20')
+        assert isinstance(legacy, spend.Spend)
+        # Base 740aae528 counts every dispatch without evidence of refusal.
+        self.assertEqual(legacy.days[0].usd, Decimal('2.01288'))
+        legacy_guard = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual(legacy_guard.cost, Decimal('.28288'))
+
+        for path, record in starts:
+            _ = path.write_text(json.dumps({**record, 'start_refusal_code': 'Blocked'}))
 
         published = spend.read_spend(self.settings, self.state, now, '2026-11-20')
         assert isinstance(published, spend.Spend)
