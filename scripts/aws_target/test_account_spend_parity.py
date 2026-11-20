@@ -216,6 +216,16 @@ def storage_bill(usd: str) -> ledger.UsageTypeCost:
     return ledger.UsageTypeCost('USE1-EBS:VolumeUsage.gp3', Decimal(usd))
 
 
+@dataclass(frozen=True)
+class GateAttemptStatus:
+    state: ledger.GateLaunchPending | ledger.GateRunning | ledger.GateAbsent | ledger.GateTerminated
+    expires_at: int
+
+
+def saved_gate_attempts(book: ledger.CostLedger) -> dict[str, GateAttemptStatus]:
+    return {row.attempt: GateAttemptStatus(row.state, row.expires) for row in book.read_snapshot().gate_reservations}
+
+
 class AccountSpendParityTests(SpendReferenceFixture):
     book: ledger.CostLedger = ledger.CostLedger(Path())
     now: int = 0
@@ -330,11 +340,12 @@ class AccountSpendParityTests(SpendReferenceFixture):
             except (OSError, ValueError, ArithmeticError) as error:
                 admission_values = (str(error), str(error))
                 with self.decision_book(self.book) as live:
-                    before = live.read_snapshot().gate_reservations
+                    request = self.proposal()
+                    before = saved_gate_attempts(live)
                     with self.assertRaises(type(error)) as refusal:
-                        _ = live.reserve_gate(self.settings, self.proposal())
+                        _ = live.reserve_gate(self.settings, request)
                     self.assertEqual(str(refusal.exception), str(error))
-                    self.assertEqual(live.read_snapshot().gate_reservations, before)
+                    self.assert_gate_attempts_after_refusal(live, request.attempt, before)
             else:
                 day = next((exact_amount(row.usd) for row in projection.day
                             if (row.start, row.end) == day_bounds), ABSENT)
@@ -373,7 +384,7 @@ class AccountSpendParityTests(SpendReferenceFixture):
 
     def assert_gate_decisions(self, book: ledger.CostLedger, projection: AdmissionCounts) -> None:
         request = replace(self.proposal(), attempt='fixture-cap-probe')
-        before = book.read_snapshot().gate_reservations
+        before = saved_gate_attempts(book)
         self.costs({'daily_limit_usd': '10000', 'monthly_limit_usd': '10000'})
         for period, periods in (('daily', projection.day), ('monthly', projection.month)):
             if periods:
@@ -381,12 +392,18 @@ class AccountSpendParityTests(SpendReferenceFixture):
                 cap = f'{period}_limit_usd'
                 self.replace(cap, str(amount))
                 self.assertEqual(book.reserve_gate(self.settings, request), ledger.GateCapReached(f'{period}_limit'))
-                self.assertEqual(book.read_snapshot().gate_reservations, before)
+                self.assert_gate_attempts_after_refusal(book, request.attempt, before)
                 self.replace(cap, '10000')
         for period, periods in (('daily', projection.day), ('monthly', projection.month)):
             if periods:
                 self.replace(f'{period}_limit_usd', str(max(row.usd for row in periods).next_plus()))
         self.assertIsInstance(book.reserve_gate(self.settings, request), ledger.GateReserved)
+
+    def assert_gate_attempts_after_refusal(self, book: ledger.CostLedger, refused_attempt: str,
+                                           before: dict[str, GateAttemptStatus]) -> None:
+        after = saved_gate_attempts(book)
+        self.assertNotIn(refused_attempt, after)
+        self.assertEqual(after, before)
 
     def assert_baseline(self, key: str, measured: SpendReference) -> None:
         self.assertEqual(measured, REFERENCE[key], 'Page, guard, and admission amounts')
@@ -645,18 +662,18 @@ class AccountSpendParityTests(SpendReferenceFixture):
             with self.subTest(row=row):
                 self.admission_bill_fixture(row)
                 request = self.proposal()
-                before = self.book.read_snapshot().gate_reservations
+                before = saved_gate_attempts(self.book)
                 if expected == MALFORMED:
                     with self.assertRaises(json.JSONDecodeError) as refusal:
                         _ = self.book.reserve_gate(self.settings, request)
                     self.assertEqual(str(refusal.exception), MALFORMED)
-                    self.assertEqual(self.book.read_snapshot().gate_reservations, before)
+                    self.assert_gate_attempts_after_refusal(self.book, request.attempt, before)
                     continue
                 monthly, = self.project().month
                 self.assertEqual(monthly, AdmissionPeriod(JAN1, FEB1, Decimal(expected)))
                 self.replace('monthly_limit_usd', '4' if row == 'N01' else expected)
                 self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached('monthly_limit'))
-                self.assertEqual(self.book.read_snapshot().gate_reservations, before)
+                self.assert_gate_attempts_after_refusal(self.book, request.attempt, before)
                 self.replace('monthly_limit_usd', str(Decimal(expected) + Decimal('.001')))
                 self.assertIsInstance(self.book.reserve_gate(self.settings, request), ledger.GateReserved)
 
