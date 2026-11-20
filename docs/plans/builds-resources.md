@@ -3093,3 +3093,13 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - A failed publication in `copies.py` removes only the folder that the same process made.
 - Fixtures clear inherited `GIT_*`, `RIPGREP_CONFIG_PATH`, `STAFF_CONFIG`, `BASH_ENV`, `CARGO_TARGET_DIR` and `COPIES_*`, and use a private home, config and session root.
 - Row tests: 54 modules, both layouts, 108 of 108 green. Reviews: blind review, 7 closure reviews, 8 repairs.
+
+### Phase 181m — Phase 181 merge test 1: two tests expect a removal that 181 keeps (item 152)  · status: done
+**Source:** builds, bb8 result 2026-11-20 03:17 EST, main `f0f012235`. Row `1f4c4a055` merge test red in `herdr/test_turn_end.py` and `production/test_mac_run.py`. The 181 row tests missed both modules.
+
+#### Work Order
+1. Find the cause of each red. A folder that a later process ends is kept and listed under the 181 rule; a test that expects its removal changes. A folder that the same process made is removed; a keep of it is a code defect.
+2. Both reds: the worker scratch folder (made by the worker, ended by the turn-end hook) and the old Mac mirror checkout (made by an earlier clone command) are kept correctly. The tests now expect the kept folder, its contents, its end record and the exact notice.
+3. Closure review 1: the native hook child sends stderr to `DEVNULL`, so the kept notice was lost. `turn_end.py` puts each kept folder in the completion details. The Mac fixture sets a private `HOME`, `XDG_CONFIG_HOME` and `SCRATCH_VISIBLE_ROOT`.
+4. Rebase onto natest 385 (`017cc0770`): `merge_gate_test_support.py` keeps 385's tmpfs parent, fixture configuration and `pin_gate_root`, with 181's private Git environment.
+5. Row `67163d9b6` on main `740aae528`: 57 modules, both layouts, 114 of 114 green. It replaces `1f4c4a055`.
