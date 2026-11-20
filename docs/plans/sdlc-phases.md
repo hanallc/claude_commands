@@ -1631,7 +1631,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
-### Phase 95 — The review hold turns off by config  · status: todo
+### Phase 95 — The review hold turns off by config  · status: done
 **Depends on:** Phase 89
 
 #### Work Order
@@ -1647,6 +1647,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Workers:** 1 writer.
 
 **Order:** first; phase 94 builds on it.
+
+**Result:** READY 10:15 EST Nov 20 as 00619cf58 on sdlc-phases-95; it joins the sdlc panerace merge run as its last row. `review_hold` ships off; held messages go out at the next prompt hook call or session start.
 
 ### Phase 94 — A native SendMessage to another session goes through send.py  · status: todo
 **Depends on:** Phase 89
