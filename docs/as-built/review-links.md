@@ -782,6 +782,10 @@ On desktop, the ETA cell stays on one line and shows an ellipsis if the text is 
 Hover or focus on the ETA to see the full text.
 On a phone, the ETA wraps to show the full text in the row.
 Past times and past range end times use the same warning color as Check overdue.
+The ETA, next check, and parking time use the local date and time in the form Nov 20 09:00 EST.
+The Park picker uses this date form for the selected time.
+Active parking hides the next check.
+When parking ends, the row shows the current check.
 The server puts parked items after other items in the default order.
 Within each group, the List uses `the_list.order`.
 User decisions come first, then unread updates, then the earliest next check.
@@ -794,6 +798,11 @@ Owner and Producer list staff in name order after All and omit every trailing `-
 If the resulting name is empty, the chip shows the original staff ID.
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
 The words box sits beside the Producer chips and wraps below them when space is limited.
+When the box contains text, it uses the same accent as a selected chip and shows the Clear filter button.
+Click Clear filter or press Escape in the box to remove the words.
+The other filters stay selected.
+The address stores the words as `q` and restores them on reload.
+The List ignores form text that the browser restores without an input event.
 The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
 The List excludes Closed records from rows, filters, and counts.
 Parked includes every non-Closed item with an active park.
@@ -927,6 +936,8 @@ A short log has no scroll bar.
 On a narrow page, `list_log_max_height_rem` in `config/review_links.conf` limits the height of the entries.
 The setting starts at 16 rem.
 Refresh keeps the first visible log entry at the same offset when new entries arrive.
+Refresh restores open Evidence Details by item and log entry before it restores the scroll position.
+Each Details summary has a stable ID based on its item and log entry so refresh can restore keyboard focus.
 A log at the top stays at the top to show the newest entry.
 The List keeps the position by item while a filter hides the row.
 The log restores that position when the row returns.
@@ -935,6 +946,19 @@ The table and log use the same format for staff names, local ETAs, and field val
 The table, log, and Park response show parking times in the user zone.
 At local midnight, the label shows the date.
 The log uses plain field labels, such as Next step and Latest status.
+The List replays the log in record order to find the previous value of each field.
+Replay starts with the creation defaults for fields that Added omits, except the requester.
+If Added omits the requester, the first update that records it shows the value.
+New Added entries record the effective requester.
+Replay applies linked delivery, Close, and Reopen before it compares later updates.
+An Updated entry shows its time, source, and the fields that changed.
+An Updated entry compares Evidence lines with the last Evidence value that a field change recorded.
+The comparison ignores line endings.
+The entry shows new lines in order or shows “Not recorded” when the update clears Evidence.
+It omits Evidence in other updates with no new lines.
+Evidence cleanup entries remain in the log and do not affect this comparison.
+Added keeps all its recorded fields.
+The Evidence in Added and Updated starts inside a closed Details control.
 The reader converts old Added, Updated, Parked, Closed, and feedback entries to the same format.
 An old entry keeps its text if the reader cannot parse it.
 The reader requires the fields for each event.
@@ -1051,6 +1075,8 @@ The row counts toward its matching Owner and Producer chips and the selected Sho
 Closing the row or changing Show ends this exception.
 Changing the Unread only switch ends this exception.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
+Each of these rows has a left bar in the Review question color and a bold Question or Answer label.
+The List and Review use the same question color rule.
 The panel clears the question when the log shows it.
 The List uses its local date and time format for questions and answers.
 A newer unread update leaves previously read answers in the log.
