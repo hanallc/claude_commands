@@ -226,6 +226,7 @@ class PageData(TypedDict):
     runs: list[RunCostData]
     hours: TableData
     hours_note: str
+    hours_reserved_by_region: dict[str, str]
 
 
 def table_rows_data(table: spot_table.Table) -> TableRowsData:
@@ -510,7 +511,8 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
                   'refused': table_data(costs.refused), 'launched': table_data(costs.launched)}
                  for costs in tables.runs],
         'hours': table_data(tables.hours),
-        'hours_note': tables.hours_note,
+        'hours_note': tables.hours.note,
+        'hours_reserved_by_region': dict(tables.hours.reserved_by_region),
     }
 
 

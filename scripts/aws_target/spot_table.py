@@ -36,6 +36,12 @@ class Table:
     not_sold: frozenset[tuple[int, int]] = frozenset()
 
 
+@dataclass(frozen=True, kw_only=True)
+class BilledHoursTable(Table):
+    note: str
+    reserved_by_region: Mapping[str, str]
+
+
 NOT_SOLD = '—'
 
 
@@ -120,8 +126,7 @@ class SpotTables:
     quotas: tuple[Table, ...]
     # One entry for each scope in run_cost.SCOPES, in that order.
     runs: tuple[RunCosts, ...]
-    hours: Table
-    hours_note: str
+    hours: BilledHoursTable
     gpu_quota_needed: int
     quota_requests: tuple[RegionalQuotaRequests, ...]
 
@@ -167,15 +172,15 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None,
     home = configuration.text('region')
     inputs = gate_pricing if gate_pricing is not None else run_cost.read_gate_pricing_inputs(
         directory, now, values, configuration)
-    hours, hours_note = billed_hours(directory, now, regions, hours_check_scope(values), days, home,
-                                     configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
+    hours = billed_hours(directory, now, regions, hours_check_scope(values), days, home,
+                         configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
     return SpotTables(
         tuple(reads),
         (price_table(standard, regions, minimum, notes, not_sold), price_table(gpu, regions, minimum, notes, not_sold)),
         (quota_table('Standard quota', 'standard_vcpus', standard, regions, readings, notes),
          quota_table('G and VT quota', 'gpu_vcpus', gpu, regions, readings, notes)),
         run_costs(directory, now, standard, regions, minimum, values, configuration, inputs),
-        hours, hours_note, values.whole('gpu_spot_quota_request_vcpus'), snapshot_quota_requests(document, regions))
+        hours, values.whole('gpu_spot_quota_request_vcpus'), snapshot_quota_requests(document, regions))
 
 
 def price_table(sizes: tuple[str, ...], regions: tuple[str, ...], minimum: Mapping[tuple[str, str], Decimal],
@@ -314,24 +319,28 @@ def paid_run_cell(billed: list[run_cost.FinishedGateRun], due: int, allocations:
 
 
 def billed_hours(directory: Path, now: int, regions: tuple[str, ...], scope: run_cost.SpotHoursScope, days: int, home: str,
-                 builder: str, max_ratio: Decimal) -> tuple[Table, str]:
-    """The billed Spot hours against the recorded box hours of each type and region, and the note under them."""
+                 builder: str, max_ratio: Decimal) -> BilledHoursTable:
+    """Show the billed Spot hours, box hours and regional Hana allowance."""
     title = 'Billed hours / box hours'
     end = datetime.fromtimestamp(now, UTC)
     try:
         checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, builder, scope,
                                        max_ratio)
     except ledger.LedgerUnavailable:
-        return Table(title, ('type', *regions), frozenset(), (), 'columns'), 'No billed hours: the cost ledger is not readable.'
+        return BilledHoursTable(title, ('type', *regions), frozenset(), (), 'columns',
+                                note='No billed hours: the cost ledger is not readable.', reserved_by_region={})
     # A region that is no longer a candidate keeps its column while it has hours in the window.
     columns = (*regions, *sorted({region for _size, region in checks} - set(regions)))
+    active_sizes = {size for (size, _region), check in checks.items() if check.billed_hours or check.box_hours}
     rows = tuple((size, *(hours_cell(checks.get((size, region))) for region in columns))
-                 for size in scope.sizes if any(key[0] == size for key in checks))
-    note = (f'AWS billed Spot hours / recorded box hours, last {days} days, on the days with a bill. '
-            + 'The gap in parentheses is the distance outside the range divided by the bound on that side. '
-            + f'Over marks a gap above {max_ratio:.0%}. '
-            + 'Not billed: no day has a bill yet.')
-    return Table(title, ('type', *columns), frozenset(range(1, len(columns) + 1)), rows, 'columns'), note
+                 for size in scope.sizes if size in active_sizes)
+    # Each eligible size in a region uses the same Hana allowance on billed days.
+    reserved_by_region = {region: f'{check.hana_reserved_hours:.1f}' for (_size, region), check in checks.items()
+                          if check.billed_hours is not None and check.hana_reserved_hours}
+    note = (f'Each cell shows billed Spot hours / recorded box hours on billed days in the last {days} days. '
+            + f'Over marks billed hours more than {max_ratio:.0%} outside the range from box hours to box hours plus any Hana allowance.')
+    return BilledHoursTable(title, ('type', *columns), frozenset(range(1, len(columns) + 1)), rows, 'columns',
+                            note=note, reserved_by_region=reserved_by_region)
 
 
 def hours_cell(check: run_cost.HoursCheck | None) -> str:
@@ -341,6 +350,5 @@ def hours_cell(check: run_cost.HoursCheck | None) -> str:
     if check.billed_hours is None:
         return 'not billed'
     gap = f' ({check.hours_gap_ratio:.0%})' if check.hours_gap_ratio is not None else ''
-    reserved = f' + {check.hana_reserved_hours:.2f} reserved' if check.hana_reserved_hours else ''
-    return f'{check.billed_hours:.1f}/{check.box_hours:.1f}{reserved}{gap}' + (' over' if check.hours_gap_over else '')
+    return f'{check.billed_hours:.1f}/{check.box_hours:.1f}{gap}' + (' over' if check.hours_gap_over else '')
 

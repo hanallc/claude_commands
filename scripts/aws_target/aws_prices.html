@@ -541,7 +541,14 @@ function draw() {
   drawPlacementScores();
   fill(document.getElementById("gate-time-price"), data.gateTimePrice,
     "Compare the lowest estimated run cost for each box size. Box times include boot and can use runs from other regions.");
-  fill(document.getElementById("hours"), data.hours, data.hours_note);
+  const hours = document.getElementById("hours");
+  fill(hours, data.hours, data.hours_note);
+  for (const region of data.hours.headers.slice(1)) {
+    const reserved = data.hours_reserved_by_region?.[region];
+    if (reserved && shown.has(region)) {
+      hours.appendChild(element("p", `${region}: ${reserved} Hana reserved hours.`, "note"));
+    }
+  }
   drawScope();
   markOverflow();
 }
