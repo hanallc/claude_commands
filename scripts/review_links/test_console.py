@@ -488,7 +488,8 @@ try{
   const fixture=document.createElement('iframe');
   fixture.style.cssText='position:fixed;left:0;top:0;width:716px;height:800px;border:0';
   const bookmark='/console/?page=investigations&at.investigations='+
-   encodeURIComponent('/console/investigations.html?show=all#showrunner=builds&q=shard');
+   encodeURIComponent('/console/investigations.html?show=all&sort=Age&dir=asc'+
+    '#state=open&showrunner=builds&q=shard&sort=Owner&dir=desc');
   fixture.src=bookmark;
   await new Promise(resolve=>{fixture.addEventListener('load',resolve,{once:true});document.body.append(fixture);});
   const layout=fixture.contentDocument;
@@ -498,6 +499,8 @@ try{
   check(opened.searchParams.get('page')==='review' && filters.get('type')==='investigations' &&
    filters.get('show')==='all' && filters.get('source-owner')==='builds' && filters.get('q')==='shard',
    'the legacy Console bookmark opens the combined filter and preserves its filters');
+  check(filters.get('sort')==='Owner' && filters.get('dir')==='desc',
+   'The legacy tab uses the sort and direction from the fragment.');
   const sidebar=layout.querySelector('.shell'),toggle=layout.querySelector('#nav-toggle');
   const box=layout.querySelector('#action-popover');
   const button=layout.querySelector('.for-you-slot button');

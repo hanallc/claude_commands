@@ -522,7 +522,7 @@ const send = () => new Promise(resolve => {
   check(!state.hidden && state.textContent.includes('Page state to send'), 'The Bug dialog shows the page state.');
   check(dialog.querySelector('[data-kind="proposal"]').getClientRects().length === 0,
         'The console owner dialog does not display Proposal.');
-  check(state.textContent.includes('Type All · State Open · Owner builds'), 'The dialog shows the selected filters.');
+  check(state.textContent.includes('Type All · Show Open · Owner builds'), 'The dialog shows the selected filters.');
   check(state.textContent.includes('2.40 s') && state.textContent.includes('Could not load …/brain.'),
         'The dialog shows the render time and the notice.');
   check(checkbox.checked && checkbox.labels[0].textContent.trim() === 'Include a screenshot',
@@ -575,9 +575,9 @@ def bug_fixture_page(*, photo: bool = False) -> bytes:
             '<main><div class="page-owner" data-page-owner="review"><span>sdlc</span>'
             f'<button data-owner-new aria-label="New item">{page_frame.icon_svg("message-circle-question")}</button></div>'
             '<h1>Review</h1><p data-page-status data-render-seconds="2.40">Live · render 2.40 s</p>'
-            '<div role="group" aria-label="Type"><button data-type-chip="" aria-pressed="true">All <b>2</b></button></div>'
-            '<div role="group" aria-label="Show"><button data-show-chip="open" aria-pressed="true">Open</button></div>'
-            '<div role="group" aria-label="Owner"><button data-owner-chip="builds" aria-pressed="true">builds</button></div>'
+            '<div role="group" aria-label="Type" data-filter-row="type"><button data-filter-value="all" aria-pressed="true">All <b>2</b></button></div>'
+            '<div role="group" aria-label="Show" data-filter-row="show"><button data-filter-value="open" aria-pressed="true">Open</button></div>'
+            '<div role="group" aria-label="Owner" data-filter-row="owner"><button data-filter-value="staff:builds" aria-pressed="true">builds</button></div>'
             '<p class="notice">Could not load …/brain.</p></main>'
             f'{new_item_dialog.render()}<script>{probe}</script></body></html>').encode()
 

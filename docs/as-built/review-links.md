@@ -140,6 +140,8 @@ The title starts 32px from the top and left edges of that column.
 Each navigation page places `page_frame.title()` directly above its content.
 The title, status line and content use the same centered column on all seven pages.
 Cards and form controls keep their page styles.
+Review and The List use the same chip markup, script, and browser count code from `record_table.py`.
+Both pages label the state filter **Show**.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
 The frame reserves scrollbar space, so short and long pages keep the same column position.
@@ -433,12 +435,14 @@ An unknown owner returns to All and clears both owner and source-owner constrain
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-The State row sets the Show filter.
-It offers Open, Validating and All below the Type row.
-With Responses selected, it offers Open and All.
-Old Waiting links open All.
+The Show row offers All, Open, Waiting, and Validating below the Type row.
+With Responses selected, Show offers Open, Waiting and All.
+Old Waiting links open Waiting.
+Review expands legacy filter names in the query and fragment before it combines them.
+The query wins for names in LIST_QUERY_FIELDS that both sources supply.
+The fragment wins for other names, including sort and dir.
 Old Done links use the default Open filter.
-The Owner row follows the State row.
+The Owner row follows the Show row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Each type count uses the selected owner, Show and words.
 Each Show count uses the selected type, owner and words.
@@ -480,7 +484,7 @@ The active validation log shows **Asked <validator> to validate**, **Asked a que
 The question and answer sections show the full text.
 The question and answer preserve the active validation and its handoff time.
 The Validating and All chips count the change.
-The Validating chip is dim at zero.
+A chip with a zero count is dim.
 The next changed snapshot replaces the index.
 An unchanged version retains the index and checks expired Later times.
 The fresh index supplies the state and revision of each active item.
@@ -493,8 +497,7 @@ Stable chip IDs retain keyboard focus after a Show load or refresh.
 The row window keeps the focused row mounted during scroll.
 A refresh restores focus to the same control by row key.
 The browser keeps each pending save by key while the form leaves the window.
-Review and The List use Show chips.
-The shared table tracks the selected Show chip.
+The shared table tracks the selected Show chip on both pages.
 The address and refresh retain the selected Show view.
 Review submissions retain the Type, Show and Owner chips and the search words.
 A new item opens when it matches the current filters.

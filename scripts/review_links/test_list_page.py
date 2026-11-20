@@ -1614,6 +1614,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 </script>'''
         script = "<script>" + list_page.SCRIPT
         for server_query, browser_fragment, first_rows, loaded_rows, all_count, first_unread, loaded_unread in (
+                ("", "", all_rows, all_rows, 4, False, False),
                 (query, fragment, numbers, numbers, len(numbers) + 1, False, False),
                 (query, fragment + "&unread=1", numbers, numbers, len(numbers) + 1, False, True),
                 ("unread=0", "show=unread", all_rows, all_rows, 4, False, False),
@@ -1711,13 +1712,13 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
                          ['owner', 'producer', 'show'])
         shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
-        self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>', shows),
+        self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+) <b>', shows),
                          [("all", "All"), ("needs-me", "Needs me"), ("morty-answering", "Morty answering"),
                           ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked")])
         self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
         owners = controls.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
         producers = controls.split('data-filter-row="producer"', 1)[1].split('</div>', 1)[0]
-        chip = r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>(\d+)</b>'
+        chip = r'data-filter-value="([^"]+)"[^>]*>([^<]+) <b>(\d+)</b>'
         self.assertEqual(re.findall(chip, owners),
                          [('all', 'All', '5'), (f'staff:{OTHER.id}', 'builds', '1'), (f'staff:{OWNER.id}', 'sdlc', '4')])
         self.assertEqual(re.findall(chip, producers),
@@ -6093,9 +6094,9 @@ check(innerWidth>620 ? words.top<producerBox.bottom && words.left>=producerBox.r
  words.top>=producerBox.bottom,'The words box sits beside Producer on desktop and wraps below it on a phone.');
 const allChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="all"]'));
 const staffChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="staff:all"]'));
-check(allChips.every(chip=>chip.textContent==='All16') && staffChips.every(chip=>chip?.textContent==='all1'),
+check(allChips.every(chip=>chip.textContent==='All 16') && staffChips.every(chip=>chip?.textContent==='all 1'),
  'Each staff row has distinct All and all chips with separate counts.');
-check(ownerChips[2].textContent==='builds1' && ownerChips[3].textContent==='builds-support1',
+check(ownerChips[2].textContent==='builds 1' && ownerChips[3].textContent==='builds-support 1',
  'The owner chips omit the suffix and sort by the displayed name.');
 const matchesAllStaff=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).join()==='13';
 staffChips.forEach(chip=>chip.click());

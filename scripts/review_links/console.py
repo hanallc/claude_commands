@@ -15,7 +15,8 @@ from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
-from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, review_link, review_legacy
+from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, record_table, review_link
+from scripts.review_links import review_legacy
 
 PHONE_QUERY = "(max-width:680px)"
 
@@ -292,7 +293,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- CLOSE -->", icon_svg("panel-left-close"))
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu") + '<span class="new-mark" id="menu-new" hidden>' + new_mark + '</span>')
-    content = content.replace('<script>', '<script>'+REVIEW_PLACE_SCRIPT, 1)
+    content = content.replace('<script>', '<script>'+record_table.PLACE_SCRIPT+REVIEW_PLACE_SCRIPT, 1)
     return content.replace("/* Phone query */", PHONE_QUERY).encode("utf-8")
 
 
@@ -692,8 +693,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       const kind={changes:'change',questions:'question',investigations:'investigation'}[identity];
       const url=new URL(location.href);
       const previous=new URL(url.searchParams.get('at.'+identity) || '/console/changes.html',location.origin);
-      const filters=new URLSearchParams(previous.search);
-      for(const [key,value] of new URLSearchParams(previous.hash.slice(1))) filters.set(key,value);
+      const filters=recordPlaceParams(reviewPlaceOptions,previous);
       filters.set('type',kind);legacyReviewPlace(filters,kind);
       url.searchParams.set('at.review','/console/review.html#'+filters);
       history.replaceState(null,'',url);identity='review';

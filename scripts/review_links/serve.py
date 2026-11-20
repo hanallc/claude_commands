@@ -518,12 +518,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     self.review_response(content, 'application/json; charset=utf-8',snapshot.payload_gzip)
                     return None
                 else:
-                    content = snapshot.render(show=fields.get('show',['open'])[0])
+                    filters = parse_qs(route.query, keep_blank_values=True)
+                    show = filters.get('show', filters.get('state', ['open']))[0]
+                    kind = filters.get('type', [''])[0]
+                    content = snapshot.render(show=show or 'open', kind=kind)
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
                 return None
-            prepared = snapshot.page_gzip if fields.get('show',['open'])[0]=='open' else b''
+            prepared = snapshot.page_gzip if content is snapshot.page else b''
             owned = owned_document(content, "review")
             self.review_response(owned, 'text/html; charset=utf-8', prepared if owned is content else b'')
             return None

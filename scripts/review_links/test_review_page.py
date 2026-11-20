@@ -136,7 +136,9 @@ class ReviewPageTests(unittest.TestCase):
         entry = next(entry for entry in snapshot.entries if entry['type'] == review_items.ReviewType.INVESTIGATION)
         for name, markup in ((entry['ownerName'], entry['ownerHtml']), (entry['sourceName'], entry['sourceHtml'])):
             self.assertIn('class="staff-name"', markup)
-            self.assertIn(f'data-owner-name="{html.escape(name)}" aria-pressed="false">{markup} <b>', owner_menu)
+            escaped_name = re.escape(html.escape(name, quote=True))
+            self.assertRegex(owner_menu, rf'data-owner-name="{escaped_name}"[^>]* aria-pressed="false"'
+                                         rf'[^>]*>{re.escape(markup)} <b>')
         body = ''.join(snapshot.body(item.key).decode() for item in snapshot.records.values())
         self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>page-owner</span>')
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>builder-unit</span>')
@@ -228,7 +230,7 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertNotIn(created.saved.key.encode(), snapshot.index_response())
                 self.assertNotIn(created.key, initial.records)
         snapshot = review_page.build_snapshot(self.root)
-        self.assertIn(b'data-type-chip="bug"', snapshot.page)
+        self.assertIn(b'data-filter-value="bug"', snapshot.page)
         self.assertEqual([item.key for item in review_items.read(
             self.root, kinds=(review_items.ReviewType.BUG,))], [published[-1].key])
         self.assertIn(proposals, snapshot.source_stamps)
@@ -261,8 +263,22 @@ class ReviewPageTests(unittest.TestCase):
         start = '(reviewPlace => {'
         shared_script = review_page.SCRIPT.split(start, 1)[0]
         old_script = start + source.split("r'''"+start, 1)[1].rsplit("''')", 1)[0]
-        markup = before.replace(review_page.SCRIPT, shared_script+old_script, 1)
-        markup = re.sub(r'<button id="review-type-response"[^>]*>.*?</button>', '', markup, count=1)
+        old_table_source = subprocess.check_output(
+            ['git', 'show', 'eb6e3239d:scripts/review_links/record_table.py'],
+            cwd=Path(__file__).resolve().parents[2], text=True)
+        old_table = old_table_source.split("SCRIPT = r'''", 1)[1].split("'''\n", 1)[0]
+        # Use the controls and table code that an open tab retains.
+        before = re.sub(r'<button [^>]*id="filter-type-response"[^>]*>.*?</button>', '', before, count=1)
+
+        def old_chip(match: re.Match[str]) -> str:
+            tag, group, value = match[0], match[1], match[2]
+            saved_value = '' if value == 'all' and group != 'show' else value.removeprefix('staff:')
+            return tag.replace(f'data-filter-value="{value}"', f'data-{group}-chip="{saved_value}"')
+
+        before = re.sub(r'<button [^>]*id="filter-(type|show|owner)-[^"]*" data-filter-value="([^"]+)"',
+                        old_chip, before)
+        before = re.sub(r' data-filter-row="(?:type|show|owner)"', '', before)
+        markup = before.replace(review_page.SCRIPT, shared_script+'{\n'+old_table+old_script+'\n}', 1)
         setup = r'''<script>
 const nextReview=SNAPSHOT, responseKey=KEY, nativeFetch=fetch;
 window.fetch=(url,options)=>{
@@ -301,8 +317,9 @@ window.fetch=(url,options)=>{
         for action, state in (('read', 'Done'), ('question', 'Waiting')):
             with self.subTest(action=action):
                 self.check_card_motion(source, 'const action='+json.dumps(action)+',state='+json.dumps(state)+r""";
- const chip=(name,value)=>document.querySelector('[data-'+name+'-chip="'+value+'"]');
- const selected=name=>document.querySelector('[data-'+name+'-chip][aria-pressed="true"]');
+ const chip=(name,value)=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+
+  (name==='owner' && value ? CSS.escape(staffChipValue(value)) : value || 'all')+'"]');
+ const selected=name=>document.querySelector('[data-filter-row="'+name+'"] [data-filter-value][aria-pressed="true"]');
  chip('show','Validating').click();
  const responses=chip('type','response');responses.click();
  check(responses.previousElementSibling===chip('type','question') &&
@@ -311,6 +328,12 @@ window.fetch=(url,options)=>{
  check(chip('show','Validating').hidden && !chip('show','Done') && selected('show')===chip('show','open'),
   'Responses uses Open when Validating was selected.');
  const row=rows().find(item=>item.dataset.type==='response');
+ history.replaceState(null,'','#'+new URLSearchParams({type:'response',show:'Validating',item:row.dataset.key}));
+ dispatchEvent(new HashChangeEvent('hashchange'));
+ check(selected('show')===chip('show','open') && !chip('show','Waiting').hidden &&
+  !row.querySelector('[data-detail]').hidden,
+  'The saved Response link opens the card under Open and keeps Waiting available.');
+ row.querySelector('.list-toggle').click();
  chip('owner',row.dataset.owner).click();
  chip('show','all').click();
  const words=document.querySelector('#list-search');
@@ -344,7 +367,7 @@ window.fetch=(url,options)=>{
  motion.finish();await frame();
  check(postCount===1 && !rows().some(item=>item.dataset.type==='response'),
   'The Response leaves the view after one submit.');
- check(place()===before && selected('owner').dataset.ownerChip===row.dataset.owner &&
+ check(place()===before && filterControl.ownerId(selected('owner'))===row.dataset.owner &&
   selected('type')===responses && selected('show')===chip('show','all') && words.value==='which layout',
   'The Response submit keeps each filter and the sort.');
 """)
@@ -1880,12 +1903,12 @@ requestAnimationFrame(focusRow);
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_selected_chips_keep_text_contrast_on_hover_and_press(self) -> None:
         review = review_page.build_snapshot(self.root).render().decode()
-        list_chip = record_table.chip_row('Show', [record_table.Chip('open', 'Open', 3)], 'open')
+        list_chip = record_table.chip_row('Show', [record_table.Chip('open', 'Open', 3)], 'open').replace('id="', 'id="fixture-')
         page = self.fixture.temporary / 'chip-contrast.html'
         _ = page.write_text(review.replace('<div data-review ', list_chip + '<div data-review ', 1))
         with self.firefox_commands(page) as command:
             for theme in ('dark', 'light'):
-                for selector in ('#review-show-open', '#filter-show-open'):
+                for selector in ('#filter-show-open', '#fixture-filter-show-open'):
                     position = cast(dict[str, list[int]], command('WebDriver:ExecuteScript',
                         args=[theme, selector], script=r"""
 const [theme, selector] = arguments;
@@ -2060,9 +2083,10 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         self.assertEqual(answer,'marked read')
         self.assertEqual(investigation.load(ready.owner,ready.id).state,investigation.InvestigationState.READ)
 
-    def test_review_state_row_starts_with_all(self) -> None:
+    def test_review_show_row_starts_with_all(self) -> None:
         markup = review_page.render(self.root).decode()
-        self.assertEqual(re.findall(r'data-show-chip="([^"]+)" aria-pressed="[^"]+">([^<]+) <b>', markup),
+        group = markup.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
+        self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+) <b>', group),
                          [('all', 'All'), ('open', 'Open'), ('Waiting', 'Waiting'), ('Validating', 'Validating')])
 
     def test_validating_change_has_a_card_and_uses_only_a_saved_handoff_time(self) -> None:
@@ -2354,7 +2378,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         for label in review_page.HEADERS:
             self.assertIn(label+'<span data-sort-mark',source)
         for kind in ('question','change','investigation'):
-            self.assertIn(f'data-type-chip="{kind}"',source)
+            self.assertIn(f'data-filter-value="{kind}"',source)
         cards = ''.join(review_page.build_snapshot(self.root).body(item.key).decode() for item in review_items.read(self.root))
         for action in ('Answer','Works','Does not work','Ask showrunner to check','Ask question','Send feedback','Mark read'):
             self.assertIn('>'+action+'</button>',cards)
@@ -2384,7 +2408,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
                 markup = review_page.render(self.root, show=spelling).decode()
                 self.assertIn('data-show="open"', markup)
                 self.assertNotIn('data-state="For you"', markup)
-                self.assertNotIn('data-show-chip="For you"', markup)
+                self.assertNotIn('data-filter-value="For you"', markup)
                 self.assertNotIn('data-state="Waiting"', markup)
 
     def test_open_decisions_keep_their_actions_counts_and_queues(self) -> None:
@@ -2430,28 +2454,39 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         for show, _ in review_page.SHOWS:
             with self.subTest(show=show):
                 source = review_page.render(self.root, show=show).decode()
-                for label, container in (
-                    ('Type', 'class="review-types"'),
-                    ('State', 'class="review-types review-shows" id="list-show"'),
-                    ('Owner', 'class="review-types" id="list-owner"'),
-                ):
-                    self.assertIn('<div class="record-filter-row">'
-                                  + f'<span aria-hidden="true">{label}</span>'
-                                  + f'<div {container} role="group" aria-label="{label}">', source)
+                for label in ('Type', 'Show', 'Owner'):
+                    key = label.lower()
+                    self.assertIn(f'<div class="record-filter-row" role="group" aria-label="{label}"'
+                                  + f' data-filter-row="{key}"><span aria-hidden="true">{label}</span>'
+                                  + f'<div id="list-{key}">', source)
                 status = source.index('<p class="page-status"')
                 words = source.index('id="list-search"')
                 self.assertIn('</p><div class="record-filter-words">', source[status:words])
                 self.assertLess(words, source.index('role="group" aria-label="Type"'))
                 self.assertIn('<label class="list-search-label" for="list-search">Search</label>', source)
-                group = source.partition('<div class="review-types review-shows"')[2].partition('</div>')[0]
+                group = source.partition('data-filter-row="show"')[2].partition('</div>')[0]
                 self.assertTrue(group, 'Show has a second chip row')
                 self.assertNotIn('<select id="list-show"', source)
                 self.assertNotIn('<label for="list-show">', source)
                 self.assertEqual(group.count('aria-pressed="true"'), 1)
-                self.assertIn(f'data-show-chip="{show}" aria-pressed="true"', group)
+                self.assertIn(f'data-filter-value="{show}" aria-pressed="true"', group)
                 for value, label in review_page.SHOWS:
-                    self.assertIn(f'type="button" data-show-chip="{value}"', group)
+                    self.assertIn(f'data-filter-value="{value}"', group)
                     self.assertIn('>'+label+' <b', group)
+
+    def test_review_and_list_emit_the_same_owner_chip_markup_for_the_same_input(self) -> None:
+        snapshot = review_page.build_snapshot(self.root)
+        entry = snapshot.entries[0]
+        owner = record_table.Chip(f'staff:{entry["owner"]}', entry['ownerHtml'] or html.escape(entry['ownerName']),
+                                  owner_name=entry['ownerName'])
+        snapshot = replace(snapshot, entries=[entry])
+        review = review_page.render_shell(snapshot, review_page.index_json(snapshot.entries), time.perf_counter(),
+                                          snapshot.read_at).decode()
+        with patch.object(list_page, 'staff_chips', return_value=[owner]):
+            list_markup = list_page.render(self.root, include_counts=False).decode()
+        start = '<div class="record-filter-row" role="group" aria-label="Owner" data-filter-row="owner">'
+        self.assertEqual(list_markup.split(start, 1)[1].split('</div></div>', 1)[0],
+                         review.split(start, 1)[1].split('</div></div>', 1)[0])
 
     def test_filter_index_has_only_filter_and_sort_values(self) -> None:
         _ = self.question('A title with </script><b>text</b> & words?')
@@ -2525,9 +2560,9 @@ window.fetch=async(url,options)=>{
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const flush=()=>new Promise(resolve=>nativeTimeout(resolve,80));
- const chip=(value,doc=document)=>doc.querySelector('[data-show-chip="'+value+'"]');
- const pressed=(doc=document)=>[...doc.querySelectorAll('[data-show-chip][aria-pressed="true"]')];
- const selected=(value,doc=document)=>pressed(doc).length===1 && pressed(doc)[0].dataset.showChip===value;
+ const chip=(value,doc=document)=>doc.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
+ const pressed=(doc=document)=>[...doc.querySelectorAll('[data-filter-row="show"] [data-filter-value][aria-pressed="true"]')];
+ const selected=(value,doc=document)=>pressed(doc).length===1 && pressed(doc)[0].dataset.filterValue===value;
  const count=(value,doc=document)=>chip(value,doc)?.querySelector('b');
  const mounted=(doc=document)=>[...doc.querySelectorAll('[data-list-item]')];
  const noMountedKey=(key,doc=document)=>mounted(doc).every(row=>row.dataset.key!==key);
@@ -2538,8 +2573,8 @@ window.fetch=async(url,options)=>{
  };
  try{
   await flush();
-  check([...document.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip).join('|')===
-    'all|open|Waiting|Validating','The State chips appear in the required order.');
+  check([...document.querySelectorAll('[data-filter-row="show"] [data-filter-value]')].map(button=>button.dataset.filterValue).join('|')===
+    'all|open|Waiting|Validating','The Show chips appear in the required order.');
   check(selected('open'),'exactly one Open chip starts pressed');
   check(exactKeys('open'),'F020: Open mounts the exact Open keys');
   check(noMountedKey(EXPECTED.doneKey),'F064: Open does not mount the Done investigation');
@@ -2568,9 +2603,9 @@ window.fetch=async(url,options)=>{
    const visible=[...document.querySelectorAll('[data-list-item]:not([hidden])')];
    check(selected('Validating') && visible.length===1 && visible[0].dataset.state==='Validating' &&
     visible[0].dataset.key==='page-owner/C1','Validating shows only the active check.');
-   check(document.querySelector('[data-owner-chip=""] b')?.textContent==='1' &&
-    document.querySelector('[data-type-chip=""] b')?.textContent==='1' &&
-    document.querySelector('[data-type-chip="change"] b')?.textContent==='1',
+   check(document.querySelector('[data-filter-row="owner"] [data-filter-value="all"] b')?.textContent==='1' &&
+    document.querySelector('[data-filter-row="type"] [data-filter-value="all"] b')?.textContent==='1' &&
+    document.querySelector('[data-filter-row="type"] [data-filter-value="change"] b')?.textContent==='1',
     'Owner and Type count the active check.');
    const row=visible[0],toggle=row?.querySelector('.list-toggle');
    check(row?.dataset.parked==='false' && toggle?.tagName==='BUTTON',
@@ -2615,8 +2650,8 @@ window.fetch=async(url,options)=>{
    handed.querySelector('button.list-toggle'),'All shows the active check and can open its card.');
   check(count('all')?.textContent==='9','All counts the active records.');
   check(noMountedKey(EXPECTED.doneKey) &&
-    document.querySelector('[data-type-chip="investigation"] b').textContent==='2' &&
-    document.querySelector('[data-owner-chip=""] b').textContent==='9',
+    document.querySelector('[data-filter-row="type"] [data-filter-value="investigation"] b').textContent==='2' &&
+    document.querySelector('[data-filter-row="owner"] [data-filter-value="all"] b').textContent==='9',
     'All excludes the completed investigation from the rows, Type counts and Owner counts.');
   check(document.activeElement===chip('all'),'F002: the pressed Show chip keeps focus after the load');
   const ordinary=document.querySelector('[data-key="'+EXPECTED.waitingChange+'"]');
@@ -2632,17 +2667,17 @@ window.fetch=async(url,options)=>{
   chip('all')?.focus();chip('all')?.click();await flush();await flush();
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   check(document.activeElement===chip('all'),'F002: the Show chip keeps focus after refresh');
-  const typeChip=()=>document.querySelector('[data-type-chip="change"]');
+  const typeChip=()=>document.querySelector('[data-filter-row="type"] [data-filter-value="change"]');
   typeChip().focus();typeChip().click();
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   check(document.activeElement===typeChip(),'F002: the type chip keeps focus after refresh');
-  document.querySelector('[data-type-chip=""]').click();
+  document.querySelector('[data-filter-row="type"] [data-filter-value="all"]').click();
   chip('Validating')?.click();await flush();await flush();
   check(selected('Validating') && new URLSearchParams(location.hash.slice(1)).get('show')==='Validating',
-    'A State chip changes the pressed state and address.');
+    'A Show chip changes the pressed state and address.');
   check(exactKeys('Validating'),'Validating shows the active check.');
   check(['all','open','Waiting','Validating'].map(value=>count(value)?.textContent).join('|')==='9|6|2|1',
-    'State counts exclude the completed investigation.');
+    'Show counts exclude the completed investigation.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   check(selected('Validating') && new URL(window.refreshRequests.at(-1),location.href).searchParams.has('version'),
     'refresh checks the version and retains the pressed Show view');
@@ -2661,9 +2696,11 @@ window.fetch=async(url,options)=>{
   }
   chip('all')?.click();await flush();await flush();
   check(['all','open','Waiting','Validating'].map(value=>count(value)?.textContent).join('|')==='9|6|2|1' &&
-    [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
+    [...document.querySelectorAll('[data-filter-row="show"] [data-filter-value] b')].every(number=>!number.hidden),
     'All supplies the count for every Show chip');
-  const groups=[...document.querySelectorAll('.review-types')],buttons=[...document.querySelectorAll('[data-show-chip]')];
+  const rows=[...document.querySelectorAll('[data-review] [data-filter-row]')];
+  const groups=rows.map(row=>row.querySelector(':scope > div'));
+  const buttons=[...document.querySelectorAll('[data-filter-row="show"] [data-filter-value]')];
   const labels=groups.map(group=>group.previousElementSibling);
   const words=search.getBoundingClientRect(),typeRow=groups[0].parentElement.getBoundingClientRect();
   const line=document.querySelector('[data-page-status]').getBoundingClientRect();
@@ -2675,8 +2712,8 @@ window.fetch=async(url,options)=>{
    words.left>=line.right && Math.abs(words.right-newButton.right)<1 &&
    Math.abs((words.top+words.bottom)-(line.top+line.bottom))<2,
    'The search input shares the status row on desktop and spans the row below the status on a phone.');
-  check(labels.map(label=>label.textContent).join('|')==='Type|State|Owner' &&
-    groups.every((group,index)=>group.getAttribute('aria-label')===labels[index].textContent),
+  check(labels.map(label=>label.textContent).join('|')==='Type|Show|Owner' &&
+    rows.every((row,index)=>row.getAttribute('aria-label')===labels[index].textContent),
     'The three filter rows have visible and accessible labels');
   const narrow=matchMedia('(max-width:480px)').matches;
   check(groups.every((group,index)=>{
@@ -2695,13 +2732,20 @@ window.fetch=async(url,options)=>{
      const box=button.getBoundingClientRect();return box.left>=0 && box.right<=innerWidth;
     })),'the three chip rows wrap with even spacing and no clipping');
 
-  for(const [spelling,value] of [['Waiting','Waiting'],['validating','Validating']]){
+  for(const [address,value,ownerSort] of [['?show=Waiting','Waiting'],['?show=validating','Validating'],
+      ['?state=Waiting','Waiting'],['#state=Waiting','Waiting'],['?state=Waiting&show=open','open'],
+      ['?show=Waiting#state=Validating','Waiting'],['?state=Waiting#show=Validating','Waiting'],
+      ['?show=Waiting#show=Validating','Waiting'],
+      ['?show=Waiting&sort=Age&dir=asc#state=Validating&sort=Owner&dir=desc','Waiting',true]]){
    const linked=document.createElement('iframe');
-   linked.src='/reload?'+new URLSearchParams({show:spelling});
+   linked.src='/reload'+address;
    const loaded=new Promise(resolve=>linked.addEventListener('load',resolve,{once:true}));
    document.body.append(linked);await loaded;await flush();await flush();
    check(selected(value,linked.contentDocument) && exactKeys(value,linked.contentDocument),
-    'A direct link selects the State chip and shows its items: '+spelling);
+    'A direct link selects the Show chip and shows its items: '+address);
+   if(ownerSort) check(linked.contentDocument.querySelector('[data-sort="2"]').parentElement
+    .getAttribute('aria-sort')==='descending',
+    'The Review link sorts by Owner in descending order.');
    linked.remove();
   }
   for(const spelling of ['For you','for-you','for you','FOR YOU']){
@@ -2716,11 +2760,11 @@ window.fetch=async(url,options)=>{
     'the legacy Show spelling opens Open: '+spelling);
    legacyShow.remove();
   }
-  const ownerChip=(value,doc=document)=>doc.querySelector('[data-owner-chip="'+value+'"]');
-  const ownerChips=()=>[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
-  const selectedOwner=(doc=document)=>doc.querySelector('[data-owner-chip][aria-pressed="true"]');
+  const ownerChip=(value,doc=document)=>doc.querySelector('[data-filter-row="owner"] [data-filter-value="'+(value ? CSS.escape(staffChipValue(value)) : 'all')+'"]');
+  const ownerChips=()=>[...document.querySelectorAll('[data-filter-row="owner"] [data-filter-value]:not([hidden])')];
+  const selectedOwner=(doc=document)=>doc.querySelector('[data-filter-row="owner"] [data-filter-value][aria-pressed="true"]');
   const chooseOwner=value=>ownerChip(value).click();
-  const chooseType=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
+  const chooseType=value=>document.querySelector('[data-filter-row="type"] [data-filter-value="'+(value || 'all')+'"]').click();
   chip('open').click();await flush();await flush();
   const builder=document.querySelector('[data-type="investigation"]').dataset.sourceOwner;
   const builderChip=ownerChip(builder),builderName=builderChip.querySelector('.staff-name');
@@ -2736,34 +2780,34 @@ window.fetch=async(url,options)=>{
     ownerChips().some(button=>button.textContent==='page-owner 1') &&
     ownerChip(builder).hidden,
     'F007: Owner lists only owners with the selected type and words in any Show.');
-  check(selectedOwner().dataset.ownerChip==='' && !new URLSearchParams(location.hash.slice(1)).get('owner') &&
+  check(filterControl.ownerId(selectedOwner())==='' && !new URLSearchParams(location.hash.slice(1)).get('owner') &&
     ['all','open','Waiting','Validating'].map(value=>count(value)?.textContent).join('|')==='1|1|0|0',
     'F007: an owner without the selected type resets to All with matching counts.');
   check([...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
     'F007: the question appears after the owner resets.');
   chooseType('investigation');
-  check(ownerChips().some(button=>button.dataset.ownerChip===builder) && ownerChips()[0].textContent==='All 1',
+  check(ownerChips().some(button=>filterControl.ownerId(button)===builder) && ownerChips()[0].textContent==='All 1',
     'a type change restores owners and counts');
   chooseOwner(builder);chip('all').click();await flush();await flush();
-  check(ownerChips()[0].textContent==='All 2' && selectedOwner().dataset.ownerChip===builder,
+  check(ownerChips()[0].textContent==='All 2' && filterControl.ownerId(selectedOwner())===builder,
     'Show limits Owner counts and retains an owner with matching loaded rows');
   chip('open').click();await flush();await flush();
-  chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
+  chooseType('question');chooseOwner(filterControl.ownerId(ownerChips().find(button=>button.dataset.ownerName==='page-owner')));
   chip('Validating').click();await flush();await flush();
-  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' &&
+  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && filterControl.ownerId(selectedOwner())!=='' &&
     ownerChips()[1].textContent==='page-owner 0',
     'Show retains the selected owner with a zero count.');
   chip('open').click();await flush();await flush();
   check(ownerChips().length===2 && ownerChips()[0].textContent==='All 1','Show restores matching owners');
   chooseType('investigation');chooseOwner(builder);
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
-  check(selectedOwner().dataset.ownerChip===builder && ownerChips()[0].textContent==='All 1' &&
+  check(filterControl.ownerId(selectedOwner())===builder && ownerChips()[0].textContent==='All 1' &&
     ownerChips().every(button=>button.querySelector('b').textContent!=='0'),'refresh retains the matching owner list and selection');
   const legacy=document.createElement('iframe');
   legacy.src='/reload#'+new URLSearchParams({owner:builder,type:'question',show:'open'});
   const legacyLoaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);
   await legacyLoaded;await flush();await flush();
-  check(selectedOwner(legacy.contentDocument).dataset.ownerChip==='' &&
+  check(filterControl.ownerId(selectedOwner(legacy.contentDocument))==='' &&
     [...legacy.contentDocument.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1 &&
     !new URLSearchParams(legacy.contentWindow.location.hash.slice(1)).get('owner'),
     'F007: a legacy owner without the selected type resets to All.');legacy.remove();
@@ -2771,29 +2815,29 @@ window.fetch=async(url,options)=>{
   const navigated=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   location.hash=new URLSearchParams({owner:'builder-unit',type:'investigation',show:'open'});
   await navigated;await flush();await flush();
-  check(selectedOwner().dataset.ownerChip===builder && [...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
+  check(filterControl.ownerId(selectedOwner())===builder && [...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
     'F004: hash navigation resolves an owner name whose chip was hidden by Questions');
   const translated=document.createElement('iframe');
   translated.src='/reload#'+new URLSearchParams({legacy:'investigation',owner:'no-investigations',type:'investigation',show:'not-read'});
   const translatedLoaded=new Promise(resolve=>translated.addEventListener('load',resolve,{once:true}));
   document.body.append(translated);await translatedLoaded;await flush();await flush();
   const translatedPage=translated.contentDocument,translatedAddress=new URLSearchParams(translated.contentWindow.location.hash.slice(1));
-  check(selectedOwner(translatedPage).dataset.ownerChip==='' &&
+  check(filterControl.ownerId(selectedOwner(translatedPage))==='' &&
     selectedOwner(translatedPage).textContent==='All 1' &&
     !translatedAddress.get('owner') && !translatedAddress.has('source-owner') &&
     [...translatedPage.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1 &&
     count('open',translatedPage)?.textContent==='1',
     'F003: a legacy investigation reset clears both owner constraints and shows the All rows');
   translated.remove();
-  chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
-  const questionOwner=selectedOwner().dataset.ownerChip;
+  chooseType('question');chooseOwner(filterControl.ownerId(ownerChips().find(button=>button.dataset.ownerName==='page-owner')));
+  const questionOwner=filterControl.ownerId(selectedOwner());
   const hasEmptyOwnerSelection=()=>ownerChips().length===2 && ownerChips()[0].textContent==='All 0' &&
-   selectedOwner().dataset.ownerChip===questionOwner && selectedOwner().textContent==='page-owner 0';
+   filterControl.ownerId(selectedOwner())===questionOwner && selectedOwner().textContent==='page-owner 0';
   const question=document.querySelector('[data-type="question"]');question.querySelector('.list-toggle').click();await readyReviewCard(question);
   const form=question.querySelector('[data-review-form]');form.elements.feedback.value='Use this layout.';
   form.querySelector('[value="answer"]').click();await new Promise(resolve=>nativeTimeout(resolve,1100));
   check(hasEmptyOwnerSelection() && !question.isConnected && count('all').textContent==='0',
-    'A save removes the completed question from the Owner and State counts.');
+    'A save removes the completed question from the Owner and Show counts.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   check(hasEmptyOwnerSelection() && count('all').textContent==='0',
     'Refresh keeps the completed question out of the counts.');
@@ -2871,14 +2915,14 @@ window.fetch=async(url,options)=>{
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const flush=()=>new Promise(resolve=>nativeTimeout(resolve,120));
- const show=value=>document.querySelector('[data-show-chip="'+value+'"]');
- const type=value=>document.querySelector('[data-type-chip="'+value+'"]');
+ const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
+ const type=value=>document.querySelector('[data-filter-row="type"] [data-filter-value="'+value+'"]');
  const counts=selector=>[...document.querySelectorAll(selector+' b')].map(node=>Number(node.textContent)).join('|');
  const search=value=>{const field=document.querySelector('#list-search');field.value=value;field.dispatchEvent(new Event('input'));};
  try{
   await flush();
   check(!document.querySelector('[data-list-count]'),'The Show chips replace the right count text.');
-  check(counts('[data-show-chip]')==='4|3|1|0','The index counts states outside the rendered view.');
+  check(counts('[data-filter-row="show"] [data-filter-value]')==='4|3|1|0','The index counts states outside the rendered view.');
   const allCount=show('all').querySelector('b');
   const nativeNow=Date.now,deadline=Date.parse(LATER_DEADLINE);
   let crossedDeadline=false;
@@ -2891,48 +2935,48 @@ window.fetch=async(url,options)=>{
     crossedDeadline=true;
    }});
    search('Later count fixture');
-   check(crossedDeadline && counts('[data-show-chip]')==='0|0|0|0',
-    'State counts add up when a Later item becomes eligible after the All count.');
+   check(crossedDeadline && counts('[data-filter-row="show"] [data-filter-value]')==='0|0|0|0',
+    'Show counts add up when a Later item becomes eligible after the All count.');
    search('Later count fixture');
-   check(counts('[data-show-chip]')==='1|0|1|0','The next render counts the Waiting item.');
+   check(counts('[data-filter-row="show"] [data-filter-value]')==='1|0|1|0','The next render counts the Waiting item.');
   }finally{
    delete allCount.textContent;
    Date.now=nativeNow;
    search('');
   }
-  const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
-  const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
+  const ownerChip=value=>document.querySelector('[data-filter-row="owner"] [data-filter-value="'+(value ? CSS.escape(staffChipValue(value)) : 'all')+'"]');
+  const selectedOwner=()=>document.querySelector('[data-filter-row="owner"] [data-filter-value][aria-pressed="true"]');
   const builder=document.querySelector('[data-type="change"]').dataset.sourceOwner;
   const chooseOwner=value=>ownerChip(value).click();
   show('all').click();await flush();await flush();
   chooseOwner(builder);
-  check(counts('[data-show-chip]')==='1|0|1|0','Show counts use the selected owner.');
+  check(counts('[data-filter-row="show"] [data-filter-value]')==='1|0|1|0','Show counts use the selected owner.');
   check(type('change').querySelector('b').textContent==='0' && type('investigation').querySelector('b').textContent==='1',
    'Type counts use the selected owner.');
   type('change').click();
-  check(selectedOwner().dataset.ownerChip==='' && counts('[data-show-chip]')==='2|2|0|0',
+  check(filterControl.ownerId(selectedOwner())==='' && counts('[data-filter-row="show"] [data-filter-value]')==='2|2|0|0',
    'F007: an owner without the selected type resets to All.');
   type('investigation').click();
   chooseOwner(builder);show('open').click();await flush();await flush();
-  check(selectedOwner().dataset.ownerChip===builder && counts('[data-show-chip]')==='1|0|1|0' &&
+  check(filterControl.ownerId(selectedOwner())===builder && counts('[data-filter-row="show"] [data-filter-value]')==='1|0|1|0' &&
    [...document.querySelectorAll('[data-list-item]')].every(row=>row.hidden),
    'F007: the user case keeps an owner with rows in another Show.');
   show('all').click();await flush();await flush();
-  check(counts('[data-show-chip]')==='1|0|1|0','Show counts combine the type and owner.');
+  check(counts('[data-filter-row="show"] [data-filter-value]')==='1|0|1|0','Show counts combine the type and owner.');
   search('gate');
-  check(counts('[data-show-chip]')==='1|0|1|0' && ownerChip('').textContent==='All 1',
+  check(counts('[data-filter-row="show"] [data-filter-value]')==='1|0|1|0' && ownerChip('').textContent==='All 1',
    'All counts combine the words, owner, type and Show filters.');
   search('');chooseOwner('');type('').click();show('open').click();await flush();await flush();
   type('change').click();
-  check(counts('[data-show-chip]')==='2|2|0|0','Show counts use the selected type.');
+  check(counts('[data-filter-row="show"] [data-filter-value]')==='2|2|0|0','Show counts use the selected type.');
   search('Numbered');
-  check(counts('[data-show-chip]')==='1|1|0|0','Show counts use the words filter.');
+  check(counts('[data-filter-row="show"] [data-filter-value]')==='1|1|0|0','Show counts use the words filter.');
   check(type('change').querySelector('b').textContent==='1' && type('question').querySelector('b').textContent==='0',
    'Type counts use the words filter and Show.');
   check(selectedOwner().textContent==='All 1',
    'Owner counts use the type, Show and words.');
   search('no matching title');
-  check(counts('[data-show-chip]')==='0|0|0|0' && [...document.querySelectorAll('[data-type-chip] b')].every(n=>n.textContent==='0') &&
+  check(counts('[data-filter-row="show"] [data-filter-value]')==='0|0|0|0' && [...document.querySelectorAll('[data-filter-row="type"] [data-filter-value] b')].every(n=>n.textContent==='0') &&
    selectedOwner().textContent==='All 0',
    'An empty filtered view has zero in every applicable count.');
   search('');show('all').click();await flush();await flush();
@@ -2943,12 +2987,12 @@ window.fetch=async(url,options)=>{
   const form=row.querySelector('form');form.elements.feedback.value='Use the first layout.';
   form.requestSubmit(form.querySelector('[value="answer"]'));
   await new Promise(resolve=>nativeTimeout(resolve,1100));
-  check(counts('[data-show-chip]')==='0|0|0|0','A save removes the completed entry from all State counts.');
+  check(counts('[data-filter-row="show"] [data-filter-value]')==='0|0|0|0','A save removes the completed entry from all Show counts.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
   await flush();await flush();
-  check(counts('[data-show-chip]')==='0|0|0|0','A refresh retains the saved state from the server index.');
+  check(counts('[data-filter-row="show"] [data-filter-value]')==='0|0|0|0','A refresh retains the saved state from the server index.');
   type('change').click();
-  check(counts('[data-show-chip]')==='2|1|0|1','A refresh replaces an unsaved entry in the index.');
+  check(counts('[data-filter-row="show"] [data-filter-value]')==='2|1|0|1','A refresh replaces an unsaved entry in the index.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/result',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace('LATER_DEADLINE', json.dumps(deadline.isoformat()))
@@ -3047,15 +3091,16 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const expected=EXPECTED;
- const chip=(group,value)=>document.querySelector('[data-'+group+'-chip="'+value+'"]');
- const selected=group=>document.querySelector('[data-'+group+'-chip][aria-pressed="true"]')
-  ?.getAttribute('data-'+group+'-chip');
+ const chip=(group,value)=>document.querySelector('[data-filter-row="'+group+'"] [data-filter-value="'+
+  (group==='owner' && value ? CSS.escape(staffChipValue(value)) : value || 'all')+'"]');
+ const selected=group=>document.querySelector('[data-filter-row="'+group+'"] [data-filter-value][aria-pressed="true"]')
+  ?.dataset.filterValue;
  const count=owner=>chip('owner',owner)?.querySelector('b')?.textContent;
  const counts=()=>Object.keys(expected.open['']).map(count).join('|');
  const checkCounts=(show,type)=>{
   const wanted=expected[show][type];
-  const visible=[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
-  check(visible.length===Object.keys(wanted).length && visible.every(button=>Object.hasOwn(wanted,button.dataset.ownerChip)),
+  const visible=[...document.querySelectorAll('[data-filter-row="owner"] [data-filter-value]:not([hidden])')];
+  check(visible.length===Object.keys(wanted).length && visible.every(button=>Object.hasOwn(wanted,filterControl.ownerId(button))),
    show+' / '+(type || 'All types')+': the Owner chips match the fixture owners.');
   for(const [owner,total] of Object.entries(wanted)){
    const label=chip('owner',owner)?.dataset.ownerName || owner || 'All';
@@ -3109,7 +3154,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         waiting_key = f'investigation/{waiting.owner}/{waiting.id}'
         done = review_page.render(self.root, show='Done').decode()
         self.assertIn('data-show="open"', done)
-        self.assertNotIn('data-show-chip="Done"', done)
+        self.assertNotIn('data-filter-value="Done"', done)
         all_items = review_page.render(self.root, show='all').decode()
         self.assertNotIn(done_key,{entry['key'] for entry in unpack_index(all_items.split('data-review-index>',1)[1].split('</script>',1)[0])})
         self.assertIn(waiting_key,{entry['key'] for entry in unpack_index(all_items.split('data-review-index>',1)[1].split('</script>',1)[0])})
@@ -3118,9 +3163,9 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             with self.subTest(show=requested):
                 source = review_page.render(self.root, show=requested).decode()
                 self.assertIn(f'data-show="{show}"', source)
-                self.assertIn(f'data-show-chip="{show}" aria-pressed="true"', source)
+                self.assertIn(f'data-filter-value="{show}" aria-pressed="true"', source)
                 owner_menu = source.partition('id="list-owner"')[2].partition('</div>')[0]
-                self.assertIn(f'data-owner-chip="{waiting.owner}"', owner_menu,
+                self.assertIn(f'data-filter-value="staff:{waiting.owner}"', owner_menu,
                               'F002: the unit Owner option remains when its Show view has no rows')
 
     def test_completed_bug_stays_in_its_store_and_out_of_review(self) -> None:
@@ -3140,7 +3185,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         for show, _ in review_page.SHOWS:
             page = after.render(show=show)
             self.assertNotIn(key.encode(), page)
-            self.assertNotIn(f'data-owner-chip="{producer.id}"'.encode(), page)
+            self.assertNotIn(f'data-filter-value="staff:{producer.id}"'.encode(), page)
         waiting = review_page.waiting_items(console.NewsRequest(self.root), snapshot=after)
         self.assertFalse(any(item.startswith(key+'/') for item in waiting))
         self.assertEqual(investigation.load(bug.owner, bug.id).state, investigation.InvestigationState.READ)
@@ -4032,13 +4077,13 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         probe = r"""<script>(async()=>{
  const failures=[];
  const mounted=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.type).sort().join(',');
- const combined=document.querySelector('[data-type-chip="investigations"]');
+ const combined=document.querySelector('[data-filter-row="type"] [data-filter-value="investigations"]');
  if(mounted()!=='bug,investigation') failures.push('The bookmark must show both report types.');
  if(combined?.hidden || combined?.getAttribute('aria-pressed')!=='true')
   failures.push('Select the combined filter on the legacy bookmark.');
- document.querySelector('[data-type-chip="investigation"]').click();
+ document.querySelector('[data-filter-row="type"] [data-filter-value="investigation"]').click();
  if(mounted()!=='investigation') failures.push('The Investigation filter must show only Investigations.');
- document.querySelector('[data-type-chip="bug"]').click();
+ document.querySelector('[data-filter-row="type"] [data-filter-value="bug"]').click();
  if(mounted()!=='bug') failures.push('The Bug filter must show only Bugs.');
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
@@ -4111,9 +4156,9 @@ window.fetch=async(url,options={})=>{
   const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
   check(Object.entries(selection).every(([key,value])=>params().get(key)===value),
         'Send keeps every filter in the address.');
-  check(review.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip===selection.show &&
-   review.querySelector('[data-type-chip][aria-pressed="true"]').dataset.typeChip===selection.type &&
-   review.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===selection.owner &&
+  check(review.querySelector('[data-filter-row="show"] [data-filter-value][aria-pressed="true"]').dataset.filterValue===selection.show &&
+   review.querySelector('[data-filter-row="type"] [data-filter-value][aria-pressed="true"]').dataset.filterValue===selection.type &&
+   filterControl.ownerId(review.querySelector('[data-filter-row="owner"] [data-filter-value][aria-pressed="true"]'))===selection.owner &&
    review.querySelector('#list-search').value===selection.q,'Send keeps each selected control.');
   if(fixture.matches){
    check(row && !row.querySelector('[data-detail]').hidden,'The new item opens when it matches the filters.');
@@ -4544,7 +4589,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const saveTop=scrollY,height=clip.getBoundingClientRect().height,key=row.dataset.key;
  let redraws=0;
  const observer=new MutationObserver(records=>redraws+=records.length);
- observer.observe(document.querySelector('[data-owner-chip=""] b'),{childList:true});
+ observer.observe(document.querySelector('[data-filter-row="owner"] [data-filter-value="all"] b'),{childList:true});
  scrollBy(0,innerHeight+50);await frame();
  check(scrollY-saveTop>=innerHeight,'The page scrolls one viewport during the save.');
  check(copy(panel)===clip && near(clip.getBoundingClientRect().height,height),
@@ -4579,7 +4624,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
             with self.subTest(cancel=cancel):
                 self.check_card_motion(source, r"""
  const owner=document.querySelector('[data-owner-name="page-owner"]');
- const selected=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
+ const selected=()=>document.querySelector('[data-filter-row="owner"] [data-filter-value][aria-pressed="true"]');
  document.querySelector('[data-sort="3"]').click();
  owner.click();
  const [row]=rows(),panel=panelId(row);
@@ -4636,9 +4681,9 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const place=new URLSearchParams(location.hash.slice(1));
  check(Object.entries(filters).every(([key,value])=>place.get(key)===value),
   'The card submit keeps every filter in the address.');
- check(document.querySelector('[data-type-chip][aria-pressed="true"]').dataset.typeChip===filters.type &&
-  document.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip===filters.show &&
-  document.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===filters.owner &&
+ check(document.querySelector('[data-filter-row="type"] [data-filter-value][aria-pressed="true"]').dataset.filterValue===filters.type &&
+  document.querySelector('[data-filter-row="show"] [data-filter-value][aria-pressed="true"]').dataset.filterValue===filters.show &&
+  filterControl.ownerId(document.querySelector('[data-filter-row="owner"] [data-filter-value][aria-pressed="true"]'))===filters.owner &&
   document.querySelector('#list-search').value===filters.q,'The card submit keeps each selected control.');
 """)
 
@@ -4871,7 +4916,7 @@ window.fetch=(url,options)=>{
    }else if(CASE==='restored'){
     check(expanded(key) && notice.hidden && history.state?.recordTable?.linkedItem===key,
      'Review saves the key of the open card.');
-   }else content.querySelector('[data-show-chip="open"]').click();
+   }else content.querySelector('[data-filter-row="show"] [data-filter-value="open"]').click();
    if(!failures.length){
     sessionStorage.setItem('review-reload','1');
     location.reload();return;
@@ -5134,7 +5179,7 @@ window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
   if(stage==='linked'){
    if(show()!=='all' || row(open)?.querySelector('[data-detail]').hidden!==false || row(done))
     failures.push('An explicit link opens the active Change under All and leaves the completed Change hidden.');
-   frame.contentDocument.querySelector('[data-show-chip="open"]').click();
+   frame.contentDocument.querySelector('[data-filter-row="show"] [data-filter-value="open"]').click();
    await until(()=>new URLSearchParams(location.search).get('at.review')==='/console/review.html'+
     frame.contentWindow.location.hash,'Console to record Open');
    sessionStorage.setItem('console-reload','reloaded');location.reload();return;
@@ -5179,8 +5224,8 @@ window.fetch=(url,options={})=>{
   ? Promise.resolve(Response.json({version:document.querySelector('[data-review]').dataset.version,facts:pageRefreshFacts()}))
   : read(url,options);
  const review=document.querySelector('[data-review]');
- const selectShow=value=>document.querySelector('[data-show-chip="'+value+'"]').click();
- const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip;
+ const selectShow=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();
+ const selectedOwner=()=>filterControl.ownerId(document.querySelector('[data-filter-row="owner"] [data-filter-value][aria-pressed="true"]'));
  const follow=async(params,key='page-owner/C1')=>{
   const link=document.createElement('a');
   link.href='#'+new URLSearchParams({item:key,...params});
@@ -5202,9 +5247,9 @@ window.fetch=(url,options={})=>{
  const expanded=(row,state)=>row?.dataset.state===state && !row.hidden && !row.querySelector('[data-detail]').hidden;
  try{
   const owner=change('page-owner/C1').dataset.owner;
-  document.querySelector('[data-owner-chip="'+CSS.escape(owner)+'"]').click();
+  document.querySelector('[data-filter-row="owner"] [data-filter-value="'+CSS.escape(staffChipValue(owner))+'"]').click();
   selectShow('open');
-  if(selectedOwner()!==owner) document.querySelector('[data-owner-chip="'+CSS.escape(owner)+'"]').click();
+  if(selectedOwner()!==owner) document.querySelector('[data-filter-row="owner"] [data-filter-value="'+CSS.escape(staffChipValue(owner))+'"]').click();
   check(expanded(await follow({}),'Open') && review.dataset.show==='open' && selectedOwner()===owner,
    'F003: A bare link preserves the matching Show and Owner filters.');
   const jump=document.createElement('a');
@@ -5350,23 +5395,23 @@ window.fetch=async(_url,options={})=>{
  const visibleStatus=text=>[...document.querySelectorAll('[data-send-status],[data-hidden-action-status]')]
    .some(node=>node.textContent.includes(text) && node.getClientRects().length);
  const leavingNow=row=>!row.isConnected && Boolean(document.querySelector('[data-record-motion]'));
- const selectedOwner=(doc=document)=>doc.querySelector('[data-owner-chip][aria-pressed="true"]');
+ const selectedOwner=(doc=document)=>doc.querySelector('[data-filter-row="owner"] [data-filter-value][aria-pressed="true"]');
  const choose=(id,value,event='change')=>{
-  if(id==='list-owner'){document.querySelector('[data-owner-chip="'+value+'"]').click();return;}
-  if(id==='list-show'){document.querySelector('[data-show-chip="'+value+'"]').click();return;}
+  if(id==='list-owner'){document.querySelector('[data-filter-row="owner"] [data-filter-value="'+(value ? CSS.escape(staffChipValue(value)) : 'all')+'"]').click();return;}
+  if(id==='list-show'){document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();return;}
   const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));
  };
- const showValue=(doc=document)=>doc.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip;
+ const showValue=(doc=document)=>doc.querySelector('[data-filter-row="show"] [data-filter-value][aria-pressed="true"]').dataset.filterValue;
  try{
   await flush();
   check(shown().length===5 && shown().every(row=>row.dataset.state==='Open'),'Open includes only Open records');
-  check(document.querySelector('[data-show-chip="open"] b').textContent==='5',
+  check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='5',
     'F007: Open counts only Open records');
-  check(document.querySelector('[data-show-chip="Validating"]'),
+  check(document.querySelector('[data-filter-row="show"] [data-filter-value="Validating"]'),
     'The Show row includes Validating.');
-  document.querySelector('[data-type-chip="question"]').click();
+  document.querySelector('[data-filter-row="type"] [data-filter-value="question"]').click();
   choose('list-search','Q1','input');check(shown().length===1,'type and ID filters');
-  choose('list-search','','input');document.querySelector('[data-type-chip=""]').click();
+  choose('list-search','','input');document.querySelector('[data-filter-row="type"] [data-filter-value="all"]').click();
   const question=rows().find(row=>row.dataset.type==='question');question.querySelector('.list-toggle').click();await readyReviewCard(question);
   const title=question.querySelector('.review-title'),titleHeight=title.getBoundingClientRect().height;
   title.textContent='A long review title '.repeat(20);
@@ -5419,7 +5464,7 @@ window.fetch=async(_url,options={})=>{
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
   check(status.hidden && !status.textContent,'The animation leaves no action status.');
-  check(document.querySelector('[data-show-chip="open"] b').textContent==='4','the count excludes the saved row');
+  check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='4','the count excludes the saved row');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
   choose('list-show','all');
   const allTarget=rows().find(row=>row.dataset.type==='change' && row!==target);allTarget.querySelector('.list-toggle').click();await readyReviewCard(allTarget);
@@ -5435,14 +5480,14 @@ window.fetch=async(_url,options={})=>{
   const linkedTarget=reloaded.contentDocument.querySelector('[data-key="'+target.dataset.key+'"]');
   check(linkedTarget.dataset.state==='Open' && !linkedTarget.hidden && !linkedTarget.querySelector('[data-detail]').hidden,
    'The fixture still shows the Change as Open on a fresh load.');
-  check(showValue(reloaded.contentDocument)==='open' && selectedOwner(reloaded.contentDocument).dataset.ownerChip==='' &&
+  check(showValue(reloaded.contentDocument)==='open' && filterControl.ownerId(selectedOwner(reloaded.contentDocument))==='' &&
     reloaded.contentDocument.getElementById('list-search').value==='','A bare link keeps the default filters for an Open Change.');
   reloaded.remove();
   const retained={item:fresh.dataset.key,type:'question',owner:fresh.dataset.owner,show:'open',q:'Q1',sort:'Age',dir:'desc'};
   location.hash=new URLSearchParams(retained);await flush();
   fresh=rows().find(row=>row.dataset.type==='question');
-  check(selectedOwner().dataset.ownerChip===retained.owner && showValue()==='open' &&
-    document.getElementById('list-search').value==='Q1' && document.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
+  check(filterControl.ownerId(selectedOwner())===retained.owner && showValue()==='open' &&
+    document.getElementById('list-search').value==='Q1' && document.querySelector('[data-filter-row="type"] [data-filter-value="question"]').getAttribute('aria-pressed')==='true',
     'F014: restore the filters with an open row');
   check(!fresh.hidden && !fresh.querySelector('[data-detail]').hidden,'F014: restore the open row');
   check(document.querySelector('[data-sort="5"]').parentElement.getAttribute('aria-sort')==='descending','F014: restore the sort');
@@ -5452,9 +5497,9 @@ window.fetch=async(_url,options={})=>{
   const loaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);await loaded;
   await flush();await flush();
   const restored=legacy.contentDocument;
-  check(selectedOwner(restored).dataset.ownerChip===fresh.dataset.owner &&
+  check(filterControl.ownerId(selectedOwner(restored))===fresh.dataset.owner &&
     selectedOwner(restored).textContent==='page-owner 0' && showValue(restored)==='Waiting' &&
-    restored.getElementById('list-search').value==='layout' && restored.querySelector('[data-type-chip="question"]').getAttribute('aria-pressed')==='true',
+    restored.getElementById('list-search').value==='layout' && restored.querySelector('[data-filter-row="type"] [data-filter-value="question"]').getAttribute('aria-pressed')==='true',
     'F012: a legacy link selects Waiting and retains the other filters.');
   check(restored.querySelector('[data-sort="5"]').parentElement.getAttribute('aria-sort')==='descending','F012: the legacy link keeps its sort');
   legacy.remove();
@@ -5523,14 +5568,14 @@ window.fetch=async(_url,options={})=>{
   const laterResponse=holdPost();
   week.click();
   check(leavingNow(fresh),'Later starts the departure before the response');
-  check(document.querySelector('[data-show-chip="open"] b').textContent==='0' &&
-    selectedOwner().dataset.ownerChip===retained.owner,'Later updates the count and keeps the owner while the request runs');
+  check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='0' &&
+    filterControl.ownerId(selectedOwner())===retained.owner,'Later updates the count and keeps the owner while the request runs');
   laterResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')===new Date(weekAt).toISOString(),
     'a preset sends its time at once');
   check(fresh.hidden,'Later removes the question from the page');
-  check(document.querySelector('[data-show-chip="open"] b').textContent==='0','Later removes the question from the filtered count');
+  check(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent==='0','Later removes the question from the filtered count');
   const nativeNow=Date.now;Date.now=()=>new Date('2099-01-01T09:00').getTime()+1000;
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   let returned=rows().find(row=>row.dataset.type==='question');
@@ -5547,15 +5592,15 @@ window.fetch=async(_url,options={})=>{
     'F023: Answer leaves no action status after an empty Later.');
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   choose('list-show','open');choose('list-search','','input');choose('list-owner','');
-  document.querySelector('[data-type-chip=""]').click();
+  document.querySelector('[data-filter-row="type"] [data-filter-value="all"]').click();
   const pending=rows().find(row=>row.dataset.number==='page-owner/c3'),pendingKey=pending.dataset.key;
   pending.querySelector('.list-toggle').click();await readyReviewCard(pending);
   const pendingForm=pending.querySelector('form');pendingForm.elements.feedback.value='Wait for a new answer.';
-  const initialCount=Number(document.querySelector('[data-show-chip="open"] b').textContent);
+  const initialCount=Number(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent);
   const questionResponse=holdPost();
   pendingForm.requestSubmit(pendingForm.querySelector('[value="question"]'));
   check(window.posts.at(-1).get('outcome')==='question' && leavingNow(pending) &&
-    Number(document.querySelector('[data-show-chip="open"] b').textContent)===initialCount-1,
+    Number(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent)===initialCount-1,
     'Ask question starts the departure and updates the count before the response');
   questionResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
@@ -5571,19 +5616,19 @@ window.fetch=async(_url,options={})=>{
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
    const shownPending=rows().find(row=>row.dataset.key===pendingKey);
    check(Boolean(shownPending && !shownPending.hidden)===revealed,'F021: state and revision control return for '+state+' '+updated);
-   check(Number(document.querySelector('[data-show-chip="open"] b').textContent)===initialCount-(revealed?0:1),
+   check(Number(document.querySelector('[data-filter-row="show"] [data-filter-value="open"] b').textContent)===initialCount-(revealed?0:1),
      'F021: only the new Open response restores the count');
   }
   const beforeShowRequests=window.refreshRequests.length;
   choose('list-show','all');await flush();await flush();
-  check(document.querySelector('[data-show-chip="all"] b').textContent==='3' &&
+  check(document.querySelector('[data-filter-row="show"] [data-filter-value="all"] b').textContent==='3' &&
     rows().every(row=>row.dataset.state!=='Done'),
     'All excludes completed records, saved verdicts and the saved answer.');
   check(window.refreshRequests.length===beforeShowRequests,
     'the Show chips select rows without a request');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   check(new URL(window.refreshRequests.at(-1),location.href).searchParams.has('version') &&
-    showValue()==='all','the refresh keeps the selected State view');
+    showValue()==='all','the refresh keeps the selected Show view');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""

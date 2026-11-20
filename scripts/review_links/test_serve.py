@@ -52,7 +52,7 @@ from scripts.production import (
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
-from scripts.review_links import new_item_dialog, page_frame, page_question, question_record, review_submissions
+from scripts.review_links import new_item_dialog, page_frame, page_question, question_record, record_table, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, scratch, urgency
 from scripts.feature_log import feature_log
@@ -1061,7 +1061,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     state = new_item_dialog.BugPageState(
                         url, new_item_dialog.PageViewport(1280, 800, True), 2.4, ("Could not load brain.",),
                         (new_item_dialog.PageScriptError("Error", url, 9, 3, "2026-11-18T16:05:00Z"),),
-                        "State Open · Owner builds", checked)
+                        "Show Open · Owner builds", checked)
                     data = new_item_dialog.PageDataEvidence("Review", (("Item", "State"), ("Console", "Open")))
                     request = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
                                       page="review", request_id="r2-" + uuid4().hex, evidence=data, page_state=state)
@@ -1754,13 +1754,28 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_review_request_passes_the_selected_show_view(self) -> None:
         snapshot = review_page.build_snapshot(self.review_fixture().root)
         for query, show in (('', 'open'), ('?show=Done', 'Done'), ('?show=all', 'all'),
-                            ('?show=For+you', 'For you'), ('?show=Waiting', 'Waiting')):
-            with self.subTest(show=show), patch.object(review_page.ReviewSnapshotCache,'get',return_value=snapshot), patch.object(
+                            ('?show=For+you', 'For you'), ('?show=Waiting', 'Waiting'),
+                            ('?state=Waiting', 'Waiting'), ('?state=Waiting&show=all', 'all'),
+                            ('?state=Waiting&show=', 'open'), ('?show=&show=Waiting', 'open')):
+            with self.subTest(query=query), patch.object(review_page.ReviewSnapshotCache,'get',return_value=snapshot), patch.object(
                     review_page.ReviewSnapshot,'render',return_value=b'Review') as render:
                 reply = self.request('/console/review.html'+query)
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(reply.body, b'Review')
-                render.assert_called_once_with(show=show)
+                render.assert_called_once_with(show=show, kind='')
+
+    def test_review_initial_html_falls_back_to_open_for_unavailable_show(self) -> None:
+        snapshot = review_page.build_snapshot(self.review_fixture().root)
+        with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
+            for kind in ('', 'investigations', *review_page.TYPES):
+                show = 'Validating' if kind == review_items.ReviewType.RESPONSE else 'Done'
+                with self.subTest(kind=kind, show=show):
+                    query = urlencode({'state': show, 'type': kind})
+                    reply = self.request(review_page.PAGE_PATH+'?'+query)
+                    self.assertEqual(reply.status, 200)
+                    self.assertIn(b'data-show="open"', reply.body)
+                    self.assertIn(b'data-filter-value="open" aria-pressed="true"', reply.body)
+                    self.assertNotIn(f'data-filter-value="{show}" aria-pressed="true"'.encode(), reply.body)
 
     def test_review_snapshot_endpoints_do_not_read_stores_and_use_gzip(self) -> None:
         case = self.review_fixture()
@@ -1769,6 +1784,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(review_page.ReviewSnapshotCache,'get',return_value=snapshot), patch.object(
                 review_items,'read',side_effect=AssertionError('A GET read a store.')), patch.object(
                 staff,'snapshot',side_effect=AssertionError('A GET read staff.')):
+            waiting = self.request(review_page.PAGE_PATH+'?state=Waiting')
+            self.assertEqual(waiting.status, 200)
+            self.assertIn(b'data-show="Waiting"', waiting.body)
+            self.assertIn(b'data-filter-value="Waiting" aria-pressed="true"', waiting.body)
             version=self.request(review_page.PAGE_PATH+'?version=1')
             self.assertEqual(version.status,200)
             self.assertEqual(json.loads(version.body)['version'],snapshot.version)
@@ -3122,14 +3141,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                 _ = the_list.mark_read(keeper, item.id, source="nate")
 
     def list_filter_markup(self, query: str = "") -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
-        response = self.request(list_page.PAGE_PATH + query)
+        with patch.object(record_table, "count_filter_row", wraps=record_table.count_filter_row) as count:
+            response = self.request(list_page.PAGE_PATH + query)
         self.assertEqual(response.status, 200)
+        count.assert_called()
         markup = response.body.decode()
         visible = [match[1] for match in re.finditer(
             r'<tbody data-list-item[^>]+ data-number="([^"]+)"([^>]*)>', markup) if not match[2].endswith(' hidden')]
-        chips = {(match[1], match[2]): (match[3], match[4]) for match in re.finditer(
-            r'id="filter-(owner|producer|show)-[^"]+" data-filter-value="([^"]+)" '
-            + r'aria-pressed="([^"]+)" data-filter-count="([^"]+)"', markup)}
+        rows = re.finditer(r'<div [^>]*data-filter-row="(owner|producer|show)"[^>]*>(.*?)</div>', markup, re.S)
+        chips = {(row[1], chip[1]): (chip[2], chip[3]) for row in rows for chip in re.finditer(
+            r'<button [^>]*data-filter-value="([^"]+)" aria-pressed="([^"]+)" data-filter-count="([^"]+)"', row[2])}
         return visible, chips
 
     def test_list_applies_address_filters_before_javascript_runs(self) -> None:

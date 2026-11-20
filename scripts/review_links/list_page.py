@@ -26,7 +26,7 @@ from scripts.production import change_review, footer_counts, record_store, sessi
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
-from scripts.review_links import new_item_dialog, review_items, review_page
+from scripts.review_links import new_item_dialog, review_items, review_legacy, review_page
 from scripts.review_links import search_fold, staff_names
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
@@ -67,25 +67,14 @@ CHIP_BY_STATE = {
 }
 
 
-class FilterFacet(NamedTuple):
-    name: str
-    field: str
-    bit: int
-    count_mask: int
-
-
 FILTER_FIELDS = {"show": "chip", "owner": "owner", "producer": "producer"}
-ALL_FILTER_BITS = (1 << len(FILTER_FIELDS)) - 1
-# Each count ignores its own filter.
-FILTER_FACETS = tuple(FilterFacet(name, field, 1 << index, ALL_FILTER_BITS ^ (1 << index))
-                      for index, (name, field) in enumerate(FILTER_FIELDS.items()))
+FILTER_FACETS = record_table.filter_facets(FILTER_FIELDS)
 STAFF_FILTERS = ("owner", "producer")
 SEARCH_FIELDS = {"number": r"^#?l?(?=[0-9])", "ownerName": "", "title": "", "state": "", "parkingLabel": ""}
 PARKED_SEARCH_LABEL = search_fold.fold("Parked")
 STATE_SEARCH_TEXT = {state: search_fold.fold(state.value) for state in the_list.ItemState}
 UNREAD_FILTER = ("unread", "1", "true")
 UNREAD_FIELD, UNREAD_VALUE, UNREAD_MATCH = UNREAD_FILTER
-LIST_QUERY_FIELDS = ("show", UNREAD_FIELD, *record_table.OWNER_QUERY_KEYS, "producer", "q", "key", "item", "reveal", "state")
 LINK_REVEAL_FIELDS = (("openQuestion", "true", ""), (UNREAD_FIELD, "false", UNREAD_FIELD))
 # Match the whitespace that String.trim removes.
 QUERY_WHITESPACE = ("\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
@@ -1028,7 +1017,7 @@ class ListQuery:
     @classmethod
     def read(cls, query: str, items: list[ListRecord]) -> ListQuery:
         fields = {name: values for name, values in parse_qs(query, keep_blank_values=True).items()
-                  if name in LIST_QUERY_FIELDS}
+                  if name in record_table.LIST_QUERY_FIELDS}
 
         def first(name: str) -> str:
             return fields.get(name, [""])[0]
@@ -1049,12 +1038,11 @@ class ListQuery:
                 keys -= {item}
         return cls({
             "show": show if show in ListChip and show != ListChip.ALL else "",
-            "owner": owner if any(entry.item.owner == owner for entry in items) else "",
-            "producer": producer if any(entry.item.producer == producer for entry in items) else "",
+            "owner": owner if owner and any(entry.item.owner == owner for entry in items) else "",
+            "producer": producer if producer and any(entry.item.producer == producer for entry in items) else "",
         }, first("q"), first(UNREAD_FIELD) == UNREAD_VALUE, keys, item, first("reveal") == "1")
 
-    def count_row(self, entry: ListRecord, text: SearchText, chip: ListChip,
-                  counts: dict[str, Counter[str]], search: str) -> bool:
+    def eligible(self, entry: ListRecord, text: SearchText, chip: ListChip, search: str) -> bool:
         item = entry.item
         if self.keys and entry.key not in self.keys:
             return False
@@ -1067,16 +1055,7 @@ class ListQuery:
             if not any((re.sub(pattern, "", search) if pattern else search) in search_values[field]
                        for field, pattern in SEARCH_FIELDS.items()):
                 return False
-        data = {"chip": chip, "owner": str(item.owner), "producer": item.producer}
-        excluded = sum(bit for name, field, bit, _ in FILTER_FACETS
-                       if self.selected[name] and data[field] != self.selected[name])
-        for name, field, _, count_mask in FILTER_FACETS:
-            if not excluded & count_mask:
-                counts[name]["all"] += 1
-                value = f"staff:{data[field]}" if name in STAFF_FILTERS else data[field]
-                if value != "all":
-                    counts[name][value] += 1
-        return not excluded
+        return True
 
     def reveals(self, entry: ListRecord, open_question: bool) -> bool:
         if self.item != entry.key:
@@ -1113,15 +1092,14 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     ordered_items = [(entry, the_list.parking_active(entry.item.parked_until, today)) for entry in items]
     ordered_items.sort(key=lambda pair: pair[1])
     secret = form_secret(root)
-    selection = ListQuery.read(query, items) if query else None
+    selection = ListQuery.read(query, items)
     chip_totals: dict[str, Counter[str]] = {facet.name: Counter() for facet in FILTER_FACETS}
-    search = normalize_search_text(selection.words.strip(QUERY_WHITESPACE)) if selection else ""
-    owners: Counter[the_list.ItemOwner] = Counter()
-    producers: Counter[the_list.ItemOwner] = Counter()
+    search = normalize_search_text(selection.words.strip(QUERY_WHITESPACE))
+    owners: set[the_list.ItemOwner] = set()
+    producers: set[the_list.ItemOwner] = set()
     rows: list[str] = []
     linked_row = ''
     deferred_links = False
-    chip_counts: Counter[ListChip] = Counter()
     shown = 0
 
     @cache
@@ -1132,17 +1110,18 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         return cell, owner.casefold(), normalize_search_text(owner)
 
     for index, (entry, parked) in enumerate(ordered_items):
-        owners[entry.item.owner] += 1
-        producers[entry.item.producer] += 1
+        owners.add(entry.item.owner)
+        producers.add(entry.item.producer)
         open_question = has_open_question(entry.item)
         visibility = the_list.question_visibility(entry.keeper, entry.item, status)
         chip = list_chip(entry.item.state, parked=parked, open_question=open_question,
                          unread_delivery=the_list.unread_delivery(entry.item))
-        chip_counts[chip] += 1
         owner_cell, owner_sort, owner_search = owner_display(entry.item.owner)
         search_text = SearchText(owner_search, normalize_search_text(entry.item.title))
-        visible = selection is None or selection.count_row(entry, search_text, chip, chip_totals, search)
-        linked = not visible and selection is not None and selection.reveals(entry, open_question)
+        visible = selection.eligible(entry, search_text, chip, search) and record_table.count_filter_row(
+            FILTER_FACETS, {"chip": chip, "owner": entry.item.owner, "producer": entry.item.producer},
+            selection.selected, chip_totals, staff_filters=STAFF_FILTERS)
+        linked = not visible and selection.reveals(entry, open_question)
         shown += visible
         row_reviews = reviews
         if entry.item.reviews and (
@@ -1159,23 +1138,16 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             linked_row = row
         else:
             rows.append(row)
-    shows = [record_table.Chip("all", "All", len(items)),
-             *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
-               for chip in ListChip if chip != ListChip.ALL)]
-    if selection is not None:
-        shows = [replace(chip, count=chip_totals["show"][chip.value]) for chip in shows]
-    else:
-        for name, totals in (("owner", owners), ("producer", producers)):
-            chip_totals[name].update({f"staff:{identity}": total for identity, total in totals.items()})
-            chip_totals[name]["all"] = totals.total()
+    shows = [record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_totals["show"][chip])
+             for chip in ListChip]
     owner_chips = staff_chips(members, owners, chip_totals["owner"])
     producer_chips = staff_chips(members, producers, chip_totals["producer"])
-    owner_selected = f'staff:{selection.selected["owner"]}' if selection and selection.selected["owner"] else "all"
-    producer_selected = f'staff:{selection.selected["producer"]}' if selection and selection.selected["producer"] else "all"
-    show_selected = (selection.selected["show"] or "all") if selection else "all"
-    check_unread = ' checked' if selection and selection.unread else ''
-    words = selection.words if selection else ''
-    hide_empty = ' hidden' if shown or selection is None else ''
+    owner_selected = f'staff:{selection.selected["owner"]}' if selection.selected["owner"] else "all"
+    producer_selected = f'staff:{selection.selected["producer"]}' if selection.selected["producer"] else "all"
+    show_selected = selection.selected["show"] or "all"
+    check_unread = ' checked' if selection.unread else ''
+    words = selection.words
+    hide_empty = ' hidden' if shown or not query else ''
     hide_link = '' if linked_row else ' hidden'
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
@@ -1322,6 +1294,7 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 
 # Use the Python case-folding table for browser search.
 SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
+          + review_legacy.SHOW_ALIAS_SCRIPT
           + record_table.DATE_TIME_SCRIPT + '''(() => {
 const chipsByQuestion=''' + json.dumps({
     str(open_question).lower(): {
@@ -1536,18 +1509,17 @@ async function markOpenedAnswerRead(item,watch){
 const tableView=createRecordTable({content:()=>content,
  shows,
  defaultShow:'all',
- queryFields:''' + json.dumps(LIST_QUERY_FIELDS) + r''',
  normalizeWords,
  expandFilters:params=>{
-  const show=params.get('show') || '',state=params.get('state') || '';
+  const show=params.get('show') || '';
   if(show===unreadField) params.set(unreadField,unreadValue);
   else if(params.has(unreadField) && params.get(unreadField)!==unreadValue) params.set(unreadField,'');
-  if(params.has('show') || params.has('state')){
+  expandStateAlias(params,(show,state)=>{
+   show=show || '';
    const aliases=Object.hasOwn(showAliases,show) ? showAliases[show] : showAliases['*'];
    const alias=Object.hasOwn(aliases,state) ? state : '';
-   params.set('show',Object.hasOwn(aliases,alias) ? aliases[alias] : show);
-   params.delete('state');
-  }
+   return Object.hasOwn(aliases,alias) ? aliases[alias] : show;
+  });
   const [owner,showrunner]=ownerQueryKeys;
   if(params.has(showrunner)){
    params.set(owner,params.get(owner) || params.get(showrunner));
@@ -1556,6 +1528,7 @@ const tableView=createRecordTable({content:()=>content,
  },
  filters:['producer',unreadField],
  staffChipFilters:staffFilters,
+ encodedStaffFields:true,
  beforeApply:rememberLogPositions,
  applied:(_items,{show,filters})=>{
   const nextUnreadShow=filters.unread ? show : '';
