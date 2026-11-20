@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 from typing import TypedDict, cast, override
 import unittest
@@ -19,8 +20,9 @@ from unittest import mock
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import queue_place as shell_place
-from scripts.build_queue import snapshot_codec as codec, step_estimator
+from scripts.build_queue import placement, snapshot_codec as codec, step_estimator
 from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock
+from scripts.mac_test.claim_state import WholeMacScope
 
 
 class CheckerCall(TypedDict):
@@ -61,6 +63,31 @@ def wait_client_main() -> int:
     with mock.patch.object(client, "CLOCK", clock), mock.patch.object(step_estimator, "step_estimate", side_effect=estimate):
         with mock.patch.object(sys, "argv", ["queue_place.py", *sys.argv[2:]]):
             return shell_place.main()
+
+
+class PlacementWaitReasonTests(unittest.TestCase):
+    def test_an_immediate_repository_slot_leaves_the_gate_wait_report_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, {"BUILDLOG_DIR": temporary}):
+            clock = FakeClock()
+            owner = wire.Owner(1234, "8000")
+            request = wire.RepositorySlotRequest("gate-slot", owner, clock.now(), "repo", "host", temporary, 1,
+                                                 clock.now() + 60, wire.Identity("unit", "worker", "merge-gate", temporary))
+            with mock.patch.object(client, "CLOCK", clock), mock.patch.object(client, "_call", return_value=wire.RepositorySlotReady()):
+                self.assertIsInstance(client.repository_slot(request), wire.RepositorySlotReady)
+            call_id = admission_records.verify_run_call_id(owner.pid, owner.start_time)
+            admission_records.finish_placement_waits(call_id, clock.now() + 5)
+            self.assertEqual(admission_records.placement_wait_totals(call_id), {})
+
+    def test_hana_recovery_and_refusal_use_different_reasons(self) -> None:
+        target = placement.PlacementDestination("ssh", "hana", "fixture", WholeMacScope())
+        candidate = placement.CandidateEligibility(target, placement.TemporaryExclusion("recovery"))
+        recovery = wire.PlacementWait("step", 10, 1, (candidate,),
+            retry_notices=(placement.ProviderRetryNotice("hana", "recovery", 1),))
+        self.assertIs(client.placement_wait_reason(recovery), admission_records.PlacementWaitReason.HANA_RECOVERY)
+
+        refusal = replace(recovery, eligibility=(),
+            retry_notices=(placement.ProviderRetryNotice("mac", "off", 180),))
+        self.assertIs(client.placement_wait_reason(refusal), admission_records.PlacementWaitReason.AWS_REFUSAL_RETRY)
 
 
 class AdmissionClientWaitTests(unittest.TestCase):

@@ -23,13 +23,14 @@ build exits with cargo's status, and the tests do not run.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import subprocess
 import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
@@ -229,8 +230,8 @@ def host_platform() -> str:
     return "macos" if sys.platform == "darwin" else sys.platform
 
 
-def build(prebuild: Prebuild, manifest: Path, words: tuple[str, ...]) -> int:
-    """Build one artifact and set its variable; return cargo's status."""
+def build(prebuild: Prebuild, manifest: Path, words: tuple[str, ...], call_id: str = "") -> int:
+    """Build one artifact and set its variable."""
     if host_platform() not in prebuild.platforms:
         print(f"prebuild: {prebuild.package} builds only on {', '.join(sorted(prebuild.platforms))}; "
               + f"not built on {host_platform()}", file=sys.stderr, flush=True)
@@ -239,8 +240,12 @@ def build(prebuild: Prebuild, manifest: Path, words: tuple[str, ...]) -> int:
                "-p", prebuild.package, "--target", prebuild.target]
     command += [f"--target-dir={value}" for value in option_values(words, ("--target-dir",))[-1:]]
     print("+ " + " ".join(command), file=sys.stderr, flush=True)
-    result = subprocess.run([*command, "--message-format=json-render-diagnostics"],
-                            stdout=subprocess.PIPE, text=True, check=False)
+    command.append("--message-format=json-render-diagnostics")
+    if call_id:
+        from scripts.build_queue.admission_client import verify_command_argv
+
+        command = verify_command_argv(call_id, command)
+    result = subprocess.run(command, stdout=subprocess.PIPE, text=True, check=False)
     if result.returncode != 0:
         print(f"prebuild: cargo build of {prebuild.package} failed (status {result.returncode}); the tests did not run",
               file=sys.stderr)
@@ -255,11 +260,53 @@ def build(prebuild: Prebuild, manifest: Path, words: tuple[str, ...]) -> int:
     return 0
 
 
+class VerifyNextestArguments(argparse.Namespace):
+    call_id: str = ""
+    pool: Path = Path()
+    width_file: Path = Path()
+    reservation: str = ""
+    command: list[str] = []
+
+
+def run_verified_nextest(argv: list[str]) -> int:
+    """Stamp the Cargo commands that the token holder starts."""
+    from scripts.build_queue.admission_client import verify_command_argv
+    from scripts.lib import conf
+    from scripts.lint import nextest_tokens
+
+    parser = argparse.ArgumentParser(description=run_verified_nextest.__doc__)
+    _ = parser.add_argument("--call-id", required=True)
+    _ = parser.add_argument("--pool", type=Path, required=True)
+    _ = parser.add_argument("--width-file", type=Path, required=True)
+    _ = parser.add_argument("--reservation", default="")
+    _ = parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv, namespace=VerifyNextestArguments())
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    run = nextest_tokens.test_run(command)
+    if isinstance(run, nextest_tokens.UnsizedCommand):
+        return nextest_tokens.run_child(verify_command_argv(args.call_id, run.argv))
+
+    def record_width(threads: int) -> None:
+        if args.reservation:
+            nextest_tokens.record_reservation_width(args.reservation, threads)
+
+    configuration = conf.read("build_admission")
+    measured = replace(run, head=tuple(verify_command_argv(args.call_id, run.head)))
+    return nextest_tokens.run_with_tokens(measured, args.pool, configuration.whole("test_token_floor"),
+        args.width_file, record_width, nested_tokens=configuration.whole("nested_tokens"))
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) < 4 or argv[0] != "--manifest" or argv[2] != "--":
-        print("usage: prebuild.py --manifest <Cargo.toml> -- <command...>", file=sys.stderr)
+    if argv[:1] == ["--verify-nextest"]:
+        return run_verified_nextest(argv[1:])
+    manifest_args, tail = argv[:2], argv[2:]
+    call_id = ""
+    if len(tail) >= 2 and tail[0] == "--verify-call-id":
+        call_id, tail = tail[1], tail[2:]
+    if len(manifest_args) != 2 or manifest_args[0] != "--manifest" or len(tail) < 2 or tail[0] != "--":
+        print("usage: prebuild.py --manifest <Cargo.toml> [--verify-call-id ID] -- <command...>", file=sys.stderr)
         return 2
-    manifest, command = Path(argv[1]), argv[3:]
+    manifest, command = Path(manifest_args[1]), tail[1:]
     try:
         prebuilds = read_prebuilds(manifest)
     except (OSError, tomllib.TOMLDecodeError, DeclarationError) as error:
@@ -269,7 +316,7 @@ def main(argv: list[str]) -> int:
     if starts:
         words = tuple(command[starts[0] + 3:])
         for prebuild in needed(prebuilds, test_selection(words)):
-            status = build(prebuild, manifest, words)
+            status = build(prebuild, manifest, words, call_id)
             if status != 0:
                 return status
     os.execvp(command[0], command)

@@ -578,6 +578,23 @@ Queue views continue to use the service.
 
 ### Queue lifecycle and calibration
 
+Verify reports setup as the time from call start to first command start minus the named waits in that time.
+The launcher starts Cargo before it writes the command stamp. An exec failure leaves no stamp.
+The stamp uses the child's kernel start time when `CLOCK_BOOTTIME` is available.
+Without `CLOCK_BOOTTIME`, setup can include the time between Cargo's start and the launcher's observation.
+The launcher writes the stamp in a daemon thread. It returns Cargo's status as soon as Cargo exits.
+The stamp can be lost if the launcher exits before the write completes.
+Cargo builds for prebuild use the same launcher as the check or test command.
+A detached process uses the original call ID and start time.
+Verify confirms a detached handoff from the matching run record before the record has a command PID.
+If an identical run is already active, Verify finishes the new call.
+If the supervisor dies before the command starts, recovery ends the call at the last live observation.
+A provider refusal ends its attempt, and the call continues when another target is eligible.
+If the journal has no command start, the report uses the call end.
+A copy that exits before it calls verify has no call record.
+The copy finishes the call after first-step admission or checkout failure.
+If Nix refuses the call, recovery ends the wait at the last time it observed the owner alive.
+
 The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
 The same record holds Cargo, `targeted-test`, and `merge-gate` steps.
 The append function locks the file and removes incomplete rows before an append.

@@ -2444,6 +2444,10 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
                     print(f"copies: publish: {error}", file=sys.stderr)
             target = checkout / os.environ.get("CARGO_TARGET_DIR", "target")
             before = publication_candidates(checkout, target, command, paths)
+            if args.verify_call_id:
+                from scripts.build_queue import admission_client
+
+                command = admission_client.verify_command_argv(args.verify_call_id, command)
             status = build_folders.run_build_command(command, path=checkout, environment=os.environ,
                                                      pass_fds=COMMAND_LOCKS.get())
             capture_step_files(output, paths, before)
@@ -2539,6 +2543,7 @@ class CopyArguments(argparse.Namespace):
     step: str = "hold"
     tree: str = ""
     capacity_file: str = ""
+    verify_call_id: str = ""
     deadline: float = 0
     pid: int = 0
     verify_pid: int = 0
@@ -2585,6 +2590,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = hold.add_argument("--tree", required=True)
     _ = hold.add_argument("--step", default="hold")
     _ = hold.add_argument("--capacity-file", default="")
+    _ = hold.add_argument("--verify-call-id", default="")
     _ = hold.add_argument("--scratch", action="store_true")
     _ = hold.add_argument("command", nargs=argparse.REMAINDER)
     wait_slot = commands.add_parser("wait-slot")

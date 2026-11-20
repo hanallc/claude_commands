@@ -6,7 +6,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -21,6 +21,7 @@ import socket
 import shlex
 import subprocess
 import sys
+import time
 from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
 
@@ -184,7 +185,25 @@ def _print_placement_status(episode: str, attempt: str) -> int:
 def request_placement(request: wire.PlacementRequest
                       ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
     """Request a durable destination without selecting a fallback in the caller."""
-    reply = _call(request, lambda _wait: None)
+    from scripts.build_queue import admission_records as records
+
+    key = placement_wait_key(request)
+    retry = _ACQUISITION_RETRY.get()
+    if retry is not None:
+        if isinstance(key, records.PlacementWaitKey):
+            retry.placement_wait = key
+        elif isinstance(retry.placement_wait, records.PlacementWaitKey) and retry.placement_wait.episode == request.episode:
+            key = retry.placement_wait
+    if isinstance(key, records.PlacementWaitKey):
+        records.record_placement_wait(key, records.PlacementWaitReason.ROUTING, CLOCK.now(), begin_routing=True)
+    try:
+        reply = _call(request, lambda _wait: None)
+    except BaseException:
+        WaitOutput.record_placement(key, records.NoPlacementWait())
+        raise
+    if isinstance(key, records.PlacementWaitKey) and isinstance(reply, wire.Assignment):
+        key = replace(key, attempt=reply.assignment.attempt)
+    WaitOutput.record_placement(key, placement_wait_reason(reply))
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Refused):
@@ -366,6 +385,11 @@ class _QueueLeft(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class UnlinkedPlacementWait:
+    """The acquisition has no linked verify call."""
+
+
 @dataclass
 class AcquisitionRetry:
     deadline: float
@@ -375,6 +399,7 @@ class AcquisitionRetry:
     leave_interval: float = float("inf")
     unreachable_deadline: float = float("inf")
     estimate_refresh_pending: bool = False
+    placement_wait: records.PlacementWaitKey | UnlinkedPlacementWait = field(default_factory=UnlinkedPlacementWait)
 
     def start_leave_schedule(self, interval: float) -> None:
         self.leave_interval = interval
@@ -654,6 +679,10 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                             raise CheckerFailure("invalid repository slot answer")
                         if reply != slot_waiting or not had_wait:
                             print(reply.text, file=sys.stderr)
+                        if not had_wait:
+                            call = records.verify_run_call_id(first.owner.pid, first.owner.start_time)
+                            records.record_placement_wait(records.PlacementWaitKey(call, first.episode),
+                                records.PlacementWaitReason.FOLDER, CLOCK.now())
                         slot_waiting = reply
                         had_wait = True
                         failed_since = None
@@ -890,7 +919,14 @@ def request_id() -> str:
 
 def repository_slot(request: wire.RepositorySlotRequest) -> wire.RepositorySlotReady | wire.RepositorySlotExpired | wire.Refused:
     """Wait on the queue connection without polling the repository pool."""
-    reply = _call(request, lambda waiting: None, configuration=wire.PROTOCOL_ACQUISITION_TIMING)
+    from scripts.build_queue import admission_records as records
+
+    try:
+        reply = _call(request, lambda waiting: None, configuration=wire.PROTOCOL_ACQUISITION_TIMING)
+    finally:
+        call = records.verify_run_call_id(request.owner.pid, request.owner.start_time)
+        records.record_placement_wait(records.PlacementWaitKey(call, request.episode),
+            records.NO_PLACEMENT_WAIT, CLOCK.now(), only=records.PlacementWaitReason.FOLDER)
     if isinstance(reply, (wire.RepositorySlotReady, wire.RepositorySlotExpired, wire.Refused)):
         return reply
     return wire.Refused("left the repository slot queue")
@@ -956,14 +992,82 @@ class QueuedPlacementEpisode:
     episode: str
 
 
+def placement_wait_key(request: wire.PlacementRequest) -> records.PlacementWaitKey | records.NoCallRecord:
+    from scripts.build_queue import admission_records as records
+
+    local = request.local
+    if (isinstance(request.purpose, placement.NormalStep) and isinstance(local, wire.LocalAdmissionContext)
+            and isinstance(local.call, records.CallRecord)):
+        return records.PlacementWaitKey(local.call.call_id, request.episode)
+    return records.NoCallRecord()
+
+
+def admission_wait_reason(reply: wire.Wait) -> records.PlacementWaitReason:
+    from scripts.build_queue import admission_records as records
+
+    reason = records.PlacementWaitReason
+    cause = reply.reason.cause if isinstance(reply.reason, records.HeadAdmissionStatus) else reply.reason
+    if isinstance(cause, placement.CargoFolderWait):
+        return reason.FOLDER
+    if isinstance(cause, wire.CloudSlotWait):
+        return reason.REMOTE_START if isinstance(cause.state, status_wire.ReservedCloudSlot) else reason.SLOT
+    if isinstance(cause, (records.GpuSlotWait, records.TokenWaitingWaiter)):
+        return reason.SLOT
+    if isinstance(cause, records.NatedevHeld):
+        return reason.HOLD
+    return reason.MEMORY
+
+
+def placement_wait_reason(reply: object) -> records.PlacementWaitReason | records.NoPlacementWait:
+    from scripts.build_queue import admission_records as records
+
+    reason = records.PlacementWaitReason
+    if isinstance(reply, wire.Assignment):
+        return reason.REMOTE_START
+    if not isinstance(reply, wire.PlacementWait):
+        return records.NoPlacementWait()
+    wait = reply.wait
+    if isinstance(wait, wire.Wait):
+        return admission_wait_reason(wait)
+    if isinstance(wait, wire.PlacementResourceWait):
+        if wait.reason == "blocked":
+            return reason.HOLD
+        if wait.reason == "starting":
+            return reason.REMOTE_START
+        if wait.reason == "busy":
+            return reason.SLOT
+    if any(notice.delay_seconds > 0 and notice.reason not in ("starting", "blocked", "recovery")
+           for notice in reply.retry_notices):
+        return reason.AWS_REFUSAL_RETRY
+    for candidate in reply.eligibility:
+        if candidate.destination.provider != "ssh" or not isinstance(candidate.eligibility, placement.TemporaryExclusion):
+            continue
+        if candidate.eligibility.reason == "recovery":
+            return reason.HANA_RECOVERY
+        if candidate.eligibility.reason == "starting":
+            return reason.REMOTE_START
+    return reason.ROUTING
+
+
+@dataclass(frozen=True)
+class MemoryWaitInactive:
+    pass
+
+
+@dataclass(frozen=True)
+class MemoryWaitStarted:
+    monotonic_at: float
+
+
 @dataclass(frozen=True)
 class PlacementWaitNotice:
     started: float
     last_reasons: tuple[str, ...]
     last_position: int
-    last_reply: wire.Wait | wire.PlacementResourceWait
+    last_reply: wire.Wait | wire.PlacementResourceWait | wire.PlacementEvidenceWait
     elapsed_memory_seconds: float = 0.0
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
+    memory_wait: MemoryWaitStarted | MemoryWaitInactive = field(default_factory=MemoryWaitInactive)
 
 
 def first_hana_image_notice() -> bool:
@@ -991,11 +1095,28 @@ class WaitOutput:
     on_event: Callable[[str], None] = field(default=lambda _event: None)
     last_resource: wire.PlacementResourceWait | wire.PlacementEvidenceWait = field(default_factory=wire.PlacementEvidenceWait)
     elapsed_memory_seconds: float = 0.0
+    memory_wait: MemoryWaitStarted | MemoryWaitInactive = field(default_factory=MemoryWaitInactive)
     last_provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     announced_retries: set[str] = field(default_factory=set)
     announced_hana_image_stale: bool = False
     status_open: bool = False
     local_reason: str = field(default_factory=lambda: os.environ.get("BUILD_QUEUE_LOCAL_REASON", ""))
+
+    @staticmethod
+    def record_placement(key: records.PlacementWaitKey | records.NoCallRecord,
+                         reason: records.PlacementWaitReason | records.NoPlacementWait) -> None:
+        from scripts.build_queue import admission_records as records
+
+        if isinstance(key, records.PlacementWaitKey):
+            records.record_placement_wait(key, reason, CLOCK.now())
+
+    def count_memory(self, waiting: bool) -> None:
+        active = self.memory_wait
+        if waiting and isinstance(active, MemoryWaitInactive):
+            self.memory_wait = MemoryWaitStarted(CLOCK.monotonic())
+        elif not waiting and isinstance(active, MemoryWaitStarted):
+            self.elapsed_memory_seconds += CLOCK.monotonic() - active.monotonic_at
+            self.memory_wait = MemoryWaitInactive()
 
     def retry_notices(self, notices: tuple[placement.ProviderRetryNotice, ...], *, placement_events: bool) -> None:
         for retry in notices:
@@ -1041,12 +1162,11 @@ class WaitOutput:
     def resource_wait(self, reply: wire.PlacementResourceWait) -> None:
         from scripts.build_queue import placement
 
+        self.count_memory(False)
         previous = self.last_resource
         changed = not isinstance(previous, wire.PlacementResourceWait) or (
             previous.resource, previous.reason) != (reply.resource, reply.reason)
         if self.held and changed:
-            if not isinstance(previous, wire.PlacementResourceWait):
-                self.elapsed_memory_seconds += CLOCK.monotonic() - self.started
             self.on_event("done")
             self.held = False
         if not self.held or previous != reply:
@@ -1078,6 +1198,7 @@ class WaitOutput:
     def __call__(self, reply: wire.Wait) -> None:
         from scripts.build_queue import admission_records as records
         from scripts.lib.user_zone import user_zone
+        self.count_memory(admission_wait_reason(reply) == records.PlacementWaitReason.MEMORY)
         if isinstance(self.last_resource, wire.PlacementResourceWait):
             self.on_event("done")
             self.held = False
@@ -1137,9 +1258,11 @@ class WaitOutput:
         self.status(f"{prefix}: " + "; ".join(part for part in parts if part))
 
     def elapsed_seconds(self) -> int:
-        if isinstance(self.last_resource, wire.PlacementResourceWait):
-            return int(self.elapsed_memory_seconds)
-        return int(self.elapsed_memory_seconds + CLOCK.monotonic() - self.started) if self.held or self.deadline_reached else 0
+        if isinstance(self.memory_wait, MemoryWaitStarted):
+            return int(self.elapsed_memory_seconds + CLOCK.monotonic() - self.memory_wait.monotonic_at)
+        if self.deadline_reached and not self.held:
+            return int(CLOCK.monotonic() - self.started)
+        return int(self.elapsed_memory_seconds)
 
     def finished(self, *, left: bool = False, placement_events: bool = False) -> None:
         if not self.held:
@@ -1330,6 +1453,7 @@ def saved_cleanup_timing() -> wire.CleanupTiming:
 
 class ClientArguments(argparse.Namespace):
     command: str = ""
+    label: str = ""
     session_id: str = ""
     reservation: str = ""
     value: int = 0
@@ -1352,6 +1476,15 @@ class ClientArguments(argparse.Namespace):
     run: str = ""
     parent_episode: str = ""
     call_started: float = 0.0
+    step_since: float = 0.0
+    call_id: str = ""
+    wait_reason: str = ""
+    wait_only: str = ""
+    wait_at: float = 0.0
+    copy_pid: int = 0
+    owner_start: str = ""
+    owner_seen_at: float = 0.0
+    continue_call: bool = False
     assignment_file: Path = Path()
     token: str = "none"
     writes_tree: bool = False
@@ -1403,6 +1536,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 output.started, output.last_reasons = saved.started, saved.last_reasons
                 output.last_position = saved.last_position
                 output.elapsed_memory_seconds = saved.elapsed_memory_seconds
+                output.memory_wait = saved.memory_wait
                 output.last_provider_diagnostics = saved.provider_diagnostics
                 if isinstance(saved.last_reply, wire.Wait):
                     output.last_holder = saved.last_reply.snapshot.holder
@@ -1435,8 +1569,11 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             else:
                 already_queued = already_queued or assigned.assignment.episode == episode
         def refresh_local() -> wire.AdmitRequest:
-            return step_request(step_argv, os.getcwd(), wire.Owner(args.pid, start), args.since,
-                                args.sidecar, episode, run=parse_run_identity(args.run))
+            refreshed = step_request(step_argv, os.getcwd(), wire.Owner(args.pid, start), args.since,
+                                     args.sidecar, episode, run=parse_run_identity(args.run))
+            if args.call_id and args.step_since > 0:
+                return replace(refreshed, call=records.StepCallRecord(args.call_id, args.step_since))
+            return replace(refreshed, call=records.CallRecord(args.call_id)) if args.call_id else refreshed
 
         cargo_folder: placement.CargoFolder | placement.NoCargoFolder = placement.NoCargoFolder()
         if args.cargo_folder is not None:
@@ -1502,13 +1639,14 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                            and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             if isinstance(answer.wait, wire.Wait) and not token_check:
                 output(answer.wait)
-                notice = PlacementWaitNotice(output.started, output.last_reasons,
-                    output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
-                write_text_atomic(placement_wait_state, wire.encode_record(notice), new_file_mode=0o600)
             elif isinstance(answer.wait, wire.PlacementResourceWait):
                 output.resource_wait(answer.wait)
+            else:
+                output.count_memory(False)
+            if output.held:
                 notice = PlacementWaitNotice(output.started, output.last_reasons,
-                    output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
+                    output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics,
+                    output.memory_wait)
                 write_text_atomic(placement_wait_state, wire.encode_record(notice), new_file_mode=0o600)
             if isinstance(answer.wait, wire.Wait):
                 cause = answer.wait.reason
@@ -1557,20 +1695,117 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 queued_episode_state.unlink(missing_ok=True)
 
 
+def copy_call_start(pid: int, verify_started: float, saved_start: str = "") -> float:
+    """Use the copy process start when it prepared the source before verify."""
+    if pid > 0 and hasattr(time, "CLOCK_BOOTTIME"):
+        from scripts.build_queue import admission_records as records
+
+        try:
+            started = saved_start or records.process_start_time(pid)
+            if started is not None:
+                uptime = time.clock_gettime(time.CLOCK_BOOTTIME)
+                return min(verify_started, CLOCK.now() - uptime + int(started) / os.sysconf("SC_CLK_TCK"))
+        except (OSError, ValueError):
+            pass
+    return verify_started
+
+
+def verify_command_argv(call_id: str, command: Sequence[str]) -> list[str]:
+    """Wrap the command that will run after preparation."""
+    return [sys.executable, str(Path(__file__).resolve()), "verify-command", "--call-id", call_id, "--", *command]
+
+
+def launch_verify_command(call_id: str, command: list[str]) -> int:
+    """Start the command in this group, then record its start."""
+    from scripts.build_queue import admission_records as records
+
+    try:
+        if command[0] == "env":
+            cargo = 1
+            while command[cargo:cargo + 1] == ["-u"]:
+                cargo += 2
+            while cargo < len(command) and "=" in command[cargo] and not command[cargo].startswith("-"):
+                cargo += 1
+            if command[cargo:cargo + 1] == ["cargo"]:
+                os.execvp("env", [*command[:cargo], *verify_command_argv(call_id, command[cargo:])])
+        child = subprocess.Popen(command, close_fds=False)
+    except (OSError, ValueError) as error:
+        print(f"verify.sh: cannot launch {command[0]}: {error}", file=sys.stderr)
+        return 125
+    with child:
+        records.record_started_verify_command(call_id, child.pid)
+        status = child.wait()
+    return status if status >= 0 else 128 - status
+
+
+def detached_verify_handoff(label: str, command: list[str]) -> bool:
+    """Check for a run record that matches this call."""
+    from scripts.agents import detached_runs, worker_lifecycle
+
+    def recorded(directory: str) -> bool:
+        runs = Path(directory) / worker_lifecycle.DETACHED_RUNS_DIR
+        try:
+            for path in runs.glob("*.json"):
+                try:
+                    record = worker_lifecycle.read_json_object(path)
+                except (OSError, ValueError):
+                    continue
+                if (record.get("label") == label and record.get("command") == command
+                        and record.get("status") in ("running", "finished")):
+                    return True
+        except OSError:
+            return False
+        return False
+
+    run_dir = os.environ.get("UNIT_RUN_DIR", "")
+    if run_dir and recorded(run_dir):
+        return True
+    try:
+        caller = detached_runs.caller_from_environment(dict(os.environ))
+    except (OSError, ValueError):
+        return False
+    return isinstance(caller, detached_runs.PaneCaller) and caller.session_dir != run_dir and recorded(caller.session_dir)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
     for name in ("view", "explain", "down-alert", "priority-clear", "code-version", "check-nested"):
         _ = subcommands.add_parser(name)
+    command_parser = subcommands.add_parser("verify-command")
+    _ = command_parser.add_argument("--call-id", required=True)
+    _ = command_parser.add_argument("argv", nargs=argparse.REMAINDER)
+    handoff_parser = subcommands.add_parser("verify-detached-handoff")
+    _ = handoff_parser.add_argument("--label", required=True)
+    _ = handoff_parser.add_argument("argv", nargs=argparse.REMAINDER)
     status_parser = subcommands.add_parser("placement-status")
     _ = status_parser.add_argument("--episode", required=True)
     _ = status_parser.add_argument("--attempt", required=True)
     placement_parser = subcommands.add_parser("place-step")
-    for name in ("episode", "repo-root", "package", "kind", "source-key", "target", "session-id", "run", "sidecar", "parent-episode"):
+    for name in ("episode", "repo-root", "package", "kind", "source-key", "target", "session-id", "run", "sidecar", "parent-episode", "call-id"):
         _ = placement_parser.add_argument("--" + name, default="")
+    for name in ("placement-wait", "placement-wait-start", "placement-wait-report"):
+        wait_parser = subcommands.add_parser(name)
+        _ = wait_parser.add_argument("--call-id", required=True)
+        if name == "placement-wait":
+            _ = wait_parser.add_argument("--episode", default="")
+            _ = wait_parser.add_argument("--attempt", default="")
+            _ = wait_parser.add_argument("--wait-reason", required=True)
+            _ = wait_parser.add_argument("--wait-only", default="")
+            _ = wait_parser.add_argument("--wait-at", type=float, required=True)
+        if name != "placement-wait-report":
+            _ = wait_parser.add_argument("--continue-call", action="store_true")
+        if name == "placement-wait-start":
+            _ = wait_parser.add_argument("--wait-at", type=float, required=True)
+            _ = wait_parser.add_argument("--call-started", type=float, default=0.0)
+            _ = wait_parser.add_argument("--pid", type=int, required=True)
+            _ = wait_parser.add_argument("--copy-pid", type=int, default=0)
+            _ = wait_parser.add_argument("--owner-start", default="")
+            _ = wait_parser.add_argument("--owner-seen-at", type=float, default=0.0)
     _ = placement_parser.add_argument("--cargo-folder", type=Path)
     _ = placement_parser.add_argument("--pid", type=int, default=os.getppid())
     _ = placement_parser.add_argument("--since", type=float, required=True)
+    _ = placement_parser.add_argument("--step-since", type=float, default=0.0)
     _ = placement_parser.add_argument("--call-started", type=float, default=0.0)
     _ = placement_parser.add_argument("--assignment-file", type=Path, required=True)
     _ = placement_parser.add_argument("--shell-state", type=Path)
@@ -1611,6 +1846,42 @@ def main(argv: list[str] | None = None) -> int:
     _ = priority_parser.add_argument("unit")
     _ = priority_parser.add_argument("--why", default="the user's bump")
     args = parser.parse_args(argv, namespace=ClientArguments())
+    if args.command == "verify-command":
+        command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+        if not command:
+            parser.error("verify-command needs a command after --")
+        return launch_verify_command(args.call_id, command)
+    if args.command == "verify-detached-handoff":
+        command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+        return 0 if detached_verify_handoff(args.label, command) else 1
+    if args.command in ("placement-wait", "placement-wait-start", "placement-wait-report"):
+        from scripts.build_queue import admission_records as records
+
+        if args.command == "placement-wait-report":
+            print(json.dumps({"call_id": args.call_id, "placement_wait_s": records.placement_wait_totals(args.call_id)}))
+        elif args.command == "placement-wait-start":
+            from scripts.lib import process_start
+
+            start = args.owner_start
+            seen = args.owner_seen_at if start else 0.0
+            identity = process_start.process_start(args.pid)
+            if isinstance(identity, process_start.Started) and start in ("", identity.start):
+                start = identity.start
+                seen = max(seen, CLOCK.now())
+            owner = records.PlacementWaitOwner(args.pid, start) if start else records.UNTRACKED_WAIT_OWNER
+            at = args.call_started or copy_call_start(
+                args.copy_pid, args.wait_at, start if args.copy_pid == args.pid else "")
+            observed = records.OwnerLastSeen(seen) if seen else records.OwnerObservationNotRecorded.MISSING
+            records.register_placement_waits(args.call_id, owner, at, entered_at=args.wait_at,
+                                             owner_seen=observed, continued=args.continue_call)
+        elif args.wait_reason == "finish":
+            records.finish_placement_waits(args.call_id, args.wait_at, continued=args.continue_call)
+        else:
+            reason = records.NoPlacementWait() if args.wait_reason == "done" else records.PlacementWaitReason(args.wait_reason)
+            only = records.PlacementWaitReason(args.wait_only) if args.wait_only else records.NO_PLACEMENT_WAIT
+            records.record_placement_wait(records.PlacementWaitKey(args.call_id, args.episode, args.attempt),
+                                          reason, args.wait_at, only=only)
+        return 0
     if args.command in ("check-nested", "place-step"):
         reason = nested_reservation_reason()
         if reason:
