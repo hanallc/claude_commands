@@ -276,6 +276,18 @@ exit {manager_exit}
         self.assertEqual(len(self.module_events()), 2 * self.module_count)
         self.assertTrue((self.state / "types-ran").exists())
 
+    def test_required_scope_refuses_after_probe_failure_without_a_user_manager(self) -> None:
+        self.fail_scope_probe(manager_exit=1)
+        self.environment["BUILDLOG_SCOPE"] = "1"
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment, clear=True), redirect_stdout(output), \
+                self.assertRaisesRegex(GateRefused, "the systemd scope probe failed.*builds.slice"):
+            _ = merge_gate.run_suites(self.checkout, type_dirs=("scripts/production",))
+        self.assertIn("probe failed (exit 1)", output.getvalue())
+        self.assertEqual([call["args"][-1] for call in self.calls() if call["tool"] == "systemd-run"], ["true"])
+        self.assertEqual(self.module_events(), [])
+        self.assertFalse((self.state / "types-ran").exists())
+
     @gate_suites(*FIXTURE_FOLDERS[:merge_gate.RERUN_LIMIT])
     def test_more_than_the_rerun_limit_keeps_all_first_failures(self) -> None:
         failed_suites = self.suites[:merge_gate.RERUN_LIMIT]

@@ -11,6 +11,7 @@ A job still running at the module time limit fails the gate (default 1800 s).
 After the parallel pass, up to eight failed test modules run once more, alone.
 Time-limited jobs and the type check do not run again.
 Shared gates give each job a scope under the gate slice when scopes are enabled and supported.
+For a private FIFO with old records, BUILDLOG_JOBSERVER_SLOTS can supply its seeded slot count.
 --tests-only runs the same suite runner without changing git refs or files.
 Clean trees reuse full passes on the same host. Merge gates run all modules.
 Targeted tests select affected modules from a certified ancestor. --nightly validates a shared clone.
@@ -43,7 +44,6 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
-import errno
 import fcntl
 import hashlib
 import inspect
@@ -395,7 +395,9 @@ class SharedCPUSlot:
         self.returning = True
         recovery = ACTIVE_GATE_RECOVERY.get()
         if self.record is not None and isinstance(recovery, GateRecovery):
-            with token_operation(self.descriptor):
+            with token_operation(self.descriptor) as fifo:
+                if fifo and self.record.pool_size and fifo_bytes(self.descriptor) >= self.record.pool_size:
+                    raise GateRecoveryUnresolved("the FIFO has no room for the recorded slot return")
                 recovery.return_token(self.record, self.descriptor)
         else:
             with token_operation(self.descriptor):
@@ -410,6 +412,7 @@ class SharedCPUPool:
     blocking: int
     owned: list[SharedCPUSlot] = field(default_factory=list)
     deadline: float = math.inf
+    fifo_size: int = 0
 
     def acquire(self) -> SharedCPUSlot:
         """Wait for a CPU slot or cancellation while no module runs."""
@@ -432,13 +435,7 @@ class SharedCPUPool:
                     if not readable or remaining == 0:
                         recovery = ACTIVE_GATE_RECOVERY.get()
                         recover_shared_gate_runs(recovery.repo if isinstance(recovery, GateRecovery) else "",
-                                                 deadline=self.deadline)
-                        if time.monotonic() >= self.deadline:
-                            raise TimeoutError("gate time limit while waiting for a CPU slot")
-                        try:
-                            recover_lost_fifo_token(self.descriptor, deadline=self.deadline)
-                        except (GateRecoveryUnresolved, OSError, ValueError, KeyError, TypeError) as error:
-                            report_gate_recovery(Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve")), error)
+                                                 deadline=self.deadline, pool_descriptor=self.descriptor)
                         now = time.monotonic()
                         if now >= self.deadline:
                             raise TimeoutError("gate time limit while waiting for a CPU slot")
@@ -461,20 +458,25 @@ class SharedCPUPool:
         # CUSE devices need not honor O_NONBLOCK in the same way as pipes.
         if not select.select([self.descriptor], [], [], 0)[0]:
             return WaitingForCPU()
-        try:
-            with token_operation(self.descriptor, deadline=self.deadline) as fifo:
-                available = fifo_bytes(self.descriptor) if fifo else 0
-                if fifo and not available:
-                    return WaitingForCPU()
-                return self.read_slot(available)
-        except GateRecoveryUnresolved:
-            return WaitingForCPU()
+        with ExitStack() as locked:
+            try:
+                fifo = locked.enter_context(token_operation(self.descriptor, deadline=self.deadline))
+            except GateRecoveryUnresolved:
+                return WaitingForCPU()
+            available = fifo_bytes(self.descriptor) if fifo else 0
+            if fifo and not available:
+                return WaitingForCPU()
+            if fifo and not self.fifo_size and isinstance(ACTIVE_GATE_RECOVERY.get(), GateRecovery):
+                records = fifo_records(self.descriptor)
+                if records is not None:
+                    self.fifo_size = fifo_pool_size(self.descriptor, records, available)
+            return self.read_slot()
 
-    def read_slot(self, available: int) -> SharedCPUSlot | WaitingForCPU:
+    def read_slot(self) -> SharedCPUSlot | WaitingForCPU:
         recovery = ACTIVE_GATE_RECOVERY.get()
         record = None
         if isinstance(recovery, GateRecovery):
-            record = recovery.token(self.descriptor, b"", "acquiring", available=available)
+            record = recovery.token(self.descriptor, b"", "acquiring", pool_size=self.fifo_size)
             recovery.tokens.append(record)
             recovery.save()
         try:
@@ -797,7 +799,7 @@ class HeldGateToken:
     inode: int
     value: str
     operation: Literal["acquiring", "held", "returning"] = "held"
-    available: int = 0
+    pool_size: int = 0
 
 
 @dataclass
@@ -838,10 +840,10 @@ class GateRecovery:
             self.save()
 
     def token(self, descriptor: int, value: bytes,
-              operation: Literal["acquiring", "held", "returning"], *, available: int = 0) -> HeldGateToken:
+              operation: Literal["acquiring", "held", "returning"], *, pool_size: int = 0) -> HeldGateToken:
         status = os.fstat(descriptor)
         return HeldGateToken(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"),
-                             status.st_dev, status.st_ino, value.hex(), operation, available)
+                             status.st_dev, status.st_ino, value.hex(), operation, pool_size)
 
     def update_token(self, token: HeldGateToken, replacement: HeldGateToken | None = None) -> None:
         position = next(index for index, entry in enumerate(self.tokens) if entry is token)
@@ -851,55 +853,33 @@ class GateRecovery:
             self.tokens[position] = replacement
         self.save()
 
-    def return_token(self, token: HeldGateToken, descriptor: int, *, recovering: bool = False,
-                     recovered_value: bytes | None = None) -> None:
-        value = bytes.fromhex(token.value) if recovered_value is None else recovered_value
-        pending = replace(token, value=value.hex(), operation="returning")
+    def return_token(self, token: HeldGateToken, descriptor: int) -> None:
+        value = bytes.fromhex(token.value)
+        pending = replace(token, operation="returning")
         self.update_token(token, pending)
         try:
             count = os.write(descriptor, value)
-        except OSError as error:
-            if recovering and error.errno == errno.ENOSPC:
-                self.update_token(pending)
-                return
-            if isinstance(error, BlockingIOError):
-                self.update_token(pending, token)
+        except BlockingIOError:
+            self.update_token(pending, token)
             raise
         if count != 1:
             raise GateRecoveryUnresolved("could not confirm the shared CPU slot return")
         self.update_token(pending)
 
-    def recover_tokens(self, *, deadline: float = math.inf) -> None:
+    def discard_retired_tokens(self) -> None:
+        """Leave current FIFO tokens for the pool recount."""
         for token in reversed(self.tokens[:]):
-            problem = f"UNRESOLVED: CPU slot {token.operation} in {token.path}. Record: {self.path}"
             try:
-                descriptor = os.open(token.path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+                status = Path(token.path).stat()
             except FileNotFoundError:
                 self.update_token(token)
                 continue
             except OSError as error:
-                print(f"{problem} ({error})", flush=True)
+                report_gate_recovery(self.path, error)
                 continue
-            try:
-                status = os.fstat(descriptor)
-                # The jobserver device reclaims slots when their owner dies.
-                if (not stat.S_ISFIFO(status.st_mode)
-                        or (status.st_dev, status.st_ino) != (token.device, token.inode)):
-                    self.update_token(token)
-                    continue
-                with token_operation(descriptor, deadline=deadline):
-                    if fifo_bytes(descriptor) == fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ):
-                        self.update_token(token)
-                        continue
-                    if token.operation == "held":
-                        self.return_token(token, descriptor, recovering=True)
-                        continue
-            except (OSError, GateRecoveryUnresolved) as error:
-                print(f"{problem} ({error})", flush=True)
-                continue
-            finally:
-                os.close(descriptor)
-            print(problem, flush=True)
+            # The jobserver device reclaims its own slots when the owner dies.
+            if not stat.S_ISFIFO(status.st_mode) or (status.st_dev, status.st_ino) != (token.device, token.inode):
+                self.update_token(token)
 
     def recover(self, *, deadline: float = math.inf) -> None:
         """Stop recorded groups before removing their folders and undoing the merge."""
@@ -957,7 +937,7 @@ class GateRecovery:
             self.folders.clear()
             self.scope = ""
             self.save()
-        self.recover_tokens(deadline=stop_deadline)
+        self.discard_retired_tokens()
         if self.rollback:
             repo = Path(self.repo)
             with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
@@ -1087,7 +1067,7 @@ def shared_gate_directories() -> list[Path]:
         return []
 
 
-def recover_shared_gate_runs(repo: str, *, deadline: float = math.inf) -> None:
+def recover_shared_gate_runs(repo: str, *, deadline: float = math.inf, pool_descriptor: int | None = None) -> None:
     for directory in shared_gate_directories():
         if time.monotonic() >= deadline:
             break
@@ -1097,6 +1077,8 @@ def recover_shared_gate_runs(repo: str, *, deadline: float = math.inf) -> None:
             raise
         except (GateRecoveryUnresolved, OSError) as error:
             report_gate_recovery(directory, error)
+    if time.monotonic() < deadline:
+        recover_configured_fifo(deadline, pool_descriptor)
 
 
 def recover_gate_directory(directory: Path, repo: str, *, deadline: float = math.inf) -> None:
@@ -1144,51 +1126,83 @@ def recover_private_gate_runs(root: Path, repo: str) -> None:
             report_gate_recovery(folder, error)
 
 
-def read_gate_recovery(path: Path, *, fifo_identity: tuple[int, int] | None = None) -> GateRecovery | None:
-    try:
-        payload = cast(object, json.loads(path.read_text()))
-    except FileNotFoundError:
-        return
-    if not isinstance(payload, dict):
-        raise ValueError("the gate record must be an object")
-    data = cast(dict[str, object], payload)
-    raw_tokens = data["tokens"]
-    if not isinstance(raw_tokens, list):
-        raise ValueError("the gate token records must be a list")
-    token_rows: list[dict[str, object]] = []
-    for row in cast(list[object], raw_tokens):
-        if not isinstance(row, dict):
-            raise ValueError("the gate token record must be an object")
-        token_rows.append(cast(dict[str, object], row))
-    identities = [(token["device"], token["inode"]) for token in token_rows]
-    if any(type(device) is not int or type(inode) is not int for device, inode in identities):
-        raise ValueError("invalid FIFO device or inode in the gate token record")
+class GateRecordError(ValueError):
+    """The recovery record cannot establish ownership."""
+
+
+def record_object(value: object, field_name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise GateRecordError(f"invalid {field_name}: expected an object")
+    return cast(dict[str, object], value)
+
+
+def record_list(value: object, field_name: str) -> list[object]:
+    if not isinstance(value, list):
+        raise GateRecordError(f"invalid {field_name}: expected a list")
+    return cast(list[object], value)
+
+
+def record_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or "\0" in value:
+        raise GateRecordError(f"invalid {field_name}: expected text")
+    return value
+
+
+def record_int(value: object, field_name: str, maximum: int, minimum: int = 0) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise GateRecordError(f"invalid {field_name}: expected an integer from {minimum} to {maximum}")
+    return value
+
+
+MAX_PID = 2**31 - 1
+MAX_STAT_ID = 2**64 - 1
+
+
+def parse_gate_recovery(path: Path, payload: object, fifo_identity: tuple[int, int] | None) -> GateRecovery | None:
+    data = record_object(payload, "gate record")
+    rows = [record_object(row, "gate token") for row in record_list(data.get("tokens"), "tokens")]
+    identities = [(record_int(row.get("device"), "token device", MAX_STAT_ID),
+                   record_int(row.get("inode"), "token inode", MAX_STAT_ID)) for row in rows]
     if fifo_identity is not None and fifo_identity not in identities:
         return None
     tokens: list[HeldGateToken] = []
-    for token, (device, inode) in zip(token_rows, identities, strict=True):
-        operation = token.get("operation", "held")
-        value = token["value"]
+    for row, (device, inode) in zip(rows, identities, strict=True):
+        operation = row.get("operation", "held")
         if operation not in ("acquiring", "held", "returning"):
-            raise ValueError(f"invalid CPU slot operation {operation!r}")
-        pattern = "" if operation == "acquiring" else r"[0-9a-fA-F]{2}"
-        if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
-            raise ValueError(f"invalid CPU slot value {value!r} for {operation}")
-        token_path, available = token["path"], token.get("available", 0)
-        if not isinstance(token_path, str) or type(available) is not int or available < 0:
-            raise ValueError("invalid CPU slot path or available byte count")
-        tokens.append(HeldGateToken(token_path, cast(int, device), cast(int, inode), value, operation, available))
-    pid, start = data["pid"], data["start"]
-    groups, folders, scope = data["groups"], data["folders"], data.get("scope", "")
-    if type(pid) is not int or not isinstance(start, str):
-        raise ValueError("invalid gate owner identity")
-    if not isinstance(groups, dict) or not isinstance(folders, list) or not isinstance(scope, str):
-        raise ValueError("invalid gate groups, folders, or scope")
-    return GateRecovery(path, cast(str, data["repo"]), pid, start,
-                        {int(group): identity for group, identity in cast(dict[str, str], groups).items()},
-                        cast(list[str], folders), tokens, cast(str, data["rollback"]),
-                        cast(str, data["rollback_head"]), cast(str, data["rollback_source"]), scope=scope)
+            raise GateRecordError("invalid CPU slot operation")
+        value = record_text(row.get("value"), "CPU slot value")
+        if re.fullmatch("" if operation == "acquiring" else r"[0-9a-fA-F]{2}", value) is None:
+            raise GateRecordError(f"invalid CPU slot value for {operation}")
+        # Older records kept the byte count before the read.
+        _ = record_int(row.get("available", 0), "available byte count", MAX_PID)
+        size = record_int(row.get("pool_size", 0), "pool size", MAX_PID)
+        tokens.append(HeldGateToken(record_text(row.get("path"), "token path"), device, inode, value, operation, size))
+    groups: dict[int, str] = {}
+    for group, identity in record_object(data.get("groups"), "groups").items():
+        if not group.isascii() or not group.isdecimal() or len(group) > 10:
+            raise GateRecordError("invalid process group id")
+        groups[record_int(int(group), "process group id", MAX_PID, 1)] = record_text(identity, "process group start")
+    folders = [record_text(folder, "folder path") for folder in record_list(data.get("folders"), "folders")]
+    return GateRecovery(path, record_text(data.get("repo"), "repo"), record_int(data.get("pid"), "pid", MAX_PID, 1),
+                        record_text(data.get("start"), "start"), groups, folders, tokens,
+                        record_text(data.get("rollback"), "rollback"), record_text(data.get("rollback_head"), "rollback head"),
+                        record_text(data.get("rollback_source"), "rollback source"),
+                        scope=record_text(data.get("scope", ""), "scope"))
 
+
+def read_gate_recovery(path: Path, *, fifo_identity: tuple[int, int] | None = None) -> GateRecovery | None:
+    try:
+        source = path.read_text()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as error:
+        raise GateRecordError(f"cannot read gate record: {error}") from error
+    try:
+        return parse_gate_recovery(path, cast(object, json.loads(source)), fifo_identity)
+    except GateRecordError:
+        raise
+    except (ValueError, RecursionError) as error:
+        raise GateRecordError(f"cannot parse gate record: {error}") from error
 
 
 def report_gate_recovery(path: Path, error: Exception) -> None:
@@ -1199,7 +1213,7 @@ def report_gate_recovery(path: Path, error: Exception) -> None:
 def recover_gate_record(path: Path, repo: str, *, deadline: float = math.inf) -> None:
     try:
         recovery = read_gate_recovery(path)
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except GateRecordError as error:
         report_gate_recovery(path, error)
         return
     if recovery is None:
@@ -1221,62 +1235,125 @@ def recover_gate_record(path: Path, repo: str, *, deadline: float = math.inf) ->
         ACTIVE_GATE_RECOVERY.reset(active)
 
 
-def fifo_holders(descriptor: int) -> list[tuple[GateRecovery, HeldGateToken]] | None:
+def fifo_records(descriptor: int) -> list[tuple[GateRecovery, list[HeldGateToken]]] | None:
     status = os.fstat(descriptor)
     identity = status.st_dev, status.st_ino
-    holders: list[tuple[GateRecovery, HeldGateToken]] = []
+    records: list[tuple[GateRecovery, list[HeldGateToken]]] = []
     uncertain = False
     for directory in shared_gate_directories():
         for path in directory.glob("*.json"):
             try:
                 record = read_gate_recovery(path, fifo_identity=identity)
-            except (OSError, ValueError, KeyError, TypeError) as error:
+            except GateRecordError as error:
                 report_gate_recovery(path, error)
                 uncertain = True
                 continue
             if record is not None:
-                holders.extend((record, token) for token in record.tokens
-                               if (token.device, token.inode) == identity)
-    return None if uncertain else holders
+                records.append((record, [token for token in record.tokens if (token.device, token.inode) == identity]))
+    return None if uncertain else records
 
 
-def recover_lost_fifo_token(descriptor: int, *, deadline: float = math.inf) -> None:
-    """Restore the last slot when a dead gate left one interrupted operation."""
-    if not stat.S_ISFIFO(os.fstat(descriptor).st_mode) or fifo_bytes(descriptor):
-        return
-    holders = fifo_holders(descriptor)
-    if holders is None or len(holders) != 1:
-        return
-    record, _ = holders[0]
+def fifo_pool_size(descriptor: int, records: list[tuple[GateRecovery, list[HeldGateToken]]], available: int) -> int:
+    sizes = {token.pool_size for _, tokens in records for token in tokens if token.pool_size}
+    setting = os.environ.get("BUILDLOG_JOBSERVER_SLOTS")
+    limit = fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ)
+    if setting is not None:
+        if not setting.isascii() or not setting.isdecimal() or len(setting) > 10 or not 1 <= int(setting) <= limit:
+            raise GateRecoveryUnresolved(f"BUILDLOG_JOBSERVER_SLOTS must be from 1 to {limit}")
+        sizes.add(int(setting))
+    if len(sizes) > 1 or any(size > limit for size in sizes):
+        raise GateRecoveryUnresolved("the FIFO records disagree with each other or with the pipe size")
+    if sizes:
+        return sizes.pop()
+    # Before the first tracked read, every slot is still in the FIFO.
+    return 0 if records else available
+
+
+def recover_configured_fifo(deadline: float, descriptor: int | None) -> None:
+    path = Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"))
     try:
-        directory = os.open(record.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        if descriptor is not None:
+            recover_fifo_slots(descriptor, deadline=deadline)
+        elif stat.S_ISFIFO(path.stat().st_mode):
+            descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+            try:
+                recover_fifo_slots(descriptor, deadline=deadline)
+            finally:
+                os.close(descriptor)
     except FileNotFoundError:
+        pass
+    except (OSError, GateRecoveryUnresolved) as error:
+        report_gate_recovery(path, error)
+
+
+def recover_fifo_slots(descriptor: int, *, deadline: float = math.inf) -> None:
+    """Recount the private FIFO without giving slots back to dead gates."""
+    if not stat.S_ISFIFO(os.fstat(descriptor).st_mode):
         return
-    try:
-        try:
-            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with token_operation(descriptor, deadline=deadline), ExitStack() as locked:
+        records = fifo_records(descriptor)
+        if not records:
             return
-        with token_operation(descriptor, deadline=deadline):
-            holders = fifo_holders(descriptor)
-            if fifo_bytes(descriptor) or holders is None or len(holders) != 1:
+        live_slots = 0
+        dead: list[tuple[GateRecovery, list[HeldGateToken]]] = []
+        directories: set[Path] = set()
+        for record, tokens in records:
+            owner = process_start(record.pid)
+            if isinstance(owner, Started) and owner.start == record.start:
+                if any(token.operation != "held" for token in tokens):
+                    report_gate_recovery(record.path, GateRecoveryUnresolved("a live gate has an interrupted slot operation"))
+                    return
+                live_slots += len(tokens)
+                continue
+            if isinstance(owner, Unreadable) or record.groups or record.folders or record.scope:
+                report_gate_recovery(record.path, GateRecoveryUnresolved("the gate still needs cleanup before slot recovery"))
                 return
-            candidate, token = holders[0]
-            if (candidate.path != record.path or token.operation == "held"
-                    or (token.operation == "acquiring" and token.available != 1)
-                    or candidate.groups or candidate.folders or candidate.scope):
+            directory = record.path.parent
+            if directory not in directories:
+                lock = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                _ = locked.callback(os.close, lock)
+                # The directory scan can hold this lock while another gate waits on the FIFO.
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                directories.add(directory)
+            try:
+                current = read_gate_recovery(record.path)
+            except GateRecordError as error:
+                report_gate_recovery(record.path, error)
                 return
-            owner = process_start(candidate.pid)
-            if isinstance(owner, Unreadable) or isinstance(owner, Started) and owner.start == candidate.start:
+            if current != record:
                 return
-            # An interrupted read has no saved byte. Each byte represents one slot.
-            value = b"+" if token.operation == "acquiring" else None
-            candidate.return_token(token, descriptor, recovering=True, recovered_value=value)
-            if not (candidate.tokens or candidate.rollback):
-                candidate.path.unlink(missing_ok=True)
-            print(f"Recovered a lost FIFO slot from {candidate.path}", flush=True)
-    finally:
-        os.close(directory)
+            dead.append((record, tokens))
+        if not dead:
+            return
+        available = fifo_bytes(descriptor)
+        size = fifo_pool_size(descriptor, records, available)
+        if not size:
+            raise GateRecoveryUnresolved("the FIFO slot count is unknown")
+        target = size - live_slots
+        if available > target:
+            raise GateRecoveryUnresolved("the FIFO and live gates exceed the recorded slot count")
+        original = os.read(descriptor, available) if available else b""
+        if len(original) != available:
+            if original:
+                _ = os.write(descriptor, original)
+            raise GateRecoveryUnresolved("the FIFO changed during the recount")
+        restore = target - len(original)
+        saved = b"".join(bytes.fromhex(token.value) for _, tokens in dead for token in tokens)
+        # Each byte represents one slot. Keep saved byte values where possible.
+        restored = original + saved[:restore].ljust(restore, b"+")
+        if restored and os.write(descriptor, restored) != len(restored):
+            raise GateRecoveryUnresolved("the FIFO write did not restore the full slot count")
+        # Keep the slot count in a record until the recount clears the last token.
+        for record, tokens in sorted(dead, key=lambda item: any(token.pool_size for token in item[1])):
+            record.tokens[:] = [token for token in record.tokens if token not in tokens]
+            if record.tokens or record.rollback:
+                record.save()
+            else:
+                record.path.unlink(missing_ok=True)
+        print(f"Recovered {restore} FIFO slots from {len(dead)} dead gate records", flush=True)
 
 
 @contextmanager
@@ -1385,10 +1462,8 @@ def suite_scope_prefix() -> list[str]:
     if setting == "0":
         print("Module scope skipped: BUILDLOG_SCOPE=0", flush=True)
         return []
-    if sys.platform != "linux":
-        return []
-    prefix = probe_scope_prefix()
-    if not prefix and user_manager_answers():
+    prefix = probe_scope_prefix() if sys.platform == "linux" else []
+    if not prefix and (setting == "1" or sys.platform == "linux" and user_manager_answers()):
         raise GateRefused("the systemd scope probe failed to start a scope in builds.slice")
     return prefix
 

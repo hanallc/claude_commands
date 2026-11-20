@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import unittest
 from contextlib import ExitStack, redirect_stdout
-from dataclasses import replace
-import fcntl
+from dataclasses import asdict, replace
 import io
 import json
 import os
@@ -17,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Literal, cast, final
+from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
 from scripts.build_queue.queue_place import QueuePlace
@@ -90,9 +89,11 @@ sys.stdin.read(1)
             descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
             try:
                 with mock.patch.dict(os.environ, self.environment, clear=True):
-                    recovery.tokens.append(recovery.token(descriptor, os.read(descriptor, 1), "held"))
+                    recovery.path = merge_gate.gate_run_directory(self.checkout) / "dead-gate.json"
+                    recovery.tokens.append(recovery.token(descriptor, os.read(descriptor, 1), "held", pool_size=1))
                     recovery.save()
                     recovery.recover()
+                    merge_gate.recover_fifo_slots(descriptor)
             finally:
                 os.close(descriptor)
             self.assert_process_stopped(member)
@@ -100,7 +101,7 @@ sys.stdin.read(1)
             self.assertEqual(list(self.root.glob("abandoned-gate")), [])
             self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
             self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
-            self.assertEqual(list(self.state.glob("dead-gate.json")), [])
+            self.assertFalse(recovery.path.exists())
         finally:
             if leader.poll() is None:
                 leader.kill()
@@ -131,7 +132,7 @@ sys.stdin.read(1)
                     recovery.rollback_source = self.checkpoint
                     descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
                     try:
-                        recovery.tokens.append(recovery.token(descriptor, os.read(descriptor, 1), "held"))
+                        recovery.tokens.append(recovery.token(descriptor, os.read(descriptor, 1), "held", pool_size=1))
                         recovery.save()
                     finally:
                         os.close(descriptor)
@@ -139,6 +140,9 @@ sys.stdin.read(1)
                         output = io.StringIO()
                         with redirect_stdout(output):
                             recovery.recover()
+                        with redirect_stdout(io.StringIO()), merge_gate.shared_cpu_pool() as pool:
+                            assert isinstance(pool, merge_gate.SharedCPUPool)
+                            merge_gate.recover_fifo_slots(pool.descriptor)
                         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
                         record = cast(dict[str, object], json.loads(recovery.path.read_text()))
                         self.assertEqual(record["rollback"], self.base)
@@ -177,34 +181,29 @@ sys.stdin.read(1)
             self.assertFalse(path.exists())
             self.assertEqual(pool.read_text(), "original pool")
 
-    def test_fifo_recovery_resolves_full_pools_and_reports_ambiguous_slots(self) -> None:
-        self.supply_jobserver(b"")
-        with mock.patch.dict(os.environ, self.environment, clear=True):
-            descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
-            self.addCleanup(os.close, descriptor)
-            capacity = fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ)
+    def test_fifo_recount_keeps_records_for_unknown_size_or_excess_slots(self) -> None:
+        self.supply_jobserver(b"QR")
+        with mock.patch.dict(os.environ, self.environment, clear=True), merge_gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, merge_gate.SharedCPUPool)
             directory = merge_gate.gate_run_directory(self.checkout)
-            operations: tuple[tuple[Literal["acquiring", "returning"], bytes], ...] = (
-                ("acquiring", b""), ("returning", b"Q"))
-            for operation, value in operations:
-                for full in (False, True):
-                    with self.subTest(operation=operation, full=full):
-                        contents = b"Q" * (capacity if full else 1)
-                        self.assertEqual(os.write(descriptor, contents), len(contents))
-                        recovery = merge_gate.GateRecovery(directory / "dead-owner.json", str(self.checkout),
-                                                           os.getpid(), "ended-owner")
-                        recovery.tokens.append(recovery.token(descriptor, value, operation))
-                        recovery.save()
-                        output = io.StringIO()
-                        with redirect_stdout(output), merge_gate.gate_recovery(self.checkout):
-                            self.assertEqual(os.read(descriptor, capacity), contents)
-                        self.assertEqual(recovery.path.exists(), not full)
-                        if not full:
-                            self.assertIn(f"UNRESOLVED: CPU slot {operation}", output.getvalue())
-                            record = cast(dict[str, object], json.loads(recovery.path.read_text()))
-                            [token] = cast(list[dict[str, object]], record["tokens"])
-                            self.assertEqual(token["operation"], operation)
-                            recovery.path.unlink()
+            for size, reason in ((0, "slot count is unknown"), (1, "exceed the recorded slot count")):
+                with self.subTest(size=size):
+                    recovery = merge_gate.GateRecovery(directory / "dead-owner.json", str(self.checkout),
+                                                       os.getpid(), "ended-owner")
+                    recovery.tokens.append(recovery.token(pool.descriptor, b"Q", "returning", pool_size=size))
+                    recovery.save()
+                    original = recovery.path.read_text()
+                    with self.assertRaisesRegex(merge_gate.GateRecoveryUnresolved, reason):
+                        merge_gate.recover_fifo_slots(pool.descriptor)
+                    self.assertEqual(recovery.path.read_text(), original)
+                    self.assertEqual(self.jobserver_tokens(), b"QR")
+
+            with mock.patch.dict(os.environ, {"BUILDLOG_JOBSERVER_SLOTS": "2"}):
+                recovery.tokens[:] = [replace(recovery.tokens[0], pool_size=0)]
+                recovery.save()
+                merge_gate.recover_fifo_slots(pool.descriptor)
+            self.assertFalse(recovery.path.exists())
+            self.assertEqual(self.jobserver_tokens(), b"QR")
 
     def test_bad_slot_values_leave_their_records_and_allow_other_recovery(self) -> None:
         self.supply_jobserver(b"Q")
@@ -213,14 +212,19 @@ sys.stdin.read(1)
             directory = merge_gate.gate_run_directory(self.checkout)
             valid = merge_gate.GateRecovery(directory / "valid.json", str(self.checkout),
                                             os.getpid(), "ended-owner")
-            valid.tokens.append(valid.token(pool.descriptor, os.read(pool.descriptor, 1), "held"))
             valid.save()
             invalid: dict[Path, str] = {}
             for index, value in enumerate(("zz", "", "5152")):
                 path = directory / f"invalid-{index}.json"
                 data = cast(dict[str, object], json.loads(valid.path.read_text()))
-                [token] = cast(list[dict[str, object]], data["tokens"])
-                token["value"] = value
+                token = replace(valid.token(pool.descriptor, b"Q", "held"), value=value)
+                data["tokens"] = [asdict(token)]
+                invalid[path] = json.dumps(data)
+                self.write(path, invalid[path])
+            for name, update in (("null-folder", {"folders": [None]}), ("large-pid", {"pid": 10**399})):
+                path = directory / f"{name}.json"
+                data = cast(dict[str, object], json.loads(valid.path.read_text()))
+                data.update(update)
                 invalid[path] = json.dumps(data)
                 self.write(path, invalid[path])
             output = io.StringIO()
@@ -231,7 +235,9 @@ sys.stdin.read(1)
             for path, original in invalid.items():
                 self.assertEqual(path.read_text(), original)
                 self.assertIn(f"Record: {path}", output.getvalue())
-            self.assertEqual(output.getvalue().count("UNRESOLVED: invalid CPU slot value"), len(invalid))
+            self.assertEqual(output.getvalue().count("UNRESOLVED: invalid CPU slot value"), 3)
+            self.assertIn("UNRESOLVED: invalid folder path", output.getvalue())
+            self.assertIn("UNRESOLVED: invalid pid", output.getvalue())
 
     def test_gate_scope_sidecar_names_the_slice_before_the_child_starts(self) -> None:
         sidecar = self.state / "gate.cgroup"
@@ -249,7 +255,8 @@ sys.stdin.read(1)
         self.assertEqual(json.loads(record.read_text())["scope"], str(scope))
         self.assertEqual(sidecar.with_name(build_folders.RECOVERY_MARKER).readlink(), record)
 
-    def test_cpu_wait_repairs_the_last_slot_after_one_bounded_slice(self) -> None:
+    def test_cpu_wait_recounts_two_interrupted_fifo_operations(self) -> None:
+        self.supply_jobserver(b"")
         with mock.patch.dict(os.environ, self.environment, clear=True), merge_gate.shared_cpu_pool() as pool:
             assert isinstance(pool, merge_gate.SharedCPUPool)
             ready = select.select
@@ -268,26 +275,46 @@ sys.stdin.read(1)
                     return [], [], []
                 return ready(readers, writers, errors, timeout)
 
-            cases: tuple[tuple[Literal["acquiring", "returning"], bytes, int, bytes], ...] = (
-                ("acquiring", b"", 1, b"+"), ("returning", b"Q", 0, b"Q"))
-            for operation, value, available, expected in cases:
-                with self.subTest(operation=operation):
-                    waits = 0
-                    self.supply_jobserver(b"Q" if operation == "acquiring" else b"")
-                    path = merge_gate.gate_run_directory(self.checkout) / f"dead-{operation}.json"
-                    recovery = merge_gate.GateRecovery(path, str(self.checkout), os.getpid(), "ended-owner")
-                    recovery.tokens.append(recovery.token(pool.descriptor, value, operation, available=available))
-                    recovery.save()
-                    if operation == "acquiring":
-                        self.assertEqual(os.read(pool.descriptor, 1), b"Q")
-                    with mock.patch.object(select, "select", side_effect=expire_slice):
-                        slot = pool.acquire()
-                    self.assertEqual(slot.token, expected)
-                    self.assertFalse(path.exists())
-                    slot.release()
-                    self.assertEqual(self.jobserver_tokens(), expected)
+            directory = merge_gate.gate_run_directory(self.checkout)
+            returning = merge_gate.GateRecovery(directory / "returning.json", str(self.checkout), os.getpid(), "old")
+            returning.tokens.append(returning.token(pool.descriptor, b"Q", "returning", pool_size=1))
+            returning.save()
+            acquiring = merge_gate.GateRecovery(directory / "acquiring.json", str(self.checkout), os.getpid(), "old")
+            acquiring.tokens.append(acquiring.token(pool.descriptor, b"", "acquiring", pool_size=1))
+            acquiring.save()
+            with mock.patch.object(select, "select", side_effect=expire_slice):
+                slot = pool.acquire()
+            self.assertEqual(slot.token, b"Q")
+            self.assertFalse(returning.path.exists())
+            self.assertFalse(acquiring.path.exists())
+            slot.release()
+        self.assertEqual(self.jobserver_tokens(), b"Q")
 
-    def test_last_slot_repair_checks_fifo_identity_before_the_token_value(self) -> None:
+    def test_fifo_recount_preserves_live_slots_and_available_bytes(self) -> None:
+        self.supply_jobserver(b"ABC")
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                merge_gate.gate_recovery(self.checkout) as live, merge_gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, merge_gate.SharedCPUPool)
+            slot = pool.try_acquire()
+            assert isinstance(slot, merge_gate.SharedCPUSlot)
+            self.assertEqual(slot.token, b"A")
+            [token] = live.tokens
+            self.assertEqual(token.pool_size, 3)
+            dead = merge_gate.GateRecovery(live.path.with_name("dead.json"), str(self.checkout), os.getpid(), "old")
+            # Simulate a second gate that read B before it died.
+            with merge_gate.token_operation(pool.descriptor):
+                dead.tokens.append(dead.token(pool.descriptor, b"", "acquiring", pool_size=token.pool_size))
+                dead.save()
+                self.assertEqual(os.read(pool.descriptor, 1), b"B")
+            merge_gate.recover_fifo_slots(pool.descriptor)
+            self.assertEqual(self.jobserver_tokens(), b"C+")
+            self.assertFalse(dead.path.exists())
+            self.assertEqual(merge_gate.read_gate_recovery(live.path), live)
+            merge_gate.recover_fifo_slots(pool.descriptor)
+            self.assertEqual(self.jobserver_tokens(), b"C+")
+        self.assertEqual(self.jobserver_tokens(), b"C+A")
+
+    def test_fifo_recount_checks_fifo_identity_before_the_token_value(self) -> None:
         other = self.root / "other-fifo"
         os.mkfifo(other)
         other_descriptor = os.open(other, os.O_RDWR | os.O_NONBLOCK)
@@ -297,7 +324,7 @@ sys.stdin.read(1)
             directory = merge_gate.gate_run_directory(self.checkout)
             valid = merge_gate.GateRecovery(directory / "valid.json", str(self.checkout),
                                             os.getpid(), "ended-owner")
-            valid.tokens.append(valid.token(pool.descriptor, b"Q", "returning"))
+            valid.tokens.append(valid.token(pool.descriptor, b"Q", "returning", pool_size=1))
             invalid = merge_gate.GateRecovery(directory / "invalid.json", str(self.checkout),
                                               os.getpid(), "ended-owner")
             for same_fifo in (False, True):
@@ -311,7 +338,7 @@ sys.stdin.read(1)
                     original = invalid.path.read_text()
                     output = io.StringIO()
                     with redirect_stdout(output):
-                        merge_gate.recover_lost_fifo_token(pool.descriptor)
+                        merge_gate.recover_fifo_slots(pool.descriptor)
                     self.assertEqual(invalid.path.read_text(), original)
                     if same_fifo:
                         self.assertTrue(valid.path.is_file())
@@ -386,7 +413,7 @@ sys.stdin.read(1)
             parent = self.root / "recorded-work"
             parent.mkdir()
             first.folders.append(str(parent))
-            first.tokens.append(first.token(descriptor, os.read(descriptor, 1), "held"))
+            first.tokens.append(first.token(descriptor, os.read(descriptor, 1), "held", pool_size=1))
             first.save()
             second.save()
             (parent / build_folders.RECOVERY_MARKER).symlink_to(first.path)
