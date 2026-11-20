@@ -22,6 +22,7 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from textwrap import dedent
 from typing import Literal, NoReturn, cast, final, overload
 
 from scripts.astra import astra_roles
@@ -41,6 +42,8 @@ from scripts.whoami import quota_state
 SCRIPTS = Path(__file__).resolve().parent
 PYTHON = str(SCRIPTS / "../lib/py")
 PROGRESS = str(SCRIPTS / "progress_history.py")
+PROMPT_CONTRACT = SCRIPTS.parents[1] / "docs/direct/write_prompt_contract.md"
+TEST_RULE_ROLES = frozenset(("implement", "fix", "test"))
 RULES = """
 Rules for this dispatch:
 Run only commands that finish within one call. Never poll, sleep, call wait,
@@ -105,6 +108,23 @@ def read_object(path: Path) -> dict[str, object]:
 def refuse(message: str) -> NoReturn:
     print(f"assign.sh: {message}", file=sys.stderr)
     raise SystemExit(2)
+
+
+def with_test_rules(prompt: str) -> str:
+    try:
+        contract = PROMPT_CONTRACT.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        refuse(f"cannot read test rules in {PROMPT_CONTRACT} ({error})")
+    prompt_words = " ".join(prompt.split())
+    for tag in ("TestRules", "WhenYouWriteNoTest"):
+        _, opening, rest = contract.partition(f"<{tag}>")
+        body, closing, _ = rest.partition(f"</{tag}>")
+        rules = dedent(body).strip()
+        if not opening or not closing or not rules:
+            refuse(f"missing {tag} section in {PROMPT_CONTRACT}")
+        if " ".join(rules.split()) not in prompt_words:
+            prompt += "\n\n" + rules + "\n"
+    return prompt
 
 
 def call(command: list[str], env: dict[str, str], *, capture: bool = False,
@@ -487,6 +507,9 @@ def record_worker_launch_exit(run: Path, instance: uuid.UUID, outcome: progress_
 def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                   role: str, paths: list[str], env: dict[str, str]) -> int:
     """Send the assignment through the shared worker command."""
+    content = prompt.read_text()
+    if args.role in TEST_RULE_ROLES:
+        content = with_test_rules(content)
     directory = phase_reservation.phase_directory(run, phase)
     directory.mkdir(parents=True, exist_ok=True)
     launcher = launcher_command()
@@ -497,7 +520,7 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     message = directory / f"{slot}_prompt{suffix}.txt"
     reply = directory / f"{slot}_reply{suffix}.txt"
     log = directory / f"{slot}_agent{suffix}.log"
-    content = prompt.read_text() + "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
+    content += "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
     content += image_note(args.image)
     if role == "review":
         content += "\nReturn the complete review result in your final reply.\n"
@@ -651,6 +674,8 @@ def execute_consultation(args: Arguments, cwd: Path) -> int:
         if args.prompt:
             prompt = Path(args.prompt).expanduser().resolve()
             question = f"Read {prompt}.\n{prompt.read_text()}"
+            if args.role in TEST_RULE_ROLES:
+                question = with_test_rules(question)
         review = args.operation == AssignmentOperation.ASTRA_REVIEW
         policy = (worker_panes.astra_review_policy(args.model, args.effort) if review else
                   pane_policy(args.policy, model=args.model, effort=args.effort))
@@ -715,9 +740,22 @@ def execute_durable(args: Arguments) -> int:
     prompt = Path(args.prompt).expanduser().resolve()
     if not prompt.is_file() or not args.session_dir or not args.phase:
         refuse("durable dispatch requires --prompt, --session-dir, and --phase")
-    result = staff_worker.dispatch(target.parent, name, role, prompt, session_dir=Path(args.session_dir),
+    run = Path(args.session_dir)
+    reply = Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT
+    if args.role in TEST_RULE_ROLES:
+        original = prompt.read_text()
+        content = with_test_rules(original)
+        if content != original:
+            if not args.reply_file:
+                reply = prompt.with_name(prompt.stem + "_reply.txt")
+            directory = phase_reservation.phase_directory(run, args.phase)
+            directory.mkdir(parents=True, exist_ok=True)
+            prompt = directory / f"{name.value}_{prompt.name}"
+            if not prompt.is_file() or prompt.read_text() != content:
+                write_text_atomic(prompt, content)
+    result = staff_worker.dispatch(target.parent, name, role, prompt, session_dir=run,
         slot=name.value, phase=args.phase, kind="astra",
-        reply=Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
+        reply=reply, policy=policy,
         completion_actions=progress_history.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
         launcher_command=launcher_command())
     return result

@@ -1076,6 +1076,12 @@ class AssignLauncherTests(HookAssignmentFixture):
                 self.assertEqual(self.native.agent.submitted, submitted)
                 self.assertEqual(self.native.fixture.world.launches, launched)
                 self.assertEqual({path: path.read_bytes() for path in self.project.rglob("*") if path.is_file()}, files)
+        rules = "1. Keep the first fixture rule.\n2. Keep the second fixture rule."
+        limits = "## Fixture test limits\n1. Keep the fixture limit."
+        contract = self.session_dir.parent / "prompt-contract.md"
+        _ = contract.write_text(f"<TestRules>\n{rules}\n</TestRules>\n"
+                                + f"<WhenYouWriteNoTest>\n{limits}\n</WhenYouWriteNoTest>\n")
+        _ = self.enterContext(patch.object(assign, "PROMPT_CONTRACT", contract, create=True))
         _ = self.successful("implement", "--reply-file", str(reply_file))
         name, record = next(iter(self.assignment_records().items()))
         self.assertEqual(self.turn_starts, 1)
@@ -1094,6 +1100,18 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(len(finished), 1, self.events())
         started = next(event for event in self.events() if event.get("event_type") == "pass_started")
         self.assertEqual(started["worker_id"], record["staff_id"])
+
+        with self.subTest(behavior="test rules by role"):
+            self.assertEqual((prompt.count(rules), prompt.count(limits)), (1, 1))
+            for role, filename, source_rules, options, count in (
+                ("fix", "fix_prompt.txt", "", ("--fix-cause", "Repair the fixture"), 1),
+                ("test", "test_prompt.txt", f"\n{rules}\n", (), 1),
+                ("review", "review_prompt_1.txt", "", (), 0),
+            ):
+                self.write_phase_prompt("7", "Assignment core", f"Continue the fixture work.{source_rules}")
+                _ = self.successful(role, *options)
+                dispatched = (manifest.parent / filename).read_text()
+                self.assertEqual((dispatched.count(rules), dispatched.count(limits)), (count, count), role)
 
     def test_review_is_read_only_and_thread_board_and_summary_use_the_shown_context(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
