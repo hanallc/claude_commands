@@ -68,6 +68,7 @@ def words_box(element_id: str, placeholder: str, *, value: str = '') -> str:
             + f'<button type="button" id="{identity}-clear" data-clear-filter-words aria-label="Clear filter">×</button></div>')
 
 
+WEEKDAYS = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
 CLOCK = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
 
 
@@ -80,18 +81,47 @@ def clock_minutes(settings: conf.ConfigRead, key: str) -> int:
     return int(match[1])*60+int(match[2])
 
 
-def date_time_picker(*, field: str, action: str, value: str) -> str:
-    """Render the date and time sheet inside an action popover."""
-    return ('<div class="later-custom" data-later-custom hidden>'
+def park_settings(settings: conf.ConfigRead) -> dict[str, int]:
+    """Read the settings for the shared park control."""
+    day = settings.text('later_week_day')
+    if day not in WEEKDAYS:
+        raise ValueError(f'review_links.conf: later_week_day={day!r} is not a weekday name such as Monday')
+    return {'soon': settings.whole('later_soon_minutes'), 'morning': clock_minutes(settings, 'later_morning'),
+            'weekDay': WEEKDAYS.index(day), 'weekTime': clock_minutes(settings, 'later_week_time'),
+            'step': settings.whole('park_time_step_minutes')}
+
+
+def park_control(label: str, *, field: str, action: str, value: str, identity: str = '',
+                 allow_delivery: bool = False) -> str:
+    """Render the park menu and date picker."""
+    id_html = f' id="{html.escape(identity, quote=True)}"' if identity else ''
+    action = html.escape(action, quote=True)
+    presets: tuple[tuple[str, str], ...] = (('delivered', 'Until delivered'),) if allow_delivery else ()
+    presets += (('soon', '1 hour'), ('morning', 'Tomorrow'), ('week', 'Next week'))
+    buttons = ''.join(
+        f'<button type="submit" role="menuitem" tabindex="-1" name="{action}" value="park-until-{key}"'
+        + f' data-later-preset="{key}"><span>{text}</span><small></small></button>'
+        for key, text in presets
+    )
+    return ('<div class="later-menu"><button type="button"' + id_html
+            + f' aria-haspopup="menu" aria-expanded="false" data-later-toggle>{label}'
+            + ' <span aria-hidden="true">▾</span></button>'
+            + f'<div role="menu" aria-label="{label}" data-later-menu hidden>' + buttons + '<hr>'
+            + '<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Pick a date…</span></button>'
+            + '<div class="later-custom" data-later-custom hidden>'
             +f'<input type="hidden" name="{html.escape(field, quote=True)}">'
             +'<div class="later-month-header"><strong data-later-month aria-live="polite"></strong><div>'
             +'<button type="button" tabindex="-1" data-later-month-step="-1" aria-label="Previous month">‹</button>'
             +'<button type="button" tabindex="-1" data-later-month-step="1" aria-label="Next month">›</button></div></div>'
             +'<div role="grid" aria-label="Choose a day" data-later-grid></div>'
-            +'<label class="later-time">Time<input type="text" inputmode="numeric" autocomplete="off" data-later-time></label>'
+            # Keep Enter in the time field from submitting the first form action.
+            +'<div class="later-time"><label>Time<input type="text" inputmode="numeric" autocomplete="off" form="" '
+            +'role="combobox" aria-expanded="false" data-later-time></label>'
+            +'<button type="button" tabindex="-1" aria-label="Show suggested times" data-later-time-choices>▾</button>'
+            +'<div role="listbox" aria-label="Suggested times" data-later-times hidden></div></div>'
             +'<div class="later-save"><span data-later-summary aria-live="polite"></span>'
-            +f'<button class="primary" name="{html.escape(action, quote=True)}" value="{html.escape(value, quote=True)}">Save</button>'
-            +'</div></div>')
+            +f'<button class="primary" name="{action}" value="{html.escape(value, quote=True)}">Save</button>'
+            +'</div></div></div></div>')
 
 
 STYLE = '''<style>
@@ -216,10 +246,23 @@ background:var(--card);color:var(--ink)}[data-later-menu] .primary{background:va
 [data-later-menu] [data-later-grid] [aria-selected=true]{background:var(--accent);color:#fff}
 [data-later-menu] [data-later-grid] button:disabled{opacity:.3}
 [data-later-menu] [data-later-grid] button:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
-[data-later-menu] .later-time{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:400;margin:0 0 10px}
-[data-later-menu] .later-time input{font:inherit;min-height:32px;width:120px;max-width:100%;box-sizing:border-box;padding:3px 8px;
+[data-later-menu] .later-time{position:relative;margin:0 0 10px}
+[data-later-menu] .later-time label{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:400}
+[data-later-menu] .later-time input{font:inherit;min-height:32px;width:120px;max-width:100%;box-sizing:border-box;padding:3px 28px 3px 8px;
 border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);color-scheme:light dark}
 [data-later-menu] .later-time input[aria-invalid=true]{border-color:var(--error);color:var(--error)}
+[data-later-menu] [data-later-time-choices]{position:absolute;right:2px;top:2px;width:26px;min-height:28px;padding:0;border:0;background:none}
+[data-later-times]{position:absolute;right:0;top:100%;z-index:1;box-sizing:border-box;width:120px;max-height:144px;overflow:auto;
+background:var(--card);border:1px solid var(--line);border-radius:6px}
+[data-later-times] [role=option]{padding:4px 8px;cursor:pointer}
+[data-later-times] [role=option]:hover,[data-later-times] [aria-selected=true]{background:var(--accent);color:#fff}
+[data-later-menu] button[role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
+min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;color:var(--ink);text-align:left}
+[data-later-menu] [role=menuitem]:focus{background:var(--accent);color:#fff;outline:none}
+[data-later-menu] small{font-size:12px;color:var(--ink-3)}
+[data-later-menu] [role=menuitem]:focus small{color:inherit;opacity:.85}
+[data-later-menu] hr{border:0;border-top:1px solid var(--line);margin:5px 4px}
+[data-later-menu][data-choosing]>:is([role=menuitem],hr){display:none}
 .later-save [data-later-summary]{font-size:11px;white-space:nowrap;color:var(--ink-3)}
 [data-later-menu] .later-save button{min-height:32px;padding:4px 10px;font-size:12px;flex-shrink:0}
 [data-later-menu] .later-save button:disabled{opacity:.4}
@@ -992,6 +1035,38 @@ function dateTimeDraftEpoch(zone,wall){
  const draft=parseDateTimeDraft(wall);
  return draft ? dateTimeEpoch(zone,draft.date,draft.minutes) : NaN;
 }
+function parkPresetTime(preset,now,zone,settings){
+ if(preset==='soon') return now+settings.soon*60000;
+ const today=zoneParts(zone,now);
+ const at=(days,minutes)=>zoneEpoch(zone,today.year,today.month,today.day+days,minutes);
+ if(preset==='morning') return at(1,settings.morning);
+ const weekday=new Date(Date.UTC(today.year,today.month-1,today.day)).getUTCDay();
+ return at((settings.weekDay-weekday+7)%7 || 7,settings.weekTime);
+}
+function showParkPresets(menu,settings){
+ const hours=settings.soon%60===0,count=hours ? settings.soon/60 : settings.soon;
+ const unit=hours ? 'hour' : 'minute';
+ menu.querySelector('[data-later-preset="soon"] span').textContent=count+' '+unit+(count===1 ? '' : 's');
+ menu.querySelector('[data-later-preset="morning"] small').textContent=dateTimeClock(settings.morning);
+ const weekdays=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+ menu.querySelector('[data-later-preset="week"] small').textContent=
+  weekdays[settings.weekDay]+' '+dateTimeClock(settings.weekTime);
+}
+function parkRequestTime(form,submitter,zone,settings,wall){
+ const preset=submitter?.dataset.laterPreset;
+ let until='';
+ if(preset==='delivered') until='delivered';
+ else if(preset) until=new Date(parkPresetTime(preset,Date.now(),zone,settings)).toISOString();
+ else{
+  if(/^\d{4}-\d{2}-\d{2}$/.test(wall)) until=wall;
+  else{
+   const at=dateTimeDraftEpoch(zone,wall);
+   if(at>Date.now()) until=new Date(at).toISOString();
+  }
+ }
+ if(until) closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
+ return until;
+}
 function closeDateTimePicker(menu,focus){
  menu.hidden=true;menu.querySelector('[data-later-custom]').hidden=true;delete menu.dataset.choosing;
  const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
@@ -1004,19 +1079,20 @@ function pickerSummary(zone){
   return date.format(at)+' '+dateTimeClock(hour*60+minute);
  };
 }
-function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummary=pickerSummary(zone),
- prepareMenu=()=>{},retryTime=()=>NaN}){
+let parkTimeListId=0;
+function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary=pickerSummary(zone)}){
  const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
  const custom=menu.querySelector('[data-later-custom]'),chooseItem=menu.querySelector('[data-later-choose]');
- const items=()=>[...menu.querySelectorAll('[role=menuitem]:not([hidden])')];
+ const items=()=>[...menu.querySelectorAll('[role=menuitem]')];
  toggle.addEventListener('click',()=>{
   if(!menu.hidden){closeDateTimePicker(menu,true);return;}
-  prepareMenu(menu);
+  showParkPresets(menu,settings());
   menu.hidden=false;toggle.setAttribute('aria-expanded','true');
-  if(chooseItem) items()[0].focus();
-  else choose();
+  items()[0].focus();
  });
  const grid=custom.querySelector('[data-later-grid]'),time=custom.querySelector('[data-later-time]');
+ const times=custom.querySelector('[data-later-times]'),timeChoices=custom.querySelector('[data-later-time-choices]');
+ times.id='park-times-'+(++parkTimeListId);time.setAttribute('aria-controls',times.id);
  const focusCalendar=()=> (grid.querySelector('[tabindex="0"]') ?? time).focus();
  const save=custom.querySelector('.later-save button'),month=custom.querySelector('[data-later-month]');
  const previousMonth=custom.querySelector('[data-later-month-step="-1"]');
@@ -1033,14 +1109,74 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
   if(valid && normalize) time.value=clock;
   field.value=valid ? dayText(selected)+'T'+clock : '';
   field.dispatchEvent(new Event('input',{bubbles:true}));
-  const retry=retryTime();
-  const at=Number.isFinite(retry) ? retry : valid ? dateTimeEpoch(zone,selected,minutes) : NaN;
+  const at=valid ? dateTimeEpoch(zone,selected,minutes) : NaN;
   custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at)
    ? summaryPrefix+formatSummary(at) : 'Choose a time';
-  save.disabled=!Number.isFinite(retry) && !(at>Date.now());
+  save.disabled=!(at>Date.now());
  };
+ const activeTime=()=>times.querySelector('[aria-selected="true"]');
+ const showTimes=open=>{
+  times.hidden=!open;
+  time.setAttribute('aria-expanded',String(open));
+  if(!open){
+   activeTime()?.setAttribute('aria-selected','false');
+   time.removeAttribute('aria-activedescendant');
+  }
+ };
+ const acceptTime=option=>{
+  time.value=option.textContent;
+  showTimes(false);
+  update();
+ };
+ timeChoices.addEventListener('mousedown',event=>event.preventDefault());
+ timeChoices.addEventListener('click',()=>{
+  time.focus({preventScroll:true});showTimes(times.hidden);
+ });
+ times.addEventListener('mousedown',event=>{
+  if(event.target.closest('[role=option]')) event.preventDefault();
+ });
+ times.addEventListener('click',event=>{
+  const option=event.target.closest('[role=option]');
+  if(option) acceptTime(option);
+ });
+ time.addEventListener('keydown',event=>{
+  if(event.defaultPrevented || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  if(event.key==='ArrowDown' || event.key==='ArrowUp'){
+   if(!times.firstElementChild) return;
+   event.preventDefault();
+   showTimes(true);
+   const active=activeTime();
+   const down=event.key==='ArrowDown';
+   const next=down ? active?.nextElementSibling : active?.previousElementSibling;
+   const option=next ?? active ?? (down ? times.firstElementChild : times.lastElementChild);
+   active?.setAttribute('aria-selected','false');
+   option.setAttribute('aria-selected','true');
+   time.setAttribute('aria-activedescendant',option.id);
+   option.scrollIntoView({block:'nearest'});
+  }else if(!times.hidden && (event.key==='Enter' || event.key==='Escape')){
+   event.preventDefault();
+   const option=activeTime();
+   if(event.key==='Enter' && option) acceptTime(option);
+   else showTimes(false);
+  }
+ });
  const draw=()=>{
   const current=today(),currentText=dayText(current),selectedText=dayText(selected);
+  const step=settings().step,now=zoneParts(zone,Date.now());
+  const firstTime=(Math.floor((now.hour*60+now.minute)/step)+1)*step;
+  const clockValues=[];
+  for(let minutes=firstTime;minutes<1440;minutes+=step) clockValues.push(minutes);
+  if(selected>current) for(let minutes=0;minutes<Math.min(firstTime,1440);minutes+=step) clockValues.push(minutes);
+  showTimes(false);
+  times.replaceChildren(...clockValues.map(minutes=>{
+   const option=document.createElement('div');
+   option.id=times.id+'-'+minutes;
+   option.setAttribute('role','option');
+   option.setAttribute('aria-selected','false');
+   option.textContent=dateTimeClock(minutes);
+   return option;
+  }));
+  timeChoices.disabled=!clockValues.length;
   month.textContent=monthText.format(display);grid.replaceChildren();
   grid.setAttribute('aria-label',month.textContent);
   const header=document.createElement('div');header.setAttribute('role','row');
@@ -1071,33 +1207,37 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
  };
  function choose(){
   const draft=parseDateTimeDraft(field.value);
-  if(draft && (Number.isFinite(retryTime()) || dateTimeEpoch(zone,draft.date,draft.minutes)>Date.now())){
+  if(draft && dateTimeEpoch(zone,draft.date,draft.minutes)>Date.now()){
    selected=draft.date;time.value=dateTimeClock(draft.minutes);
   }else{
    selected=today();selected.setUTCDate(selected.getUTCDate()+1);
-   time.value=dateTimeClock(defaultMinutes());
+   time.value=dateTimeClock(settings().morning);
   }
   const current=today();
   display=new Date(selected<current ? current : selected);
   custom.hidden=false;menu.dataset.choosing='true';draw();
   focusCalendar();
  }
- chooseItem?.addEventListener('click',choose);
+ chooseItem.addEventListener('click',choose);
  custom.querySelectorAll('[data-later-month-step]').forEach(button=>button.addEventListener('click',()=>{
   const hadFocus=document.activeElement===button;
   display=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth()+Number(button.dataset.laterMonthStep),1));
   draw();
   if(hadFocus && button.disabled) focusCalendar();
  }));
- time.addEventListener('input',()=>update());
- time.addEventListener('blur',()=>update(true));
- time.addEventListener('keydown',event=>{
-  const step={ArrowUp:15,ArrowDown:-15}[event.key];
-  if(step===undefined) return;
-  event.preventDefault();
-  const minutes=dateTimeMinutes(time.value);
-  if(!Number.isFinite(minutes)) return;
-  time.value=dateTimeClock((minutes+step+1440)%1440);update();
+ time.addEventListener('input',()=>{showTimes(false);update();});
+ time.addEventListener('blur',()=>{showTimes(false);update(true);});
+ toggle.parentElement.addEventListener('focusout',event=>{
+  if(menu.hidden) return;
+  const control=toggle.parentElement;
+  if(event.relatedTarget){
+   if(!control.contains(event.relatedTarget)) closeDateTimePicker(menu,false);
+  }else{
+   // The calendar can replace the active day before it sets focus again.
+   requestAnimationFrame(()=>{
+    if(!menu.hidden && !control.contains(document.activeElement)) closeDateTimePicker(menu,false);
+   });
+  }
  });
  grid.addEventListener('keydown',event=>{
   const days={ArrowLeft:-1,ArrowRight:1,ArrowUp:-7,ArrowDown:7}[event.key];
@@ -1110,16 +1250,18 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
   selected=date;display=new Date(date);draw();focusCalendar();
  });
  menu.addEventListener('keydown',event=>{
+  if(event.defaultPrevented || event.isComposing) return;
+  if(event.target===time &&
+     (event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey)) return;
   if(event.key==='Escape'){event.preventDefault();closeDateTimePicker(menu,true);return;}
   if(custom.contains(event.target)){
-   if(event.key==='Enter'){
+   if(event.key==='Enter' && event.target!==timeChoices){
     event.preventDefault();update(true);if(!save.disabled) form.requestSubmit(save);
    }
    return;
   }
   const list=items();
- if(!list.length) return;
- const index=list.indexOf(document.activeElement);
+  const index=list.indexOf(document.activeElement);
   const next={ArrowDown:index+1,ArrowUp:index-1+list.length,Home:0,End:list.length-1}[event.key];
   if(next===undefined) return;
   event.preventDefault();list[next%list.length].focus();

@@ -153,7 +153,7 @@ class ReviewPageTests(unittest.TestCase):
         assets: dict[str, str] = {}
         review_page.retain_asset(item, assets)
         inputs = review_page.ReviewBodyInputs(snapshot.browser, snapshot.members, snapshot.words_rows,
-            'In 1 hour', assets, snapshot.zone, snapshot.names)
+            assets, snapshot.zone, snapshot.names)
         return review_page.details(item, inputs)
 
     @override
@@ -175,8 +175,8 @@ class ReviewPageTests(unittest.TestCase):
             + "status.round_trip_limit_seconds=1\nstatus.render_limit_seconds=1\n"
             + "status.reading_delay_seconds=1\nstatus.review.age_limit_seconds=45\n")
         _ = write_config_fixture(config / "review_links.conf",
-            "review_words_rows=4\nlater_soon_minutes=60\nlater_evening=18:00\n"
-            + "later_evening_until=17:00\nlater_morning=09:00\nlater_week_day=Monday\nlater_week_time=09:00\n")
+            "review_words_rows=4\nlater_soon_minutes=60\nlater_morning=09:00\n"
+            + "later_week_day=Monday\nlater_week_time=09:00\npark_time_step_minutes=15\n")
         self.root = self.fixture.root
         _ = change_page.console_folder(self.root)
         self.status = change_page.DeliveryStatus(self.root)
@@ -3343,12 +3343,13 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 heading = 'Sends to showrunner' if item.type == review_items.ReviewType.CHANGE else 'The item returns to you'
                 self.assertIn(heading,form)
                 self.assertIn('aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later',form)
-                for label in ('In 1 hour','This evening','Tomorrow morning','Next week','Choose a time…'):
+                for label in ('1 hour','Tomorrow','Next week','Pick a date…'):
                     self.assertIn('<span>'+label+'</span>',form)
+                self.assertNotIn('Until delivered',form)
                 self.assertNotIn('type="datetime-local"',form)
                 self.assertIn('type="hidden" name="later"',form)
                 self.assertIn('role="grid"',form)
-                self.assertIn('<label class="later-time">Time<input type="text" inputmode="numeric" autocomplete="off" data-later-time></label>',form)
+                self.assertIn('role="combobox" aria-expanded="false" data-later-time',form)
                 self.assertIn('value="later">Save',form)
                 self.assertNotIn('value="skip"',form)
 
@@ -3361,23 +3362,22 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         self.assertIn(b'data-card-fade-out-ms="365" data-card-fade-in-ms="725"', after.render())
         self.assertIn(b'"cardFadeOutMs": 365, "cardFadeInMs": 725', after.index_response())
 
-    def test_later_presets_read_their_settings(self) -> None:
-        for minutes, label in ((1,'In 1 minute'),(90,'In 90 minutes'),(60,'In 1 hour'),(120,'In 2 hours')):
-            with self.subTest(minutes=minutes):
-                self.assertEqual(review_page.soon_label(minutes),label)
-        lines = ('# whole: 1..1440','later_soon_minutes=60','later_evening=18:00','later_evening_until=17:00','later_morning=09:00',
-                 'later_week_day=Monday','later_week_time=09:30')
+    def test_park_settings_validate_the_times_weekday_and_step(self) -> None:
+        lines = ('# whole: 1..1440', 'later_soon_minutes=60', 'later_morning=09:30',
+                 'later_week_day=Wednesday', 'later_week_time=10:35', '# whole: 1..60', 'park_time_step_minutes=15')
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder)/'review_links.conf'
             _ = path.write_text('\n'.join(lines)+'\n',encoding='utf-8')
-            self.assertEqual(review_page.later_settings(conf.read(path)),
-                             {'soon':60,'evening':1080,'eveningUntil':1020,'morning':540,'weekDay':1,'weekTime':570})
-            for bad in ('later_week_day=Mon','later_morning=9:00'):
+            self.assertEqual(record_table.park_settings(conf.read(path)),
+                             {'soon': 60, 'morning': 570, 'weekDay': 3, 'weekTime': 635, 'step': 15})
+            for bad in ('later_soon_minutes=0', 'later_morning=9:00', 'later_morning=24:00', 'later_week_day=Wed',
+                        'later_week_time=9:00', 'park_time_step_minutes=61'):
                 with self.subTest(bad=bad):
                     key = bad.split('=')[0]
-                    _ = path.write_text('\n'.join(line for line in lines if not line.startswith(key+'='))+'\n'+bad+'\n',encoding='utf-8')
+                    _ = path.write_text('\n'.join(bad if line.startswith(key+'=') else line for line in lines)+'\n',
+                                        encoding='utf-8')
                     with self.assertRaisesRegex(ValueError,key):
-                        _ = review_page.later_settings(conf.read(path))
+                        _ = record_table.park_settings(conf.read(path))
 
     def test_ask_question_and_one_owner_answer_command_for_each_type(self) -> None:
         decisions = self.decisions()
@@ -3851,6 +3851,20 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertEqual(len(self.fixture.messages), 1)
                 recovered = self.status.slots(delivery.page, row).question
                 self.assertEqual(recovered, replace(pending, delivery=change_page.NoDelivery()))
+
+    def test_later_refuses_an_expired_deadline_before_writing(self) -> None:
+        snapshot = review_page.build_snapshot(self.root)
+        key = 'page-owner/C1'
+        listing = self.fixture.review_list.read_bytes()
+        times_before = review_later.times()
+        form = self.card_body(snapshot, key, 'later', 'Try this expired time.')
+        for value in ('2026-10-31T09:00', '2026-10-31T09:00:00-04:00'):
+            with self.subTest(value=value):
+                body = form+'&'+urlencode({'later': value})
+                with self.assertRaisesRegex(ValueError, r'^Choose a future parking date\.$'):
+                    _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
+                self.assertEqual(self.fixture.review_list.read_bytes(), listing)
+                self.assertEqual(review_later.times(), times_before)
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,
@@ -5463,13 +5477,15 @@ window.fetch=async(_url,options={})=>{
   if(innerWidth<960) check(getComputedStyle(shown()[0]).display==='block','phone rows are cards');
   await readyReviewCard(fresh);
   const laterToggle=fresh.querySelector('[data-later-toggle]'),laterMenu=fresh.querySelector('[data-later-menu]');
+  const menuNow=Date.now;Date.now=()=>Date.parse('2026-11-23T04:53:00Z');
   laterToggle.click();
+  Date.now=menuNow;
   const menuItems=()=>[...laterMenu.querySelectorAll('[role=menuitem]')].filter(item=>!item.hidden);
   const presetTime=name=>laterMenu.querySelector('[data-later-preset="'+name+'"] small').textContent;
   check(!laterMenu.hidden && laterToggle.getAttribute('aria-expanded')==='true' && document.activeElement===menuItems()[0],
     'Later opens its menu with the first preset in focus');
-  check(/^[A-Z][a-z]{2} [0-9]{2}:[0-9]{2}$/.test(presetTime('soon')) && /^[A-Z][a-z]{2} 09:00$/.test(presetTime('morning')) &&
-    /^Mon 09:00$/.test(presetTime('week')),'each preset shows its resolved time in the user zone');
+  check(presetTime('soon')==='' && presetTime('morning')==='09:00' &&
+    presetTime('week')==='Mon 09:00','Later shows relative choices without dates');
   menuItems()[0].dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true}));
   check(document.activeElement===menuItems().at(-1),'ArrowUp moves from the first item to the last');
   menuItems().at(-1).dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));
@@ -5482,7 +5498,10 @@ window.fetch=async(_url,options={})=>{
   laterMenu.querySelector('[data-later-choose]').click();
   const calendar=laterMenu.querySelector('[role=grid]'),timeField=laterMenu.querySelector('[data-later-time]');
   check(!laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===calendar?.querySelector('[tabindex="0"]'),
-    'Choose a time shows the calendar with the selected day in focus');
+    'Pick a date shows the calendar with the selected day in focus');
+  const times=document.getElementById(timeField.getAttribute('aria-controls'));
+  check([...times.children].slice(0,3).map(option=>option.textContent).join()==='10:15,10:30,10:45',
+    'The time list starts at the next quarter hour');
   const chooserChecks=['the grid opens on tomorrow in the user zone','arrows move the selected day across months',
     'a past day cannot be picked','Save is disabled for a time before now','the summary shows the selected wall time',
     'the chooser fits within the menu and viewport'];
@@ -5518,17 +5537,27 @@ window.fetch=async(_url,options={})=>{
   document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
   check(laterMenu.hidden && laterMenu.querySelector('[data-later-custom]').hidden && document.activeElement===laterToggle,
     'Escape closes the menu and returns focus to Later');
-  Date.now=chooserNow;
-  laterToggle.click();const week=laterMenu.querySelector('[data-later-preset="week"]'),weekAt=Number(week.dataset.at);
+  laterToggle.click();
+  const search=document.getElementById('list-search');
+  search.focus();
+  check(laterMenu.hidden && document.activeElement===search && !dateTimePickerOpen(fresh),
+    'Focus outside Later closes the menu and releases the refresh hold');
+  Date.now=()=>Date.parse('2026-11-23T04:59:00Z');
+  laterToggle.click();
+  const week=laterMenu.querySelector('[data-later-preset="week"]'),postCount=window.posts.length;
+  check(presetTime('week')==='Mon 09:00','The relative choice shows Monday at 09:00 before midnight');
+  Date.now=()=>Date.parse('2026-11-23T05:01:00Z');
   const laterResponse=holdPost();
   week.click();
+  check(laterMenu.hidden && window.posts.length===postCount+1,'One click after midnight submits Later');
+  Date.now=chooserNow;
   check(leavingNow(fresh),'Later starts the departure before the response');
   check(document.querySelector('[data-show-chip="open"] b').textContent==='0' &&
     selectedOwner().dataset.ownerChip===retained.owner,'Later updates the count and keeps the owner while the request runs');
   laterResponse.save();
   await new Promise(resolve=>nativeTimeout(resolve,1000));
-  check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')===new Date(weekAt).toISOString(),
-    'a preset sends its time at once');
+  check(window.posts.at(-1).get('outcome')==='later' && window.posts.at(-1).get('later')==='2026-11-30T14:00:00.000Z',
+    'The first click sends the deadline for the new day');
   check(fresh.hidden,'Later removes the question from the page');
   check(document.querySelector('[data-show-chip="open"] b').textContent==='0','Later removes the question from the filtered count');
   const nativeNow=Date.now;Date.now=()=>new Date('2099-01-01T09:00').getTime()+1000;
@@ -5691,13 +5720,20 @@ window.fetch=async(_url,options={})=>{
    'The 17:30 draft shows 17:30 without AM or PM (input type: '+field.type+')');
   const key=name=>field.dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
   const type=value=>{field.value=value;field.dispatchEvent(new Event('input',{bubbles:true}));};
-  field.focus();key('ArrowUp');
-  check(field.value==='17:45' && form.elements.later.value==='2026-12-01T17:45','ArrowUp adds 15 minutes');
-  key('ArrowDown');check(field.value==='17:30','ArrowDown subtracts 15 minutes');
-  type('23:45');key('ArrowUp');
-  check(field.value==='00:00' && form.elements.later.value==='2026-12-01T00:00','ArrowUp wraps at midnight');
+  const times=form.querySelector('[data-later-times]'),menu=form.querySelector('[data-later-menu]');
+  check(field.getAttribute('aria-controls')===times.id && times.hidden && !field.form,
+   'Time controls the suggestion list and has no implicit form action');
+  field.focus();
   key('ArrowDown');
-  check(field.value==='23:45' && form.elements.later.value==='2026-12-01T23:45','ArrowDown wraps at midnight');
+  for(const name of ['ArrowLeft','ArrowRight','Home','End','Tab']){
+   check(key(name) && field.value==='17:30' && form.elements.later.value==='2026-12-01T17:30',
+    'The page leaves '+name+' to the browser and keeps the draft');
+  }
+  key('Escape');
+  check(times.hidden && !menu.hidden && !posts.length,'Escape closes only the suggestion list');
+  key('ArrowDown');key('Enter');
+  check(times.hidden && !menu.hidden && field.value==='15:15' && !posts.length,
+   'Enter accepts the active suggestion without saving the draft');
   for(const value of ['9:00','0900','09:00']){
    field.focus();type(value);
    check(field.getAttribute('aria-invalid')==='false' && !save.disabled &&
@@ -5709,21 +5745,18 @@ window.fetch=async(_url,options={})=>{
   for(const value of ['','24:00','12:60','9:00 AM','17:30:00']){
    type(value);key('Enter');
    check(field.getAttribute('aria-invalid')==='true' && save.disabled && !form.elements.later.value && !posts.length,
-    'An invalid time blocks Save and Enter: '+JSON.stringify(value));
+    'An invalid time disables Save: '+JSON.stringify(value));
   }
   const error=document.createElement('span');error.style.color='var(--error)';form.append(error);
   const errorColor=getComputedStyle(error).color,style=getComputedStyle(field);
   check(style.color===errorColor && style.borderTopColor===errorColor,'An invalid time uses the console error color');
   type('1730');
-  let submitted=false;
-  form.addEventListener('submit',event=>{
-   event.preventDefault();event.stopImmediatePropagation();submitted=event.submitter===save;
-  },{capture:true,once:true});
-  key('Enter');
-  check(field.value==='17:30' && field.getAttribute('aria-invalid')==='false' && !save.disabled && submitted,
-   'Enter shows 17:30 and submits Save');
-  save.click();
-  check(posts.at(-1)?.get('later')==='2026-12-01T17:30:00.000Z','Save sends T17:30 in UTC');
+  save.focus();
+  check(field.value==='17:30' && field.getAttribute('aria-invalid')==='false' && !save.disabled && !posts.length,
+   'Moving from Time to Save formats 17:30 and enables Save');
+  field.focus();key('Enter');
+  check(posts.length===1 && posts[0].get('later')==='2026-12-01T17:30:00.000Z',
+   'Enter in Time sends T17:30 in UTC when the list is closed');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
@@ -5754,7 +5787,8 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
  const flush=()=>new Promise(resolve=>nativeTimeout(resolve,60));
  const form=()=>document.querySelector('[data-type="question"] form');
  const open=()=>{form().querySelector('[data-later-toggle]').click();form().querySelector('[data-later-choose]').click();};
- const close=()=>form().querySelector('[data-later-time]').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+ const close=()=>form().querySelector('[data-later-grid] [tabindex="0"]')
+  .dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
  const time=value=>{const field=form().querySelector('[data-later-time]');field.value=value;field.dispatchEvent(new Event('input',{bubbles:true}));};
  const selected=()=>form().querySelector('[role=grid] [aria-selected="true"]')?.dataset.date;
  try{
@@ -5782,7 +5816,8 @@ Date.now=()=>Date.parse(SCENARIO==='gap' ? '2027-03-13T15:00:00Z' :
    settings.morning=gap ? 150 : 90;content.dataset.later=JSON.stringify(settings);
    form().querySelector('[data-later-toggle]').click();
    const preset=form().querySelector('[data-later-preset="morning"]');
-   check(new Date(Number(preset.dataset.at)).toISOString()===expected,'F005: '+SCENARIO+' preset uses compatible resolution');
+   const at=parkPresetTime(preset.dataset.laterPreset,Date.now(),content.dataset.zone,settings);
+   check(new Date(at).toISOString()===expected,'F005: '+SCENARIO+' preset resolves at activation');
    form().querySelector('[data-later-choose]').click();time(clock);
    check(form().querySelector('[data-later-summary]').textContent===
     (gap ? 'Hides until Sun 14 Mar 03:30' : 'Hides until Sun 7 Nov 01:30'),

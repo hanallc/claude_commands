@@ -347,14 +347,14 @@ def review_action_groups(closing_buttons: str, returning_buttons: str, later_con
                          returning_heading: ReturningActionHeading = ReturningActionHeading.ITEM_RETURNS) -> str:
     """Render the Review action groups that have controls."""
     groups = (
-        ("Closes the item", closing_buttons, "", ""),
-        (returning_heading, returning_buttons, "", ""),
-        ("Hides it until", later_controls, " review-later", ' class="later-menu"'),
+        ("Closes the item", closing_buttons, ""),
+        (returning_heading, returning_buttons, ""),
+        ("Hides it until", later_controls, " review-later"),
     )
     return '<div class="review-actions">' + "".join(
         f'<div class="review-action-group{group_class}"><span>{label}</span>'
-        + f'<div{controls_class}>{controls}</div></div>'
-        for label, controls, group_class, controls_class in groups if controls
+        + f'<div>{controls}</div></div>'
+        for label, controls, group_class in groups if controls
     ) + '</div>'
 
 

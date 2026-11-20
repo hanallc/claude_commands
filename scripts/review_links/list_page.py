@@ -10,7 +10,7 @@ import secrets
 import sys
 import time
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, tzinfo
 from enum import Enum, StrEnum
@@ -26,7 +26,7 @@ from scripts.production import change_review, footer_counts, record_store, sessi
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
-from scripts.review_links import new_item_dialog, review_items, review_page
+from scripts.review_links import new_item_dialog, review_actions, review_items, review_page
 from scripts.review_links import search_fold, staff_names
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
@@ -456,10 +456,8 @@ def feedback_form(entry: ListRecord, secret: str, today: datetime, resends: tupl
     return ('<form method="post" data-feedback-form>' + hidden + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read
             + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
-            + f'<div class="list-park"><button type="button" id="park-{key}" aria-haspopup="dialog" aria-expanded="false" data-later-toggle>Park until</button>'
-            + '<div role="dialog" aria-label="Park until" data-later-menu hidden>'
-            + '<button type="submit" name="action" value="park-until-delivered" data-later-preset>Until delivered</button>'
-            + record_table.date_time_picker(field="until", action="action", value="park") + '</div></div></div></div>'
+            + record_table.park_control("Park", field="until", action="action", value="park",
+                                        identity="park-" + key, allow_delivery=True) + '</div></div>'
             + retry
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
@@ -881,11 +879,17 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
     elif action == "park":
         if until != the_list.ParkUntilDelivered.DELIVERED and the_list.ISO_TIME.fullmatch(until) is None:
             raise question_record.AnswerRefused("choose Until delivered, a parking date, or a time with a UTC offset")
-        parked_until = the_list.parking_value(until)
-        assert parked_until is not the_list.NoTimestamp.UNSET
-        label = parking_notice_label(parked_until, user_zone())
-        notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
-        changed = the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
+        zone = user_zone()
+
+        def save_park(parked_until: datetime | the_list.ParkUntilDelivered,
+                      check_deadline: Callable[[datetime], None] | None = None) -> the_list.ListItem:
+            label = parking_notice_label(parked_until, zone)
+            notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
+            return the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE,
+                                 notice=notice, check_deadline=check_deadline)
+
+        changed = (save_park(the_list.ParkUntilDelivered.DELIVERED) if until == the_list.ParkUntilDelivered.DELIVERED
+                   else review_actions.save_timed_park(until, zone, save_park, require_offset=len(until) != 10))
     elif action == "unpark":
         notice = the_list.PageItemNotice(request, f"List page: nate unparked item {item.number}.", "unpark", words)
         changed = the_list.unpark(morty.id, identity, source=the_list.PAGE_SOURCE, notice=notice).item
@@ -1186,8 +1190,9 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
+    park_retry = settings.number("frame_retry_seconds")
     card_motion = page_frame.CardMotion.read(settings)
-    morning = record_table.clock_minutes(settings, "later_morning")
+    parking = html.escape(json.dumps(record_table.park_settings(settings)), quote=True)
     log_max_height = settings.whole("list_log_max_height_rem")
     counts = ''
     if include_counts:
@@ -1199,9 +1204,10 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     content = (STYLE + page_frame.title("The List", "list", action=new_item_dialog.title_button("list"), compact_actions=True)
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}"'
+               + f' data-park-retry-seconds="{park_retry}"'
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
-               + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
+               + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem">'
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)
                + '<div class="list-producer-filter">'
@@ -1278,11 +1284,10 @@ background:var(--ink-2);border-radius:50%}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
 .list-actions{position:relative}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
-.list-park [data-later-menu] [data-later-preset]{display:block;width:calc(100% - 12px);margin:6px 6px 4px}
 .list-table [data-parked]:not([data-parked="false"]) [data-list-check]{display:none}
 .list-table tbody:has([data-parked-detail]:not([hidden])) .list-row.open [data-parked-note]{display:none}
-.list-table:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible),
-.list-table tbody:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible){overflow:visible}
+.list-table:has([data-later-menu]:not([hidden]),.list-eta:focus-visible),
+.list-table tbody:has([data-later-menu]:not([hidden]),.list-eta:focus-visible){overflow:visible}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
 .list-tell [value="tell"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
 .list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
@@ -1738,10 +1743,13 @@ function bindFeedbackForm(form){
   });
   const draft=drafts.get(key);if(draft && !waitingForm){words.value=draft.words;until.value=draft.until;}
   const unconfirmed=draft?.unconfirmed ?? new Set();
-  const matching=action=>[...unconfirmed].findLast(attempt=>attempt.words===words.value &&
-   (attempt.action==='park-until-delivered' || attempt.until===until.value) &&
-   (action===undefined || attempt.action===action));
+  const matching=action=>[...unconfirmed].findLast(attempt=>
+   attempt.words===words.value && attempt.until===until.value && (action===undefined || attempt.action===action));
   const identity=request=>{form.elements.request.value=request.request;form.elements.token.value=request.token;};
+  const zone=content.dataset.zone;
+  const parkSettings=()=>JSON.parse(content.dataset.parking);
+  const parkToggle=form.querySelector('[data-later-toggle]');
+  const parkSummary=waitingForm ? null : listPickerSummary(zone);
   const retainDraft=()=>{
    drafts.set(key,{words:waitingForm ? draft?.words ?? '' : words.value,
     until:waitingForm ? draft?.until ?? '' : until.value,unconfirmed});
@@ -1750,41 +1758,37 @@ function bindFeedbackForm(form){
   const retain=()=>{retainDraft();syncTell();};
   retain();
   words.addEventListener('input',retain);until.addEventListener('input',retain);
-  const zone=content.dataset.zone;
-  const parkToggle=form.querySelector('[data-later-toggle]');
-  if(!waitingForm) bindDateTimePicker(form,{zone,defaultMinutes:()=>Number(content.dataset.parkMorning),summaryPrefix:'Parks until ',
-   formatSummary:listPickerSummary(zone),retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
+  if(!waitingForm) bindDateTimePicker(form,{zone,settings:parkSettings,summaryPrefix:'Parks until ',
+   formatSummary:parkSummary});
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(cardSubmitBlocked(form,tableView.rowFading(key))) return;
-   const submitter=event.submitter,action=submitter?.value || 'tell';
-   const parkForDelivery=action==='park-until-delivered',parks=action==='park' || parkForDelivery;
+   const submitter=event.submitter;
+   const action=submitter?.value || 'tell';
+   const parkForDelivery=action==='park-until-delivered',parks=action==='park' || Boolean(submitter?.dataset.laterPreset);
    const changesParking=parks || action==='unpark';
    const focusUnpark=action==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
    const asksQuestion=action==='question' || action.startsWith('resend-');
    if(usesWords && !words.value.trim()) return;
-   const retry=matching(action);
-   let parkingTime=parkForDelivery ? deliveryParking : retry?.parkingTime ?? until.value;
-   if(action==='park'){
-    if(!retry && !/^\d{4}-\d{2}-\d{2}$/.test(parkingTime)){
-     const at=dateTimeDraftEpoch(zone,parkingTime);
-     if(!(at>Date.now())){showActionFailure(notice,'Choose a future parking time.');return;}
-     parkingTime=new Date(at).toISOString();
-    }
-   }
-   if(!waitingForm && changesParking) closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
-   const attempt=retry ?? {...fresh,action,words:words.value,until:until.value,parkingTime};
+   const retry=parks ? undefined : matching(action);
+   const parkingTime=parks ? parkRequestTime(form,submitter,zone,parkSettings(),until.value) : '';
+   if(parks && !parkingTime){showActionFailure(notice,'Choose a future parking time.');return;}
+   if(!waitingForm && action==='unpark') closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
+   const attempt=retry ?? {...fresh,action,words:words.value,until:until.value};
    identity(attempt);
    const data=new URLSearchParams(new FormData(form));data.set('action',parks ? 'park' : action);
    if(parks) data.set('until',parkingTime);
-   if(!retry){unconfirmed.add(attempt);fresh=newRequest();}
+   if(!retry){
+    if(!parks) unconfirmed.add(attempt);
+    fresh=newRequest();
+   }
    retainDraft();
    startListSave();
    const hadFocus=asksQuestion && item.contains(document.activeElement);
    let focusChoice;
    const trackFocus=event=>{if(event.target!==document.body) focusChoice=event.target;};
    if(hadFocus) document.addEventListener('focusin',trackFocus);
-   let saved=false,refused=false,nextForm;
+   let saved=false,refused=false,retried=false,nextForm;
    setCardSubmitting(form,true,item);
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    if(action==='remove'){
@@ -1802,11 +1806,23 @@ function bindFeedbackForm(form){
    if(pendingRead) pendingRead.keepOpen=false;
    const submission=tableView.startAction(item);
    const hidUnread=clearsUnread && wasVisible && item.hidden;
-   try{
-    const response=await fetch(location.pathname,{method:'POST',body:data});
+   const requestSignal=()=>parks ? AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000) : undefined;
+   const post=async()=>{
+    const response=await fetch(location.pathname,{method:'POST',body:data,signal:requestSignal()});
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
     const result=await response.json();
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+    return result;
+   };
+   try{
+    let result;
+    try{result=await post();}
+    catch(error){
+     if(!parks || refused) throw error;
+     await new Promise(resolve=>setTimeout(resolve,Number(content.dataset.parkRetrySeconds)*1000));
+     retried=true;
+     result=await post();
+    }
     saved=true;
     nextForm=applySavedState(result,changesParking);
     if(usesWords && words.value===data.get('words')) words.value='';
@@ -1817,21 +1833,23 @@ function bindFeedbackForm(form){
    }catch(error){
     const wasHidden=item.hidden;
     let restore=refused || releasesHolds;
-    if(refused) syncConfirmed();
-    else if(parks || action==='remove'){
+    if(retried || (!refused && (parks || action==='remove'))){
      restore=false;
      try{
       const query=new URLSearchParams({'item-state':data.get('id'),keeper:data.get('keeper')});
       if(parks) query.set('park-request',attempt.request);
-      const response=await fetch(location.pathname+'?'+query,{cache:'no-store'});
+      const response=await fetch(location.pathname+'?'+query,{cache:'no-store',signal:requestSignal()});
       if(!response.ok) throw new Error('HTTP '+response.status);
       const current=await response.json();
       nextForm=applySavedState(current);
+      saved=parks && current.park_request_saved===true;
       restore=confirmed.state!=='Closed' && (!parks || current.park_request_saved===false);
      }catch(_){
+      if(retried) refused=false;
       // Keep the pending row state until a refresh can read the record.
      }
-    }else if(clearsUnread) item.dataset.unread=unreadBefore;
+    }else if(refused) syncConfirmed();
+    else if(clearsUnread) item.dataset.unread=unreadBefore;
     if(restore){
      restoreLink?.();
      if(readFilterVersion===unreadFilterVersion){
@@ -1839,11 +1857,14 @@ function bindFeedbackForm(form){
       if(pendingRead) pendingRead.keepOpen=true;
      }
     }
-    if((refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
-    const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-    tableView.showActionFailure(item,submission,'Item '+item.dataset.number,message);
+    if(saved) tableView.applyAction();
+    else{
+     if((refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
+     const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
+     tableView.showActionFailure(item,submission,'Item '+item.dataset.number,message);
+    }
     // The return animation now has the confirmed sort keys.
-    if(refused && wasHidden && !item.hidden) tableView.applyAction();
+    if(!saved && refused && wasHidden && !item.hidden) tableView.applyAction();
    }
    finally{
     if(saved || refused) unconfirmed.delete(attempt);

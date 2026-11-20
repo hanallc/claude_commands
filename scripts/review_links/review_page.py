@@ -47,9 +47,6 @@ SHOWS = (('all', 'All'), ('open', 'Open'), (ReviewState.WAITING, 'Waiting'), (Re
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
           ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies', ReviewType.BUG: 'Bugs',
           ReviewType.RESPONSE: 'Responses'}
-LATER_PRESETS = (('soon', ''), ('evening', 'This evening'), ('morning', 'Tomorrow morning'), ('week', 'Next week'))
-# Weekday names in the order of the browser's getUTCDay.
-WEEKDAYS = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
 FRONT_MATTER = re.compile(r'\A\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)', re.DOTALL)
 CARD_ERROR = page_frame.action_failure("review-card-failure", "This card is not available.").encode()
 
@@ -122,28 +119,12 @@ def index_json(entries: list[ReviewIndexEntry]) -> str:
         '&','\\u0026').replace('<','\\u003c').replace('>','\\u003e')
 
 
-def later_settings(settings: conf.ConfigRead) -> dict[str, int]:
-    """Return the Later menu's preset settings for the page script, in minutes and getUTCDay numbers."""
-    day = settings.text('later_week_day')
-    if day not in WEEKDAYS:
-        raise ValueError(f'review_links.conf: later_week_day={day!r} is not a weekday name such as Monday')
-    return {'soon': settings.whole('later_soon_minutes'), 'evening': record_table.clock_minutes(settings, 'later_evening'),
-            'eveningUntil': record_table.clock_minutes(settings, 'later_evening_until'), 'morning': record_table.clock_minutes(settings, 'later_morning'),
-            'weekDay': WEEKDAYS.index(day), 'weekTime': record_table.clock_minutes(settings, 'later_week_time')}
-
-
-def soon_label(minutes: int) -> str:
-    count, unit = (minutes//60, 'hour') if minutes % 60 == 0 else (minutes, 'minute')
-    return f'In {count} {unit}'+('s' if count > 1 else '')
-
-
 @dataclass(frozen=True)
 class ReviewBodyInputs:
     """Keep the data required to render a card without reading its store."""
     browser: change_page.ReviewBrowser
     members: staff.StaffSnapshot
     words_rows: int
-    soon_label: str
     assets: Mapping[str, str]
     zone: ZoneInfo
     names: staff_names.StaffNames
@@ -223,7 +204,7 @@ class ReviewSnapshot:
         if item.key not in self.unavailable_cards:
             try:
                 body = details(item, ReviewBodyInputs(self.browser, self.members, self.words_rows,
-                    soon_label(self.later.get("soon", 60)), assets, self.zone, self.names)).encode()
+                    assets, self.zone, self.names)).encode()
             except Exception as error:
                 logging.getLogger(__name__).warning('Review card %s: %s', item.key, error)
         return body
@@ -407,7 +388,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     refresh_seconds = settings.number('page_refresh_seconds')
     request_timeout = settings.whole('page_request_timeout_seconds')
     card_motion = page_frame.CardMotion.read(settings)
-    later = later_settings(settings)
+    later = record_table.park_settings(settings)
     title_limit = conf.read_or_repository('production').whole('question_title_max_chars')
     index = index_json(entries)
     notices = tuple(sources.notices.values())
@@ -746,7 +727,7 @@ def waiting_change(item: ReviewItem) -> bool:
 
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
-         soon: str = "In 1 hour", owner: str = '', validator: str = '') -> str:
+         owner: str = '', validator: str = '') -> str:
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
@@ -769,12 +750,7 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     later = ''
     if (item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
             and item.type != ReviewType.RESPONSE and not waiting_change(item)):
-        presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
-                          +f'<span>{html.escape(label or soon)}</span><small></small></button>' for key, label in LATER_PRESETS)
-        later = ('<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
-                 +'<div role="menu" aria-label="Hide until" data-later-menu hidden>'+presets+'<hr>'
-                 +'<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Choose a time…</span></button>'
-                 +record_table.date_time_picker(field='later', action='outcome', value='later')+'</div>')
+        later = record_table.park_control('Later', field='later', action='outcome', value='later')
     words = ''
     if closes or returns or later:
         field = 'words-'+html.escape(item.key, quote=True)
@@ -879,7 +855,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     body += inputs.assets.get('submission:'+item.key, '')
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div><div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+exchange+'</div>'
-            +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets), soon=inputs.soon_label,
+            +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets),
                   owner=owner, validator=validator)+footer+'</div>')
 
 
@@ -1175,13 +1151,6 @@ color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
 .review-actions{margin-top:12px}
 .review-later{margin-left:auto}
 .list-log span{white-space:pre-wrap}
-.review-actions [data-later-menu] [role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
-min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;color:var(--ink);text-align:left}
-.review-actions [data-later-menu] [role=menuitem]:focus{background:var(--accent);color:#fff;outline:none}
-[data-later-menu] small{font-size:12px;color:var(--ink-3)}
-[data-later-menu] [role=menuitem]:focus small{color:inherit;opacity:.85}
-[data-later-menu] hr{border:0;border-top:1px solid var(--line);margin:5px 4px}
-[data-later-menu][data-choosing]>:is([role=menuitem],hr){display:none}
 .review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;
 background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
@@ -1260,31 +1229,6 @@ function updateTitleFallback(panel){
  const plain=text=>text.replace(/\s+/g,' ').trim();
  fallback.hidden=plain(bodyText(body)).includes(plain(fallback.querySelector('p').textContent));
 }
-function laterTimes(now,zone,settings){
- const today=zoneParts(zone,now);
- const at=(days,minutes)=>zoneEpoch(zone,today.year,today.month,today.day+days,minutes);
- const weekday=new Date(Date.UTC(today.year,today.month-1,today.day)).getUTCDay();
- return {soon:now+settings.soon*60000,
-  evening:today.hour*60+today.minute<settings.eveningUntil ? at(0,settings.evening) : 0,
-  morning:at(1,settings.morning),week:at((settings.weekDay-weekday+7)%7 || 7,settings.weekTime)};
-}
-function bindLater(form,zone,settings,pick){
- const shown=new Intl.DateTimeFormat('en-US',{timeZone:zone(),weekday:'short',hour:'2-digit',minute:'2-digit',hourCycle:'h23'});
- const prepareMenu=menu=>{
-  const times=laterTimes(Date.now(),zone(),settings());
-  menu.querySelectorAll('[data-later-preset]').forEach(item=>{
-   const at=times[item.dataset.laterPreset];item.hidden=!at;item.dataset.at=at ? String(at) : '';
-   item.querySelector('small').textContent=at ? shown.format(at) : '';
-  });
- };
- form.querySelectorAll('[data-later-preset]').forEach(item=>item.addEventListener('click',()=>{
-  // Resolve the time again at the click, so a menu left open does not send a stale time.
-  const at=laterTimes(Date.now(),zone(),settings())[item.dataset.laterPreset] || Number(item.dataset.at);
-  closeDateTimePicker(form.querySelector('[data-later-menu]'),false);pick(new Date(at).toISOString());
- }));
- bindDateTimePicker(form,{zone:zone(),defaultMinutes:()=>settings().morning,
-  summaryPrefix:'Hides until ',prepareMenu});
-}
 function installReviewBody(row,text){
  row.dataset.bodyLoaded='true';
  row.querySelector('[data-detail]>td').innerHTML=text;
@@ -1310,16 +1254,15 @@ function bindReviewForm(form,{zone,settings,remember=()=>rememberReviewDraft(for
  });
  form.addEventListener('submit',event=>{
   event.preventDefault();
-  const outcome=event.submitter.value;
-  if(outcome==='later'){
-   const at=dateTimeDraftEpoch(zone(),later.value);
-   if(!(at>Date.now())) return;
-   closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
-   submit(outcome,new Date(at).toISOString());return;
+  const button=event.submitter,outcome=button.value;
+  if(outcome==='later' || button.dataset.laterPreset){
+   const until=parkRequestTime(form,button,zone(),settings(),later.value);
+   if(until) submit('later',until);
+   return;
   }
   submit(outcome);
  });
- if(later) bindLater(form,zone,settings,until=>submit('later',until));
+ if(later) bindDateTimePicker(form,{zone:zone(),settings,summaryPrefix:'Hides until '});
 }
 function readReviewDraft(form){
  if(!form?.elements.feedback) return null;

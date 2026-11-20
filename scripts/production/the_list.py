@@ -434,6 +434,12 @@ def parking_active(value: Parking, moment: datetime) -> bool:
     return value is ParkUntilDelivered.DELIVERED or isinstance(value, datetime) and value > moment
 
 
+def require_active_parking(value: Parking, moment: datetime) -> None:
+    """Refuse a parking deadline that has passed."""
+    if not parking_active(value, moment):
+        raise ListError("Choose a future parking date.")
+
+
 def _parking_text(value: Parking) -> str:
     return value.value if isinstance(value, ParkUntilDelivered) else _time_text(value)
 
@@ -1505,7 +1511,8 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
 
 
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
-         notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+         notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+         check_deadline: Callable[[datetime], None] | None = None) -> ListItem:
     fields: LogFields = {"parked_until": until}
     event = FieldChange("Parked", fields)
     if isinstance(until, datetime):
@@ -1515,8 +1522,10 @@ def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
         event = PageParkingChange("Parked", fields, notice.request)
 
     def edit(item: ListItem, moment: datetime) -> ListItem:
-        if isinstance(notice, PageItemNotice) and not parking_active(until, moment):
-            raise ListError("Choose a future parking date.")
+        if check_deadline is not None:
+            check_deadline(moment)
+        elif isinstance(notice, PageItemNotice):
+            require_active_parking(until, moment)
         _open(item)
         if until is ParkUntilDelivered.DELIVERED and item.state in (ItemState.DELIVERED, ItemState.DONE):
             raise ListError("This item is already delivered.")

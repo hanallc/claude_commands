@@ -140,6 +140,8 @@ The title starts 32px from the top and left edges of that column.
 Each navigation page places `page_frame.title()` directly above its content.
 The title, status line and content use the same centered column on all seven pages.
 Cards and form controls keep their page styles.
+List and Review share the parking menu, date picker, browser script, and timed park action.
+The timed park action saves to the item's store.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
 The frame reserves scrollbar space, so short and long pages keep the same column position.
@@ -586,16 +588,17 @@ Investigations offer Mark read and Send feedback in that group.
 Proposals and efficiencies offer Approve, Decline and Send feedback in that group.
 A plan backlog proposal has no issue to hold an answer, so it offers only Later; the user answers it in chat.
 Cards with actions offer Ask question in the return group and **Later** in its own group.
-The menu lists four presets, then a divider and **Choose a time…**:
-1. **In 1 hour**: `later_soon_minutes` from now; the label follows the setting.
-2. **This evening**: `later_evening` today. The item shows only before `later_evening_until`.
-3. **Tomorrow morning**: `later_morning` tomorrow.
-4. **Next week**: `later_week_time` on the next `later_week_day`.
-Each preset shows its time on the right, such as `Tue 09:00`, in the user zone.
-The page computes the preset times each time the menu opens.
-A preset click hides the item at once.
-**Choose a time…** shows a calendar and a time field in the same menu.
-Review Later and List Park until share the date and time picker in `record_table.py`.
+The menu has three presets.
+
+1. **1 hour** adds `later_soon_minutes` to the current time. The label follows the setting.
+2. **Tomorrow** uses `later_morning` on the next day in the user zone.
+3. **Next week** uses the next `later_week_day` at `later_week_time` in the user zone.
+
+**Tomorrow** shows its time on the right.
+**Next week** shows its weekday and time, such as `Mon 09:00`.
+A preset click calculates the deadline and hides the item at once.
+**Pick a date…** shows a calendar and a time field in the same menu.
+Review Later and List Park share the date and time picker in `record_table.py`.
 The calendar keeps a valid future Later draft when it opens, including a draft restored after a refresh.
 Otherwise, it opens on tomorrow in the user zone, with `later_morning` as its time.
 The month header has previous and next buttons.
@@ -607,19 +610,28 @@ A repeated wall time uses the earlier instant.
 The presets use the same conversion.
 **Save** is disabled unless that time is in the future.
 In the calendar, the arrow keys move one day or one week, including across months.
-Tab moves from the selected day to the time field and **Save**.
+Tab moves from the selected day to **Time** and **Save**.
 The **Time** field uses 24-hour `HH:MM` in every locale.
-It accepts `9:00`, `0900` and `09:00` and displays `09:00` when focus leaves the field or you press Enter.
-In the time field, Up and Down change the time by 15 minutes and wrap at midnight.
+It accepts `9:00`, `0900`, and `09:00`.
+It shows `09:00` when focus leaves the field.
+The suggestion list in **Time** starts at the next time step in the user zone.
+The default step is 15 minutes.
+The list shows future times for today and all times for a future date.
+Open the list with the arrow button or an Up or Down key.
+Use Up and Down to move through the suggestions.
+While the list is open, Escape closes it. Enter accepts the highlighted suggestion; with none highlighted, Enter closes the list.
+With the list closed, Enter saves the time and Escape closes the picker.
 An invalid time uses the error color and disables **Save**.
-Enter saves a valid future time. Escape closes the menu.
+Select **Save** to submit the chosen time.
+Escape closes the menu from a preset or the calendar.
 The hidden `later` field keeps the wall time for the draft.
 The page converts that time to UTC for the request.
-A preset resolves its time again at the click.
 The arrow keys, Home and End move between items, Enter picks one and Escape closes the menu.
-A click outside the menu closes it.
-The page refresh waits while a Later menu is open.
-The server stores a preset time, sent as UTC, in the user zone.
+A click outside the control or a move of focus outside the control closes the menu.
+The page refresh waits while the menu is open.
+The server stores the preset time in the user zone.
+List and Review refuse a new save if the deadline has passed.
+A List retry can still return the result of an earlier save.
 Waiting cards for questions, investigations, proposals and efficiencies retain their Open actions.
 Unowned questions retain only Later.
 Waiting cards for these types keep their state and counts until the user acts.
@@ -995,7 +1007,7 @@ The Answer event includes the question ID.
 Link and Unlink events include the review keys.
 Evidence cleanup events name the copy that was removed.
 Request receipts stay in the record and are hidden from the log display.
-Each expanded row with actions has Remove, Park until, and a text box for Ask question and Tell morty.
+Each expanded row with actions has Remove, Park, and a text box for Ask question and Tell morty.
 The text box shows “Your words for morty about this item” as its placeholder and accessible name.
 Ask question and Tell morty sit below the box at its right edge, beside the send status.
 Both buttons stay disabled until the box contains words.
@@ -1023,7 +1035,7 @@ The POST response includes the current unread state.
 The form keeps its signed update until a page refresh shows a new snapshot.
 The page clears the dot and Mark read button when that state is false.
 It restores both controls when the response reports a new unread update.
-Mark read, Park until, and Remove release the link to the item.
+Mark read, Park, and Remove release the link to the item.
 If the item stops matching the filters, it starts to fade as soon as the user submits the action.
 If the read write fails, the question or feedback remains saved and the sender can deliver it.
 The store keeps the unread update if the read write fails or a newer update exists.
@@ -1118,12 +1130,13 @@ Recovery leaves uncertain outcomes for the user.
 An older pending attempt with no live sender appears as uncertain.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Remove sits at the left edge of the row above the four-line text box.
-**Unpark** and **Park until** sit at the right edge of the row.
+**Unpark** and **Park** sit at the right edge of the row.
 An expanded parked item shows its parking condition above the buttons.
 **Unpark** appears in the form when the item has active parking and its state is outside Closed.
-**Park until** opens the picker.
-**Until delivered** sits above the shared calendar and 24-hour time field.
-One click saves this choice and shows “Parked until delivered” in the row.
+**Park** opens the menu with **Until delivered** before the shared time presets.
+A click on **Until delivered** saves the choice and shows “Parked until delivered” in the row.
+A click on a timed preset saves the selected time.
+**Pick a date…** opens the shared calendar and 24-hour time field.
 The picker aligns with the right edge of the text box.
 The page refresh waits while the picker is open.
 **Save** sends the chosen time in UTC.
@@ -1131,8 +1144,10 @@ Park writes a date, a time, or `delivered` through `the_list.park` with the List
 The server reads a date as midnight in the user zone.
 The writer checks a new parking time against the current time under the List lock.
 The writer checks a Park retry against the parking condition in the receipt or the event with the same request ID.
-The picker can resend the original request and instant after the parking time passes.
-When the saved date has passed, the picker gives focus to an enabled day.
+After an unconfirmed Park save, the List retries once with the same request ID, token, deadline, and words.
+The List uses `frame_retry_seconds` for the retry delay and `page_request_timeout_seconds` for each request.
+A new preset click uses a fresh request ID and calculates the deadline at the time of the click.
+When a draft date has passed, the picker selects tomorrow.
 The page keeps the words for Tell morty.
 **Unpark** clears parking through `the_list.unpark` and keeps the item state.
 It records one Unparked event and saves one notice for morty.
@@ -1188,12 +1203,16 @@ The unread state includes the Update sort key.
 If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
 The page opens the restored row and shows the reason there.
 The restored row slides back into view.
-After a Park refusal, the page returns focus to **Park until** only if the document body has focus and the control is visible and enabled.
+After a Park refusal, the page can return focus to **Park**.
+The document body must have focus.
+The button must be visible and enabled.
 Each row keeps its own inline failure notice.
 The List uses the same rules as Review for notices above the table.
-If Remove or Park loses its response, the page restores the confirmed row and reports that the save is unconfirmed.
+If Remove loses its response, the page restores the confirmed row and reports that the save is unconfirmed.
+If a Park retry fails, the List checks the original receipt and reads the current row.
+The List shows the shared failure line if the receipt cannot confirm Park.
 A new action uses a new request ID, even if the previous response did not arrive.
-The page keeps each unconfirmed request ID for an exact retry, even after another action.
+The page keeps unconfirmed request IDs for actions that support another manual submission.
 An HTTP 5xx response to Ask question leaves the request unconfirmed.
 The page discards each request ID when it receives a success or refusal for that request.
 A sent or alerted notice sends no second message.
@@ -1919,11 +1938,12 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
 `review_words_rows` sets the height of the Review page **Your words** box from 1 to 20 rows and starts at 4.
-The `later_*` keys set the Review page Later presets; each render reads them.
+The List and Review pages read the parking settings at each render.
 `later_soon_minutes` is 1 to 1440 minutes and starts at 60.
-`later_evening`, `later_evening_until`, `later_morning` and `later_week_time` are HH:MM times in the user zone.
-They start at 18:00, 17:00, 09:00 and 09:00.
-`later_week_day` is a weekday name and starts at Monday.
+`later_morning` is an HH:MM time from 00:00 to 23:59 in the user zone. It starts at 09:00.
+`later_week_day` is a full English weekday name with an initial capital. It starts at Monday.
+`later_week_time` uses the same format as `later_morning` and starts at 09:00.
+`park_time_step_minutes` is 1 to 60 minutes and starts at 15.
 `unrouted_alert_recipient` selects the alert recipient and the root showrunner for changes that nobody can take.
 This owner rule applies to routed changes when the list has no staff showrunner or its production document is gone.
 An unknown producer id or a broken parent chain keeps the change unrouted.
