@@ -1631,6 +1631,29 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 94 — A native SendMessage to a session in a review goes through send.py  · status: todo
+**Depends on:** Phase 89
+
+#### Work Order
+
+**Goal:** sdlc, 09:32 EST Nov 20. Name: reviewhold2. In the dwight session, nate was in an adhoc review. morty sent 3 native SendMessage messages. The UserPromptSubmit hook kept them, but Claude Code printed each one in full: "UserPromptSubmit operation blocked by hook: Kept for the end of the review. Original prompt: <whole message>". nate: "look what is happening - it's actually worse that things are getting blocked". Only send.py keeps a message without a mark on the receiver's screen.
+
+**Spec:**
+1. Add a PreToolUse hook on `SendMessage`. It finds the target session from `to`: a `uds:` socket path or a session name, through the Claude Code `sessions/<pid>.json` files in each config dir.
+2. When that session has an open review hold, the hook refuses the send. Its reason tells the sender to send the same text with `send.py --to <name>`, which answers KEPT.
+3. Every other native send goes through unchanged: no hold, an unknown target, an `URGENT:` text, or a read error.
+4. `review_hold.py` gets one public check for an open hold. The hook and `keep_native_message` use the same rule.
+5. The settings.json entry goes in only after nate types "go" in the phases tab.
+
+**Files:** `scripts/hooks/pre-tool-use-review-hold-send.py` (new), its test module, `scripts/message/review_hold.py`, `settings.json` (after nate's go), `docs/as-built/message-clarity.md` where it states the review hold.
+
+**Workers:** 1 writer.
+
+**Order:** before other phases work, after the phase 93 and 91 test slot. Tests run only when natemerge allows them.
+
+**Acceptance gate:**
+1. Fixture sessions only: a send to a held session is refused with the send.py line; sends with no hold, an unknown target, or `URGENT:` pass. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
