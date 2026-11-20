@@ -83,10 +83,10 @@ Refill: at each phase end, run the riser check and `show.py top`. Never start th
 - Join small modules only after Phase 398 closes and only with the verify unit's go.
 
 **Lane C: fold and dead code.**
-- The rule "No test removal or coverage reduction is approved" stays in force for tests of live code. (user, 2026-11-11)
+- The mission allows "removal of trivial tests" (user, 2026-11-03). The 2026-11-11 words "No test removal is approved" covered only the verify speed item and the coverage collection of that day (user, 2026-11-20).
 - Lane C may do these with no question: fold sibling tests into one parametrized test with every assertion kept; delete a test only together with the dead code it tests, after the owner's answer.
 - Fold only groups that share one costly start. A fold of other groups lowers the count and saves no CPU.
-- Every other test deletion is a proposal. The director asks one question that replaces the 2026-11-11 rule or keeps it: open with the user since 2026-11-20. The value report's delete estimates (1,350 to 1,950 tests) come from a sample of 300 tests.
+- Delete a test of live code when it is a duplicate, a mock-only check, a wording pin, or a row whose behavior a kept test proves. Each delete names the kept test or the reason in the summary, and gets the blind review. The value report estimates 1,350 to 1,950 such tests, from a sample of 300.
 
 **Lane D: proposals to cut source.**
 - Tests follow source. natest sends numbers to the owner through builds; natest sends no code for another owner's file. A rewrite of a file that every unit uses is the owner's decision.
@@ -108,12 +108,12 @@ Refill: at each phase end, run the riser check and `show.py top`. Never start th
 6. A rare case gets a test only when the defect causes damage that no later run or command restores.
 7. A test that needs a subprocess, a sleep or a real Git repository needs a reason in the summary.
 8. A new test above 1 CPU s needs its cost in the phase report.
-9. When your change makes a test a duplicate, name the test in the summary. Its deletion waits for the Lane C answer.
+9. When your change makes a test a duplicate, name the test in the summary. Delete it in the same change.
 10. "No test: <reason>" is a complete answer. A reviewer does not reopen it for coverage alone.
 
 ### Rules for every phase
 
-1. Remove no test of live code and reduce no coverage, with the two Lane C exceptions. (user, 2026-11-11)
+1. Delete a test only by the Lane C rules: every behavior that hurts the user when it breaks stays checked. (user mission, 2026-11-03)
 2. Start no test run without natemerge's go. (user through builds, 2026-11-19)
 3. Keep one build-queue item for the unit at a time. (user, 2026-11-18)
 4. Every phase that changes code gets a blind review. (plan-set, 2026-11-20)
@@ -149,7 +149,7 @@ P6 risk, approved by the user on 2026-11-20: a defect outside the selected modul
 1. Before the first phase starts, send P6 to builds. Date sent: 2026-11-20. Answer: natest owns it (Phase 406).
 2. Then send P1 to P5 and P7 in one message. Date sent: 2026-11-20
 3. Send P8 to builds as a proposal that is not approved. Date sent: ____
-4. The director asks the user the Lane C deletion question. Date answered: ____
+4. The user answered the Lane C deletion question on 2026-11-20: the 2026-11-11 words were for one situation and are no general rule.
 5. The evidence folder is `/session/natest/testcount` (adopted with `scratch.py adopt`, kept until 2026-12-20). At each refill, run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py renew /session/natest/testcount`.
 6. Build the plan file in this order: title, Status, Source, Standing work, Delegation Context, `## Phases`, Phases 381 to 398, Phases 399 and up.
 7. Mark Phases 382, 384 and 385 with one line each: "parked 2026-11-20: at most N AWS s; reopen from the top list". N is 19, 14 and 14. Do not park Phases 387, 394 and 395; their code is finished and waits for a gate.
@@ -191,7 +191,7 @@ P6 risk, approved by the user on 2026-11-20: a defect outside the selected modul
   - Tests use fixtures. They never read or write live state: `~/.claude` main, `~/.local/state/buildlog`, `~/.local/state/merge-gate`, `/tmp/claude` (the gate's as-built).
   - Python is typed throughout, with no `Any` and no file-level type ignores (user, `~/.claude/CLAUDE.md`). All text uses Simplified Technical English (user, 2026-10-18).
   - One place for each thing (user, 2026-10-30): reuse the build log store and index, `conf.py`, `user_zone.py`, `terminal_cells.py` and the gate's `discover_test_modules`; never copy a reader, a parser or a module list. A tunable lives in config and is read at use (user, 2026-10-31).
-  - Speed work keeps coverage (user mission, 2026-11-03). Every behavior a module checked before stays checked. The 2026-11-11 rule in Lane C limits test removal further.
+  - Speed work keeps coverage (user mission, 2026-11-03). Every behavior a module checked before stays checked. Lane C states what a phase may delete.
   - A speed gain that needs a change outside a phase's Files goes to builds as a proposal with the measured gain; the phase does not make the change (user mission, 2026-11-03). A change to another unit's file names that owner in the checkpoint notice (production doc, Production rules).
   - A worker starts at most one detached run at a time, with at most 4 named test files (sdlc, 2026-11-03). No test run starts while a natedev build hold is in force (builds showrunner, 2026-11-03).
   - Commit every new file in the disposable gate clone before the gate starts. The aws_target box replica copies only `git ls-files`.
@@ -725,7 +725,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 **Workers:** 1 writer. Four small groups; nothing splits.
 - `impl` — all files.
 
-**Constraints from prior phases:** Each file's owner gives its go through builds before the edit: the verify unit for the two `direct` files, the owner that builds names for the two `production` files. The user rule of 2026-11-11 stays in force: a fold keeps every assertion. A fold saves CPU only when the rows share one start (value report). Tests read no tunable config value. No test run starts without natemerge's go.
+**Constraints from prior phases:** Each file's owner gives its go through builds before the edit: the verify unit for the two `direct` files, the owner that builds names for the two `production` files. A fold keeps every assertion. A fold saves CPU only when the rows share one start (value report). Tests read no tunable config value. No test run starts without natemerge's go.
 
 **Acceptance gate:** each old test name is a row label in the new tables (compare the names before and after); the 3 broken-code checks of step 7 fail as stated; `module_cost.py` CPU of each changed module is not above its base, with both numbers and the host; 20 repeated runs of each changed module pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`; basedpyright gives zero errors and zero warnings on changed files; one blind review.
 
@@ -757,7 +757,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **State:** the section "Dead-code answers" in `docs/plans/builds-natest-next.md`.
 
-**Constraints from prior phases:** The pilot scripts `size_graph.py`, `size_reach.py` and `folders_dead.py` are in the evidence folder of instantiation step 5; read them, do not copy them into the repository. Totals from the reports (size report rows 3, 4, 7, 8): about 19,700 source lines, 24,000 test lines and 1,005 tests. A test of live code is not a candidate (user, 2026-11-11).
+**Constraints from prior phases:** The pilot scripts `size_graph.py`, `size_reach.py` and `folders_dead.py` are in the evidence folder of instantiation step 5; read them, do not copy them into the repository. Totals from the reports (size report rows 3, 4, 7, 8): about 19,700 source lines, 24,000 test lines and 1,005 tests.
 
 **Acceptance gate:** each candidate has a row with evidence and one question; each sent question has its send result line; each answer in the next file names who gave it and the date; no code file changed.
 
@@ -774,7 +774,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 3. Delete its config keys and their `config/README.md` lines. Before each key delete, grep every reader of the key and show that none remains.
 4. Correct each as-built doc line that names a deleted file, in the same commit.
 5. Where a kept file imports a deleted one (`deploy.py` imports `aws_trial` and `gate_probe`; `lint/invoke.sh` calls `width_trial.py`), remove the call only with that owner's answer. Without the answer, keep the file and say so.
-6. Delete a test only together with the dead code it tests. Delete no test of live code.
+6. Delete a test only together with the dead code it tests.
 7. Summary: each deleted test file with the reason "code deleted".
 
 **Files:**
