@@ -555,7 +555,7 @@ Parking sets a time without changing the state.
 The List hides an item with unanswered questions while each send is pending or successful.
 If any unanswered question needs a resend, the item appears with its resend control.
 The `the_list.py list` command still shows the item.
-The producer uses `the_list.py answer` to save an answer and mark the item unread.
+Morty uses `the_list.py answer` to save an answer and mark the item unread.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
 The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.
@@ -592,20 +592,23 @@ Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
 They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
-Only morty can close an item.
 Their updates use the caller's staff name as the log source.
+They can add items with `--producer` set to their own name or staff ID.
+The CLI saves these items in morty's store on the machine where it runs. Every producer runs on natedev.
+Only morty can use the other commands.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
-New items default to morty.
-Changing the producer to someone other than morty sends two notices after the save.
+New items that morty adds without `--producer` default to morty.
+An assignment that morty makes to another producer sends two notices after the save.
+When another producer adds their own item, the CLI sends only the showrunner notice after the save.
 The producer gets the title, showrunner, and List commands.
 The current showrunner gets the title, producer, and where to send design questions.
 The sender checks the fixed staff ID, required role, and current session before each delivery attempt.
 If the recipient is offline, the notice fails and stays unsent.
-If the producer retires before the staff refresh, the CLI reports the failed producer notice.
+If a producer that morty assigned retires before the staff refresh, the CLI reports the failed producer notice.
 The showrunner gets a notice that the saved assignment needs a new producer.
 When the Owner has no current showrunner row, the CLI reports a failed showrunner notice.
-When the staff refresh fails, the CLI reports the saved item ID and both unsent notices.
+When the staff refresh fails, the CLI reports the saved item ID and the notices it could not send.
 The CLI exits nonzero if a notice fails. The saved assignment stays in place.
 An unchanged producer or an assignment to morty sends no notice.
 

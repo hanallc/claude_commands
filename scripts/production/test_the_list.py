@@ -601,10 +601,33 @@ class TheListTests(unittest.TestCase):
                                  (0, "", ""))
                 self.assertEqual(the_list.load(MORTY.id, item.id).log[-1].source, source)
 
+    def test_producer_can_add_an_item_for_themselves(self) -> None:
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+            for number, reference in enumerate((BOB.name, BOB.id), 1):
+                with self.subTest(reference=reference):
+                    identity = f"L{number}"
+                    self.assertEqual(self.command("add", "--title", "New item", "--owner", RUNNER.id,
+                                                  "--source", "bob", "--producer", reference), (0, f"{identity}\n", ""))
+                    item = the_list.load(MORTY.id, identity)
+                    self.assertEqual((item.title, item.owner, item.producer), ("New item", RUNNER.id, BOB.id))
+        self.assertEqual(self.notices, [
+            (RUNNER.id, f"bob is the producer of item {number}: New item. Send design questions on this item to bob.")
+            for number in (1, 2)
+        ])
+
+    def test_producer_add_requires_their_own_producer_reference(self) -> None:
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+            for options in ((), ("--producer", OTHER.name), ("--producer", OTHER.id)):
+                with self.subTest(options=options):
+                    self.assertEqual(self.command("add", "--title", "New item", "--owner", RUNNER.id,
+                                                  "--source", "bob", *options),
+                                     (1, "", "the_list: To add an item, use --producer bob or your staff ID.\n"))
+        self.assertEqual(the_list.records(MORTY.id), [])
+        self.assertEqual(self.notices, [])
+
     def test_producer_cannot_run_other_commands(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
         commands = (
-            ("add", "--title", "New item", "--owner", RUNNER.id),
             ("park", "--id", item.id, "--until", START.isoformat()),
             ("close", "--id", item.id, "--words", "Done"),
             ("reopen", "--id", item.id),

@@ -1977,13 +1977,16 @@ def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
     raise ListError((result.stderr or result.stdout).strip() or "message delivery failed")
 
 
-def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId, keeper: staff.StaffId) -> int:
+def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId, keeper: staff.StaffId, *,
+                                caller: staff.StaffId) -> int:
     if item.producer in (keeper, previous_producer):
         return 0
+    notify_producer = item.producer != caller
     try:
         members = staff.snapshot()
     except (ValueError, staff.StaffRefused, OSError) as error:
-        raise ListError(f"{item.id} was saved. The producer and showrunner notices were not sent. {error}") from error
+        unsent = "The producer and showrunner notices were" if notify_producer else "The showrunner notice was"
+        raise ListError(f"{item.id} was saved. {unsent} not sent. {error}") from error
     producer = next((row for row in staff.active(members, "producer") if row.id == item.producer), None)
     owner = next((row for row in staff.active(members, "showrunner") if row.id == item.owner), None)
     showrunner = f"Its showrunner is {owner.name}." if owner is not None else "The item has no assigned showrunner."
@@ -2000,6 +2003,8 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
     )
     status = 0
     for role, reference, recipient, message in notices:
+        if role == "producer" and not notify_producer:
+            continue
         try:
             if recipient is None:
                 if role == "producer":
@@ -2101,8 +2106,8 @@ def main(argv: list[str] | None = None) -> int:
             changed = _update(keeper, identity, _cli_changes(args, record), source=source, add_evidence=add_evidence or "")
             if isinstance(changed, UnchangedEdit):
                 return 0
-            return _notify_producer_assignment(changed.item, changed.before.producer, keeper)
-        if assigned_to is not AllItems.INCLUDED:
+            return _notify_producer_assignment(changed.item, changed.before.producer, keeper, caller=caller.id)
+        if assigned_to is not AllItems.INCLUDED and name != "add":
             raise ListError(f"only morty can run {name}")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
@@ -2144,6 +2149,8 @@ def main(argv: list[str] | None = None) -> int:
             _ = edit_reviews(keeper, identity, resolved, source=source)
         elif name == "add":
             changes = _cli_changes(args, record)
+            if assigned_to is not AllItems.INCLUDED and changes.get("producer") != assigned_to:
+                raise ListError(f"To add an item, use --producer {caller.name} or your staff ID.")
             if add_evidence is not None:
                 changes["evidence"] = _append_evidence(changes.get("evidence", ""), add_evidence)
             number = cast(dict[str, object], vars(args)).get("number")
@@ -2153,7 +2160,7 @@ def main(argv: list[str] | None = None) -> int:
             item = add(keeper, cast(str, args.title), owner=owner, source=source,
                        number=number if isinstance(number, int) else NextNumber.AVAILABLE, changes=changes)
             print(item.id)
-            return _notify_producer_assignment(item, keeper, keeper)
+            return _notify_producer_assignment(item, keeper, keeper, caller=caller.id)
         elif name == "park":
             _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source)
         elif name == "close":

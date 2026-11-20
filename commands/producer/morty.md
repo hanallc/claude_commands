@@ -30,9 +30,10 @@ Save substantive item changes through `the_list.py add`, `update`, `park`, `clos
 Use `--review <shown id>` or `--review-key <key>` with `link` and `unlink`; both options can repeat and mix.
 Use `--producer <name or staff id>` with `add` or `update` for an item that another producer, such as dwight, runs.
 When a producer gets an item in a Rust project, tell it to load `~/.claude/docs/producer/rust_design.md`. Ask it to confirm.
-New items default to morty.
+New items that morty adds without `--producer` default to morty.
 The assigned producer writes the latest status, next step, and ETA.
-Morty keeps add, close, park, and reassign for all items.
+Morty can add, close, park, and reassign any item.
+Other producers can add their own items with `--producer <their name or staff ID>`.
 Closed items retain their records and logs.
 Do not write `current.md`, the `items` or `removed_items` parts of `checkins.json`, or `open-questions.json`.
 Each item has a stable number, showrunner owner, state, next action, ETA, latest report, source time, and unread flag.

@@ -72,9 +72,10 @@ Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_
 Use `the_list.py update --id L<n>` to update your items.
 Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
 Write no time in `--source`.
-A producer other than morty asks morty to add, close, park, or assign its items.
-It also asks morty to record updates and decisions that it cannot write with `the_list.py`.
-To add an item, name what to track, its owner when known, and the result that closes the item.
+Add your own item with `the_list.py add --producer <your name or staff ID> --owner <showrunner staff ID> --title <text> --source <source>`.
+Use `--done-when` to record the result that closes the item.
+Ask morty to close, park, or reassign your items.
+Ask morty to record updates and decisions that you cannot write with `the_list.py`.
 Ask the showrunner or unit for facts. Verify claims against records such as commits, staff rows, and config files.
 Name the source of each fact you report.
 Use staff reporting lines for a survey of showrunner needs. Include child productions.

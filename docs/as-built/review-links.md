@@ -854,7 +854,9 @@ Old records without the reviews field load with no links.
 Each List record stores a `producer`: the fixed staff ID of a staff row with the producer role.
 `the_list.py add` and `update` take `--producer <name or staff id>`.
 The option refuses a name or ID that does not resolve to exactly one current producer row.
-A new item without the option, and an old record without the field, belong to the record keeper, morty.
+Only morty can omit `--producer` when adding an item.
+Other producers must supply their own name or staff ID.
+New items without the option and old records without the field belong to morty.
 The terminal list shows a Producer column after Owner.
 The CLI shows producers only their assigned items. Morty can see every item.
 See the `the_list.py` section of `showrunner-automation.md` for update permissions and assignment notices.
