@@ -575,33 +575,31 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **As built:** no code change. The report is `/session/natest/testcount/rise_report_399.md`. Mean CPU of a green AWS full gate rose 1,409 s (4,192 on 11-16 to 5,602 on 11-19). New modules: `copies/test_slot_order.py` (155.6 s, commits 2e49fd46c5 and bddbd51cf1), `review_links/test_list_page.py` (97.2, 9b2b208a45), `direct/test_verify_lint_repair_grant.py` (28.1, 891fa52702). Test file causes: `direct/test_verify_doc_checkout.py` (7.7 to 59.2, 0eeaf8919e and bddbd51cf1), `lib/test_models_registry.py` (8.1 to 26.1, 5bd2d6b09a), `worktree/test_worktrees.py` (11.2 to 27.6, 7f9f08a714). Source of another unit: statusline (2b7e107c94; one AWS gate after the Phase 365 repair gave 53.9 s), offload cleanup (aa09eeedf2), copies (bddbd51cf1). The broad rise has no cause: 798 common modules rose from 4,149 to 5,166 s, median ratio 1.135 on AWS and 1.407 on natedev. Module start explains about 19 s. No two AWS runs shared a box. A rise on both hosts points to code; Phase 407 measures it.
 
-### Phase 400 — the Lane A target from the top list halves its AWS CPU  · status: todo
+### Phase 400 — the List page test halves its AWS CPU  · status: todo
 **Depends on:** none
 
 #### Work Order
 
-**Goal:** the module that the director names at dispatch uses half its AWS gate CPU with every assertion kept, or has a floor result with its cause. Predicted saving (computed, AWS, half of the 11-19 median): 78 CPU s per gate for `copies/test_slot_order.py`, 57 for `review_links/test_list_page.py`, 30 for `direct/test_verify_doc_checkout.py`.
+**Goal:** `review_links/test_list_page.py` uses half its AWS gate CPU with each main-path List behavior still checked, or has a floor result with its cause. Baseline: 97.2 CPU s median on 11-19 (measured, AWS; new on 11-17, commit 9b2b208a45). Predicted saving: about 49 CPU s per gate (computed, AWS).
 
 **Spec:**
-1. Lane A target, chosen at dispatch from the current top list. Candidates on 2026-11-20: `copies/test_slot_order.py` (156.9 AWS, new on 11-18; two tests of 38.8 and 33.6 s), `review_links/test_list_page.py` (114.1 AWS, new on 11-17), `direct/test_verify_doc_checkout.py` (59.6).
-2. At dispatch, the director reads `show.py top` under the measure rule and takes the first candidate with no open phase. The director writes the module, its baseline, host and date into Goal and Files before the dispatch.
-3. Measure first: `module_cost.py --tree <tree> --tests 20 --commands 20 <folder>/<file>`, fresh TMPDIR on /tmp, bytecode on. Name the top commands and fixtures with their CPU share. Confirm the cause before any edit; use the Phase 399 row for this module if it exists.
-4. Cut the cost at its cause: repeated process starts, Git setup, fixed waits, polls. Share setup for each class where the tests only read it. Call the real function where the decision is in a function.
-5. Keep every assertion. Keep a full-entry test where the decision exists only in the dispatch branch. Never copy a production decision into a fixture.
-6. Change production code only when the same cost also hits production runs, and only with the owner's go.
-7. Add no test function. The phase changes how the tests start, not what they assert.
-8. If the floor is above half, report the floor, the operation that sets it, its owner, and the measure conditions. Write the Floors row for the next file.
-9. Write a map in the summary: each assertion, and the test that checks it after the phase.
+1. Measure first: `module_cost.py --tree <tree> --tests 20 --commands 20 review_links/test_list_page.py`, fresh TMPDIR on /tmp, bytecode on. Name the top commands and fixtures with their CPU share. The test rows are in `/session/natest/testcount/rise_report_399.md`.
+2. Share one server and one browser for the module where the cases allow it (sdlc term 2). State each case that needs its own start, and why.
+3. Keep one test for each main-path List behavior. Remove a browser case only when another case already proves the same behavior, for example the same check in Firefox and in Chrome (sdlc term 1).
+4. Replace each fixed wait with the event that the page or the server gives.
+5. Never copy a production decision into a fixture. Change no production file.
+6. Write a map in the summary: each behavior, and the test that checks it after the phase. For each removed case, name the kept case that proves the same behavior.
+7. If the floor is above half, report the floor, the operation that sets it and the measure conditions. Write the Floors row for the next file.
 
 **Files:**
-- `scripts/copies/test_slot_order.py`, `scripts/review_links/test_list_page.py`, `scripts/direct/test_verify_doc_checkout.py` — the candidates; the director writes the chosen module and its support file here at dispatch
+- `scripts/review_links/test_list_page.py` — shared starts and the removed duplicate cases
 
 **Workers:** 1 writer. One module and its support; nothing splits.
 - `impl` — all files.
 
-**Constraints from prior phases:** The owner of each candidate file gives its go through builds before the first edit. `direct/test_verify_doc_checkout.py` is a verify unit file, and the Lane B limits apply to it. Tests read no tunable config value. Tests run on the Mac too. No test run starts without natemerge's go; the unit has one build-queue item.
+**Constraints from prior phases:** sdlc gave the go on 2026-11-20 (owner: admin-console; it does not do the cut). admin-console has open edits in this file (keepplace and listadd, run B): the row merges after run B is on main, so merge main and resolve before the hash. Phase 350 pinned List and status fixture settings in review_links tests; keep them. Tests read no tunable config value. Tests run on the Mac too. One module run inside the writer pass is allowed; any other test run needs natemerge's go.
 
-**Acceptance gate:** `module_cost.py` before and after shows CPU at half or less, labeled with its host, or the report gives a floor result; 20 repeated runs of the changed module and of each importer of changed support pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`; basedpyright gives zero errors and zero warnings on changed files; one blind review; the gate route that builds names for the merge passes. After the phase is merged to main, the director writes the AWS median from `show.py top --host aws` in the next file when AWS has a full gate in the last 2 days.
+**Acceptance gate:** `module_cost.py` before and after shows CPU at half or less, labeled with its host, or the report gives a floor result; 20 repeated runs of the changed module and of each importer of changed support pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`, after natemerge's go; basedpyright gives zero errors and zero warnings on changed files; one blind review; the gate route that builds names for the merge passes. After the phase is merged to main, the director writes the AWS median in the next file when AWS has a full gate in the last 2 days.
 
 ### Phase 401 — the start cost of one verify.sh test is measured  · status: todo
 **Depends on:** none
@@ -814,4 +812,28 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 **Constraints from prior phases:** Phase 399 ruled out a fixed module start cost (about 19 s of the rise) and shared boxes on AWS. The runs need natemerge's go, the unit's one build-queue item, and `systemd-run --user --scope -p MemoryMax=2G`. Never give a natedev number as an AWS number.
 
 **Acceptance gate:** the report gives both numbers for each of the 6 modules with host and tree; it names one commit with the command group that holds the rise, or states "no rise between the trees on natedev" with the numbers; `git status` shows no changed file.
+
+### Phase 408 — the lint repair grant test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_lint_repair_grant.py` uses half its AWS gate CPU with every assertion kept, or has a floor result with its cause. Baseline: 28.1 CPU s median on 11-19 (measured, AWS; new module, commit 891fa52702). Predicted saving: about 14 CPU s per gate (computed, AWS).
+
+**Spec:**
+1. Measure first with `module_cost.py --tree <tree> --tests 20 --commands 20 direct/test_verify_lint_repair_grant.py`. Name the top commands and fixtures with their CPU share.
+2. Cut the cost at its cause: repeated full-script starts, Git setup, fixed waits. Call the real verify function through `shell_test_support.shell_functions` where the decision is in a function.
+3. Keep every assertion. Keep a full-entry test where the decision exists only in the dispatch branch. Never copy a production decision into a fixture.
+4. Add no test function. Map each assertion to the test that checks it after the phase; put the map in the summary.
+5. If the floor is above half, report the floor and its cause, and write the Floors row for the next file.
+
+**Files:**
+- `scripts/direct/test_verify_lint_repair_grant.py` — the cheaper start
+
+**Workers:** 1 writer. One module; nothing splits.
+- `impl` — the file.
+
+**Constraints from prior phases:** builds routed this cut to natest on 2026-11-20 (the file came from the queue item 44bk; builds tells queue). The Lane B limits apply: read the Floors and Declined sections of the next file first; do not propose startup reuse or a fork server. Tests run on the Mac too. One module run inside the writer pass is allowed; any other test run needs natemerge's go.
+
+**Acceptance gate:** `module_cost.py` before and after shows CPU at half or less, labeled with its host, or the report gives a floor result; 20 repeated runs of the changed module pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`, after natemerge's go; basedpyright gives zero errors and zero warnings on the changed file; one blind review.
 
