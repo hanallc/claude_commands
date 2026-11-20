@@ -458,8 +458,8 @@ def _cached_role_map() -> tuple[RoleMap, datetime]:
     return decode_role_map(json.dumps(saved["map"])), stamp
 
 
-def read_role_map() -> RoleMap:
-    scope = _command_map.get()
+def read_role_map(*, fresh: bool = False) -> RoleMap:
+    scope = MapNotRead() if fresh else _command_map.get()
     if isinstance(scope, CommandRoleMap) and isinstance(scope.value, RoleMap):
         return scope.value
     if isinstance(scope, CommandRoleMap) and isinstance(scope.value, MapReadRefused):
@@ -467,7 +467,7 @@ def read_role_map() -> RoleMap:
     try:
         if is_role_map_host():
             result = _local_role_map()
-        elif isinstance(_role_map_source.get(), StoredRoleMap):
+        elif not fresh and isinstance(_role_map_source.get(), StoredRoleMap):
             result, stamp = _cached_role_map()
             result = replace(result, provenance=ExplicitStoredRoleMap(stamp))
             _map_observer.get()(result.provenance)
