@@ -154,6 +154,7 @@ read -r command
         observation = self.observe_waits()
         pid_saved, ready, exited = self.observe_step_hold_waiter()
         process = self.start("final")
+        self.wait_for_call(process)
         wait_for_verify_state(pid_saved.exists, pid_saved.parent, process, "verify saved the step hold waiter PID")
         pid = int(pid_saved.read_text().splitlines()[0])
         try:
@@ -166,7 +167,6 @@ read -r command
                                   "the first step hold waiter became ready or exited")
             if not ready.exists():
                 self.fail(f"Step hold waiter PID {pid} exited without a ready marker")
-            self.wait_for_call(process)
             self.assertFalse(select.select([descriptor], [], [], 0)[0],
                              f"Step hold waiter PID {pid} exited after its ready marker")
             process.send_signal(signal.SIGTERM)
