@@ -17,11 +17,13 @@ import unittest
 from unittest import mock
 
 from scripts.build_hold import build_hold
-from scripts.build_queue import admission_records as records, head_stall
+from scripts.build_queue import admission_client, admission_records as records, head_stall
+from scripts.build_queue.admission_wire import AdmissionUnavailable
 from scripts.build_queue.queue_fixture import fixture_reservation
-from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
+from scripts.build_queue.queue_snapshot import QueueSnapshot, read_queue_snapshot, write_queue_snapshot
 from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import cli, mac_idle, sample
+from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.production import staff
 
@@ -55,6 +57,10 @@ def snapshot(waiters: list[records.Waiter], running: tuple[records.RunningStep, 
     return QueueSnapshot(NOW, inputs, admission_policy_fixture())
 
 
+def fixture_explanation(queue: QueueSnapshot) -> records.QueueExplanation:
+    return gate.queue_read_from(queue.inputs, queue.policy).explanation
+
+
 def compiler_service(*jobs: records.CompilerJob,
                      source: records.ScopeSource | records.NoSource = COMPILER_SCOPE_UNAVAILABLE) -> records.RunningStep:
     return records.RunningStep("", "sccache.service", "compile", "builds.slice", 0,
@@ -68,14 +74,14 @@ STALLED = snapshot([waiter(NOW - 3 * 3600)], (holder(NOW - 3 * 3600),
 class FindStallTests(unittest.TestCase):
     def test_holder_time_starts_at_admission(self) -> None:
         queue = snapshot([waiter(NOW - 3600)], (holder(NOW - 62 * 60),))
-        stall = head_stall.find_stall(queue, NOW - 3600, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(queue), NOW - 3600, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         self.assertIn("held for 62 min", head_stall.builds_text(stall))
 
     def test_head_behind_an_idle_holder_with_no_start_is_a_stall(self) -> None:
-        stall = head_stall.find_stall(STALLED, NOW - 2 * 3600, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(STALLED), NOW - 2 * 3600, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertEqual((stall.last_start, stall.need, round(stall.waited), round(stall.quiet)),
+        self.assertEqual((stall.last_start, stall.head.waiter.need, round(stall.waited), round(stall.quiet)),
                          (NOW - 2 * 3600, 15 * GIB, 3 * 3600, 2 * 3600))
         self.assertEqual(stall.holders, (head_stall.Holder((STALLED.inputs.running[0],),
             records.RunMemory("706237-706237", 12 * GIB, records.AnonymousRunUse(GIB // 10)),
@@ -97,12 +103,23 @@ class FindStallTests(unittest.TestCase):
         queue = snapshot([token_waiter, head], STALLED.inputs.running)
         inputs = replace(queue.inputs, pressure=records.MemoryPressure(3.0, condition="full"))
 
-        stall = head_stall.find_stall(replace(queue, inputs=inputs), 0.0, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(replace(queue, inputs=inputs)), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         report = head_stall.builds_text(stall)
         self.assertIn("The build queue head has waited 60 min.", report)
         self.assertIn("Head: check in pressure-head (pid 1618940) needs 4.0 GiB.", report)
         self.assertIn("Reason: memory pressure.", report)
+        self.assertNotIn("Memory shortfall:", report)
+
+    def test_the_head_waits_for_its_own_remote_start(self) -> None:
+        head = waiter(NOW - 3600)
+        queue = snapshot([head], STALLED.inputs.running)
+        inputs = replace(queue.inputs, pending_remote_starts=frozenset({records.waiter_owner(head)}))
+
+        stall = head_stall.find_stall(fixture_explanation(replace(queue, inputs=inputs)), 0.0, NOW, LIMIT)
+        assert isinstance(stall, head_stall.HeadStall)
+        report = head_stall.builds_text(stall)
+        self.assertIn("Reason: waiting for its remote start.", report)
         self.assertNotIn("Memory shortfall:", report)
 
     def test_a_slot_between_steps_is_listed_with_its_memory(self) -> None:
@@ -114,7 +131,7 @@ class FindStallTests(unittest.TestCase):
                 host = queue.inputs.host if running else records.HostMemory(21 * GIB, 60 * GIB)
                 inputs = replace(queue.inputs, slots=(slot,), host=host)
 
-                stall = head_stall.find_stall(replace(queue, inputs=inputs), NOW - 3600, NOW, LIMIT)
+                stall = head_stall.find_stall(fixture_explanation(replace(queue, inputs=inputs)), NOW - 3600, NOW, LIMIT)
                 assert isinstance(stall, head_stall.HeadStall)
                 report = head_stall.builds_text(stall)
                 self.assertIn("- Run pid 706239: held between steps, keep-aside 5.0 GiB", report)
@@ -191,7 +208,8 @@ class FindStallTests(unittest.TestCase):
                 with self.subTest(name=name):
                     queue = snapshot([waiter(NOW - 3600)], (first, second_holder, *service))
                     write_queue_snapshot(paths.admission, queue.inputs, queue.policy)
-                    stall = head_stall.current_stall(paths, NOW, LIMIT, 120)
+                    with mock.patch.object(admission_client, "explain", return_value=fixture_explanation(queue)):
+                        stall = head_stall.current_stall(paths, NOW, LIMIT, 120)
                     assert isinstance(stall, head_stall.HeadStall)
                     self.assertEqual(head_stall.builds_text(stall).splitlines()[3:-1], [
                         *header,
@@ -207,7 +225,7 @@ class FindStallTests(unittest.TestCase):
         source = records.ProcessSource((records.ProcessAnonymousUse(706237, use),))
         step = holder(NOW - 3600, measured=records.MeasuredMemory(use.bytes, anonymous=use, anonymous_source=source))
         queue = snapshot([waiter(NOW - 3600)], (step, compiler_service(source=COMPILER_SCOPE)))
-        stall = head_stall.find_stall(queue, 0.0, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(queue), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         self.assertEqual(head_stall.builds_text(stall).splitlines()[4],
                          "- check in devtools-chooserux (pid 706237): effective need 12.0 GiB, keep-aside 11.9 GiB, "
@@ -224,17 +242,18 @@ class FindStallTests(unittest.TestCase):
         }
         for name, (queue, admitted) in cases.items():
             with self.subTest(name):
-                self.assertEqual(head_stall.find_stall(queue, admitted, NOW, LIMIT), head_stall.NoStall())
+                self.assertEqual(head_stall.find_stall(fixture_explanation(queue), admitted, NOW, LIMIT), head_stall.NoStall())
 
     def test_a_recent_zero_need_start_does_not_hide_the_stall(self) -> None:
-        gate = replace(holder(NOW - 60), step="merge-gate", promise=0)
-        stall = head_stall.find_stall(snapshot([waiter(NOW - 3600)], (holder(NOW - 3600), gate)), 0.0, NOW, LIMIT)
+        zero_need = replace(holder(NOW - 60), step="merge-gate", promise=0)
+        queue = snapshot([waiter(NOW - 3600)], (holder(NOW - 3600), zero_need))
+        stall = head_stall.find_stall(fixture_explanation(queue), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         self.assertEqual([step.step for row in stall.holders for step in row.steps], ["check"])
 
     def test_a_holder_without_a_reading_shows_unknown_use(self) -> None:
         queue = snapshot([waiter(NOW - 3600)], (holder(NOW - 3600, measured=records.GoneMemory()),))
-        stall = head_stall.find_stall(queue, 0.0, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(queue), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         self.assertIn("effective need 12.0 GiB, keep-aside 12.0 GiB, uses unknown, original grant 12.0 GiB",
                       head_stall.builds_text(stall))
@@ -248,7 +267,7 @@ class FindStallTests(unittest.TestCase):
             anonymous_source=records.ScopeSource(IDLE_SCOPE / "child.scope", frozenset({706238})))),
             folder="/build/child", pid=706238)
         queue = snapshot([waiter(NOW - 3600)], (parent, child, compiler_service(source=COMPILER_SCOPE)))
-        stall = head_stall.find_stall(queue, 0.0, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(queue), 0.0, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         self.assertEqual(head_stall.builds_text(stall).splitlines()[4:6], [
             "- check in parent (pid 706237): effective need 12.0 GiB, keep-aside 12.0 GiB, "
@@ -259,7 +278,7 @@ class FindStallTests(unittest.TestCase):
 
     def test_a_holder_without_a_start_time_shows_unknown_duration(self) -> None:
         queue = snapshot([waiter(NOW - 3600)], (holder(0.0),))
-        stall = head_stall.find_stall(queue, NOW - 3600, NOW, LIMIT)
+        stall = head_stall.find_stall(fixture_explanation(queue), NOW - 3600, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
         self.assertIn("held for unknown", head_stall.builds_text(stall))
 
@@ -301,7 +320,14 @@ class WatchTests(unittest.TestCase):
         })))
         self.enterContext(staff.supplied_snapshot(staff.StaffSnapshot(())))
         _ = self.enterContext(mock.patch.object(head_stall, "configured_limits", return_value=(LIMIT, 120.0)))
+        _ = self.enterContext(mock.patch.object(admission_client, "explain", side_effect=self.explain_fixture))
         self.sent = []
+
+    def explain_fixture(self) -> records.QueueExplanation:
+        queue = read_queue_snapshot(self.paths.admission)
+        if not isinstance(queue, QueueSnapshot):
+            raise AdmissionUnavailable("no fixture admission pass")
+        return fixture_explanation(queue)
 
     def run_send(self, result: bool) -> Callable[[list[str], str], bool]:
         def run(command: list[str], text: str) -> bool:
@@ -363,13 +389,37 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(self.sent_recipients(), ["builds", "bob"])
         self.assertEqual([text for _, text in self.sent], [head_stall.builds_text(stall)] * 2)
 
+    def test_the_hold_read_fallback_uses_the_head_from_admission(self) -> None:
+        held = waiter(NOW - 7200)
+        held.update(step="nextest", folder="/build/held-ci")
+        head = waiter(NOW - 3600)
+        head.update(pid=1618940, need=12 * GIB, step="check", folder="/build/admission-head")
+        published = snapshot([head], STALLED.inputs.running)
+        observed = snapshot([held, head], STALLED.inputs.running)
+        explanation = fixture_explanation(published)
+
+        with (mock.patch.object(build_hold, "natedev_holds", side_effect=PermissionError("cannot list holders")),
+              mock.patch.object(admission_client, "explain", return_value=explanation)):
+            self.assertIsInstance(self.observe(observed, NOW), head_stall.HeadStall)
+
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+        for _, report in self.sent:
+            self.assertIn("Head: check in admission-head (pid 1618940) needs 12.0 GiB.", report)
+            self.assertIn("Memory shortfall: 1.9 GiB.", report)
+            self.assertNotIn("held-ci", report)
+
+    def test_an_unavailable_admission_decision_sends_no_alert(self) -> None:
+        with mock.patch.object(admission_client, "explain", side_effect=AdmissionUnavailable("no fixture reply")):
+            self.assertEqual(self.observe(STALLED, NOW), head_stall.NoStall())
+        self.assertEqual(self.sent, [])
+
     def test_test_phase_reduces_the_alert_charge_while_nextest_stays_active(self) -> None:
         memory = records.MeasuredMemory(GIB, anonymous=records.AnonymousRunUse(GIB))
         nextest = replace(holder(NOW - 3600, measured=memory), step="nextest", folder="/build/hana-slot1")
         queued = [waiter(NOW - 3600)]
         queue = snapshot(queued, (nextest,))
         inputs = replace(queue.inputs, host=records.HostMemory(20 * GIB, 60 * GIB))
-        before = head_stall.find_stall(replace(queue, inputs=inputs), 0.0, NOW, LIMIT)
+        before = head_stall.find_stall(fixture_explanation(replace(queue, inputs=inputs)), 0.0, NOW, LIMIT)
         assert isinstance(before, head_stall.HeadStall)
         self.assertIn("effective need 12.0 GiB, keep-aside 11.0 GiB", head_stall.builds_text(before))
         self.assertIn("Memory shortfall: 9.0 GiB.", head_stall.builds_text(before))
