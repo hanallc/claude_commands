@@ -176,6 +176,9 @@ A live detached run holds DONE.
 A finished run with no delivery record can still hold DONE.
 A matching DONE covers a run that finished before DONE.
 A DONE at the next second covers a finish time that an old run record saved with seconds only.
+DONE also covers an ordinary run that started before DONE and names the exact pass.
+The hook waits for those live runs to finish.
+It adds their late results above the DONE line in the saved reply.
 The result can arrive later without requiring a new DONE.
 The delivery command records coverage and sends no result if it finds a covering DONE.
 The delivery command defers the result when transcript evidence is uncertain.
@@ -199,9 +202,12 @@ A worker puts its question in its reply and ends the turn.
 The turn hook sends that reply to the director.
 An unexpected screen prompt ends no turn, and the director finds it only when it reads the pane.
 A turn without DONE reports `no DONE` when no pending work explains it.
+An empty turn also reports `no DONE` after prompt acceptance if the pane is idle or the transcript records compaction.
+The hook reports an empty turn only when no pending work explains it.
+The hook sends one notice for the empty turn per pass.
+A startup turn before prompt acceptance sends no notice.
+A final reply without a staff row goes to the showrunner only if the recorder confirms that thread accepted a worker prompt.
 The notice includes the worker's last reply and leaves the pass active.
-A turn without an assistant reply reports `no DONE` when the transcript records compaction after the accepted dispatch prompt.
-An empty turn without that compaction evidence stays ignored.
 Resubmit that work with `worker.py answer <name> --text "Read the assigned prompt and do the work."`.
 `answer` takes the same worker lock as `assign`.
 It requires an active pass, a saved delivery, and transcript proof that the worker accepted the delivery.
@@ -272,6 +278,7 @@ Uncertain ownership or failed closure produces a retained-pane diagnostic.
 
 Event producers call `handle(WorkerEvent(thread_id, EventKind.RUN_FINISHED))` after a run record reaches `finished`.
 The final diff event uses `EventKind.STAGE_READY` for a review with two stages.
+The hook saves the first stage's DONE reply and any results it covers before the second stage starts.
 `detached_runs.py` calls the handler after supervisor completion and orphan completion.
 The director sends the final-diff event with `turn_end.py stage-ready <worker>`.
 
@@ -898,9 +905,21 @@ A canceled pass permits closure when the agent is idle and no live run holds the
 An interrupted pass keeps its pane until the saved stage receipt and reply match.
 Pruning uses the same receipt and reply for results from the current pass.
 A finished hook permits closure of an idle pane after pruning removes the detached run records.
-A live detached run keeps the pass active, so the hook closes no pane until that run ends.
+An idle worker parks when its pass waits only on live runs that name the pass.
+Parking closes the pane and keeps the pass, launch settings, and conversation.
+A failed close keeps the park marker while the pass waits only on live runs.
+A later event retries the close.
+A finished result restores the parked worker when the worker still needs the result.
+Restore uses the saved conversation and launch settings. It sends no new assignment.
+An account move also uses the saved conversation and launch settings for a parked worker.
+An explicit restore account applies when reap opens the pane during restore.
+The transcript receipt prevents repeated result input.
 A live detached run also keeps a stopped worker's pane at the shell, so the Codex capacity stop cannot close it.
 When that run ends, its run-end event checks whether the stopped pane can close.
+A run with a dead supervisor and a dead command stays live only if its saved group still has live members.
+Reap recovers the run after its group ends.
+A failed close keeps completion pending for the next event.
+A repeated `finish-pass --status canceled` can retry closure for the same pass.
 The stop report names each pane that stays open.
 `worker.py end` recovers a matching DONE before it retires the worker.
 It also retries a saved unfinished completion.
@@ -936,16 +955,18 @@ It stores none of these three fields.
 Unavailable backend evidence gives `account` the `AccountUnavailable` state and its cause.
 That row has no `home` field.
 
-`worker.py list [open|closed|all]` defaults to open panes.
+`worker.py list [open|closed|all]` defaults to open panes and parked workers.
 `list closed` shows closed panes. `list all` includes uncertain rows too.
 The positional filter uses `WorkerFilter`; `--all-parents` replaces the old `--all` flag.
 The flag still selects saved dispatches from every parent.
-`list all --json --all-parents` needs no caller staff row or live pane read.
+`list all --json --all-parents` needs no caller staff row.
+It reads pane evidence for a worker with a park record.
 Open and closed filters use current pane evidence, including with `--all-parents`.
 
 Text output has aligned headers: `#`, `Name`, `Account`, `Activity`, `Pane`, `State`, and `Waiting on`.
 Activity uses the active dispatch kind, then the worker's role when no dispatch is active.
 Waiting on uses existing live detached run labels and shows `-` without a specific run.
+A parked worker shows `parked` with its live run labels.
 Text rows place open panes first and retain the current order inside each group.
 `_worker_pane_state` maps each observed worker to its pane and state words.
 

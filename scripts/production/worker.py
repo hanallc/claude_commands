@@ -9,6 +9,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, redirect_stderr, suppress
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from enum import Enum, IntEnum
 from importlib import import_module
@@ -78,6 +79,12 @@ class DispatchWaitingForRuns:
     runs: tuple[str, ...]
     has_live_run: bool
     reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply
+    can_park: bool = False
+    reap_required: frozenset[str] = frozenset()
+
+    @property
+    def waits_only_for_reap(self) -> bool:
+        return bool(self.reap_required) and self.reap_required.issuperset(self.runs)
 
 
 class NoMatchingDone(Enum):
@@ -298,6 +305,17 @@ def _done_covers_finish(done_at: float | DoneTimeUnknown,
     return isinstance(finished_at, float) and finished_at < done_at
 
 
+def _done_covers_run(done_at: float | DoneTimeUnknown, record: detached_runs.RunRecord,
+                     finished_at: float | detached_runs.RunFinishedBefore | detached_runs.RunFinishTimeUnknown) -> bool:
+    if _done_covers_finish(done_at, finished_at):
+        return True
+    link = record.get("pane_dispatch_id")
+    return (isinstance(done_at, float) and isinstance(link, str) and bool(link)
+            and isinstance(finished_at, (float, detached_runs.RunFinishedBefore))
+            and record["started_at"] < done_at and not record.get("stop_pass_requested")
+            and not record.get("self_stop"))
+
+
 def result_done_coverage(row: staff.StaffRow, passed: dict[str, object], record: detached_runs.RunRecord,
                          ) -> detached_runs.ResultDoneCoverage | detached_runs.ResultTranscriptUnknown:
     """Check the saved prompt and DONE before delivering a run result."""
@@ -325,7 +343,7 @@ def result_done_coverage(row: staff.StaffRow, passed: dict[str, object], record:
             return detached_runs.ResultTranscriptUnknown(finished_at.value)
         if transcript.done_at is DoneTimeUnknown.UNRECORDED:
             return detached_runs.ResultTranscriptUnknown(transcript.done_at.value)
-    return (detached_runs.ResultDoneCoverage.COVERED if _done_covers_finish(transcript.done_at, finished_at)
+    return (detached_runs.ResultDoneCoverage.COVERED if _done_covers_run(transcript.done_at, record, finished_at)
             else detached_runs.ResultDoneCoverage.NEEDS_DELIVERY)
 
 
@@ -362,7 +380,8 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
     live = ([] if isinstance(pane_pass, worker_panes.PassDetachedResults) and pane_pass.live_runs_checked else
             detached_runs.live_runs(directory, row.name, identity=row.id))
     if isinstance(pane_pass, progress_history.StoppedPassReceipt):
-        live = [record for record in live if record.get("pane_dispatch_id") == pane_pass.instance_id]
+        instance = pane_pass.instance_id
+        live = [record for record in live if record.get("pane_dispatch_id") == instance]
     else:
         if isinstance(pane_pass, worker_panes.PassDetachedResults):
             since, instance = pane_pass.started_at, pane_pass.instance_id
@@ -383,12 +402,16 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
                      if isinstance(recovered, DispatchComplete) and recovered == reply.matching_done else recovered)
     covered = {run_id for run_id, result in deliveries.items()
                if result.delivered_at is detached_runs.WorkerResultCovered.BY_DONE
-               or _done_covers_finish(transcript.done_at, result.finished_at)}
+               or _done_covers_run(transcript.done_at, result.run, result.finished_at)}
     if isinstance(reply, DispatchAwaitingReply) and isinstance(reply.matching_done, DispatchComplete):
         later = tuple(run_id for run_id in reply.runs if run_id not in covered)
         reply = replace(reply, runs=later) if later else replace(reply.matching_done, restored_done=True)
-    unseen = deliveries.keys() - transcript.received_runs - covered
-    pending = unseen.union(record["run_id"] for record in live)
+    reap_required = {run_id for run_id, result in deliveries.items()
+                     if result.delivered_at is detached_runs.WorkerResultDeferred.REAP_REQUIRED}
+    unseen = {run_id for run_id in deliveries.keys() - transcript.received_runs - covered - reap_required
+              if deliveries[run_id].delivered_at is not detached_runs.WorkerResultDeliverySuppressed.SUCCESS_ONLY}
+    live_ids = {record["run_id"] for record in live}
+    pending = unseen | live_ids | reap_required
     pending.update(run_id for run_id, result in deliveries.items()
                    if result.requires_done_after_finish and run_id not in covered)
     if isinstance(reply, DispatchAwaitingReply):
@@ -400,10 +423,29 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
             and delivered_at < done_at)))
         if after_done:
             reply = DispatchAwaitingReply(reply.reply, after_done, reply)
-        elif not live:
+        elif not live and not reap_required:
             return replace(reply, anomalies=tuple(
                 f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(unseen)))
-    return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply) if pending else reply
+    if pending:
+        can_park = (not stopped and not reap_required and not isinstance(reply, DispatchAwaitingReply) and pending == live_ids
+                    and isinstance(instance, str) and bool(instance)
+                    and all(record.get("pane_dispatch_id") == instance and not record.get("stop_pass_requested")
+                            and not record.get("self_stop") for record in live))
+        return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply, can_park,
+                                      reap_required=frozenset(reap_required))
+    if isinstance(reply, DispatchComplete):
+        finished_after_done = [
+            deliveries[run_id].run for run_id in sorted(covered)
+            if _done_covers_run(transcript.done_at, deliveries[run_id].run, deliveries[run_id].finished_at)
+            and not _done_covers_finish(transcript.done_at, deliveries[run_id].finished_at)]
+        if finished_after_done:
+            body, _, done_line = reply.reply.rstrip().rpartition("\n")
+            sections = [f"Detached run: {record['run_id']}\n"
+                        + detached_runs.result_message(record, detached_runs.command_result(record))
+                        for record in finished_after_done]
+            text = "\n\n".join(part for part in (body.rstrip(), *sections, done_line) if part)
+            return replace(reply, reply=text, restored_done=True)
+    return reply
 
 
 def completion_close_evidence(row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
@@ -618,7 +660,7 @@ class AttachedCompaction(Enum):
 
 
 def _accept_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: str, completion_id: str) -> None:
-    progress_history.confirm_assignment_submission(run, instance, completion_id)
+    progress_history.confirm_assignment_submission(run, instance, completion_id, worker_thread=str(row.current_session))
     handoff = worker_admission.dispatch_record(run, row.name)
     if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED,
                          worker_admission.SwitchState.DISPATCH_IN_FLIGHT):
@@ -690,6 +732,7 @@ class CompletionRecovery(Enum):
     PENDING_CLOSE = "completion has pending pane cleanup"
     WAITING_ON_RUNS = "the completion waits for a detached run"
     WAITING_ON_REPLY = "a detached run result awaits a matching DONE"
+    WAITING_ON_REAP = "reap must record the run result"
 
 
 class CompletionNotices(Protocol):
@@ -760,7 +803,8 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
                     print(f"anomaly: {row.name}: pending completion notice for pass {previous.get('instance_id')}: {error}",
                           file=sys.stderr)
                     return ExitCode.UNCERTAIN
-                if recovered in (CompletionRecovery.WAITING_ON_RUNS, CompletionRecovery.WAITING_ON_REPLY):
+                if recovered in (CompletionRecovery.WAITING_ON_RUNS, CompletionRecovery.WAITING_ON_REPLY,
+                                 CompletionRecovery.WAITING_ON_REAP):
                     print(f"{row.name}: {recovered.value}", file=sys.stderr)
                     return ExitCode.BUSY
                 if recovered is CompletionRecovery.PENDING_CLOSE:
@@ -1626,6 +1670,68 @@ def not_restored(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     return None
 
 
+def _restore_worker_pane(parent: StaffId, row: staff.StaffRow, hold: worker_panes.WorkerLockHold, *,
+                         account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount
+                                  | accounts.AccountSelection = worker_panes.ConfiguredWorkerAccount.CURRENT,
+                         runs: dict[str, list[str]] | None = None,
+                         codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT,
+                         policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT,
+                         ) -> worker_panes.WorkerStart:
+    return worker_panes.start_or_resume(parent, WorkerName.parse(row.name), worker_panes.dispatch_role(row),
+                                        account=account, lock=hold, runs=runs, codex=codex, policy=policy)
+
+
+@dataclass(frozen=True)
+class ParkedRestoreRequest:
+    """Apply a restore account and report panes that its reap opens."""
+
+    workers: frozenset[StaffId]
+    account: worker_panes.ConfiguredWorkerAccount | worker_panes.DestinationWorkerAccount | accounts.AccountSelection
+    started_panes: dict[StaffId, str]
+    codex: herdr.CodexConversations | herdr.CodexLaunchRead
+
+
+class RestoreFromRunEvent(Enum):
+    CURRENT = "use the configured restore account"
+
+
+_parked_restore_request: ContextVar[ParkedRestoreRequest | RestoreFromRunEvent] = ContextVar(
+    "parked_restore_request", default=RestoreFromRunEvent.CURRENT)
+
+
+def restore_parked_worker(row: staff.StaffRow, parent: StaffId, hold: worker_panes.WorkerLockHold) -> bool:
+    """Restore the pane for a result without repeating its accepted assignment."""
+    record = staff.snapshot()
+    state = worker_panes.observe_worker(parent, row, record)
+    if isinstance(state, worker_panes.OpenWorker):
+        return True
+    if not isinstance(state, (worker_panes.ClosedWorker, worker_panes.StoppedWorker)):
+        return False
+    run = worker_panes.worker_run(row, record=record)
+    policy = worker_panes.parked_launch_policy(row, worker_panes.worker_pass(row, run, record=record))
+    if isinstance(policy, progress_history.ParkedLaunchUnavailable):
+        return False
+    if quota_state.no_worker_mode() and policy.settings.kind == "codex":
+        return False
+    request = _parked_restore_request.get()
+    if not isinstance(request, ParkedRestoreRequest) or row.id not in request.workers:
+        result = _restore_worker_pane(parent, row, hold, policy=policy)
+    else:
+        result = _restore_worker_pane(parent, row, hold, policy=policy, account=request.account, codex=request.codex)
+        if isinstance(result, worker_panes.OpenWorker):
+            request.started_panes[row.id] = result.pane
+    return startup_result(WorkerName.parse(row.name), result) == ExitCode.OK
+
+
+def park_waiting_worker(row: staff.StaffRow, hold: worker_panes.WorkerLockHold, park: worker_panes.ParkWaitingPass,
+                        delivery: progress_history.DispatchDelivery, receipt: DispatchWaitingForRuns
+                        ) -> worker_panes.Closed | worker_panes.Kept | worker_panes.UncertainWorker:
+    with detached_runs.guard_worker_park(park.run, receipt.runs) as guarded:
+        if guarded and dispatch_receipt(row, delivery.line, park.stage, run=park.run, require_transcript=True) == receipt:
+            return worker_panes.close(hold.parent, hold.name, lock=hold, park=park)
+    return worker_panes.Kept("the detached run wait changed before parking")
+
+
 @herdr.pane_evidence_run()
 def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             only: frozenset[StaffId] | Literal["all"] = "all", account: str | accounts.AccountSelection = "",
@@ -1645,16 +1751,25 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
     selected_workers = tuple(dict.fromkeys(state.row.name for state in observed.states
         if state.row.id in only and isinstance(state, (worker_panes.OpenWorker,
             worker_panes.StoppedWorker, worker_panes.ClosedWorker)))) if only != "all" else ()
-    for run in held_runs:
-        for name in selected_workers if only != "all" else ("",):
-            try:
-                reaped = (detached_runs.reap_orphans(str(run), name) if name else
-                          detached_runs.reap_orphans(str(run)))
-                for run_id in reaped:
-                    print(f"{holder.name}: reaped detached run {run_id}")
-            except OSError as error:
-                print(f"anomaly: {run}: {error}", file=sys.stderr)
-                outcome = ExitCode.UNCERTAIN
+    reaped_panes: dict[StaffId, str] = {}
+    request = ParkedRestoreRequest(frozenset(state.row.id for state in observed.states), launch_account, reaped_panes, codex)
+    token = _parked_restore_request.set(request)
+    try:
+        for run in held_runs:
+            for name in selected_workers if only != "all" else ("",):
+                try:
+                    reaped = (detached_runs.reap_orphans(str(run), name) if name else
+                              detached_runs.reap_orphans(str(run)))
+                    for run_id in reaped:
+                        print(f"{holder.name}: reaped detached run {run_id}")
+                except OSError as error:
+                    print(f"anomaly: {run}: {error}", file=sys.stderr)
+                    outcome = ExitCode.UNCERTAIN
+    finally:
+        _parked_restore_request.reset(token)
+    if isinstance(started_panes, dict):
+        started_panes.update(reaped_panes)
+    changed = bool(reaped_panes)
     runs = runs if runs is not None else {str(holder.current_session): [str(path) for path in observed.runs]}
     with progress_history.dispatch_reads(record, observed.runs):
         for state in observed.states:
@@ -1671,6 +1786,37 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if recovery is CompletionRecovery.RECOVERED:
                         changed = True
                         continue
+                    if recovery is CompletionRecovery.WAITING_ON_REAP:
+                        print(f"{state.row.name}: {recovery.value}", file=sys.stderr)
+                        outcome = ExitCode.UNCERTAIN
+                        continue
+                    passed = worker_panes.worker_pass(state.row, run, record=record)
+                    if recovery is not CompletionRecovery.PENDING_CLOSE and progress_history.parked_worker_pass(passed):
+                        current = worker_panes.observe_worker(parent, state.row, staff.snapshot())
+                        if isinstance(current, worker_panes.ClosedWorker):
+                            continue
+                        delivery = progress_history.dispatch_delivery(passed)
+                        park = worker_panes.ParkWaitingPass(run, str(passed["instance_id"]), delivery.completion_id)
+                        if isinstance(current, worker_panes.OpenWorker) and current.status.idle:
+                            receipt = dispatch_receipt(current.row, delivery.line, park.stage, run=run, require_transcript=True)
+                            if isinstance(receipt, DispatchWaitingForRuns) and receipt.can_park:
+                                closed = park_waiting_worker(current.row, hold, park, delivery, receipt)
+                                if isinstance(closed, worker_panes.Closed):
+                                    changed = True
+                                elif isinstance(closed, worker_panes.UncertainWorker):
+                                    print(f"anomaly: {state.row.name}: {closed.reason}", file=sys.stderr)
+                                    outcome = ExitCode.UNCERTAIN
+                                continue
+                        if isinstance(current, (worker_panes.OpenWorker, worker_panes.StoppedWorker)):
+                            _ = progress_history.record_worker_park(run, state.row.id, park.instance, park.stage,
+                                                                   launch=progress_history.ClearWorkerPark.MARKER)
+                        continue
+                    if recovery is CompletionRecovery.WAITING_ON_REPLY and isinstance(state, worker_panes.ClosedWorker):
+                        # Reap can resume a worker after the first pane read.
+                        current = worker_panes.observe_worker(parent, state.row, staff.snapshot())
+                        if isinstance(current, worker_panes.OpenWorker) and not current.status.idle:
+                            changed = True
+                            continue
                     if (recovery is CompletionRecovery.WAITING_ON_REPLY
                             and isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker))
                             and worker_panes.worker_pass(state.row, run, record=record).get("status") == "canceled"):
@@ -1711,10 +1857,8 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         continue
                     resume = partial(_resume_launcher, detached=detached) if detached else _resume_launcher
                     if not isinstance(state, worker_panes.OpenWorker):
-                        role = worker_panes.dispatch_role(state.row)
                         before = rows_before_launch()
-                        result = worker_panes.start_or_resume(parent, WorkerName.parse(state.row.name), role,
-                            account=launch_account, lock=hold, runs=runs, codex=codex)
+                        result = _restore_worker_pane(parent, state.row, hold, account=launch_account, runs=runs, codex=codex)
                         arm_launch_cleanup(cleanup, before, result)
                         code = startup_result(WorkerName.parse(state.row.name), result)
                         if code != ExitCode.OK:
@@ -1981,8 +2125,13 @@ def _open_worker(state: worker_panes.WorkerPane) -> bool:
     return isinstance(state, (worker_panes.OpenWorker, worker_panes.StoppedWorker, worker_panes.ProcessUnknownWorker))
 
 
-def _listed_worker(state: worker_panes.WorkerPane, selection: WorkerFilter) -> bool:
-    return (selection is WorkerFilter.ALL or selection is WorkerFilter.OPEN and _open_worker(state)
+def _worker_is_parked(state: worker_panes.WorkerPane, dispatch: worker_panes.WorkerDispatchState) -> bool:
+    return (isinstance(state, worker_panes.ClosedWorker) and isinstance(dispatch, worker_panes.DispatchHoldsWorker)
+            and dispatch.parked and session_state.staff_state(state.row) == "active")
+
+
+def _listed_worker(state: worker_panes.WorkerPane, selection: WorkerFilter, *, parked: bool) -> bool:
+    return (selection is WorkerFilter.ALL or selection is WorkerFilter.OPEN and (_open_worker(state) or parked)
             or selection is WorkerFilter.CLOSED and isinstance(state, worker_panes.ClosedWorker))
 
 
@@ -2007,8 +2156,6 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
             saved = dispatches.by_worker.get(row.id, WorkerDispatchRecord({}, 0))
             if parent is None:
                 continue
-            if selection is not WorkerFilter.ALL and (row.id not in states or not _listed_worker(states[row.id], selection)):
-                continue
             fields = saved.fields
             status = fields.get("status", "unknown")
             status = status if isinstance(status, str) else "unknown"
@@ -2020,8 +2167,18 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
             work = "busy" if status == "active" else "idle" if status in ("completed", "error", "canceled", "interrupted", "paused", "exited") else "unknown"
             dispatch = _worker_dispatch_state(row, record, detached, read=read)
             observed = states.get(row.id)
+            if observed is None and isinstance(dispatch, worker_panes.DispatchHoldsWorker) and dispatch.parked:
+                found = worker_panes.observe_worker(parent.id, row, record)
+                if not isinstance(found, worker_panes.WorkerNotObserved):
+                    observed = found
+            parked = observed is not None and _worker_is_parked(observed, dispatch)
+            if selection is not WorkerFilter.ALL and (
+                    observed is None or not _listed_worker(observed, selection, parked=parked)):
+                continue
             pane = "-"
-            if not as_json and isinstance(observed, worker_panes.OpenWorker):
+            if parked:
+                pane, status, work = "closed", "parked", "parked"
+            elif not as_json and isinstance(observed, worker_panes.OpenWorker):
                 pane, displayed = _worker_pane_state(observed, dispatch)
                 status = work = displayed
             elif status not in ("paused", "exited"):
@@ -2038,6 +2195,7 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
                 item["list_activity"] = activity or item["role"]
                 if pane != "-":
                     item["pane"] = pane
+            if parked or not as_json:
                 item["waiting_on"] = _waiting_on(row, detached)
             listing.append(item)
     if not as_json:
@@ -2049,6 +2207,8 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
 def _worker_pane_state(state: worker_panes.WorkerPane,
                        dispatch: worker_panes.WorkerDispatchState) -> tuple[str, str]:
     row = state.row
+    if _worker_is_parked(state, dispatch):
+        return "closed", "parked"
     activity = worker_panes.worker_state(state)
     if isinstance(state, worker_panes.OpenWorker):
         classified = session_state.classify(row, session_state.LiveActivity(
@@ -2083,11 +2243,12 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool 
     with progress_history.dispatch_reads(record, runs):
         states = observed.states if as_json else sorted(observed.states, key=lambda state: not _open_worker(state))
         for state in states:
-            if not _listed_worker(state, selection):
-                continue
             dispatch_state = _worker_dispatch_state(state.row, record, detached)
             pane, displayed_state = _worker_pane_state(state, dispatch_state)
-            work = (displayed_state if isinstance(state, worker_panes.OpenWorker) or displayed_state == "busy"
+            parked = displayed_state == "parked"
+            if not _listed_worker(state, selection, parked=parked):
+                continue
+            work = (displayed_state if isinstance(state, worker_panes.OpenWorker) or displayed_state in ("busy", "parked")
                     else worker_panes.worker_state(state))
             facts: dict[str, object] = {"state": type(state).__name__, "work": work}
             if as_json:
@@ -2104,6 +2265,7 @@ def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool 
                 dispatch = progress_history.last_dispatch(state.row.id)
                 fields["list_activity"] = (dispatch.role if isinstance(dispatch, progress_history.RecordedDispatch)
                                            and dispatch.status in ("active", "refused") else fields["role"])
+            if parked or not as_json:
                 fields["waiting_on"] = _waiting_on(state.row, detached)
             listing.append(fields)
     return listing

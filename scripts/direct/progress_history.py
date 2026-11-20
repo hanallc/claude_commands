@@ -560,8 +560,19 @@ def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
     history_file = Path(history_file_value)
     history_file.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(_stored_fields(event), separators=(",", ":"), sort_keys=True) + "\n"
-    with history_file.open("a", encoding="utf-8") as handle:
+    cancellation = (event.get("event_type") == "pass_finished" and event.get("status") == "canceled"
+                    and bool(event.get("pass_instance_id")))
+    with history_file.open("a+" if cancellation else "a", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if cancellation:
+            # The history can contain the cancellation even if the state write failed.
+            _ = handle.seek(0)
+            for previous_line in handle:
+                previous = _json_object(previous_line)
+                if previous is not None and all(previous.get(key) == event.get(key)
+                        for key in ("event_type", "run_id", "pass_instance_id", "status")):
+                    event["timestamp_epoch"] = previous.get("timestamp_epoch")
+                    return
         _ = handle.write(line)
         handle.flush()
         # Disposable fixtures may omit disk durability; production syncs by default.
@@ -1407,7 +1418,7 @@ def _close_slot_pass(
     )
     _append_event(state, event)
     current_pass["status"] = status
-    current_pass["finished_at"] = now
+    current_pass["finished_at"] = _number(event.get("timestamp_epoch"), now)
     _write_state(session_dir, state)
     return True
 
@@ -2370,7 +2381,7 @@ def dispatch_submission_confirmed(run: Path, instance_id: str, completion_id: st
         return isinstance(slot, str) and completion_id in _string_list(passes[slot].get("confirmed_delivery_ids"))
 
 
-def confirm_assignment_submission(run: Path, instance_id: str, completion_id: str) -> None:
+def confirm_assignment_submission(run: Path, instance_id: str, completion_id: str, *, worker_thread: str = "") -> None:
     """Confirm the delivery and restore running status for the open pass."""
     with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -2383,14 +2394,22 @@ def confirm_assignment_submission(run: Path, instance_id: str, completion_id: st
         if isinstance(hook_completion(passed), HookCompletion):
             return
         confirmed = _string_list(passed.get("confirmed_delivery_ids"))
-        if completion_id not in confirmed:
-            passed["confirmed_delivery_ids"] = [*confirmed, completion_id]
+        new_thread = bool(worker_thread and passed.get("submitted_worker_thread") != worker_thread)
+        if new_thread:
+            passed["submitted_worker_thread"] = worker_thread
+        if completion_id not in confirmed or new_thread:
+            passed["confirmed_delivery_ids"] = confirmed if completion_id in confirmed else [*confirmed, completion_id]
             _write_state(run, state)
         if status_file := _string(passed.get("assign_status_file")):
             try:
                 write_text_atomic(Path(status_file), "running\n")
             except OSError as error:
                 print(f"Unable to restore running status in {status_file}. {error}", file=sys.stderr)
+
+
+def submitted_worker_thread(state: dict[str, object], thread: str) -> bool:
+    return any(passed.get("worker_id") and passed.get("submitted_worker_thread") == thread
+               and bool(_string_list(passed.get("confirmed_delivery_ids"))) for passed in _pass_slots(state).values())
 
 
 @dataclass(frozen=True)
@@ -2455,6 +2474,68 @@ def worker_artifact(path: Path, slot: str, worker: str) -> Path:
 
 def save_dispatch_delivery(session_dir: Path, instance_id: str, delivery: DispatchDelivery) -> None:
     _update_dispatch(session_dir, instance_id, "delivery", delivery)
+
+
+def parked_worker_pass(passed: dict[str, object]) -> bool:
+    stage = passed.get("parked_completion_id")
+    return bool(stage and passed.get("status") in ("active", "refused")
+                and stage == dispatch_delivery(passed).completion_id)
+
+
+@dataclass(frozen=True)
+class ParkedWorkerLaunch:
+    """Keep the native thread and effective settings for a parked pass."""
+
+    thread: str
+    family: Literal["claude", "codex"]
+    model: str
+    effort: str
+    service_tier: str
+    sandbox: str
+    permission: str
+
+
+class ParkedLaunchUnavailable(Enum):
+    MISSING = "the parked worker launch is unavailable"
+
+
+class ClearWorkerPark(Enum):
+    MARKER = "clear the park marker and saved launch"
+
+
+def parked_worker_launch(passed: dict[str, object]) -> ParkedWorkerLaunch | ParkedLaunchUnavailable:
+    saved = _object_dict(passed.get("parked_launch")) or {}
+    family = saved.get("family")
+    thread, model = _string(saved.get("thread")), _string(saved.get("model"))
+    if not parked_worker_pass(passed) or not thread or not model or family not in ("claude", "codex"):
+        return ParkedLaunchUnavailable.MISSING
+    return ParkedWorkerLaunch(thread, family, model, _string(saved.get("effort")), _string(saved.get("service_tier")),
+                              _string(saved.get("sandbox")), _string(saved.get("permission")))
+
+
+def record_worker_park(run: Path, identity: staff.StaffId, instance: str, stage: str, *,
+                       launch: ParkedWorkerLaunch | ClearWorkerPark) -> bool:
+    """Change the park state only for the open pass and stage."""
+    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = _read_state(run)
+        for passed in _open_passes(state).values():
+            if (passed.get("instance_id") != instance or passed.get("worker_id") != identity
+                    or not stage or dispatch_delivery(passed).completion_id != stage):
+                continue
+            if isinstance(launch, ParkedWorkerLaunch):
+                fields = asdict(launch)
+                if passed.get("parked_completion_id") == stage and passed.get("parked_launch") == fields:
+                    return True
+                passed.update(parked_completion_id=stage, parked_launch=fields)
+            elif "parked_completion_id" in passed:
+                _ = passed.pop("parked_completion_id")
+                _ = passed.pop("parked_launch", None)
+            else:
+                return True
+            _write_state(run, state)
+            return True
+    return False
 
 
 def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:
@@ -2666,6 +2747,14 @@ def _finish_pass(args: argparse.Namespace) -> CanceledWorkerPass | NoCanceledPan
     slot = _team_slot()
     state = _read_state(session_dir)
     current = _open_passes(state).get(slot, {})
+    if not current and status == "canceled":
+        previous = _pass_slots(state).get(slot, {})
+        identity = _string(previous.get("worker_id"))
+        instance = _string(previous.get("instance_id"))
+        requested = _optional_arg(args, "pass_instance_id")
+        if (previous.get("status") == "canceled" and identity and instance
+                and (not requested or requested == instance)):
+            return CanceledWorkerPass(session_dir, staff.StaffId(identity), instance)
     if instance_id := _optional_arg(args, "pass_instance_id"):
         if current.get("instance_id") != instance_id:
             return NoCanceledPane.NONE

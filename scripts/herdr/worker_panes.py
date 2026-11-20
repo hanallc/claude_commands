@@ -805,6 +805,7 @@ def _final_reply(row: staff.StaffRow) -> CloseAllowed | Kept:
 @dataclass(frozen=True)
 class DispatchHoldsWorker:
     blocker: str
+    parked: bool = False
 
 
 @dataclass(frozen=True)
@@ -879,7 +880,9 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
             return DispatchHoldsWorker("a detached run record is unreadable")
         live = row.id in detached.staff_ids
     if live:
-        return DispatchHoldsWorker("a detached run is live")
+        membership = staff.local_snapshot() if record is None else record
+        passed = _pass_in(row, _run_state(run, read), membership)
+        return DispatchHoldsWorker("a detached run is live", parked=progress_history.parked_worker_pass(passed))
     record = staff.local_snapshot() if record is None else record
     if isinstance(detached, DetachedWorkAtUse):
         # Direct pane operations use the current pass.
@@ -931,7 +934,7 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
             detached_results=PassDetachedResults(dispatch if isinstance(dispatch, str) else "",
                                                0 if started_at == float("-inf") else started_at, live_runs_checked))
         if isinstance(hold, Kept):
-            return DispatchHoldsWorker(hold.blocker)
+            return DispatchHoldsWorker(hold.blocker, parked=progress_history.parked_worker_pass(passed))
         if active:
             return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "completed":
@@ -966,13 +969,35 @@ def stage_two_completion_id(dispatch_id: str) -> str:
     return dispatch_id + "-2"
 
 
+@dataclass(frozen=True)
+class ParkWaitingPass:
+    """Close an idle pane while its accepted pass waits only on live runs."""
+
+    run: Path
+    instance: str
+    stage: str
+
+
+class CloseEndedPane(Enum):
+    CHECK = "use the normal closure rules"
+
+
 def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
               run: DispatchRun | HolderRun = HolderRun.CURRENT,
-              lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> CloseAllowed | Kept:
+              lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
+              park: ParkWaitingPass | CloseEndedPane = CloseEndedPane.CHECK) -> CloseAllowed | Kept:
     record = staff.snapshot()
     parent = record.parent_of(worker.row)
     if parent is None:
         return Kept("worker parent is unavailable")
+    if isinstance(park, ParkWaitingPass):
+        if not isinstance(lock, WorkerLockHold) or not lock.owns(worker.row):
+            return Kept("the worker lock is unavailable for parking")
+        if not isinstance(worker, OpenWorker) or not worker.status.idle:
+            return Kept("the worker pane is no longer idle")
+        if worker_run(worker.row, record=record) != park.run:
+            return Kept("the worker run changed before parking")
+        return CloseAllowed()
     directory = run.directory if isinstance(run, DispatchRun) else worker_run(worker.row, record=record)
     if isinstance(worker, ClosedWorker):
         return _idle_checks(worker.row, directory, lock)
@@ -1025,6 +1050,21 @@ def launch_policy(role: WorkerRole, family: Literal["claude", "codex", "assigned
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
     return _launch_policy(settings, sandbox)
+
+
+def parked_launch_policy(row: staff.StaffRow, passed: dict[str, object]
+                         ) -> LaunchPolicy | progress_history.ParkedLaunchUnavailable:
+    """Use the saved policy only for the same native conversation."""
+    from scripts.direct import progress_history
+
+    saved = progress_history.parked_worker_launch(passed)
+    backend = staff.backend(row)
+    if (isinstance(saved, progress_history.ParkedLaunchUnavailable)
+            or isinstance(backend, staff.BackendUnavailable) or saved.family != backend.family
+            or saved.thread != row.current_session):
+        return progress_history.ParkedLaunchUnavailable.MISSING
+    settings = models_registry.LaunchSettings(saved.family, saved.model, saved.effort, saved.service_tier)
+    return LaunchPolicy(settings, saved.sandbox, saved.permission)
 
 
 def astra_review_policy(model: str, effort: str) -> LaunchPolicy:
@@ -1649,9 +1689,32 @@ def _retire_launch(row: staff.StaffRow, client: herdr.Herdr, record: staff.Staff
             pane_launch.retire_launch(path, pane, entry)
 
 
+def _parked_launch(worker: OpenWorker, client: herdr.Herdr) -> progress_history.ParkedWorkerLaunch:
+    from scripts.direct import progress_history
+
+    herdr.forget_pane_evidence(client.session, worker.pane)
+    info = herdr.json_object(client.result("pane", "process-info", "--pane", worker.pane).get("process_info"),
+                             "worker launch policy")
+    owner = herdr.foreground_pane_owner(info)
+    pane = client.pane_row(worker.pane)
+    if (not isinstance(owner, (herdr.ProvedCodexForeground, herdr.ProvedClaudeForeground))
+            or isinstance(pane, herdr.NoPane) or pane.get("terminal_id") != worker.terminal
+            or herdr.read_foreground_pane_owner(owner, pane).current_identity != worker.row.current_session):
+        raise ValueError("the worker launch does not match the pane")
+    settings = kept_settings(models_registry.LaunchSettings(owner.kind, "", "", ""), owner.arguments)
+    pairs = dict(zip(owner.arguments, owner.arguments[1:]))
+    sandbox, permission = pairs.get("--sandbox", ""), pairs.get("--permission-mode", "")
+    if (not settings.model or owner.kind == "codex" and
+            (not sandbox or pairs.get("--ask-for-approval") != "never") or owner.kind == "claude" and not permission):
+        raise ValueError("the worker launch settings are incomplete")
+    return progress_history.ParkedWorkerLaunch(str(worker.row.current_session), owner.kind, settings.model,
+        settings.effort, settings.service_tier, sandbox, permission)
+
+
 @herdr.pane_evidence_run()
 def close(parent: StaffId, name: WorkerName, *,
-          lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE) -> Closed | Kept | UncertainWorker:
+          lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE,
+          park: ParkWaitingPass | CloseEndedPane = CloseEndedPane.CHECK) -> Closed | Kept | UncertainWorker:
     with ExitStack() as operations:
         held = operations.enter_context(worker_lock(parent, name, blocking=True)) if isinstance(lock, WorkerLockAtUse) else lock
         if isinstance(held, Kept):
@@ -1674,9 +1737,20 @@ def close(parent: StaffId, name: WorkerName, *,
             if isinstance(observed, ProcessUnknownWorker):
                 return _uncertain(row, observed.reason)
             if isinstance(observed, (OpenWorker, StoppedWorker)):
-                permission = can_close(observed, lock=held)
+                permission = (can_close(observed, lock=held, park=park) if isinstance(park, ParkWaitingPass)
+                              else can_close(observed, lock=held))
                 if isinstance(permission, Kept):
                     return permission
+                if isinstance(park, ParkWaitingPass):
+                    from scripts.direct import progress_history
+
+                    assert isinstance(observed, OpenWorker)
+                    try:
+                        launch = _parked_launch(observed, client)
+                    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+                        return _uncertain(row, str(error))
+                    if not progress_history.record_worker_park(park.run, row.id, park.instance, park.stage, launch=launch):
+                        return Kept("the worker pass changed before parking")
                 if not client.close_terminal_pane(observed.pane, observed.terminal):
                     return _uncertain(row, "pane close is incomplete")
             _retire_launch(row, client, record)

@@ -19,11 +19,11 @@ from threading import Event, current_thread
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from dataclasses import replace
-from typing import cast, final, override
+from typing import Literal, cast, final, override
 from unittest.mock import patch
 
 from scripts.accounts import refusals
-from scripts.agents import detached_runs, restart, shutdown_record, worker_lifecycle
+from scripts.agents import detached_run_process, detached_runs, restart, shutdown_record, worker_lifecycle
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
 from scripts.herdr import herdr, side_pane, turn_end, worker_panes
@@ -42,7 +42,8 @@ class NativeHookEntryTests(unittest.TestCase):
         for family, size in (("codex", 1), ("claude", 1), ("codex", 5_000)):
             with self.subTest(family=family, size=size), TemporaryDirectory() as folder:
                 reply = 'The work is complete.\nDONE "dispatch"' * size
-                value: dict[str, object] = {"hook_event_name": "Stop", "session_id": "native-thread", "last_assistant_message": reply}
+                value: dict[str, object] = {"hook_event_name": "Stop", "session_id": "native-thread",
+                                            "last_assistant_message": reply, "cwd": folder}
                 if family == "codex":
                     value.update({"turn_id": "turn-1", "model": "sol", "transcript_path": None})
                 payload = json.dumps(value)
@@ -79,7 +80,7 @@ class NativeHookEntryTests(unittest.TestCase):
                     start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self.assertEqual(children[0].wait(timeout=TEST_HANG_GUARD_SECS), 0)
                 self.assertEqual(json.loads(receipt.read_text()),
-                                 {"thread_id": "native-thread", "kind": "turn end", "reply": reply})
+                                 {"thread_id": "native-thread", "kind": "turn end", "reply": reply, "cwd": folder})
                 self.assertEqual(output.getvalue(), "")
 
     def test_separate_invocation_calls_handle_once_without_starting_another_process(self) -> None:
@@ -359,6 +360,39 @@ class TurnEndTests(unittest.TestCase):
         self.assertNotIn(opened.pane, self.case.fixture.world.locations)
         self.assertEqual(self.case.fixture.world.closed, [(opened.pane, opened.terminal)])
 
+        for submission, reply, count in (
+                ("startup", "Ready.", 0), ("unknown thread", "The check is complete.\nDONE missing-pass", 0),
+                ("submitted worker", "The check is complete.\nDONE missing-pass", 1),
+                ("submitted worker replies Ready", "Ready.", 1)):
+            with self.subTest(missing_staff_reply=submission):
+                name = submission.replace(" ", "-").lower()
+                if submission.startswith("submitted worker"):
+                    self.case.agent.finish_after = 100
+                    self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), "impl",
+                        self.case.prompt, session_dir=self.case.run_dir, slot=name, phase="8", kind="impl",
+                        launcher_command=["assign.sh", name], reply=self.case.reply), worker.DispatchSubmission.SUBMITTED)
+                    worker_row = self.case.agent.row(self.case.agent.submitted[-1][0])
+                elif submission == "startup":
+                    worker_row = self.case.opened(name).row
+                else:
+                    worker_row = None
+                membership = staff.snapshot()
+                missing = replace(membership, rows=tuple(row for row in membership.rows if row != worker_row))
+                thread = str(worker_row.current_session) if worker_row is not None else "unknown-thread"
+                notices = len(self.case.agent.notices)
+                event = turn_end.hook_event({"hook_event_name": "Stop", "session_id": thread,
+                    "cwd": str(self.case.fixture.root), "last_assistant_message": reply})
+                with (staff.supplied_snapshot(missing),
+                      patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.case.run_dir)})):
+                    self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
+                self.assertEqual(len(self.case.agent.notices), notices + count)
+                if count:
+                    message = self.case.agent.notices[-1]
+                    self.assertIn(f"Thread {thread}", message)
+                    self.assertIn(f"Directory {self.case.fixture.root}", message)
+                    self.assertTrue(message.endswith(reply))
+        self.case.agent.finish_after = 0
+
         for cause, event, closes in (
                 ("empty delivery", turn_end.EventKind.TURN_END, True),
                 ("missing prompt", turn_end.EventKind.TURN_END, False),
@@ -428,10 +462,20 @@ class TurnEndTests(unittest.TestCase):
                                          turn_end.TurnOutcome.IGNORED)
                 else:
                     before = (self.case.run_dir / "progress_history_state.json").read_bytes()
-                    self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.IGNORED)
+                    expected = turn_end.TurnOutcome.NO_DONE if cause == "pending assignment" else turn_end.TurnOutcome.IGNORED
+                    self.assertEqual(self.case.finish(name, event), expected)
                 self.assertEqual(opened.pane not in self.case.fixture.world.locations, closes)
-                self.assertEqual((self.case.run_dir / "progress_history_state.json").read_bytes(), before)
-                self.assertEqual(self.case.agent.notices, notices)
+                saved = (self.case.run_dir / "progress_history_state.json").read_bytes()
+                if cause == "pending assignment":
+                    fields = cast(dict[str, dict[str, dict[str, object]]], json.loads(saved))
+                    self.assertTrue(fields["pass"]["impl"].pop("hook_notice"))
+                    self.assertEqual(fields, json.loads(before))
+                    self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.NO_DONE)
+                    self.assertEqual(len(self.case.agent.notices), len(notices) + 1)
+                    self.assertIn("phase 8: no DONE", self.case.agent.notices[-1])
+                else:
+                    self.assertEqual(saved, before)
+                    self.assertEqual(self.case.agent.notices, notices)
                 self.assertEqual(staff.by_id(opened.row.id), opened.row)
 
         with self.subTest(cause="consultation awaits its reply"):
@@ -662,6 +706,136 @@ class TurnEndTests(unittest.TestCase):
                     _ = supervisor.wait(timeout=LauncherHangGuard("private run exit").remaining())
         self.assertEqual(len(self.case.agent.submitted), 3)
         self.assertEqual(self.case.agent.waited, [])
+
+        source = Path(__file__).resolve().parents[2] / "config"
+        for config in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
+            _ = shutil.copyfile(source / config, self.case.fixture.root / "conf" / config)
+        for case in ("done", "result", "retry-close", "role-change", "stage-one"):
+            with self.subTest(park=case):
+                self.check_parked_pass(case)
+
+    def check_parked_pass(self, case: Literal["done", "result", "retry-close", "role-change", "stage-one"]) -> None:
+        done = case in ("done", "stage-one")
+        name = f"parked-{case}"
+        run = self.case.run_dir
+        ready = run / f"{name}.ready"
+        self.case.reply = self.case.run_dir / f"{name}.md"
+        self.case.agent.finish_after = 1
+        registry = self.case.fixture.root / "conf/models.conf"
+        _ = write_registry(registry, {"assignments": {"direct": "codex"}}, update=True)
+        role: staff.WorkerRole = "review" if case == "stage-one" else "impl"
+        launched = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), role, self.case.prompt,
+            session_dir=run, slot=name, phase="8", kind=role, launcher_command=[name],
+            early_ready=ready if case == "stage-one" else worker.SINGLE_STAGE_REVIEW, reply=self.case.reply)
+        self.assertIs(launched, worker.DispatchSubmission.SUBMITTED)
+        pane, _ = self.case.agent.submitted[-1]
+        row = self.case.agent.row(pane)
+        original_family, original_args, _ = self.case.fixture.world.requests[-1]
+        active = progress_history.active_dispatch(row.id, self.case.run_dir)
+        assert isinstance(active, progress_history.ActiveDispatch)
+        path, record = self.case.detached_record(row, name)
+        atomic_file.write_text_atomic(Path(record["log"]), "The final type check passed.\n")
+        label = "TEST final type check"
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
+                              stdin=subprocess.PIPE, text=True) as supervisor:
+            try:
+                record.update(status="running", pid=supervisor.pid, label=label, pane_dispatch_id=active.instance_id)
+                atomic_file.write_text_atomic(path, json.dumps(record))
+                self.case.agent.without_done = not done
+                self.case.agent.complete(pane)
+                self.case.agent.without_done = False
+                final = self.case.agent.replies[-1]
+                if case == "retry-close":
+                    close = self.case.fixture.world.close_terminal_pane
+
+                    def fail_close(pane_id: str, terminal: str) -> bool:
+                        return pane_id != pane and close(pane_id, terminal)
+
+                    with patch.object(self.case.fixture.world, "close_terminal_pane", side_effect=fail_close):
+                        self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.WAITING_ON_RUNS)
+                        self.assertIn(pane, self.case.fixture.world.locations)
+                        self.assertIs(worker.restore(self.case.fixture.parent.id, only=frozenset({row.id})),
+                                      worker.ExitCode.UNCERTAIN)
+                    self.assertIn(pane, self.case.fixture.world.locations)
+                    self.assertIs(worker.restore(self.case.fixture.parent.id, only=frozenset({row.id})), worker.ExitCode.OK)
+                else:
+                    self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.WAITING_ON_RUNS)
+                if case == "stage-one":
+                    self.assertIn(pane, self.case.fixture.world.locations)
+                    atomic_file.write_text_atomic(ready, "ready\n")
+                else:
+                    self.assertNotIn(pane, self.case.fixture.world.locations)
+                    for scope in ((), ("--all-parents",)):
+                        code, rows, error = self.case.text_command("list", *scope)
+                        self.assertEqual(code, 0, error)
+                        listed = next(cells for cells in rows if cells[1] == name)
+                        self.assertEqual(listed[4:], ["closed", "parked", label])
+                self.assertEqual(staff.by_id(row.id), row)
+                self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)
+                launches = len(self.case.fixture.world.launches)
+                if case != "stage-one":
+                    self.assertIs(worker.restore(self.case.fixture.parent.id, only=frozenset({row.id})), worker.ExitCode.OK)
+                    self.assertEqual(len(self.case.fixture.world.launches), launches)
+            finally:
+                assert supervisor.stdin is not None
+                supervisor.stdin.close()
+                _ = supervisor.wait(timeout=LauncherHangGuard("parked run supervisor exit").remaining())
+
+        record.update(status="finished", exit_code=0, completion_pending=True,
+                      finished_at=datetime.now().astimezone().isoformat(timespec="microseconds"))
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+        run_command = self.case.fixture.world.run
+        submissions: list[tuple[str, str]] = []
+
+        def submit(*arguments: str, deadline: float = math.inf) -> str:
+            result = run_command(*arguments, deadline=deadline)
+            if arguments[:2] == ("agent", "prompt") and f"Detached run: {name}\n" in arguments[3]:
+                target, text = arguments[2:4]
+                submissions.append((target, text))
+                self.case.agent.append(target, "user", text)
+                self.case.fixture.world.locations[target]["agent_status"] = "working"
+            return result
+
+        if case == "role-change":
+            _ = write_registry(registry, {"assignments": {"direct": "claude"}}, update=True)
+        with patch.object(self.case.fixture.world, "run", side_effect=submit):
+            if done:
+                self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
+            else:
+                self.assertIs(worker.restore(self.case.fixture.parent.id, only=frozenset({row.id})), worker.ExitCode.OK)
+            self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
+        if done:
+            self.assertEqual(submissions, [])
+            self.assertEqual(len(self.case.fixture.world.launches), launches)
+            reply_file = self.case.reply
+            if case == "stage-one":
+                target, line = self.case.agent.submitted[-1]
+                self.assertEqual(target, pane)
+                self.assertIn(f"DONE {worker_panes.stage_two_completion_id(active.instance_id)}", line)
+                self.case.agent.complete(pane)
+                self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
+                self.assertEqual(self.case.reply.read_text(), self.case.agent.replies[-1] + "\n")
+                reply_file = self.case.reply.with_name(f"{self.case.reply.stem}_stage1_{active.instance_id}.md")
+            reply = reply_file.read_text()
+            self.assertTrue(reply.startswith(final.splitlines()[0]))
+            self.assertTrue(reply.rstrip().endswith(f"DONE {active.instance_id}"))
+            self.assertIn("The final type check passed.", reply)
+            self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "completed")
+            self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
+        else:
+            (target, text), = submissions
+            self.assertIn("The final type check passed.", text)
+            self.assertEqual(len(self.case.fixture.world.launches), launches + 1)
+            self.assertEqual(self.case.agent.row(target).current_session, row.current_session)
+            self.assertEqual(progress_history.active_dispatch(row.id, self.case.run_dir), active)
+            if case == "role-change":
+                family, arguments, _ = self.case.fixture.world.requests[-1]
+                self.assertEqual((family, arguments[arguments.index("--model"):]),
+                                 (original_family, original_args[original_args.index("--model"):]))
+            self.case.agent.append(target, "assistant", f"DONE {active.instance_id}")
+            self.case.fixture.world.locations[target]["agent_status"] = "done"
+            self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
 
     def test_a_friend_reply_completes_the_same_pass_without_another_prompt(self) -> None:
         self.case.agent.without_done = True
@@ -1400,7 +1574,7 @@ class TurnEndTests(unittest.TestCase):
                       patch.object(detached_runs, "_run", return_value=143 if self_stop else 0),
                       patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver)):
                     if not finishes_during_turn:
-                        with patch.object(detached_runs, "live_runs", return_value=[record]):
+                        with patch.object(detached_run_process, "supervises", return_value=True):
                             self.assertEqual(finish_turn(), turn_end.TurnOutcome.WAITING_ON_RUNS)
                     if transcript_unavailable:
                         with patch.object(detached_runs, "_result_received", side_effect=OSError("fixture read failure")):
@@ -1724,6 +1898,76 @@ class TurnEndTests(unittest.TestCase):
         finished = progress_history.hook_completion(worker_panes.worker_pass(row, self.case.run_dir))
         assert isinstance(finished, progress_history.HookCompletion)
         self.assertTrue(finished.finished)
+
+        with self.subTest(retry="reap after a failed close"):
+            name = "retry-close"
+            self.case.agent.finish_after = 1
+            self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+            pane, _ = self.case.agent.submitted[-1]
+            row = self.case.agent.row(pane)
+            path, record = self.case.detached_record(row, "retry-close-result")
+            record.update(delivery=f"sent: worker {name} at {pane}", completion_pending=True)
+            with detached_runs.record_lock(path):
+                atomic_file.write_text_atomic(path, json.dumps(record))
+            self.case.agent.append(pane, "user", f"Detached run: {record['run_id']}\nRun finished: tests")
+            self.case.agent.complete(pane)
+            with patch.object(self.case.fixture.world, "close_terminal_pane", return_value=False):
+                self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
+            self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), True)
+            self.assertIn(pane, self.case.fixture.world.locations)
+            notices = list(self.case.agent.notices)
+            self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
+            self.assertNotIn(pane, self.case.fixture.world.locations)
+            self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
+            self.assertEqual(self.case.agent.notices, notices)
+
+        for failure in ("pane close", "state write"):
+            with self.subTest(retry="finish-pass after recorder cancellation", failure=failure):
+                name = "retry-cancel-" + failure.replace(" ", "-")
+                self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                pane, _ = self.case.agent.submitted[-1]
+                row = self.case.agent.row(pane)
+                run = self.case.run_dir
+                instance = str(worker_panes.worker_pass(row, run)["instance_id"])
+                history = Path(str(worker_panes.run_state(run)["history_file"]))
+                state_file = run / unit_runs.STATE_FILE
+                self.case.fixture.world.locations[pane]["agent_status"] = "idle"
+                args = ["progress_history.py", "finish-pass", "--session-dir", str(run),
+                        "--status", "canceled", "--pass-instance-id", instance]
+
+                def cancel_events() -> list[dict[str, object]]:
+                    events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+                    return [event for event in events if event.get("pass_instance_id") == instance
+                            and event.get("event_type") == "pass_finished"]
+
+                def fail_state_write(path: Path, value: str) -> None:
+                    if path == state_file:
+                        raise OSError("state write failed")
+                    atomic_file.write_text_atomic(path, value)
+
+                with patch.object(sys, "argv", args):
+                    if failure == "state write":
+                        with (patch.object(progress_history, "write_text_atomic", side_effect=fail_state_write),
+                              self.assertRaisesRegex(OSError, "state write failed")):
+                            progress_history.main()
+                        self.assertEqual(worker_panes.worker_pass(row, run)["status"], "active")
+                    else:
+                        with (patch.object(self.case.fixture.world, "close_terminal_pane", return_value=False),
+                              redirect_stderr(io.StringIO())):
+                            progress_history.main()
+                        self.assertEqual(worker_panes.worker_pass(row, run)["status"], "canceled")
+                    self.assertIn(pane, self.case.fixture.world.locations)
+                    state = state_file.read_bytes()
+                    original, = cancel_events()
+                    progress_history.main()
+                self.assertNotIn(pane, self.case.fixture.world.locations)
+                if failure == "pane close":
+                    self.assertEqual(state_file.read_bytes(), state)
+                self.assertEqual(cancel_events(), [original])
+                canceled = worker_panes.worker_pass(row, run)
+                self.assertEqual(canceled["status"], "canceled")
+                self.assertEqual(canceled["finished_at"], original["timestamp_epoch"])
+                self.assertEqual(staff.by_id(row.id), row)
 
     def test_restore_retries_a_saved_close_diagnostic_after_delivery_fails(self) -> None:
         self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)

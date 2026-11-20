@@ -34,7 +34,7 @@ from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
-from scripts.lib import atomic_file, detached, unit_runs
+from scripts.lib import atomic_file, detached, process_start, unit_runs
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.transcripts import open_transcript
 from scripts.lib.script_envelope import script_prompt
@@ -409,6 +409,9 @@ class WorkerCommandTests(unittest.TestCase):
         completion_id = progress_history.dispatch_delivery(passed).completion_id
         self.assertTrue(completion_id)
         passed["confirmed_delivery_ids"] = [completion_id]
+        row = staff.by_id(staff.StaffId(str(passed["worker_id"])))
+        assert row is not None
+        passed["submitted_worker_thread"] = str(row.current_session)
         current = (self.run_dir / unit_runs.STATE_FILE).read_bytes()
         self.assertEqual(current, (json.dumps(expected, indent=2, sort_keys=True) + "\n").encode())
         return current
@@ -593,6 +596,59 @@ class WorkerCommandTests(unittest.TestCase):
 
     def test_restore_resumes_a_stopped_busy_worker_with_live_runs_and_exact_context(self) -> None:
         self.assert_restore_live_run(active=True)
+        with self.subTest(restore="a parked result uses the requested account"):
+            self.check_restore_parked_account()
+
+    def check_restore_parked_account(self) -> None:
+        from scripts.whoami import agent_accounts
+
+        source = Path(__file__).resolve().parents[2] / "config"
+        for config in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
+            atomic_file.write_text_atomic(self.fixture.root / "conf" / config, (source / config).read_text())
+        name = "parked-account"
+        self.agent.finish_after = 1
+        self.assertIs(self.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+        pane, line = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        active = progress_history.active_dispatch(row.id, self.run_dir)
+        assert isinstance(active, progress_history.ActiveDispatch)
+        path = self.run_dir / worker_lifecycle.DETACHED_RUNS_DIR / f"{name}.json"
+        path.parent.mkdir(exist_ok=True)
+        with pane_fixtures.live_detached_run(self.run_dir, row):
+            record = worker_lifecycle.read_json_object(path)
+            record["pane_dispatch_id"] = active.instance_id
+            atomic_file.write_text_atomic(path, json.dumps(record))
+            self.agent.without_done = True
+            self.agent.complete(pane)
+            self.assertEqual(self.finish(name), turn_end.TurnOutcome.WAITING_ON_RUNS)
+            self.assertNotIn(pane, self.fixture.world.locations)
+        record.update(status="finished", exit_code=0, completion_pending=True,
+                      finished_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+        run_command = self.fixture.world.run
+        received: list[str] = []
+
+        def accept_result(*arguments: str, deadline: float = math.inf) -> str:
+            result = run_command(*arguments, deadline=deadline)
+            if arguments[:2] == ("agent", "prompt") and f"Detached run: {name}\n" in arguments[3]:
+                target, text = arguments[2:4]
+                received.append(target)
+                self.agent.append(target, "user", text)
+                self.fixture.world.locations[target]["agent_status"] = "working"
+            return result
+
+        target_home = self.fixture.root / ".codex2"
+        started_panes: dict[staff.StaffId, str] = {}
+        with (patch.object(self.fixture.world, "run", side_effect=accept_result),
+              patch.object(agent_accounts, "codex_account_home",
+                           return_value=agent_accounts.CodexHomeHoldingLogin("codex2", target_home, "fixture"))):
+            self.assertIs(worker.restore(self.fixture.parent.id, account="codex2", only=frozenset({row.id}),
+                                         started_panes=started_panes), worker.ExitCode.OK)
+        self.assertEqual(received, [started_panes[row.id]])
+        self.assertEqual(self.fixture.world.requests[-1][2]["CODEX_HOME"], str(target_home))
+        self.assertEqual(self.agent.row(started_panes[row.id]).current_session, row.current_session)
+        self.assertEqual(self.agent.submitted, [(pane, line)])
 
     def assert_restore_live_run(self, *, active: bool) -> None:
         from scripts.whoami import agent_accounts
@@ -1071,8 +1127,9 @@ class WorkerCommandTests(unittest.TestCase):
     def test_restore_reports_each_worker_with_pending_completion(self) -> None:
         impl = self.opened("impl")
         cm = self.opened("cm")
+        reap = self.opened("reap")
         dispatches: dict[str, str] = {}
-        for opened in (impl, cm):
+        for opened in (impl, cm, reap):
             name = opened.row.name
             dispatch = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
                 worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh", name],
@@ -1096,23 +1153,34 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent.append(cm.pane, "assistant", "The check is on hold.")
         self.fixture.world.locations[cm.pane]["agent_status"] = "done"
 
+        reap_path, orphan = self.detached_record(reap.row, "unreaped-check")
+        process = process_start.process_start(os.getpid())
+        assert isinstance(process, process_start.Started)
+        orphan.update(status="running", pid=2_147_483_647, pane_dispatch_id=dispatches["reap"],
+                      command_pid=os.getpid(), command_started=process.start)
+        atomic_file.write_text_atomic(reap_path, json.dumps(orphan))
+        self.agent.append(reap.pane, "assistant", f"DONE {dispatches['reap']}")
+        self.fixture.world.locations[reap.pane]["agent_status"] = "done"
+
         observe = worker_panes.observe
 
         def observe_impl_first(parent: staff.StaffId, record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
-            return sorted(observe(parent, record), key=lambda state: state.row.name != "impl")
+            return sorted(observe(parent, record), key=lambda state: (state.row.name != "impl", state.row.name))
 
         _ = self.enterContext(patch.object(worker_panes, "observe", side_effect=observe_impl_first))
         code, _, errors = self.command("restore")
         self.assertEqual(code, worker.ExitCode.UNCERTAIN)
         self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records",
-                                               "cm: a detached run result awaits a matching DONE"])
+                                               "cm: a detached run result awaits a matching DONE",
+                                               "reap: reap must record the run result"])
         self.assertIn(impl.pane, self.fixture.world.locations)
         self.assertIn(cm.pane, self.fixture.world.locations)
 
         self.agent.append(cm.pane, "assistant", f"The check is complete.\nDONE {dispatches['cm']}")
         code, _, errors = self.command("restore")
         self.assertEqual(code, worker.ExitCode.UNCERTAIN)
-        self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records"])
+        self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records",
+                                               "reap: reap must record the run result"])
         self.assertIn(impl.pane, self.fixture.world.locations)
         self.assertNotIn(cm.pane, self.fixture.world.locations)
 
@@ -2133,6 +2201,10 @@ class WorkerCommandTests(unittest.TestCase):
                 atomic_file.write_text_atomic(path, json.dumps(record))
                 self.agent.complete(pane)
                 receipt = worker.dispatch_receipt(row, line, dispatch_id, run=self.run_dir)
+                if status == "running":
+                    assert isinstance(receipt, worker.DispatchWaitingForRuns)
+                    self.assertEqual(receipt.reap_required, frozenset({"private-check"}))
+                    continue
                 self.assertIsInstance(receipt, worker.DispatchComplete)
                 assert isinstance(receipt, worker.DispatchComplete)
                 self.assertEqual(bool(receipt.anomalies), pending)
