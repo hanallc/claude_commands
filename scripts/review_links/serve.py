@@ -10,7 +10,7 @@ import argparse
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
-from functools import partial
+from functools import lru_cache, partial
 import html
 import gzip
 import ipaddress
@@ -101,6 +101,12 @@ def owned_document(content: bytes, page: str) -> bytes:
     except (OSError, ValueError):
         pass
     return content
+
+
+@lru_cache(maxsize=4)
+def _gzip_review_shell(content: bytes) -> bytes:
+    """Keep the compressed shell for each recent set of exact HTML bytes."""
+    return gzip.compress(content, compresslevel=1, mtime=0)
 
 
 def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCaptureRequest) -> bytes:
@@ -526,7 +532,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 return None
             prepared = snapshot.page_gzip if fields.get('show',['open'])[0]=='open' else b''
             owned = owned_document(content, "review")
-            self.review_response(owned, 'text/html; charset=utf-8', prepared if owned is content else b'')
+            self.review_response(owned, 'text/html; charset=utf-8', prepared if owned is content else b'',
+                                 cache_shell=owned is not content)
             return None
         if route.path == list_page.PAGE_PATH:
             if route.query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
@@ -718,12 +725,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         _ = self.wfile.write(content)
 
     def review_response(self, content: bytes, content_type: str, prepared: bytes = b'', *,
-                        version: str = '', status: int = 200) -> None:
+                        version: str = '', status: int = 200, cache_shell: bool = False) -> None:
         """Compress the retained Review index and shell for transfer."""
         accepts = self.headers.get('Accept-Encoding','')
         compressed = accepts_gzip(accepts)
         if compressed:
-            content = prepared or gzip.compress(content,compresslevel=1,mtime=0)
+            content = _gzip_review_shell(content) if cache_shell else prepared or gzip.compress(content,compresslevel=1,mtime=0)
         self.send_response(status)
         self.send_header('Content-Type',content_type)
         self.send_header('Content-Length',str(len(content)))

@@ -42,7 +42,8 @@ from uuid import uuid4
 from scripts.aws_target import aws_page
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
-from scripts.build_queue import memory_feed
+from scripts.build_queue import memory_feed, memory_files
+from scripts.disks import disks_page
 from scripts.message import send_result
 from scripts.review_links.test_page_question import question_outcome
 from scripts.production import (
@@ -387,22 +388,62 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(self.new_item_http(encoded(payload)).status, 503)
             self.assertEqual(cache.get().records, {})
 
-    def test_owner_options_resolve_the_recipient_and_review_reuses_its_dialog(self) -> None:
+    def test_console_owner_controls_resolve_the_recipient_and_share_one_dialog(self) -> None:
+        from scripts.accounts import accounts
+
         case = self.review_fixture()
-        owner = case.ready_submission_recipient()
-        config = conf.path("console")
-        _ = write_config_fixture(config, f"page.review.owner={owner.id}\n")
+        published = (
+            ("aws", "aws_page", Path(aws_page.__file__).with_name(aws_page.PAGE_NAME)),
+            ("builds", "memory_feed", memory_files.PAGE_SOURCE),
+            ("disks", "disks", Path(disks_page.__file__).with_name(disks_page.PAGE_NAME)),
+        )
+        pages = (
+            ("review", review_page.PAGE_PATH),
+            ("accounts", accounts_page.PAGE_PATH),
+            ("images", images.PAGE_PATH),
+            ("list", list_page.PAGE_PATH),
+            ("rebuilds", f"/console/{change_page.REBUILDS_NAME}"),
+            *((page, f"/{page}/{source.name}") for page, _, source in published),
+        )
+        self.assertEqual({page for page, _ in pages}, page_frame.OWNER_PAGES)
+        for page, configuration, source in published:
+            output = case.root / page
+            output.mkdir()
+            _ = write_config_fixture(conf.path(configuration), f"output_folder={output}\n")
+            _ = shutil.copyfile(source, output / source.name)
+        owners: dict[str, staff.StaffRow] = {}
+        for page, _ in pages:
+            doc = case.fixture.temporary / f"{page}-owner.md"
+            _ = doc.write_text(f"# {page} owner\n", encoding="utf-8")
+            owners[page] = fixture_member("showrunner", name=f"{page}-owner",
+                                          doc=staff.LiveDoc(local_machine(), doc))
+        _ = write_config_fixture(conf.path("console"),
+                                 "".join(f"page.{page}.owner={owner.id}\n" for page, owner in owners.items()))
+        _ = write_config_fixture(conf.path("accounts"))
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        with patch.object(self.server, "review_cache", cache):
-            options = self.new_item_http(query="?page=review")
-            review = self.request(review_page.PAGE_PATH)
-        fields = cast(dict[str, object], json.loads(options.body))
-        self.assertEqual(options.status, 200)
-        self.assertEqual(fields["recipients"], [{"id": owner.id, "name": owner.name, "proposal": False}])
+        reading = accounts.StatusReading((), (), (), timezone.utc, datetime.now(timezone.utc))
+
+        def render_accounts() -> accounts_page.AccountsRender:
+            # Render in process so the Accounts page can use the fixture reading.
+            return accounts_page.AccountsRender(accounts_page.page(), 0, time.time())
+
+        with (patch.object(self.server, "review_cache", cache), patch.object(self.server, "root", case.root),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(accounts, "read_status", return_value=reading),
+              patch.object(accounts_page, "render_with_facts", new=render_accounts)):
+            for page, url in pages:
+                with self.subTest(page=page):
+                    owner = owners[page]
+                    options = self.new_item_http(query=f"?page={page}")
+                    self.assertEqual(options.status, 200)
+                    fields = cast(dict[str, object], json.loads(options.body))
+                    self.assertEqual(fields["recipients"], [{"id": owner.id, "name": owner.name, "proposal": False}])
+                    reply = self.request(url)
+                    self.assertEqual(reply.status, 200)
+                    self.assertIn(f'data-page-owner="{page}"'.encode(), reply.body)
+                    self.assertIn(f'data-owner-new aria-label="New item for {owner.name}"'.encode(), reply.body)
+                    self.assertEqual(reply.body.count(b'<dialog id="review-new-item"'), 1)
         self.assertEqual(self.new_item_http(query="?page=other").status, 400)
-        self.assertEqual(review.status, 200)
-        self.assertIn(b'data-page-owner="review"', review.body)
-        self.assertEqual(review.body.count(b'<dialog id="review-new-item"'), 1)
 
     def test_list_owner_control_and_sends_use_the_configured_producer(self) -> None:
         case = self.review_fixture()
@@ -1791,6 +1832,36 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertLess(len(wire),len(snapshot.index_response()))
             finally:
                 connection.close()
+
+    def test_review_reuses_gzip_until_the_owner_shell_changes(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
+        snapshot = review_page.build_snapshot(case.root)
+        connection = HTTPConnection('127.0.0.1', self.port, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(connection.close)
+        compress = Mock(wraps=gzip.compress)
+
+        with (patch.object(self.server.review_cache, 'get', return_value=snapshot),
+              patch.object(serve, 'gzip', Mock(compress=compress))):
+            for name in (owner.name, 'renamed-review-owner'):
+                if name != owner.name:
+                    _ = staff.rename(owner.id, name)
+                for show in ('open', 'Waiting'):
+                    with self.subTest(owner=name, show=show):
+                        url = review_page.PAGE_PATH + '?' + urlencode({'show': show})
+                        plain = self.request(url)
+                        self.assertEqual(plain.status, 200)
+                        self.assertIn(f'aria-label="New item for {name}"'.encode(), plain.body)
+                        self.assertIn(f'data-show="{show}"'.encode(), plain.body)
+                        before = compress.call_count
+                        for _ in range(2):
+                            connection.request('GET', url, headers={'Accept-Encoding': 'gzip'})
+                            response = connection.getresponse()
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(response.getheader('Content-Encoding'), 'gzip')
+                            self.assertEqual(gzip.decompress(response.read()), plain.body)
+                        self.assertEqual(compress.call_count, before + 1)
 
     def test_server_initializes_review_on_a_fresh_root(self) -> None:
         with (patch.object(serve, "loaded_module_stamps", return_value={}),
