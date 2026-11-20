@@ -3232,7 +3232,7 @@ Tests: one row in the existing bare copy removal test, failing first.
 
 Tests: one row each in the existing Mac offload busy-mirror test and the existing dispatch test, each failing first.
 
-### Phase 44dt — Base red on main: copies slot and memory queue tests pass under load  · status: todo
+### Phase 44dt — Base red on main: copies slot and memory queue tests pass under load  · status: done (merged 729fe78f2, main d2a48d4835)
 **From builds, 2026-11-20 00:39 EST (base red on main 861d6408c; sdlc phase 86 and admin-console gates each failed twice, and once on a main rerun at load 49).** Ahead of the other unstarted work. Fast phase. Base: main 3d49d35e9. Logs: /tmp/claude/unit/29fc6964-2d74-4547-8edd-8764df425c44/phases/86/gate.log, rerun.log, main_rerun.log.
 
 1. `copies/test_slot_order.py` `test_remote_adoption_replays_with_the_parent_owner_and_original_queue_time`: the first recorded field is `""`, not `"4242"`.
