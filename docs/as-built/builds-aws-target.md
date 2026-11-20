@@ -1128,6 +1128,8 @@ The user approved the combined table on 2026-11-18.
 2. The first two columns show the region and its quota in vCPUs.
    The quota is Standard quota or G and VT quota for the selected types.
    The quota has a blue-gray tint and stays visible when all Show chips are off.
+   The next three columns show the requested vCPUs, request state, and request age.
+   A region without a request shows a dash in those columns.
 3. Each type header includes its vCPU count.
    When multiple values show, each type groups the Spot (USD/h), Gate (USD), or Fit (boxes) columns.
    Fit divides the region quota by the type's vCPU count and rounds down.

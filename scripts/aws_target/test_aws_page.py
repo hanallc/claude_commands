@@ -47,14 +47,17 @@ class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
     def test_quota_request_uses_plain_labels_when_values_are_missing(self) -> None:
         applied = aws_page.AppliedQuotaUnavailable.NOT_MEASURED
         for status, expected in (
-            ('APPROVED', 'closed, quota unknown'), ('IN_PROGRESS', 'open'), ('FIXTURE_UNKNOWN', 'status unknown'),
+            ('APPROVED', {'request': 'not measured', 'detail': 'closed, quota unknown'}),
+            ('IN_PROGRESS', {'request': 'open'}),
+            ('FIXTURE_UNKNOWN', {'request': 'not measured', 'detail': 'status unknown'}),
         ):
             with self.subTest(status=status):
                 request = quota_requests.quota_request(status, Decimal(32), None, None)
-                self.assertEqual(aws_page.quota_request_cell(request, applied, 0),
-                                 {'text': f'32 vCPUs wanted · {expected}, age unknown'})
+                self.assertEqual(aws_page.quota_request_columns(request, applied, 0),
+                                 {'wanted': '32', 'age': 'age unknown', **expected})
         reading = quota_requests.QuotaRequestReadFailed('fixture private diagnostic')
-        self.assertEqual(aws_page.quota_request_cell(reading, applied, 0), {'text': 'request read failed'})
+        self.assertEqual(aws_page.quota_request_columns(reading, applied, 0),
+                         {'wanted': '—', 'request': 'not measured', 'age': '—', 'detail': 'request read failed'})
 
     def test_future_quota_request_dates_have_unknown_age(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
@@ -450,8 +453,8 @@ class AwsCombinedTableTests(PageCostFixture):
         self.run_browser_checks('?prices=cost', """
     const table = () => document.querySelector("#price-table table");
     const click = selector => document.querySelector(selector).click();
-    const spot = () => table().tBodies[0].rows[0].cells[2];
-    const gate = () => table().tBodies[0].rows[0].cells[3];
+    const spot = () => table().tBodies[0].rows[0].cells[5];
+    const gate = () => table().tBodies[0].rows[0].cells[6];
     const params = () => new URLSearchParams(location.search);
     const placement = document.querySelector("#placement-scores");
     const placementRows = () => [...placement.querySelectorAll("tbody tr")];
@@ -460,26 +463,26 @@ class AwsCombinedTableTests(PageCostFixture):
     check(placementRows().some(row => row.cells[0].textContent === "us-west-1")
           && table().tBodies[0].rows.length === 3, "A region with only scores does not get a price row");
     check(table().tHead.rows.length === 2, "Default grouped headers");
-    check(table().tHead.rows[0].cells[2].textContent === "c7a.4xlarge (16 vCPUs)", "Type vCPU count");
+    check(table().tHead.rows[0].cells[5].textContent === "c7a.4xlarge (16 vCPUs)", "Type vCPU count");
     check(table().tHead.rows[1].cells[0].textContent === "Spot USD/h", "Spot unit");
     check(table().tHead.rows[1].cells[1].textContent === "Gate USD", "Gate unit");
     check(table().tHead.rows[1].cells[2].textContent === "Fit boxes", "Fit unit");
     const first = table().tBodies[0].rows[0];
-    check(first.cells[1].firstChild.textContent === "137" && first.cells[4].textContent === "8", "Quota and Fit numbers");
+    check(first.cells[1].textContent === "137" && first.cells[7].textContent === "8", "Quota and Fit numbers");
     check([...table().querySelectorAll(".quota-request")].map(cell => cell.textContent).join(",")
           === "not measured,not measured,not measured", "Legacy snapshots have no request history");
     check(document.querySelector("#quota-request-note").textContent === "The snapshot has no quota request history.",
           "One note for the legacy table");
-    check(first.cells[1].className === "n edge region-quota" && first.cells[4].className === "n", "No quota marks");
+    check(first.cells[1].className === "n edge region-quota" && first.cells[7].className === "n", "No quota marks");
     check(spot().textContent === "0.1000" && spot().classList.contains("cheapest"), "Lowest Spot price");
     check(first.querySelector(".spot-status").textContent === "read failed", "Visible failed read");
     check(table().tBodies[0].rows[1].querySelector(".spot-status").textContent === "old", "Visible old read");
-    check(first.cells[5].classList.contains("dearest"), "Highest Spot price");
-    check(table().tBodies[0].rows[1].cells[6].classList.contains("cheapest"), "Lowest Gate cost in another cell");
-    check(table().tBodies[0].rows[2].cells[3].classList.contains("dearest"), "Highest Gate cost");
-    check(table().tBodies[0].rows[2].cells[2].classList.contains("end"), "Column box");
-    check(table().tBodies[0].rows[2].cells[5].title === "Not sold here", "Unavailable type icon");
-    const missingGate = table().tBodies[0].rows[2].cells[6];
+    check(first.cells[8].classList.contains("dearest"), "Highest Spot price");
+    check(table().tBodies[0].rows[1].cells[9].classList.contains("cheapest"), "Lowest Gate cost in another cell");
+    check(table().tBodies[0].rows[2].cells[6].classList.contains("dearest"), "Highest Gate cost");
+    check(table().tBodies[0].rows[2].cells[5].classList.contains("end"), "Column box");
+    check(table().tBodies[0].rows[2].cells[8].title === "Not sold here", "Unavailable type icon");
+    const missingGate = table().tBodies[0].rows[2].cells[9];
     check(missingGate.title === "no current gate price"
           && missingGate.getAttribute("aria-label") === missingGate.title, "Unavailable Gate price note");
     const merge = gate().textContent;
@@ -490,18 +493,18 @@ class AwsCombinedTableTests(PageCostFixture):
     click("#regions [data-region='us-east-1']");
     check(table().tBodies[0].rows.length === 2 && spot().classList.contains("cheapest"), "Marks use the filtered regions");
     check(!placementRows().some(row => row.cells[0].textContent === "us-east-1"), "The region filter applies to placement scores");
-    check(gate().classList.contains("cheapest") && table().tBodies[0].rows[0].cells[6].classList.contains("dearest"),
+    check(gate().classList.contains("cheapest") && table().tBodies[0].rows[0].cells[9].classList.contains("dearest"),
           "Gate marks use the filtered regions");
     click("#show [data-measure='cost']");
     check(document.querySelector("#runs-label").hidden && document.querySelector("#runs-chips").hidden, "Hide Runs");
     check(params().get("show") === "spot,quota" && params().get("runs") === "targeted-test", "Show and Runs URL");
     click("#show [data-measure='spot']");
-    check(table().tHead.rows.length === 1 && table().tBodies[0].rows[0].cells.length === 4, "Fit alone");
+    check(table().tHead.rows.length === 1 && table().tBodies[0].rows[0].cells.length === 7, "Fit alone");
     click("#show [data-measure='quota']");
-    check(table().tBodies[0].rows[0].cells.length === 2 && params().get("show") === "", "Quota remains with all chips off");
+    check(table().tBodies[0].rows[0].cells.length === 5 && params().get("show") === "", "Quota remains with all chips off");
     click("#show [data-measure='cost']");
     const gateOnly = table().tBodies[0].rows[0].cells;
-    check(gateOnly[2].classList.contains("cheapest") && gateOnly[3].classList.contains("dearest"), "Gate marks with Gate alone");
+    check(gateOnly[5].classList.contains("cheapest") && gateOnly[6].classList.contains("dearest"), "Gate marks with Gate alone");
     click("#show [data-measure='spot']");
     document.head.appendChild(element("style", "#price-table table { min-width: 1000px; }"));
     const scroller = () => document.querySelector("#price-table .scroll");
@@ -543,29 +546,30 @@ class AwsCombinedTableTests(PageCostFixture):
                         'reason': 'The AWS plan key is locked. Run github-warmup in a terminal on natedev.'}
         self.run_browser_checks('?types=gpu&show=quota', """
     const summary = document.querySelector("#gpu-quota-summary");
-    const cell = region => [...document.querySelectorAll("#price-table tbody tr")]
-      .find(row => row.cells[0].textContent === region).cells[1];
-    const request = region => cell(region).querySelector(".quota-request").textContent;
+    const cells = region => [...document.querySelectorAll("#price-table tbody tr")]
+      .find(row => row.cells[0].textContent === region).cells;
+    const request = region => [...cells(region)].slice(1, 5).map(cell => cell.textContent).join("|");
+    const headers = [...document.querySelectorAll("#price-table thead th")].slice(2, 5);
+    check(headers.map(cell => cell.textContent).join("|") === "wanted|request|request age", "Request headings");
     check(summary?.textContent === "G and VT quota (32 vCPUs): 1 granted · 1 open · 1 closed, not granted",
           "GPU progress across the three regions");
-    check(cell("us-east-2").firstChild.textContent === "32" && request("us-east-2") === "32 vCPUs wanted · granted, 4 days",
-          "The applied quota meets an open request");
-    check(cell("us-east-1").firstChild.textContent === "8"
-          && request("us-east-1") === "32 vCPUs wanted · closed, not granted, 4 days",
-          "The applied quota is below the approved request");
-    check(request("eu-west-1") === "32 vCPUs wanted · open, 2 hours", "Age uses the update time without a creation time");
+    check(request("us-east-2") === "32|32|granted|4 days", "The applied quota meets an open request");
+    check(request("us-east-1") === "8|32|closed, not granted|4 days", "The applied quota is below the approved request");
+    check(request("eu-west-1") === "8|32|open|2 hours", "Age uses the update time without a creation time");
+    check([1, 2, 4].every(index => getComputedStyle(cells("us-east-2")[index]).textAlign === "right"),
+          "Quota, wanted, and request age align right");
     const grantRegion = document.querySelector("#regions [data-region='us-east-2']");
     grantRegion.click();
     check(summary.textContent === "G and VT quota (32 vCPUs): 0 granted · 1 open · 1 closed, not granted",
           "The summary counts only the visible rows");
     grantRegion.click();
     document.querySelector("#types [data-types='standard']").click();
-    check(request("us-east-2") === "not measured" && request("us-east-1") === "not measured",
+    check(request("us-east-2") === "137|—|not measured|—" && request("us-east-1") === "137|—|not measured|—",
           "Standard has its own request history");
-    check(request("eu-west-1") === "no request", "Empty history remains distinct");
+    check(request("eu-west-1") === "137|—|—|—", "Empty history remains distinct");
     check(document.querySelector("#quota-request-note").textContent
           === "The plan identity is locked. Run github-warmup on natedev.", "One note for the locked identity");
-    check(document.querySelectorAll("#price-table td").length === 12, "No extra table column");
+    check(document.querySelectorAll("#price-table td").length === 21, "Three added columns for each region");
 """, quota_history=(
             {'region': 'us-east-2', 'standard': not_measured, 'gpu': {**gpu, 'status': 'CASE_OPENED'}},
             {'region': 'us-east-1', 'standard': not_measured, 'gpu': {**gpu, 'status': 'APPROVED'}},
@@ -594,7 +598,7 @@ class AwsCombinedTableTests(PageCostFixture):
     const note = document.querySelector("#quota-request-note");
     const requests = [...document.querySelectorAll("#price-table .quota-request")];
     check(requests.some(cell => cell.textContent === "not measured"), "A missing history cell says not measured");
-    check(requests.some(cell => cell.textContent === "no request"), "An empty history has a record");
+    check(requests.some(cell => cell.textContent === "—"), "An empty history has a record");
     check(note.hidden && note.textContent === "", "Mixed history has no whole-snapshot note");
     document.querySelector("#regions [data-region='us-east-1']").click();
     check(!note.hidden && note.textContent === "The snapshot has no quota request history.",
@@ -607,9 +611,9 @@ class AwsCombinedTableTests(PageCostFixture):
         self.run_browser_checks('?show=spot,cost,quota&types=gpu&runs=both', """
     const table = document.querySelector("#price-table table");
     check(table.tHead.rows[0].cells[1].textContent === "G and VT quota vCPUs", "GPU quota");
-    check(table.tHead.rows[0].cells[2].textContent === "g6.2xlarge (8 vCPUs)", "GPU type");
+    check(table.tHead.rows[0].cells[5].textContent === "g6.2xlarge (8 vCPUs)", "GPU type");
     check([...table.tHead.rows[1].cells].map(cell => cell.textContent).join(",") === "Spot USD/h,Fit boxes", "GPU omits Gate");
-    check(table.tBodies[0].rows[0].cells[3].textContent === "4", "GPU Fit uses the GPU quota and vCPUs");
+    check(table.tBodies[0].rows[0].cells[6].textContent === "4", "GPU Fit uses the GPU quota and vCPUs");
     check(document.querySelector("#runs-chips [data-scope='both']").getAttribute("aria-pressed") === "true", "Runs URL");
     document.querySelector("#show [data-measure='spot']").click();
     document.querySelector("#show [data-measure='quota']").click();

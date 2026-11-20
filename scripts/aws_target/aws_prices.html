@@ -56,10 +56,6 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 #price-table .measures th:first-child { position: static; padding-left: 18px; box-shadow: none; }
 #price-table .region-quota { width: 1%; color: var(--ink); font-weight: 600;
   background: color-mix(in srgb, var(--accent) 12%, var(--card)); }
-#price-table .quota-request { display: block; font-size: 0.76rem; font-weight: 400; color: var(--ink-2); }
-@media (max-width: 600px) {
-  #price-table .quota-request { min-width: 18ch; white-space: normal; }
-}
 #price-table .spot-status { margin-left: 6px; color: var(--ink-3); }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 10px 0 0; font-size: 0.82rem; color: var(--ink-2); }
 .swatch { display: inline-block; width: 30px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
@@ -426,7 +422,7 @@ function pricesAndQuotas(quota, spot, sources, rows, requests) {
   const wrap = element("div", undefined, "scroll");
   const grid = element("table");
   const typeHeaders = sources.length ? quota.headers.slice(2) : [];
-  grid.appendChild(element("colgroup")).span = 2;
+  grid.appendChild(element("colgroup")).span = 5;
   for (const _type of typeHeaders) grid.appendChild(element("colgroup")).span = sources.length;
   const head = grid.createTHead();
   const top = head.insertRow();
@@ -435,6 +431,9 @@ function pricesAndQuotas(quota, spot, sources, rows, requests) {
   if (grouped) detail.className = "measures";
   priceHeader(top, "region", "", "").rowSpan = grouped ? 2 : 1;
   priceHeader(top, quota.headers[1], "vCPUs", "n edge region-quota").rowSpan = grouped ? 2 : 1;
+  priceHeader(top, "wanted", "", "n").rowSpan = grouped ? 2 : 1;
+  priceHeader(top, "request", "", "").rowSpan = grouped ? 2 : 1;
+  priceHeader(top, "request age", "", "n").rowSpan = grouped ? 2 : 1;
   for (const header of typeHeaders) {
     const [name, vcpus] = header.split(" (");
     if (grouped) {
@@ -453,8 +452,11 @@ function pricesAndQuotas(quota, spot, sources, rows, requests) {
     if (status && measures.has("spot") && spot.values[index].some(value => typeof value === "number")) {
       name.appendChild(element("small", status, "spot-status"));
     }
-    const applied = priceCell(row, quota, index, 1, "n edge region-quota");
-    if (requests[region]) applied.appendChild(element("small", requests[region].text, "quota-request"));
+    priceCell(row, quota, index, 1, "n edge region-quota");
+    const request = requests[region];
+    const state = element("td", request?.request ?? "not measured", "quota-request");
+    if (request?.detail) state.title = request.detail;
+    row.append(element("td", request?.wanted ?? "—", "n"), state, element("td", request?.age ?? "—", "n"));
     for (let type = 2; type < quota.headers.length; type++) {
       sources.forEach(({table, marks}, position) => {
         priceCell(row, table, index, table === quota ? type : type - 1, position ? "n" : "n edge", marks);

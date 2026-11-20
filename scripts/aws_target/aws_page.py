@@ -200,8 +200,11 @@ class LaunchesRefused(TypedDict):
 type LaunchState = CloudGatesOff | InvalidCloudGateSetting | NoLaunchEvidence | LaunchesWorking | LaunchesRefused
 
 
-class QuotaRequestCell(TypedDict):
-    text: str
+class QuotaRequestColumns(TypedDict):
+    wanted: str
+    request: QuotaRequestOutcome | Literal['not measured', '—']
+    age: str
+    detail: NotRequired[str]
     note: NotRequired[str]
     history_missing: NotRequired[Literal[True]]
 
@@ -212,8 +215,8 @@ class GpuQuotaSummary(TypedDict):
 
 
 class QuotaHistoryData(TypedDict):
-    standard: dict[str, QuotaRequestCell]
-    gpu: dict[str, QuotaRequestCell]
+    standard: dict[str, QuotaRequestColumns]
+    gpu: dict[str, QuotaRequestColumns]
     gpu_summary: GpuQuotaSummary
 
 
@@ -449,19 +452,25 @@ def quota_request_note(reason: str) -> str:
     return 'The page could not measure quota request history.'
 
 
-def quota_request_cell(reading: quota_requests.QuotaRequestReading,
-                       applied: Decimal | AppliedQuotaUnavailable, now: int) -> QuotaRequestCell:
+def quota_request_columns(reading: quota_requests.QuotaRequestReading,
+                          applied: Decimal | AppliedQuotaUnavailable, now: int) -> QuotaRequestColumns:
     if isinstance(reading, quota_requests.QuotaRequest):
         wanted = reading.requested_vcpus
         outcome = quota_request_outcome(reading, applied, wanted)
-        return {'text': f'{wanted:f} vCPUs wanted · {outcome}, {quota_request_age(reading, now)}'}
+        columns: QuotaRequestColumns = {'wanted': f'{wanted:f}', 'request': outcome, 'age': quota_request_age(reading, now)}
+        if outcome in (QuotaRequestOutcome.CLOSED_QUOTA_UNKNOWN, QuotaRequestOutcome.STATUS_UNKNOWN):
+            columns.update(request='not measured', detail=outcome)
+        return columns
+    unavailable: QuotaRequestColumns = {'wanted': '—', 'request': 'not measured', 'age': '—'}
     if isinstance(reading, quota_requests.NoQuotaRequest):
-        return {'text': 'no request'}
-    if isinstance(reading, quota_requests.QuotaRequestReadFailed):
-        return {'text': 'request read failed'}
-    if reading.reason == 'The snapshot has no quota request history for this region.':
-        return {'text': 'not measured', 'history_missing': True}
-    return {'text': 'not measured', 'note': quota_request_note(reading.reason)}
+        unavailable['request'] = '—'
+    elif isinstance(reading, quota_requests.QuotaRequestReadFailed):
+        unavailable['detail'] = 'request read failed'
+    elif reading.reason == 'The snapshot has no quota request history for this region.':
+        unavailable['history_missing'] = True
+    else:
+        unavailable['note'] = quota_request_note(reading.reason)
+    return unavailable
 
 
 def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryData:
@@ -483,8 +492,8 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
         region = history.region
         applied = gpu[region]
         request = history.gpu
-        data['standard'][region] = quota_request_cell(history.standard, standard[region], now)
-        data['gpu'][region] = quota_request_cell(request, applied, now)
+        data['standard'][region] = quota_request_columns(history.standard, standard[region], now)
+        data['gpu'][region] = quota_request_columns(request, applied, now)
         if isinstance(applied, Decimal) and applied >= needed:
             regions_by_outcome[QuotaRequestOutcome.GRANTED].append(region)
         elif isinstance(request, quota_requests.QuotaRequest) and request.requested_vcpus >= needed:
