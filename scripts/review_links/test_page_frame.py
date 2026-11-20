@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -22,15 +24,45 @@ from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 NO_DATA_FILE: dict[str, object] = {}
+STATUS_PAGES = (
+    ("accounts", "Accounts", "users", "Accounts", 45),
+    ("aws", "AWS", "cloud", "AWS", 3900),
+    ("builds", "Builds", "hammer", "Builds", 15),
+    ("disks", "Disks", "hard-drive", "Disks", 600),
+    ("images", "Images", "image", "Images", 45),
+    ("list", "List", "list-checks", "The List", 45),
+    ("review", "Review", "inbox", "Review", 45),
+)
+
+
+@contextmanager
+def status_configuration() -> Generator[None]:
+    with tempfile.TemporaryDirectory(prefix="page-status-config-") as temporary:
+        root = Path(temporary)
+        pages = "".join(
+            f"page.{name}.label={label}\npage.{name}.icon={icon}\npage.{name}.title={title}\n"
+            + f"# range: 0.001..86400\nstatus.{name}.age_limit_seconds={age}\n"
+            for name, label, icon, title, age in STATUS_PAGES
+        )
+        _ = (root / "console.conf").write_text(
+            "# range: 0.001..86400\nstatus.round_trip_limit_seconds=1\n"
+            + "# range: 0.001..86400\nstatus.render_limit_seconds=1\n"
+            + "# range: 0.001..86400\nstatus.reading_delay_seconds=1\n"
+            + pages)
+        _ = (root / "review_links.conf").write_text(
+            "# range: 5..300\npage_refresh_seconds=15\n"
+            + "# range: 0.5..60\nframe_retry_seconds=2\n")
+        with patch.dict(os.environ, {"CONF_DIR": temporary, "USER_ZONE": "America/New_York"}):
+            yield
 
 
 class PageStatusTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")})))
+        self.enterContext(status_configuration())
 
     def test_title_places_one_status_directly_after_the_title(self) -> None:
-        for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
+        for page, *_ in STATUS_PAGES:
             with self.subTest(page=page):
                 markup = page_frame.title(page.title(), page)
                 self.assertIn('</h1><p class="page-status"', markup)
@@ -77,18 +109,19 @@ class PageStatusTests(unittest.TestCase):
         self.assertEqual(page_frame.with_owner(page, "list", owner, rows, lambda: self.fail("The dialog already exists.")), page)
 
     def test_each_page_uses_the_same_states_and_retains_the_last_good_read(self) -> None:
-        for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
+        for page, *_ in STATUS_PAGES:
             with self.subTest(page=page):
                 assert_component_states(self, page_frame.title(page.title(), page))
 
     def test_only_the_configured_status_pages_have_age_limits(self) -> None:
-        limits = {key for key in conf.read_or_repository("console").values() if key.startswith("status.") and key.endswith(".age_limit_seconds")}
-        self.assertEqual(limits, {f"status.{page}.age_limit_seconds" for page in (
-            "accounts", "aws", "builds", "disks", "images", "list", "review")})
+        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        limits = set(re.findall(r"(?m)^[ \t]*(status\.[^\s=]+\.age_limit_seconds)[ \t]*=",
+                                path.read_text(encoding="utf-8")))
+        self.assertEqual(limits, {f"status.{name}.age_limit_seconds" for name, *_ in STATUS_PAGES})
 
     def test_age_uses_seconds_then_whole_minutes_on_every_page(self) -> None:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
-        for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
+        for page, *_ in STATUS_PAGES:
             with self.subTest(page=page):
                 match = re.search(r'data-status-options="([^"]+)"', page_frame.title(page.title(), page))
                 assert match is not None
@@ -499,11 +532,11 @@ window.fetch=async(url,options={})=>{
     identity = 'list' if match[1] == 'The List' else match[1].split()[0].lower()
     if identity in ('changes', 'questions', 'investigations'):
         identity = 'review'
-    with patch.dict(os.environ, {"CONF_DIR": str(Path(__file__).resolve().parents[2] / "config")}):
+    with status_configuration():
         settings = conf.read("console").values()
         pages = tuple(console.ConsolePage(name, settings[f"page.{name}.label"], settings[f"page.{name}.icon"],
                                          settings[f"page.{name}.title"], console.AvailablePage('/page'))
-                      for name in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'))
+                      for name, *_ in STATUS_PAGES)
         shell = console.render(pages, console.UnavailablePage()).replace(b'</body>', b'<img hidden src="/complete"></body>')
     results: list[list[str]] = []
     complete = threading.Event()

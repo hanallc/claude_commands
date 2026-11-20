@@ -36,7 +36,6 @@ from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
@@ -341,6 +340,9 @@ class ListPageTests(unittest.TestCase):
         config = cls.browser_root / "config"
         config.mkdir()
         _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
+        _ = (config / "statusline.conf").write_text(
+            "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
+            + "role.producer=#90fe42\nrole.worker=#ff0404\n")
         _ = (config / "review_links.conf").write_text(
             "# whole: 1..20\ndelivery_tries=3\n# range: 0..300\ndelivery_pause_seconds=0\n"
             + "# whole: 1..20\nfeedback_rows=5\n# whole: 1..20\nreview_words_rows=4\n"
@@ -354,6 +356,8 @@ class ListPageTests(unittest.TestCase):
             + "# range: 0.001..\ntailscale_check_seconds=60\n"
             + "# range: 0.001..\nsnapshot_sweep_seconds=3600\n"
             + "# range: 0..\nsnapshot_retention_seconds=604800\n"
+            + "# range: 0..365\nchange_image_unclaimed_days=14\n"
+            + "# range: 1..600\nstaff_snapshot_seconds=60\n"
             + "# range: 0.001..\ncode_check_seconds=5\n"
             + "# whole: 1..65535\nserver_port=8765\n"
             + "changes_first_root=natedev\nreview_attachments_root=review-attachments\n")
@@ -751,8 +755,11 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         waiting_key = f"investigation/{waiting.owner}/{waiting.id}"
         waiting_item = self.add("Check the linked reviews that are waiting", number=113)
         _ = the_list.link(MORTY.id, waiting_item.id, (waiting_key,), source="morty")
-        _ = write_config_fixture(self.root / "config/review_links.conf",
-                                 "page_request_timeout_seconds=7\ncard_fade_out_ms=180\ncard_fade_in_ms=260\n")
+        settings = self.root / "config/review_links.conf"
+        overlay_settings = settings.read_text()
+        for key, value in (("page_request_timeout_seconds", 7), ("card_fade_out_ms", 180), ("card_fade_in_ms", 260)):
+            overlay_settings = re.sub(rf"(?m)^{key}=.*$", f"{key}={value}", overlay_settings)
+        _ = settings.write_text(overlay_settings)
         pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
                  console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
         shell = console.render(pages, console.UnavailablePage()).decode()
@@ -1062,7 +1069,11 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
 </script>'''.replace('WAITING_KEY', json.dumps(waiting_key))
         shell = shell.replace('</body>', probe + '</body>')
         proof = os.environ.get("LIST_OVERLAY_SCREENSHOT")
-        _ = write_config_fixture(self.root / "config/scratch.conf", f"visible_root={self.root / 'scratch'}\n")
+        _ = (self.root / "config/scratch.conf").write_text(
+            f"visible_root={self.root / 'scratch'}\nholds_file={self.root / 'holds.json'}\n"
+            + "# whole: 1..\ndefault_life_seconds=86400\n# whole: 1..\nrepo_depth=3\n"
+            + "# whole: 1..\nsuffix_length=6\nrepo_skip=target node_modules .git\n"
+            + "# whole: 1..\nrecord_lock_attempts=3\n# whole: 1..\nremoval_remote_timeout_seconds=30\n")
         for size in ("1440,1000", "600,900", "430,900", *(("screenshot",) if proof else ())):
             with self.subTest(size=size):
                 _ = listing.write_text(original)
@@ -2386,7 +2397,9 @@ window.fetch=async (url,options)=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_refresh_keeps_the_follow_up_request_and_retries_after_timeout(self) -> None:
-        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\n")
+        settings = conf.path("review_links")
+        _ = settings.write_text(settings.read_text().replace(
+            "page_request_timeout_seconds=15\n", "page_request_timeout_seconds=4\n"))
         root = self.root / "reviews"
         changed = self.add("Keep the changed row usable")
         counts_only = list_page.render(root, defer_counts=True, review_records={}).decode()
