@@ -9,7 +9,7 @@ In both directions, refuse if both profile keys exist.
 Set a natedev drain hold first.
 Stop the admission socket, admission service, memory feed, and buildlog timer.
 Wait for the buildlog service to stop.
-Run this program with the live checkout on PYTHONPATH.
+Run this program through the checkout's scripts/lib/py -I.
 Restart the stopped units after the conversion succeeds.
 Release the hold last.
 The program never stops services or changes a hold.
@@ -17,12 +17,13 @@ The program never stops services or changes a hold.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -37,7 +38,7 @@ from typing import cast
 
 from scripts.build_queue import memory_files, progress_profile
 from scripts.build_targets import target_config
-from scripts.buildlog import store
+from scripts.buildlog import index, store
 from scripts.lib import build_folders, conf, session_folder
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.lib.process_start import Started, Unreadable, process_start
@@ -124,6 +125,23 @@ class ProfileRename:
     new: Path
 
 
+def content_digest(path: Path) -> str | None:
+    try:
+        with move_gate_state.open_record(path) as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def write_snapshot(files: Sequence[Path], folder: Path | None) -> dict[str, object]:
+    identity = move_gate_state.path_identity(folder, directory=True) if folder is not None else None
+    return {
+        "files": {str(path): content_digest(path) for path in files},
+        "folder": str(folder) if folder is not None else None,
+        "identity": list(identity) if identity is not None else None,
+    }
+
+
 @dataclass(frozen=True)
 class ConversionWrites:
     """Keep evidence of the first change across interruptions."""
@@ -135,8 +153,38 @@ class ConversionWrites:
         return self.marker.with_suffix(".pending") if self.marker is not None else None
 
     def requires_completion(self) -> bool:
-        return any(move_gate_state.path_identity(path) is not None
-                   for path in (self.marker, self.pending) if path is not None)
+        """Clear a pending write only when its original state is visible."""
+        marker, pending = self.marker, self.pending
+        if marker is None or pending is None:
+            return False
+        if move_gate_state.path_identity(marker) is not None:
+            return True
+        try:
+            saved = cast(object, json.loads(move_gate_state.read_record(pending)))
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError):
+            return True
+        if not isinstance(saved, dict):
+            return True
+        fields = cast(dict[str, object], saved)
+        files, folder = fields.get("files"), fields.get("folder")
+        if fields.get("unresolved") is True:
+            return True
+        if not isinstance(files, dict) or not files or (folder is not None and not isinstance(folder, str)):
+            return True
+        paths = tuple(Path(name) for name in cast(dict[str, object], files))
+        source = Path(folder) if folder is not None else None
+        if any(not path.is_absolute() for path in paths) or (source is not None and not source.is_absolute()):
+            return True
+        try:
+            if write_snapshot(paths, source) != fields:
+                return True
+        except (OSError, ValueError):
+            return True
+        pending.unlink()
+        sync_folder(pending.parent)
+        return False
 
     def clear(self) -> None:
         if self.marker is not None:
@@ -146,21 +194,18 @@ class ConversionWrites:
             sync_folder(self.marker.parent)
 
     @contextmanager
-    def publish(self, *, unchanged: Callable[[], bool] = lambda: True) -> Generator[None]:
+    def publish(self, *files: Path, folder: Path | None = None) -> Generator[None]:
         marker, pending = self.marker, self.pending
         if marker is None or pending is None or move_gate_state.path_identity(marker) is not None:
             yield
             return
-        first = move_gate_state.path_identity(pending) is None
-        if first:
-            write_text_atomic(pending, "First conversion write.\n", new_file_mode=0o600)
-        try:
-            yield
-        except (OSError, ValueError, sqlite3.Error):
-            if first and unchanged():
-                pending.unlink()
-                sync_folder(pending.parent)
-            raise
+        unresolved = self.requires_completion()
+        original = write_snapshot(files, folder)
+        if unresolved:
+            # This proof cannot account for an earlier write with an unknown result.
+            original["unresolved"] = True
+        write_text_atomic(pending, json.dumps(original) + "\n", new_file_mode=0o600)
+        yield
         os.replace(pending, marker)
         sync_folder(marker.parent)
 
@@ -204,8 +249,8 @@ def require_no_waiting_callers(roots: RecordRoots) -> None:
     paths = [admission / "state.json", *sorted(admission.glob("*.waiting")),
              *sorted(admission.glob("*.reservation"))]
     for path in paths:
-        if path.exists():
-            identities.update(recorded_callers(decode_record(path, path.read_bytes())))
+        if os.path.lexists(path):
+            identities.update(recorded_callers(decode_record(path, move_gate_state.read_record(path))))
     entries = {"queue_place.py", "admission_client.py", "memory_admit.py", "gate.py", "merge_gate.py", "targeted_test.py"}
     modules = {"scripts.build_queue.queue_place", "scripts.build_queue.admission_client",
                "scripts.lint.memory_admit", "scripts.production.gate", "scripts.production.merge_gate",
@@ -235,7 +280,7 @@ def require_no_waiting_callers(roots: RecordRoots) -> None:
                 if separator and key == b"BUILDLOG_HOLD_WAITER_FILE" and value:
                     marker = Path(os.fsdecode(value))
                     try:
-                        identities.update(recorded_callers(decode_record(marker, marker.read_bytes())))
+                        identities.update(recorded_callers(decode_record(marker, move_gate_state.read_record(marker))))
                     except FileNotFoundError:
                         pass
             # Inspect argument words, never shell source or Python source strings.
@@ -293,7 +338,7 @@ def decode_record(path: Path, data: bytes) -> JsonValue:
 
 
 def records(path: Path) -> Iterator[tuple[bytes, JsonValue]]:
-    with (gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb")) as stream:
+    with move_gate_state.open_record(path) as stream:
         if path.suffix == ".jsonl":
             for line in stream:
                 if line.strip():
@@ -301,7 +346,11 @@ def records(path: Path) -> Iterator[tuple[bytes, JsonValue]]:
                 else:
                     yield line, None
         else:
-            data = stream.read()
+            if path.suffix == ".gz":
+                with gzip.GzipFile(fileobj=stream) as compressed:
+                    data = compressed.read()
+            else:
+                data = stream.read()
             yield data, decode_record(path, data)
 
 
@@ -325,9 +374,7 @@ def wait_files(roots: RecordRoots) -> list[Path]:
                     path = parent / name
                     if path.lstat().st_uid != os.getuid():
                         continue
-                    if path.is_symlink():
-                        raise Refused(f"assignment wait record is a symlink: {path}")
-                    text = record_text(path, path.read_bytes())
+                    text = record_text(path, move_gate_state.read_record(path))
                     try:
                         value = cast(JsonValue, json.loads(text))
                     except json.JSONDecodeError:
@@ -345,7 +392,7 @@ def record_paths(roots: RecordRoots) -> dict[Path, frozenset[str]]:
     steps = frozenset({"step", "program"})
     admission = roots.buildlog / "admission"
     for name in ("state.json", "anon_peaks.jsonl", "queue_times.jsonl", "queue.json"):
-        if (admission / name).exists():
+        if os.path.lexists(admission / name):
             paths[admission / name] = steps
     for pattern in ("*.reservation", "*.waiting"):
         paths.update((path, steps) for path in admission.glob(pattern))
@@ -354,7 +401,7 @@ def record_paths(roots: RecordRoots) -> dict[Path, frozenset[str]]:
         if directory.is_dir() and not directory.is_symlink() and directory.name not in ("admission", "pending-steps"):
             paths.update((path, frozenset({"step"})) for path in directory.iterdir() if MONTH.fullmatch(path.name))
     for name in ("cloud-gate-launches.jsonl", "cost-ledger.json"):
-        if (roots.aws / name).exists():
+        if os.path.lexists(roots.aws / name):
             paths[roots.aws / name] = frozenset({"mode"})
     for directory in roots.buildlog.iterdir():
         if directory.is_dir() and not directory.is_symlink():
@@ -415,13 +462,17 @@ def profile_renames(roots: RecordRoots, hosts: set[str]) -> list[ProfileRename]:
     return renames
 
 
+def index_tables(connection: sqlite3.Connection) -> set[str]:
+    return {row[0] for row in cast(list[tuple[str]], connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall())}
+
+
 def inspect_indexes(roots: RecordRoots) -> list[Path]:
     paths = sorted(roots.buildlog.glob("index-*.sqlite"))
     for path in paths:
         _ = RecordVersion.read(path)
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
-            tables = {str(row[0]) for row in cast(list[tuple[str]], connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'").fetchall())}
+            tables = index_tables(connection)
             for table in ("gate_runs", "steps"):
                 if table in tables:
                     _ = connection.execute(f"SELECT step FROM {table} LIMIT 0")
@@ -448,7 +499,7 @@ def write_record(change: RecordChange, names: Mapping[str, str], writes: Convers
         if count != change.count or RecordVersion.read(change.path) != change.version:
             raise Refused(f"record changed during conversion: {change.path}")
         temp.chmod(mode)
-        with writes.publish():
+        with writes.publish(change.path):
             os.replace(temp, change.path)
         sync_folder(change.path.parent)
         report(f"Converted {change.path}", started, count)
@@ -459,30 +510,26 @@ def write_record(change: RecordChange, names: Mapping[str, str], writes: Convers
 def update_index(path: Path, names: Mapping[str, str], writes: ConversionWrites) -> int:
     started = time.monotonic()
     count = 0
-    with closing(sqlite3.connect(path)) as connection:
-        updated: list[tuple[str, str, int]] = []
-        tables = {str(row[0]) for row in cast(list[tuple[str]], connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'").fetchall())}
+    updates: list[tuple[str, str, str]] = []
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as reader:
+        tables = index_tables(reader)
         for table in ("gate_runs", "steps"):
             if table not in tables:
                 continue
             for old, new in names.items():
+                if reader.execute(f"SELECT 1 FROM {table} WHERE step = ? LIMIT 1", (old,)).fetchone():
+                    updates.append((table, old, new))
+    if updates:
+        # A commit can change the WAL while the main database stays unchanged.
+        sidecars = (Path(str(path) + suffix) for suffix in index.INDEX_SIDECAR_SUFFIXES if suffix != "-shm")
+        with writes.publish(path, *sidecars), closing(sqlite3.connect(path)) as connection:
+            _ = connection.execute("BEGIN IMMEDIATE")
+            for table, old, new in updates:
                 cursor = connection.execute(f"UPDATE {table} SET step = ? WHERE step = ?", (new, old))
-                if cursor.rowcount:
-                    updated.append((table, old, cursor.rowcount))
-                    count += cursor.rowcount
-        if updated:
-            def index_unchanged() -> bool:
-                connection.rollback()
-                for table, old, expected in updated:
-                    row = cast(tuple[int], connection.execute(
-                        f"SELECT COUNT(*) FROM {table} WHERE step = ?", (old,)).fetchone())
-                    if row[0] != expected:
-                        return False
-                return True
-
-            with writes.publish(unchanged=index_unchanged):
-                connection.commit()
+                count += cursor.rowcount
+            if not count:
+                raise Refused(f"index changed before conversion: {path}")
+            connection.commit()
     report(f"Converted index {path}", started, count)
     return count
 
@@ -540,10 +587,9 @@ def migrate(roots: RecordRoots, writes: ConversionWrites) -> int:
         began = time.monotonic()
         if os.path.lexists(rename.new):
             raise Refused(f"replacement profile appeared: {rename.new}")
-        source = move_gate_state.path_identity(rename.old)
-        if source is None:
+        if move_gate_state.path_identity(rename.old) is None:
             raise Refused(f"source profile disappeared: {rename.old}")
-        with writes.publish(unchanged=lambda: move_gate_state.path_identity(rename.old) == source):
+        with writes.publish(rename.new, folder=rename.old):
             move_gate_state.rename_folder(rename.old, rename.new)
         report(f"Renamed profile {rename.old} -> {rename.new}", began, 1)
         count += 1
@@ -551,7 +597,7 @@ def migrate(roots: RecordRoots, writes: ConversionWrites) -> int:
         count += update_index(path, names, writes)
     for path in caches:
         began = time.monotonic()
-        with writes.publish():
+        with writes.publish(path):
             path.unlink()
         sync_folder(path.parent)
         report(f"Removed derived cache {path}", began, 1)
@@ -598,12 +644,13 @@ def require_expired_uploaded_attempts(roots: RecordRoots) -> None:
         if not root.exists():
             continue
         for request in root.rglob("request.json"):
-            data = cast(dict[str, JsonValue], decode_record(request, request.read_bytes()))
+            data = cast(dict[str, JsonValue], decode_record(request, move_gate_state.read_record(request)))
             mode = data.get("mode")
             if not isinstance(mode, str) or mode not in modes or not (request.parent / "launch.json").exists():
                 continue
             outcome = request.parent / "outcome.json"
-            saved = cast(dict[str, JsonValue], decode_record(outcome, outcome.read_bytes())) if outcome.exists() else {}
+            saved = (cast(dict[str, JsonValue], decode_record(outcome, move_gate_state.read_record(outcome)))
+                     if os.path.lexists(outcome) else {})
             expires = data.get("expires", 0)
             status = saved.get("status")
             if status not in ("complete", "fallback", "interrupted") and isinstance(expires, (int, float)) and expires > now:

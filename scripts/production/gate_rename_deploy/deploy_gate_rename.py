@@ -40,13 +40,7 @@ OVERRIDES = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CONFIG", "GIT_CONFIG_COUNT",
     "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL",
     "BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
-    "PYTHONHOME", "PYTHONUSERBASE", "PYTHONPLATLIBDIR", "PYTHONPYCACHEPREFIX",
-    "PYTHONSTARTUP", "PYTHONSAFEPATH", "PYTHONNOUSERSITE", "PYTHONINSPECT",
-    "PYTHONDEVMODE", "PYTHONUTF8", "PYTHONIOENCODING", "PYTHONWARNINGS",
-    "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__", "PYTHONCASEOK", "PYTHONCOERCECLOCALE",
-    "PYTHONHASHSEED", "PYTHONMALLOC", "PYTHONMALLOCSTATS", "PYTHONTRACEMALLOC",
-    "PYTHONFAULTHANDLER", "PYTHONPROFILEIMPORTTIME", "PYTHONBREAKPOINT", "PYTHONOPTIMIZE",
-    "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE", "PYTHON_CPU_COUNT", "PYTHON_GIL",
+    "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__",
 )
 PROC_ROOT = move_gate_state.PROC_ROOT
 NAMES = ("", "Wait for old AWS attempts", "Set the drain hold", "Wait for kept builds", "Stop waiting gates",
@@ -71,6 +65,23 @@ class RecoveryRequired:
     message: str
 
 
+@dataclass(frozen=True)
+class GateFolders:
+    """Record both gate paths that the land reader can select."""
+
+    source: tuple[int, int] | None
+    destination: tuple[int, int] | None
+
+    @classmethod
+    def read(cls, source: Path, destination: Path) -> GateFolders:
+        return cls(move_gate_state.path_identity(source, directory=True),
+                   move_gate_state.path_identity(destination, directory=True))
+
+    @property
+    def moved(self) -> GateFolders:
+        return self if self.source is None else GateFolders(None, self.source)
+
+
 @dataclass
 class DeploymentState:
     """The next unfinished step and ownership survive an interrupted command."""
@@ -79,7 +90,7 @@ class DeploymentState:
     owns_hold: bool = False
     stopped_at: float = 0.0
     stop_seconds: float = 0.0
-    move_source: tuple[int, int] | None = None
+    gate_folders: GateFolders | None = None
     recovery: NoRecovery | RecoveryRequired = field(default_factory=NoRecovery)
     direction: Direction = Direction.FORWARD
 
@@ -132,25 +143,37 @@ def save(paths: DeploymentPaths, state: DeploymentState) -> None:
     write_text_atomic(paths.journal, json.dumps(asdict(state)), new_file_mode=0o600)
 
 
+def folder_identity(value: object) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        fields = cast(list[object], value)
+        if len(fields) == 2:
+            device, inode = fields
+            if type(device) is int and type(inode) is int:
+                return device, inode
+    raise ValueError("Invalid gate folder identity.")
+
+
 def load(path: Path, reverse: bool) -> DeploymentState:
     if not path.exists():
         return DeploymentState(direction=Direction.REVERSE if reverse else Direction.FORWARD)
     value = cast(dict[str, object], json.loads(path.read_text()))
     step, owned = value.get("next_step"), value.get("owns_hold")
     began, total = value.get("stopped_at"), value.get("stop_seconds")
-    moved = value.get("move_source")
     if (not isinstance(step, int) or isinstance(step, bool) or not 1 <= step <= LAST + 1
             or not isinstance(owned, bool) or not isinstance(began, (int, float))
             or not isinstance(total, (int, float)) or began < 0 or total < 0):
         raise DeploymentFailed(f"Invalid state file. Restore it before another run: {path}")
-    move_source = None
-    if moved is not None:
-        if not isinstance(moved, list) or len(cast(list[object], moved)) != 2:
-            raise DeploymentFailed(f"Invalid source folder identity in the state file: {path}")
-        device, inode = cast(list[object], moved)
-        if type(device) is not int or type(inode) is not int:
-            raise DeploymentFailed(f"Invalid source folder identity in the state file: {path}")
-        move_source = (device, inode)
+    original = value.get("gate_folders")
+    gate_folders = None
+    if original is not None:
+        if not isinstance(original, dict) or original.keys() != {"source", "destination"}:
+            raise DeploymentFailed(f"Invalid gate folders in the state file: {path}")
+        fields = cast(dict[str, object], original)
+        gate_folders = GateFolders(folder_identity(fields["source"]), folder_identity(fields["destination"]))
+        if gate_folders.source is not None and gate_folders.destination is not None:
+            raise DeploymentFailed(f"Both gate folders exist in the state file: {path}")
     recovery_value = value.get("recovery", {})
     recovery: NoRecovery | RecoveryRequired = NoRecovery()
     if recovery_value != {}:
@@ -172,7 +195,7 @@ def load(path: Path, reverse: bool) -> DeploymentState:
         if step != LAST + 1:
             raise DeploymentFailed(f"Complete the {direction.value} deployment before changing direction.", 2)
         return DeploymentState(direction=requested)
-    return DeploymentState(step, owned, float(began), float(total), move_source, recovery, direction)
+    return DeploymentState(step, owned, float(began), float(total), gate_folders, recovery, direction)
 
 
 def require_installed_code(tree: Path, direction: Direction) -> None:
@@ -202,11 +225,14 @@ def require_installed_code(tree: Path, direction: Direction) -> None:
     expected = "old" if reverse else "new"
     raise DeploymentFailed(f"Install the {expected} gate code in the live checkout before deployment.", 2)
 
-def run(settings: DeploymentSettings, command: Sequence[str], label: str, *, lock_fd: int | None = None) -> str:
+
+def run(settings: DeploymentSettings, command: Sequence[str], label: str, *,
+        lock_fd: int | None = None, environment: dict[str, str] | None = None) -> str:
     """Keep terminal input for sudo and summarize the child output."""
     with tempfile.TemporaryFile(mode="w+t") as output:
         pass_fds = () if lock_fd is None else (lock_fd,)
-        with subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, text=True, pass_fds=pass_fds) as child:
+        with subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, text=True,
+                              pass_fds=pass_fds, env=environment) as child:
             while True:
                 try:
                     status = child.wait(timeout=settings.heartbeat_seconds)
@@ -222,6 +248,14 @@ def run(settings: DeploymentSettings, command: Sequence[str], label: str, *, loc
     return text
 
 
+def run_python(paths: DeploymentPaths, script: Path, arguments: Sequence[str], label: str, *,
+               writes: bool = False) -> str:
+    # Some shared helpers start Python again. Keep their startup environment clean.
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("PYTHON")}
+    command = [str(paths.tree / "scripts/lib/py"), "-I", str(script), *arguments]
+    return run(paths.settings, command, label, lock_fd=paths.lock_fd if writes else None, environment=environment)
+
+
 def service(paths: DeploymentPaths, action: str, unit: str, *, user: bool = False) -> None:
     if user:
         command = ["systemctl", "--user", action, unit]
@@ -232,13 +266,12 @@ def service(paths: DeploymentPaths, action: str, unit: str, *, user: bool = Fals
 
 
 def hold_command(paths: DeploymentPaths, action: str) -> None:
-    command = [str(paths.tree / "scripts/lib/py"), str(paths.tree / "scripts/build_hold/build_hold.py"),
-               action, "natedev", "--holder", HOLDER]
+    arguments = [action, "natedev", "--holder", HOLDER]
     if action == "drain":
         eta = datetime.now(paths.settings.zone) + timedelta(hours=paths.settings.hold_eta_hours)
-        command += ["--for", "gate folder and step-name deployment", "--release-eta", eta.strftime("%H:%M"),
-                    "--zone", paths.settings.zone.key]
-    _ = run(paths.settings, command, f"{action} natedev", lock_fd=paths.lock_fd)
+        arguments += ["--for", "gate folder and step-name deployment", "--release-eta", eta.strftime("%H:%M"),
+                      "--zone", paths.settings.zone.key]
+    _ = run_python(paths, paths.tree / "scripts/build_hold/build_hold.py", arguments, f"{action} natedev", writes=True)
 
 
 def wait_cloud(roots: rename.RecordRoots, settings: DeploymentSettings) -> None:
@@ -340,19 +373,27 @@ def move_paths(paths: DeploymentPaths) -> tuple[Path, Path]:
     return parent / source, parent / destination
 
 
-def move_back(paths: DeploymentPaths, state: DeploymentState) -> None:
-    """Return the gate folder before services start with unconverted step names."""
-    if state.move_source is None:
-        return
+def original_folders(state: DeploymentState) -> GateFolders:
+    if state.gate_folders is None:
+        raise DeploymentFailed("The state file has no proof of the original gate folders.")
+    return state.gate_folders
+
+
+def restore_original_state(paths: DeploymentPaths, state: DeploymentState, step: int) -> None:
+    """Prove the original records and both gate paths before recovery can restart services."""
+    if paths.writes.requires_completion():
+        raise DeploymentFailed("Cannot prove the records match their state before deployment.")
+    original = original_folders(state)
     old, new = move_paths(paths)
-    if move_gate_state.path_identity(old) != state.move_source:
-        if move_gate_state.path_identity(new) != state.move_source:
-            raise DeploymentFailed(f"Cannot find the original gate folder at {old} or {new}.")
-        move_gate_state.rename_folder(new, old)
-        if move_gate_state.path_identity(old) != state.move_source:
-            raise DeploymentFailed(f"Cannot verify the original gate folder at {old}.")
-        say(f"Moved the gate folder back: {new} -> {old}")
-    sync_folder(old.parent)
+    current = GateFolders.read(old, new)
+    if step >= MOVE_STEP and original.source is not None:
+        if current == original.moved:
+            move_gate_state.rename_folder(new, old)
+            say(f"Moved the gate folder back: {new} -> {old}")
+        elif current == original:
+            sync_folder(old.parent)
+    if GateFolders.read(old, new) != original:
+        raise DeploymentFailed(f"Cannot verify the original gate folders at {old} and {new}.")
 
 
 def restart(paths: DeploymentPaths, state: DeploymentState) -> None:
@@ -396,9 +437,8 @@ def conversion_arguments(roots: rename.RecordRoots) -> list[str]:
 
 def discover_roots(paths: DeploymentPaths) -> rename.RecordRoots:
     say("Find assignment and cloud folders")
-    output = run(paths.settings,
-        [str(paths.tree / "scripts/lib/py"), str(HERE / "deploy_gate_rename.py"), "--discover",
-         *paths.roots.direction.arguments(), *paths.discovery_arguments], "Find assignment and cloud folders")
+    output = run_python(paths, HERE / "deploy_gate_rename.py",
+        ["--discover", *paths.roots.direction.arguments(), *paths.discovery_arguments], "Find assignment and cloud folders")
     discovered = cast(dict[str, list[str]], json.loads(output))
     say(f"Done: Find assignment and cloud folders at {datetime.now(paths.settings.zone):%Y-%m-%d %H:%M:%S %Z}")
     return replace(paths.roots, wait_roots=tuple(Path(path) for path in discovered["wait"]),
@@ -422,8 +462,8 @@ def execute_step(number: int, paths: DeploymentPaths, state: DeploymentState) ->
         stop_waiting_gates(paths.settings)
     elif number == 5:
         roots = discover_roots(paths)
-        _ = run(paths.settings, [str(paths.tree / "scripts/lib/py"), str(HERE / "rename_step_names.py"), "--check", "early",
-                 *conversion_arguments(roots)], NAMES[number])
+        _ = run_python(paths, HERE / "rename_step_names.py", ["--check", "early", *conversion_arguments(roots)],
+                       NAMES[number])
     elif number == STOP_STEP:
         if not state.stopped_at:
             state.stopped_at = time.time()
@@ -442,45 +482,39 @@ def execute_step(number: int, paths: DeploymentPaths, state: DeploymentState) ->
         stop_waiting_gates(paths.settings)
         old, new = move_paths(paths)
         roots = discover_roots(paths)
-        _ = run(paths.settings, [str(paths.tree / "scripts/lib/py"), str(HERE / "rename_step_names.py"), "--check", "full",
-                 *conversion_arguments(roots)], NAMES[number])
-        _ = run(paths.settings, [str(paths.tree / "scripts/lib/py"), str(HERE / "move_gate_state.py"), "--check",
-                 "--old", str(old), "--new", str(new)], NAMES[number])
+        _ = run_python(paths, HERE / "rename_step_names.py", ["--check", "full", *conversion_arguments(roots)],
+                       NAMES[number])
+        _ = run_python(paths, HERE / "move_gate_state.py", ["--check", "--old", str(old), "--new", str(new)],
+                       NAMES[number])
     elif number == MOVE_STEP:
+        original = original_folders(state)
         old, new = move_paths(paths)
-        source, target = move_gate_state.path_identity(old), move_gate_state.path_identity(new)
-        if source is not None and target is not None:
-            raise DeploymentFailed(f"Both gate folders exist: {old} and {new}.", 2)
-        if source is not None:
-            if state.move_source is not None and state.move_source != source:
-                raise DeploymentFailed(f"The gate folder changed before the move: {old}.", 2)
-            state.move_source = source
-            save(paths, state)
-            _ = run(paths.settings, [str(paths.tree / "scripts/lib/py"), str(HERE / "move_gate_state.py"),
-                     "--defer-typecheck-cleanup", "--old", str(old), "--new", str(new)], NAMES[number],
-                     lock_fd=paths.lock_fd)
-            if move_gate_state.path_identity(new) != source:
-                raise DeploymentFailed(f"The gate folder did not reach {new}.", 2)
-        elif state.move_source is not None:
-            if target != state.move_source:
-                raise DeploymentFailed(f"Cannot find the original gate folder at {old} or {new}.", 2)
+        current = GateFolders.read(old, new)
+        if original.source is not None and current == original:
+            _ = run_python(paths, HERE / "move_gate_state.py",
+                           ["--defer-typecheck-cleanup", "--old", str(old), "--new", str(new)], NAMES[number],
+                           writes=True)
+        elif original.source is not None and current == original.moved:
             say(f"The gate folder has already moved to {new}.")
-        else:
+        if GateFolders.read(old, new) != original.moved:
+            raise DeploymentFailed(f"The gate folders changed during deployment: {old} and {new}.", 2)
+        if original.source is None:
             say("No source gate folder exists.")
     elif number in (CONVERT_STEP, 11):
         roots = discover_roots(paths)
-        output = run(paths.settings, [str(paths.tree / "scripts/lib/py"), str(HERE / "rename_step_names.py"),
-                     "--write-marker", str(paths.writes.marker), *conversion_arguments(roots)], NAMES[number],
-                     lock_fd=paths.lock_fd)
+        output = run_python(paths, HERE / "rename_step_names.py",
+                            ["--write-marker", str(paths.writes.marker), *conversion_arguments(roots)], NAMES[number],
+                            writes=True)
         last = output.strip().splitlines()[-1] if output.strip() else ""
         if number == 11 and not last.endswith("changed=0"):
             raise DeploymentFailed("The second conversion changed records. Inspect the writers before another run.", 2)
         say(last.split("Conversion complete;")[-1].strip())
     elif number == RESTART_STEP:
-        if state.move_source is not None:
-            _, target = move_paths(paths)
-            if move_gate_state.path_identity(target) != state.move_source:
-                raise DeploymentFailed(f"Cannot verify the moved gate folder at {target}.")
+        original = original_folders(state)
+        old, target = move_paths(paths)
+        if GateFolders.read(old, target) != original.moved:
+            raise DeploymentFailed(f"Cannot verify the gate folders after the move: {old} and {target}.")
+        if original.source is not None:
             move_gate_state.remove_typecheck_environment(target)
         restart(paths, state)
         paths.writes.clear()
@@ -489,7 +523,7 @@ def execute_step(number: int, paths: DeploymentPaths, state: DeploymentState) ->
 
 
 def print_resume_command(paths: DeploymentPaths) -> None:
-    arguments = shlex.join(paths.discovery_arguments)
+    arguments = shlex.join((*paths.roots.direction.arguments(), *paths.discovery_arguments))
     command = "bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh"
     say(f"After correcting the cause, continue with: {command}" + (f" {arguments}" if arguments else ""))
 
@@ -500,9 +534,7 @@ def recover(paths: DeploymentPaths, state: DeploymentState, failure: RecoveryReq
     say("For a detached caller: detached_runs.py stop --reason 'gate rename deployment' <record.json>.")
     say("For a scoped caller: systemctl --user stop <unit.scope>.")
     try:
-        if failure.step >= RESTART_STEP or paths.writes.requires_completion():
-            raise DeploymentFailed("Cannot prove the records match their state before deployment.")
-        move_back(paths, state)
+        restore_original_state(paths, state, failure.step)
     except (DeploymentFailed, OSError, ValueError) as error:
         say(f"Recovery blocked: {error}")
         say("Keep the services stopped and the drain hold in force.")
@@ -512,7 +544,7 @@ def recover(paths: DeploymentPaths, state: DeploymentState, failure: RecoveryReq
         if state.stopped_at or failure.step >= STOP_STEP:
             restart(paths, state)
         release_owned(paths, state)
-        state.move_source = None
+        state.gate_folders = None
         state.next_step = 2
         state.recovery = NoRecovery()
         save(paths, state)
@@ -535,6 +567,17 @@ def deploy(paths: DeploymentPaths, state: DeploymentState, *,
     if state.next_step == LAST + 1:
         say(f"Deployment already complete. Total stop time: {state.stop_seconds:.2f} s.")
         return 0
+    if state.gate_folders is None:
+        if state.stopped_at or state.next_step > STOP_STEP:
+            say("Cannot verify the state before the service stop. Keep the drain hold in force.")
+            print_resume_command(paths)
+            return 2
+        old, new = move_paths(paths)
+        state.gate_folders = GateFolders.read(old, new)
+        if state.gate_folders.source is not None and state.gate_folders.destination is not None:
+            say(f"Refused: both gate folders exist: {old} and {new}.")
+            print_resume_command(paths)
+            return 2
     number = state.next_step
     try:
         save(paths, state)

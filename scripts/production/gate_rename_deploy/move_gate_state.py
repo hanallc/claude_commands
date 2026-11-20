@@ -3,7 +3,7 @@
 """Move the gate state after the machine drains.
 
 1. After the merge reaches main, set `/build:hold drain natedev`.
-2. Run this program with the checkout on PYTHONPATH.
+2. Run this program through the checkout's scripts/lib/py -I.
 3. Release the drain hold.
 
 A unit worktree with old code can create a stray `merge-gate` folder for tests-only runs until it merges main.
@@ -17,14 +17,17 @@ The program refuses other unreadable state for processes owned by the current us
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from io import BufferedReader
 import json
 import os
 from pathlib import Path
 import select
 import shutil
+import stat
 import sys
 from typing import cast
 
@@ -51,12 +54,32 @@ def exists(path: Path) -> bool:
     return os.path.lexists(path)
 
 
-def path_identity(path: Path) -> tuple[int, int] | None:
+def path_identity(path: Path, *, directory: bool = False) -> tuple[int, int] | None:
     try:
         status = path.lstat()
-        return status.st_dev, status.st_ino
     except FileNotFoundError:
         return None
+    if directory and not stat.S_ISDIR(status.st_mode):
+        raise ValueError(f"Gate path is not a directory: {path}")
+    return status.st_dev, status.st_ino
+
+
+@contextmanager
+def open_record(path: Path) -> Generator[BufferedReader]:
+    """Open a regular record without following its final link or waiting on a FIFO."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"Record is not a regular file: {path}")
+        with open(descriptor, "rb", closefd=False) as stream:
+            yield stream
+    finally:
+        os.close(descriptor)
+
+
+def read_record(path: Path) -> bytes:
+    with open_record(path) as stream:
+        return stream.read()
 
 
 def rename_folder(old: Path, new: Path) -> None:
@@ -182,7 +205,7 @@ def refuse_record_paths(old: Path) -> None:
             if path.suffix not in (".json", ".jsonl"):
                 continue
             try:
-                text = path.read_text(encoding="utf-8")
+                text = read_record(path).decode("utf-8")
                 values = ([cast(object, json.loads(line)) for line in text.splitlines() if line.strip()]
                           if path.suffix == ".jsonl" else [cast(object, json.loads(text))])
             except UnicodeDecodeError as error:

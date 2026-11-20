@@ -4577,15 +4577,19 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - A state file in the Git directory keeps the direction and the next step for an interrupted run.
   Each child that can change the deployment inherits the deployment lock.
   A separate process holds the lock while each privileged service command runs.
-  Recovery restores the services and releases the owned hold only when it verifies the original state.
-  It verifies the original folder identity before it starts the services.
+  The state file records the identity or absence of both gate folders before the first step.
+  Recovery checks both paths before it restarts services and releases the owned hold.
   The command removes the type-check environment only after both conversion passes succeed.
-  The converter records a pending write before publication and confirms the write after it takes effect.
+  The converter saves the original content digest before it writes.
+  For a profile move, it saves the source identity and the destination state.
+  Recovery clears a pending write when the recorded state still matches.
   When recovery cannot verify the original state, it keeps the services stopped and the hold in force.
   The command prints how to continue from the saved step.
+  The command starts each Python child in isolated mode.
   It resumes release when the holder file or a matching release record exists.
   An unpublished hold needs no release (F001).
-- The early check reads the JSON records as UTF-8, including the contents of gzip files.
+- Both checks open regular records without following links or waiting on FIFOs.
+  The early check reads the JSON records as UTF-8, including the contents of gzip files.
 - A 16.6 GB copy of the live records: full run passed with a stop time of 187 seconds; a stop after each step resumed; refusal recovery, a completed rerun and an existing hold passed. The two folder searches add about 1 minute of stop time.
 - To reverse the deployment, install the old gate code. Keep the deploy folder and its configuration in the live checkout.
   Run the same command with `--reverse`. It uses the same hold, service stops and two conversion passes.
