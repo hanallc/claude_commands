@@ -225,7 +225,10 @@ The queue survives a unit rename because its key is the fixed staff id.
 - `--trailer <line>` (repeatable), `--regime after|trial`, `--holds K`, and `--merge-defects D`.
 - `--excluded "<why>"`, `--cancel-prior`, `--bump`, and `--scratch <dir>`.
 
-`produce.md` `<MergeCheckpoint/>` runs the command in the background after the showrunner's judgments.
+`produce.md` `<MergeCheckpoint/>` sends the command to a merge unit when one serves the production.
+Otherwise, the showrunner starts single and batch merges with `detached_runs.py start --session-dir "<STATE_DIR>"`.
+The showrunner also uses this start command for child handoffs.
+The run continues across an account move. Stop the run with `detached_runs.py stop --reason "<why>" <record>`.
 `--as-built` merges a unit's closing documentation commit without tests or a review-ledger row.
 It requires an earlier code checkpoint merge for that phase.
 It accepts only `.md` paths and requires a change to or deletion of the unit's plan.
@@ -277,7 +280,7 @@ Each local Promote checkout must exist before the command pushes.
   [Review regime records](review-regime-trial.md) define the counts, times, types, and checkpoint parser.
 - **Held simplify items.** The checkpoint notice carries each held item and its ledger reference.
   The [simplify lens](simplify-lens.md#findings-and-decisions) defines which items require user questions and which items the director settles.
-- **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands.
+- **Merge tests** are the backticked spans before the first unquoted `(`. A missing field is refused. An empty field means no commands. The nightly run checks types.
 - **Steps:**
   1. *ancestry*: the checkpoint exists on an origin branch. Git ancestry identifies a checkpoint that already reached the merge branch. An already merged hash skips steps 2–7.
   2. *scope*: nothing staged in the merge checkout. Code paths have no responsibility filter.
@@ -490,7 +493,7 @@ Each local Promote checkout must exist before the command pushes.
   It uses the shared runner with affected-module selection.
 - **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
   The gate runs all test modules under a memory governor.
-  Basedpyright runs only with `--nightly` or an explicit `--type-dirs`.
+  Basedpyright runs only with `--nightly`.
   Recursive discovery sorts module paths and uses the first folder under `scripts/` as the suite.
   Test modules use `builds.slice` scopes when available.
   After the parallel pass, up to eight failed test modules run once more, alone.
@@ -554,7 +557,7 @@ Quoted log values preserve line endings as JSON escapes.
 States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
 Parking sets a time without changing the state.
 The List hides an item with unanswered questions while each send is pending or successful.
-If any unanswered question needs a resend, the item appears with its resend control.
+If a question send fails, the item shows Question not delivered.
 The `the_list.py list` command still shows the item.
 The producer uses `the_list.py answer` to save an answer and mark the item unread.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.

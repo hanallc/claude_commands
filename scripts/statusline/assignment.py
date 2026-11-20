@@ -16,7 +16,12 @@ from typing import cast
 
 from scripts.lib import git_files
 from scripts.production import staff
-from scripts.statusline import adhoc_items, for_you_count, rebuild_row
+from scripts.statusline import adhoc_items, rebuild_row
+
+try:
+    from scripts.review_links import for_you
+except Exception:
+    for_you = None
 
 
 def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
@@ -138,7 +143,20 @@ def counts_rows(record: staff.StaffSnapshot, session_id: str) -> str:
     return "".join(lines)
 
 
-def main() -> None:
+def status_action_count() -> str:
+    """Keep the other rows available if an action count fails."""
+    if for_you is None:
+        return "unavailable"
+    try:
+        system = os.environ.get("STATUSLINE_SYSTEM") or os.uname().sysname
+        if system == "Darwin":
+            return for_you.console_action_count()
+        return for_you.global_action_count()
+    except Exception:
+        return "unavailable"
+
+
+def main(rebuild: rebuild_row.RebuildAnswer | None = None) -> None:
     payload = cast(dict[str, object], json.load(sys.stdin))
     try:
         record = staff_record(Path(os.environ["STAFF_FILE"]).read_text(encoding="utf-8"))
@@ -149,11 +167,12 @@ def main() -> None:
     pwd = next((value for option, name, value in zip(sys.argv, sys.argv[1:], sys.argv[2:])
                 if option == "--arg" and name == "pwd"), os.getcwd())
     branch = current_branch(payload, pwd) if role == "unit-director" else ""
-    rebuild_config = Path(__file__).resolve().parents[2] / "config/statusline.conf"
-    system = os.environ.get("STATUSLINE_SYSTEM") or os.uname().sysname
-    action_count = (for_you_count.console_action_count() if system == "Darwin"
-                    else for_you_count.global_action_count(rebuild_config))
-    rebuild = rebuild_row.read(rebuild_config)
+    rebuild_config = rebuild_row.DEFAULT_CONFIG
+    action_args: list[str] = []
+    if rebuild is None:
+        action_args = ["--arg", "for_you", status_action_count()]
+        # The cache can expire during the count. Read it again without reading the needs.
+        rebuild = rebuild_row._read_cache(rebuild_config, time.time)  # pyright: ignore[reportPrivateUsage]
     if rebuild.refresh_due:
         try:
             _ = subprocess.Popen(
@@ -168,7 +187,7 @@ def main() -> None:
                      "--arg", "counts", counts_rows(record, session_id),
                      "--arg", "branch", branch,
                      "--arg", "adhoc", adhoc_items.row(session_id),
-                     "--arg", "for_you", action_count, *sys.argv[1:]])
+                     *action_args, *sys.argv[1:]])
 
 
 if __name__ == "__main__":

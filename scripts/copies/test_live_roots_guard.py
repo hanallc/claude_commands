@@ -49,7 +49,7 @@ class LiveRootsGuardTests(unittest.TestCase):
             private = private_slot_config(root, repository="origin")
             for fixture in (protected, private):
                 _ = write_config_fixture(Path(fixture.environment["COPIES_CONFIG"]),
-                                         "wait_seconds=0.01\ngit_timeout_seconds=30\nguard_timeout_seconds=30\n")
+                                         "git_timeout_seconds=30\nguard_timeout_seconds=30\n")
             guarded_temporary = guarded / "temporary"
             guarded_temporary.mkdir()
             with patch.dict(os.environ, {**protected.environment, "TMPDIR": str(guarded_temporary),

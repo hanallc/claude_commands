@@ -2099,7 +2099,7 @@ def _start_pass(args: argparse.Namespace,
         if launcher_command and not active.get("launcher_command"):
             active["launcher_command"] = launcher_command
             changed = True
-        if (status_file and active.get("status") == "active" and not active.get("assign_status_file")
+        if (status_file and active.get("status") in ("active", "refused") and not active.get("assign_status_file")
                 and not dispatch_delivery(active).line and isinstance(hook_completion(active), NoHookCompletion)):
             active["assign_status_file"] = status_file
             changed = True
@@ -2317,6 +2317,21 @@ def _assignment_pass_slot(passes: dict[str, dict[str, object]], instance_id: str
                 AssignmentLaunchNotRecorded.NO_PASS)
 
 
+def assignment_launch_worker_id(run: Path, instance_id: uuid.UUID) -> staff.StaffId | AssignmentLaunchNotRecorded:
+    """Find the fixed ID of the worker that opened this pass."""
+    if not _state_path(run).is_file():
+        return AssignmentLaunchNotRecorded.NO_PASS
+    state = _read_state(run, resolve_staff=False)
+    passes = _pass_slots(state)
+    slot = _assignment_pass_slot(passes, str(instance_id))
+    if isinstance(slot, AssignmentLaunchNotRecorded):
+        return slot
+    identity = _string(passes[slot].get("worker_id"))
+    if not identity:
+        raise SystemExit(f"{run}: assignment pass has no recorded worker id")
+    return staff.StaffId(identity)
+
+
 def record_assignment_launch_exit(run: Path, instance_id: uuid.UUID, outcome: AssignmentLaunchExit,
                                   ) -> RecordedAssignmentLaunch | AssignmentLaunchNotRecorded:
     """Find the exact launch and record any failure under the recorder lock."""
@@ -2326,11 +2341,15 @@ def record_assignment_launch_exit(run: Path, instance_id: uuid.UUID, outcome: As
             return AssignmentLaunchNotRecorded.NO_PASS
         state = _read_state(run)
         passes = _pass_slots(state)
-        slot = _assignment_pass_slot(passes, str(instance_id))
+        # The launcher opens the pass with the ID of its first delivery.
+        launch_delivery_id = str(instance_id)
+        slot = _assignment_pass_slot(passes, launch_delivery_id)
         if isinstance(slot, AssignmentLaunchNotRecorded):
             return slot
         passed = passes[slot]
-        if (outcome is AssignmentLaunchExit.SUBMITTED or passed.get("status") not in ("active", "refused", "error")
+        if (outcome is AssignmentLaunchExit.SUBMITTED
+                or launch_delivery_id in _string_list(passed.get("confirmed_delivery_ids"))
+                or passed.get("status") not in ("active", "refused", "error")
                 or isinstance(hook_completion(passed), HookCompletion)):
             return RecordedAssignmentLaunch(slot, failure_recorded=False)
         if status_file := _string(passed.get("assign_status_file")):
@@ -2340,17 +2359,38 @@ def record_assignment_launch_exit(run: Path, instance_id: uuid.UUID, outcome: As
         return RecordedAssignmentLaunch(slot, failure_recorded=True)
 
 
-def restore_submitted_assignment_status(run: Path, instance_id: str) -> None:
-    """Restore running status for the active pass after confirmed submission."""
+def dispatch_submission_confirmed(run: Path, instance_id: str, completion_id: str) -> bool:
+    """Check delivery confirmation under the recorder lock."""
     with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not _state_path(run).is_file():
+            return False
         passes = _pass_slots(_read_state(run, resolve_staff=False))
         slot = _assignment_pass_slot(passes, instance_id)
-        if isinstance(slot, str):
-            passed = passes[slot]
-            if passed.get("status") == "active" and isinstance(hook_completion(passed), NoHookCompletion):
-                if status_file := _string(passed.get("assign_status_file")):
-                    write_text_atomic(Path(status_file), "running\n")
+        return isinstance(slot, str) and completion_id in _string_list(passes[slot].get("confirmed_delivery_ids"))
+
+
+def confirm_assignment_submission(run: Path, instance_id: str, completion_id: str) -> None:
+    """Confirm the delivery and restore running status for the open pass."""
+    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = _read_state(run, resolve_staff=False)
+        passes = _open_passes(state)
+        slot = _assignment_pass_slot(passes, instance_id)
+        if isinstance(slot, AssignmentLaunchNotRecorded):
+            return
+        passed = passes[slot]
+        if isinstance(hook_completion(passed), HookCompletion):
+            return
+        confirmed = _string_list(passed.get("confirmed_delivery_ids"))
+        if completion_id not in confirmed:
+            passed["confirmed_delivery_ids"] = [*confirmed, completion_id]
+            _write_state(run, state)
+        if status_file := _string(passed.get("assign_status_file")):
+            try:
+                write_text_atomic(Path(status_file), "running\n")
+            except OSError as error:
+                print(f"Unable to restore running status in {status_file}. {error}", file=sys.stderr)
 
 
 @dataclass(frozen=True)

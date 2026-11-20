@@ -11,10 +11,11 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -22,7 +23,7 @@ from enum import Enum
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, NewType, Protocol, Self, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast
 from uuid import UUID
 
 from scripts.lib import git_files
@@ -883,6 +884,34 @@ def row_operation(reference: str) -> Generator[None]:
         yield
 
 
+def _write_slot_holder(lock: IO[bytes]) -> None:
+    holder = {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+    with suppress(OSError):
+        os.ftruncate(lock.fileno(), 0)
+        _ = lock.write((json.dumps(holder) + "\n").encode("utf-8"))
+
+
+def _clear_slot_holder(lock: IO[bytes]) -> None:
+    with suppress(OSError):
+        os.ftruncate(lock.fileno(), 0)
+
+
+def _slot_holder_suffix(lock: IO[bytes]) -> str:
+    try:
+        _ = lock.seek(0)
+        line = lock.read(4096).partition(b"\n")[0]
+        holder = cast(object, json.loads(line))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(holder, dict):
+        return ""
+    record = cast(dict[str, object], holder)
+    pid, command = record.get("pid"), record.get("command")
+    if type(pid) is not int or pid <= 0 or not isinstance(command, str) or not command:
+        return ""
+    return f" (pid {pid}: {command})"
+
+
 @contextmanager
 def slot_operation(key: str, name: str) -> Generator[None]:
     """Lock a row or a named worker slot across inherited children."""
@@ -891,16 +920,18 @@ def slot_operation(key: str, name: str) -> Generator[None]:
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as lock:
+    with path.open("a+b", buffering=0) as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise StaffRefused(f"{name}: another operation holds this row") from error
+            raise StaffRefused(f"{name}: another operation holds this row{_slot_holder_suffix(lock)}") from error
         previous = os.environ.get(variable)
-        os.environ[variable] = str(lock.fileno())
+        _write_slot_holder(lock)
         try:
+            os.environ[variable] = str(lock.fileno())
             yield
         finally:
+            _clear_slot_holder(lock)
             if previous is None:
                 _ = os.environ.pop(variable, None)
             else:

@@ -1,25 +1,30 @@
 """Test The List page with private records and a real browser."""
 from __future__ import annotations
-from scripts.lint.memory_test_support import write_config_fixture
 
+import base64
 import html
 import io
 import json
 import os
 import re
+import select
 import shutil
+import signal
+import socket
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import BinaryIO, cast, override
+from types import SimpleNamespace
+from typing import BinaryIO, ClassVar, cast, override
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
@@ -27,7 +32,8 @@ from xml.etree import ElementTree
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
-from scripts.lib import atomic_file, conf, file_lock, process_start
+from scripts.lib import atomic_file, conf, file_lock
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
@@ -52,10 +58,372 @@ OTHER = staff.StaffRow(staff.StaffId("f5636030-6745-4ff4-aeda-4c2773d18da8"), "s
 DWIGHT = staff.StaffRow(staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"), "producer", "dwight", staff.StaffRoot(),
                         current_session=staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"))
 NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
+FIREFOX_MIN_SHARED_WIDTH = 500
+
+
+def _private_firefox_command(profile: Path, width: int, height: int, *, dark: bool) -> tuple[list[str], dict[str, str]]:
+    profile.mkdir()
+    if dark:
+        _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+    command = ["firefox", "--headless", "--no-remote", "--profile", str(profile), "--window-size", f"{width},{height}"]
+    return command, {**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)}
+
+
+def _stop_browser(process: subprocess.Popen[bytes]) -> None:
+    try:
+        with suppress(ProcessLookupError):
+            send_process_group(process.pid, signal.SIGTERM)
+        with suppress(subprocess.TimeoutExpired):
+            _ = process.wait(timeout=10)
+        # The browser can exit before its child processes.
+        with suppress(ProcessLookupError):
+            send_process_group(process.pid, signal.SIGKILL)
+        _ = process.wait(timeout=10)
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+class _Browser:
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self.process: subprocess.Popen[bytes] = process
+        self.closed: bool = False
+        self.resources: ExitStack = ExitStack()
+        _ = self.resources.callback(_stop_browser, process)
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.resources.close()
+
+    @contextmanager
+    def stop_on_error(self) -> Generator[None]:
+        try:
+            yield
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                error.add_note(f"Browser cleanup failed: {cleanup_error}")
+            raise
+
+
+class _Chrome(_Browser):
+    """Keep one Chrome target and start each probe in a new document."""
+
+    def __init__(self, root: Path) -> None:
+        self.root: Path = root
+        self.pending: bytearray = bytearray()
+        self.loaded: set[tuple[str, str]] = set()
+        self.sequence: int = 0
+        with (root / "chrome.log").open("wb") as log:
+            process = subprocess.Popen(
+                ["sh", "-c", 'exec 3<&0 4>&1; exec "$@" 1>&2', "chrome-fixture",
+                 "google-chrome", "--headless", "--no-sandbox", "--disable-gpu", "--disable-background-networking",
+                 "--no-first-run", "--allow-file-access-from-files", "--remote-debugging-pipe",
+                 f"--user-data-dir={root / 'chrome'}", "about:blank"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0,
+                start_new_session=True)
+        super().__init__(process)
+        with self.stop_on_error():
+            writer = process.stdin
+            assert writer is not None
+            os.set_blocking(writer.fileno(), False)
+            context = self.command("Target.createBrowserContext", {})["browserContextId"]
+            target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": context})
+            self.session: str = cast(str, self.command("Target.attachToTarget",
+                {"targetId": target["targetId"], "flatten": True})["sessionId"])
+            _ = self.command("Page.enable", {}, self.session)
+            _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, self.session)
+
+    def read(self, deadline: float) -> dict[str, object]:
+        reader = self.process.stdout
+        assert reader is not None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Chrome did not answer")
+            end = self.pending.find(b"\0")
+            if end >= 0:
+                reply = cast(dict[str, object], json.loads(self.pending[:end]))
+                del self.pending[:end + 1]
+                if reply.get("method") == "Page.lifecycleEvent":
+                    parameters = cast(dict[str, str], reply["params"])
+                    if parameters["name"] == "DOMContentLoaded":
+                        self.loaded.add((cast(str, reply["sessionId"]), parameters["loaderId"]))
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Chrome did not answer")
+                return reply
+            if not select.select([reader], [], [], remaining)[0]:
+                raise TimeoutError("Chrome did not answer")
+            chunk = os.read(reader.fileno(), 65536)
+            if not chunk:
+                raise RuntimeError((self.root / "chrome.log").read_text(errors="replace"))
+            self.pending.extend(chunk)
+
+    def command(self, method: str, parameters: dict[str, object], session: str = "") -> dict[str, object]:
+        self.sequence += 1
+        request: dict[str, object] = {"id": self.sequence, "method": method, "params": parameters}
+        if session:
+            request["sessionId"] = session
+        writer = self.process.stdin
+        assert writer is not None
+        data = memoryview(json.dumps(request).encode() + b"\0")
+        deadline = time.monotonic() + 20
+        while data:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([], [writer], [], remaining)[1] or time.monotonic() >= deadline:
+                raise TimeoutError(f"{method}: Chrome did not accept the command")
+            try:
+                written = os.write(writer.fileno(), data)
+            except BlockingIOError:
+                continue
+            data = data[written:]
+        while True:
+            reply = self.read(deadline)
+            if reply.get("id") == self.sequence:
+                if "error" in reply:
+                    raise RuntimeError(f"{method}: {reply['error']}")
+                return cast(dict[str, object], reply["result"])
+
+    def navigate(self, destination: str) -> None:
+        navigation = self.command("Page.navigate", {"url": destination}, self.session)
+        if "errorText" in navigation:
+            raise RuntimeError(f"Page.navigate: {navigation['errorText']}")
+        load = (self.session, cast(str, navigation["loaderId"]))
+        deadline = time.monotonic() + 20
+        while load not in self.loaded:
+            _ = self.read(deadline)
+
+    def dom(self, page: Path, marker: str, *, reduced_motion: bool,
+            window_size: tuple[int, int] | None) -> subprocess.CompletedProcess[str]:
+        with self.stop_on_error():
+            session = self.session
+            if window_size is not None:
+                width, height = window_size
+                _ = self.command("Emulation.setDeviceMetricsOverride",
+                    {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False}, session)
+            else:
+                _ = self.command("Emulation.clearDeviceMetricsOverride", {}, session)
+            features = [{"name": "prefers-reduced-motion", "value": "reduce"}] if reduced_motion else []
+            _ = self.command("Emulation.setEmulatedMedia", {"features": features}, session)
+            destination = page.as_uri()
+            # Evaluate the promise in the new document, after the navigation.
+            marker_literal = json.dumps(marker)
+            script = (
+                "try { sessionStorage.clear(); localStorage.clear(); }"
+                "catch (error) { if (error.name !== 'SecurityError') throw error; }"
+                "globalThis.fixtureDOM = new Promise(resolve => {"
+                "const observer = new MutationObserver(() => {"
+                f"const result = document.getElementById({marker_literal});"
+                "if (result) { observer.disconnect(); resolve(document.documentElement.outerHTML); }"
+                "});"
+                "observer.observe(document, {childList: true, subtree: true});"
+                "});"
+            )
+            hook = self.command("Page.addScriptToEvaluateOnNewDocument", {"source": script}, session)
+            self.navigate(destination)
+            try:
+                response = self.command("Runtime.evaluate",
+                    {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session)
+            except TimeoutError as error:
+                raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
+            result = cast(dict[str, object], response["result"])
+            _ = self.command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hook["identifier"]}, session)
+            self.navigate("about:blank")
+            _ = self.command("Page.resetNavigationHistory", {}, session)
+            self.loaded.clear()
+            return subprocess.CompletedProcess(destination, 0, str(result.get("value", "")), "")
+
+
+class _Firefox(_Browser):
+    """Keep Firefox open and control its private profile through Marionette."""
+
+    def __init__(self, root: Path) -> None:
+        profile = root / "firefox"
+        profile.mkdir()
+        _ = (profile / "user.js").write_text(
+            'user_pref("marionette.port", 0);\n'
+            + 'user_pref("browser.sessionhistory.max_total_viewers", 0);\n')
+        with (root / "firefox.log").open("wb") as log:
+            process = subprocess.Popen(
+                ["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                 "--marionette", "--remote-allow-system-access", "about:blank"],
+                stdout=log, stderr=log, start_new_session=True)
+        super().__init__(process)
+        with self.stop_on_error():
+            port_file = profile / "MarionetteActivePort"
+            deadline = time.monotonic() + 30
+            while not port_file.exists():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError((root / "firefox.log").read_text(errors="replace"))
+                time.sleep(0.02)
+            address = ("127.0.0.1", int(port_file.read_text()))
+            self.connection: socket.socket = self.resources.enter_context(socket.create_connection(address, timeout=45))
+            self.stream: BinaryIO = self.resources.enter_context(self.connection.makefile("rb"))
+            _ = self.read()
+            self.sequence: int = 0
+            _ = self.command("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "none"}}})
+            initial = cast(dict[str, str], self.command("WebDriver:GetWindowHandle"))
+            self.initial: str = initial["value"]
+
+    def read(self) -> object:
+        size = bytearray()
+        while (byte := self.stream.read(1)) != b":":
+            if not byte or not byte.isdigit():
+                raise RuntimeError("Firefox closed the Marionette connection")
+            size.extend(byte)
+        return cast(object, json.loads(self.stream.read(int(size))))
+
+    def command(self, method: str, parameters: dict[str, object] | None = None) -> object:
+        self.sequence += 1
+        message = json.dumps([0, self.sequence, method, parameters or {}]).encode()
+        self.connection.sendall(str(len(message)).encode() + b":" + message)
+        kind, sequence, error, result = cast(list[object], self.read())
+        if kind != 1 or sequence != self.sequence or error is not None:
+            raise RuntimeError(f"{method}: {error}")
+        return result
+
+    def script(self, source: str, arguments: list[object]) -> object:
+        result = cast(dict[str, object], self.command("WebDriver:ExecuteScript", {"script": source, "args": arguments}))
+        return result["value"]
+
+    @contextmanager
+    def page(self, destination: str, width: int, height: int, *, dark: bool = False,
+             reduced_motion: bool = False) -> Generator[None]:
+        with self.stop_on_error():
+            _ = self.command("Marionette:SetContext", {"value": "chrome"})
+            cleared = cast(dict[str, object], self.command("WebDriver:ExecuteAsyncScript", {
+                "script": """
+Services.prefs.setIntPref("ui.systemUsesDarkTheme", arguments[0]);
+Services.prefs.setIntPref("ui.prefersReducedMotion", arguments[1]);
+const flags = Ci.nsIClearDataService;
+Services.clearData.deleteData(
+    flags.CLEAR_COOKIES | flags.CLEAR_DOM_STORAGES | flags.CLEAR_ALL_CACHES | flags.CLEAR_HISTORY,
+    arguments[2]);
+""", "args": [int(dark), int(reduced_motion)],
+            }))
+            if cleared["value"] != 0:
+                raise RuntimeError(f"Firefox could not clear profile data: {cleared['value']}")
+            _ = self.command("Marionette:SetContext", {"value": "content"})
+            window = cast(dict[str, str], self.command("WebDriver:NewWindow", {"type": "tab", "focus": True}))
+            # If the switch fails, close the group to close the new tab.
+            _ = self.command("WebDriver:SwitchToWindow", {"handle": window["handle"]})
+            dimensions = cast(list[int], self.script("return [outerWidth - innerWidth, outerHeight - innerHeight];", []))
+            _ = self.command("WebDriver:SetWindowRect", {"width": width + dimensions[0], "height": height + dimensions[1]})
+            _ = self.command("WebDriver:Navigate", {"url": destination})
+            yield
+            _ = self.command("WebDriver:CloseWindow")
+            _ = self.command("WebDriver:SwitchToWindow", {"handle": self.initial})
+
+    def screenshot(self, path: Path) -> None:
+        result = cast(dict[str, str], self.command("WebDriver:TakeScreenshot", {"full": False}))
+        _ = path.write_bytes(base64.b64decode(result["value"]))
+
+    def wait_for_load(self, destination: str) -> None:
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            if self.script("""
+// The console can change the query with history.replaceState.
+const navigation = performance.getEntriesByType('navigation')[0];
+return navigation?.name.split('#', 1)[0] === arguments[0] && document.readyState === 'complete';
+""", [destination.partition("#")[0]]) is True:
+                return
+            time.sleep(0.02)
+        raise TimeoutError(f"Firefox did not load {destination}")
 
 
 class ListPageTests(unittest.TestCase):
     root: Path = Path()
+    browser_root: ClassVar[Path]
+    _chrome: ClassVar[_Chrome | None] = None
+    _firefox: ClassVar[_Firefox | None] = None
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        cls.browser_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="list-page-class-")))
+        cls._chrome = None
+        cls._firefox = None
+        config = cls.browser_root / "config"
+        config.mkdir()
+        _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
+        _ = (config / "statusline.conf").write_text(
+            "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
+            + "role.producer=#90fe42\nrole.worker=#ff0404\n")
+        _ = (config / "review_links.conf").write_text(
+            "# whole: 1..20\ndelivery_tries=3\n# range: 0..300\ndelivery_pause_seconds=0\n"
+            + "# whole: 1..20\nfeedback_rows=5\n# whole: 1..20\nreview_words_rows=4\n"
+            + "# whole: 1..1440\nlater_soon_minutes=60\n"
+            + "later_evening=18:00\nlater_evening_until=17:00\nlater_morning=09:00\n"
+            + "later_week_day=Monday\nlater_week_time=09:00\n"
+            + "# range: 5..300\npage_refresh_seconds=15\n# whole: 1..80\nlist_log_max_height_rem=16\n"
+            + "# whole: 1..300\npage_request_timeout_seconds=15\n"
+            + "# whole: 1..5000\ncard_fade_out_ms=450\n# whole: 1..5000\ncard_fade_in_ms=600\n"
+            + "# range: 0.5..60\nframe_retry_seconds=2\n"
+            + "# range: 0.001..\ntailscale_check_seconds=60\n"
+            + "# range: 0.001..\nsnapshot_sweep_seconds=3600\n"
+            + "# range: 0..\nsnapshot_retention_seconds=604800\n"
+            + "# range: 0..365\nchange_image_unclaimed_days=14\n"
+            + "# range: 1..600\nstaff_snapshot_seconds=60\n"
+            + "# range: 0.001..\ncode_check_seconds=5\n"
+            + "# whole: 1..65535\nserver_port=8765\n"
+            + "changes_first_root=natedev\nreview_attachments_root=review-attachments\n")
+        _ = (config / "console.conf").write_text(
+            "page.list.label=List\npage.list.icon=list-checks\npage.list.title=The List\n"
+            + "page.list.url=python:scripts.review_links.list_page:page_url\n"
+            + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
+            + "# range: 0.001..86400\nstatus.round_trip_limit_seconds=1\n"
+            + "# range: 0.001..86400\nstatus.render_limit_seconds=1\n"
+            + "# range: 0.001..86400\nstatus.reading_delay_seconds=1\n"
+            + "# range: 0.001..86400\nstatus.list.age_limit_seconds=45\n"
+            + "# range: 0.001..86400\nstatus.review.age_limit_seconds=45\n")
+
+    @classmethod
+    def chrome(cls) -> _Chrome:
+        if cls._chrome is not None:
+            if not cls._chrome.closed and cls._chrome.process.poll() is None:
+                return cls._chrome
+            cls._chrome.close()
+        root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="chrome-"))
+        cls._chrome = _Chrome(root)
+        cls.addClassCleanup(cls._chrome.close)
+        return cls._chrome
+
+    @classmethod
+    def firefox(cls) -> _Firefox:
+        if cls._firefox is not None:
+            if not cls._firefox.closed and cls._firefox.process.poll() is None:
+                return cls._firefox
+            cls._firefox.close()
+        root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="firefox-"))
+        cls._firefox = _Firefox(root)
+        cls.addClassCleanup(cls._firefox.close)
+        return cls._firefox
+
+    def firefox_view(self, destination: str, path: Path | None, width: int, height: int,
+                     complete: threading.Event | None = None, *, dark: bool = False
+                     ) -> subprocess.CompletedProcess[str]:
+        if width < FIREFOX_MIN_SHARED_WIDTH:
+            with tempfile.TemporaryDirectory(dir=self.root, prefix="firefox-view-") as temporary:
+                root = Path(temporary)
+                command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
+                screenshot = path if path is not None else root / "page.png"
+                return subprocess.run([*command, "--screenshot", str(screenshot), destination],
+                                      capture_output=True, text=True, timeout=45, env=environment)
+        try:
+            browser = self.firefox()
+            with browser.page(destination, width, height, dark=dark):
+                if complete is None:
+                    browser.wait_for_load(destination)
+                elif not complete.wait(45):
+                    raise TimeoutError("Firefox did not report the page result")
+                if path is not None:
+                    browser.screenshot(path)
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(f"Firefox could not show {destination}") from error
+        return subprocess.CompletedProcess(destination, 0, "", "")
 
     def test_review_links_use_the_card_body_for_every_state(self) -> None:
         source = review_items.ProposalLedgerSource(self.root / "proposals.md")
@@ -135,7 +503,7 @@ check(checkLine(2).textContent==='Check overdue Nov 16 12:00 EST' && checkLine(2
  'An unparked item shows the overdue check in the same date form.');
 check(row(8).querySelector('[data-parked-note]').textContent==='Parked until Nov 20 09:00 EST',
  'The parked time uses the ETA date form.');
-check(!checkLine(8).getClientRects().length,'A parked item hides its overdue check.');
+check(!checkLine(8),'A date park omits the overdue check.');
 check(etaLine(9).textContent==='Paused','The cell shows the status as stored.');
 check(etaLine(10).textContent==='Dec 3 03:30 EST','The cell omits the leading zero from the day.');
 check(etaLine(11).textContent==='Nov 20' && eta(11).title==='2026-11-20',
@@ -186,6 +554,18 @@ document.body.append(result);
         for width in (1440, 500):
             with self.subTest(width=width):
                 self.browser_actions(markup, "", probe, window_size=(width, 900))
+
+    def test_delivery_park_omits_the_overdue_check(self) -> None:
+        item = self.add("Publish the reviewed change", number=123, next_check=NOW - timedelta(hours=1))
+        _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        row = markup.split('data-number="123"', 1)[1].split("</tbody>", 1)[0]
+        self.assertIn("Parked until delivered", row)
+        self.assertNotIn("<small data-list-check>", row)
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["check_html"], "")
+        _ = the_list.unpark(MORTY.id, item.id, source="nate")
+        check = list_page.saved_action_state(MORTY.id, item.id)["check_html"]
+        self.assertIn('<span class="warning">Check overdue Nov 16 12:00 EST</span>', check)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_new_item_opens_the_dialog_and_reveals_the_saved_row(self) -> None:
@@ -264,7 +644,7 @@ window.fetch=async (path,options={})=>{
         for status, body in ((200, {"item_state": "Working"}), (409, {"reason": "The row save failed."})):
             with self.subTest(status=status):
                 self.browser_actions(initial, setup, probe.replace("__ROW_REPLY__", json.dumps({
-                    "status": status, "body": body})), virtual_time_ms=3000)
+                    "status": status, "body": body})))
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_list_title_actions_fit_at_320_pixels(self) -> None:
@@ -417,8 +797,11 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         waiting_key = f"investigation/{waiting.owner}/{waiting.id}"
         waiting_item = self.add("Check the linked reviews that are waiting", number=113)
         _ = the_list.link(MORTY.id, waiting_item.id, (waiting_key,), source="morty")
-        _ = write_config_fixture(self.root / "config/review_links.conf",
-                                 "page_request_timeout_seconds=7\ncard_fade_out_ms=180\ncard_fade_in_ms=260\n")
+        settings = self.root / "config/review_links.conf"
+        overlay_settings = settings.read_text()
+        for key, value in (("page_request_timeout_seconds", 7), ("card_fade_out_ms", 180), ("card_fade_in_ms", 260)):
+            overlay_settings = re.sub(rf"(?m)^{key}=.*$", f"{key}={value}", overlay_settings)
+        _ = settings.write_text(overlay_settings)
         pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
                  console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
         shell = console.render(pages, console.UnavailablePage()).decode()
@@ -728,7 +1111,11 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
 </script>'''.replace('WAITING_KEY', json.dumps(waiting_key))
         shell = shell.replace('</body>', probe + '</body>')
         proof = os.environ.get("LIST_OVERLAY_SCREENSHOT")
-        _ = write_config_fixture(self.root / "config/scratch.conf", f"visible_root={self.root / 'scratch'}\n")
+        _ = (self.root / "config/scratch.conf").write_text(
+            f"visible_root={self.root / 'scratch'}\nholds_file={self.root / 'holds.json'}\n"
+            + "# whole: 1..\ndefault_life_seconds=86400\n# whole: 1..\nrepo_depth=3\n"
+            + "# whole: 1..\nsuffix_length=6\nrepo_skip=target node_modules .git\n"
+            + "# whole: 1..\nrecord_lock_attempts=3\n# whole: 1..\nremoval_remote_timeout_seconds=30\n")
         for size in ("1440,1000", "600,900", "430,900", *(("screenshot",) if proof else ())):
             with self.subTest(size=size):
                 _ = listing.write_text(original)
@@ -783,31 +1170,31 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
-                        profile = self.root / f'overlay-profile-{size}'
-                        profile.mkdir()
-                        _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        viewport = '1440,1000' if size == "screenshot" else size
-                        width, height = viewport.split(',')
-                        browser_env = {**os.environ, "MOZ_HEADLESS_WIDTH": width, "MOZ_HEADLESS_HEIGHT": height}
-                        command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', viewport]
-                        url = f'http://127.0.0.1:{server.server_port}' + destination
+                        viewport = "1440,1000" if size == "screenshot" else size
+                        width, height = map(int, viewport.split(","))
+                        route = destination
                         if size == "430,900":
-                            url = f'http://127.0.0.1:{server.server_port}' + list_place.replace('#', '?direct=1#', 1)
+                            route = list_place.replace("#", "?direct=1#", 1)
+                        elif size == "600,900":
+                            route += "&phone=1"
+                        url = f"http://127.0.0.1:{server.server_port}" + route
                         if size == "screenshot":
                             assert proof is not None
-                            result = subprocess.run([*command, '--screenshot', proof, url + '&shot=1'],
-                                                    capture_output=True, text=True, timeout=45, env=browser_env)
+                            result = self.firefox_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
-                        else:
-                            if size == "600,900":
-                                url += '&phone=1'
+                        elif size == "430,900":
+                            command, environment = _private_firefox_command(
+                                self.root / f"overlay-profile-{size}", width, height, dark=True)
                             with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL,
-                                                  stderr=subprocess.DEVNULL, env=browser_env) as browser:
+                                                  stderr=subprocess.DEVNULL, env=environment) as browser:
                                 try:
                                     self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
                                 finally:
                                     browser.terminate()
                                     _ = browser.wait(timeout=10)
+                        else:
+                            with self.firefox().page(url, width, height, dark=True):
+                                self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
                     finally:
                         complete.set()
                         server.shutdown()
@@ -1058,9 +1445,6 @@ frame.addEventListener('load',async()=>{
                     with self.subTest(link=case):
                         complete.clear()
                         results.clear()
-                        profile = self.root / f"list-jump-{case}"
-                        profile.mkdir()
-                        _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
                         filters = {"sort": "#", "item": f"{MORTY.id}/{source.id}"}
                         if case in ("open", "closed", "producer", "missing"):
                             filters.update(owner=OWNER.id, producer=MORTY.id, q="linked item")
@@ -1069,19 +1453,12 @@ frame.addEventListener('load',async()=>{
                         place = list_page.PAGE_PATH + "?show=working#" + urlencode(filters)
                         url = "/console/" + console.place_query("list", place)
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
-                        command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', '1440,1100']
                         if case == "proof" and proof:
-                            result = subprocess.run([*command, '--screenshot', proof, destination],
-                                                    capture_output=True, text=True, timeout=45)
+                            result = self.firefox_view(destination, Path(proof), 1440, 1100, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         else:
-                            with subprocess.Popen([*command, destination], stdout=subprocess.DEVNULL,
-                                                  stderr=subprocess.DEVNULL) as browser:
-                                try:
-                                    self.assertTrue(complete.wait(30), "The browser must report the result of the link click.")
-                                finally:
-                                    browser.terminate()
-                                    _ = browser.wait(timeout=10)
+                            with self.firefox().page(destination, 1440, 1100, dark=True):
+                                self.assertTrue(complete.wait(30), "The browser must report the result of the link click.")
                         self.assertEqual(results, [[]])
             finally:
                 complete.set()
@@ -1490,9 +1867,11 @@ document.body.append(result);
         item = self.add("Long log for a narrow view", number=1)
         for update in range(18):
             _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
+        settings = self.root / "config/review_links.conf"
+        original = settings.read_text()
         for limit in (8, 12):
             with self.subTest(limit=limit):
-                _ = write_config_fixture(self.root / "config/review_links.conf", f"list_log_max_height_rem={limit}\n")
+                _ = settings.write_text(re.sub(r"(?m)^list_log_max_height_rem=.*$", f"list_log_max_height_rem={limit}", original))
                 with patch.object(list_page, "counts_strip", return_value=""):
                     markup = list_page.render(self.root / "reviews").decode()
                 probe = r'''<script>
@@ -1515,16 +1894,15 @@ document.body.append(result);
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="list-page-test-")))
         config = self.root / "config"
-        config.mkdir()
-        _ = write_config_fixture(config / "change_review.conf")
-        _ = write_config_fixture(config / "review_links.conf", "page_refresh_seconds=15\ndelivery_pause_seconds=0\n")
-        _ = write_config_fixture(config / "console.conf",
-            "page.list.url=python:scripts.review_links.list_page:page_url\n"
-            + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
+        changes = self.root / "change-reviews"
+        _ = shutil.copytree(self.browser_root / "config", config)
+        _ = (config / "change_review.conf").write_text(
+            f"lists_directory={changes}\nreview_links_directory={self.root / 'reviews'}\n")
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        environment.update({"CONF_DIR": str(config), "CHANGE_REVIEW_DIR": str(changes),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "STAFF_FILE": str(self.root / "staff.json"),
-            "USER_ZONE": "America/New_York", "REVIEW_LINKS_ROOT": str(self.root / "reviews"),
-            "CHANGE_REVIEW_DIR": str(self.root / "change-reviews")})))
+            "USER_ZONE": "America/New_York", "REVIEW_LINKS_ROOT": str(self.root / "reviews")})
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment, clear=True)))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
             row.to_json() for row in (MORTY, DWIGHT, OWNER, OTHER)]}))
         _ = self.enterContext(patch.object(the_list, "now", return_value=NOW))
@@ -1930,7 +2308,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
 
     def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
         item = self.add("Explain this item")
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", NOW, ())
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret")
         actions, words = form.split('</div>', 1)
         self.assertNotIn('value="tell"', actions)
         self.assertNotIn('<label for="words-', words)
@@ -2062,7 +2440,7 @@ document.body.append(result);
                                                     "--text", "The gate passed."]), 0)
         markup = list_page.render(root, status=status, include_counts=False).decode()
         controls = markup.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
-        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["18", "2", "2", "2", "3", "8"])
+        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["18", "3", "2", "2", "2", "8"])
         probe = '''<script>
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const chips=[...document.querySelectorAll('[data-filter-row="show"] button')];
@@ -2070,7 +2448,7 @@ const unread=document.getElementById('list-unread');
 const total=document.querySelector('[data-list-count]');
 const entries=[
  ['all',[1,2,3,4,5,6,7,9,10,11,12,13,14,15,17,18,19,20],[1,3,4,6,9,11,13,15,18,19,20]],
- ['needs-me',[4,5],[4]],['morty-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7,20],[3,20]],
+ ['needs-me',[4,5,20],[4,20]],['morty-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7],[3]],
  ['parked',[9,10,11,12,13,14,15,18],[9,11,13,15,18]],
 ];
 const count=button=>Number(button.dataset.filterCount);
@@ -2098,8 +2476,8 @@ expand(17);
 check(!row(17).hidden && detail(17)?.querySelector('[data-waiting-note]'),
  'The unparked item shows the waiting note in Morty answering.');
 expand(19);
-check(!row(19).hidden && detail(19)?.querySelector('[value="resend-Q1"]'),
- 'The failed question stays in Morty answering with Resend.');
+check(!row(19).hidden && detail(19)?.querySelector('[data-question-delivery-failed]'),
+ 'The failed question stays in Morty answering with a failure notice.');
 chips[5].click();expand(18);
 const waitingPanel=detail(18);
 check(!row(18).hidden && waitingPanel?.querySelector('[data-waiting-note]') &&
@@ -2107,13 +2485,13 @@ check(!row(18).hidden && waitingPanel?.querySelector('[data-waiting-note]') &&
  waitingPanel.querySelector('[value="unpark"]').getClientRects().length &&
  !row(18).querySelector('[data-parked-note]').getClientRects().length,
  'The parked item shows one parking note, the waiting note, and Unpark in its panel.');
-chips[4].click();
+chips[1].click();
 expand(20);
 const answer=detail(20)?.querySelector('.list-panel [data-question="Q1"]');
 check(!row(20).hidden && row(20).querySelector('[aria-label="Unread update"]') &&
  answer?.textContent.includes('The gate passed.') && answer.querySelector('.question-unread') &&
  !detail(20).querySelector('[data-log-index="Q1-answered"]'),
- 'The answered item returns to Blocked with its unread answer in the panel.');
+ 'The answered item shows in Needs me with its unread answer in the panel.');
 const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
 document.body.append(result);
 </script>'''
@@ -2189,7 +2567,9 @@ window.fetch=async (url,options)=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_refresh_keeps_the_follow_up_request_and_retries_after_timeout(self) -> None:
-        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\n")
+        settings = conf.path("review_links")
+        _ = settings.write_text(settings.read_text().replace(
+            "page_request_timeout_seconds=15\n", "page_request_timeout_seconds=4\n"))
         root = self.root / "reviews"
         changed = self.add("Keep the changed row usable")
         counts_only = list_page.render(root, defer_counts=True, review_records={}).decode()
@@ -2375,7 +2755,7 @@ window.fetch=(url,options)=>{
     def fields(self, item: the_list.ListItem, action: str, **changes: str) -> dict[str, str]:
         folder = change_page.console_folder(self.root / "reviews")
         secret = change_browser.browser_manifest(folder)[0]
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret, NOW, ())
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), secret)
         fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', form))
         return {**fields, "action": action, "words": "", "until": "", **changes}
 
@@ -2670,7 +3050,7 @@ window.fetch=async(_path,options={})=>{
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, setup, probe, virtual_time_ms=3000)
+        self.browser_actions(markup, setup, probe)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_opens_the_shared_picker_and_submits_the_chosen_time(self) -> None:
@@ -2953,9 +3333,7 @@ window.fetch=async(_path,options={})=>{
  const unpark=form.querySelector('[value=unpark]');
  show('parked');
  row.querySelector('.list-toggle').click();
- const hiddenCheck=row.querySelector('[data-list-check]');
- check(!hiddenCheck.getClientRects().length && hiddenCheck.textContent==='Check Nov 16 14:00 EST',
-  'The parked row hides the check before it is overdue.');
+ check(!row.querySelector('[data-list-check]'),'The parked row omits the future check.');
  unpark.focus();
  const first=submit('unpark');
  losePost();await flush();
@@ -2976,9 +3354,10 @@ window.fetch=async(_path,options={})=>{
  form.elements.words.value='Keep these words.';
  form.elements.until.value='2026-12-03';
  submit('park');
- finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST'});await flush();
+ check(!nextCheck.getClientRects().length,'The row hides the check while Park is pending.');
+ finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST',check_html:''});await flush();
  show('parked');
- check(!nextCheck.getClientRects().length,'Park hides the saved check without a refresh.');
+ check(!row.querySelector('[data-list-check]'),'The Park response removes the check before a refresh.');
  document.querySelector('[data-sort="3"]').click();
  unpark.focus();
  submit('unpark');
@@ -3267,7 +3646,7 @@ const observer=new MutationObserver(()=>{
 });
 observer.observe(original.parentNode,{childList:true});
 </script>'''
-        self.browser_actions(markup, setup, probe, virtual_time_ms=2000)
+        self.browser_actions(markup, setup, probe)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_retries_a_lost_tell_after_a_refused_park(self) -> None:
@@ -3393,7 +3772,11 @@ observer.observe(original.parentNode,{childList:true});
             _ = self.add(f"List item {number}", number=number)
         with patch.object(list_page, "counts_strip", return_value=""):
             page = list_page.render(self.root / "reviews")
-        self.assertEqual(save_notice_failures(page, 'remove'), [[]])
+        def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            return self.firefox_view(arguments[-1], None, 1366, 768)
+
+        with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
+            self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_keeps_the_question_request_after_a_service_failure(self) -> None:
@@ -3596,7 +3979,7 @@ observer.observe(original.parentNode,{childList:true});
                 self.assertEqual(answered["unread"], "true")
                 self.assertEqual(answered["parked"], "false" if unpark else "true")
 
-    def test_another_question_keeps_the_failed_questions_resend_available(self) -> None:
+    def test_another_question_keeps_the_first_failure_visible(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         item = self.add("Keep the first question available")
@@ -3621,14 +4004,8 @@ observer.observe(original.parentNode,{childList:true});
                     self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "false")
                     markup = list_page.render(root, include_counts=False, status=status).decode().split('<script>', 1)[0]
                     self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
-                    self.assertIn('value="resend-Q1">Resend question Q1</button>', markup)
-                    self.assertNotIn('value="resend-Q2"', markup)
-            current = the_list.load(MORTY.id, item.id)
-            retry = list_page.submit(root, urlencode(self.fields(current, "resend-Q1")), status)
-            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "true")
-            list_page.deliver(retry)
-            self.assertEqual(send.call_count, 2)
-        self.assertEqual(the_list.load(MORTY.id, item.id).questions, current.questions)
+                    self.assertEqual(markup.count("Question not delivered."), 1)
+                    self.assertNotIn('value="resend-', markup)
 
     def test_recorded_question_failure_takes_priority_when_the_intent_clear_fails(self) -> None:
         root = self.root / "reviews"
@@ -3654,19 +4031,8 @@ observer.observe(original.parentNode,{childList:true});
         self.assertEqual(reopened.failed_delivery(page, delivery.row), failure)
         markup = list_page.render(root, include_counts=False).decode().split('<script>', 1)[0]
         self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
-        self.assertIn('Question Q1 did not reach morty', markup)
-        self.assertIn('value="resend-Q1">Resend question Q1</button>', markup)
-
-        current = the_list.load(MORTY.id, item.id)
-        retry = list_page.submit(root, urlencode(self.fields(current, "resend-Q1")), reopened)
-        assert isinstance(retry, list_page.ListQuestionDelivery)
-        assert isinstance(retry.delivery, change_page.MessageDelivery)
-        self.assertNotEqual(retry.delivery.attempt, failure.attempt)
-        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=reopened)["waiting_for_answer"], "true")
-        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
-            list_page.deliver(retry)
-        send.assert_called_once()
-        self.assertEqual(the_list.load(MORTY.id, item.id), current)
+        self.assertIn("Question not delivered.", markup)
+        self.assertNotIn('value="resend-', markup)
 
     def test_startup_reuses_the_list_question_key_after_a_result_write_failure(self) -> None:
         root = self.root / "reviews"
@@ -3699,6 +4065,41 @@ observer.observe(original.parentNode,{childList:true});
         self.assertEqual(saved.state, delivery_state.QuestionSendState.SENT)
         self.assertEqual(saved.attempt_id, sending.attempt_id)
 
+    def test_ask_sends_to_the_keeper_when_another_producer_has_the_item(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Check a producer's work")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        words = "Which check passed?"
+        submission = list_page.submit(root, urlencode(self.fields(item, "question", words=words)), status)
+        markup = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
+        self.assertIn(words, markup)
+        for text in ("Resend question", "ready to send", "may not have reached", "Question not delivered."):
+            self.assertNotIn(text, markup)
+        assert isinstance(submission, list_page.ListQuestionDelivery)
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            list_page.deliver(submission)
+        path = status.path(submission.delivery.page, submission.delivery.row)
+        record = change_page.read_question_attempt(path)
+        self.assertIs(record.state, delivery_state.QuestionSendState.SENT)
+        send.assert_called_once_with(MORTY.id, record.message, record.message_id)
+
+    def test_question_start_error_records_a_failure_and_logs_one_line(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Keep the failed question")
+        submission = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
+        assert isinstance(submission, list_page.ListQuestionDelivery)
+        with (patch.object(change_page, "_authorize_question_send", side_effect=RuntimeError("Cannot verify\nsource")),
+              patch.object(change_page, "send_question") as send, redirect_stderr(io.StringIO()) as output):
+            list_page.deliver(submission)
+        send.assert_not_called()
+        path = status.path(submission.delivery.page, submission.delivery.row)
+        record = change_page.read_question_attempt(path)
+        self.assertIs(record.state, delivery_state.QuestionSendState.FAILED)
+        self.assertIsInstance(record.owner, delivery_state.NoQuestionSendOwner)
+        self.assertEqual(output.getvalue().splitlines(), [f"review-links question {submission.delivery.row}: Cannot verify source"])
+
     def test_a_failed_list_question_alerts_the_item_showrunner(self) -> None:
         root = self.root / "reviews"
         item = self.add("Ask about the repair", owner=OTHER.id)
@@ -3716,7 +4117,7 @@ observer.observe(original.parentNode,{childList:true});
         self.assertIn("Which check passed?", cast(str, alert.call_args.args[2]))
         fallback.assert_not_called()
 
-    def test_question_result_write_failure_leaves_the_saved_question_available_for_resend(self) -> None:
+    def test_question_result_write_failure_keeps_the_saved_question(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         first_jobs: dict[str, the_list.ListItem] = {}
@@ -3752,7 +4153,8 @@ observer.observe(original.parentNode,{childList:true});
                 second = first_jobs[message_id]
                 self.assertEqual(list_page.saved_action_state(MORTY.id, second.id, status=recovering)["waiting_for_answer"], "true")
                 markup = list_page.render(root, include_counts=False, status=recovering).decode().split('<script>', 1)[0]
-                self.assertIn('Question Q1 may not have reached morty', markup)
+                self.assertIn('Question Q1 — waiting for an answer', markup)
+                self.assertNotIn("Question not delivered.", markup)
                 self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root))), 2)
             return transport.send(recipient, message, message_id)
 
@@ -3764,7 +4166,7 @@ observer.observe(original.parentNode,{childList:true});
         self.assertEqual(len(transport.calls), 2)
         self.assertEqual(len(transport.receipts), 2)
 
-    def test_accepted_question_has_no_resend_after_job_cleanup_fails(self) -> None:
+    def test_accepted_question_sends_once_when_job_cleanup_fails(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         item = self.add("The accepted question")
@@ -3779,129 +4181,11 @@ observer.observe(original.parentNode,{childList:true});
             restarted = change_page.DeliveryStatus(root)
             change_page.recover_review_messages(restarted)
             list_page.deliver(list_page.submit(root, urlencode(fields), restarted))
-            current = the_list.load(MORTY.id, item.id)
-            list_page.deliver(list_page.submit(root, urlencode(self.fields(current, "resend-Q1")), restarted))
         markup = list_page.render(root, include_counts=False).decode().split('<script>', 1)[0]
         self.assertIn('data-waiting-for-answer="true"', markup)
         self.assertNotIn('value="resend-Q1"', markup)
         self.assertEqual(len(transport.calls), 1)
         self.assertEqual(len(transport.receipts), 1)
-
-    def test_resend_repairs_a_mismatch_after_the_previous_sender_finishes(self) -> None:
-        root = self.root / "reviews"
-        status = change_page.DeliveryStatus(root)
-        item = self.add("Repair the delivery")
-        words = "Which check passed?"
-        asked = list_page.submit(root, urlencode(self.fields(item, "question", words=words)), status)
-        assert isinstance(asked, list_page.ListQuestionDelivery)
-        delivery = asked.delivery
-        assert isinstance(delivery, change_page.PageQuestionSend)
-        assert isinstance(delivery.job, change_page.QuestionJob)
-        path = status.path(delivery.page, delivery.row)
-        saved = delivery.job.record
-        damaged = replace(saved, source=replace(saved.source, words="A different question."), recipient_id=OTHER.id,
-                          message="A different message.", resend_requests=("earlier-request",))
-        with status.locked():
-            change_page.advance_question_attempt(path, saved, damaged)
-        damaged = change_page.read_question_attempt(path)
-        current = the_list.load(MORTY.id, item.id)
-        fields = urlencode(self.fields(current, "resend-Q1", words="Ignore these words."))
-        active = "Resend is unavailable while the previous sender is active."
-        body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
-        self.assertIn('data-waiting-for-answer="false"', body)
-        self.assertIn(active, body)
-        self.assertNotIn('value="resend-Q1"', body)
-        with patch.object(change_page, "send_question") as send:
-            with self.assertRaisesRegex(question_record.AnswerRefused, re.escape(active)):
-                list_page.deliver(list_page.submit(root, fields, status))
-            send.assert_not_called()
-        self.assertEqual(change_page.read_question_attempt(path), damaged)
-
-        receipt = delivery_state.QuestionSendReceipt("sent", "Receipt for the wrong question.")
-        with status.locked():
-            change_page.advance_question_attempt(path, damaged, replace(
-                damaged, state=delivery_state.QuestionSendState.SENT,
-                owner=delivery_state.NoQuestionSendOwner(), receipt=receipt))
-        _ = delivery.job.release()
-        previous = change_page.read_question_attempt(path)
-        body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
-        self.assertIn('data-waiting-for-answer="false"', body)
-        self.assertIn('value="resend-Q1">Resend question Q1</button>', body)
-        message = (f'List item {item.number}: Ask question\n{item.title}\n{words}\n'
-                   + 'Answer with this command: ~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py '
-                   + f'answer {item.id} --question Q1 --text "<answer>"')
-        outcome = (send_result.UnconfirmedSendOutcome(), "No reply from transport.")
-        with patch.object(change_page, "send_question", return_value=outcome) as send:
-            for _ in range(2):
-                list_page.deliver(list_page.submit(root, fields, status))
-            send.assert_called_once_with(MORTY.id, message, saved.message_id)
-        repaired = change_page.read_question_attempt(path)
-        self.assertEqual(repaired.source, saved.source)
-        self.assertEqual(repaired.recipient_id, MORTY.id)
-        self.assertEqual(repaired.message, message)
-        self.assertNotEqual(repaired.attempt_id, previous.attempt_id)
-        self.assertGreater(repaired.revision, previous.revision)
-        self.assertIsInstance(repaired.owner, delivery_state.NoQuestionSendOwner)
-        self.assertIsInstance(repaired.receipt, delivery_state.NoQuestionSendReceipt)
-        self.assertTrue(repaired.earlier_unconfirmed)
-        self.assertEqual(repaired.resend_requests, ("earlier-request", parse_qs(fields)["request"][0]))
-        self.assertEqual(repaired.state, delivery_state.QuestionSendState.UNKNOWN)
-        with status.locked(), self.assertRaisesRegex(ValueError, "stale"):
-            change_page.advance_question_attempt(path, damaged, previous)
-        self.assertEqual(change_page.read_question_attempt(path), repaired)
-        self.assertEqual(the_list.load(MORTY.id, item.id), current)
-        with (patch.object(staff, "caller_identity", return_value=MORTY.current_session),
-              redirect_stdout(io.StringIO())):
-            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The check passed."]), 0)
-        answer = the_list.load(MORTY.id, item.id).questions[0].answer
-        assert answer is not None
-        self.assertEqual(answer.text, "The check passed.")
-
-    def test_resend_uses_a_released_lock_when_the_previous_process_is_unreadable(self) -> None:
-        root = self.root / "reviews"
-        status = change_page.DeliveryStatus(root)
-        item = self.add("Check the previous sender")
-        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check finished?")), status)
-        assert isinstance(asked, list_page.ListQuestionDelivery)
-        delivery = asked.delivery
-        assert isinstance(delivery, change_page.PageQuestionSend)
-        assert isinstance(delivery.job, change_page.QuestionJob)
-        claimed = delivery.job.record
-        assert isinstance(claimed.owner, delivery_state.QuestionSendOwner)
-        previous_owner = replace(claimed.owner, pid=claimed.owner.pid + 1)
-        path = status.path(delivery.page, delivery.row)
-        with status.locked():
-            change_page.advance_question_attempt(path, claimed, replace(
-                claimed, owner=previous_owner, state=delivery_state.QuestionSendState.SENDING))
-        fields = urlencode(self.fields(the_list.load(MORTY.id, item.id), "resend-Q1"))
-        process_identity = process_start.process_start
-
-        def read_identity(pid: int) -> process_start.ProcessStart:
-            if pid == previous_owner.pid:
-                return process_start.Unreadable("Cannot read the previous sender.")
-            return process_identity(pid)
-
-        blocked = "Resend is unavailable until the sender can be checked."
-        with (patch.object(process_start, "process_start", side_effect=read_identity) as identity,
-              patch.object(change_page, "send_question", return_value=question_outcome()) as send):
-            markup = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
-            self.assertIn('data-waiting-for-answer="false"', markup)
-            self.assertIn(blocked, markup)
-            self.assertNotIn('value="resend-Q1"', markup)
-            with self.assertRaisesRegex(question_record.AnswerRefused, re.escape(blocked)):
-                list_page.deliver(list_page.submit(root, fields, status))
-            send.assert_not_called()
-            _ = delivery.job.release()
-            self.assertTrue(Path(cast(str, delivery.job.lock.name)).is_file())
-            identity.reset_mock()
-            markup = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
-            self.assertNotIn(blocked, markup)
-            self.assertIn('value="resend-Q1">Resend question Q1</button>', markup)
-            identity.assert_not_called()
-            list_page.deliver(list_page.submit(root, fields, status))
-            list_page.deliver(list_page.submit(root, fields, status))
-            send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
-        self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
 
     def test_a_title_edit_preserves_ready_sent_and_queued_questions(self) -> None:
         root = self.root / "reviews"
@@ -3981,63 +4265,12 @@ observer.observe(original.parentNode,{childList:true});
                     send.assert_not_called()
                     self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "false")
                     body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
-                    self.assertIn('value="resend-Q1">Resend question Q1</button>', body)
+                    self.assertNotIn('value="resend-', body)
                     current = the_list.load(MORTY.id, item.id)
-                    fields = urlencode(self.fields(current, "resend-Q1"))
-                    for _ in range(2):
-                        list_page.deliver(list_page.submit(root, fields, status))
-                    send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
-                self.assertEqual(the_list.load(MORTY.id, item.id), current)
-
-    def test_a_malformed_job_id_keeps_sender_exclusion_until_the_lock_releases(self) -> None:
-        root = self.root / "reviews"
-        status = change_page.DeliveryStatus(root)
-        item = self.add("Keep the sender lock")
-        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check finished?")), status)
-        assert isinstance(asked, list_page.ListQuestionDelivery)
-        delivery = asked.delivery
-        assert isinstance(delivery, change_page.PageQuestionSend)
-        assert isinstance(delivery.job, change_page.QuestionJob)
-        lock_path = Path(cast(str, delivery.job.lock.name))
-        path = status.path(delivery.page, delivery.row)
-        claimed = delivery.job.record
-        current = the_list.load(MORTY.id, item.id)
-        fields = urlencode(self.fields(current, "resend-Q1"))
-        reopened = change_page.DeliveryStatus(root)
-        blocked = "Resend is unavailable while the previous sender is active."
-
-        def send_with_damage(_recipient: staff.StaffId, _message: str, _message_id: str
-                             ) -> tuple[send_result.ConfirmedSendOutcome, str]:
-            with status.locked():
-                sending = change_page.read_question_attempt(path)
-                assert isinstance(sending.owner, delivery_state.QuestionSendOwner)
-                change_page.publish_question_attempt(path, replace(sending, owner=replace(sending.owner, job_id="damaged")))
-            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=reopened)["waiting_for_answer"], "false")
-            body = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
-            self.assertIn(blocked, body)
-            self.assertNotIn('value="resend-Q1"', body)
-            with self.assertRaisesRegex(question_record.AnswerRefused, re.escape(blocked)):
-                _ = list_page.submit(root, fields, reopened)
-            return question_outcome()
-
-        with patch.object(change_page, "send_question", side_effect=send_with_damage) as send:
-            list_page.deliver(asked)
-            send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
-        with self.assertRaisesRegex(ValueError, "Invalid delivery field job_id"):
-            _ = change_page.read_question_attempt(path)
-        body = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
-        self.assertIn('value="resend-Q1">Resend question Q1</button>', body)
-        outcome = (send_result.UnconfirmedSendOutcome(), "No reply from transport.")
-        with patch.object(change_page, "send_question", return_value=outcome) as send:
-            retried = list_page.submit(root, fields, reopened)
-            assert isinstance(retried, list_page.ListQuestionDelivery)
-            assert isinstance(retried.delivery, change_page.PageQuestionSend)
-            assert isinstance(retried.delivery.job, change_page.QuestionJob)
-            self.assertEqual(Path(cast(str, retried.delivery.job.lock.name)), lock_path)
-            list_page.deliver(retried)
-            list_page.deliver(list_page.submit(root, fields, reopened))
-            send.assert_called_once_with(MORTY.id, claimed.message, claimed.message_id)
-        self.assertEqual(the_list.load(MORTY.id, item.id), current)
+                    fields = urlencode(self.fields(current, "question", words=words))
+                    list_page.deliver(list_page.submit(root, fields, status))
+                    send.assert_not_called()
+                self.assertEqual(the_list.load(MORTY.id, item.id).questions, current.questions)
 
     def test_mixed_question_results_keep_counts_and_unread_in_agreement(self) -> None:
         root = self.root / "reviews"
@@ -4059,18 +4292,15 @@ observer.observe(original.parentNode,{childList:true});
         body = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
         self.assertIn('data-waiting-for-answer="false"', body)
         self.assertIn('aria-label="Unread update"', body)
-        self.assertIn("Question Q3 did not reach morty", body)
-        self.assertIn("Question Q4 may not have reached morty", body)
-        for identity in ("Q1", "Q2", "Q3", "Q4"):
-            self.assertEqual(f'value="resend-{identity}"' in body, identity in ("Q3", "Q4"))
+        self.assertEqual(body.count("Question not delivered."), 1)
+        self.assertNotIn('value="resend-', body)
+        self.assertIn('data-unread-answer="true"', body)
+        self.assertRegex(body, r'data-filter-value="needs-me"[^>]*data-filter-count="1"')
         self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root))), 1)
         self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=reopened)["unread"], "true")
-        current = the_list.load(MORTY.id, item.id)
-        fields = self.fields(current, "resend-Q4")
-        with patch.object(change_page, "send_question", return_value=cases[-1][1]) as send:
-            for _ in range(2):
-                list_page.deliver(list_page.submit(root, urlencode(fields), reopened))
-            send.assert_called_once()
+        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        read = list_page.render(root, include_counts=False, status=reopened).decode().split("<script>", 1)[0]
+        self.assertRegex(read, r'data-filter-value="needs-me"[^>]*data-filter-count="0"')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_moves_a_saved_question_to_morty_answering(self) -> None:
@@ -4773,11 +5003,11 @@ window.fetch=async(_url,options)=>{
         return the_list.load(MORTY.id, item.id)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_keeps_row_focus_through_refresh_when_an_older_question_needs_resend(self) -> None:
+    def test_browser_keeps_row_focus_through_refresh_when_an_older_question_failed(self) -> None:
         _ = self.add_item_with_failed_question()
         self.browser_action_sequence(r"""
  const ask=form.querySelector('[value="question"]'),input=form.elements.words;
- check(Boolean(form.querySelector('[value="resend-Q1"]')),'The older question needs a resend');
+ check(Boolean(row.querySelector('[data-question-delivery-failed]')),'The older question has a delivery failure');
  refreshMarkup=document.documentElement.outerHTML;
  input.value='Which check is next?';input.dispatchEvent(new Event('input'));
  ask.focus();
@@ -4796,7 +5026,7 @@ window.fetch=async(_url,options)=>{
         _ = self.add("The next unread item", number=2)
         self.browser_action_sequence(r"""
  onlyUnread();
- check(!row.hidden && form.querySelector('[value="resend-Q1"]'),'Unread shows the item with a failed question');
+ check(!row.hidden && row.querySelector('[data-question-delivery-failed]'),'Unread shows the item with a failed question');
  const snapshot=document.documentElement.cloneNode(true);
  snapshot.querySelector('[data-number="1"]').dataset.unread='false';
  refreshMarkup=snapshot.outerHTML;
@@ -5172,7 +5402,12 @@ window.fetch=async(_url,options)=>{
                 console_shell = console_shell.replace(b"</body>", b'<img hidden src="/complete"></body>')
         host_page = (f'<!doctype html><style>iframe{{border:0;width:100%;height:{height}}}'
                      + 'iframe[hidden]{display:block;visibility:hidden}</style>'
-                     + f'<iframe src="{html.escape(frame_url)}"></iframe><img hidden src="/complete">').encode()
+                     + f'<iframe data-src="{html.escape(frame_url)}"></iframe><img hidden src="/complete">'
+                     + """<script>
+// Set the frame size before the List starts its observers.
+const frame=document.querySelector('iframe');
+requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src;}));
+</script>""").encode()
         results: list[list[str]] = []
         complete = threading.Event()
 
@@ -5214,14 +5449,10 @@ window.fetch=async(_url,options)=>{
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                profile = self.root / "answer-profile"
-                profile.mkdir(exist_ok=True)
                 window_height = max(900, (viewport_height or 0) + 32)
-                start_path = frame_url if console_fragment or viewport_width is not None else "/"
-                browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                    '--window-size', f'{viewport_width or 1280},{window_height}', '--screenshot',
-                    str(self.root / 'answer.png'), f'http://127.0.0.1:{server.server_port}{start_path}'],
-                    capture_output=True, text=True, timeout=45)
+                destination = frame_url if console_fragment or viewport_width is not None else "/"
+                browser = self.firefox_view(f"http://127.0.0.1:{server.server_port}{destination}",
+                                           None, viewport_width or 1280, window_height, complete)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:
@@ -5293,11 +5524,11 @@ const change=async path=>{
   check(/(?:EST|EDT)$/.test(waitingQuestion?.querySelector('time[datetime]')?.textContent),
    'the waiting question shows the asked time in the user zone');
   await change('/answer');
-  await open('working','','1');
+  await open('needs-me','','1');
   const unreadQuestion=row().querySelector('.list-panel [data-question="Q1"]');
   check(!row().hidden && hasDot() && unreadQuestion?.textContent.includes('Which check passed?') &&
    unreadQuestion.textContent.includes('The gate passed.') && !row().querySelector('[data-open-question-note]'),
-   'Working with Unread only shows the answer in the panel and clears the question note.');
+   'Needs me with Unread only shows the answer in the panel and clears the question note.');
   check(unreadQuestion?.querySelectorAll('time[datetime]').length===2 &&
    unreadQuestion.querySelector('.question-unread')?.textContent==='Unread',
    'the unread answer shows both times and the Unread mark');
@@ -5327,7 +5558,7 @@ const change=async path=>{
   check(!row().querySelector('[data-detail]').hidden && nextQuestion(row()) && firstAnswer(row()),
    'a direct link shows both the waiting question and the first answer in the log');
   const {loggedAt}=await change('/second-answer');
-  await open('working','','1');
+  await open('all','','1');
   const original=row(), doc=frame.contentDocument;
   const panelQuestion=original.querySelector('[data-question="Q2"]');
   const askedAt=Date.parse(panelQuestion.querySelector('time').dateTime);
@@ -5355,11 +5586,11 @@ const change=async path=>{
   const chip=(filter,value)=>doc.querySelector('[data-filter-row="'+filter+'"] [data-filter-value="'+value+'"]');
   const count=(filter,value)=>Number(chip(filter,value).dataset.filterCount);
   const shown=()=>doc.querySelector('table').querySelectorAll('[data-list-item]:not([hidden])').length;
-  check(shown()===2 && count('owner','all')===2 && count('producer','all')===2 && count('show','working')===2,
-   'The Owner, Producer, and Working counts include the row kept open after the read.');
+  check(shown()===2 && count('owner','all')===2 && count('producer','all')===2 && count('show','all')===2,
+   'The Owner, Producer, and Show All counts include the row kept open after the read.');
   check(doc.querySelector('[data-list-count]').textContent.startsWith('2 of 2 items shown'),
    'The total includes the row kept open after the read.');
-  check(count('show','all')===1,'The Show All count reflects the end of the exception when Show changes.');
+  check(count('show','working')===1,'The Working count excludes the read row when Show changes.');
   chip('owner','staff:'+doc.querySelector('[data-number="2"]').dataset.owner).click();
   const allOwners=count('owner','all');
   chip('owner','all').click();
@@ -5416,11 +5647,8 @@ const change=async path=>{
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                profile = self.root / "ask-profile"
-                profile.mkdir()
-                browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                    '--window-size', '1440,900', '--screenshot', str(self.root / 'ask.png'),
-                    f'http://127.0.0.1:{server.server_port}/proof'], capture_output=True, text=True, timeout=45)
+                browser = self.firefox_view(f'http://127.0.0.1:{server.server_port}/proof',
+                                            None, 1440, 900, complete)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:
@@ -5496,7 +5724,7 @@ window.fetch=async(path,options={})=>{
                              window_size=window_size, in_frame=in_frame)
 
     def browser_actions(self, markup: str, setup: str, probe: str, *,
-                        reduced_motion: bool = False, virtual_time_ms: int = 1500,
+                        reduced_motion: bool = False,
                         window_size: tuple[int, int] | None = None, in_frame: bool = False) -> None:
         page = self.root / 'actions.html'
         _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
@@ -5504,12 +5732,7 @@ window.fetch=async(path,options={})=>{
             page = self.root / 'actions-console.html'
             _ = page.write_text('<!doctype html><button id="console-nav">Console navigation</button>'
                                 + '<iframe title="The List" src="actions.html"></iframe>')
-        result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
-            *(['--force-prefers-reduced-motion'] if reduced_motion else []),
-            *([f'--window-size={window_size[0]},{window_size[1]}'] if window_size else []),
-            *(['--allow-file-access-from-files'] if in_frame else []),
-            '--user-data-dir=' + str(self.root / 'chrome-actions'), f'--virtual-time-budget={virtual_time_ms}',
-            '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
+        result = self.chrome().dom(page, "probe-results", reduced_motion=reduced_motion, window_size=window_size)
         self.assertEqual(result.returncode, 0, result.stderr)
         marker = '<p id="probe-results">'
         self.assertIn(marker, result.stdout[-3000:], 'The browser must complete the item action checks.')
@@ -5743,9 +5966,7 @@ window.fetch=async(_path,options={})=>{
                 page = self.root / f"{action}-{unread}.html"
                 _ = page.write_text(markup.replace('<head>', '<head>' + setup.replace('UNREAD', unread), 1).replace('</body>',
                     probe.replace('ACTION', action).replace('NOTICE', notice).replace('EXPECTED_UNREAD', unread) + '</body>'))
-                result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
-                    '--user-data-dir=' + str(self.root / f'chrome-{action}-{unread}'), '--virtual-time-budget=1000',
-                    '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
+                result = self.chrome().dom(page, "probe-result", reduced_motion=False, window_size=None)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue('<p id="probe-result">PASS</p>' in result.stdout,
                                 f"The {action} action must show the saved unread state and apply the Unread filter.")
@@ -5878,7 +6099,14 @@ window.fetch=async(_path,options={})=>{
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_shared_page_status_uses_the_real_list_loader(self) -> None:
         _ = self.fixture_items()
-        assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
+
+        def screenshot(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            path = Path(arguments[arguments.index("--screenshot") + 1])
+            width, _, height = arguments[arguments.index("--window-size") + 1].partition(",")
+            return self.firefox_view(arguments[-1], path, int(width), int(height))
+
+        with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
+            assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_sort_filters_hash_refresh_open_rows_and_phone_cards(self) -> None:
@@ -6398,7 +6626,9 @@ try{
  check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===5,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
- if(innerWidth<960){
+ check((innerWidth<960)===(FIXTURE_WIDTH<960),'the browser uses the requested layout');
+ if(FIXTURE_WIDTH===390) check(innerWidth===390,'The phone cards use the 390 px viewport.');
+ if(FIXTURE_WIDTH<960){
   check(getComputedStyle(visible()[0]).display==='block','a phone row is a card');
   const card=number=>rows().find(row=>row.dataset.number===number);
   const cell=(number,label,part=null)=>getComputedStyle(card(number).querySelector('td[data-label="'+label+'"]'),part);
@@ -6418,7 +6648,8 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                         {"latest_status": f"The fixture uses a width of {width} pixels."}, source="morty")
                 markup = list_page.render(self.root / "reviews").decode()
                 setup_for_width = setup.replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
-                page = markup.replace('<head>', '<head>' + setup_for_width, 1).replace('</body>', probe + '</body>').encode()
+                probe_for_width = probe.replace('FIXTURE_WIDTH', str(width))
+                page = markup.replace('<head>', '<head>' + setup_for_width, 1).replace('</body>', probe_for_width + '</body>').encode()
                 root = self.root / "reviews"
                 results: list[list[str]] = []
                 complete = threading.Event()
@@ -6460,12 +6691,9 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     try:
-                        profile = self.root / f'profile-{width}'
-                        profile.mkdir()
                         with patch.object(change_page, "send_to_staff") as sends:
-                            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                                '--window-size', f'{width},900', '--screenshot', str(self.root / f'page-{width}.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                            done = self.firefox_view(f'http://127.0.0.1:{server.server_port}/',
+                                                     None, width, 900, complete)
                             self.assertEqual(done.returncode, 0, done.stderr)
                             self.assertEqual(results, [[]])
                             sends.assert_called_once()

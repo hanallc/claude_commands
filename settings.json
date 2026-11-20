@@ -183,6 +183,7 @@
     "additionalDirectories": [
       "~/Library",
       "~/rust",
+      "~/worktrees",
       "/tmp",
       "/tmp/claude/",
       "~/.claude/projects",
@@ -351,6 +352,10 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-ste.py\""
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-review-hold.py\""
           }
         ]
       },
@@ -476,6 +481,7 @@
         "~/Library/Application Support",
         "~/Library/Caches/Mozilla.sccache",
         "~/rust",
+        "~/worktrees",
         "/private/tmp",
         "/tmp"
       ]

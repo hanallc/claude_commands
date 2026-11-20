@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 import json
@@ -12,7 +12,7 @@ from pathlib import Path
 from statistics import median
 from typing import cast
 
-from scripts.aws_target import ledger
+from scripts.aws_target import hana_spend, ledger
 from scripts.aws_target.ledger import gate_vcpus as gate_vcpus
 from scripts.aws_target.measurement import number
 from scripts.lib import conf
@@ -22,6 +22,7 @@ EVERY_KIND = tuple(mode for mode, _label in KINDS)
 _MODE_ALIASES = {'gate': 'merge-gate', 'test-affected': 'targeted-test'}
 # The mode of a launch request written before launch rows recorded a mode.
 NO_MODE = ''
+_NO_RESERVED_HOURS = Decimal(0)
 
 
 def _run_kind(mode: str) -> str:
@@ -156,16 +157,36 @@ def spot_bills(book: ledger.CostLedger, start: datetime, end: datetime) -> dict[
     return bills_from_readings(billed_readings(book, start, end))
 
 
+def _spot_usage_key(usage_type: str) -> tuple[str, str] | None:
+    size = usage_type.partition('SpotUsage:')[2]
+    region = ledger.usage_region(usage_type, 'SpotUsage:')
+    return (size, region) if size and region is not None else None
+
+
 def bills_from_readings(readings: Sequence[ledger.ChargeRead]) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
     bills: dict[tuple[str, str, str], tuple[Decimal, Decimal]] = {}
     for reading in readings:
         for usage in reading.usage_types:
-            size = usage.usage_type.partition('SpotUsage:')[2]
-            region = ledger.usage_region(usage.usage_type, 'SpotUsage:')
-            if size and region is not None:
+            key = _spot_usage_key(usage.usage_type)
+            if key is not None:
+                size, region = key
                 usd, hours = bills.get((size, region, reading.day), (Decimal(0), Decimal(0)))
                 bills[size, region, reading.day] = usd + usage.usd, hours + usage.quantity
     return bills
+
+
+def hana_billed_hours(directory: Path, day: date) -> Decimal | None:
+    """Read Hana's billed Spot hours for a UTC day, or return None when the bill is unavailable."""
+    path = directory / 'charges' / (day.isoformat() + '.json')
+    try:
+        bill = ledger.read_strict_charge(path)
+        if not ledger.matches_utc_charge_day(path.name, bill, day):
+            return None
+    except (OSError, ValueError, ArithmeticError):
+        return None
+    settings = hana_spend.read_settings(conf.read_or_repository('hana_aws'))
+    keys = {(size, settings.region) for size in (settings.instance_type, *settings.fallback_instance_types)}
+    return sum((row.quantity for row in bill.usage_types if _spot_usage_key(row.usage_type) in keys), Decimal('0.0'))
 
 
 def paid_per_hour(bills: dict[tuple[str, str, str], tuple[Decimal, Decimal]]) -> dict[tuple[str, str], Decimal]:
@@ -205,38 +226,58 @@ def billed_cost_per_run(runs: list[FinishedGateRun], allocations: dict[BilledKey
 
 
 @dataclass(frozen=True)
+class SpotHoursScope:
+    """The checked machine types and the types eligible for Hana hours in each region."""
+    sizes: tuple[str, ...]
+    hana_sizes_by_region: Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
 class HoursCheck:
-    """Billed Spot hours against the recorded box hours of one type and region, on the days with a bill."""
+    """Compare billed Spot hours with recorded and reserved hours on billed days."""
     # None when no day has a bill read; box_hours then counts every day.
     billed_hours: Decimal | None
     box_hours: Decimal
-    # abs(billed - box) / box; None without a bill or without box hours.
+    # Distance from the range, divided by the bound on that side.
     hours_gap_ratio: Decimal | None
-    # The ratio is above the limit, or AWS billed hours with no recorded box.
     hours_gap_over: bool
+    hana_reserved_hours: Decimal = _NO_RESERVED_HOURS
 
 
-def hours_check(billed: Decimal | None, box: Decimal, max_ratio: Decimal) -> HoursCheck:
+def hours_check(billed: Decimal | None, box: Decimal, max_ratio: Decimal, *,
+                hana_reserved_hours: Decimal = _NO_RESERVED_HOURS) -> HoursCheck:
+    if hana_reserved_hours > 0 and billed is not None and billed >= box:
+        high = box + hana_reserved_hours
+        ratio = max(billed - high, Decimal(0)) / high
+        return HoursCheck(billed, box, ratio, billed > high * (1 + max_ratio), hana_reserved_hours)
     ratio = abs(billed - box) / box if billed is not None and box > 0 else None
     over = billed is not None and (ratio > max_ratio if ratio is not None else billed > 0)
-    return HoursCheck(billed, box, ratio, over)
+    return HoursCheck(billed, box, ratio, over, hana_reserved_hours)
+
+
+def _utc_day_hours(left: int, right: int, start: datetime, end: datetime) -> Iterator[tuple[str, Decimal]]:
+    left = max(left, int(start.timestamp() // 86400) * 86400)
+    right = min(right, int(end.timestamp() // 86400) * 86400)
+    while left < right:
+        stop = min(right, (left // 86400 + 1) * 86400)
+        yield datetime.fromtimestamp(left, UTC).date().isoformat(), Decimal(stop - left) / 3600
+        left = stop
 
 
 def box_hours(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str) -> dict[DayKey, Decimal]:
+    return _box_hours(book.read_snapshot(), start, end, home, builder)
+
+
+def _box_hours(snapshot: ledger.LedgerEvidence, start: datetime, end: datetime, home: str,
+               builder: str) -> dict[DayKey, Decimal]:
     """The recorded box hours of each type, region and UTC day in [start, end).
 
     A gate counts from its reservation to its confirmed end; open and absent gates do not count.
     The builder box of type builder in the home region counts from each running observation to the next other state."""
-    first, last = start.date().isoformat(), end.date().isoformat()
     hours: dict[DayKey, Decimal] = defaultdict(Decimal)
     def add(size: str, region: str, left: int, right: int) -> None:
-        while left < right:
-            day = datetime.fromtimestamp(left, UTC).date()
-            stop = min(right, int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp()) + 86400)
-            if first <= day.isoformat() < last:
-                hours[size, region, day.isoformat()] += Decimal(stop - left) / 3600
-            left = stop
-    snapshot = book.read_snapshot()
+        for day, duration in _utc_day_hours(left, right, start, end):
+            hours[size, region, day] += duration
     for reservation in snapshot.gate_reservations:
         if isinstance(reservation.state, ledger.GateTerminated) and reservation.instance_type:
             add(reservation.instance_type, reservation.region or home, reservation.at, reservation.state.at)
@@ -254,33 +295,49 @@ def box_hours(book: ledger.CostLedger, start: datetime, end: datetime, home: str
 
 
 def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
-                     sizes: Collection[str], max_ratio: Decimal) -> dict[DayKey, HoursCheck]:
-    """The hours check of each type in sizes, region and UTC day in [start, end).
+                     scope: SpotHoursScope, max_ratio: Decimal) -> dict[DayKey, HoursCheck]:
+    """Check each type in scope by region and UTC day in the window.
 
-    A day with a bill read and no Spot hours for the type bills 0 hours; a day without a read has no bill."""
+    A bill without Spot usage for a type counts as zero hours."""
     readings = billed_readings(book, start, end)
     read_days = {reading.day for reading in readings}
     bills = bills_from_readings(readings)
-    boxes = box_hours(book, start, end, home, builder)
-    keys = {key for key in boxes.keys() | bills.keys() if key[0] in sizes}
+    snapshot = book.read_snapshot()
+    boxes = _box_hours(snapshot, start, end, home, builder)
+    reserved_by_region: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
+    seen_generations: set[int] = set()
+    now = int(end.timestamp())
+    for exposure in snapshot.hana_compute:
+        if exposure.generation in seen_generations or not ledger.hana_compute_counts(snapshot, exposure):
+            continue
+        seen_generations.add(exposure.generation)
+        if exposure.region not in scope.hana_sizes_by_region:
+            continue
+        stop = min(exposure.state.at, now) if isinstance(exposure.state, ledger.HanaExposureClosed) else now
+        for day, duration in _utc_day_hours(exposure.at, stop, start, end):
+            reserved_by_region[exposure.region, day] += duration
+    reserved = {(size, region, day): duration for (region, day), duration in reserved_by_region.items()
+                for size in scope.hana_sizes_by_region[region]}
+    keys = {key for key in boxes.keys() | bills.keys() | reserved.keys() if key[0] in scope.sizes}
     return {key: hours_check(bills[key][1] if key in bills else Decimal(0) if key[2] in read_days else None,
-                             boxes.get(key, Decimal(0)), max_ratio) for key in keys}
+                             boxes.get(key, Decimal(0)), max_ratio,
+                             hana_reserved_hours=reserved.get(key, _NO_RESERVED_HOURS)) for key in keys}
 
 
 def hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
-                 sizes: Collection[str], max_ratio: Decimal) -> dict[tuple[str, str], HoursCheck]:
+                 scope: SpotHoursScope, max_ratio: Decimal) -> dict[tuple[str, str], HoursCheck]:
     """The hours check of each type in sizes and region, summed over the days in [start, end) with a bill."""
     billed: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
     unbilled: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
-    for (size, region, _day), check in day_hours_checks(book, start, end, home, builder, sizes, max_ratio).items():
+    daily = day_hours_checks(book, start, end, home, builder, scope, max_ratio)
+    for (size, region, _day), check in daily.items():
         (unbilled if check.billed_hours is None else billed)[size, region].append(check)
     checks: dict[tuple[str, str], HoursCheck] = {}
     for key in billed.keys() | unbilled.keys():
-        if key in billed:
-            checks[key] = hours_check(sum((day.billed_hours or Decimal(0) for day in billed[key]), Decimal(0)),
-                                      sum((day.box_hours for day in billed[key]), Decimal(0)), max_ratio)
-        else:
-            checks[key] = HoursCheck(None, sum((day.box_hours for day in unbilled[key]), Decimal(0)), None, False)
+        days = billed[key] if key in billed else unbilled[key]
+        billed_hours = sum((day.billed_hours or Decimal(0) for day in days), Decimal(0)) if key in billed else None
+        checks[key] = hours_check(billed_hours, sum((day.box_hours for day in days), Decimal(0)), max_ratio,
+                                 hana_reserved_hours=sum((day.hana_reserved_hours for day in days), Decimal(0)))
     return checks
 
 
