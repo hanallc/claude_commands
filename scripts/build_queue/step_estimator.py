@@ -50,7 +50,6 @@ from scripts.build_queue.admission_records import (
     test_threads,
 )
 
-from scripts.lint import sweep_state
 from scripts.lint.build_shape import (BuildShape, NoBuildShape, CompileCountUnknown, NoCratesCompiled,
     StepEvidence, build_shape, index_step_evidence, recorded_build_shape, step_index)
 from scripts.lib.test_phase import TEST_STEPS
@@ -780,9 +779,11 @@ def is_fresh_test(root: Path, host: str, worktree: str, package: str,
             targets = {output_roots.target_directory, output_roots.build_directory}
             if any(not target.is_dir() for target in targets):
                 return False
-            state = sweep_state.state_dir()
+            from scripts.lint import tmp_sweep
+
+            state = tmp_sweep.state_dir()
             try:
-                deleted = cast(object, json.loads((state / sweep_state.TARGET_DELETES_NAME).read_text()))
+                deleted = cast(object, json.loads((state / tmp_sweep.TARGET_DELETES_NAME).read_text()))
             except FileNotFoundError:
                 deleted = {}
             if not isinstance(deleted, dict):

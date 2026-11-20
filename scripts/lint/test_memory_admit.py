@@ -36,7 +36,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 
-from scripts.lint import memory_admit as gate, sweep_state
+from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib import conf
@@ -1365,7 +1365,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         (self.worktree / "target").mkdir(parents=True)
         self.state = self.root / "sweep-state"
         self.state.mkdir()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {sweep_state.STATE_ENV: str(self.state)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(self.state)})))
         (self.root / "admission").mkdir()
         with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
@@ -1701,10 +1701,10 @@ class FreshTestPromiseTests(unittest.TestCase):
         _ = (other / "target-deletes.json").write_text(json.dumps({
             str(self.worktree / "target"): (NOW - timedelta(seconds=30)).timestamp(),
         }))
-        with patch.dict(os.environ, {sweep_state.STATE_ENV: str(other)}):
+        with patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(other)}):
             self.assertFalse(self.fresh())
         self.assertTrue(self.fresh())
-        with patch.object(sweep_state, "state_dir", return_value=other) as authority:
+        with patch.object(tmp_sweep, "state_dir", return_value=other) as authority:
             self.assertFalse(self.fresh())
             authority.assert_called_once_with()
 
@@ -5138,12 +5138,16 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
             return reply
 
         admission.server.reply_filter = capture
-        for command, options, step in (("check", ("--no-cache",), "check"), ("lint", ("--check",), "clippy")):
-            with self.subTest(command=command):
+        cases = (("check", ("--no-cache",), "check", ""), ("lint", ("--check",), "clippy", ""),
+                 ("check", ("--no-cache",), "check", str(self.root / "outer-copy")),
+                 ("lint", ("--check",), "clippy", str(self.root / "outer-copy")))
+        for command, options, step, enclosing_copy in cases:
+            with self.subTest(command=command, enclosing_copy=enclosing_copy):
                 grants.clear()
                 observed_grants.clear()
                 result = subprocess.run(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
-                    env=self.environment, start_new_session=True, capture_output=True, text=True,
+                    env={**self.environment, "COPIES_STEP_SOURCE": enclosing_copy},
+                    start_new_session=True, capture_output=True, text=True,
                     check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual([grant[0] for grant in grants], [step])
@@ -5303,7 +5307,12 @@ class ShellTests(unittest.TestCase):
     def test_launch_wait_limit_refuses_without_a_reservation(self) -> None:
         self.admission.free(0)
         self.admission.hold_starts()
-        result = self.shell('buildlog_wait_for_memory; printf "step started\\n"', launch=True, BUILDLOG_MEM_WAIT_LIMIT_S="1")
+        client_script = self.admission.root / "clocked-queue-client.py"
+        _ = client_script.write_text("from __future__ import annotations\nimport sys\n"
+            + inspect.getsource(queue_leave_client_main) + "\nsys.exit(queue_leave_client_main(sys.argv[1:]))\n")
+        result = self.shell('BUILDLOG_QUEUE_PLACE_SCRIPT="$TEST_QUEUE_CLIENT"; '
+            + 'buildlog_wait_for_memory; printf "step started\\n"', launch=True, BUILDLOG_MEM_WAIT_LIMIT_S="1",
+            TEST_QUEUE_CLIENT=str(client_script), PYTHONPATH=str(Path(__file__).resolve().parents[2]))
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr.count("waiting for memory since "), 1)
@@ -5420,10 +5429,11 @@ class ShellTests(unittest.TestCase):
 
 
 def queue_leave_client_main(argv: list[str]) -> int:
-    """Advance the client clock at its first held answer."""
+    """Advance the client clock when the service sends its first wait reply."""
+    import os
     import time
     from unittest.mock import patch
-    from scripts.build_queue import admission_client as client, admission_records, queue_place
+    from scripts.build_queue import admission_client as client, queue_place
 
     class HeldWaitClock:
         def __init__(self) -> None:
@@ -5441,16 +5451,29 @@ def queue_leave_client_main(argv: list[str]) -> int:
 
     clock = HeldWaitClock()
     report = client.WaitOutput.__call__
-    advanced = False
+    check_leave = client.AcquisitionRetry.left_queue
+    first_wait = False
+    checked = False
 
     def held(output: client.WaitOutput, reply: wire.Wait) -> None:
-        nonlocal advanced
+        nonlocal first_wait
         report(output, reply)
-        if not advanced:
-            clock.elapsed += admission_records.read_memory_config().running_pass_seconds
-            advanced = True
+        if not first_wait and argv[0] == "launch":
+            clock.elapsed += int(os.environ["BUILDLOG_MEM_WAIT_LIMIT_S"])
+        first_wait = True
 
-    with patch.object(client, "CLOCK", clock), patch.object(client.WaitOutput, "__call__", held):
+    def leave_on_wait(retry: client.AcquisitionRetry) -> bool:
+        nonlocal checked
+        if first_wait and not checked and retry.next_leave != float("inf"):
+            checked = True
+            retry.next_leave = clock.monotonic()
+            left = check_leave(retry)
+            retry.next_leave = float("inf")
+            return left
+        return check_leave(retry)
+
+    with (patch.object(client, "CLOCK", clock), patch.object(client.WaitOutput, "__call__", held),
+          patch.object(client.AcquisitionRetry, "left_queue", leave_on_wait)):
         return queue_place.main(argv)
 
 
@@ -5536,7 +5559,7 @@ class QueueLeaveTests(unittest.TestCase):
     def run_step(self, hook: str | None, sleep: str, step: str = 'run_once touch "$2"') -> subprocess.CompletedProcess[str]:
         self.admission.free(0)
         self.admission.hold_starts()
-        environment = dict(self.environment)
+        environment = {name: value for name, value in self.environment.items() if name != "NEXTEST_TEST_THREADS"}
         if hook is not None:
             environment["LINT_QUEUE_LEAVE_HOOK"] = f'echo poll >> "{self.calls}"; {hook}'
         waits = 0
@@ -5628,9 +5651,19 @@ class QueueLeaveTests(unittest.TestCase):
     def test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width(self) -> None:
         with (self.root / "build_admission.conf").open("a", encoding="utf-8") as configuration:
             _ = configuration.write("\n# whole: 0..\nnested_tokens=3\n")
-        pool, calls = self.root / "pool", self.root / "cargo-calls"
-        ran_args, reservation, waited = self.root / "args", self.root / "reservation", self.root / "waited"
-        listing = self.root / "test-list.json"
+        for inherited_width in ("", "1"):
+            with self.subTest(inherited_width=inherited_width), patch.dict(self.environment):
+                case = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.root)))
+                if inherited_width:
+                    self.environment["NEXTEST_TEST_THREADS"] = inherited_width
+                elif "NEXTEST_TEST_THREADS" in self.environment:
+                    del self.environment["NEXTEST_TEST_THREADS"]
+                self.assert_waiting_run_reserves_token_width(case)
+
+    def assert_waiting_run_reserves_token_width(self, case: Path) -> None:
+        pool, calls = case / "pool", case / "cargo-calls"
+        ran_args, reservation, waited = case / "args", case / "reservation", case / "waited"
+        listing = case / "test-list.json"
         _ = listing.write_text(json.dumps({"rust-suites": {"suite": {"testcases": {
             f"test_{index}": {"filter-match": {"status": "matches"}} for index in range(12)
         }}}}), encoding="utf-8")
@@ -5638,7 +5671,7 @@ class QueueLeaveTests(unittest.TestCase):
         keeper = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, keeper)
         _ = os.write(keeper, bytes(6))
-        bin_dir = self.root / "bin"
+        bin_dir = case / "bin"
         bin_dir.mkdir()
         cargo = bin_dir / "cargo"
         _ = cargo.write_text("#!/usr/bin/env bash\n"
@@ -5650,13 +5683,13 @@ class QueueLeaveTests(unittest.TestCase):
         cargo.chmod(0o755)
         self.environment["PATH"] = f"{bin_dir}{os.pathsep}{self.environment['PATH']}"
         self.environment["CARGO_MAKEFLAGS"] = f"--jobserver-auth=fifo:{pool}"
-        self.environment["TMPDIR"] = str(self.root)
+        self.environment["TMPDIR"] = str(case)
         free = (f'[[ -e "{calls}" ]] && echo built >> "{waited}"; echo waited >> "{waited}"; '
                 + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";')
         step = 'nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; LINT_TEST_WIDTH=logical; run_nextest --workspace'
         result = self.run_step(None, free, step)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
+        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"], result.stdout + result.stderr)
         # The memory wait ends before the build. The build ends before the launcher takes tokens.
         self.assertEqual(waited.read_text().splitlines(), ["waited"])
         self.assertEqual(calls.read_text().splitlines(), [

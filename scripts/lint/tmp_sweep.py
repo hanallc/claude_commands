@@ -117,7 +117,6 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.agents import remote
 from scripts.mac_test import nextest_log
-from scripts.lint import sweep_state
 from scripts.direct import phase_reservation, recorder_state
 
 if TYPE_CHECKING:
@@ -193,8 +192,11 @@ START_SLACK_SECONDS = 2.0
 EMPTY_TREE_FOLDERS = 1000
 DARWIN_TEMP_NAME = "CS_DARWIN_USER_TEMP_DIR"
 DELETED_SUFFIX = " (deleted)"
+STATE_ENV = "LINT_SWEEP_STATE_DIR"
+DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "lint-sweep")
 LOG_NAME = "tmp-sweep.jsonl"
 STAMP_NAME = "tmp-sweep.stamp"
+TARGET_DELETES_NAME = "target-deletes.json"
 DRY_RUN_FLAG = "--dry-run"
 
 ROOT = "a root"
@@ -1482,7 +1484,7 @@ def apply_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
             print(f"tmp sweep: deleted {path} ({removed['gib']:.1f} GiB), last changed {removed['last_change']}")
     for failure in result.failed:
         print(f"tmp sweep: could not delete {failure['path']}: {failure['error']}", file=sys.stderr)
-    append_log(sweep_state.state_dir() / LOG_NAME, record(result, False, now, lint_settings=lint_settings), now,
+    append_log(state_dir() / LOG_NAME, record(result, False, now, lint_settings=lint_settings), now,
                lint_settings=lint_settings)
     return 1 if result.failed else 0
 
@@ -1492,6 +1494,10 @@ def wide_idle_seconds(*, lint_settings: conf.ConfigRead | UseConfiguredValue = U
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     return lint_settings.whole("folder_remove_after_seconds")
+
+
+def state_dir() -> Path:
+    return Path(os.path.expanduser(os.environ.get(STATE_ENV) or DEFAULT_STATE_DIR))
 
 
 def record(result: Sweep, dry_run: bool, now: float, *,
@@ -1656,7 +1662,7 @@ def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, pro
         print(f"tmp sweep: removed {result.dataclass_code_removed} dataclass code entries")
     print(summary(result, dry_run))
     if not dry_run:
-        append_log(sweep_state.state_dir() / LOG_NAME, record(result, dry_run, moment, lint_settings=lint_settings), moment,
+        append_log(state_dir() / LOG_NAME, record(result, dry_run, moment, lint_settings=lint_settings), moment,
                    lint_settings=lint_settings)
     return 1 if result.failed else 0
 
@@ -1686,7 +1692,7 @@ def run_if_due(dry_run: bool, now: float | None = None, *,
 ) -> SweepAssessment:
     """Assess only a due sweep. Move the stamp before the attempt."""
     moment = time.time() if now is None else now
-    stamp = sweep_state.state_dir() / STAMP_NAME
+    stamp = state_dir() / STAMP_NAME
     try:
         if stamp.stat().st_mtime > moment - RUN_INTERVAL_SECONDS:
             return SkippedSweepAssessment()

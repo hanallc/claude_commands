@@ -77,7 +77,6 @@ scripts/lib/unit_runs.py
 scripts/lib/user_zone.py
 scripts/lint/build_shape.py
 scripts/lint/memory_admit.py
-scripts/lint/sweep_state.py
 scripts/mac_test/abandoned_sessions.py
 scripts/mac_test/claim_state.py
 scripts/mac_test/floor_claims.py

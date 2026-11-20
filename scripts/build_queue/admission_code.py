@@ -19,7 +19,7 @@ ADMISSION_CODE_PATHS = (
     "build_targets/execution_transport.py",
     "build_queue/scope_activity.py", "build_queue/queue_snapshot.py", "build_queue/progress_profile.py", "build_queue/snapshot_codec.py",
     "lib/suite_runners.py", "lib/build_steps.py", "lib/boot_identity.py", "lib/inotify.py", "lib/conf.py", "lib/atomic_file.py", "lib/test_phase.py",
-    "lint/build_shape.py", "lint/sweep_state.py", "buildlog/store.py", "buildlog/record.py", "buildlog/repository.py", "buildlog/parse.py",
+    "lint/build_shape.py", "buildlog/store.py", "buildlog/record.py", "buildlog/repository.py", "buildlog/parse.py",
 )
 
 

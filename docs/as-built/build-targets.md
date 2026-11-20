@@ -273,7 +273,7 @@ Each command shows its script's output unchanged; each script answers in about a
 `CONF_DIR` selects the configuration folder for private tests.
 The moved values retain their previous defaults. `config/README.md` lists each key.
 `hold_floor(floor, dry_run)` reads `sweep_floor_roots` when the pass starts.
-Floor records and `floor.lock` use `sweep_state.state_dir()`.
+Floor records and `floor.lock` use `tmp_sweep.state_dir()`.
 Disk measurements and build history use `scripts/buildlog/store.py::root()`.
 The first `sweep_message_path_widths` entry supplies the default alert path width.
 

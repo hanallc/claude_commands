@@ -185,7 +185,7 @@ The `folder_*` keys control the folder audit. The `sweep_*` keys control the bui
 | `sweep_floor_skip` | Folder names excluded from target discovery. |
 | `sweep_scan_workers` | Maximum concurrent target scans. |
 
-Floor records and `floor.lock` use `sweep_state.state_dir()`.
+Floor records and `floor.lock` use `tmp_sweep.state_dir()`.
 Disk measurements and build history use `scripts/buildlog/store.py::root()`.
 
 ## hana_instances.conf
