@@ -3667,13 +3667,16 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(fake.commands, [])
         self.assertEqual([row['reason'] for row in self.fallback_rows()], [reason])
 
-    def test_invalid_cloud_gate_switch_reports_config_error(self) -> None:
+    def test_invalid_cloud_gate_switch_falls_back_with_config_error(self) -> None:
         _ = (self.root / 'cloud_gate.conf').write_text('# one of: on, off\nenabled=invalid\n')
         service = mock.Mock(side_effect=AssertionError('An invalid switch must not start a service'))
         mode = gate.SuiteMode.MERGE_GATE
-        with self.assertRaisesRegex(conf.Unusable, r"cloud_gate\.conf: enabled='invalid':"):
-            _ = cloud_gate.run_cloud(self.repo, mode=mode, full=False, module_time_limit_s=1800,
-                                     service=service, attempt=cloud_gate.CloudAttempt(self.state, mode))
+        outcome = cloud_gate.run_cloud(self.repo, mode=mode, full=False, module_time_limit_s=1800,
+                                       service=service, attempt=cloud_gate.CloudAttempt(self.state, mode))
+        self.assertIsInstance(outcome, cloud_gate.LocalFallback)
+        assert isinstance(outcome, cloud_gate.LocalFallback)
+        self.assertIn("cloud_gate.conf: enabled='invalid':", outcome.reason)
+        service.assert_not_called()
 
     def test_fallback_row_write_error_keeps_the_original_fallback(self) -> None:
         service = mock.Mock(side_effect=AssertionError('An absent stack needs no service'))
