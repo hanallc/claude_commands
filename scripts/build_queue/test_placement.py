@@ -1020,7 +1020,8 @@ class PlacementTests(unittest.TestCase):
                  (False, "busy", "recovered absence"), (False, "lost", "retry delay with registry error"),
                  (False, "busy", "recovered registration with off"),
                  (False, "busy", "remove Mac with a pending journal close"),
-                 (False, "lost", "remove Mac during retry delay"))
+                 (False, "lost", "remove Mac during retry delay"),
+                 (False, "lost", "remove Mac while local waits"))
         local_registry = "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
         for pinned, reason, change in cases:
             with self.subTest(reason=reason, change=change), PlacementFixture() as fixture:
@@ -1036,23 +1037,42 @@ class PlacementTests(unittest.TestCase):
                               "recovered registration with off"):
                     request = replace(request, constraints=replace(request.constraints, selection=placement.MacOnlyHost()))
                 if reason == "lost":
-                    request = replace(request, local=wire.LocalAdmissionUnavailable("no local candidate"))
+                    local_wait = change == "remove Mac while local waits"
+                    if local_wait:
+                        fixture.hold_starts()
+                        assert isinstance(request.local, wire.LocalAdmissionContext)
+                        request = replace(request, local=replace(request.local, call=records.NoCallRecord()),
+                                          constraints=replace(request.constraints,
+                                              candidates=(*request.constraints.candidates, local_candidate(fixture))))
+                    else:
+                        request = replace(request, local=wire.LocalAdmissionUnavailable("no local candidate"))
                     _ = publish_candidate(fixture, request)
                     assigned = assignment_for(fixture, request)
                     ended, = fixture.server.handle_request(wire.ClaimFailure("lost-attempt", assigned, reason))
                     assert isinstance(ended, wire.DispatchStatus)
                     self.assertEqual(ended.state, placement.ClosedAssignment("lost"))
                     self.assertEqual(ended.retry, placement.RetryAt(fixture.clock.now() + 180))
+                    if local_wait:
+                        waiting, = fixture.server.handle_request(request)
+                        assert isinstance(waiting, wire.PlacementWait)
+                        self.assertEqual(waiting.retry_notices, (placement.ProviderRetryNotice("mac", "lost", 180),))
                     registry = fixture.root / "build_targets.conf"
-                    if change == "remove Mac during retry delay":
+                    if local_wait or change == "remove Mac during retry delay":
                         _ = registry.write_text(local_registry)
                         refusal = "target is no longer configured"
                     else:
                         _ = registry.write_bytes(b"\xff")
                         refusal = "retry deadline has not passed"
                     refused, = fixture.server.handle_request(request)
-                    assert isinstance(refused, wire.DispatchStatus)
-                    self.assertEqual(refused.retry, placement.DoNotRetry(refusal))
+                    if local_wait:
+                        assert isinstance(refused, wire.PlacementWait)
+                        mac, local = refused.eligibility
+                        self.assertEqual(mac.eligibility, placement.FixedExclusion(refusal))
+                        self.assertEqual(local.eligibility, ALLOWED_HOST)
+                        self.assertEqual(refused.retry_notices, ())
+                    else:
+                        assert isinstance(refused, wire.DispatchStatus)
+                        self.assertEqual(refused.retry, placement.DoNotRetry(refusal))
                     self.assertEqual(published_mac_waits(fixture), ())
                     continue
                 if change == "remove Mac with a pending journal close":

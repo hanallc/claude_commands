@@ -4188,8 +4188,9 @@ done
 
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
+        candidates = self.placement_eligibility.get(request.episode, ())
         diagnostics = tuple(evidence.provider_diagnostic
-            for candidate in self.placement_eligibility.get(request.episode, ())
+            for candidate in candidates
             if candidate.destination.provider != "local" and isinstance(candidate.eligibility, placement.TemporaryExclusion)
             and candidate.eligibility.reason == "busy"
             if (key := self.placement_host_keys.get((request.episode, candidate.destination))) is not None
@@ -4197,12 +4198,12 @@ done
             if isinstance(evidence, placement.FreshHostEvidence)
             and isinstance(evidence.provider_diagnostic, placement.BusyProviderDiagnostic))
         disk_exclusions = tuple(dict.fromkeys(candidate.destination.target
-            for candidate in self.placement_eligibility.get(request.episode, ())
+            for candidate in candidates
             if candidate.destination.provider == "mac"
             and isinstance(candidate.eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))
             and candidate.eligibility.reason == "disk"))
         delayed: dict[str, placement.ProviderRetryNotice] = {}
-        for candidate in self.placement_eligibility.get(request.episode, ()):
+        for candidate in candidates:
             if (candidate.destination.provider == 'ssh' and isinstance(candidate.eligibility, placement.TemporaryExclusion)
                     and candidate.eligibility.reason in ('starting', 'blocked', 'recovery')):
                 from scripts.aws_target import hana_placement
@@ -4220,9 +4221,12 @@ done
                     interval = (self.last_usable_configuration.waiting_pass_seconds
                         if isinstance(self.last_usable_configuration, records.MemoryConfig) else 1.0)
                     delayed[target.name] = placement.ProviderRetryNotice(target.name, candidate.eligibility.reason, interval)
+        excluded_destinations = {candidate.destination for candidate in candidates
+                                 if isinstance(candidate.eligibility, placement.FixedExclusion)}
         for attempt in self.assignments.values():
             report = attempt.terminal_report
             if (attempt.assignment.episode == request.episode and isinstance(attempt.state, placement.ClosedAssignment)
+                    and attempt.assignment.destination not in excluded_destinations
                     and isinstance(attempt.retry, placement.RetryAt) and attempt.retry.deadline > self.clock.now()
                     and isinstance(report, placement.TerminalAttemptReport)
                     and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
@@ -4233,7 +4237,7 @@ done
         retry_notices = tuple(delayed.values())
         stale_hana = (any(isinstance(candidate.eligibility, placement.FixedExclusion)
                           and candidate.eligibility.reason == placement.HANA_IMAGE_STALE
-                          for candidate in self.placement_eligibility.get(request.episode, ()))
+                          for candidate in candidates)
                       and not any(attempt.assignment.episode == request.episode
                                   and attempt.retry == placement.DoNotRetry(placement.HANA_IMAGE_STALE)
                                   for attempt in self.assignments.values()))
@@ -4255,8 +4259,7 @@ done
             if isinstance(state, placement.ClosedAssignment):
                 # A released provider claim is final only after a pass settles the attempt and its retry.
                 self.next_pass = min(self.next_pass, self.clock.monotonic())
-                return wire.PlacementWait(request.episode, request.since, 1,
-                    self.placement_eligibility.get(request.episode, ()),
+                return wire.PlacementWait(request.episode, request.since, 1, candidates,
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
             if saved.assignment.destination.provider == "local":
@@ -4264,8 +4267,7 @@ done
                 assert isinstance(replay.reply, wire.Admitted)
                 return wire.LocalPlacementGranted(saved.assignment, replay.reply, diagnostics, disk_exclusions, stale_hana)
             if isinstance(saved.permission, placement.PermissionConsumed):
-                return wire.PlacementWait(request.episode, request.since, 1,
-                    self.placement_eligibility.get(request.episode, ()),
+                return wire.PlacementWait(request.episode, request.since, 1, candidates,
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
             return wire.Assignment(saved.assignment, diagnostics, disk_exclusions, stale_hana)
@@ -4273,7 +4275,6 @@ done
                     and isinstance(saved.state, placement.ClosedAssignment) and saved.state.reason in ("completed", "cancelled")]
         if terminal:
             return self._placement_status(terminal[-1].assignment)
-        candidates = self.placement_eligibility.get(request.episode, ())
         refusal = self._terminal_candidate_refusal(request, candidates)
         if isinstance(refusal, placement.DoNotRetry):
             reason = refusal.reason
@@ -4312,10 +4313,10 @@ done
             return wire.PlacementWait(request.episode, request.since, position, candidates,
                 wire.PlacementResourceWait(candidate.destination.target, candidate.eligibility.reason, holder), diagnostics, disk_exclusions, retry_notices)
         if waiting is not None and isinstance(waiting.last_reply, wire.Wait):
-            return wire.PlacementWait(request.episode, request.since, position,
-                self.placement_eligibility.get(request.episode, ()), waiting.last_reply, diagnostics, disk_exclusions, retry_notices)
-        return wire.PlacementWait(request.episode, request.since, position,
-            self.placement_eligibility.get(request.episode, ()), provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
+            return wire.PlacementWait(request.episode, request.since, position, candidates,
+                waiting.last_reply, diagnostics, disk_exclusions, retry_notices)
+        return wire.PlacementWait(request.episode, request.since, position, candidates,
+            provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions, retry_notices=retry_notices)
 
     def _occupied_local_cargo_folders(self) -> frozenset[placement.CargoFolder]:
         """Keep each local folder occupied until its reservation ends."""
