@@ -1568,7 +1568,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Goal:** a decision by bob and builds, sent by sdlc at 18:19 EST Nov 19. Name: gappush. It replaces phase 90. Each command that pushes a config or settings commit direct to main takes its place in natemerge's land line. It pushes only in a gap between two items. Until this merges, a direct main push asks natemerge for a gap first.
 
 **Spec:**
-1. Put the change in the shared publish path from phase 40 (`live_settings.publish`, the main push lock, one gap function in `land_queue.py`), not in each caller. It covers the tool publishers only: tune, zone, the notes timer and registry rows. Hand commits (`/validate_and_push --to main` of a settings.json commit, the case a296444e4, and fast track of a `.conf`) and the CI receipt after a queued push are not in this phase (sdlc, 04:08 EST Nov 20). They go to phase 92. Until then a hand push during a land asks natemerge for a gap first.
+1. Put the change in the shared publish path from phase 40 (`live_settings.publish`, the main push lock, one gap function in `land_queue.py`), not in each caller. It covers the tool publishers only: tune, zone, the notes timer and registry rows. Hand commits (`/validate_and_push --to main` of a settings.json commit, the case a296444e4, and fast track of a `.conf`) and the CI receipt after a queued push are not in this phase (sdlc, 04:08 EST Nov 20). They go to phase 92. Until then a hand push during a land asks natemerge for a gap first. Phase 91 covers publishers that push from natedev. A push from the Mac keeps its base route and moves to phase 92 (sdlc, 07:13 EST Nov 20). The phase 91 as-built names this limit.
 2. The live value still changes at once on natedev and on the Mac. Only the main commit and the push wait for the gap.
 3. When no land runs, the push goes at once. When a land runs, the publisher waits for a gap in its own detached process (sdlc, 04:46 EST Nov 20). It uses no wake files, no row in the land line and no runner-side replay; `next` keeps its base behavior. One gap lock: the waiter and land registration both take it, and the waiter holds it until its push process exits. The prepared commit is pushed before local main advances.
 4. A push that waits shows where it waits and does not block the caller's turn. One waiter covers all waiting changes. It cleans up after itself.
@@ -1590,10 +1590,10 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 #### Work Order
 
-**Goal:** sdlc, 04:08 EST Nov 20. Phase 91 covers the tool publishers only. A hand push of a settings commit (`/validate_and_push --to main` of settings.json, the case a296444e4, and fast track of a `.conf`) can still break a running land.
+**Goal:** sdlc, 04:08 EST Nov 20. Phase 91 covers the tool publishers that push from natedev only. A hand push of a settings commit (`/validate_and_push --to main` of settings.json, the case a296444e4, and fast track of a `.conf`) can still break a running land.
 
 **Spec:**
-1. `/validate_and_push --to main` and fast track change no commit. They ask natemerge's land line for a gap and wait in their own detached process, outside the caller's turn.
+1. Stop every push to main from outside the natedev publishers, also a publisher push from the Mac (sdlc, 07:13 EST Nov 20). `/validate_and_push --to main` and fast track change no commit. They ask natemerge's land line for a gap and wait in their own detached process, outside the caller's turn.
 2. The caller's reply says the push waits for a gap and where. The push goes in the gap and cleans up after itself.
 3. Add no new check or refusal beyond the wait.
 4. CI starts after the push goes in, from the pushed commit.
