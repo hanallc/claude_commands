@@ -1682,6 +1682,7 @@ Run the pilot from the Hana checkout.
 ```
 
 The queue offers one Linux slot for the package and test pairs in `hana_gpu_selections`.
+`verify.sh test --target hana-gpu` omits the implicit workspace dev features.
 The executor captures the caller tree and passes the commit to the one-step GPU nextest worker.
 The worker uses the selected nextest profile and returns the exit status and both output streams.
 Cancellation in `verify.sh` stops the assigned GPU service and starts its cleanup.
@@ -1692,6 +1693,6 @@ The queue retains the claim until cleanup confirms termination or the ledger con
 A settled infrastructure refusal releases the slot.
 A `HanaCommandAdmissionRefused` result prevents another attempt on the target for the same placement request.
 The queue gets a settled refusal only after the exact claim is free.
-A pinned call prints the cause of the refusal and exits with status 2.
+A pinned call prints the refusal reason and exits with status 2.
 
 The `hana-aws` target handles check and clippy steps.
