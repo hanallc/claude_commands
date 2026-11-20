@@ -19,6 +19,7 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import ci_cargo_front
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 DENIED_HOME_CLIENT = """
@@ -230,7 +231,8 @@ class CargoLifetimeTests(unittest.TestCase):
 
     def started(self, child: subprocess.Popen[str]) -> dict[str, object]:
         stream = cast(TextIO, child.stdout)
-        self.assertTrue(select.select([stream], [], [], 8)[0])
+        self.assertTrue(select.select([stream], [], [], TEST_HANG_GUARD_SECS)[0],
+                        "the Cargo wrapper did not report startup")
         return cast(dict[str, object], json.loads(stream.readline()))
 
     def supply_front_memory(self, fixture: AdmissionFixture, child: subprocess.Popen[str]) -> None:
