@@ -30,7 +30,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
-from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_gate_config
+from scripts.aws_target.ledger_test_support import CostFixture, install_cost_settings, text_setting, write_gate_config, write_hana_config
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
@@ -48,8 +48,9 @@ class GuestTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
+        install_cost_settings(root / 'aws_target.conf')
         write_gate_config(root / 'cloud_gate.conf')
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
+        _ = write_hana_config(root / 'hana_aws.conf')
         _ = (root / 'test_times.conf').write_text(
             '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
             + '# whole: 1..\nTOP_RUNS=5\n')
@@ -66,6 +67,7 @@ class GuestTests(unittest.TestCase):
             + 'patterns.tool={purpose}{suffix}\n'
             + '# range: 0.001..60\nlocks.probe_wait_seconds=0.25\n'
             + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
 
     def test_user_data_fits_ec2_limit_with_module_times_and_400_character_signed_links(self) -> None:
         prefix = 'https://fixture.invalid/object?X-Amz-Signature='

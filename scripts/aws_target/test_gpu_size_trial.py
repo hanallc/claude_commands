@@ -25,7 +25,7 @@ from unittest import mock
 
 from scripts.aws_target import cloud_gate, gpu_size_trial as trial, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, largest_gate_vcpus
-from scripts.aws_target.ledger_test_support import CostFixture, install_cost_settings, write_gate_config
+from scripts.aws_target.ledger_test_support import FIXTURES, CostFixture, install_cost_settings, numeric_settings, write_gate_config, write_hana_config
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
 from scripts.lib import conf
@@ -82,6 +82,7 @@ class GpuTrialTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         install_cost_settings(self.root / 'config/aws_target.conf')
         write_gate_config(self.root / 'config/cloud_gate.conf')
+        _ = write_hana_config(self.root / 'config/hana_aws.conf')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**config_environment(self.root / 'config'),
                 'HOME': str(self.root), 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'})))
 
@@ -91,7 +92,7 @@ class GpuTrialTests(unittest.TestCase):
         config = conf.path('cloud_gate')
         _ = write_config_fixture(config, 'gpu_size_trial_limit_usd=4\ngpu_size_trial_lifetime_minutes=25\n'
                                   + 'gpu_size_trial_box_extra_usd=0.07\n'
-                                  + 'gpu_size_trial_spot_max_usd_per_hour={"g6.2xlarge":0.73}')
+                                  + 'gpu_size_trial_spot_max_usd_per_hour={"g6.2xlarge":0.73}', template=FIXTURES / 'cloud_gate.conf')
         after = trial.settings()
         source = conf.read('cloud_gate')
         self.assertEqual(after.lifetime_minutes, source.whole('gpu_size_trial_lifetime_minutes'))
@@ -105,7 +106,7 @@ class GpuTrialTests(unittest.TestCase):
                       '{"m7a.8xlarge":0.5}', '[]'):
             with self.subTest(value=value):
                 _ = write_config_fixture(conf.path('cloud_gate'),
-                                         'gpu_size_trial_spot_max_usd_per_hour=' + value)
+                                         'gpu_size_trial_spot_max_usd_per_hour=' + value, template=FIXTURES / 'cloud_gate.conf')
                 with self.assertRaises(ValueError):
                     _ = trial.settings()
 
@@ -343,7 +344,7 @@ elif name == 'cargo':
 
     def test_nextest_cli_keeps_real_preparation_hold_progress_on_stderr(self) -> None:
         _ = write_config_fixture(conf.path('cloud_gate'),
-            'hana_gpu_instance_types=g6.2xlarge\nhana_gpu_spot_max_usd_per_hour={"g6.2xlarge":0.8}')
+            'hana_gpu_instance_types=g6.2xlarge\nhana_gpu_spot_max_usd_per_hour={"g6.2xlarge":0.8}', template=FIXTURES / 'cloud_gate.conf')
         holder = build_hold.Holder('fixture holder', datetime.now(UTC), 'fixture', build_hold.UnknownReleaseEta(), 'fixture')
         holds = build_hold.NatedevHolds((holder,))
         attempt = 'f' * 64
@@ -756,7 +757,7 @@ elif name == 'cargo':
             with self.subTest(failure=failure):
                 expected_timeout = conf.read('aws_target').number('gpu_size_trial_preflight_timeout_s') + 1
                 _ = write_config_fixture(conf.path('aws_target'),
-                                         f'gpu_size_trial_preflight_timeout_s={expected_timeout}')
+                                         f'gpu_size_trial_preflight_timeout_s={expected_timeout}', template=FIXTURES / 'aws_target.conf')
 
                 def checked(argv: Sequence[str], _cwd: Path, *,
                             environment: Mapping[str, str] = os.environ, timeout: float | None = None) -> str:
@@ -1218,7 +1219,7 @@ class GpuOnlineTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = write_config_fixture(conf.path('cloud_gate'), """spot_candidate_regions=us-east-1 us-east-2 us-west-2
+        self.configure_gate("""spot_candidate_regions=us-east-1 us-east-2 us-west-2
 hana_gpu_instance_types=g4dn.2xlarge g6.2xlarge
 hana_gpu_spot_max_usd_per_hour={"g4dn.2xlarge":0.75,"g6.2xlarge":0.98}
 hana_gpu_lifetime_minutes=90
@@ -1235,7 +1236,7 @@ expiry_timeout_s=30
 gpu_size_trial_lifetime_minutes=60
 gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
 """)
-        _ = write_config_fixture(conf.path('hana_aws'), 'gp3_usd_per_gib_month=0.08\n')
+        numeric_settings(conf.path('hana_aws'), {'gp3_usd_per_gib_month': '0.08'})
         self.costs({'ipv4_usd_per_month': '3.65'})
         candidates = conf.read('cloud_gate').words('spot_candidate_regions')
         region = candidates[0]
@@ -1316,7 +1317,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
 
     def test_hana_nextest_uses_the_cheapest_offer_within_quota_and_settles(self) -> None:
         types = ('g4dn.2xlarge', 'g6.2xlarge', 'g6.4xlarge')
-        _ = write_config_fixture(conf.path('cloud_gate'), 'hana_gpu_instance_types=' + ' '.join(types) + '\n'
+        self.configure_gate('hana_gpu_instance_types=' + ' '.join(types) + '\n'
                                   + 'hana_gpu_spot_max_usd_per_hour={"g4dn.2xlarge":0.75,"g6.2xlarge":0.98,"g6.4xlarge":1.32}')
         first, second, third = conf.read('cloud_gate').words('spot_candidate_regions')[:3]
         self.fake.quotas = {first: 4, second: 8, third: 8}
@@ -1429,7 +1430,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
                     elif changes == 'usage':
                         self.fake.used_types[second] = ('g6.xlarge',)
                     else:
-                        _ = write_config_fixture(conf.path('cloud_gate'),
+                        self.configure_gate(
                             'gpu_size_trial_gp3_usd_per_gib_month_by_region=' + json.dumps({second: 0.10}))
 
                 price_reads = self.fake.events.count('describe-spot-price-history')
@@ -1460,7 +1461,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
 
     def test_hana_expiry_reserves_each_async_attempt_and_retry_delay(self) -> None:
         size = 'g6.2xlarge'
-        _ = write_config_fixture(conf.path('cloud_gate'), 'expiry_schedule_minutes=1\nexpiry_timeout_s=30')
+        self.configure_gate('expiry_schedule_minutes=1\nexpiry_timeout_s=30')
         self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
         started = int(self.fake.now)
         code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
@@ -1474,7 +1475,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
 
     def test_hana_refuses_when_list_disk_and_ipv4_exceed_the_extra_allowance(self) -> None:
         size = 'g6.2xlarge'
-        _ = write_config_fixture(conf.path('cloud_gate'), 'gpu_size_trial_box_extra_usd=0.045\n')
+        self.configure_gate('gpu_size_trial_box_extra_usd=0.045\n')
         self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
 
         code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
@@ -1487,7 +1488,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
     def test_hana_cost_check_uses_the_selected_regions_gp3_rate(self) -> None:
         size = 'g6.2xlarge'
         _first, second, _third = conf.read('cloud_gate').words('spot_candidate_regions')
-        _ = write_config_fixture(conf.path('cloud_gate'), 'gpu_size_trial_gp3_usd_per_gib_month_by_region='
+        self.configure_gate('gpu_size_trial_gp3_usd_per_gib_month_by_region='
                                  + json.dumps({second: 0.10}) + '\n')
         self.fake.quotas = {second: 8}
         self.fake.live_prices = {(second, size): Decimal('.20')}
@@ -1509,7 +1510,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
         self.fake.quotas = {ohio: 8, frankfurt: 8}
         for gp3_rate, frankfurt_spot in ((0.0952, '.20'), (0.088, '.439')):
             with self.subTest(gp3_rate=gp3_rate, frankfurt_spot=frankfurt_spot):
-                _ = write_config_fixture(conf.path('cloud_gate'), 'spot_candidate_regions=eu-central-1 us-east-2\n'
+                self.configure_gate('spot_candidate_regions=eu-central-1 us-east-2\n'
                                          + 'gpu_size_trial_gp3_usd_per_gib_month_by_region='
                                          + json.dumps({frankfurt: gp3_rate}) + '\n')
                 self.fake.live_prices = {(ohio, size): Decimal('.44'), (frankfurt, size): Decimal(frankfurt_spot)}
@@ -1559,7 +1560,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
 
     def test_hana_budget_includes_the_backstop_before_launch(self) -> None:
         size = 'g6.2xlarge'
-        _ = write_config_fixture(conf.path('cloud_gate'), 'gpu_size_trial_limit_usd=2.57')
+        self.configure_gate('gpu_size_trial_limit_usd=2.57')
         self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
         code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
         self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT, errors)
@@ -1690,7 +1691,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
     def test_expiry_backstop_fits_reservation_and_guest_arms_before_import(self) -> None:
         size = 'g6.2xlarge'
         schedule, timeout = 60, 30
-        _ = write_config_fixture(conf.path('cloud_gate'),
+        self.configure_gate(
                                  f'expiry_schedule_minutes={schedule}\nexpiry_timeout_s={timeout}')
         self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
         code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
@@ -1839,7 +1840,7 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
 
     def selection_fixture(self, types: str) -> tuple[tuple[str, ...], int]:
         price = next(iter(trial.settings().spot_max_usd_per_hour.values()))
-        _ = write_config_fixture(conf.path('cloud_gate'),
+        self.configure_gate(
             'gpu_size_trial_spot_max_usd_per_hour='
             + json.dumps({name: str(price) for name in types.split()}) + '\n'
             + 'spot_candidate_regions=fixture-first fixture-second fixture-last')
@@ -2143,7 +2144,7 @@ CMD=test
 
     def test_hana_worker_terminates_at_expiry_without_a_caller_stop(self) -> None:
         size = 'g6.2xlarge'
-        _ = write_config_fixture(conf.path('cloud_gate'), 'hana_gpu_lifetime_minutes=10')
+        self.configure_gate('hana_gpu_lifetime_minutes=10')
         self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
         self.fake.lose_nextest_result = True
         started = int(self.fake.now)

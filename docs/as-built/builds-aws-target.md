@@ -1712,7 +1712,13 @@ Run the gate setup command on natedev.
 python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
 ```
 
-The GPU probe prints its verdict. The verdict is available only in the command output.
+Approved gate setup removes the old `gate-probe.json` before it can change gate resources.
+An interruption or early setup failure leaves the record absent.
+When the probe ends, it saves the verdicts in a private record beside `gate-deployment.json`.
+The record includes the deployment ID, the UTC end time, and any failed checks.
+Run `deploy.py probe-status` to read the saved verdicts and record age without contacting AWS.
+The command shows verdicts only for a readable record that matches the current deployment.
+It checks the recorded regions and instance types against `gate-deployment.json`.
 
 After the GPU setup probe passes, set `hana_gpu_route_enabled=on` in `config/cloud_gate.conf`.
 The route checks the deployment record for every type in `hana_gpu_instance_types`.

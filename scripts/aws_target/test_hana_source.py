@@ -207,7 +207,8 @@ source_basis_max_commits=8
                         self.sender.acknowledge(leased.identity)
 
     def test_acknowledged_basis_sends_only_new_objects_and_retains_a_small_record(self) -> None:
-        _ = write_config_fixture(self.configuration.source, 'source_basis_max_commits=1\n')
+        _ = write_config_fixture(self.configuration.source, 'source_basis_max_commits=1\n',
+                                 template=self.configuration.source)
         first = self.prepare()
         with self.guest(), self.materialize(first) as leased:
             assert isinstance(leased, source.LeasedSource)
@@ -415,7 +416,8 @@ source_basis_max_commits=8
     def test_upload_bound_applies_to_the_entire_archive(self) -> None:
         manifest = self.prepare()
         bundle_size = len(self.member(manifest, 'source.bundle'))
-        _ = write_config_fixture(self.configuration.source, f'source_max_bytes={bundle_size}\n')
+        _ = write_config_fixture(self.configuration.source, f'source_max_bytes={bundle_size}\n',
+                                 template=self.configuration.source)
         objects = MemorySourceObjects()
         sender = transport.SourceSender(objects, self.root / 'acknowledged', self.configuration,
                                         checkout=self.runtime_checkout)
