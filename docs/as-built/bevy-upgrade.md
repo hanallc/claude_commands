@@ -367,7 +367,10 @@ find_bevy_compatible_version(crate_name: str, all_versions: list[str], target_be
 - `BEVY_UPGRADE_NOTIFIER`: the notifier script, default `scripts/message/notifier.sh`.
 - `BEVY_UPGRADE_SEND`: the sender script, default `scripts/message/send.py`.
 - `CLAUDE_CODE_SESSION_ID`: the session whose production is used when `--production` is absent. The default is `""`, which matches no production.
-- `NOTIFIER_STATE_DIR`, `NOTIFIER_SESSIONS_DIR`, `SHOWRUNNER_STATE_DIR`, `SHOWRUNNERS_CONFIG`, `SHOWRUNNERS_SESSIONS`: where `scripts/production/showrunners.py` finds a showrunner and its production, defaults `~/.local/state/notifier`, `~/.claude/sessions`, `~/.local/state/showrunner`, `config/showrunners.json` and `scripts/message/sessions.py`. `showrunners.py` reads them once, at import.
+- `NOTIFIER_STATE_DIR`, `NOTIFIER_SESSIONS_DIR`, `SHOWRUNNER_STATE_DIR`, and `SHOWRUNNERS_SESSIONS` select sources for showrunners and their productions.
+  Their defaults are `~/.local/state/notifier`, `~/.claude/sessions`, `~/.local/state/showrunner`, and `scripts/message/sessions.py`.
+  `SHOWRUNNERS_CONFIG` selects the settings file when `showrunners.py` loads.
+  The default is `~/.claude/config/showrunners.conf`, or `showrunners.conf` in `CONF_DIR` when set.
 - The migration plan's dependency check reads no environment variable: the Bevy checkout is `rust/bevy-<version>` under `Path.home()`.
 
 ## Invariants

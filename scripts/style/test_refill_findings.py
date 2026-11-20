@@ -152,6 +152,7 @@ class FindingResultsTests(LedgerTestCase):
                 _ = hidden.rename(object_path)
 
         with self.subTest(read="findings that share a file"):
+            ledger.ticket_drop("1")
             source = "pub fn first() {}\n\npub fn second() {}\n"
             _ = self.commit_tip(ledger, {PARENT_FILE: source})
             _, shared = self.judge_parent(ledger, ((1, "pub fn first() {}"), (3, "pub fn second() {}")),

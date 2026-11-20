@@ -1792,7 +1792,9 @@ def _claim_question(questions: _ListQuestionStore, item: ListItem, words: str,
 
 
 def _list_question_target(keeper: staff.StaffId, item: ListItem) -> change_page.QuestionDeliveryTarget:
-    return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title, keeper)
+    owner = None if isinstance(item.owner, UnassignedOwner) else item.owner
+    return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title,
+                                           keeper, alert_owner=owner)
 
 
 def resend_question(keeper: staff.StaffId, identity: str, question_id: str,

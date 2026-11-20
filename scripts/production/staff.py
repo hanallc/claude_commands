@@ -19,6 +19,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager, nullco
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import Enum
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
@@ -618,6 +619,13 @@ class StaffSnapshot:
     def parent_of(self, row: StaffRow) -> StaffRow | None:
         return self.by_id(row.parent.id) if isinstance(row.parent, ReportsTo) else None
 
+    def qualified_name(self, row: StaffRow) -> str:
+        names = [row.name]
+        while (parent := self.parent_of(row)) is not None:
+            names.append(parent.name)
+            row = parent
+        return "/".join(reversed(names))
+
     def owner_of(self, reference: str) -> StaffRow | None:
         """Return the member, or the parent unit when the member is a worker."""
         row = self.by_member_reference(reference)
@@ -928,6 +936,77 @@ def slot_operation(key: str, name: str) -> Generator[None]:
                 _ = os.environ.pop(variable, None)
             else:
                 os.environ[variable] = previous
+
+
+@dataclass(frozen=True)
+class RowAvailable:
+    """No operation holds the staff row."""
+
+
+@dataclass(frozen=True)
+class RowBusy:
+    """An operation holds the row without a proved move target."""
+
+
+@dataclass(frozen=True)
+class RowMoving:
+    target: str
+
+
+def _move_fields(descriptor: int) -> dict[str, object]:
+    try:
+        value = cast(object, json.loads(os.pread(descriptor, 1024, 0)))
+    except (ValueError, UnicodeError):
+        return {}
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def row_activity(key: str) -> RowAvailable | RowBusy | RowMoving:
+    """Read the row lock without creating it or joining its owner."""
+    from scripts.lib import process_start
+
+    path, _ = _row_lock(key)
+    try:
+        stream = path.open("rb")
+    except FileNotFoundError:
+        return RowAvailable()
+    with stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fields = _move_fields(stream.fileno())
+            pid, start, target = fields.get("pid"), fields.get("start"), fields.get("target")
+            if isinstance(pid, int) and isinstance(start, str) and isinstance(target, str):
+                owner = process_start.process_start(pid)
+                if isinstance(owner, process_start.Started) and owner.start == start:
+                    return RowMoving(target)
+            return RowBusy()
+        return RowAvailable()
+
+
+@contextmanager
+def mark_row_move(key: str, target: str) -> Generator[None]:
+    """Publish the move while the caller holds the row lock."""
+    from scripts.lib import process_start
+
+    path, variable = _row_lock(key)
+    if not _joined_operation(path, variable):
+        raise StaffRefused("the move does not hold the row")
+    with path.open("r+b") as stream:
+        def write(fields: dict[str, object]) -> None:
+            _ = stream.seek(0)
+            _ = stream.write(json.dumps(fields).encode())
+            _ = stream.truncate()
+            stream.flush()
+
+        pid = os.getpid()
+        owner = process_start.process_start(pid)
+        write({"pid": pid, "start": owner.start, "target": target}
+              if isinstance(owner, process_start.Started) else {})
+        try:
+            yield
+        finally:
+            write({})
 
 
 def _joined_operation(path: Path, variable: str = "STAFF_OPERATION_FD") -> bool:
@@ -1297,15 +1376,55 @@ def _remote_row(arguments: list[str]) -> StaffRow:
     return StaffRow.from_json(_remote(arguments))
 
 
-def producer_creation_registry(action: str, name: str, marker: str = "", profile: str = "") -> str:
+@dataclass(frozen=True)
+class RecordedProducerCreation:
+    name: str
+    marker: str
+
+    def to_json(self) -> dict[str, str]:
+        return {"name": self.name, "marker": self.marker}
+
+
+class ProducerCreationRegistryStatus(Enum):
+    ABSENT = "no creation marker"
+    UPDATED = "registry update complete"
+
+
+def _read_remote_producer_creation(name: str) -> RecordedProducerCreation | ProducerCreationRegistryStatus:
+    try:
+        result = _remote(["producer-creation", "read-named", f"--name={name}"])
+    except StaffUnreadable as error:
+        last_line = str(error).rpartition("\n")[2]
+        if ": error: argument creation_action: invalid choice: 'read-named' (choose from " not in last_line:
+            raise
+        result = _remote(["producer-creation", "read", f"--name={name}"])
+        if isinstance(result, str):
+            return RecordedProducerCreation(name, result) if result else ProducerCreationRegistryStatus.ABSENT
+        raise StaffUnreadable("invalid producer creation response") from error
+    if result == "":
+        return ProducerCreationRegistryStatus.ABSENT
+    if isinstance(result, dict):
+        fields = cast(dict[str, object], result)
+        saved_name = fields.get("name")
+        saved_marker = fields.get("marker")
+        if (isinstance(saved_name, str) and saved_name.casefold() == name.casefold()
+                and isinstance(saved_marker, str) and saved_marker):
+            return RecordedProducerCreation(saved_name, saved_marker)
+    raise StaffUnreadable("invalid producer creation response")
+
+
+def producer_creation_registry(action: str, name: str, marker: str = "",
+                               profile: str = "") -> RecordedProducerCreation | ProducerCreationRegistryStatus:
     """Use the staff owner for shared producer creation marker operations."""
     if not is_owner():
+        if action == "read":
+            return _read_remote_producer_creation(name)
         result = _remote(["producer-creation", action, f"--name={name}",
                           f"--marker={marker}", f"--profile={profile}"])
-        if not isinstance(result, str):
+        if result != "":
             raise StaffUnreadable("invalid producer creation response")
-        return result
-    edit = cast(Callable[[str, str, str, str], str],
+        return ProducerCreationRegistryStatus.UPDATED
+    edit = cast(Callable[[str, str, str, str], RecordedProducerCreation | ProducerCreationRegistryStatus],
                 import_module("scripts.agents.producer_creation").owner_registry_action)
     try:
         return edit(action, name, marker, profile)
@@ -2371,7 +2490,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = producer_retirement.add_argument("--profile", required=True)
     _ = producer_retirement.add_argument("--json", action="store_true")
     creation = verbs.add_parser("producer-creation", help=argparse.SUPPRESS)
-    _ = creation.add_argument("creation_action", choices=("read", "claim", "finish"))
+    _ = creation.add_argument("creation_action", choices=("read", "claim", "finish", "read-named"))
     _ = creation.add_argument("--name", required=True)
     _ = creation.add_argument("--marker", default="")
     _ = creation.add_argument("--profile", default="")
@@ -2513,8 +2632,13 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 def _main(arguments: _Arguments) -> int:
     if arguments.verb == "producer-creation":
-        print(json.dumps(producer_creation_registry(arguments.creation_action, arguments.name,
-                                                    arguments.marker, arguments.profile)))
+        action = arguments.creation_action
+        creation = producer_creation_registry("read" if action == "read-named" else action,
+                                              arguments.name, arguments.marker, arguments.profile)
+        payload: str | dict[str, str] = ""
+        if not isinstance(creation, Enum):
+            payload = creation.marker if action == "read" else creation.to_json()
+        print(json.dumps(payload))
         return 0
     if arguments.verb == "move":
         if arguments.destination is not None:

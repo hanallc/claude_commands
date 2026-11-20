@@ -828,3 +828,12 @@ Missing-note instructions name that folder.
 The refusal pass reads the usage age once and passes it through account selection.
 
 See the [account design](as-built/accounts.md) for types, invariants, shared settings, and machine-local settings.
+
+### Published settings order
+
+`config/settings-orders.json` records the save order of settings published to `main`.
+Each top-level key names a `config/*.conf` file without its extension.
+Each nested key names a setting in that file.
+Its value is a positive integer sequence number.
+A missing entry has order zero.
+The publisher uses these numbers to keep an older pending save from replacing a newer published save.
