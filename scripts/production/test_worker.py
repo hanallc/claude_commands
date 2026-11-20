@@ -403,7 +403,7 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertTrue(completion_id)
         passed["confirmed_delivery_ids"] = [completion_id]
         current = (self.run_dir / unit_runs.STATE_FILE).read_bytes()
-        self.assertEqual(cast(object, json.loads(current)), expected)
+        self.assertEqual(current, (json.dumps(expected, indent=2, sort_keys=True) + "\n").encode())
         return current
 
     def assert_pass_completed(self, previous: bytes) -> None:
