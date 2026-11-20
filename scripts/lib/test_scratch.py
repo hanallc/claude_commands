@@ -1846,6 +1846,39 @@ assert scratch.removal_mark(path).is_file()
         self.assertTrue(scratch.holds()[str(held)]["ended"])
         self.assertEqual((held / "work").read_text(), "keep")
 
+        with self.subTest(interrupted_worktree_removal=True):
+            task = "gate:interrupted-worktree"
+            source = self.base / "worktree-source"
+            source.mkdir()
+            self.git(source, "init", "-q")
+            self.git(source, "commit", "--allow-empty", "-qm", "source")
+            self.git(source, "update-ref", "refs/remotes/origin/main", "HEAD")
+            worktree = self.base / "scratch" / "a-worktree"
+            self.git(source, "worktree", "add", "--detach", "-q", str(worktree))
+            scratch.write_record(worktree, task, 0.0)
+            later = worktree.with_name("z-clean")
+            later.mkdir()
+            scratch.write_record(later, task, 0.0)
+            check_quiescent = scratch.require_quiescent
+
+            def refuse_hidden_worktree(removal: scratch.CoordinatedRemoval, path: Path) -> None:
+                if path.parent == worktree.parent and path.name.startswith(".scratch-operation-"):
+                    raise scratch.RemovalRefused("worktree became busy after rename")
+                check_quiescent(removal, path)
+
+            with mock.patch.object(scratch, "require_quiescent", side_effect=refuse_hidden_worktree):
+                result = scratch.end(task)
+
+            self.assertEqual(result, [later])
+            self.assertEqual(result.kept, [scratch.KeptFolder(worktree, "worktree became busy after rename")])
+            self.assertFalse(later.exists())
+            self.assertFalse(worktree.exists())
+            journal = scratch.operation_journal(worktree, conf.read("scratch"))
+            step = journal.read().step
+            assert isinstance(step, scratch.HideRemoval)
+            self.assertTrue(step.target.path.is_dir())
+            journal.path.unlink()
+
         with self.subTest(unreadable_journal=True):
             task = "gate:other"
             other = self.base / "other"
@@ -2546,6 +2579,21 @@ print(scratch.target('gate:proof', 'tree', False))
                 self.assertNotIn(str(held), scratch.holds())
                 self.assertFalse(scratch.cargo_removal_mark(path).exists())
                 self.assertFalse(scratch.removal_mark(path).exists())
+
+        with self.subTest(mounted_empty_pair=True):
+            task = "gate:mounted-pair"
+            copies_root = self.base / "copies"
+            pair = copies_root / "mounted"
+            pair.mkdir()
+            _ = scratch.hold(copies_root, task, "copy container")
+            refusal = scratch.MountRemovalRefused(f"tree contains a mount point at {pair}")
+
+            with mock.patch.object(scratch.CoordinatedRemoval, "check_tree", side_effect=refusal) as check:
+                with self.assertRaisesRegex(scratch.MountRemovalRefused, "tree contains a mount point"):
+                    _ = scratch.end(task)
+
+            check.assert_called_once_with(pair)
+            self.assertTrue(pair.is_dir())
 
     def test_end_resumes_after_the_record_was_unlinked_during_removal(self) -> None:
         path = self.copy()

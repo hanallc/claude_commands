@@ -118,8 +118,10 @@ The check inspects these entries without following symbolic links.
 
 For an interrupted scratch move, the journal records a task end before recovery can hold the retained source.
 Recovery checks for process use through all mount aliases before it releases the retained source's hold.
-A task end reads each journal once and checks for changes before using that reading.
+A task end reads the existing journals once and checks for changes before it uses those readings.
+It checks new journals for path overlap before it removes another folder.
 It reports unreadable journals, keeps folders that it cannot verify, and records the end of later holds.
+An error such as a mount refusal during empty pair removal reaches the caller.
 A scoped sweep recovers a move only when its roots include the source and the destination.
 The sweep checks the file identity of the Git registration's backlink target.
 The sweep reads only regular backlink files, without following symbolic links.

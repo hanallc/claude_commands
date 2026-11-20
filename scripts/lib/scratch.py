@@ -2091,9 +2091,8 @@ class FolderOperationScope(Enum):
     ALL = "all"
 
 
-@dataclass(frozen=True)
-class UnreadableFolderOperation:
-    reason: str
+class UnreadableFolderOperation(RemovalRefused):
+    """Task cleanup could not read this journal in its first scan."""
 
 
 @dataclass(frozen=True)
@@ -2110,14 +2109,25 @@ class TaskEndJournals:
     def checked_operation(self, journal: OperationJournal) -> FolderOperation:
         """Use the first reading only while the journal still matches it."""
         reading = self.readings.get(journal.path)
+        if reading is None:
+            return journal.read()
         current = journal.path.lstat()
-        if (reading is None or not os.path.samestat(reading.status, current)
+        if (not os.path.samestat(reading.status, current)
                 or reading.status.st_ctime_ns != current.st_ctime_ns
                 or reading.status.st_mtime_ns != current.st_mtime_ns):
             raise FolderRecoveryRequired(f"{journal.path}: a folder operation changed during task cleanup")
         if isinstance(reading.operation, UnreadableFolderOperation):
-            raise RemovalRefused(reading.operation.reason)
+            raise UnreadableFolderOperation(str(reading.operation))
         return reading.operation
+
+    @contextmanager
+    def use(self) -> Generator[None]:
+        """Share the first readings with removal and finalization checks."""
+        token = _TASK_END_JOURNALS.set(self)
+        try:
+            yield
+        finally:
+            _TASK_END_JOURNALS.reset(token)
 
 
 _TASK_END_JOURNALS: ContextVar[TaskEndJournals | None] = ContextVar("scratch_task_end_journals", default=None)
@@ -3962,104 +3972,96 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
                 readings[path] = TaskEndJournalReading(status, operation)
             except (OSError, ScratchError) as error:
                 kept[path] = str(error)
-    token = _TASK_END_JOURNALS.set(TaskEndJournals(operation_journal_root(scratch_settings), readings))
-    try:
-        return finish_task_end(task, moment, selected, kept, scratch_settings)
-    finally:
-        _TASK_END_JOURNALS.reset(token)
+    with TaskEndJournals(operation_journal_root(scratch_settings), readings).use():
+        removed = TaskCleanup()
+        attempted: dict[Path, Path] = {}
 
-
-def finish_task_end(task: str, moment: float, selected: Callable[[Path], bool],
-                    kept: dict[Path, str], scratch_settings: conf.ConfigRead) -> TaskCleanup:
-    removed = TaskCleanup()
-    attempted: dict[Path, Path] = {}
-
-    def remove_task_folder(path: Path, *, require_task: bool = True) -> bool:
-        key = path.parent.resolve() / path.name
-        if key in attempted:
-            return attempted[key] not in kept
-        attempted[key] = path
-        try:
-            outcome = remove_folder(path, TaskRemoval(task, moment, require_task), scratch_settings=scratch_settings)
-            if isinstance(outcome, KeptFolder):
-                kept[path] = outcome.reason
+        def remove_task_folder(path: Path, *, require_task: bool = True) -> bool:
+            key = path.parent.resolve() / path.name
+            if key in attempted:
+                return attempted[key] not in kept
+            attempted[key] = path
+            try:
+                outcome = remove_folder(path, TaskRemoval(task, moment, require_task), scratch_settings=scratch_settings)
+                if isinstance(outcome, KeptFolder):
+                    kept[path] = outcome.reason
+                    return False
+            except (ScratchError, OSError) as error:
+                kept[path] = str(error)
                 return False
-        except (ScratchError, OSError) as error:
-            kept[path] = str(error)
-            return False
-        _ = kept.pop(path, None)
-        removed.append(path)
-        return True
+            _ = kept.pop(path, None)
+            removed.append(path)
+            return True
 
-    for folder in folders(scratch_settings=scratch_settings):
-        if folder.task == task and selected(folder.path):
-            _ = remove_task_folder(folder.path)
-    with locked_holds(scratch_settings=scratch_settings) as found:
-        changed = False
-        for path, record in list(found.items()):
-            if record["task"] != task or not selected(Path(path)):
-                continue
-            held = Path(path)
-            if record.get("release_on_task_end"):
-                try:
-                    require_no_folder_operations((held,), scratch_settings=scratch_settings)
-                except (OSError, ScratchError) as error:
-                    kept[held] = str(error)
+        for folder in folders(scratch_settings=scratch_settings):
+            if folder.task == task and selected(folder.path):
+                _ = remove_task_folder(folder.path)
+        with locked_holds(scratch_settings=scratch_settings) as found:
+            changed = False
+            for path, record in list(found.items()):
+                if record["task"] != task or not selected(Path(path)):
                     continue
-                del found[path]
+                held = Path(path)
+                if record.get("release_on_task_end"):
+                    try:
+                        require_no_folder_operations((held,), scratch_settings=scratch_settings)
+                    except (OSError, ScratchError) as error:
+                        kept[held] = str(error)
+                        continue
+                    del found[path]
+                    changed = True
+                    continue
                 changed = True
-                continue
-            changed = True
-            copies = Path(os.path.realpath(copy_record.copies_root()))
-            if copies.is_relative_to(held.resolve()) or held.parent == copies:
-                for copy in list(copy_paths()):
-                    if copy.is_relative_to(held) and selected(copy):
-                        _ = remove_task_folder(copy, require_task=False)
-                try:
-                    unfinished = clear_finished_copy_removals(copies, skip=attempted.keys(), ending_task=task,
-                                                              scratch_settings=scratch_settings)
-                except (ScratchError, OSError) as error:
-                    kept[held] = str(error)
-                    record["ended"] = moment
+                copies = Path(os.path.realpath(copy_record.copies_root()))
+                if copies.is_relative_to(held.resolve()) or held.parent == copies:
+                    for copy in list(copy_paths()):
+                        if copy.is_relative_to(held) and selected(copy):
+                            _ = remove_task_folder(copy, require_task=False)
+                    try:
+                        unfinished = clear_finished_copy_removals(copies, skip=attempted.keys(), ending_task=task,
+                                                                  scratch_settings=scratch_settings)
+                    except (ScratchError, OSError) as error:
+                        kept[held] = str(error)
+                        record["ended"] = moment
+                        continue
+                    for retained in unfinished:
+                        _ = kept.setdefault(retained.path, retained.reason)
+                        attempted[retained.path] = retained.path
+                    if any(key.is_relative_to(held) and path in kept and not os.path.lexists(key)
+                           for key, path in attempted.items()):
+                        kept[held] = "the container has unfinished copy removals"
+                        record["ended"] = moment
+                        continue
+                    try:
+                        _ = remove_empty_copy_pairs(copies, source_deletion=SourceDeletion.STANDARD,
+                                                    ending_task=task, scratch_settings=scratch_settings)
+                        # A container hold allows only empty directory removal.
+                        if held != copies and held.exists():
+                            outcome = remove_folder(held, EmptyFolderRemoval(), ending_task=task, scratch_settings=scratch_settings)
+                            if isinstance(outcome, KeptFolder):
+                                kept[held] = outcome.reason
+                                record["ended"] = moment
+                                continue
+                    except UnreadableFolderOperation as error:
+                        kept[held] = str(error)
+                        record["ended"] = moment
+                        continue
+                    if held == copies and any(copy_paths()):
+                        kept[held] = "the container has retained copies"
+                        record["ended"] = moment
+                        continue
+                    del found[path]
                     continue
-                for retained in unfinished:
-                    _ = kept.setdefault(retained.path, retained.reason)
-                    attempted[retained.path] = retained.path
-                if any(key.is_relative_to(held) and path in kept and not os.path.lexists(key)
-                       for key, path in attempted.items()):
-                    kept[held] = "the container has unfinished copy removals"
-                    record["ended"] = moment
-                    continue
-                try:
-                    _ = remove_empty_copy_pairs(copies, source_deletion=SourceDeletion.STANDARD,
-                                                ending_task=task, scratch_settings=scratch_settings)
-                    # A container hold allows only empty directory removal.
-                    if held != copies and held.exists():
-                        outcome = remove_folder(held, EmptyFolderRemoval(), ending_task=task, scratch_settings=scratch_settings)
-                        if isinstance(outcome, KeptFolder):
-                            kept[held] = outcome.reason
-                            record["ended"] = moment
-                            continue
-                except (ScratchError, OSError) as error:
-                    kept[held] = str(error)
-                    record["ended"] = moment
-                    continue
-                if held == copies and any(copy_paths()):
-                    kept[held] = "the container has retained copies"
+                needs_removal = (held in attempted or os.path.lexists(held)
+                                 or removal_mark(held).exists() or cargo_removal_mark(held).exists())
+                if needs_removal and not remove_task_folder(held):
                     record["ended"] = moment
                     continue
                 del found[path]
-                continue
-            needs_removal = (held in attempted or os.path.lexists(held)
-                             or removal_mark(held).exists() or cargo_removal_mark(held).exists())
-            if needs_removal and not remove_task_folder(held):
-                record["ended"] = moment
-                continue
-            del found[path]
-        if changed:
-            write_holds(found, scratch_settings=scratch_settings)
-    removed.kept = [KeptFolder(path, reason) for path, reason in kept.items()]
-    return removed
+            if changed:
+                write_holds(found, scratch_settings=scratch_settings)
+        removed.kept = [KeptFolder(path, reason) for path, reason in kept.items()]
+        return removed
 
 
 def end_selected_copy(path: Path, expected: copy_record.Registered, now: float,
