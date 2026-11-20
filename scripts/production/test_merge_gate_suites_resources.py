@@ -396,7 +396,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         with mock.patch.object(merge_gate, "start_gate_job", side_effect=observed):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(available_at_start, [b""] * (self.module_count + 1))
+        self.assertEqual(available_at_start, [b""] * self.module_count)
         self.assertEqual(self.jobserver_tokens(), b"Q")
         events = self.module_events()
         self.assertEqual([row["event"] for row in events], ["start", "finish"] * self.module_count)
