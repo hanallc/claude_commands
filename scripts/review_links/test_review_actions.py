@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import unittest
 from typing import override
+from unittest.mock import patch
 from urllib.parse import urlencode
 from uuid import uuid4
 
@@ -62,6 +63,30 @@ class WaitingActionTests(unittest.TestCase):
                 current = next(value for value in review_items.read(self.fixture.root, assign_ids=False) if value.key == item.key)
                 self.assertEqual(current.state, review_items.ReviewState.WAITING)
                 self.assertEqual(current.waiting_why, words)
+
+    def test_review_sends_a_followup_with_trailing_spaces_and_a_newline(self) -> None:
+        doc = self.fixture.fixture.production
+        _ = doc.write_text(doc.read_text() + '\n> **Status: PRODUCTION — running.**\n')
+        recipient = staff.snapshot().by_doc(local_machine(), doc)
+        assert recipient is not None
+        request = new_item_dialog.NewItemRequest(f'r1-{uuid4().hex}-question-{recipient.id}',
+            new_item_dialog.SubmissionKind.QUESTION, recipient.id, 'What caused this?', new_item_dialog.NoEvidence())
+        sent = review_submissions.submit(request)
+        self.assertTrue(review_submissions.answer(sent.key, 'The cause is known.', sent.reply_token))
+        root = self.fixture.root
+        item = next(item for item in review_items.read(root, assign_ids=False) if item.type == review_items.ReviewType.RESPONSE)
+        browser = change_page.ReviewBrowser(*change_browser.browser_manifest(change_page.console_folder(root)))
+        words = 'Which evidence shows the cause?'
+        body = urlencode({'row': item.key, 'token': change_browser.row_token(browser, item.key),
+                          'outcome': 'question', 'feedback': words + '  \n'})
+        status = change_page.DeliveryStatus(root)
+        delivery, _ = review_page.submit(root, body, status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        with patch.object(change_page, 'send_to_staff', return_value=None) as send:
+            change_page.deliver(delivery, status)
+        self.assertIn('\n' + words + '\nAnswer with this command:', delivery.message)
+        send.assert_called_once_with(recipient.id, change_page.SENDER, delivery.message,
+                                     key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt))
 
 
 if __name__ == '__main__':

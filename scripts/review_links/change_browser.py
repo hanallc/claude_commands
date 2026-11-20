@@ -259,13 +259,11 @@ def section(change: WaitingChange, feedback_rows: int) -> str:
     else:
         form = change_page.answer_form(page, change_page.AnswerNotice(row["#"]), feedback_rows).replace(
             '<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">') if change.waiting else ""
-        text = change_page.answer_status(row.get("Verdict", ""), change.slots)
-        saved = f'<p>{html.escape(text)}</p>' if text else ""
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 {change_page.review_html(row.get(change_review.CHECK, ''))}
-{anomaly}{change_page.question_html(change.question)}{saved}<p role="status" data-save-state></p>{form}
-{change_page.change_details(row, shown)}'''
+{anomaly}{change_page.question_html(change.question)}<p role="status" data-save-state hidden></p>{form}
+{change_page.change_details(row, shown, validating=change.slots.validation_requested)}'''
     return f'<section {attributes}>' + change_page.change_content(row, content) + '</section>'
 
 
@@ -498,7 +496,7 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
 <h1>{html.escape(title)}</h1>
 {body}{shown_choices}
-<p role="status" data-save-state></p>{form}{question_details(question, names)}</section>'''
+<p role="status" data-save-state hidden></p>{form}{question_details(question, names)}</section>'''
 
 
 @dataclass(frozen=True)
@@ -848,7 +846,7 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
-SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r'''
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + r'''
 let content=document.querySelector('[data-review-content]');
 const motion=createCardMotion(()=>content);
 let rows,viewOrders,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
@@ -914,7 +912,7 @@ function show(){
  shownHash=location.hash;
  // The console records this place in its own URL, so a reload or a shared link opens it again.
  if(parent!==window) parent.postMessage('console-place',location.origin); }
-function clearNotice(){saveNotice.hidden=true;saveNotice.textContent='';}
+function clearNotice(){showActionFailure(saveNotice);}
 function go(key){navigation++;clearNotice();location.hash=new URLSearchParams({showrunner:tab,row:key || ''});show();}
 function advance(row){
  const ordered=viewRows(), at=ordered.indexOf(row), candidates=waiting();
@@ -927,37 +925,34 @@ async function save(row,form,outcome){
  const data=new URLSearchParams(new FormData(form));
  data.set('row',row.dataset.key);data.set('outcome',outcome);data.delete('choice');
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
- state.textContent='Saving'; row.dataset.saveState='saving';
- const moveOn=notice=>{
+ showActionFailure(state);
+ const moveOn=()=>{
   row.dataset.pending='false';
-  if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){advance(row);saveNotice.textContent=notice;saveNotice.hidden=false;}
+  if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position) advance(row);
   else show();
   motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});
  };
  // Works and Does not work show the next change at once; a failed save puts the change back.
  const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
- if(early) moveOn('Saving review.');
+ if(early) moveOn();
  try{
   const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
-  state.textContent=reply.answer ? 'Saved: '+reply.answer :
-   outcome==='question' ? ''' + json.dumps(page_frame.QUESTION_WAITING.format(owner_role="showrunner")) + r''' :
-   outcome==='feedback' ? 'The showrunner will act on this' :
-   outcome==='followup' ? 'Follow-up sent to the asker' : outcome==='skip' ? 'Moved to the end of the list' : 'The showrunner will validate this';
-  row.dataset.saveState='saved';
   saved=true;
-  if(!early) moveOn(kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : outcome==='skip' ? 'Skipped.' : 'Answer saved.');
-  else if(!saveNotice.hidden && saveNotice.textContent==='Saving review.') saveNotice.textContent='Review saved.';
+  if(!early) moveOn();
  }catch(error){
   const reason=error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message;
-  row.dataset.saveState='failed'; state.textContent='Not saved: '+reason;
+  showActionFailure(state,'Not saved: '+reason);
   if(early){
    row.dataset.pending='true';form.hidden=false;show();
+  }
+  if(current!==row){
    const open=document.createElement('button');open.type='button';open.textContent='Open it';
    open.addEventListener('click',()=>go(row.dataset.key));
-   saveNotice.replaceChildren('Not saved: '+row.dataset.shown+'. '+reason+' It is back in the list. ',open);
-   saveNotice.hidden=false;
+   const label=row.dataset.shown || row.dataset.key;
+   showActionFailure(saveNotice,'Not saved: '+label+'. '+reason);
+   saveNotice.append(' ',open);
   }
  }finally{
   form.dataset.saving='false';activeSaves--;
@@ -988,13 +983,21 @@ function applyHeldPage(){
   .filter(row=>row.dataset.pending==='true');
  const keep=candidates.find(row=>row.dataset.key===current?.dataset.key);
  const chosen=keep || following.map(key=>candidates.find(row=>row.dataset.key===key)).find(Boolean) || candidates[0];
- const notice=saveNotice.hidden ? '' : saveNotice.textContent;
+ const notice=saveNotice.hidden ? null : saveNotice;
+ const failures=new Map(rows.flatMap(row=>{
+  const status=row.querySelector('[data-save-state]');
+  return status?.textContent ? [[row.dataset.key,status.textContent]] : [];
+ }));
  motion.finish();
  shownPage=fresh.outerHTML;content.replaceWith(fresh);content=fresh;bindPage();
+ for(const row of rows){
+  const status=row.querySelector('[data-save-state]');
+  if(status && failures.has(row.dataset.key)) showActionFailure(status,failures.get(row.dataset.key));
+ }
  content.querySelectorAll('details').forEach(detail=>detail.open=opened.has(detailKey(detail)));
  history.replaceState(null,'','#'+new URLSearchParams({showrunner:tab,row:chosen?.dataset.key || ''}));
  show();
- if(notice){saveNotice.textContent=notice;saveNotice.hidden=false;}
+ if(notice){saveNotice.replaceWith(notice);saveNotice=notice;}
  if(controlId) content.querySelector('#'+controlId)?.focus({preventScroll:true});
  const field=rows.find(row=>row.dataset.key===fieldRow)?.querySelector('[name="'+fieldName+'"]');
  if(field && !field.closest('section').hidden){field.focus({preventScroll:true});field.setSelectionRange(...selection);}

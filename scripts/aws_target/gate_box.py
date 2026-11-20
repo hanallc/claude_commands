@@ -745,9 +745,15 @@ def decode_run(value: object) -> GateRun:
 
     def number(row: dict[str, object], key: str) -> float:
         value = row[key]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f'{key}: expected a finite nonnegative number')
-        return float(value)
+        try:
+            result = float(value)
+        except OverflowError as error:
+            raise ValueError(f'{key}: expected a finite nonnegative number') from error
+        if not math.isfinite(result) or result < 0:
+            raise ValueError(f'{key}: expected a finite nonnegative number')
+        return result
 
     def job(row: dict[str, object]) -> GateJobResult:
         status = row['returncode']

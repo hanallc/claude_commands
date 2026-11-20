@@ -8,11 +8,12 @@ except FileNotFoundError:
 import argparse
 import fcntl
 import json
+import os
 import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Protocol, cast
@@ -185,12 +186,34 @@ def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems
     return compare(settings, expected, run).row
 
 
+type OpenRebuildNeeds = tuple[need.MachineNeeds, ...]
+
+
+class _NoKnownRebuildNeeds:
+    """Let the Rebuilds page list the records that are available."""
+
+    def __iter__(self) -> Iterator[need.MachineNeeds]:
+        return iter(())
+
+
+@dataclass(frozen=True)
+class RebuildNeedsNotRead(_NoKnownRebuildNeeds):
+    """The open rebuild records have not been read."""
+
+
+@dataclass(frozen=True)
+class RebuildNeedsUnavailable(_NoKnownRebuildNeeds):
+    """The open rebuild records could not be read."""
+
+    reason: str
+
+
 @dataclass(frozen=True)
 class RebuildAnswer:
     """The known rebuild machines and whether the cache needs a refresh.
 
     `compared` holds the machines whose running system differs from main;
-    `needs` holds the open rebuild needs that `read` joined into `machines`.
+    `needs` holds the open rebuild records or the reason they are unavailable.
     `probes` records whether each machine supplied a running system path.
     """
 
@@ -199,7 +222,7 @@ class RebuildAnswer:
     expected: ExpectedSystems | NoExpectedSystems = NoExpectedSystems()
     failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
     compared: tuple[str, ...] = ()
-    needs: tuple[need.MachineNeeds, ...] = ()
+    needs: OpenRebuildNeeds | RebuildNeedsNotRead | RebuildNeedsUnavailable = RebuildNeedsNotRead()
     probes: RunningSystemProbes = RunningSystemProbes()
 
     def row(self) -> str:
@@ -344,11 +367,18 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
     """Combine the cached comparison with open rebuild needs."""
     answer = _read_cache(config, clock)
     try:
+        # Glob can hide an inaccessible folder.
+        try:
+            with os.scandir(need.needs_folder()):
+                pass
+        except FileNotFoundError:
+            pass
         needs = tuple(need.read_needs())
         machines = set(answer.machines) | {summary.newest["machine"] for summary in needs}
-    except (OSError, ValueError, KeyError, TypeError):
-        return answer
-    return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines), needs=needs)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return replace(answer, needs=RebuildNeedsUnavailable(str(error)))
+    return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines),
+                   needs=needs)
 
 
 def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
@@ -393,10 +423,25 @@ def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
         return RebuildAnswer((), True)
 
 
+def _watched_source(path: Path) -> Path:
+    """The path itself, or for one that does not exist yet its nearest folder that does."""
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
+
+
+def write_status_cache(cache: Path, line: str, due: str, sources: list[Path], began: int, details: str = "") -> None:
+    """Replace the cache with the answer, deadline, source paths, and optional result details."""
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    scratch = cache.with_name(f".{cache.name}.{os.getpid()}")
+    named = dict.fromkeys(str(_watched_source(path)) for path in sources)
+    _ = scratch.write_text("\n".join([line, due, *named, *([details] if details else [])]) + "\n", encoding="utf-8")
+    os.utime(scratch, ns=(began, began))
+    _ = scratch.replace(cache)
+
+
 def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[[], float] = time.time) -> None:
     """Refresh the configured cache without concurrent evaluations."""
-    from scripts.statusline import counts_row
-
     try:
         cache = cache_path(config)
     except (OSError, ValueError, KeyError):
@@ -439,7 +484,7 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
             fields = cast(dict[str, object], json.loads(details))
             fields["running_system_probes"] = {"natedev": probes.natedev, "mac": probes.mac}
             details = json.dumps(fields)
-        counts_row.write_cache(cache, line, due, [config], began, details)
+        write_status_cache(cache, line, due, [config], began, details)
 
 
 def main(argv: list[str]) -> int:

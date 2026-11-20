@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from urllib.parse import quote
 
 from scripts.lib import conf
+from scripts.review_links import page_frame
 
 
 @dataclass(frozen=True)
@@ -225,7 +226,7 @@ border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--
 </style>'''
 
 
-SCRIPT = 'const ownerQueryKeys=' + json.dumps(OWNER_QUERY_KEYS) + r''';
+SCRIPT = page_frame.ACTION_STATUS_SCRIPT + 'const ownerQueryKeys=' + json.dumps(OWNER_QUERY_KEYS) + r''';
 const filterControl={
  wordValues:new WeakMap(),
  getWords(control){return this.wordValues.get(control) ?? '';},
@@ -317,7 +318,7 @@ let placeHash=location.hash;
 let highlightedRow,highlightTimer;
 const opened=new Set(),filterNames=options.filters || [],filters={};
 const columns=[...content.querySelectorAll('[data-sort]')].map(button=>button.textContent);
-const rowMotion=new Map(),actionNotices=new Map();
+const rowMotion=new Map(),actionFailures=new Map();
 const motionsByKey=()=>new Map([...rowMotion].map(([node,motion])=>[node.dataset.key,motion]));
 let latestSubmission=0,latestActionFailure=null;
 const boundRoots=new WeakSet();
@@ -393,7 +394,7 @@ function drawWindow(){
    if(motion) placeNode(motion.spacer);
   }
  }
- showHiddenActionResults([...mounted.values()]);
+ showHiddenActionFailure([...mounted.values()]);
  options.mounted?.();
 }
 function mount(data){
@@ -589,31 +590,25 @@ function animateRow(table,item,showRow,previousItem=item){
  rowMotion.set(item,{spacer,clip,copy,animation,finished,sortValues:showRow ? sortValues(item.dataset) :
   previous?.sortValues ?? sortValues(item.dataset)});
 }
-function showHiddenActionResults(items){
+function showHiddenActionFailure(items){
  const status=content.querySelector('[data-hidden-action-status]');
  if(!status) return;
  const hidden=key=>{
   const item=items.find(item=>item.dataset.key===key);
   return !item || item.hidden || item.querySelector('[data-detail]').hidden || !item.querySelector('[data-send-status]');
  };
- const messages=[];
- for(const [key,{hiddenMessage}] of actionNotices)
-  if(hiddenMessage && hidden(key)) messages.push(hiddenMessage);
- if(latestActionFailure && hidden(latestActionFailure.key)) messages.push(latestActionFailure.message);
- const text=messages.join(' ');
- if(status.textContent!==text) status.textContent=text;
- status.hidden=!text;
+ const failure=latestActionFailure;
+ showActionFailure(status,failure && hidden(failure.key) ? failure.message : '');
 }
-/** @param {{kind:'success' | 'failure', message:string, hiddenMessage?:string}} result */
-function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
+function showRowActionFailure(item,submission,label,message){
  const key=item.dataset.key;
- actionNotices.set(key,{message,hiddenMessage});
- if(kind==='failure' && submission===latestSubmission) latestActionFailure={key,message:label+': '+message};
+ actionFailures.set(key,message);
+ if(submission===latestSubmission) latestActionFailure={key,message:label+': '+message};
  const status=item.querySelector('[data-send-status]');
- if(status) status.textContent=message;
+ if(status) showActionFailure(status,message);
  apply(false,{animate:true});
  const restored=mounted.get(key);
- if(kind==='failure' && restored && restored!==item && !matchMedia('(prefers-reduced-motion: reduce)').matches){
+ if(restored && restored!==item && !matchMedia('(prefers-reduced-motion: reduce)').matches){
   animateRow(content.querySelector('table'),restored,true,item);
  }
 }
@@ -762,15 +757,13 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
    notice=document.createElement('p');notice.dataset.missingKeys='';notice.setAttribute('role','status');
    empty.after(notice);
   }
-  notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
-  notice.hidden=!missing.length;
+  showActionFailure(notice,missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n'));
  }
  empty.hidden=count>0 || missing.length>0;
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
   const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
-  missingItem.textContent=message;
-  missingItem.hidden=!message;
+  showActionFailure(missingItem,message);
  }
  const group=content.querySelector('[data-clear-linked-reviews]');
  if(group) group.hidden=!keys.size;
@@ -778,7 +771,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(counts) for(const [name,values] of Object.entries(counts)) filterSelection(name).setCounts?.(values);
  const countLine=content.querySelector('[data-list-count]');
  if(countLine) countLine.textContent=options.counts(selection,count,{show,keys,counts});
- if(!options.mount) showHiddenActionResults(items);
+ if(!options.mount) showHiddenActionFailure(items);
  options.applied?.(selection,active);
  if(write || location.hash===placeHash &&
   (revealedLinkedItem!==previousReveal || owner!==previousOwner || show!==previousShow ||
@@ -933,12 +926,14 @@ return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,follo
  startAction(item){
   const submission=++latestSubmission;
   latestActionFailure=null;
-  actionNotices.delete(item.dataset.key);
+  actionFailures.delete(item.dataset.key);
+  const status=item.querySelector('[data-send-status]');
+  if(status) showActionFailure(status);
   apply(false,{animate:true});
   return submission;
  },
- showActionResult,
- actionNotice(item){return actionNotices.get(item.dataset.key)?.message ?? '';},
+ showActionFailure:showRowActionFailure,
+ actionFailure(item){return actionFailures.get(item.dataset.key) ?? '';},
  applyAction(){apply(false,{animate:true});},
  rowFading(key){return [...rowMotion.keys()].some(item=>item.dataset.key===key);},
  async rowSettled(item){while(rowMotion.has(item)) await rowMotion.get(item).finished;},

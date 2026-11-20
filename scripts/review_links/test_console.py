@@ -353,7 +353,7 @@ try{
  check(panel.getBoundingClientRect().right<=innerWidth && panel.getBoundingClientRect().left>=0,'the panel fits the viewport');
  check(document.documentElement.scrollWidth===innerWidth,'the shell has no horizontal overflow');
  const copy=panel.querySelector('[data-copy-code]');copy.focus();copy.click();await flush();
- check(copied==='rebuild' && copy.getAttribute('aria-label')==='Copied','Copy writes the command');
+ check(copied==='rebuild' && !copy.querySelector('[data-copied-icon]').hasAttribute('hidden'),'Copy writes the command and shows a check');
  const code=panel.querySelector('code'),selection=getSelection(),range=document.createRange();
  range.selectNodeContents(code);selection.removeAllRanges();selection.addRange(range);
  mode='good';dispatchEvent(new Event('focus'));await flush();
@@ -362,7 +362,7 @@ try{
  check(document.activeElement===copy && selection.toString()==='rebuild' && code.textContent==='rebuild','changed entries wait for the focused selection');
  selection.removeAllRanges();trigger.focus();await flush();
  check(panel.querySelector('code').textContent==='rebuild --new','released commands receive the pending refresh');
- const note=panel.querySelector('.panel-note');
+ const note=panel.querySelector('[data-for-you-summary]');
  const crossCode=panel.querySelector('code');
  selection.setBaseAndExtent(note.firstChild,0,crossCode.firstChild,crossCode.textContent.length);
  const selected=selection.toString();
@@ -383,7 +383,7 @@ try{
    selection.anchorNode===start && selection.focusNode===end,result+' preserves the panel count and command selection');
   selection.removeAllRanges();await flush();
   check(heading.textContent===count && panel.querySelectorAll('article').length===0 &&
-   note.textContent===(result==='zero'?'No actions required.':'The action count is unavailable.'),
+   panel.querySelector('.panel-note:not([hidden])').textContent===(result==='zero'?'No actions required.':'The action count is unavailable.'),
    result+' updates the panel after selection ends');
  }
  mode='good';dispatchEvent(new Event('focus'));await flush();

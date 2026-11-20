@@ -19,7 +19,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.aws_target import ledger
@@ -41,6 +41,7 @@ class FailedProbeTests(OffloadCommandFixture):
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, verify_test_environment(), clear=True)))
         super().setUp()
         self.linux_settings = self.root / "box.conf"
         _ = write_config_fixture(self.linux_settings,
@@ -741,7 +742,7 @@ raise SystemExit(255)
 ''')
         self.write_config(clippy="on")
         self.environment["BUILD_TARGETS_SCRIPT"] = str(Path(build_targets.__file__))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True)))
         admission = caller_admission(self, self.root, self.environment)
         admission.server.host_probe = admission.server.read_provider_evidence
         result = self.verify("lint", "sample")

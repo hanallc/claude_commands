@@ -135,10 +135,24 @@ def rendered(content: bytes, started: float, read_at: float) -> bytes:
     return content.replace(b'data-page-facts', facts.encode(), 1)
 
 
+def action_failure(notice: str | None, message: str = "") -> str:
+    identity = f' id="{html.escape(notice, quote=True)}"' if notice else ""
+    hidden = " hidden" if not message else ""
+    return f'<p class="action-failure"{identity} role="alert"{hidden}>{html.escape(message)}</p>'
+
+
+ACTION_STATUS_SCRIPT = r'''function showActionFailure(status,message=''){
+ if(status.textContent!==message) status.textContent=message;
+ status.hidden=!message;
+}
+'''
+
+
 def template(source: str, text: str, page: str) -> str:
     """Fill the shared title, style and script in a static page template."""
     return (source.replace("__PAGE_FRAME_STYLE__", STYLE).replace("__PAGE_TITLE__", title(text, page))
-            .replace("__PAGE_REFRESH_SCRIPT__", REFRESH_SCRIPT))
+            .replace("__PAGE_REFRESH_SCRIPT__", REFRESH_SCRIPT)
+            .replace("__ACTION_STATUS_SCRIPT__", ACTION_STATUS_SCRIPT))
 
 
 REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
@@ -216,8 +230,8 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  function abandon(){
   request++;active=false;clearTimeout(delay);reading=false;pending=null;draw();
  }
- function setStatus(text,reason=''){
-  busy=text;failure=reason;
+ function setBusy(text){
+  busy=text;if(text) failure='';
   if(last) last={...last,busy:text,answeredAt:Date.now()/1000};
   draw();
  }
@@ -244,7 +258,7 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  const first=initial || (line?.dataset.readAt ? pageRefreshFacts() : null);
  if(first){const navigation=performance.getEntriesByType('navigation')[0];
   void present(first,navigation?.requestStart || started,request,true);}
- return {restart,refresh,changed,abandon,setStatus};
+ return {restart,refresh,changed,abandon,setBusy};
 }
 '''
 
@@ -301,6 +315,7 @@ STYLE = (BUTTON_STATES
          + r'''
 .page-status{display:flex;align-items:center;flex-wrap:wrap;gap:6px 0;font:14px/1.5 system-ui,sans-serif;
 color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
+.action-failure{color:var(--error);white-space:pre-line;overflow-wrap:anywhere}
 .page-status>[hidden],.page-status [hidden]{display:none!important}
 .page-status>span:not(.page-status-announcement){white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
 .page-status>span:not(:first-child):not(.page-status-announcement)::before{content:'·';margin:0 10px;color:var(--ink-3)}
@@ -365,10 +380,11 @@ background:transparent;color:inherit;opacity:.55;cursor:pointer;user-select:none
 
 COPY_SCRIPT = r'''(() => {
 const resultMs=2000, states=new WeakMap();
-function show(button,label){
- button.setAttribute('aria-label',label);button.title=label==='Copy code' ? 'Copy' : label;
- button.querySelector('[data-copy-icon]').toggleAttribute('hidden',label==='Copied');
- button.querySelector('[data-copied-icon]').toggleAttribute('hidden',label!=='Copied');
+function show(button,copied,failed=false){
+ button.setAttribute('aria-label',failed ? 'Copy failed' : 'Copy code');
+ button.title=failed ? 'Copy failed' : 'Copy';
+ button.querySelector('[data-copy-icon]').toggleAttribute('hidden',copied);
+ button.querySelector('[data-copied-icon]').toggleAttribute('hidden',!copied);
 }
 function copyText(text){
  const active=document.activeElement, selection=getSelection();
@@ -392,13 +408,14 @@ document.addEventListener('click',async event=>{
  if(!code) return;
  const state=states.get(button) || {timer:0,request:0};states.set(button,state);
  clearTimeout(state.timer);const request=++state.request;
- let label='Copied';
+ let copied=false;
  try{
   if(navigator.clipboard?.writeText) await navigator.clipboard.writeText(code.textContent);
   else copyText(code.textContent);
- }catch(error){label='Copy failed';}
+  copied=true;
+ }catch{}
  if(request!==state.request) return;
- show(button,label);state.timer=setTimeout(()=>show(button,'Copy code'),resultMs);
+ show(button,copied,!copied);state.timer=setTimeout(()=>show(button,false),resultMs);
 });
 })();'''
 
