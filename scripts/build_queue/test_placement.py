@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, nullcontext, redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -33,7 +33,7 @@ from scripts.lint.memory_test_support import write_config_fixture, write_pressur
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.lib import conf
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
@@ -551,47 +551,42 @@ class PlacementTests(unittest.TestCase):
                 mac_test.write_json(paths.run, record)
                 before = paths.run.read_bytes()
                 granted = only_admitted(fixture.connect(fixture.request()).replies())
-                locked, started, finish = threading.Event(), threading.Event(), threading.Event()
+                lock_requested = threading.Event()
+                provider_lock = mac_test.locked
 
-                def hold_provider_lock() -> None:
-                    with mac_test.locked(paths.lock):
-                        locked.set()
-                        if not finish.wait(TEST_HANG_GUARD_SECS):
-                            raise AssertionError("The fixture did not release the provider lock")
+                def observe_lock_request(path: Path) -> AbstractContextManager[None]:
+                    if path == paths.lock:
+                        lock_requested.set()
+                    return provider_lock(path)
 
                 def adapter() -> int:
                     args = mac_test.CliArguments()
                     args.pid, args.worktree, args.remote = request.owner.pid, str(fixture.root), assignment.destination.host
                     args.claim_id, args.episode, args.attempt = reference.claim_id, reference.episode, reference.attempt
-                    started.set()
                     with redirect_stdout(io.StringIO()):
                         if operation == "cleanup":
                             return mac_test.command_release(args, paths)
                         return mac_test.command_claim(args, paths, watch_claim=False,
                             session=assignment.session, assignment=assignment)
 
-                with ThreadPoolExecutor(max_workers=2) as workers:
-                    lock_owner = workers.submit(hold_provider_lock)
-                    try:
-                        self.assertTrue(locked.wait(1))
+                with (ThreadPoolExecutor(max_workers=2) as workers,
+                      mock.patch.object(mac_test, "locked", new=observe_lock_request)):
+                    with provider_lock(paths.lock):
                         pending = workers.submit(adapter)
-                        self.assertTrue(started.wait(1))
+                        LauncherHangGuard(f"Provider {operation} lock request").event(lock_requested)
                         self.assertFalse(pending.done())
                         fixture.allow_next_start()
                         for message in (wire.ViewRequest(), wire.ReleaseRequest("release-responsive", granted.reservation, 0),
                                         fixture.request()):
-                            began = time.monotonic()
-                            replies = fixture.connect(message).replies()
-                            self.assertLess(time.monotonic() - began, 1, type(message).__name__)
+                            reply_guard = LauncherHangGuard(
+                                f"{type(message).__name__} while provider {operation} waits for the lock")
+                            replies = reply_guard.result(workers.submit(fixture.connect(message).replies))
                             self.assertTrue(replies)
                             self.assertIsInstance(replies[-1], wire.ViewReply if isinstance(message, wire.ViewRequest)
                                 else wire.Ok if isinstance(message, wire.ReleaseRequest) else wire.Admitted)
-                        self.assertFalse(pending.done())
+                            self.assertFalse(pending.done())
                         self.assertEqual(paths.run.read_bytes(), before)
-                    finally:
-                        finish.set()
-                    _ = lock_owner.result(timeout=TEST_HANG_GUARD_SECS)
-                    _ = pending.result(timeout=TEST_HANG_GUARD_SECS)
+                    _ = LauncherHangGuard(f"Provider {operation} completion").result(pending)
 
     def test_speculative_placement_keeps_the_newest_live_candidate_and_its_local_parent_charge(self) -> None:
         cases = (
