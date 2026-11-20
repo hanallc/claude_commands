@@ -264,16 +264,13 @@ def output_folder() -> Path:
 
 
 def quota_help() -> str:
-    """Render the shared instructions with links to AWS settings and the case list."""
+    """Render the shared instructions with a link to the case list."""
+    link = escape(console_help.CASE_LIST_URL)
     steps: list[str] = []
     for step in console_help.QUOTA_CASE_STEPS:
-        text = escape(step)
-        for url in (console_help.SETTINGS_URL, console_help.CASE_LIST_URL):
-            link = escape(url)
-            text = text.replace(link, f'<a href="{link}">{link}</a>')
+        text = escape(step).replace(link, f'<a href="{link}">{link}</a>')
         steps.append(f'<li>{text}</li>')
-    notes = ''.join(f'\n<p>{escape(note)}</p>' for note in (console_help.WRONG_ACCOUNT, console_help.PASSKEY_NOTE))
-    return '<ol>' + ''.join(steps) + '</ol>' + notes
+    return '<ol>' + ''.join(steps) + f'</ol>\n<p>{escape(console_help.WRONG_ACCOUNT)}</p>'
 
 
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
@@ -288,9 +285,11 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     except (OSError, ValueError, KeyError) as error:
         print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
         placement = ()
-    tables = spot_table.spot_tables(directory, now, settings_path=settings_path)
+    values = conf.read_or_repository('cloud_gate')
+    gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
+    tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
     data = page_data(tables, spend, now, placement)
-    comparisons = run_cost.merge_gate_comparisons(directory, now, conf.read_or_repository('cloud_gate'), configuration)
+    comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
     gate_time_data = {'table': gate_time_price, 'regions': regions}

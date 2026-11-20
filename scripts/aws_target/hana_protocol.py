@@ -58,6 +58,13 @@ class SourceLimits:
     allowed_environment: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MissingBasis:
+    """The guest lacks commits needed to apply an incremental bundle."""
+    repository: str
+    commits: tuple[str, ...]
+
+
 def validate_manifest(manifest: SourceManifest, limits: SourceLimits) -> None:
     """Reject unsafe paths, revisions, URLs, and inherited environment values."""
     _ = manifest.encode()
