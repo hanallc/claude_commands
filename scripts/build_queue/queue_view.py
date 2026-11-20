@@ -256,8 +256,13 @@ def mac_reading_status(reading: MacBuildReading, now: float) -> str:
 
 def mac_build_script() -> str:
     """Read cargo tile registrations and process trees in one SSH call."""
-    return ("python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config)
-            + "\n" + inspect.getsource(mac_gate_records) + r'''
+    return ("python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config) + r'''
+import pwd
+if sys.platform == "darwin":
+    account_home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    sys.path.insert(0, str(account_home / ".claude"))
+
+''' + inspect.getsource(mac_gate_records) + r'''
 from functools import cache
 import json
 import sys
@@ -269,8 +274,6 @@ import time
 import tomllib
 
 CAPTURE_ROOT = Path("/tmp/cargo-tile")
-if sys.platform == "darwin":
-    sys.path.insert(0, str(mac_gate_account_home() / ".claude"))
 
 
 def output(arguments):

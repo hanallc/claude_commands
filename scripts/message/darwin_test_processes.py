@@ -5,20 +5,17 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 import errno
-from functools import cache
 import os
 import time
 from typing import cast, final
 
+from scripts.lib.darwin_process import DarwinProcessInfoUnavailable, SSTOP, SZOMB, libproc, read_process_info
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # These values are Darwin ABI selectors, not test policy.
 PROC_UID_ONLY = 4
 PROC_PPID_ONLY = 6
-PROC_PIDTBSDINFO = 3
 PROC_PIDUNIQIDENTIFIERINFO = 17
-SSTOP = 4
-SZOMB = 5
 CTL_KERN = 1
 KERN_PROCARGS2 = 49
 
@@ -30,34 +27,11 @@ class ProcessIdentityInfo(ctypes.Structure):
                 ("parent_version", ctypes.c_int32), ("reserved", ctypes.c_uint64 * 2)]
 
 
-@final
-class ProcessStateInfo(ctypes.Structure):
-    """Match Darwin's proc_bsdinfo layout for PROC_PIDTBSDINFO."""
-
-    _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32),
-                ("exit_status", ctypes.c_uint32), ("pid", ctypes.c_uint32),
-                ("parent_pid", ctypes.c_uint32), ("uid", ctypes.c_uint32),
-                ("gid", ctypes.c_uint32), ("real_uid", ctypes.c_uint32),
-                ("real_gid", ctypes.c_uint32), ("saved_uid", ctypes.c_uint32),
-                ("saved_gid", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
-                ("command", ctypes.c_char * 16), ("name", ctypes.c_char * 32),
-                ("file_count", ctypes.c_uint32), ("group_id", ctypes.c_uint32),
-                ("job_count", ctypes.c_uint32), ("terminal", ctypes.c_uint32),
-                ("terminal_group", ctypes.c_uint32), ("nice", ctypes.c_int32),
-                ("start_seconds", ctypes.c_uint64), ("start_microseconds", ctypes.c_uint64)]
-
-
 @dataclass(frozen=True)
 class OwnedProcessIdentity:
     pid: int
     unique_id: int
     version: int
-
-
-@cache
-def libproc() -> ctypes.CDLL:
-    """Load the Darwin process library once, when a caller needs it."""
-    return ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
 
 
 def identity(pid: int) -> OwnedProcessIdentity | None:
@@ -148,19 +122,14 @@ def process_state(owned: OwnedProcessIdentity) -> str:
         current = identity(owned.pid)
         if current is None or current.unique_id != owned.unique_id:
             return ""
-        library = libproc()
-        info = ProcessStateInfo()
-        size = cast(int, library.proc_pidinfo(owned.pid, PROC_PIDTBSDINFO, 1,
-                                             ctypes.byref(info), ctypes.sizeof(info)))
-        if size != ctypes.sizeof(info):
-            error = ctypes.get_errno()
-            if error in (0, errno.ESRCH, errno.ENOENT):
-                return ""
-            raise OSError(error, "cannot read test process state")
+        info = read_process_info(owned.pid, include_zombies=True)
         after = identity(owned.pid)
         if after is None or after.unique_id != owned.unique_id:
             return ""
+    except DarwinProcessInfoUnavailable as error:
+        if error.errno not in (0, errno.ESRCH, errno.ENOENT):
+            raise
+        return ""
     except ProcessLookupError:
         return ""
-    status = cast(int, info.status)
-    return "T" if status == SSTOP else "Z" if status == SZOMB else "R"
+    return "T" if info.status == SSTOP else "Z" if info.status == SZOMB else "R"

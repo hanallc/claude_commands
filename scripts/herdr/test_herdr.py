@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 from importlib import import_module
 import io
-import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
@@ -37,7 +36,8 @@ from scripts.message import codex_daemon
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import operation_deadline, session_folder
+from scripts.lib import darwin_process, operation_deadline, session_folder
+from scripts.lib.darwin_process_test_support import native_process_read, write_process_info
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
 from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
@@ -49,7 +49,6 @@ GIT_BINARY = shutil.which("git") or "git"
 BASH_BINARY = shutil.which("bash") or "bash"
 NATIVE_PROCESS_START = "Tue Nov  3 08:00:00 2026"
 NATIVE_PROCESS_MICROSECONDS = 1793692800123456
-DARWIN_BSD_INFO = herdr._DarwinProcessBSDInfo  # pyright: ignore[reportPrivateUsage]
 
 
 @contextmanager
@@ -63,16 +62,13 @@ def native_process_commands(pid: int, *, generations: tuple[herdr.AgentProcessId
     def generation(observed_pid: int, flavor: int, argument: int, buffer: object, size: int) -> int:
         if observed_pid not in starts:
             raise AssertionError(f"unexpected process: {observed_pid}")
-        if (flavor, argument, size) != (3, 0, ctypes.sizeof(DARWIN_BSD_INFO)):
+        if (flavor, argument) != (darwin_process.PROC_PIDTBSDINFO, 0):
             raise AssertionError(f"unexpected proc_pidinfo request: {flavor}, {argument}, {size}")
         readings = starts[observed_pid]
         started = readings.pop(0) if len(readings) > 1 else readings[0]
         if isinstance(started, herdr.ProcessGenerationUnavailable):
             return 0
-        info = ctypes.cast(cast(ctypes.c_void_p, buffer), ctypes.POINTER(DARWIN_BSD_INFO)).contents
-        info.pbi_pid = observed_pid
-        info.pbi_start_tvsec, info.pbi_start_tvusec = divmod(started, 1_000_000)
-        return size
+        return write_process_info(buffer, size, darwin_process.DarwinProcessInfo(observed_pid, 0, started, 2, 0))
 
     def process_start(observed_pid: int) -> str:
         if observed_pid != pid:
@@ -88,8 +84,7 @@ def native_process_commands(pid: int, *, generations: tuple[herdr.AgentProcessId
         return program(argv, timeout, environment=environment)
 
     with (patch.object(herdr, "run_program", side_effect=run),
-          patch.object(ctypes, "CDLL"),
-          patch.object(ctypes, "CFUNCTYPE", return_value=Mock(return_value=generation)),
+          native_process_read(generation),
           patch.object(sessions, "process_start", side_effect=process_start),
           patch.object(session_records, "process_start", side_effect=process_start)):
         yield
@@ -641,28 +636,24 @@ class NativePaneSessionTests(StaffTestCase):
         info = {"process_info": {"shell_pid": shell, "foreground_process_group_id": codex,
             "foreground_processes": [{"pid": codex, "argv": ["codex"]},
                                      {"pid": child, "name": "editor", "argv": ["editor", "private-argument"]}]}}
-        parent = DARWIN_BSD_INFO()
-        parent.pbi_ppid = codex
-        terminal = DARWIN_BSD_INFO()
-        terminal.e_tdev = 0x1000001
         observed = herdr.NativeAgentProcess(herdr.PaneSessionReport(identity), "fixture-start", {})
-        def bsd_info(pid: int, *, include_zombies: bool = False) -> herdr._DarwinProcessBSDInfo:  # pyright: ignore[reportPrivateUsage]
+
+        def bsd_info(pid: int, *, include_zombies: bool = False) -> darwin_process.DarwinProcessInfo:
             if pid == child:
                 self.assertTrue(include_zombies)
-                return parent
+                return darwin_process.DarwinProcessInfo(pid, codex, NATIVE_PROCESS_MICROSECONDS, state, 0)
             self.assertEqual(pid, shell)
-            return terminal
+            return darwin_process.DarwinProcessInfo(pid, 0, NATIVE_PROCESS_MICROSECONDS, 2, 0x1000001)
 
         for fields, error, state in (("r0x1000001\ntCHR\n", "terminal held by editor", 2),
                                      ("tPIPE\n", "", 2), ("tCHR\n", "terminal may be held by editor", 2),
-                                     ("", "", 5)):
-            parent.pbi_status = state
+                                     ("", "", darwin_process.SZOMB)):
             with (self.subTest(fields=fields, state=state), patch.dict(os.environ, {"HERDR_PLATFORM": "darwin"}),
                   patch.object(client, "pane_row", return_value=row),
                   patch.object(client, "result", return_value=info),
                   patch.object(client, "composer", return_value=herdr.NoComposer()),
                   patch.object(client, "run") as command,
-                  patch.object(herdr, "_darwin_process_bsd_info", side_effect=bsd_info),
+                  patch.object(darwin_process, "read_process_info", side_effect=bsd_info),
                   patch.object(herdr, "native_process", return_value=observed),
                   patch.object(herdr, "run_program", return_value=subprocess.CompletedProcess[str](
                       [], 0, f"p{child}\nf0\n{fields}", "")) as lsof):
@@ -673,7 +664,7 @@ class NativePaneSessionTests(StaffTestCase):
                 else:
                     client.prompt(pane, "fixture result", target=identity)
                     command.assert_called_once_with("agent", "prompt", pane, script_prompt("fixture result"))
-                if state == 5:
+                if state == darwin_process.SZOMB:
                     lsof.assert_not_called()
                 else:
                     lsof.assert_called_once_with([os.environ.get("HERDR_LSOF", "lsof"), "-nP", "-a",

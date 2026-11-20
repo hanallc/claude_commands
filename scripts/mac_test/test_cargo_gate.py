@@ -25,7 +25,8 @@ from scripts.mac_test.mac_gate_records import MacGateRecord, MacProcessIdentity
 GATE = Path(__file__).with_name("cargo_gate") / "bin"
 FIXTURE_WORKER_BUDGET = "3"
 FIXTURE_STARTED_US = 1_793_280_000_123_456
-REGISTER_PYTHON = '''import json, os, subprocess, sys
+REGISTER_PYTHON = '''import errno, json, os, subprocess, sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,27 +36,69 @@ if sys.argv[1] == "-B" and Path(sys.argv[2]).name == "register.py":
 
     path = Path(sys.argv[2]).resolve()
     sys.path.insert(0, str(path.parents[3]))
+    from scripts.lib import darwin_process
+    from scripts.lib.darwin_process_test_support import native_process_read, write_process_info
     from scripts.mac_test import mac_gate_records
     from scripts.mac_test.cargo_gate import register
-    from scripts.mac_test.mac_gate_records import LiveMacProcess, MacProcessEvidence, MacProcessIdentity
+    from scripts.mac_test.mac_gate_records import MacGateRecord, MacProcessIdentity
 
-    def observe(pid):
-        if pid in json.loads(os.environ.get("GATE_TEST_UNKNOWN_PIDS", "[]")):
-            return MacProcessEvidence.UNAVAILABLE
+    failures = json.loads(os.environ.get("GATE_TEST_PROBE_FAILURES", "{}"))
+    original_kill = os.kill
+    original_scandir = os.scandir
+
+    def read(pid, flavor, argument, buffer, size):
+        assert (flavor, argument) == (darwin_process.PROC_PIDTBSDINFO, 1)
+        with (root / "probes").open("a") as stream:
+            stream.write(f"{pid}\\n")
+        if str(pid) in failures:
+            return size - 1
         result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "ppid=", "-o", "state="],
                                 text=True, capture_output=True)
         if result.returncode:
-            return MacProcessEvidence.ENDED
+            return 0
         parent, state = result.stdout.split()
-        if state.startswith("Z"):
-            return MacProcessEvidence.ENDED
-        return LiveMacProcess(MacProcessIdentity(pid, FIXTURE_STARTED_US), int(parent))
+        status = darwin_process.SZOMB if state.startswith("Z") else 2
+        info = darwin_process.DarwinProcessInfo(pid, int(parent), FIXTURE_STARTED_US, status, 0)
+        return write_process_info(buffer, size, info)
+
+    def check_pid(pid, signal):
+        assert signal == 0
+        if str(pid) == os.environ.get("GATE_TEST_LEGACY_REUSE"):
+            record = MacGateRecord(MacProcessIdentity(pid, FIXTURE_STARTED_US), "placement episode/attempt")
+            (mac_gate_records.mac_gate_state() / "records" / record.identity.key).write_text(record.line())
+            raise ProcessLookupError(errno.ESRCH, "old owner ended")
+        match failures.get(str(pid)):
+            case "denied":
+                raise PermissionError(errno.EPERM, "cannot check the PID")
+            case "ended":
+                raise ProcessLookupError(errno.ESRCH, "owner ended")
+            case _:
+                original_kill(pid, signal)
+
+    @contextmanager
+    def scan(directory):
+        relative, failure = os.environ.get("GATE_TEST_SCAN_FAILURE", ":").split(":")
+        selected = relative and Path(directory) == mac_gate_records.mac_gate_state() / relative
+        if selected and failure == "open":
+            raise OSError("cannot open the directory")
+        with original_scandir(directory) as entries:
+            if selected and failure == "iterate":
+                def interrupted():
+                    for entry in entries:
+                        if entry.name == os.environ["GATE_TEST_ENDED_ENTRY"]:
+                            yield entry
+                            raise OSError("cannot continue reading the directory")
+                    raise AssertionError("the scan fixture has no ended entry")
+                yield interrupted()
+            else:
+                yield entries
 
     with (root / "registrations").open("a") as stream:
         stream.write("register\\n")
     sys.argv = sys.argv[2:]
     with (patch.object(mac_gate_records.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(root))),
-          patch.object(register, "observe_mac_process", side_effect=observe)):
+          patch.object(sys, "platform", "darwin"), native_process_read(read),
+          patch.object(os, "kill", check_pid), patch.object(os, "scandir", scan)):
         raise SystemExit(register.main())
 if sys.argv[1:3] != ["-I", "-c"]:
     with (root / "parsers").open("a") as stream:
@@ -208,6 +251,24 @@ class CargoGateTests(unittest.TestCase):
 
     def runs(self, root: Path) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in (root / "runs").read_text().splitlines()]
+
+    def legacy_record(self, records: Path, pid: int, label: str) -> Path:
+        path = records / str(pid)
+        _ = path.write_text(f"{pid}\tMon Nov 9 12:00:00 2026\t{label}\n")
+        return path
+
+    def owner_entries(self, root: Path, pid: int, *, has_record: bool = True,
+                      started_us: int = FIXTURE_STARTED_US) -> tuple[Path, Path]:
+        state = root / ".local/state/mac-gate"
+        records = state / "records"
+        records.mkdir(parents=True, exist_ok=True)
+        owner = MacGateRecord(MacProcessIdentity(pid, started_us), "placement episode/attempt")
+        record = records / owner.identity.key
+        if has_record:
+            _ = record.write_text(owner.line())
+        pipe = state / ("jobserver-" + owner.identity.key)
+        os.mkfifo(pipe)
+        return record, pipe
 
     def test_copied_gate_links_find_the_copied_configuration_reader(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -396,8 +457,8 @@ class CargoGateTests(unittest.TestCase):
                 self.assertEqual(row["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
                 self.assertEqual(len(cast(list[str], row["records"])), 1)
 
-    def test_only_the_live_root_blocks_a_second_root(self) -> None:
-        for case in ("foreground", "background", "unreadable", "different home"):
+    def test_gate_blocks_current_roots_and_ignores_legacy_roots(self) -> None:
+        for case in ("foreground", "background", "unreadable", "different home", "legacy"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 environment = {**self.fixture(root), "SSH_CONNECTION": "fake", "MAC_PLACEMENT": "episode/attempt"}
@@ -418,25 +479,34 @@ class CargoGateTests(unittest.TestCase):
                             _ = cache.write_text("0\t" + environment["MAC_PLACEMENT"] + "\n")
                             record, = (state / "records").iterdir()
                             message = "placement already has a live build root"
-                            if case == "unreadable":
+                            if case == "legacy":
+                                record.unlink()
+                                record = self.legacy_record(record.parent, first.pid, "placement episode/attempt")
+                            elif case == "unreadable":
                                 _ = record.write_bytes(b"\xff")
                                 message = "cannot verify an existing build root"
                             home = root / "different-home" if case == "different home" else root
-                            refusal = self.run_gate({**environment, "HOME": str(home)}, "build")
-                            self.assertEqual(refusal.returncode, 125, refusal.stdout + refusal.stderr)
-                            self.assertIn(message, refusal.stderr)
-                            self.assertEqual(list((state / "records").iterdir()), [record])
-                            if home != root:
-                                self.assertFalse((home / ".local/state/mac-gate").exists())
-                            self.assertEqual(len(self.runs(root)), 1)
-                            self.assertEqual((root / "checks").read_text().splitlines(), ["check"])
+                            overlap = self.run_gate({**environment, "HOME": str(home)}, "build")
+                            if case == "legacy":
+                                self.assertEqual(overlap.returncode, 0, overlap.stdout + overlap.stderr)
+                                self.assertTrue(record.exists())
+                                self.assertEqual(len(self.runs(root)), 2)
+                            else:
+                                self.assertEqual(overlap.returncode, 125, overlap.stdout + overlap.stderr)
+                                self.assertIn(message, overlap.stderr)
+                                self.assertEqual(list((state / "records").iterdir()), [record])
+                                if home != root:
+                                    self.assertFalse((home / ".local/state/mac-gate").exists())
+                                self.assertEqual(len(self.runs(root)), 1)
+                                self.assertEqual((root / "checks").read_text().splitlines(), ["check"])
                             event.sendall(b"+")
                         output = first.communicate(timeout=TEST_HANG_GUARD_SECS)
                         self.assertEqual(first.returncode, 0, "".join(output))
 
                         result = self.run_gate(environment, "build")
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                        before, after = self.runs(root)
+                        before, *overlaps, after = self.runs(root)
+                        self.assertEqual(len(overlaps), int(case == "legacy"))
                         self.assertNotEqual(before["record"], after["record"])
                         self.assertEqual(after["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
                         self.assertEqual(len(cast(list[str], after["records"])), 1)
@@ -448,43 +518,91 @@ class CargoGateTests(unittest.TestCase):
                         if first.returncode is None:
                             first.kill()
 
-    def test_failed_process_probe_preserves_records_and_pipe_names(self) -> None:
-        for has_record in (False, True):
-            with self.subTest(has_record=has_record), tempfile.TemporaryDirectory() as temporary:
+    def test_short_native_read_uses_the_pid_existence_result(self) -> None:
+        for evidence in ("live", "denied", "ended"):
+            with self.subTest(evidence=evidence), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 environment = self.fixture(root)
                 pid = os.getpid()
                 environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt",
-                                   GATE_TEST_UNKNOWN_PIDS=json.dumps([pid]))
-                state = root / ".local/state/mac-gate"
-                (state / "records").mkdir(parents=True)
-                owner = MacGateRecord(MacProcessIdentity(pid, FIXTURE_STARTED_US), "placement episode/attempt")
-                record = state / "records" / owner.identity.key
-                if has_record:
-                    _ = record.write_text(owner.line())
-                pool = state / ("jobserver-" + owner.identity.key)
-                os.mkfifo(pool)
+                                   GATE_TEST_PROBE_FAILURES=json.dumps({pid: evidence}))
+                record, pipe = self.owner_entries(root, pid)
+                original = record.read_text()
                 result = self.run_gate(environment, "build")
-                self.assertEqual(result.returncode, 125, result.stdout + result.stderr)
-                self.assertIn("cannot verify an existing", result.stderr)
-                self.assertTrue(pool.exists())
-                self.assertEqual(list(record.parent.iterdir()), [record] if has_record else [])
-                if has_record:
-                    self.assertEqual(record.read_text(), owner.line())
-                self.assertFalse((root / "runs").exists())
+                self.assertEqual((root / "probes").read_text().splitlines().count(str(pid)), 1)
+                if evidence == "ended":
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertFalse(record.exists())
+                    self.assertFalse(pipe.exists())
+                else:
+                    self.assertEqual(result.returncode, 125, result.stdout + result.stderr)
+                    self.assertIn("cannot verify an existing build root", result.stderr)
+                    self.assertTrue(pipe.exists())
+                    self.assertEqual(list(record.parent.iterdir()), [record])
+                    self.assertEqual(record.read_text(), original)
+                    self.assertFalse((root / "runs").exists())
+
+    def test_scan_failure_preserves_ended_records_and_pipe_names(self) -> None:
+        for directory in ("records", "."):
+            for failure in ("open", "iterate"):
+                with self.subTest(directory=directory, failure=failure), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    environment = self.fixture(root)
+                    pid = os.getpid()
+                    record, pipe = self.owner_entries(root, pid)
+                    environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt",
+                                       GATE_TEST_PROBE_FAILURES=json.dumps({pid: "ended"}),
+                                       GATE_TEST_SCAN_FAILURE=f"{directory}:{failure}",
+                                       GATE_TEST_ENDED_ENTRY=(record if directory == "records" else pipe).name)
+                    result = self.run_gate(environment, "build")
+                    self.assertEqual(result.returncode, 125, result.stdout + result.stderr)
+                    self.assertIn("cannot enumerate", result.stderr)
+                    self.assertEqual(list(record.parent.iterdir()), [record])
+                    self.assertTrue(pipe.exists())
+                    self.assertNotIn(str(pid), (root / "probes").read_text().splitlines())
+
+    def test_live_pipe_requires_a_matching_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
+            record, pipe = self.owner_entries(root, os.getpid(), has_record=False)
+            result = self.run_gate(environment, "build")
+            self.assertEqual(result.returncode, 125, result.stdout + result.stderr)
+            self.assertIn("cannot verify an existing jobserver owner", result.stderr)
+            self.assertEqual(list(record.parent.iterdir()), [])
+            self.assertTrue(pipe.exists())
+            self.assertFalse((root / "runs").exists())
+
+    def test_legacy_cleanup_preserves_live_or_unknown_pids_and_stamped_replacements(self) -> None:
+        for evidence in ("live", "denied", "reused"):
+            with self.subTest(evidence=evidence), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = self.fixture(root)
+                pid = os.getpid()
+                records = root / ".local/state/mac-gate/records"
+                records.mkdir(parents=True)
+                legacy = self.legacy_record(records, pid, "user")
+                environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt",
+                                   GATE_TEST_PROBE_FAILURES=json.dumps({pid: evidence}))
+                if evidence == "reused":
+                    environment["GATE_TEST_LEGACY_REUSE"] = str(pid)
+                result = self.run_gate(environment, "build")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn(str(pid), (root / "probes").read_text().splitlines())
+                if evidence == "reused":
+                    self.assertFalse(legacy.exists())
+                    replacement = records / MacProcessIdentity(pid, FIXTURE_STARTED_US).key
+                    self.assertTrue(replacement.exists())
+                else:
+                    self.assertTrue(legacy.exists())
 
     def test_pid_reuse_within_one_second_releases_the_old_record_and_pipe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = self.fixture(root)
             environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
-            state = root / ".local/state/mac-gate"
-            (state / "records").mkdir(parents=True)
-            old = MacGateRecord(MacProcessIdentity(os.getpid(), FIXTURE_STARTED_US - 1), "placement episode/attempt")
-            record = state / "records" / old.identity.key
-            _ = record.write_text(old.line())
-            pool = state / ("jobserver-" + old.identity.key)
-            os.mkfifo(pool)
+            record, pool = self.owner_entries(root, os.getpid(), started_us=FIXTURE_STARTED_US - 1)
             result = self.run_gate(environment, "build")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse(record.exists())

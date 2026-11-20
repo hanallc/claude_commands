@@ -9,7 +9,6 @@ import re
 import sys
 
 
-MICROSECONDS_PER_SECOND = 1_000_000
 PLACEMENT_FORM = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 PLACEMENT_PREFIX = "placement "
 
@@ -35,31 +34,32 @@ class MacProcessEvidence(Enum):
     UNAVAILABLE = "the process identity is unavailable"
 
 
+def pid_has_ended(pid: int) -> bool:
+    """Use the kernel existence check to confirm that a PID is absent."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, OverflowError):
+        pass
+    return False
+
+
 def observe_mac_process(pid: int) -> LiveMacProcess | MacProcessEvidence:
     """Report exit only when the kernel confirms it."""
     if sys.platform != "darwin":
         return MacProcessEvidence.UNAVAILABLE
     try:
-        from scripts.herdr.herdr import _DARWIN_SZOMB, _darwin_process_bsd_info  # pyright: ignore[reportPrivateUsage]
-        from scripts.herdr.herdr_types import HerdrFailure
+        from scripts.lib import darwin_process
     except ImportError:
         return MacProcessEvidence.UNAVAILABLE
     try:
-        info = _darwin_process_bsd_info(pid, include_zombies=True)
-    except (HerdrFailure, OSError, AttributeError, OverflowError):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return MacProcessEvidence.ENDED
-        except (OSError, OverflowError):
-            pass
-        return MacProcessEvidence.UNAVAILABLE
-    if info.pbi_status == _DARWIN_SZOMB:
+        info = darwin_process.read_process_info(pid, include_zombies=True)
+    except darwin_process.DarwinProcessInfoUnavailable:
+        return MacProcessEvidence.ENDED if pid_has_ended(pid) else MacProcessEvidence.UNAVAILABLE
+    if info.status == darwin_process.SZOMB:
         return MacProcessEvidence.ENDED
-    if info.pbi_start_tvsec <= 0 or not 0 <= info.pbi_start_tvusec < MICROSECONDS_PER_SECOND:
-        return MacProcessEvidence.UNAVAILABLE
-    started_us = info.pbi_start_tvsec * MICROSECONDS_PER_SECOND + info.pbi_start_tvusec
-    return LiveMacProcess(MacProcessIdentity(pid, started_us), info.pbi_ppid)
+    return LiveMacProcess(MacProcessIdentity(info.pid, info.started_us), info.parent_pid)
 
 
 def mac_gate_account_home() -> Path:

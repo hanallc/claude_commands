@@ -6,29 +6,24 @@ import re
 import sys
 
 from scripts.mac_test.mac_gate_records import (
-    LiveMacProcess, MacGateRecord, MacProcessEvidence, mac_gate_state, observe_mac_process, read_mac_gate_record,
+    LiveMacProcess, MacGateRecord, MacProcessEvidence, MacProcessIdentity, mac_gate_state,
+    observe_mac_process, pid_has_ended, read_mac_gate_record,
 )
 
 
 JOBSERVER_PREFIX = "jobserver-"
-OWNER_NAME = re.compile(r"([1-9][0-9]*)(?:-([A-Za-z0-9_]+))?")
+LEGACY_NAME = re.compile(r"[1-9][0-9]*")
+OWNER_NAME = re.compile(r"([1-9][0-9]*)-([1-9][0-9]*)")
 
 
 class RootRefusal(Exception):
     """The gate cannot confirm that this root can start."""
 
 
-def owner_evidence(name: str) -> LiveMacProcess | MacProcessEvidence:
-    owner = OWNER_NAME.fullmatch(name)
-    if owner is None:
-        return MacProcessEvidence.UNAVAILABLE
-    pid, stamp = owner.groups()
-    observed = observe_mac_process(int(pid))
-    if isinstance(observed, LiveMacProcess):
-        if stamp is None or not stamp.isdecimal():
-            return MacProcessEvidence.UNAVAILABLE
-        if observed.identity.key != name:
-            return MacProcessEvidence.ENDED
+def owner_evidence(identity: MacProcessIdentity) -> LiveMacProcess | MacProcessEvidence:
+    observed = observe_mac_process(identity.pid)
+    if isinstance(observed, LiveMacProcess) and observed.identity != identity:
+        return MacProcessEvidence.ENDED
     return observed
 
 
@@ -48,24 +43,35 @@ def inherits_root(process: LiveMacProcess, root: MacGateRecord) -> bool:
 
 
 def check_existing_roots(state: Path, own_record: Path, label: str) -> None:
+    try:
+        with os.scandir(own_record.parent) as records, os.scandir(state) as state_entries:
+            record_paths = {entry.name: Path(entry.path) for entry in records if entry.name != own_record.name}
+            pipe_paths = {entry.name.removeprefix(JOBSERVER_PREFIX): Path(entry.path)
+                          for entry in state_entries if entry.name.startswith(JOBSERVER_PREFIX)}
+    except OSError as error:
+        raise RootRefusal("cannot enumerate the build root records and jobserver names") from error
+
     ended: list[Path] = []
-    for path in own_record.parent.iterdir():
-        if path == own_record or OWNER_NAME.fullmatch(path.name) is None:
+    for name in record_paths.keys() | pipe_paths.keys():
+        owner = OWNER_NAME.fullmatch(name)
+        if owner is None:
+            if name in pipe_paths:
+                raise RootRefusal("cannot verify an existing jobserver owner")
             continue
-        evidence = owner_evidence(path.name)
+        pid, stamp = owner.groups()
+        evidence = owner_evidence(MacProcessIdentity(int(pid), int(stamp)))
         if evidence is MacProcessEvidence.ENDED:
-            ended.append(path)
+            ended.extend(paths[name] for paths in (record_paths, pipe_paths) if name in paths)
             continue
-        record = read_mac_gate_record(path)
-        if isinstance(evidence, MacProcessEvidence) or not isinstance(record, MacGateRecord):
+        if name not in record_paths:
+            raise RootRefusal("cannot verify an existing jobserver owner")
+        record = read_mac_gate_record(record_paths[name])
+        if evidence is MacProcessEvidence.UNAVAILABLE or not isinstance(record, MacGateRecord):
             raise RootRefusal("cannot verify an existing build root")
         if record.label == label:
             raise RootRefusal("placement already has a live build root")
-    for path in state.glob(f"{JOBSERVER_PREFIX}*"):
-        evidence = owner_evidence(path.name.removeprefix(JOBSERVER_PREFIX))
-        if evidence is MacProcessEvidence.UNAVAILABLE:
-            raise RootRefusal("cannot verify an existing jobserver owner")
-        if evidence is MacProcessEvidence.ENDED:
+    for name, path in record_paths.items():
+        if LEGACY_NAME.fullmatch(name) and pid_has_ended(int(name)):
             ended.append(path)
     for path in ended:
         path.unlink(missing_ok=True)

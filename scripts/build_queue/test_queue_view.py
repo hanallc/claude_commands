@@ -10,8 +10,10 @@ from dataclasses import replace
 import json
 import os
 import shlex
+import shutil
 import struct
 import subprocess
+import sys
 import time
 import unittest
 from typing import cast, override
@@ -27,7 +29,10 @@ from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
 from scripts.build_queue.queue_fixture import write_memory_config
-from scripts.mac_test.mac_gate_records import MICROSECONDS_PER_SECOND, MacGateRecord, MacProcessIdentity
+from scripts.lib.darwin_process import MICROSECONDS_PER_SECOND
+from scripts.lib.helper_tree_test_support import copy_helpers
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test.mac_gate_records import MacGateRecord, MacProcessIdentity
 
 
 def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
@@ -182,6 +187,8 @@ class MacQueueViewTests(unittest.TestCase):
                     (20, 1, "placement stale/attempt"), (100, 1, "placement stale/attempt")):
                 record = MacGateRecord(MacProcessIdentity(pid, started_us + delta), label)
                 _ = (records / record.identity.key).write_text(record.line())
+            for pid in (80, 90):
+                _ = (records / str(pid)).write_text(f"{pid}\tMon Nov 9 12:00:00 2026\tuser\n")
             processes = {pid: {"parent": parent, "uid": uid, "started_at": started,
                 "resident_bytes": 1024, "command": command, "executable": "/bin/" + command.split()[0]}
                 for pid, parent, uid, started, command in (
@@ -208,6 +215,7 @@ class MacQueueViewTests(unittest.TestCase):
                 + f"with patch('pwd.getpwuid', return_value=types.SimpleNamespace(pw_dir={str(fixture.root)!r})), "
                 + "patch('pwd.getpwnam', return_value=types.SimpleNamespace(pw_uid=502)):\n"
                 + "    assert len(read_gate_records()) == 4\n"
+                + "    assert gate_label(80, read_processes(), read_gate_records(), 502) == 'placement episode-2/attempt'\n"
                 + "    print(json.dumps(read_reading()))")
             result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -223,6 +231,38 @@ class MacQueueViewTests(unittest.TestCase):
                 reading = queue_view.read_mac_builds()
             self.assertEqual([run.pid for run in reading.unplaced_runs], [50, 90, 100])
             self.assertEqual([build.pid for build in reading.builds], [40, 70, 11, 21])
+
+    def test_generated_mac_script_imports_the_shared_probe(self) -> None:
+        with QueueFixture(captured=False) as fixture:
+            installed = copy_helpers(fixture.root)
+            script = queue_view.mac_build_script().replace(
+                "from __future__ import annotations\n",
+                "from __future__ import annotations\n"
+                + "import pwd, sys\n"
+                + "from types import SimpleNamespace\n"
+                + "from unittest.mock import patch\n"
+                + f"pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir={str(fixture.root)!r})\n"
+                + "sys.platform = 'darwin'\n", 1)
+            script = script.replace("print(json.dumps(read_reading()))",
+                "from scripts.lib import darwin_process\n"
+                + "from scripts.lib.darwin_process_test_support import native_process_read, write_process_info\n"
+                + f"assert Path(darwin_process.__file__) == Path({str(installed / 'lib/darwin_process.py')!r})\n"
+                + f"started_us = {int(NOW) * MICROSECONDS_PER_SECOND + 1}\n"
+                + "def read(pid, flavor, argument, buffer, size):\n"
+                + "    info = darwin_process.DarwinProcessInfo(pid, os.getppid(), started_us, 2, 0)\n"
+                + "    return write_process_info(buffer, size, info)\n"
+                + "with native_process_read(read):\n"
+                + "    observed = observe_mac_process(os.getpid())\n"
+                + "    assert observed == LiveMacProcess(MacProcessIdentity(os.getpid(), started_us), os.getppid())")
+            for interpreter in (sys.executable, shutil.which("python3.11")):
+                with self.subTest(interpreter=interpreter):
+                    if interpreter is None:
+                        self.skipTest("Python 3.11 is unavailable.")
+                    command = script.replace("python3 - ", shlex.join([interpreter, "-I", "-"]) + " ", 1)
+                    result = subprocess.run(["sh", "-c", command], text=True, capture_output=True,
+                                            timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "rc=0\n")
 
     @unittest.skipIf(os.geteuid() == 0, "Root can read a folder with mode 000.")
     def test_project_record_returns_empty_for_an_unreadable_folder(self) -> None:

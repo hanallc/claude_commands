@@ -49,6 +49,13 @@ The gate stores state in the Mac account's home directory, independent of the ca
 The gate and Builds page identify each root by its PID and kernel start time in microseconds.
 The gate removes old records and pipe names only after it confirms that their owners ended.
 A placed root receives a refusal if the gate cannot verify an existing root or pipe owner.
+The gate deletes nothing from existing records and pipe names if it cannot collect complete evidence.
+After the evidence check, a cleanup error can occur after the gate deletes some entries.
+A refused root removes its own record.
+Mac launches use the installed gate. Installing the new gate stops launches that create bare PID records.
+An old root can still overlap a new root during the install window, as it could before the one-root rule.
+The new gate ignores bare PID records for admission. It removes one only when the kernel confirms that the PID is absent.
+The Builds page takes no trusted label from a bare PID record. It can still use the placement from the process environment.
 A background descendant of a finished root does not prevent the next root from starting.
 Each root gets an unlinked pipe with `worker_budget - 1` tokens. The gate publishes the pipe in `CARGO_MAKEFLAGS`.
 A verified nested call uses the same pipe. Each Cargo process has one implicit slot.

@@ -14,6 +14,8 @@ import unittest
 from unittest.mock import patch
 from typing import cast
 
+from scripts.lib import darwin_process
+from scripts.lib.darwin_process_test_support import native_process_read, write_process_info
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.message import process_test_support as support
@@ -42,39 +44,38 @@ class OwnedTestProcessesTests(unittest.TestCase):
 
     def test_darwin_state_accepts_a_process_that_exits_during_either_read(self) -> None:
         identity = darwin.OwnedProcessIdentity(123, 10, 1)
+
+        def process_exited(*_arguments: object) -> int:
+            raise ProcessLookupError()
+
         for stage in ("identity", "state"):
             with self.subTest(stage=stage):
                 owned = OwnedTestProcesses()
                 owned.identities[identity.pid] = identity
                 with (patch.object(darwin, "identity", return_value=identity,
                                    side_effect=ProcessLookupError() if stage == "identity" else None),
-                      patch.object(darwin, "libproc", side_effect=ProcessLookupError()),
+                      native_process_read(process_exited),
                       patch.object(support, "USE_PIDFD", False)):
                     self.assertEqual(darwin.process_state(identity), "")
                     owned.wait_stopped()
 
     def test_darwin_state_reads_libproc_without_starting_a_process(self) -> None:
         owned = darwin.OwnedProcessIdentity(123, 10, 1)
-        status = darwin.SSTOP
+        status = darwin_process.SSTOP
         calls: list[tuple[int, int, int, int]] = []
 
-        class Library:
-            def proc_pidinfo(self, pid: int, flavor: int, argument: int,
-                             buffer: object, size: int) -> int:
-                calls.append((pid, flavor, argument, size))
-                info = ctypes.cast(cast(ctypes.c_void_p, buffer),
-                                   ctypes.POINTER(darwin.ProcessStateInfo)).contents
-                info.status = status
-                return size
+        def read(pid: int, flavor: int, argument: int, buffer: object, size: int) -> int:
+            calls.append((pid, flavor, argument, size))
+            info = darwin_process.DarwinProcessInfo(pid, 1, darwin_process.MICROSECONDS_PER_SECOND, status, 0)
+            return write_process_info(buffer, size, info)
 
-        self.assertEqual(ctypes.sizeof(darwin.ProcessStateInfo), 136)
         with (patch.object(darwin, "identity", return_value=owned),
-              patch.object(darwin, "libproc", return_value=Library()),
+              native_process_read(read),
               patch.object(subprocess, "Popen", side_effect=AssertionError("cleanup started a process"))):
-            for status, expected in ((darwin.SSTOP, "T"), (darwin.SZOMB, "Z"), (2, "R")):
+            for status, expected in ((darwin_process.SSTOP, "T"), (darwin_process.SZOMB, "Z"), (2, "R")):
                 with self.subTest(status=status):
                     self.assertEqual(darwin.process_state(owned), expected)
-        self.assertEqual(calls, [(123, darwin.PROC_PIDTBSDINFO, 1, 136)] * 3)
+        self.assertEqual(calls, [(123, darwin_process.PROC_PIDTBSDINFO, 1, 136)] * 3)
 
     def test_darwin_wait_stopped_uses_an_identity_snapshot(self) -> None:
         first = darwin.OwnedProcessIdentity(123, 10, 1)
@@ -115,25 +116,21 @@ class OwnedTestProcessesTests(unittest.TestCase):
             signal.pidfd_send_signal(owned.handles[process.pid], signum)
             signals.append((process.pid, signum))
 
-        class Library:
-            def proc_pidinfo(self, pid: int, flavor: int, argument: int,
-                             buffer: object, size: int) -> int:
-                self_test.assertEqual((flavor, argument), (darwin.PROC_PIDTBSDINFO, 1))
-                try:
-                    state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-                except (FileNotFoundError, ProcessLookupError):
-                    return 0
-                info = ctypes.cast(cast(ctypes.c_void_p, buffer),
-                                   ctypes.POINTER(darwin.ProcessStateInfo)).contents
-                info.status = darwin.SSTOP if state in ("T", "t") else darwin.SZOMB if state == "Z" else 2
-                return size
+        def read(pid: int, flavor: int, argument: int, buffer: object, size: int) -> int:
+            self.assertEqual((flavor, argument), (darwin_process.PROC_PIDTBSDINFO, 1))
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except (FileNotFoundError, ProcessLookupError):
+                return 0
+            status = {"T": darwin_process.SSTOP, "t": darwin_process.SSTOP, "Z": darwin_process.SZOMB}.get(state, 2)
+            info = darwin_process.DarwinProcessInfo(pid, 1, darwin_process.MICROSECONDS_PER_SECOND, status, 0)
+            return write_process_info(buffer, size, info)
 
-        self_test = self
         with (patch.object(support, "USE_PIDFD", False),
               patch.object(darwin, "identity", identity),
               patch.object(darwin, "user_processes", return_value=list(identities)),
               patch.object(darwin, "signal_identity", send),
-              patch.object(darwin, "libproc", return_value=Library()),
+              native_process_read(read),
               patch.object(subprocess, "Popen", side_effect=AssertionError("cleanup started a process"))):
             owned.finish()
         for child in children:

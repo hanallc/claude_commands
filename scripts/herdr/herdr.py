@@ -24,7 +24,6 @@ import secrets
 import struct
 import json
 import hashlib
-import ctypes
 import os
 import re
 import signal
@@ -52,7 +51,7 @@ from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
-from scripts.lib import conf, models_registry, operation_deadline, script_prompts, session_folder
+from scripts.lib import conf, darwin_process, models_registry, operation_deadline, script_prompts, session_folder
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -3467,8 +3466,8 @@ def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, ob
             while current > 1 and current not in proved and current not in path:
                 path.add(current)
                 if darwin:
-                    info = _darwin_process_bsd_info(current, include_zombies=True)
-                    state = ForegroundProcessState(info.pbi_ppid, info.pbi_status == _DARWIN_SZOMB)
+                    info = darwin_process.read_process_info(current, include_zombies=True)
+                    state = ForegroundProcessState(info.parent_pid, info.status == darwin_process.SZOMB)
                 else:
                     state = _linux_process_state(current, fresh=for_input)
                 states[current] = state
@@ -3736,7 +3735,7 @@ def _require_codex_terminal_input(shell_pid: int, foreground: ProvedCodexForegro
     @cache
     def pane_terminal() -> int:
         if darwin:
-            terminal = _darwin_process_bsd_info(shell_pid).e_tdev
+            terminal = darwin_process.read_process_info(shell_pid).terminal_device
             if terminal == 0xFFFFFFFF:
                 raise HerdrFailure("pane terminal is unavailable")
             return terminal
@@ -5114,60 +5113,12 @@ class _StartupProcessGone(Exception):
     """The process has exited or is absent from the process snapshot."""
 
 
-@final
-class _DarwinProcessBSDInfo(ctypes.Structure):
-    # Mac probe, 2026-11-03: PROC_PIDTBSDINFO returns 136 bytes.
-    # The pid is at offset 12. Start seconds and microseconds are at offsets 120 and 128.
-    # The spawned process matched ps lstart and the probe's wall-clock interval.
-    _fields_ = [
-        ("pbi_flags", ctypes.c_uint32), ("pbi_status", ctypes.c_uint32),
-        ("pbi_xstatus", ctypes.c_uint32), ("pbi_pid", ctypes.c_uint32),
-        ("pbi_ppid", ctypes.c_uint32), ("pbi_uid", ctypes.c_uint32),
-        ("pbi_gid", ctypes.c_uint32), ("pbi_ruid", ctypes.c_uint32),
-        ("pbi_rgid", ctypes.c_uint32), ("pbi_svuid", ctypes.c_uint32),
-        ("pbi_svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
-        ("pbi_comm", ctypes.c_char * 16), ("pbi_name", ctypes.c_char * 32),
-        ("pbi_nfiles", ctypes.c_uint32), ("pbi_pgid", ctypes.c_uint32),
-        ("pbi_pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
-        ("e_tpgid", ctypes.c_uint32), ("pbi_nice", ctypes.c_int32),
-        ("pbi_start_tvsec", ctypes.c_uint64), ("pbi_start_tvusec", ctypes.c_uint64),
-    ]
-    pbi_status: int = 0
-    pbi_pid: int = 0
-    pbi_ppid: int = 0
-    e_tdev: int = 0
-    pbi_start_tvsec: int = 0
-    pbi_start_tvusec: int = 0
-
-
-_DARWIN_SZOMB = 5
-
-
-def _darwin_process_bsd_info(pid: int, *, include_zombies: bool = False) -> _DarwinProcessBSDInfo:
-    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    read = cast(Callable[[int, int, int, object, int], int], ctypes.CFUNCTYPE(
-        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
-        ctypes.c_void_p, ctypes.c_int)(("proc_pidinfo", library)))
-    info = _DarwinProcessBSDInfo()
-    size = ctypes.sizeof(info)
-    # A nonzero PROC_PIDTBSDINFO argument includes zombies.
-    count = read(pid, 3, int(include_zombies), ctypes.byref(info), size)
-    if count != size or info.pbi_pid != pid:
-        raise HerdrFailure(f"process {pid}: libproc returned no process information")
-    return info
-
-
 def _darwin_process_generation(pid: int) -> int | ProcessGenerationUnavailable:
     """Read the kernel start time without reading process environment values."""
     try:
-        info = _darwin_process_bsd_info(pid)
-    except (OSError, AttributeError) as error:
-        return ProcessGenerationUnavailable(f"process {pid}: libproc start time: {error}")
-    except HerdrFailure:
+        return darwin_process.read_process_info(pid).started_us
+    except darwin_process.DarwinProcessInfoUnavailable:
         return ProcessGenerationUnavailable(f"process {pid}: libproc start time is unavailable")
-    if not 0 <= info.pbi_start_tvusec < 1_000_000:
-        return ProcessGenerationUnavailable(f"process {pid}: libproc start time is unavailable")
-    return info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
 
 
 @dataclass(frozen=True)
