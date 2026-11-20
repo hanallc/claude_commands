@@ -48,10 +48,12 @@ The next user prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.
 
 `send.py` keeps local messages during an open review and returns `KEPT`.
-The `pre-tool-use-review-hold-send.py` hook refuses native `SendMessage` calls to other sessions, including urgent calls.
-It matches `uds:` addresses, `session:` addresses, and live registry names.
-For a name, it removes a trailing ` [ref]` before lookup.
-The hook allows calls to local helpers.
+The sender hook refuses native `SendMessage` calls to other sessions, including urgent calls.
+It matches bare socket paths, `uds:` addresses, `session:` addresses, and live local registry names.
+It ignores case and differences in spacing when it compares names.
+For a name with ` [ref]`, it gives the matching session ID.
+For multiple matches, it lists the session IDs so the sender can choose one.
+The hook allows names with no live local match, including remote session names and local helpers.
 Use `send.py` for messages to other sessions. Add `--urgent` for an URGENT message.
 The hook works only after its `PreToolUse` entry is in `settings.json`.
 

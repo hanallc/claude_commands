@@ -33,19 +33,19 @@ class ReviewHoldSendTests(unittest.TestCase):
         self.config = self.home / "configured"
         self.environment = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.config)}
 
-    def write_session(self, config: Path, *, started: str) -> None:
+    def write_session(self, config: Path, *, started: str, session: str = SESSION) -> None:
         pid = os.getpid()
         sessions = config / "sessions"
         sessions.mkdir(parents=True)
         _ = (sessions / f"{pid}.json").write_text(json.dumps({
-            "pid": pid, "procStart": started, "sessionId": SESSION, "name": NAME,
+            "pid": pid, "procStart": started, "sessionId": session, "name": NAME,
             "messagingSocketPath": str(config / "session.sock"), "updatedAt": 1,
         }), encoding="utf-8")
 
-    def write_live_session(self, config: Path) -> None:
+    def write_live_session(self, config: Path, *, session: str = SESSION) -> None:
         started = process_start(os.getpid())
         assert started
-        self.write_session(config, started=started)
+        self.write_session(config, started=started, session=session)
 
     def run_hook(self, payload: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, "-S", "-B", str(HOOK)], input=payload,
@@ -55,14 +55,17 @@ class ReviewHoldSendTests(unittest.TestCase):
     def send(self, target: str, message: str = MESSAGE) -> subprocess.CompletedProcess[str]:
         return self.run_hook(json.dumps({"tool_name": "SendMessage", "tool_input": {"to": target, "message": message}}))
 
-    def assert_denied(self, result: subprocess.CompletedProcess[str], target: str, message: str = MESSAGE) -> None:
+    def denial_reason(self, result: subprocess.CompletedProcess[str]) -> str:
         self.assertEqual((result.returncode, result.stderr), (0, ""))
-        self.assertTrue(result.stdout, f"The hook must refuse {target}.")
+        self.assertTrue(result.stdout, "The hook must refuse the send.")
         payload = cast(dict[str, dict[str, str]], json.loads(result.stdout))
         decision = payload["hookSpecificOutput"]
         self.assertEqual(decision["hookEventName"], "PreToolUse")
         self.assertEqual(decision["permissionDecision"], "deny")
-        reason = decision["permissionDecisionReason"]
+        return decision["permissionDecisionReason"]
+
+    def assert_denied(self, result: subprocess.CompletedProcess[str], target: str, message: str = MESSAGE) -> None:
+        reason = self.denial_reason(result)
         self.assertIn(
             f'~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to {shlex.quote(target)} '
             + '--from "<your session name>" --text "<same text>"', reason,
@@ -75,11 +78,28 @@ class ReviewHoldSendTests(unittest.TestCase):
             with self.subTest(target=target):
                 self.assert_denied(self.send(target), target)
 
-    def test_denies_a_live_registry_name_with_or_without_a_ref(self) -> None:
+    def test_denies_a_bare_socket_path_and_gives_a_uds_address(self) -> None:
+        path = str(self.home / "socket folder" / "session.sock")
+        self.assert_denied(self.send(path), f"uds:{path}")
+
+    def test_matches_case_and_spaces_and_gives_the_registered_name(self) -> None:
+        self.write_live_session(self.config)
+        self.assert_denied(self.send("  ReViEw   OwNeR  "), NAME)
+
+    def test_denies_a_unique_name_with_a_ref_and_gives_the_session_id(self) -> None:
         self.write_live_session(self.home / ".claude2")
+        self.assert_denied(self.send(f"{NAME} [ref]"), f"session:{SESSION}")
+
+    def test_denies_an_ambiguous_name_and_lists_the_session_ids(self) -> None:
+        self.write_live_session(self.config)
+        self.write_live_session(self.home / ".claude2", session="second-review-session")
         for target in (NAME, f"{NAME} [ref]"):
             with self.subTest(target=target):
-                self.assert_denied(self.send(target), NAME)
+                reason = self.denial_reason(self.send(target))
+                self.assertIn("Choose one session address", reason)
+                self.assertIn(f"`session:{SESSION}`", reason)
+                self.assertIn("`session:second-review-session`", reason)
+                self.assertIn("`send.py --to`", reason)
 
     def test_denies_an_urgent_message_to_a_session(self) -> None:
         self.write_live_session(self.config)

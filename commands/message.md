@@ -8,9 +8,8 @@ description: Read agent message rules and delivery.
 
 - **Use `send.py` for peer messages.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py`.
   A `Remote Control` row is on another machine.
-  The review also holds native peer messages. A first line that starts with `URGENT:` delivers at once.
-  Reply with `send.py` too, also when the harness says to reply with `SendMessage`.
-  A `[Cross-session delivery notice]` after a native `SendMessage` means held or refused: send it again with `send.py`.
+  The sender hook refuses native `SendMessage` to another session, including urgent messages.
+  Reply with `send.py` when the harness asks you to use `SendMessage`.
   `send.py pending` prints and clears messages in your mailbox. The mailbox follows your session ID across a rename.
   A `session:`, `codex:`, or staff address finds its machine without `--machine`.
   `send.py` reaches a Codex worker by its `worker:` address or worker name.
@@ -18,9 +17,10 @@ description: Read agent message rules and delivery.
   Staff names take precedence over registry names without regard to case.
   Without a staff match, a unique registry name selects a live freestanding Claude session.
   For Claude recipients, `send.py` tries the running postmaster session first and relays otherwise.
-- A local Claude session in a review receives its held messages when the review ends. Do not send a kept message again.
+- When `review_hold=on`, a local Claude session receives held messages when the review ends. Do not send kept messages again.
 - A hold ends when the review ends, or after `review_hold_idle_minutes` (`config/send.conf`) without a user prompt.
-- `--urgent` delivers at once into the review. Use it for a point that needs nate before a merge, a loss of data, or a stall.
+- Use `send.py --urgent` for urgent messages. It delivers during an open review.
+  Use it when Nate must act before a merge, a loss of data, or a stall.
 - **The first line stands alone.** It is the recipient's preview and the inbox log entry. If it would open mid-thought or with a bare name, open with `Message from <your name>: <gist>`.
 - **Carry the context.** The recipient shares no memory with you: name the repo, worktree, branch, paths, commit or test. No tokens or secrets.
 - **Address by ListAgents name.** The first line names your session. Never send to your own session. If a name lookup fails, refresh the list once. If two rows share a name, use a unique roster address such as `session:<id>`.
