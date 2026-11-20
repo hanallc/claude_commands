@@ -382,8 +382,9 @@ def _main(argv: list[str]) -> int:
         detail = said.strip() if isinstance(said, str) and said.strip() else str(error)
         print(f"add_showrunner: the session did not start: {detail}", file=sys.stderr)
         return 2
-    if isinstance(outcome, herdr.ClaudeTrustNotWritten):
-        return SESSION_NOT_READY
+    if isinstance(outcome, herdr.AgentNotStarted):
+        print(herdr.format_start_failure(outcome), file=sys.stderr)
+        return 2 if outcome.launch_refused else SESSION_NOT_READY
     if outcome.publication_error is not None:
         print(f"add_showrunner: {child.name}: staff publication failed: {outcome.publication_error}", file=sys.stderr)
         return 1 if outcome.state == "confirmed" else SESSION_NOT_READY

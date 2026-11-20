@@ -266,6 +266,9 @@ def restore(path: Path) -> int:
                                      entry["cwd"], environment, "claude", pane_record.resume_arguments(entry),
                                      herdr.NoOpeningPrompt(), 90_000, agent=source.name)
         started = outcome if isinstance(outcome, herdr.nix_env.Refused) else outcome.outcome
+        if isinstance(started, herdr.AgentNotStarted):
+            print(herdr.format_start_failure(started), file=sys.stderr)
+            return 1
         if isinstance(started, (herdr.nix_env.Refused, herdr.PromptNotSubmitted)):
             print(started.reason, file=sys.stderr)
             return 1

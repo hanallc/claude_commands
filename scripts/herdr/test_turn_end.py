@@ -302,6 +302,26 @@ class TurnEndTests(unittest.TestCase):
         self.assertIn("phase 8: done", self.case.agent.notices[0])
         self.assertNotIn(opened.pane, self.case.fixture.world.locations)
 
+    def test_completion_close_leaves_other_operations_on_stderr(self) -> None:
+        name = staff.WorkerName.parse("impl")
+        self.assertIs(worker.dispatch(self.case.fixture.parent.id, name, "impl", self.case.prompt,
+            session_dir=self.case.run_dir, slot=name.value, phase="8", kind="impl", launcher_command=["impl"],
+            reply=self.case.reply, completion_actions=progress_history.CompletionActions(end_worker=True)),
+            worker.DispatchSubmission.SUBMITTED)
+        close = self.case.fixture.world.close_terminal_pane
+
+        def close_with_independent_diagnostic(pane: str, terminal: str) -> bool:
+            print("independent start diagnostic", file=sys.stderr)
+            return close(pane, terminal)
+
+        with (patch.object(self.case.fixture.world, "close_terminal_pane", side_effect=close_with_independent_diagnostic),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(self.case.finish(name.value), turn_end.TurnOutcome.DONE)
+
+        self.assertEqual(errors.getvalue().splitlines().count("independent start diagnostic"), 1)
+        self.assertEqual(len(self.case.agent.notices), 1)
+        self.assertNotIn("independent start diagnostic", self.case.agent.notices[0])
+
     def test_completed_rerun_repeats_the_saved_kept_pane_anomaly(self) -> None:
         for family in ("codex", "claude"):
             name = "impl-" + family
@@ -2094,6 +2114,12 @@ class TurnEndTests(unittest.TestCase):
 
 class StageTwoCompactionTests(unittest.TestCase):
     def test_failed_compaction_reports_one_line_and_submits_one_prompt(self) -> None:
+        self.check_failed_compaction(native_stop=False)
+
+    def test_detached_stop_hook_saves_the_compaction_line_and_submits_one_prompt(self) -> None:
+        self.check_failed_compaction(native_stop=True)
+
+    def check_failed_compaction(self, *, native_stop: bool) -> None:
         case = test_worker.WorkerCommandTests("runTest")
         self.addCleanup(case.doCleanups)
         case.setUp()
@@ -2117,12 +2143,24 @@ class StageTwoCompactionTests(unittest.TestCase):
         atomic_file.write_text_atomic(ready, "ready\n")
         before = len(case.agent.submitted)
 
-        with redirect_stderr(io.StringIO()) as errors:
-            outcome = case.finish(name, turn_end.EventKind.STAGE_READY)
+        diagnostic = f"{name}: compaction failed: herdr agent compact: compact_failed: compact unavailable"
+        log = run / f"compact-{delivery.completion_id}.log"
+        if native_stop:
+            case.agent.complete(pane)
+            payload = json.dumps({"hook_event_name": "Stop", "session_id": str(row.current_session),
+                                  "last_assistant_message": case.agent.last_replies[str(row.current_session)]})
+            atomic_file.write_text_atomic(log, "Earlier dispatch output\n")
+            with (patch.object(sys, "stdin", io.StringIO(payload)),
+                  open(os.devnull, "w", encoding="utf-8") as discarded,
+                  redirect_stderr(discarded)):
+                self.assertEqual(turn_end.main(["--handle-hook"]), 0)
+            self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["Earlier dispatch output", diagnostic])
+        else:
+            with redirect_stderr(io.StringIO()) as errors:
+                outcome = case.finish(name, turn_end.EventKind.STAGE_READY)
+            self.assertIs(outcome, turn_end.TurnOutcome.SUBMITTED)
+            self.assertEqual(errors.getvalue().splitlines(), [diagnostic])
 
-        self.assertIs(outcome, turn_end.TurnOutcome.SUBMITTED)
-        self.assertEqual(errors.getvalue().splitlines(),
-                         [f"{name}: compaction failed: herdr agent compact: compact_failed: compact unavailable"])
         self.assertEqual(len(case.agent.submitted), before + 1)
         target, prompt = case.agent.submitted[-1]
         self.assertEqual(target, pane)

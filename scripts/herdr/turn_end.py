@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Generator, Iterable
-from contextlib import AbstractContextManager, ExitStack, redirect_stderr
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum, StrEnum
@@ -384,19 +384,24 @@ def repeat_completion_notice(worker_name: str, parent: staff.StaffRow, run: Path
 def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_panes.WorkerPane,
                   client: herdr.Herdr, run: Path, passed: dict[str, object], instance: str,
                   delivery: progress_history.DispatchDelivery) -> TurnOutcome | TurnDecision:
-    with redirect_stderr(io.StringIO()) as diagnostics:
+    attempt = (worker.dispatch_turn(parent.id, state, client, delivery.line, delivery.completion_id, run=run)
+               if isinstance(state, worker_panes.OpenWorker) else worker.DispatchResult(worker.ExitCode.UNCERTAIN))
+    result = attempt.code
+    diagnostics = attempt.diagnostics if attempt.error is None else (*attempt.diagnostics, str(attempt.error))
+    diagnostic_text = "\n".join(diagnostics) + "\n" if diagnostics else ""
+    if diagnostic_text:
+        path = worker.dispatch_log_path(run, instance)
         try:
-            result = (worker.dispatch_turn(parent.id, state, client, delivery.line, delivery.completion_id, run=run)
-                      if isinstance(state, worker_panes.OpenWorker) else worker.ExitCode.UNCERTAIN)
-        except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
-            print(str(error), file=sys.stderr)
-            result = worker.ExitCode.UNCERTAIN
+            with path.open("a", encoding="utf-8", errors="backslashreplace") as log:
+                _ = log.write(diagnostic_text)
+        except OSError as error:
+            unit_runs.report_anomaly(f"anomaly: {path}: cannot save stage-two diagnostics: {error}")
     if result is worker.DispatchSubmission.SUBMITTED:
         progress_history.confirm_assignment_submission(run, instance, delivery.completion_id)
-        print(diagnostics.getvalue(), end="", file=sys.stderr)
+        print(diagnostic_text, end="", file=sys.stderr)
         return TurnOutcome.SUBMITTED
     outcome = TurnOutcome.BUSY if result == worker.ExitCode.BUSY else TurnOutcome.UNCERTAIN
-    details = diagnostics.getvalue().strip() or f"Stage 2 submission returned {result}"
+    details = diagnostic_text.strip() or f"Stage 2 submission returned {result}"
     path = Path(delivery.reply_file)
     path = path.with_name(path.stem + "_turn" + path.suffix)
     worker.save_reply(path, details)
@@ -497,13 +502,9 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
                                  role_released=completion.role_released or delivery.actions.held_role == pane.held_role)
             progress_history.save_hook_completion(run, instance, completion)
         if isinstance(pane, worker.CloseCompletedPane) and not completion.pane_closed:
-            with redirect_stderr(io.StringIO()) as errors:
-                if delivery.actions.end_worker:
-                    ended = worker.end(parent.id, name, lock=hold, retire=False)
-                    closed = worker_panes.Closed() if ended == worker.ExitCode.OK else worker_panes.Kept(
-                        errors.getvalue().strip() or f"worker end returned {ended}")
-                else:
-                    closed = worker_panes.close(parent.id, name, lock=hold)
+            with herdr.collect_diagnostics():
+                closed = (worker.end_result(parent.id, name, lock=hold, retire=False) if delivery.actions.end_worker
+                          else worker_panes.close(parent.id, name, lock=hold))
             if isinstance(closed, worker_panes.Closed):
                 completion = replace(completion, pane_closed=True)
                 progress_history.save_hook_completion(run, instance, completion)
@@ -782,7 +783,7 @@ def _close_stopped_after_notice(row: staff.StaffRow, parent: staff.StaffRow, run
                 _ = after_unlock.callback(report, reason)
                 return
             try:
-                with redirect_stderr(io.StringIO()):
+                with herdr.collect_diagnostics():
                     closed = worker_panes.close(parent.id, name, lock=hold)
             except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
                     staff.StaffRefused, staff.StaffUnreadable) as error:

@@ -29,6 +29,8 @@ The child uses a separate session, so a signal to the caller's process group doe
 Only a new compaction record in the transcript proves completion.
 If the deadline expires, the worker checks for this record before it reports a timeout.
 A compaction failure logs one line and clears only matching `/compact` composer text.
+The Stop hook saves stage-two diagnostics in `compact-<dispatch id>.log`.
+The completion hook reads the close result for its diagnostic.
 The child sends the prompt after the compaction attempt.
 It confirms the transcript receipt within `WORKER_SETTLE_SECONDS`.
 It writes its output to `compact-<dispatch id>.log` in the run folder.
@@ -157,8 +159,15 @@ A Claude child cannot claim the Codex pane.
 If a foreground Codex process has no arguments, the pane owner stays unproved.
 If the identity remains unknown, the pane notice lists the foreground program names.
 An agent report without a process identity cannot prove the agent exited during startup.
-Herdr reports a failed split start and its pane closure result on one line.
-The worker skips publication and cleanup after Herdr reports a failed split start.
+Herdr returns the cause, visible screen, and pane result when an agent fails to start.
+The launch caller formats and prints one diagnostic.
+Herdr checks the original terminal identity to confirm closure.
+The worker skips publication and cleanup after Herdr reports a failed start.
+The launcher returns exit 2 if Herdr opens no pane or confirms closure.
+The launcher returns exit 8 when the failed start leaves the pane present or its state unknown.
+After a publication failure, the launcher returns exit 2 if a fresh pane list proves the original terminal absent.
+A close acknowledgment alone leaves the publication failure at exit 8.
+The caller reports the publication failure and the cleanup reason in one line.
 After its first turn, the launcher clears the cached pane list before it checks the published worker.
 This refresh includes the pane session report and the process evidence within an observation snapshot.
 An incomplete final scan names the state, the scan reason, and membership in the parent's tabs.

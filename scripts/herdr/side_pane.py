@@ -185,6 +185,9 @@ def open(label: str, policy: worker_panes.LaunchPolicy, *, question: str = "", c
     launched = herdr.launch_prepared_agent(client.session, destination, prepared, policy.settings.kind,
         arguments, herdr.NoOpeningPrompt(),
         int(config.number("PANE_AGENT_START_SECONDS") * 1000), agent=label)
+    if isinstance(launched.outcome, herdr.AgentNotStarted):
+        print(herdr.format_start_failure(launched.outcome), file=sys.stderr)
+        return UnknownSidePane()
     if isinstance(launched.outcome, herdr.PromptNotSubmitted):
         return _note(client, launched.pane, launched.outcome.reason)
     fresh = client.panes()

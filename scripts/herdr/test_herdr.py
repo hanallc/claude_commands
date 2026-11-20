@@ -9,6 +9,7 @@ import io
 import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import os
 import select
@@ -22,6 +23,7 @@ import tempfile
 import time
 import unittest.mock
 from pathlib import Path
+from threading import Barrier
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.script_envelope import script_prompt
 from scripts.herdr import herdr_types
@@ -2191,9 +2193,11 @@ class PromptSubmissionTests(unittest.TestCase):
 
         with (patch.object(self.client, "start_command", side_effect=start),
               patch.object(self.client, "run", side_effect=read) as diagnostic,
-              redirect_stderr(io.StringIO())):
+              redirect_stderr(io.StringIO()) as errors):
             outcome = self.client.start_agent("unit", "destination:p1", "claude", [], herdr.NoOpeningPrompt(), 1000)
-        self.assertIsInstance(outcome, herdr.AgentNotStarted)
+        self.assertEqual(outcome, herdr.AgentNotStarted("start agent unit: agent_not_ready: dialog", screen="Trust dialog",
+            session="agents", pane="destination:p1", agent="unit", code="agent_not_ready"))
+        self.assertEqual(errors.getvalue(), "")
         diagnostic.assert_called_once_with("pane", "read", "destination:p1", "--source", "visible")
 
     def test_matching_turn_during_first_target_retry_stops_submission(self) -> None:
@@ -3249,23 +3253,152 @@ class LaunchDestinationTests(StaffTestCase):
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
 
-    def test_failed_split_start_reports_the_exit_and_close_result_once(self) -> None:
+    def test_failed_split_start_returns_the_exit_and_close_result(self) -> None:
         pane = "launched-pane"
         failure = herdr.AgentExited("agents", pane)
-        for closed in (True, False):
-            with (self.subTest(closed=closed),
+
+        def confirm_close(pane: str) -> bool:
+            del pane
+            return True
+
+        def refuse_close(pane: str) -> bool:
+            return herdr.Herdr("agents").pane_closed(pane, "launch-terminal")
+
+        cases: tuple[tuple[Callable[[str], bool] | herdr_types.HerdrFailure, herdr.StartPaneResult, str], ...] = (
+            (confirm_close, herdr.StartPaneResult.CLOSED, ""),
+            (refuse_close, herdr.StartPaneResult.RETAINED, f"herdr agents:{pane}: closure is pending; record retained"),
+            (herdr_types.HerdrFailure("terminal identity changed"), herdr.StartPaneResult.UNKNOWN, "terminal identity changed"),
+        )
+        for close_pane, pane_result, detail in cases:
+            def close_split(selected: str, *, terminal: str) -> bool:
+                self.assertEqual(terminal, "launch-terminal")
+                if isinstance(close_pane, herdr_types.HerdrFailure):
+                    raise close_pane
+                return close_pane(selected)
+
+            with (self.subTest(pane_result=pane_result),
                   patch.object(herdr.Herdr, "result", return_value={"pane": {"pane_id": pane}}),
+                  patch.object(herdr.Herdr, "pane_row", return_value={"terminal_id": "launch-terminal"}),
+                  patch.object(herdr.Herdr, "panes", return_value=[{"pane_id": pane}]),
                   patch.object(herdr.Herdr, "label_pane"),
                   patch.object(herdr.Herdr, "run_in_pane"),
                   patch.object(herdr.Herdr, "start_command", side_effect=failure),
-                  patch.object(herdr.Herdr, "close_retained_pane", return_value=closed) as close,
+                  patch.object(herdr.Herdr, "close_retained_pane", side_effect=close_split) as close,
                   redirect_stderr(io.StringIO()) as errors):
                 launched = herdr.launch_prepared_agent("agents", herdr.SplitPane("parent", "right", 0.5, "worker"),
                     herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(), 1000, agent="worker")
-            close.assert_called_once_with(pane)
-            self.assertEqual(launched, herdr.AgentLaunched(pane, herdr.AgentNotStarted(str(failure))))
-            state = "pane closed" if closed else "pane close unconfirmed"
-            self.assertEqual(errors.getvalue().splitlines(), [f"herdr agents:{pane}: agent start failed: {failure}; {state}"])
+            close.assert_called_once_with(pane, terminal="launch-terminal")
+            assert isinstance(launched.outcome, herdr.AgentNotStarted)
+            self.assertEqual(launched.outcome.reason, str(failure))
+            self.assertEqual(launched.outcome.pane_result, pane_result)
+            self.assertEqual(launched.outcome.pane_detail, detail)
+            self.assertEqual(errors.getvalue(), "")
+
+    def test_parallel_launches_keep_start_diagnostics_with_the_selected_pane(self) -> None:
+        ready = Barrier(2)
+        panes = [{"pane_id": pane, "terminal_id": f"{pane}-terminal"} for pane in ("first", "second")]
+
+        def split(*arguments: str) -> dict[str, object]:
+            return {"pane": {"pane_id": arguments[2]}}
+
+        def refuse(pane: str, _command: list[str], *, terminal: str) -> None:
+            self.assertEqual(terminal, f"{pane}-terminal")
+            _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
+            self.assertFalse(herdr.Herdr("agents").pane_closed(pane, terminal))
+            _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
+            raise herdr_types.HerdrFailure("terminal identity changed", "wrong_target")
+
+        def launch(pane: str) -> herdr.AgentLaunched:
+            return herdr.launch_prepared_agent("agents", herdr.SplitPane(pane, "right", 0.5, pane),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(), 1000, agent=pane)
+
+        with (patch.object(herdr.Herdr, "result", side_effect=split),
+              patch.object(herdr.Herdr, "panes", return_value=panes),
+              patch.object(herdr.Herdr, "label_pane"),
+              patch.object(herdr.Herdr, "run_in_pane", side_effect=refuse),
+              patch.object(herdr.Herdr, "close_retained_pane") as close,
+              patch.object(herdr, "start_agent") as started,
+              redirect_stderr(io.StringIO()) as errors,
+              ThreadPoolExecutor(max_workers=2) as pool):
+            failures = list(pool.map(launch, ("first", "second")))
+        started.assert_not_called()
+        close.assert_not_called()
+        self.assertEqual(errors.getvalue(), "")
+        for launched in failures:
+            assert isinstance(launched.outcome, herdr.AgentNotStarted)
+            self.assertEqual(launched.outcome.code, "wrong_target")
+            self.assertEqual(launched.outcome.pane_result, herdr.StartPaneResult.RETAINED)
+            self.assertEqual(launched.outcome.pane_detail, f"herdr agents:{launched.pane}: closure is pending; record retained")
+
+    def test_split_not_ready_includes_the_screen_in_the_one_startup_line(self) -> None:
+        pane = "launched-pane"
+        failure = subprocess.CompletedProcess([], 1, json.dumps({"error": {
+            "code": "agent_not_ready", "message": "client not ready"}}), "")
+        screen = "Trust dialog\n1. Yes\n2. No"
+        with (patch.object(herdr.Herdr, "result", return_value={"pane": {"pane_id": pane}}),
+              patch.object(herdr.Herdr, "pane_row", return_value={"terminal_id": "launch-terminal"}),
+              patch.object(herdr.Herdr, "label_pane"),
+              patch.object(herdr.Herdr, "run_in_pane"),
+              patch.object(herdr.Herdr, "start_command", return_value=failure),
+              patch.object(herdr.Herdr, "run", return_value=screen),
+              patch.object(herdr.Herdr, "close_retained_pane", return_value=True) as close,
+              redirect_stderr(io.StringIO()) as errors):
+            launched = herdr.launch_prepared_agent("agents", herdr.SplitPane("parent", "right", 0.5, "worker"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(), 1000, agent="worker")
+        close.assert_called_once_with(pane, terminal="launch-terminal")
+        cause = "start agent worker: agent_not_ready: client not ready"
+        assert isinstance(launched.outcome, herdr.AgentNotStarted)
+        self.assertEqual(launched.outcome.screen, screen)
+        self.assertEqual(herdr.format_start_failure(launched.outcome),
+            f"herdr agents:{pane}: agent start failed: {cause}; visible screen: Trust dialog 1. Yes 2. No; pane closed")
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_failed_new_tab_start_uses_the_confirmed_close_result(self) -> None:
+        pane = "launched-pane"
+        row = {"pane_id": pane, "tab_id": "launch-tab", "terminal_id": "launch-terminal", "workspace_id": "w1"}
+        reason = "client not ready"
+        moved = {**row, "pane_id": "moved-pane"}
+        for allowed, remaining, pane_result in (
+                (False, [row], herdr.StartPaneResult.RETAINED),
+                (True, [row], herdr.StartPaneResult.RETAINED),
+                (True, [moved], herdr.StartPaneResult.UNKNOWN),
+                (True, [{**moved, "terminal_id": ""}], herdr.StartPaneResult.UNKNOWN),
+                (True, [], herdr.StartPaneResult.CLOSED)):
+            listings = [[row], [row], [row], remaining, remaining] if allowed else [[row]] * 4
+            with (self.subTest(allowed=allowed, remaining=remaining),
+                  patch.object(herdr, "shared_session", return_value="agents"),
+                  patch.object(herdr, "open_tab", return_value=pane),
+                  patch.object(herdr, "start_agent", return_value=herdr.AgentNotStarted(reason)),
+                  patch.object(pane_launch, "read_valid_entries", return_value={}),
+                  patch.object(herdr.Herdr, "listed", side_effect=listings),
+                  patch.object(herdr.Herdr, "run_in_pane"),
+                  patch.object(herdr.Herdr, "run") as run,
+                  patch.object(herdr, "check_target", return_value=allowed),
+                  redirect_stderr(io.StringIO()) as errors):
+                launched = herdr.launch_prepared_agent("agents", herdr.NewTab("units", "unit"),
+                    herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(), 1000, agent="unit")
+            if allowed:
+                run.assert_called_once_with("pane", "close", pane)
+            else:
+                run.assert_not_called()
+            assert isinstance(launched.outcome, herdr.AgentNotStarted)
+            self.assertEqual(launched.outcome.pane_result, pane_result)
+            self.assertEqual(errors.getvalue(), "")
+
+    def test_agent_start_timeout_returns_the_failure_without_printing(self) -> None:
+        pane = "launched-pane"
+        with (patch.object(herdr, "open_tab", return_value=pane),
+              patch.object(herdr.Herdr, "pane_row", return_value={"terminal_id": "launch-terminal"}),
+              patch.object(herdr.Herdr, "run_in_pane"),
+              patch.object(herdr.Herdr, "start_command", side_effect=subprocess.TimeoutExpired(["agent"], 0.25)),
+              patch.object(herdr.Herdr, "close_retained_pane", return_value=False),
+              redirect_stderr(io.StringIO()) as errors):
+            launched = herdr.launch_prepared_agent("agents", herdr.NewTab("units", "unit"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(), 1000, agent="unit")
+        assert isinstance(launched.outcome, herdr.AgentNotStarted)
+        self.assertEqual(herdr.format_start_failure(launched.outcome),
+                         f"herdr agents:{pane}: agent start failed: agent start timed out after 0.25 s; pane retained")
+        self.assertEqual(errors.getvalue(), "")
 
     def test_declined_resume_explains_manual_prompt_recovery(self) -> None:
         prepared = herdr.PreparedAgentEnvironment(self.root, {})
@@ -3384,7 +3517,7 @@ class LaunchDestinationTests(StaffTestCase):
                     self.assertNotIn("TMPDIR", environment)
                     self.assertNotIn(session_folder.FOLDER_ENV, environment)
 
-    def test_failed_claude_trust_write_prints_one_anomaly_and_does_not_start(self) -> None:
+    def test_failed_claude_trust_write_returns_no_pane_without_printing(self) -> None:
         account = self.root / "broken-account"
         account.mkdir()
         target = account / ".claude.json"
@@ -3395,10 +3528,12 @@ class LaunchDestinationTests(StaffTestCase):
               redirect_stderr(io.StringIO()) as errors):
             result = herdr.launch_prepared_agent("agents", herdr.NewTab("workers", "worker"),
                 prepared, "claude", [], herdr.NoOpeningPrompt(), 5000, agent="worker")
-        self.assertIsInstance(result.outcome, herdr.ClaudeTrustNotWritten)
+        assert isinstance(result.outcome, herdr.ClaudeTrustNotWritten)
         started.assert_not_called()
         opened.assert_not_called()
-        lines = errors.getvalue().splitlines()
+        self.assertEqual(result.outcome.pane_result, herdr.StartPaneResult.NO_PANE)
+        self.assertEqual(errors.getvalue(), "")
+        lines = herdr.format_start_failure(result.outcome).splitlines()
         self.assertEqual(len(lines), 1)
         self.assertIn("trust anomaly", lines[0])
         self.assertIn(str(self.root), lines[0])
@@ -3520,41 +3655,68 @@ class LaunchDestinationTests(StaffTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["unset", "unset", "unset", "replacement-native-id", "kept"])
 
+    def test_existing_pane_with_unreadable_list_returns_the_start_failure(self) -> None:
+        client = herdr.Herdr("agents")
+        reason = "herdr response: invalid JSON"
+        with (patch.object(client, "panes", side_effect=herdr_types.HerdrFailure(reason)),
+              patch.object(client, "run_in_pane") as shell,
+              patch.object(client, "close_retained_pane") as close,
+              patch.object(herdr, "start_agent") as start,
+              redirect_stderr(io.StringIO()) as errors):
+            launched = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
+                herdr.PreparedAgentEnvironment(Path("/tmp"), {}), "codex", [],
+                herdr.NoOpeningPrompt(), 5000, agent="worker", client=client)
+
+        assert isinstance(launched.outcome, herdr.AgentNotStarted)
+        self.assertEqual(launched.pane, "worker")
+        self.assertEqual(launched.outcome.terminal, "terminal-one")
+        self.assertTrue(launched.outcome.launch_refused)
+        self.assertEqual(herdr.format_start_failure(launched.outcome),
+                         f"herdr agents:worker: agent start failed: {reason}; pane state unknown")
+        self.assertEqual(errors.getvalue(), "")
+        shell.assert_not_called()
+        start.assert_not_called()
+        close.assert_not_called()
+
     def test_existing_pane_refuses_overwriting_proved_foreground_work(self) -> None:
         client = herdr.Herdr("agents")
-        log = self.root / "occupied-pane.jsonl"
-        clock = StartupClock()
+        for terminal, status in (("terminal-one", herdr.StartPaneResult.RETAINED),
+                                 ("replacement-terminal", herdr.StartPaneResult.UNKNOWN)):
+            with self.subTest(terminal=terminal):
+                commands: list[tuple[str, ...]] = []
+                clock = StartupClock()
 
-        def transport(*arguments: str, deadline: float = math.inf) -> str:
-            del deadline
-            with log.open("a") as output:
-                _ = output.write(json.dumps(arguments) + "\n")
-            if arguments == ("pane", "list"):
-                return json.dumps({"result": {"panes": [{"pane_id": "worker", "workspace_id": "workers",
-                    "terminal_id": "terminal-one", "agent_session": {"value": None}}]}})
-            if arguments == ("pane", "process-info", "--pane", "worker"):
-                return json.dumps({"result": {"process_info": {"shell_pid": 998044,
-                    "foreground_process_group_id": 998045,
-                    "foreground_processes": [{"pid": 998045, "name": "vim", "argv": ["vim"]}]}}})
-            return "{}"
+                def transport(*arguments: str, deadline: float = math.inf) -> str:
+                    del deadline
+                    commands.append(arguments)
+                    if arguments == ("pane", "list"):
+                        return json.dumps({"result": {"panes": [{"pane_id": "worker", "workspace_id": "workers",
+                            "terminal_id": terminal, "agent_session": {"value": None}}]}})
+                    if arguments == ("pane", "process-info", "--pane", "worker"):
+                        return json.dumps({"result": {"process_info": {"shell_pid": 998044,
+                            "foreground_process_group_id": 998045,
+                            "foreground_processes": [{"pid": 998045, "name": "vim", "argv": ["vim"]}]}}})
+                    return "{}"
 
-        with (patch.object(herdr, "Herdr", return_value=client),
-              patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed, sleep=clock.advance)),
-              patch.object(client, "run", side_effect=transport),
-              patch.object(herdr, "start_agent") as started,
-              self.assertRaises(herdr_types.HerdrFailure)):
-            _ = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
-                herdr.PreparedAgentEnvironment(Path("/tmp"), {}), "codex", [],
-                herdr.NoOpeningPrompt(), 5000, agent="worker")
-        started.assert_not_called()
-        commands = [cast(list[str], json.loads(line)) for line in log.read_text().splitlines()]
-        self.assertFalse(any(command[:2] in (["pane", "run"], ["pane", "send-keys"], ["agent", "prompt"])
-                             for command in commands))
-
+                with (patch.object(herdr, "Herdr", return_value=client),
+                      patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed, sleep=clock.advance)),
+                      patch.object(client, "run", side_effect=transport),
+                      patch.object(herdr, "start_agent") as started):
+                    launched = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
+                        herdr.PreparedAgentEnvironment(Path("/tmp"), {}), "codex", [],
+                        herdr.NoOpeningPrompt(), 5000, agent="worker")
+                started.assert_not_called()
+                assert isinstance(launched.outcome, herdr.AgentNotStarted)
+                self.assertEqual(launched.outcome.code, "wrong_target")
+                self.assertTrue(launched.outcome.launch_refused)
+                self.assertEqual(launched.outcome.pane_result, status)
+                self.assertFalse(any(command[:2] in (("pane", "run"), ("pane", "send-keys"),
+                    ("agent", "prompt"), ("pane", "close")) for command in commands))
 
     def test_existing_failed_agent_exits_without_closing_its_shell(self) -> None:
         client = Mock(spec=herdr.Herdr)
         cast(Mock, client.panes).return_value = [{"pane_id": "worker", "terminal_id": "terminal-one"}]
+        cast(Mock, client.pane_row).return_value = {"pane_id": "worker", "terminal_id": "terminal-one"}
         cast(Mock, client.pane_activity).return_value = herdr.PaneAtShell()
         cast(Mock, client.startup_processes).return_value = herdr.PaneStartupObservation(
             herdr.PaneShell(123), herdr.PaneAtShell())
@@ -3563,7 +3725,9 @@ class LaunchDestinationTests(StaffTestCase):
             outcome = herdr.launch_prepared_agent("agents", herdr.ExistingPane("worker", "terminal-one"),
                 herdr.PreparedAgentEnvironment(Path("/tmp"), {}), "codex", [],
                 herdr.NoOpeningPrompt(), 5000, agent="worker")
-        self.assertEqual(outcome, herdr.AgentLaunched("worker", herdr.PromptNotSubmitted("start failed")))
+        self.assertEqual(outcome, herdr.AgentLaunched("worker", herdr.AgentNotStarted("start failed",
+            pane_result=herdr.StartPaneResult.RETAINED, session="agents", pane="worker", agent="worker",
+            terminal="terminal-one")))
         cast(Mock, client.send_keys).assert_not_called()
         cast(Mock, client.close_pane).assert_not_called()
 
@@ -6553,13 +6717,13 @@ class HerdrTests(unittest.TestCase):
                     self.assertIn(["--session", "fixture", "pane", "rename", pane, "worker"], commands)
                     self.assertEqual(commands.count(["--session", "fixture", "pane", "close", pane]), 1)
                     self.assertEqual(self.herdr.panes(), [])
-                    self.assertIn(f"herdr fixture:{pane}: agent start failed: {launched.outcome.reason}; pane closed\n",
-                                  errors.getvalue())
+                    self.assertEqual(launched.outcome.pane_result, herdr.StartPaneResult.CLOSED)
                 else:
                     self.assertFalse(any(command[2:4] in (["pane", "close"], ["tab", "close"], ["server", "stop"])
                                          for command in commands))
                     self.assertEqual([row["pane_id"] for row in self.herdr.panes()], [pane])
-                    self.assertNotIn("pane closed", errors.getvalue())
+                    self.assertEqual(launched.outcome.pane_result, herdr.StartPaneResult.RETAINED)
+                self.assertEqual(errors.getvalue(), "")
                 self.assertFalse(any(command[2:4] == ["agent", "prompt"] for command in commands))
 
     def test_pane_activity_distinguishes_shell_from_foreground_commands(self) -> None:
@@ -7541,12 +7705,12 @@ class HerdrTests(unittest.TestCase):
         self.responses["--session fixture pane list"] = [
             {"stdout": json.dumps({"result": {"panes": [
                 {"pane_id": "w1:p1", "tab_id": "w1:t1"},
-                {"pane_id": "w1:p2", "tab_id": "w1:t2"}]}}), "code": 0},
+                {"pane_id": "w1:p2", "tab_id": "w1:t2", "terminal_id": "terminal-two"}]}}), "code": 0},
             {"stdout": json.dumps({"result": {"panes": [
-                {"pane_id": "w1:p1", "tab_id": "w1:t1"}]}}), "code": 0},
+                {"pane_id": "w1:p1", "tab_id": "w1:t1", "terminal_id": "terminal-one"}]}}), "code": 0},
         ]
         _ = self.responses_path.write_text(json.dumps(self.responses))
-        herdr.close_agent("fixture", "w1:p2")
+        self.assertTrue(herdr.close_agent("fixture", "w1:p2"))
         self.assertEqual(self.commands(), [
             ["--session", "fixture", "pane", "list"],
             ["--session", "fixture", "pane", "process-info", "--pane", "w1:p2"],
@@ -7556,13 +7720,24 @@ class HerdrTests(unittest.TestCase):
         self.assertNotIn(["--session", "fixture", "server", "stop"], self.commands())
 
 
+    def test_close_agent_checks_the_stopped_terminal_when_its_pane_is_absent(self) -> None:
+        self.share()
+        for visible, closed in (("another-terminal", True), ("terminal-two", False), ("", False)):
+            with self.subTest(visible=visible):
+                rows = [{"pane_id": "w1:p1", "terminal_id": visible}]
+                with (patch.object(herdr.Herdr, "listed", return_value=rows),
+                      patch.object(herdr.Herdr, "run") as command):
+                    self.assertEqual(herdr.close_agent("fixture", "w1:p2", terminal="terminal-two"), closed)
+                command.assert_not_called()
+
     def test_close_agent_refuses_when_the_closed_pane_is_still_listed(self) -> None:
         self.share()
         self.configure_startup_shell("w1:p2")
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
-            {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"}]}}))
+            {"pane_id": "w1:p1", "tab_id": "w1:t1"},
+            {"pane_id": "w1:p2", "tab_id": "w1:t2", "terminal_id": "terminal-two"}]}}))
         with self.assertRaisesRegex(herdr_types.HerdrFailure, "tab closure is not confirmed"):
-            herdr.close_agent("fixture", "w1:p2")
+            _ = herdr.close_agent("fixture", "w1:p2")
         self.assertEqual(self.commands(), [
             ["--session", "fixture", "pane", "list"],
             ["--session", "fixture", "pane", "process-info", "--pane", "w1:p2"],

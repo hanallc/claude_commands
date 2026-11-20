@@ -162,6 +162,24 @@ class WorkerAdmissionTests(StaffTestCase):
         self.assertEqual(staff.by_current_session(current), changed)
         self.assertIsNone(staff.by_current_session(unit.id))
 
+    def test_publication_preserves_process_streams_and_returns_its_failure(self) -> None:
+        _, unit, _ = self.tree()
+        allowed = worker_admission.WorkerStartAllowed("test-publish", unit.id, self.root, worker_admission.NewWorkerSlot())
+        identity = fixture_runtime_id("publication-error")
+
+        def refuse(*_args: object) -> staff.StaffRow:
+            self.assertIs(sys.stdout, output)
+            self.assertIs(sys.stderr, errors)
+            raise staff.StaffRefused("fixture publication failure")
+
+        with (redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors,
+              mock.patch.object(staff, "ensure_worker", side_effect=refuse),
+              self.assertRaises(worker_admission.AdmissionRefused) as refusal):
+            _ = worker_admission.publish(allowed, identity)
+        self.assertEqual(str(refusal.exception),
+                         f"staff: test-publish: {identity}: publication refused: fixture publication failure")
+        self.assertEqual((output.getvalue(), errors.getvalue()), ("", ""))
+
     def test_permission_is_read_only_and_publication_uses_the_fixed_parent(self) -> None:
         _, unit, existing = self.tree()
         for replaced in (False, True):

@@ -6,14 +6,13 @@ except FileNotFoundError:
     pass
 
 import argparse
-import io
 import math
 import os
 import subprocess
 import sys
 import time
 from collections.abc import Iterable
-from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from threading import Event
@@ -22,6 +21,7 @@ from enum import Enum
 from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryFile
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from importlib import import_module
 
@@ -293,8 +293,12 @@ class DirectorResumeChecks:
                      + f"{pane.source.publication.entry['pane_id']} still has work after the restart check")
 
 
-class ClaudeTrustWriteFailed(OSError):
-    """The shared launch already reported its failed trust write."""
+class AgentStartFailed(OSError):
+    """The error contains the full start failure diagnostic."""
+
+
+class ClaudeTrustWriteFailed(AgentStartFailed):
+    """The restart cannot proceed until Claude trust is available."""
 
 
 class WorkerRow(Protocol):
@@ -325,10 +329,6 @@ class WorkerRestore(Protocol):
                 started_panes: dict[staff.StaffId, str] | Literal["discard"] = "discard",
                 runs: dict[str, list[str]] | None = None,
                 codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> int: ...
-
-
-class AgentsCommand(Protocol):
-    def main(self, argv: list[str]) -> int: ...
 
 
 class MemberLifecycle(Protocol):
@@ -700,7 +700,9 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                                   live.reason if isinstance(live, herdr.UnknownConversation) else ""),
                 codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT, client=client)
         if isinstance(result.outcome, herdr.ClaudeTrustNotWritten):
-            raise ClaudeTrustWriteFailed(result.outcome.reason)
+            raise ClaudeTrustWriteFailed(herdr.format_start_failure(result.outcome))
+        if isinstance(result.outcome, herdr.AgentNotStarted):
+            raise AgentStartFailed(herdr.format_start_failure(result.outcome))
         if not isinstance(result.outcome, herdr.PromptSubmissionNotRequired) and result.outcome.publication_error is not None:
             raise OSError(f"staff publication failed: {result.outcome.publication_error}")
         if (not isinstance(result.outcome, herdr.PromptSubmissionNotRequired)
@@ -1331,8 +1333,12 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             for holder, focus, future in futures:
                 try:
                     record_start(holder, future.result())
-                except ClaudeTrustWriteFailed:
+                except ClaudeTrustWriteFailed as error:
+                    print(error, file=sys.stderr)
                     exit_code = 1
+                except AgentStartFailed as error:
+                    print(error, file=sys.stderr)
+                    failed_starts.append(FailedHolderStart(holder, focus, error))
                 except staff.StaffRefused as error:
                     _anomaly(holder, error)
                 except errors as error:
@@ -1347,15 +1353,19 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             except errors:
                 pass
         if not isinstance(fresh, herdr.StoppedConversation):
-            _anomaly(holder, failed.error)
+            if not isinstance(failed.error, AgentStartFailed):
+                _anomaly(holder, failed.error)
             continue
         try:
             disposition = start_holder(holder, failed.focus, RestartSuccessReport.CALLER)
             record_start(holder, disposition)
             if disposition is RestartDisposition.STARTED:
                 print(f"{holder.name}: down; started")
-        except ClaudeTrustWriteFailed:
+        except ClaudeTrustWriteFailed as error:
+            print(error, file=sys.stderr)
             exit_code = 1
+        except AgentStartFailed as error:
+            print(error, file=sys.stderr)
         except staff.StaffRefused as error:
             _anomaly(holder, error)
         except errors as error:
@@ -1371,20 +1381,22 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
 
 def main() -> int:
     """Run detached restart work and save its output."""
-    command = cast(AgentsCommand, cast(object, import_module("scripts.agents.shutdown")))
-
     parser = argparse.ArgumentParser(add_help=False)
     _ = parser.add_argument("--log", type=Path, required=True)
     _ = parser.add_argument("--requester", default="")
     options, arguments = parser.parse_known_args()
-    output = io.StringIO()
-    _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
-    _ = os.environ.pop("CODEX_THREAD_ID", None)
-    try:
-        with redirect_stdout(output), redirect_stderr(output):
-            return command.main(arguments)
-    finally:
-        write_text_atomic(cast(Path, options.log), output.getvalue())
+    environment = os.environ.copy()
+    _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
+    _ = environment.pop("CODEX_THREAD_ID", None)
+    command = Path(__file__).resolve().with_name("shutdown.py")
+    with TemporaryFile(mode="w+", encoding="utf-8") as output:
+        try:
+            done = subprocess.run([sys.executable, "-u", str(command), *arguments], env=environment,
+                                  stdout=output, stderr=subprocess.STDOUT, check=False)
+            return done.returncode
+        finally:
+            _ = output.seek(0)
+            write_text_atomic(cast(Path, options.log), output.read())
 
 
 if __name__ == "__main__":

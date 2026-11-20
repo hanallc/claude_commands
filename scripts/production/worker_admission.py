@@ -1,11 +1,10 @@
 """Check launch permission, then publish the backend runtime identity."""
 from __future__ import annotations
 
-from contextlib import contextmanager, ExitStack, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, ExitStack
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from enum import StrEnum
-import io
 import hashlib
 import ast
 from importlib import import_module
@@ -504,14 +503,13 @@ def publish(allowed: WorkerStartAllowed, runtime_id: str, *,
     """Publish the session and its supplied launch home before dispatch."""
     try:
         identity = staff.native_id(runtime_id)
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            if isinstance(allowed.slot, ExistingWorkerSlot):
-                row = staff.update_current_session(allowed.slot.row.current_session, identity)
-            else:
-                row = staff.ensure_worker(identity, allowed.name, allowed.parent)
-            if isinstance(launch_home, staff.SessionHome):
-                row = staff.set_home(row.id, launch_home)
-            row = pane_launch.staff_admitted(row)
+        if isinstance(allowed.slot, ExistingWorkerSlot):
+            row = staff.update_current_session(allowed.slot.row.current_session, identity)
+        else:
+            row = staff.ensure_worker(identity, allowed.name, allowed.parent)
+        if isinstance(launch_home, staff.SessionHome):
+            row = staff.set_home(row.id, launch_home)
+        row = pane_launch.staff_admitted(row)
         return PublishedWorker(row)
     except worker_lifecycle.OperationDeadlineExpired:
         raise

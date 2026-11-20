@@ -865,6 +865,34 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertEqual(self.attachments, [])
         self.assertEqual(self.commands(), [])
 
+    def test_standalone_launch_failure_exit_table(self) -> None:
+        self.destination()
+        prompt = self.root / "prompt.txt"
+        _ = prompt.write_text("Review the changes.")
+        resume = ("resume", "solo", "--cwd", str(self.root), "--session-id",
+                  fixture_runtime_id("standalone-start-failure"), "--prompt-file", str(prompt))
+        start = ("start", "--name", "solo", "--cwd", str(self.root))
+        pending = herdr.AgentNotStarted("client not ready", screen="Trust dialog\nAccept",
+            session="agents", pane="w1:p1", code="agent_not_ready", pane_result=herdr.StartPaneResult.CLOSED)
+        busy = herdr.AgentNotStarted("pane busy", code="agent_pane_busy", pane_result=herdr.StartPaneResult.RETAINED)
+        trust = herdr.ClaudeTrustNotWritten("trust write failed")
+        refused = herdr.AgentNotStarted("shell target changed", code="wrong_target", launch_refused=True)
+        for arguments, failure, expected, attaches in (
+                (resume, pending, 0, False),
+                (resume, busy, 0, False),
+                (resume, trust, 0, False),
+                (resume, refused, 1, False),
+                (resume + ("--attach",), pending, 0, True),
+                (start, busy, 0, True),
+                (start, refused, 1, False)):
+            with (self.subTest(command=arguments[0], cause=failure.reason, attach=attaches),
+                  patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched(failure.pane, failure)),
+                  patch.object(herdr_sessions, "_attach") as attach):
+                code, errors = self.call(*arguments)
+                self.assertEqual(code, expected, errors)
+                self.assertEqual(errors.splitlines(), [herdr.format_start_failure(failure)])
+                self.assertEqual(attach.call_count, int(attaches))
+
     def test_start_after_cutover_uses_showrunners_account_for_pane(self) -> None:
         directory = self.numbered_account()
         groups = accounts.groups_file()
@@ -922,7 +950,8 @@ class StandaloneLaunchTests(unittest.TestCase):
                 with patch.object(runtime_sessions, "session_liveness",
                                   return_value=runtime_sessions.LiveSessionProcess(998043)):
                     self.assertEqual(self.call(*arguments),
-                        (1, f"herdr_sessions: would start a second copy of running session {member.current_session}\n"))
+                        (1, f"herdr agents:{title}: agent start failed: "
+                            + f"would start a second copy of running session {member.current_session}; no pane opened\n"))
                 added = self.commands()[len(before):]
                 self.assertFalse(any(command[2:4] in (["workspace", "create"], ["tab", "create"], ["agent", "start"])
                                      for command in added))

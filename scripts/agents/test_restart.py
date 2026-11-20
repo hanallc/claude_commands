@@ -2304,23 +2304,46 @@ class RestartTests(RestartTestCase):
             self.assertEqual(restart.restart(only=(str(self.rows[0].id),)), 0)
         self.assertEqual(shutdown_record.read(), [str(self.rows[1].id), other])
 
-    def test_failed_trust_write_keeps_the_pending_restart_and_reports_once(self) -> None:
+    def test_restart_start_failure_exit_table(self) -> None:
+        self.running.clear()
+        row = self.rows[0]
+        pane = "w1:p1"
+        failures = (
+            (herdr.ClaudeTrustNotWritten("cannot write Claude trust", session="agents", agent=row.name), 1),
+            (herdr.AgentNotStarted("pane busy", session="agents", pane=pane, code="agent_pane_busy"), 0),
+            (herdr.AgentNotStarted("shell target changed", session="agents", pane=pane, code="wrong_target",
+                                   launch_refused=True), 0),
+        )
+        for failure, expected in failures:
+            with self.subTest(cause=failure.reason):
+                shutdown_record.save([str(row.id)])
+                with (patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(failure.pane, failure)) as launch,
+                      redirect_stderr(io.StringIO()) as errors):
+                    result = restart.restart()
+                self.assertEqual(result, expected)
+                self.assertEqual(shutdown_record.read(), [str(row.id)])
+                self.assertGreater(launch.call_count, 0)
+                self.assertEqual(errors.getvalue().splitlines(), [herdr.format_start_failure(failure)] * launch.call_count)
+                self.assertEqual(self.launches, [])
+
+    def test_restart_reports_a_start_failure_once_before_a_successful_retry(self) -> None:
         self.running.clear()
         row = self.rows[0]
         shutdown_record.save([str(row.id)])
-        reason = f"{self.root}: trust anomaly: {self.root / '.claude2/.claude.json'}: PermissionError"
-
-        def launch(*_args: object, **_kwargs: object) -> herdr.AgentLaunched:
-            print(reason, file=sys.stderr)
-            return herdr.AgentLaunched("", herdr.ClaudeTrustNotWritten(reason))
-
-        with (patch.object(herdr, "launch_prepared_agent", side_effect=launch),
+        failure = herdr.AgentNotStarted("start timed out", screen="Trust dialog\nAccept",
+            session="agents", pane="w1:p1", pane_result=herdr.StartPaneResult.CLOSED)
+        with (patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+              patch.object(herdr, "launch_prepared_agent", side_effect=[
+                  herdr.AgentLaunched("w1:p1", failure),
+                  herdr.AgentLaunched("w1:p2", herdr.PromptSubmissionNotRequired()),
+              ]) as launch,
+              patch.object(restart.DirectorResumeCheck, "progress", return_value=restart.ResumeCheckState.RESUMED),
               redirect_stderr(io.StringIO()) as errors):
-            result = restart.restart()
-        self.assertEqual(result, 1)
-        self.assertEqual(shutdown_record.read(), [str(row.id)])
-        self.assertEqual(errors.getvalue().splitlines(), [reason])
-        self.assertEqual(self.launches, [])
+            self.assertEqual(restart.restart(), 0)
+        self.assertEqual(launch.call_count, 2)
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "herdr agents:w1:p1: agent start failed: start timed out; visible screen: Trust dialog Accept; pane closed"])
+        self.assertEqual(shutdown_record.read(), [])
 
     def test_started_row_leaves_pending_when_layout_save_fails(self) -> None:
         self.running.clear()

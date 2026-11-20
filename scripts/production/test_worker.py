@@ -1259,8 +1259,8 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertIn("--timeout", command)
                     self.assertEqual(command[command.index("--timeout") + 1], "300000")
                 if proof in {"absent", "task_started"}:
-                    self.assertEqual(errors.getvalue().splitlines(),
-                        [f"{current.row.name}: compaction failed: compaction has no transcript proof"])
+                    self.assertEqual(result.diagnostics,
+                        (f"{current.row.name}: compaction failed: compaction has no transcript proof",))
                     if proof == "absent":
                         keys.assert_called_once_with(current.pane, "ctrl-u", target=str(current.row.current_session),
                                                      expected_text="/compact")
@@ -1270,7 +1270,8 @@ class WorkerCommandTests(unittest.TestCase):
                     keys.assert_not_called()
                     if proof == "delayed":
                         self.assertEqual(order, ["compacted", "prompt"])
-                self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                self.assertIs(result.code, worker.DispatchSubmission.SUBMITTED)
+                self.assertEqual(errors.getvalue(), "")
                 self.assertEqual(self.agent.submitted[before:], [(current.pane,
                     script_prompt("End your final reply with DONE compact-proof"))])
                 self.assertEqual(self.agent.compact_inputs[current.pane], "")
@@ -1396,7 +1397,7 @@ class WorkerCommandTests(unittest.TestCase):
 
                     with ExitStack() as failures:
                         if outcome in {"hook write", "reply write", "notice failure"}:
-                            _ = failures.enter_context(patch.object(worker, "dispatch_turn", return_value=worker.ExitCode.REFUSED))
+                            _ = failures.enter_context(patch.object(worker, "dispatch_turn", return_value=worker.DispatchResult(worker.ExitCode.REFUSED)))
                         if outcome == "first staff read":
                             _ = failures.enter_context(patch.object(staff, "snapshot", side_effect=staff_read))
                         if outcome == "hook write":
@@ -1475,7 +1476,7 @@ class WorkerCommandTests(unittest.TestCase):
 
         with (patch.object(worker_panes, "worker_lock", new=retry_after_release),
               patch.object(worker_panes, "observe_worker", return_value=opened),
-              patch.object(worker, "dispatch_turn", return_value=worker.ExitCode.REFUSED),
+              patch.object(worker, "dispatch_turn", return_value=worker.DispatchResult(worker.ExitCode.REFUSED)),
               patch.object(worker, "_dispatch_notice") as dispatch_notice,
               patch.object(turn_end, "run_finished") as completion_notice):
             code = worker.finish_dispatch(parent, opened.row.id, self.run_dir, instance, instance)
@@ -1512,7 +1513,7 @@ class WorkerCommandTests(unittest.TestCase):
 
         with (patch.object(worker_panes, "observe_worker", return_value=opened),
               patch.object(worker, "_client", return_value=self.fixture.world),
-              patch.object(worker, "dispatch_turn", return_value=worker.ExitCode.REFUSED) as dispatch,
+              patch.object(worker, "dispatch_turn", return_value=worker.DispatchResult(worker.ExitCode.REFUSED)) as dispatch,
               patch.object(turn_end, "run_finished") as completion_notice,
               redirect_stderr(io.StringIO())):
             code = worker.finish_dispatch(parent, opened.row.id, self.run_dir, instance, second_id)
@@ -1649,7 +1650,7 @@ class WorkerCommandTests(unittest.TestCase):
                 result = worker.dispatch_turn(self.fixture.parent.id, current, self.fixture.world,
                     "End your final reply with DONE compressed-dispatch", "compressed-dispatch",
                     run=self.run_dir, on_submission=resume_transcript)
-            self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+            self.assertIs(result.code, worker.DispatchSubmission.SUBMITTED)
             self.assertEqual(self.agent.compactions, [(current.pane, before)])
 
     def test_long_dispatch_waits_without_submitting_again(self) -> None:
@@ -2938,7 +2939,7 @@ class WorkerCommandTests(unittest.TestCase):
     def test_publication_failure_reports_that_its_new_pane_was_closed(self) -> None:
         with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
               redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(self.dispatch(), worker.ExitCode.UNCERTAIN)
+            self.assertEqual(self.dispatch(), worker.ExitCode.REFUSED)
         self.assertIn("pane w1:p1 closed", errors.getvalue())
         self.assertNotIn("retained", errors.getvalue())
         self.assertEqual(self.fixture.world.closed, [("w1:p1", "terminal-w1:p1")])
@@ -2950,7 +2951,7 @@ class WorkerCommandTests(unittest.TestCase):
             del identity, name, parent
             raise staff.StaffRefused("publication unavailable")
         with patch.object(staff, "ensure_worker", side_effect=failed):
-            self.assertEqual(self.dispatch(), worker.ExitCode.UNCERTAIN)
+            self.assertEqual(self.dispatch(), worker.ExitCode.REFUSED)
         self.assertIs(staff.ensure_worker, publish)
         self.assertEqual(self.agent.submitted, [])
         self.assertEqual(len(self.fixture.world.launches), 1)
@@ -3244,6 +3245,33 @@ class WorkerCommandTests(unittest.TestCase):
                         case.assertEqual(set(pending), {"impl", "fix", "review", "test"})
                 finally:
                     case.doCleanups()
+
+    def test_assignment_keeps_the_default_worker_start_failure_and_close_result(self) -> None:
+        pane = "w1:p1"
+        reason = str(herdr.AgentExited(self.fixture.world.session, pane))
+        diagnostic = f"herdr {self.fixture.world.session}:{pane}: agent start failed: {reason}; pane closed"
+
+        def launch(session: str, destination: herdr.NewTab | herdr.SplitPane | herdr.ExistingPane,
+                   prepared: herdr.PreparedAgentEnvironment, kind: str, arguments: list[str],
+                   opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout: int, *, agent: str,
+                   agent_name: str | herdr.AgentNameSource = herdr.AgentNameSource.MEMBER_REFERENCE) -> herdr.AgentLaunched:
+            if agent == "fix":
+                self.assertIs(sys.stderr, errors)
+                return herdr.AgentLaunched(pane, herdr.AgentNotStarted(
+                    reason, pane_result=herdr.StartPaneResult.CLOSED, session=session, pane=pane, agent=agent))
+            return self.fixture.world.launch(session, destination, prepared, kind, arguments, opening, timeout,
+                                             agent=agent, agent_name=agent_name)
+
+        with (patch.object(herdr, "launch_prepared_agent", side_effect=launch),
+              redirect_stderr(io.StringIO()) as errors):
+            result = worker.assign(self.fixture.parent.id, "impl", self.prompt, session_dir=self.run_dir,
+                slot="impl", phase="8", kind="impl", launcher_command=["assign.sh"], reply=self.reply)
+
+        self.assertEqual(result, worker.ExitCode.OK)
+        self.assertEqual(errors.getvalue().splitlines(), [diagnostic])
+        self.assertEqual({row.name for row in staff.snapshot().find(kind="worker", parent=self.fixture.parent.id)},
+                         {"impl", "review", "test"})
+        self.assertEqual(len(self.agent.submitted), 1)
 
     def test_assignment_continues_after_a_default_split_interruption(self) -> None:
         row = self.fixture.worker("impl", family="codex")
@@ -4417,15 +4445,25 @@ class WorkerCommandTests(unittest.TestCase):
         prompt.assert_not_called()
         self.assertEqual(errors.getvalue(), "anomaly: impl: director session is unavailable\n")
 
-    def test_publication_failure_reports_that_its_new_pane_close_failed(self) -> None:
-        with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
-              patch.object(self.fixture.world, "close_pane", return_value=False),
-              redirect_stderr(io.StringIO()) as errors):
-            self.assertEqual(self.dispatch(), worker.ExitCode.UNCERTAIN)
-        self.assertIn("pane w1:p1 close failed", errors.getvalue())
-        self.assertEqual(sum(line.startswith("anomaly:") for line in errors.getvalue().splitlines()), 1)
-        self.assertIn("w1:p1", self.fixture.world.locations)
-        self.assertEqual(self.agent.submitted, [])
+    def test_publication_failure_needs_proof_after_close_acknowledgment(self) -> None:
+        for acknowledged in (False, True):
+            with self.subTest(acknowledged=acknowledged):
+                case = type(self)()
+                case.setUp()
+                try:
+                    with (patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")),
+                          patch.object(case.fixture.world, "close_pane", return_value=acknowledged),
+                          redirect_stderr(io.StringIO()) as errors):
+                        self.assertEqual(case.dispatch(), worker.ExitCode.UNCERTAIN)
+                    self.assertIn("pane w1:p1 close failed", errors.getvalue())
+                    self.assertNotIn("pane w1:p1 closed", errors.getvalue())
+                    line, = errors.getvalue().splitlines()
+                    self.assertIn("TEST admission refused", line)
+                    self.assertIn("pane w1:p1 close failed:", line)
+                    self.assertIn("w1:p1", case.fixture.world.locations)
+                    self.assertEqual(case.agent.submitted, [])
+                finally:
+                    case.doCleanups()
 
     def test_list_all_resolves_the_legacy_unit_account_once_from_stored_history(self) -> None:
         _first, second, _paths = self.recorded_list_fixture()

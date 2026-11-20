@@ -20,6 +20,7 @@ import subprocess
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Callable, cast, final, override
@@ -723,23 +724,80 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(launches, 1)
         self.assertEqual(output.getvalue(), "alpha started: herdr session attach agents, workspace build-followups, tab alpha\n")
 
-    def test_unit_start_not_ready_prints_screen_and_sends_no_prompt_or_key(self) -> None:
-        screen = "Do you trust this folder?"
+    def test_unit_start_not_ready_reports_one_line_and_sends_no_prompt_or_key(self) -> None:
+        screen = "Do you trust this folder?\n1. Yes\n2. No"
         self.herdr_overrides["agent start"] = CommandResponse(
             code=1, stdout=json.dumps({"error": {"code": "agent_not_ready", "message": "dialog"}}))
         self.herdr_overrides[f"--session {SHARED} pane read w1:p1 --source visible"] = CommandResponse(code=0, stdout=screen)
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("opening prompt not submitted:", result.stderr)
-        self.assertIn(screen, result.stderr)
+        lines = [line for line in result.stderr.splitlines() if "agent start failed:" in line]
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertIn("agent_not_ready: dialog; visible screen: Do you trust this folder? 1. Yes 2. No; pane ", lines[0])
+        self.assertEqual(result.stderr.count("Do you trust this folder?"), 1)
+        self.assertNotIn("opening prompt not submitted:", result.stderr)
         self.assertFalse(any(row[2:4] == ["server", "stop"] for row in self.herdr_calls()))
         self.assertFalse(any(row[2:4] in (["agent", "prompt"], ["pane", "send-keys"], ["pane", "send-text"])
                              for row in self.herdr_calls()))
 
+    def test_unit_start_failure_exit_table(self) -> None:
+        readiness = herdr.AgentNotStarted("client not ready", screen="Trust dialog\nAccept",
+            code="agent_not_ready", pane_result=herdr.StartPaneResult.CLOSED)
+        busy = herdr.AgentNotStarted("pane busy", code="agent_pane_busy")
+        trust = herdr.ClaudeTrustNotWritten("trust write failed")
+        refused = herdr.AgentNotStarted("workspace unavailable", launch_refused=True)
+        for failure, fresh_code, handoff_code in ((readiness, 1, 2), (busy, 1, 2), (trust, 1, 1), (refused, 1, 1)):
+            for handoff, expected in ((False, fresh_code), (True, handoff_code)):
+                with self.subTest(handoff=handoff, cause=failure.reason):
+                    case = type(self)()
+                    case.setUp()
+                    try:
+                        if handoff:
+                            prior, trace = case.prepare_attach()
+                            arguments = ("--permanent", "--attach", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
+                        else:
+                            trace = []
+                            arguments = ("--plan", "docs/plans/given.md")
+                        with patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched(failure.pane, failure)):
+                            result = case.cli("alpha", *arguments)
+                        self.assertEqual(result.returncode, expected, result.stderr)
+                        self.assertEqual(trace, ["stop", "launch"] if handoff else [])
+                        self.assertEqual([line for line in result.stderr.splitlines() if "agent start failed:" in line],
+                                         [herdr.format_start_failure(failure)])
+                    finally:
+                        case.doCleanups()
+
+    def test_resume_launches_after_the_stopped_terminal_disappears(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        previous_server = "old-alpha"
+        self.persist_herdr_unit(previous_server, prior)
+        self.herdr_overrides[f"--session {previous_server} pane list"] = CommandResponse(
+            code=0, stdout=json.dumps({"result": {"panes": []}}))
+        observed = add_unit.launched_unit
+
+        def stopped_terminal(request: add_unit.UnitLaunch | add_unit.RequestedUnitLaunch
+                             ) -> add_unit.LabeledSessionFound | add_unit.NoLabeledSession:
+            found = observed(request)
+            if isinstance(found, add_unit.LabeledSessionFound) and found.unit.place.session == previous_server:
+                return replace(found, terminal="old-terminal")
+            return found
+
+        with patch.object(add_unit, "launched_unit", side_effect=stopped_terminal):
+            result = self.cli("alpha", "--plan", "docs/plans/given.md",
+                "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertIn(["--session", previous_server, "pane", "list"], self.herdr_calls())
+        self.assertNotIn(["--session", previous_server, "server", "stop"], self.herdr_calls())
+        self.assertIn("--resume", self.agent_arguments())
+
     def test_a_prompt_never_typed_closes_the_new_session_so_a_rerun_starts_it(self) -> None:
-        for unit, typed, ending in (("alpha", False, "its session is closed: run the same command again"),
-                                    ("beta", True, "prompt typed 1 times")):
-            with self.subTest(typed=typed):
+        for unit, typed, confirmed, ending in (
+                ("alpha", False, True, "its session is closed: run the same command again"),
+                ("beta", True, False, "prompt typed 1 times"),
+                ("gamma", False, False, f"its session {SHARED} closure is unconfirmed")):
+            with self.subTest(typed=typed, confirmed=confirmed):
                 place = herdr.HerdrPlace(SHARED, "w1:p1")
                 found = add_unit.LabeledSessionFound(unit_lookup.LabeledSession(f"{unit}-unit",
                     unit_lookup.ClaudeNotRunning(), place,
@@ -749,11 +807,11 @@ class AddUnitLaunchTests(AddUnitTestCase):
                                                    + ("; prompt typed 1 times" if typed else ""), state=state)
                 with (patch.object(herdr, "start_agent", return_value=outcome),
                       patch.object(add_unit, "launched_unit", side_effect=[add_unit.NoLabeledSession(), found]),
-                      patch.object(herdr, "close_agent") as closed):
+                      patch.object(herdr, "close_agent", return_value=confirmed) as closed):
                     result = self.cli(unit, "--plan", "docs/plans/given.md")
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertTrue(result.stderr.rstrip().endswith(ending), result.stderr)
-                self.assertEqual(closed.call_args_list, [] if typed else [call(SHARED, "w1:p1")])
+                self.assertEqual(closed.call_args_list, [] if typed else [call(SHARED, "w1:p1", terminal="")])
 
     def test_job_name_configuration_does_not_change_tab_or_pane_session_name(self) -> None:
         with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")):

@@ -376,6 +376,24 @@ class SidePaneTests(StaffTestCase):
         self.assertIn(retained.pane, self.world.locations)
         self.assertEqual(self.world.closed, [])
 
+    def test_consultation_start_failure_exit_table(self) -> None:
+        question = self.root / "question.md"
+        write_text_atomic(question, "Review the design.")
+        options = assign.Arguments(new_worker="consultation", policy="astra-reviewer", prompt=str(question))
+        for failure, expected in (
+                (herdr.AgentNotStarted("start timed out", screen="Trust dialog\nAccept",
+                    session="agents", pane="w1:p8", pane_result=herdr.StartPaneResult.CLOSED), 8),
+                (herdr.AgentNotStarted("shell target changed", code="wrong_target", launch_refused=True), 8),
+                (herdr.ClaudeTrustNotWritten("trust write failed"), 8)):
+            with (self.subTest(cause=failure.reason),
+                  patch.object(assign, "pane_policy", return_value=self.policy()),
+                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(failure.pane, failure)),
+                  patch.object(herdr.Herdr, "prompt_terminal") as send,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(assign.execute_consultation(options, self.root), expected)
+            send.assert_not_called()
+            self.assertEqual(errors.getvalue().splitlines(), [herdr.format_start_failure(failure)])
+
     def test_repeated_open_with_a_question_sends_nothing(self) -> None:
         first = side_pane.open("consultation", self.policy(), question="First question.", cwd=self.root)
         commands = self.world.commands.copy()

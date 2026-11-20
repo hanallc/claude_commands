@@ -28,7 +28,7 @@ from scripts.production.production_doc import ProductionDocument, read_new_produ
 from scripts.production import showrunners
 from scripts.whoami import usage_store
 from scripts.whoami.account_test_support import stored_room
-from scripts.herdr import herdr
+from scripts.herdr import herdr, herdr_types
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.herdr.fake_herdr import CommandResponse
 
@@ -911,20 +911,45 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             code=0, stdout=screen)
         result = self.run_command("kid")
         self.assertEqual(result.returncode, add_showrunner.SESSION_NOT_READY, result.stdout + result.stderr)
-        self.assertIn(screen, result.stderr)
+        lines = [line for line in result.stderr.splitlines() if "agent start failed:" in line]
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertIn("agent_not_ready: permission dialog; visible screen: Do you trust this folder? 1. Yes 2. No; pane ",
+                      lines[0])
+        self.assertEqual(result.stderr.count("Do you trust this folder?"), 1)
+        self.assertNotIn("opening prompt not submitted:", result.stderr)
         self.assertFalse(any(row[2:4] in (["agent", "prompt"], ["pane", "send-keys"],
                                         ["pane", "send-text"]) for row in self.herdr_calls()))
         self.assertEqual(self.sent_to(), [])
         self.assertEqual(self.parent_of("kid"), "")
 
-    def test_showrunner_start_failure_is_reported_without_attaching(self) -> None:
-        self.herdr_overrides["workspace create"] = CommandResponse(
-                code=1, stdout="", stderr="fixture could not open workspace")
-        result = self.run_command("kid")
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("fixture could not open workspace", result.stderr)
-        self.assertFalse(any(row[2:4] == ["agent", "start"] for row in self.herdr_calls()))
-        self.assertEqual(self.parent_of("kid"), "")
+    def test_showrunner_start_failure_exit_table(self) -> None:
+        for cause, expected in (("open tab", 2), ("wrong_target", 2), ("agent_pane_busy", 3), ("trust", 3)):
+            with self.subTest(cause=cause):
+                case = type(self)()
+                case.setUp()
+                try:
+                    if cause == "open tab":
+                        case.herdr_overrides["workspace create"] = CommandResponse(
+                            code=1, stdout="", stderr="fixture could not open workspace")
+                    trust = herdr.ClaudeTrustNotWritten("trust write failed")
+                    busy = herdr.AgentNotStarted("pane busy", code="agent_pane_busy")
+                    if cause == "trust":
+                        launch = patch.object(herdr, "launch_agent", return_value=herdr.AgentLaunched("", trust))
+                    elif cause == "agent_pane_busy":
+                        launch = patch.object(herdr, "start_agent", return_value=busy)
+                    elif cause == "wrong_target":
+                        launch = patch.object(herdr.Herdr, "run_in_pane",
+                            side_effect=herdr_types.HerdrFailure("fixture shell target mismatch", "wrong_target"))
+                    else:
+                        launch = patch.object(herdr, "start_agent")
+                    with launch:
+                        result = case.run_command("kid")
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertEqual(sum("agent start failed:" in line for line in result.stderr.splitlines()), 1)
+                    self.assertEqual(case.sent_to(), [])
+                    self.assertEqual(case.parent_of("kid"), "")
+                finally:
+                    case.doCleanups()
 
     def test_unreadable_herdr_inventory_refuses_before_starting_the_child(self) -> None:
         self.herdr_overrides["--session default session list --json"] = CommandResponse(

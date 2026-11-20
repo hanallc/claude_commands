@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Iterable
-from contextlib import ExitStack, redirect_stderr, suppress
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from importlib import import_module
@@ -475,12 +475,17 @@ def startup_result(name: WorkerName, result: worker_panes.WorkerStart) -> ExitCo
         print(f"staff: {name.value}: not opened: {result.reason}", file=sys.stderr)
         return ExitCode.REFUSED
     if isinstance(result, worker_panes.StartRefused):
-        print(f"{result.reason.value}: {result.detail}", file=sys.stderr)
+        worker_panes.report_start_refusal(result)
         return ExitCode.REFUSED
     if isinstance(result, worker_panes.IncompleteStart):
         print(f"{name.value}: incomplete startup: {result.reason}", file=sys.stderr)
     elif isinstance(result, worker_panes.UnpublishedWorker):
-        print(f"{name.value}: publication failed: {result.cause}; {worker_panes.unpublished_cleanup_text(result)}", file=sys.stderr)
+        cause = " ".join(result.cause.splitlines())
+        print(f"{name.value}: publication failed: {cause}; {worker_panes.unpublished_cleanup_text(result)}", file=sys.stderr)
+        if result.cleanup is worker_panes.UnpublishedCleanup.PANE_CLOSED:
+            return ExitCode.REFUSED
+    elif isinstance(result, worker_panes.UncertainWorker) and result.start_failed:
+        print(result.reason, file=sys.stderr)
     # The shared scan already reports unknown and structural evidence.
     return ExitCode.UNCERTAIN
 
@@ -530,7 +535,7 @@ def arm_launch_cleanup(cleanup: ExitStack, before: frozenset[StaffId],
 def cleanup_failed_launch(row: staff.StaffRow, pane: str, terminal: str, ownership: LaunchRow) -> None:
     """Close only the saved terminal and retire only a newly created row."""
     try:
-        with redirect_stderr(io.StringIO()) as diagnostics:
+        with herdr.collect_diagnostics() as diagnostics:
             client = _client()
             closed = (client.close_tab_confirmed(pane, target=str(row.current_session), terminal=terminal)
                       and client.close_retained_pane(pane, terminal=terminal))
@@ -538,7 +543,7 @@ def cleanup_failed_launch(row: staff.StaffRow, pane: str, terminal: str, ownersh
             if ownership is LaunchRow.CREATED:
                 _ = staff.retire(row.id)
             return
-        reason = " ".join(line.removeprefix("anomaly: ") for line in diagnostics.getvalue().splitlines())
+        reason = " ".join(line.removeprefix("anomaly: ") for message in diagnostics for line in message.splitlines())
         reason = reason or "pane close is incomplete"
     except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
             staff.StaffRefused, staff.StaffUnreadable) as error:
@@ -574,13 +579,17 @@ def _done_instruction(dispatch_id: str) -> str:
             "A reply that waits on a detached run is not final.")
 
 
+def dispatch_log_path(run: Path, instance: str) -> Path:
+    return run / f"compact-{instance}.log"
+
+
 def _detach_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: str, completion_id: str) -> None:
     command = [sys.executable, str(Path(__file__).resolve()), "finish-dispatch", "--parent", str(parent),
                "--worker-id", str(row.id), "--session-dir", str(run), "--dispatch-id", instance,
                "--completion-id", completion_id]
     try:
         _ = detached.start_detached(command, ready=lambda: True, within=herdr.PROGRAM_TIMEOUT_SECONDS,
-                                    output=detached.AppendLog(run / f"compact-{instance}.log"))
+                                    output=detached.AppendLog(dispatch_log_path(run, instance)))
     except detached.DetachedStartFailure as error:
         progress_history.complete_dispatch(run, row.name, instance, status="error")
         raise herdr_types.HerdrFailure(str(error)) from error
@@ -784,8 +793,13 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             deferred = True
             print(f"{started.row.name}: {COMPACTION_STARTED_TEXT}")
 
-        result = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id,
-                               run=session_dir, on_submission=submitted, defer_compaction=defer_compaction)
+        attempt = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id,
+                                run=session_dir, on_submission=submitted, defer_compaction=defer_compaction)
+        for diagnostic in attempt.diagnostics:
+            print(diagnostic, file=sys.stderr)
+        if attempt.error is not None:
+            raise attempt.error
+        result = attempt.code
         if result is DispatchSubmission.SUBMITTED:
             submitted()
         if result is DispatchSubmission.SUBMITTED and not deferred:
@@ -808,13 +822,13 @@ def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
                 observed = worker_panes.observe_worker(parent, current.row, staff.snapshot())
                 if isinstance(observed, worker_panes.OpenWorker):
                     return _blocked_question(client, observed)
-            print(f"{error}; no prompt sent", file=sys.stderr)
+            herdr.report_diagnostic(f"{error}; no prompt sent")
             return ExitCode.UNCERTAIN
         except (OSError, herdr_types.HerdrFailure, subprocess.TimeoutExpired) as error:
-            print(f"{error}; no prompt sent", file=sys.stderr)
+            herdr.report_diagnostic(f"{error}; no prompt sent")
             return ExitCode.UNCERTAIN
         if not isinstance(observed, worker_panes.OpenWorker):
-            print(f"{current.row.name}: worker state is unavailable; no prompt sent", file=sys.stderr)
+            herdr.report_diagnostic(f"{current.row.name}: worker state is unavailable; no prompt sent")
             return ExitCode.UNCERTAIN
         current = observed
         if current.status == herdr.AgentStatus.BLOCKED and codex:
@@ -822,17 +836,38 @@ def _dispatch_ready(parent: StaffId, current: worker_panes.OpenWorker,
     return current
 
 
+@dataclass(frozen=True)
+class DispatchResult:
+    code: DispatchSubmission | ExitCode
+    diagnostics: tuple[str, ...] = ()
+    error: OSError | herdr_types.HerdrFailure | subprocess.SubprocessError | None = None
+
+
 def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
                    line: str, dispatch_id: str, *, run: Path,
                    on_submission: Callable[[], object] = lambda: None,
                    defer_compaction: Callable[[], None] | AttachedCompaction = AttachedCompaction.RUN,
-                   ) -> DispatchSubmission | ExitCode:
+                   ) -> DispatchResult:
     """Submit the saved prompt after the bounded idle checks."""
+    with herdr.collect_diagnostics() as diagnostics:
+        try:
+            code = _dispatch_turn(parent, started, client, line, dispatch_id, run=run,
+                                  on_submission=on_submission, defer_compaction=defer_compaction)
+        except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+            return DispatchResult(ExitCode.UNCERTAIN, tuple(diagnostics), error)
+    return DispatchResult(code, tuple(diagnostics))
+
+
+def _dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: herdr.Herdr,
+                   line: str, dispatch_id: str, *, run: Path,
+                   on_submission: Callable[[], object] = lambda: None,
+                   defer_compaction: Callable[[], None] | AttachedCompaction = AttachedCompaction.RUN,
+                   ) -> DispatchSubmission | ExitCode:
     if started.status == herdr.AgentStatus.BLOCKED and isinstance(staff.backend(started.row), staff.CodexBackend):
         return _blocked_question(client, started)
     receipt = dispatch_receipt(started.row, line, dispatch_id, run=run)
     if isinstance(receipt, DispatchEvidenceUnknown):
-        print(f"anomaly: {started.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
+        herdr.report_diagnostic(f"anomaly: {started.row.name}: {receipt.reason}; no prompt sent")
         return ExitCode.UNCERTAIN
     if not isinstance(receipt, DispatchNotSubmitted):
         return DispatchSubmission.SUBMITTED
@@ -844,12 +879,12 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
     if started.status == herdr.AgentStatus.WORKING:
         receipt = dispatch_receipt(current.row, line, dispatch_id, run=run)
         if isinstance(receipt, DispatchEvidenceUnknown):
-            print(f"{current.row.name}: {receipt.reason}; no prompt sent", file=sys.stderr)
+            herdr.report_diagnostic(f"{current.row.name}: {receipt.reason}; no prompt sent")
             return ExitCode.UNCERTAIN
         if not isinstance(receipt, DispatchNotSubmitted):
             return DispatchSubmission.SUBMITTED
     if current.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-        print(f"{current.row.name}: agent is {current.status.value}", file=sys.stderr)
+        herdr.report_diagnostic(f"{current.row.name}: agent is {current.status.value}")
         return ExitCode.BUSY
     defer = False
     try:
@@ -865,13 +900,13 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
                 client.send_keys(current.pane, "ctrl-u", target=str(current.row.current_session), expected_text="/compact")
         except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as cleanup_error:
             reason += f"; compaction input cleanup failed: {' '.join(str(cleanup_error).splitlines())}"
-        print(f"{current.row.name}: compaction failed: {reason}", file=sys.stderr)
+        herdr.report_diagnostic(f"{current.row.name}: compaction failed: {reason}")
     if defer and callable(defer_compaction):
         try:
             defer_compaction()
         except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             reason = " ".join(str(error).splitlines())
-            print(f"{current.row.name}: detached dispatch failed: {reason}; no prompt sent", file=sys.stderr)
+            herdr.report_diagnostic(f"{current.row.name}: detached dispatch failed: {reason}; no prompt sent")
             return ExitCode.REFUSED
         return DispatchSubmission.SUBMITTED
     try:
@@ -883,7 +918,7 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
         if isinstance(error, herdr.AgentBlocked) and codex:
             return _blocked_question(client, current, delivered_to=current.pane)
         reason = " ".join(str(error).splitlines())
-        print(f"{reason}; prompt delivered to pane {current.pane}", file=sys.stderr)
+        herdr.report_diagnostic(f"{reason}; prompt delivered to pane {current.pane}")
         return ExitCode.UNCERTAIN
     if codex:
         deadline = time.monotonic() + conf.read("direct").number("WORKER_SETTLE_SECONDS")
@@ -902,22 +937,22 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
         if isinstance(receipt, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
             reason = receipt.reason if isinstance(receipt, DispatchEvidenceUnknown) else "dispatch prompt is not in the transcript"
-            print(f"anomaly: {current.row.name}: {' '.join(reason.splitlines())}; submission is unproved", file=sys.stderr)
+            herdr.report_diagnostic(f"anomaly: {current.row.name}: {' '.join(reason.splitlines())}; submission is unproved")
             return ExitCode.UNCERTAIN
     return DispatchSubmission.SUBMITTED
 
 
 def _blocked_question(client: herdr.Herdr, worker: worker_panes.OpenWorker, *, delivered_to: str = "") -> ExitCode:
-    print(f"question: {worker.row.name} pane {worker.pane}", file=sys.stderr)
+    herdr.report_diagnostic(f"question: {worker.row.name} pane {worker.pane}")
     try:
         question = client.read(worker.pane, 40, joined=False, ansi=False)
     except (herdr_types.HerdrFailure, OSError, subprocess.SubprocessError) as error:
         reason = f"anomaly: {worker.row.name}: {' '.join(str(error).splitlines())}"
         if delivered_to:
             reason += f"; prompt delivered to pane {delivered_to}"
-        print(reason, file=sys.stderr)
+        herdr.report_diagnostic(reason)
     else:
-        print(question.rstrip("\n"), file=sys.stderr)
+        herdr.report_diagnostic(question.rstrip("\n"))
     return ExitCode.BLOCKED
 
 
@@ -954,46 +989,52 @@ def _dispatch_failure_step(identity: StaffId, step: str, action: Callable[[], No
 def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str, completion_id: str) -> int:
     """Finish a saved dispatch outside the caller's process group."""
     path = run / f"compact-{instance}_dispatch_error.txt"
-    diagnostics = io.StringIO()
+    diagnostics: tuple[str, ...] = ()
     result: DispatchSubmission | ExitCode = ExitCode.UNCERTAIN
     submission_unproved = False
     try:
         with suppress(OSError, ValueError):
             _ = recorder_state.read_state(run / recorder_state.STATE_FILENAME)
-        with redirect_stderr(diagnostics):
-            record = staff.snapshot()
-            row = record.by_id(identity)
-            if row is None:
-                raise ValueError(f"{identity}: worker staff row is unavailable")
-            with worker_panes.worker_lock(parent, WorkerName.parse(row.name), blocking=True) as hold:
-                if isinstance(hold, worker_panes.Kept):
-                    raise ValueError(hold.blocker)
-                passed = worker_panes.worker_pass(row, run)
-                if passed.get("instance_id") != instance or passed.get("status") != "active":
-                    return ExitCode.OK
-                delivery = progress_history.dispatch_delivery(passed)
-                if delivery.completion_id != completion_id:
-                    return ExitCode.OK
-                if delivery.reply_file:
-                    reply = Path(delivery.reply_file)
-                    path = reply.with_name(reply.stem + "_dispatch_error" + reply.suffix)
+        record = staff.snapshot()
+        row = record.by_id(identity)
+        if row is None:
+            raise ValueError(f"{identity}: worker staff row is unavailable")
+        with worker_panes.worker_lock(parent, WorkerName.parse(row.name), blocking=True) as hold:
+            if isinstance(hold, worker_panes.Kept):
+                raise ValueError(hold.blocker)
+            passed = worker_panes.worker_pass(row, run)
+            if passed.get("instance_id") != instance or passed.get("status") != "active":
+                return ExitCode.OK
+            delivery = progress_history.dispatch_delivery(passed)
+            if delivery.completion_id != completion_id:
+                return ExitCode.OK
+            if delivery.reply_file:
+                reply = Path(delivery.reply_file)
+                path = reply.with_name(reply.stem + "_dispatch_error" + reply.suffix)
+            with herdr.collect_diagnostics() as messages:
                 current = worker_panes.observe_worker(parent, row, staff.snapshot())
-                if not isinstance(current, worker_panes.OpenWorker):
-                    raise herdr_types.HerdrFailure(f"{row.name}: worker state is unavailable; no prompt sent")
-                result = dispatch_turn(parent, current, _client(), delivery.line, completion_id, run=run)
-                if result is DispatchSubmission.SUBMITTED:
-                    _accept_dispatch(parent, row, run, instance, completion_id)
+            diagnostics = tuple(messages)
+            if not isinstance(current, worker_panes.OpenWorker):
+                raise herdr_types.HerdrFailure(f"{row.name}: worker state is unavailable; no prompt sent")
+            attempt = dispatch_turn(parent, current, _client(), delivery.line, completion_id, run=run)
+            diagnostics += attempt.diagnostics
+            if attempt.error is not None:
+                raise attempt.error
+            result = attempt.code
+            if result is DispatchSubmission.SUBMITTED:
+                _accept_dispatch(parent, row, run, instance, completion_id)
         if result is DispatchSubmission.SUBMITTED:
-            print(diagnostics.getvalue(), end="", file=sys.stderr)
+            for diagnostic in diagnostics:
+                print(diagnostic, file=sys.stderr)
             return result
-        detail = diagnostics.getvalue().strip() or f"dispatch failed with exit {int(result)}"
+        detail = "\n".join(diagnostics).strip() or f"dispatch failed with exit {int(result)}"
         submission_unproved = result is ExitCode.UNCERTAIN
     except recorder_state.OldRecorderState as error:
         print(str(error), file=sys.stderr)
         return ExitCode.UNCERTAIN
     except (Exception, SystemExit) as error:
         result = ExitCode.UNCERTAIN
-        detail = diagnostics.getvalue().strip()
+        detail = "\n".join(diagnostics).strip()
         detail = (detail + "\n" if detail else "") + str(error)
 
     def end_pass() -> None:
@@ -1155,17 +1196,19 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                 if default_role in names or default_role == role:
                     continue
                 before = rows_before_launch()
-                with redirect_stderr(io.StringIO()) as diagnostics:
-                    result = worker_panes.start_or_resume(parent, WorkerName.parse(default_role), default_role)
+                name_for_role = WorkerName.parse(default_role)
+                with herdr.collect_diagnostics() as diagnostics:
+                    result = worker_panes.start_or_resume(parent, name_for_role, default_role)
+                for diagnostic in diagnostics:
+                    print(diagnostic, file=sys.stderr)
                 if isinstance(result, worker_panes.OpenWorker):
                     arm_launch_cleanup(cleanup, before, result)
-                    print(diagnostics.getvalue(), end="", file=sys.stderr)
-                    continue
-                with ExitStack() as failed:
-                    arm_launch_cleanup(failed, before, result)
-                detail = (result.detail if isinstance(result, worker_panes.StartRefused) else
-                          result.cause if isinstance(result, worker_panes.UnpublishedWorker) else result.reason)
-                print(f"anomaly: {default_role}: {detail}", file=sys.stderr)
+                else:
+                    with ExitStack() as failed:
+                        arm_launch_cleanup(failed, before, result)
+                    if isinstance(result, worker_panes.ProcessUnknownWorker):
+                        print(f"anomaly: {default_role}: {result.reason}", file=sys.stderr)
+                    _ = startup_result(name_for_role, result)
             record = staff.snapshot()
         runs = unit_runs.LauncherRunDirectories({}, {}) if name else _assignment_runs(
             record, parent, role, additional=(session_dir,))
@@ -1273,26 +1316,31 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
         return ExitCode.OK
 
 
-def end(parent: StaffId, name: WorkerName, *,
-        lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
-        retire: bool = True) -> ExitCode:
+def end_result(parent: StaffId, name: WorkerName, *,
+               lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse,
+               retire: bool) -> worker_panes.Closed | worker_panes.Kept | worker_panes.UncertainWorker:
+    """Close the worker and return the reason if it stays open."""
     with ExitStack() as operations:
         hold = operations.enter_context(worker_panes.worker_lock(parent, name, blocking=True)) if isinstance(lock, worker_panes.WorkerLockAtUse) else lock
         if isinstance(hold, worker_panes.Kept):
-            print(hold.blocker, file=sys.stderr)
-            return ExitCode.KEPT
+            return hold
         row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
         if row is None:
-            return ExitCode.OK
+            return worker_panes.Closed()
         result = worker_panes.close(parent, name, lock=hold)
-        if isinstance(result, worker_panes.Kept):
-            print(result.blocker, file=sys.stderr)
-            return ExitCode.KEPT
-        if isinstance(result, worker_panes.UncertainWorker):
-            return ExitCode.UNCERTAIN
-        if retire:
+        if retire and isinstance(result, worker_panes.Closed):
             _ = staff.retire(row.id)
-        return ExitCode.OK
+        return result
+
+
+def end(parent: StaffId, name: WorkerName, *,
+        lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
+        retire: bool = True) -> ExitCode:
+    result = end_result(parent, name, lock=lock, retire=retire)
+    if isinstance(result, worker_panes.Kept):
+        print(result.blocker, file=sys.stderr)
+        return ExitCode.KEPT
+    return ExitCode.UNCERTAIN if isinstance(result, worker_panes.UncertainWorker) else ExitCode.OK
 
 
 def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch

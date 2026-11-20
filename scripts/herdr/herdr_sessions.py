@@ -108,10 +108,11 @@ def _tab_pane(name: str) -> str:
 
 def _attach(pane: str) -> None:
     shared = herdr.shared_session()
-    try:
-        herdr.Herdr(shared).focus_tab_of(pane)
-    except (herdr_types.HerdrFailure, OSError) as error:
-        print(f"herdr_sessions: focus failed: {error}", file=sys.stderr)
+    if pane:
+        try:
+            herdr.Herdr(shared).focus_tab_of(pane)
+        except (herdr_types.HerdrFailure, OSError) as error:
+            print(f"herdr_sessions: focus failed: {error}", file=sys.stderr)
     binary = herdr.herdr_binary()
     os.execvp(binary, [binary, "session", "attach", shared])
 
@@ -177,6 +178,13 @@ def _launch(verb: str, arguments: list[str]) -> int:
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr_types.HerdrFailure(launched.reason)
     pane, outcome = launched.pane, launched.outcome
+    if isinstance(outcome, herdr.AgentNotStarted):
+        print(herdr.format_start_failure(outcome), file=sys.stderr)
+        if outcome.launch_refused:
+            return 1
+        if verb == "start" or options.attach:
+            _attach(pane if outcome.pane_result is herdr.StartPaneResult.RETAINED else "")
+        return 0
     if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
         reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
         print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)

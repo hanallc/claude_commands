@@ -118,7 +118,7 @@ def _tab_staff() -> staff.StaffSnapshot:
     try:
         return staff.initial_snapshot() if isinstance(record, ReadStaffAtUse) else record.record
     except (OSError, ValueError) as error:
-        print(f"herdr: staff layout data is unknown: {error}", file=sys.stderr)
+        report_diagnostic(f"herdr: staff layout data is unknown: {error}")
         return staff.StaffSnapshot(())
 
 
@@ -338,16 +338,69 @@ class PromptNotSubmitted:
     publication_error: str | None = None
 
 
+class StartPaneResult(Enum):
+    NO_PANE = "no pane opened"
+    CLOSED = "pane closed"
+    RETAINED = "pane retained"
+    UNKNOWN = "pane state unknown"
+
+
 @dataclass(frozen=True)
 class AgentNotStarted(PromptNotSubmitted):
-    """The start command failed, and no agent runs in the pane."""
+    """The start failed before the agent became ready."""
 
     state: Literal["not_sent", "unknown"] = "not_sent"
+    pane_result: StartPaneResult = StartPaneResult.UNKNOWN
+    session: str = ""
+    pane: str = ""
+    agent: str = ""
+    code: str = ""
+    pane_detail: str = ""
+    terminal: str = ""
+    # Commands report a launch refusal and a readiness failure with different exit codes.
+    launch_refused: bool = False
 
 
 @dataclass(frozen=True)
 class ClaudeTrustNotWritten(AgentNotStarted):
     """The launch cannot start because the target account trust write failed."""
+
+    pane_result: StartPaneResult = StartPaneResult.NO_PANE
+
+
+def format_start_failure(failure: AgentNotStarted) -> str:
+    target = ":".join(part for part in (failure.session, failure.pane or failure.agent) if part)
+    source = f"herdr {target}" if target else "herdr"
+    parts = [" ".join(failure.reason.splitlines())]
+    if isinstance(failure.screen, str) and (screen := " ".join(failure.screen.splitlines()).strip()):
+        parts.append(f"visible screen: {screen}")
+    parts.append(failure.pane_result.value)
+    if failure.pane_detail:
+        parts.append(" ".join(failure.pane_detail.splitlines()))
+    return f"{source}: agent start failed: {'; '.join(parts)}"
+
+
+_diagnostics: ContextVar[list[str] | None] = ContextVar("herdr_diagnostics", default=None)
+
+
+@contextmanager
+def collect_diagnostics() -> Generator[list[str]]:
+    """Keep Herdr diagnostics local to this operation."""
+    messages: list[str] = []
+    token = _diagnostics.set(messages)
+    try:
+        yield messages
+    finally:
+        _diagnostics.reset(token)
+
+
+def report_diagnostic(message: str) -> None:
+    """Report a diagnostic to the current operation or to stderr."""
+    messages = _diagnostics.get()
+    if messages is None:
+        print(message, file=sys.stderr)
+    else:
+        messages.append(message)
 
 
 @dataclass(frozen=True)
@@ -1845,7 +1898,7 @@ class Herdr:
         for pane in self.listed("pane"):
             label = pane.get("label")
             if label is not None and not isinstance(label, str):
-                print(f"herdr {self.session}: pane label is unreadable; pane id used", file=sys.stderr)
+                report_diagnostic(f"herdr {self.session}: pane label is unreadable; pane id used")
                 label = None
             session_id = pane_session(pane) or None
             entry: PaneIdentity = {"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
@@ -1923,7 +1976,7 @@ class Herdr:
                 try:
                     pane = self.order_tabs(workspace, saved, opening_members=((pane, member),) if member else ()).get(pane, pane)
                 except (HerdrFailure, OSError, ValueError) as error:
-                    print(f"herdr {self.session}: tab order unchanged: {error}", file=sys.stderr)
+                    report_diagnostic(f"herdr {self.session}: tab order unchanged: {error}")
             self.save_layout()
             return pane
 
@@ -2039,7 +2092,7 @@ class Herdr:
                 safe = check_target("", action="close", place=HerdrPlace(
                     self.session, json_text(owned[0].get("pane_id"), "herdr pane id")), client=self)
             except HerdrFailure as error:
-                print(f"herdr {self.session}: placeholder retained: {error}", file=sys.stderr)
+                report_diagnostic(f"herdr {self.session}: placeholder retained: {error}")
                 continue
             if not safe:
                 continue
@@ -2079,7 +2132,7 @@ class Herdr:
         try:
             self.record_layout(record=record, scan=scan)
         except (HerdrFailure, OSError) as error:
-            print(f"herdr {self.session}: layout not saved: {error}", file=sys.stderr)
+            report_diagnostic(f"herdr {self.session}: layout not saved: {error}")
 
     @pane_evidence_run()
     def record_layout(self, *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE,
@@ -2372,10 +2425,10 @@ class Herdr:
                     if notice in run.reported:
                         continue
                     if isinstance(sessions, PaneSessionsStarting):
-                        print(f"herdr {self.session}:{unread.pane}: pane is starting", file=sys.stderr)
+                        report_diagnostic(f"herdr {self.session}:{unread.pane}: pane is starting")
                     else:
-                        print(f"herdr {self.session}:{unread.pane} tab {unread.tab}: pane evidence is unknown: "
-                              + f"{' '.join(unread.reason.splitlines())}; row placement retained", file=sys.stderr)
+                        report_diagnostic(f"herdr {self.session}:{unread.pane} tab {unread.tab}: pane evidence is unknown: "
+                                          + f"{' '.join(unread.reason.splitlines())}; row placement retained")
                     run.reported.add(notice)
             else:
                 for identity in sessions:
@@ -2590,12 +2643,12 @@ class Herdr:
         """Return true only after the selected pane and terminal are absent."""
         row = self.pane_row(pane)
         if isinstance(row, NoPane):
-            return self._pane_closed(pane, terminal)
+            return self.pane_closed(pane, terminal)
         terminal = terminal or row.get("terminal_id", "")
         if not check_target(target, action="close", place=HerdrPlace(self.session, pane),
                             terminal=terminal, pane_info=row, client=self):
             return False
-        return self._close_pane(pane) and self._pane_closed(pane, terminal)
+        return self._close_pane(pane) and self.pane_closed(pane, terminal)
 
     def close_terminal_pane(self, pane: str, terminal: str) -> bool:
         """Close the matching terminal and confirm its removal without a process check."""
@@ -2603,14 +2656,15 @@ class Herdr:
             return False
         row = self.pane_row(pane)
         if isinstance(row, NoPane):
-            return self._pane_closed(pane, terminal)
+            return self.pane_closed(pane, terminal)
         if row.get("terminal_id") != terminal:
             return False
-        return self._close_pane(pane) and self._pane_closed(pane, terminal)
+        return self._close_pane(pane) and self.pane_closed(pane, terminal)
 
-    def _pane_closed(self, pane: str, terminal: str) -> bool:
-        if any(row["pane_id"] == pane or terminal and row.get("terminal_id") == terminal for row in self.panes()):
-            print(f"herdr {self.session}:{pane}: closure is pending; record retained", file=sys.stderr)
+    def pane_closed(self, pane: str, terminal: str) -> bool:
+        forget_pane_evidence(self.session, pane)
+        if not _pane_absent(self.panes(), pane, terminal):
+            report_diagnostic(f"herdr {self.session}:{pane}: closure is pending; record retained")
             return False
         return True
 
@@ -2620,7 +2674,7 @@ class Herdr:
         try:
             original = pane_launch.read_valid_entries(path).get(pane)
         except (OSError, ValueError) as error:
-            print(f"herdr {self.session}:{pane}: legacy record is unknown: {error}", file=sys.stderr)
+            report_diagnostic(f"herdr {self.session}:{pane}: legacy record is unknown: {error}")
             original = None
         rows = self.listed("pane")
         selected = next((row for row in rows if row.get("pane_id") == pane), None)
@@ -2642,7 +2696,7 @@ class Herdr:
             try:
                 pane_launch.retire_launch(path, original["pane_id"], original)
             except (OSError, ValueError) as error:
-                print(f"herdr {self.session}:{pane}: legacy record retained: {error}", file=sys.stderr)
+                report_diagnostic(f"herdr {self.session}:{pane}: legacy record retained: {error}")
         return True
 
     def focus_tab_of(self, pane: str) -> None:
@@ -2740,13 +2794,14 @@ class Herdr:
         """Start once, then prove the opening prompt arrived as this session's user turn."""
         forget_pane_evidence(self.session, pane)
         _check_agent_arguments(kind, agent_arguments)
-        _timeout(timeout_ms)
         launched_at = datetime.now(timezone.utc)
-        deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
-        attempt_timeout_ms = min(timeout_ms, _AGENT_START_TIMEOUT_MAXIMUM_MS)
-        if isinstance(opening, OpeningPrompt):
-            opening = opening.prepare_for_launch(launched_at)
+        deadline = time.monotonic()
         try:
+            _timeout(timeout_ms)
+            deadline += operation_deadline.remaining(timeout_ms / 1000)
+            attempt_timeout_ms = min(timeout_ms, _AGENT_START_TIMEOUT_MAXIMUM_MS)
+            if isinstance(opening, OpeningPrompt):
+                opening = opening.prepare_for_launch(launched_at)
             while True:
                 result = self.start_command(
                     self.argv("agent", "start", _agent_name(name), "--kind", kind, "--pane", pane,
@@ -2764,16 +2819,17 @@ class Herdr:
                                              _AGENT_START_TIMEOUT_MAXIMUM_MS)
                     continue
                 break
-        except HerdrFailure as error:
-            if error.code == "agent_not_ready":
+        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            screen: str | PromptScreenNotRead = PromptScreenNotRead()
+            code = error.code if isinstance(error, HerdrFailure) else ""
+            if code == "agent_not_ready":
                 try:
                     with operation_deadline.within(deadline):
                         screen = self.run("pane", "read", pane, "--source", "visible")
-                except (HerdrFailure, OSError, subprocess.SubprocessError) as screen_error:
+                except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as screen_error:
                     screen = f"visible screen is unavailable: {screen_error}"
-                if screen:
-                    print(screen, file=sys.stderr)
-            return _without_prompt_transport(opening, launched_at, AgentNotStarted(str(error)))
+            failure = replace(agent_start_failure(error, session=self.session, pane=pane, agent=name), screen=screen)
+            return _without_prompt_transport(opening, launched_at, failure)
         if kind == "codex":
             try:
                 entry = self.codex_launch(pane, agent_arguments)
@@ -2782,11 +2838,11 @@ class Herdr:
                 pane_launch.write(directory / f"{self.session}.json", entry, sources=tuple(directory.glob("*.json")))
             except (CodexPaneStarting, CodexSessionPending) as error:
                 if isinstance(error, CodexPaneStarting) or isinstance(opening, OpeningPrompt):
-                    print(f"herdr {name}:{pane}: pane is starting; pane retained", file=sys.stderr)
+                    report_diagnostic(f"herdr {name}:{pane}: pane is starting; pane retained")
                 return (_without_prompt_transport(opening, launched_at, PromptNotSubmitted("pane is starting; prompt retained"))
                         if isinstance(opening, OpeningPrompt) else PromptSubmissionNotRequired())
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                print(f"anomaly: herdr {name}:{pane}: legacy launch publication is unavailable: {error}; launch continues", file=sys.stderr)
+                report_diagnostic(f"anomaly: herdr {name}:{pane}: legacy launch publication is unavailable: {error}; launch continues")
         if isinstance(opening, OpeningPrompt):
             if isinstance(opening.transcript, SessionTranscript):
                 assert isinstance(opening.cursor, TranscriptCursor)
@@ -2811,7 +2867,7 @@ class Herdr:
             try:
                 _ = opening.before_prompt(target.transcript)
             except Exception as error:
-                print(f"herdr {target.transcript.session_id}: staff publication failed: {error}", file=sys.stderr)
+                report_diagnostic(f"herdr {target.transcript.session_id}: staff publication failed: {error}")
                 result = proof or _without_prompt_transport(opening_now, cursor.since,
                     PromptNotSubmitted(f"staff publication failed: {error}"))
                 return replace(result, publication_error=str(error))
@@ -2848,7 +2904,7 @@ class Herdr:
             native, proof = result
             return publish(readers[native if native in gate_sessions else current], proof)
         if unavailable:
-            print(f"herdr {name}:{pane}: {unavailable}; pane retained", file=sys.stderr)
+            report_diagnostic(f"herdr {name}:{pane}: {unavailable}; pane retained")
         return PromptNotSubmitted(reason, state=opening.unconfirmed_state())
 
     def start_command(self, argv: list[str], kind: str, pane: str,
@@ -3002,7 +3058,7 @@ class Herdr:
         status = AgentStatus.decode(agent.get("agent_status"))
         ready = agent.get("interactive_ready", True)
         if not isinstance(ready, bool):
-            print(f"herdr {self.session}:{pane}: readiness is unknown", file=sys.stderr)
+            report_diagnostic(f"herdr {self.session}:{pane}: readiness is unknown")
             ready = False
         return {"agent_status": status, "interactive_ready": ready}
 
@@ -3397,7 +3453,7 @@ class Herdr:
             _ = self.run("pane", "close", pane)
         except HerdrFailure as error:
             if error.code != "pane_not_found":
-                print(f"herdr {self.session}:{pane}: closure is incomplete: {error}", file=sys.stderr)
+                report_diagnostic(f"herdr {self.session}:{pane}: closure is incomplete: {error}")
                 return False
         return True
 
@@ -3421,6 +3477,15 @@ class Herdr:
         return agents
 
 
+def _pane_absent(rows: Sequence[Mapping[str, object]], pane: str, terminal: str) -> bool:
+    if any(row.get("pane_id") == pane for row in rows):
+        return False
+    if not terminal:
+        return True
+    return all(isinstance(observed := row.get("terminal_id"), str) and bool(observed) and observed != terminal
+               for row in rows)
+
+
 def _pane_process_ids(info: dict[str, object], context: str) -> tuple[int, int]:
     values = (info.get("shell_pid"), info.get("foreground_process_group_id"))
     if any(isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in values):
@@ -3433,7 +3498,7 @@ def pane_session(row: Mapping[str, object]) -> str:
     report = row.get("agent_session")
     session = cast(dict[str, object], report).get("value") if isinstance(report, dict) else row.get("session_id")
     if session is not None and not isinstance(session, str):
-        print("herdr: pane session is unreadable", file=sys.stderr)
+        report_diagnostic("herdr: pane session is unreadable")
     return session if isinstance(session, str) else ""
 
 
@@ -4053,7 +4118,7 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
         key = (place, target, reason)
         if reported is None or key not in reported:
             label = f"{place.session}:{place.pane}" if opening and isinstance(place, HerdrPlace) else name
-            print(f"herdr {label}: {reason}", file=sys.stderr)
+            report_diagnostic(f"herdr {label}: {reason}")
             if reported is not None:
                 reported.add(key)
         return False
@@ -4622,37 +4687,61 @@ def reload_agent_rules(name: str) -> bool:
     return True
 
 
-def close_agent(session: str, pane: str) -> None:
-    """Close the selected tab, or stop its separate server."""
-    if session != shared_session():
+def close_agent(session: str, pane: str, *, terminal: str = "") -> bool:
+    """Close the selected tab or stop its separate server."""
+    separate_server = session != shared_session()
+    if separate_server and not terminal:
         stop_session(session)
-        return
+        return True
     client = Herdr(session)
-    path = pane_launch.record_directory() / f"{session}.json"
-    if pane in pane_launch.read_valid_entries(path):
-        _ = client.close_retained_pane(pane)
-        return
-    rows = client.listed("pane")
+    forget_pane_evidence(session, pane)
+    try:
+        rows = client.listed("pane")
+    except HerdrFailure as error:
+        if error.code == "server_not_running" and terminal:
+            return True
+        raise
     selected = next((row for row in rows if row.get("pane_id") == pane), None)
     if selected is None:
-        return
+        if not terminal or not _pane_absent(rows, pane, terminal):
+            return False
+        path = pane_launch.record_directory() / f"{session}.json"
+        return pane not in pane_launch.read_valid_entries(path) or client.close_retained_pane(pane, terminal=terminal)
+    observed = json_text(selected.get("terminal_id", ""), "herdr terminal id")
+    if not observed or terminal and terminal != observed:
+        return False
+    terminal = observed
+    if separate_server:
+        stop_session(session)
+        try:
+            return client.pane_closed(pane, terminal)
+        except HerdrFailure as error:
+            if error.code == "server_not_running":
+                return True
+            raise
     tab = json_text(selected.get("tab_id"), "herdr pane tab id")
     if any(row.get("tab_id") == tab and row.get("pane_id") != pane for row in rows):
         raise HerdrFailure(f"{pane}: would close another pane in tab {tab}", "wrong_target")
-    target = ""
-    terminal = json_text(selected.get("terminal_id", ""), "herdr terminal id")
+    path = pane_launch.record_directory() / f"{session}.json"
+    if pane in pane_launch.read_valid_entries(path):
+        return client.close_retained_pane(pane, terminal=terminal)
     pane_info: PaneIdentity = {
-        "pane_id": pane, "terminal_id": terminal, "session_id": target or None,
+        "pane_id": pane, "terminal_id": terminal, "session_id": None,
         "workspace_id": json_text(selected.get("workspace_id", ""), "herdr workspace id"),
     }
-    if not check_target(target, action="close", place=HerdrPlace(session, pane),
+    if not check_target("", action="close", place=HerdrPlace(session, pane),
                         terminal=terminal, pane_info=pane_info, client=client):
-        return
-    _ = client.run("tab", "close", tab)
-    remaining = json_items(client.result("pane", "list").get("panes"), "herdr pane list")
-    if any((row := json_object(item, "herdr pane")).get("pane_id") == pane
-           or terminal and row.get("terminal_id") == terminal for item in remaining):
+        forget_pane_evidence(session, pane)
+        return _pane_absent(client.listed("pane"), pane, terminal)
+    try:
+        _ = client.run("tab", "close", tab)
+    except HerdrFailure as error:
+        if error.code not in ("tab_not_found", "pane_not_found"):
+            raise
+    forget_pane_evidence(session, pane)
+    if not _pane_absent(client.listed("pane"), pane, terminal):
         raise HerdrFailure(f"{pane}: tab closure is not confirmed")
+    return True
 
 
 def repair_retained_launches(record: staff.StaffSnapshot, directory: Path, *,
@@ -5068,7 +5157,7 @@ class UnknownConversation:
 
 
 def conversation_note(observed: UnknownConversation) -> None:
-    print(f"anomaly: {' '.join(observed.reason.splitlines())}; not blocking", file=sys.stderr)
+    report_diagnostic(f"anomaly: {' '.join(observed.reason.splitlines())}; not blocking")
 
 
 @dataclass(frozen=True)
@@ -6808,7 +6897,7 @@ def in_session_folder(prepared: PreparedAgentEnvironment, member: session_folder
     try:
         folder = session_folder.launch_folder(member, session_id)
     except OSError as error:
-        print(f"herdr {member.name}: session folder: {error}", file=sys.stderr)
+        report_diagnostic(f"herdr {member.name}: session folder: {error}")
         return prepared
     if folder is None:
         return prepared
@@ -6828,6 +6917,36 @@ def _resume_prompt_failure(outcome: PromptNotSubmitted, pane: str) -> PromptNotS
     return replace(outcome, reason=f"{outcome.reason}; {advice} Pane: {pane}.")
 
 
+def agent_start_failure(error: Exception, *, session: str, pane: str = "", agent: str = "") -> AgentNotStarted:
+    reason = f"agent start timed out after {error.timeout:g} s" if isinstance(error, subprocess.TimeoutExpired) else str(error)
+    code = error.code if isinstance(error, HerdrFailure) else ""
+    return AgentNotStarted(reason, session=session, pane=pane, agent=agent, code=code)
+
+
+def _start_terminal(client: Herdr, pane: str) -> str:
+    forget_pane_evidence(client.session, pane)
+    row = client.pane_row(pane)
+    return "" if isinstance(row, NoPane) else json_text(row.get("terminal_id", ""), "herdr terminal id")
+
+
+def start_failure_pane(client: Herdr, failure: AgentNotStarted, terminal: str, *,
+                       close: bool = False) -> AgentNotStarted:
+    """Check the failed launch using its original terminal identity."""
+    if not terminal:
+        return failure
+    status = StartPaneResult.UNKNOWN
+    with collect_diagnostics() as diagnostics:
+        try:
+            if close and client.close_retained_pane(failure.pane, terminal=terminal):
+                status = StartPaneResult.CLOSED
+            elif _start_terminal(client, failure.pane) == terminal:
+                status = StartPaneResult.RETAINED
+        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            diagnostics.append(str(error))
+    detail = "; ".join(filter(None, (failure.pane_detail, *diagnostics)))
+    return replace(failure, pane_result=status, pane_detail=detail, terminal=terminal)
+
+
 def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
                           timeout_ms: int, *, agent: str, reported_unknown: str = "",
@@ -6835,6 +6954,26 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                           codex: CodexConversations | CodexLaunchRead = CodexLaunchRead.CURRENT,
                           client: Herdr | LaunchClientSource = LaunchClientSource.NEW) -> AgentLaunched:
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
+    with collect_diagnostics() as diagnostics:
+        launched = _launch_prepared_agent(name, destination, prepared, kind, agent_arguments, opening, timeout_ms,
+            agent=agent, reported_unknown=reported_unknown, agent_name=agent_name, codex=codex, client=client)
+    if isinstance(launched.outcome, AgentNotStarted):
+        failure = launched.outcome
+        if diagnostics:
+            detail = "; ".join(filter(None, (*diagnostics, failure.pane_detail)))
+            return replace(launched, outcome=replace(failure, pane_detail=detail))
+    else:
+        for message in diagnostics:
+            report_diagnostic(message)
+    return launched
+
+
+def _launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
+                          kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
+                          timeout_ms: int, *, agent: str, reported_unknown: str = "",
+                          agent_name: str | AgentNameSource = AgentNameSource.MEMBER_REFERENCE,
+                          codex: CodexConversations | CodexLaunchRead = CodexLaunchRead.CURRENT,
+                          client: Herdr | LaunchClientSource = LaunchClientSource.NEW) -> AgentLaunched:
     launched_at = datetime.now(timezone.utc)
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":
@@ -6842,8 +6981,12 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
         try:
             trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"))
         except HerdrFailure as error:
-            print(str(error), file=sys.stderr)
-            return AgentLaunched("", _without_prompt_transport(opening, launched_at, ClaudeTrustNotWritten(str(error))))
+            outcome = _without_prompt_transport(opening, launched_at, ClaudeTrustNotWritten(str(error), session=name, agent=agent))
+            if isinstance(destination, ExistingPane) and isinstance(outcome, AgentNotStarted):
+                existing = Herdr(name) if isinstance(client, LaunchClientSource) else client
+                outcome = replace(outcome, pane=destination.pane, pane_result=StartPaneResult.UNKNOWN)
+                return AgentLaunched(destination.pane, start_failure_pane(existing, outcome, destination.terminal))
+            return AgentLaunched("", outcome)
     session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
                        if argument in {"--resume", "--session-id", "resume"}), "")
     resuming_with_prompt = isinstance(opening, OpeningPrompt) and (
@@ -6863,34 +7006,58 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                     **({"codex": codex} if isinstance(codex, CodexConversations) else {}))
                     if session_id else StoppedConversation())
     except (HerdrFailure, OSError, ValueError) as error:
-        print(f"herdr {session_id}: live session evidence is unknown: {error}", file=sys.stderr)
+        report_diagnostic(f"herdr {session_id}: live session evidence is unknown: {error}")
     else:
         if isinstance(observed, LiveConversation):
-            raise HerdrFailure(f"would start a second copy of running session {session_id}", "already_running")
+            failure = AgentNotStarted(f"would start a second copy of running session {session_id}",
+                                      session=name, agent=agent, code="already_running", launch_refused=True)
+            if isinstance(destination, ExistingPane):
+                failure = replace(failure, pane=destination.pane)
+                return AgentLaunched(destination.pane, start_failure_pane(client, failure, destination.terminal))
+            return AgentLaunched("", replace(failure, pane_result=StartPaneResult.NO_PANE))
         if isinstance(observed, UnknownConversation) and not reported_unknown:
             conversation_note(observed)
     if kind == "claude" and folder_member is not None:
         prepared = in_session_folder(prepared, folder_member, session_id)
     if isinstance(destination, NewTab):
-        pane = (client.open_tab(destination.space, destination.title, str(prepared.directory), prepared.env,
-                               **({"member": member} if member else {})) if reuse_client else
-                open_tab(name, destination.space, destination.title, str(prepared.directory), prepared.env,
-                         **({"member": member} if member else {})))
+        try:
+            pane = (client.open_tab(destination.space, destination.title, str(prepared.directory), prepared.env,
+                                   **({"member": member} if member else {})) if reuse_client else
+                    open_tab(name, destination.space, destination.title, str(prepared.directory), prepared.env,
+                             **({"member": member} if member else {})))
+        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            failure = agent_start_failure(error, session=name, agent=agent)
+            return AgentLaunched("", replace(failure, launch_refused=True))
     elif isinstance(destination, SplitPane):
         if not 0 < destination.ratio < 1 or destination.direction not in {"right", "down"}:
-            print(f"herdr {name}: split direction or ratio adjusted to backend limits", file=sys.stderr)
+            report_diagnostic(f"herdr {name}: split direction or ratio adjusted to backend limits")
         options = ["pane", "split", destination.of_pane, "--direction",
                    destination.direction if destination.direction in {"right", "down"} else "right",
                    "--ratio", str(min(0.99, max(0.01, destination.ratio))), "--cwd", str(prepared.directory), "--no-focus"]
         for key, value in _pane_environment(prepared.env).items():
             options.extend(["--env", f"{key}={value}"])
-        result = client.result(*options)
-        pane = json_text(json_object(result.get("pane"), "herdr split pane").get("pane_id"), "herdr split pane id")
+        try:
+            result = client.result(*options)
+            pane = json_text(json_object(result.get("pane"), "herdr split pane").get("pane_id"), "herdr split pane id")
+        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            failure = replace(agent_start_failure(error, session=name, agent=agent), launch_refused=True)
+            if failure.code == "pane_not_found":
+                failure = replace(failure, pane_result=StartPaneResult.NO_PANE)
+            return AgentLaunched("", failure)
     else:
-        panes = client.panes()
+        try:
+            panes = client.panes()
+        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            failure = agent_start_failure(error, session=name, pane=destination.pane, agent=agent)
+            return AgentLaunched(destination.pane, replace(failure, terminal=destination.terminal, launch_refused=True))
         moved = next((row for row in panes if destination.terminal
                       and row.get("terminal_id") == destination.terminal), None)
         pane = moved["pane_id"] if moved is not None else destination.pane
+    terminal = destination.terminal if isinstance(destination, ExistingPane) else ""
+    try:
+        terminal = terminal or _start_terminal(client, pane)
+    except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+        pass
     try:
         if isinstance(destination, SplitPane):
             client.label_pane(pane, destination.label)
@@ -6908,35 +7075,25 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                       'unset "${legacy_label%%=*}";; esac; done; '
                       f"cd -- {shlex.quote(str(prepared.directory))} && "
                       f"unset {shlex.join(sorted(key for key in removals if not key.startswith('HERDR_') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)))} && export {exports}")
-        client.run_in_pane(pane, ["eval", script],
-                           terminal=destination.terminal if isinstance(destination, ExistingPane) else "")
+        client.run_in_pane(pane, ["eval", script], terminal=terminal)
         server_name = agent_name if isinstance(agent_name, str) else agent
         forget_pane_evidence(name, pane)
         try:
             outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=server_name)
         finally:
             forget_pane_evidence(name, pane)
-    except (HerdrFailure, OSError, subprocess.SubprocessError) as error:
-        if isinstance(error, HerdrFailure) and error.code == "wrong_target" and not resuming_with_prompt:
-            raise
-        if isinstance(error, AgentExited):
-            failure = AgentNotStarted(str(error))
+    except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        failure = agent_start_failure(error, session=name, pane=pane, agent=agent)
+        if failure.code == "wrong_target" and not resuming_with_prompt:
+            outcome = replace(failure, launch_refused=True)
         else:
-            print(f"herdr {name}:{pane}: start incomplete: {error}; pane retained", file=sys.stderr)
-            failure = PromptNotSubmitted(str(error))
-        outcome = _without_prompt_transport(opening, launched_at, failure)
+            outcome = _without_prompt_transport(opening, launched_at, failure)
     if isinstance(outcome, AgentNotStarted):
-        pane_status = "pane retained"
-        if outcome.state == "not_sent" and not isinstance(destination, ExistingPane):
-            if isinstance(destination, NewTab):
-                close_agent(name, pane)
-                pane_status = "pane closed"
-            else:
-                pane_status = "pane closed" if client.close_retained_pane(pane) else "pane close unconfirmed"
-        reason = " ".join(outcome.reason.splitlines())
-        print(f"herdr {name}:{pane}: agent start failed: {reason}; {pane_status}", file=sys.stderr)
+        outcome = start_failure_pane(client,
+            replace(outcome, session=name, pane=pane, agent=agent), terminal,
+            close=outcome.state == "not_sent" and outcome.code != "wrong_target" and not isinstance(destination, ExistingPane))
     if (resuming_with_prompt and isinstance(outcome, PromptNotSubmitted)
-            and (isinstance(destination, ExistingPane) or not isinstance(outcome, AgentNotStarted))):
+            and (not isinstance(outcome, AgentNotStarted) or outcome.pane_result is StartPaneResult.RETAINED)):
         outcome = _resume_prompt_failure(outcome, pane)
     return AgentLaunched(pane, outcome)
 
