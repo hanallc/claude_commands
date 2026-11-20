@@ -917,11 +917,12 @@ Paired trials use this booked cost for completed gates.
 Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
-An unbilled day with an accepted or pending run keeps the usual prices and carry from the bill.
-A current builder observation of running, pending, or stopping keeps the usual prices at UTC midnight.
+An unbilled day is idle only if every run exposure that starts before its end has a confirmed closure before its start.
+An expired permit or reservation still counts until the ledger confirms closure.
+The page, spending guard, and admission use the usual prices and bill carry on run days.
 After the latest bill, an unbilled idle day carries retained resource costs and unknown usage types.
 It skips usage linked to runs and uses the usual accounting for Cost Explorer fees.
-The page and guard use the same idle-day carry.
+The page, spending guard, and admission use the same idle-day rule.
 The guard keeps any higher established charges.
 The ledger and hours table exclude a closed Hana exposure only when its START record has a valid `start_refusal_code`.
 A possible start or an observed acceptance in any generation of the exposure keeps the full exposure.
