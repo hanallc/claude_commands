@@ -589,30 +589,29 @@ def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess
         launched.append(child)
         return child
 
-    try:
-        child = start_recorded_gate_child(arguments, repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                          register=register)
-        output, errors = child.communicate(timeout=None if deadline is None else max(0, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired as error:
-        raise GateRecoveryUnresolved(f"the rollback command exceeded its deadline: {shlex.join(arguments)}") from error
-    finally:
-        if launched:
-            process = launched[0]
-            try:
-                finish_command_group(process, deadline)
-            except BaseException as error:
-                if isinstance(recovery, GateRecovery):
-                    recovery.unresolved = True
-                if isinstance(error, OSError):
-                    raise GateRecoveryUnresolved(f"cannot verify command group {process.pid}: {error}") from error
-                raise
-            finally:
-                for stream in (process.stdout, process.stderr):
-                    if stream is not None:
-                        stream.close()
-            if isinstance(recovery, GateRecovery) and not recovery.unresolved:
-                recovery.remove_group(process.pid)
-    return subprocess.CompletedProcess(arguments, cast(int, child.returncode), output, errors)
+    with tempfile.TemporaryFile(mode="w+", errors="replace") as stdout, \
+            tempfile.TemporaryFile(mode="w+", errors="replace") as stderr:
+        try:
+            child = start_recorded_gate_child(arguments, repo, stdout=stdout, stderr=stderr, register=register)
+            returncode = child.wait(timeout=None if deadline is None else max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            raise GateRecoveryUnresolved(f"the rollback command exceeded its deadline: {shlex.join(arguments)}") from error
+        finally:
+            if launched:
+                process = launched[0]
+                try:
+                    finish_command_group(process, deadline)
+                except BaseException as error:
+                    if isinstance(recovery, GateRecovery):
+                        recovery.unresolved = True
+                    if isinstance(error, OSError):
+                        raise GateRecoveryUnresolved(f"cannot verify command group {process.pid}: {error}") from error
+                    raise
+                if isinstance(recovery, GateRecovery) and not recovery.unresolved:
+                    recovery.remove_group(process.pid)
+        _ = stdout.seek(0)
+        _ = stderr.seek(0)
+        return subprocess.CompletedProcess(arguments, returncode, stdout.read(), stderr.read())
 
 
 def finish_command_group(process: subprocess.Popen[str], deadline: float | None) -> None:
@@ -638,7 +637,7 @@ def finish_command_group(process: subprocess.Popen[str], deadline: float | None)
 
 
 def start_recorded_gate_child[Child](arguments: Sequence[str], repo: Path, *,
-                                     stdout: int | TextIO, stderr: int,
+                                     stdout: int | TextIO, stderr: int | TextIO,
                                      register: Callable[[subprocess.Popen[str]], Child],
                                      environment: dict[str, str] | None = None, suite: bool = False) -> Child:
     """Publish the process group and register the child before it runs."""

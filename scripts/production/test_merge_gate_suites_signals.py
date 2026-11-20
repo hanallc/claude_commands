@@ -22,10 +22,9 @@ from scripts.build_queue import admission_records
 from scripts.build_queue.queue_place import QueuePlace
 from scripts.lib import build_folders, process_group
 from scripts.lib.process_group import send_process_group
-from scripts.lib.process_start import Started, process_start
+from scripts.lib.process_start import Gone, Zombie, process_start
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.production import merge_gate, merge_gate_suites_test_support
-from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.merge_gate_test_support import gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
@@ -65,45 +64,25 @@ class MergeGateSignalsTests(GateSuitesFixture):
         self.environment["BUILDLOG_JOBSERVER_FIFO"] = str(path)
         self.supply_jobserver(tokens)
 
-    def test_command_keeps_the_group_record_until_the_members_stop(self) -> None:
-        self.configure_gate("program_stop_seconds=5\nprogram_sample_seconds=1")
-        for remains_live in (False, True):
-            with self.subTest(remains_live=remains_live):
-                clock = 100.0
-                recovery = merge_gate.GateRecovery(self.state / "command.json", str(self.checkout),
-                                                   os.getpid(), "fixture", rollback_deadline=clock + 0.5)
-                child = mock.Mock(spec=subprocess.Popen, pid=1234, returncode=0, stdout=None, stderr=None,
-                                  communicate=mock.Mock(return_value=("output", "")))
-
-                def advance(seconds: float) -> None:
-                    nonlocal clock
-                    self.assertEqual(json.loads(recovery.path.read_text())["groups"], {"1234": "fixture-child"})
-                    clock += seconds
-
-                active = merge_gate.ACTIVE_GATE_RECOVERY.set(recovery)
-                try:
-                    with mock.patch.dict(os.environ, self.environment, clear=True), \
-                            mock.patch.object(subprocess, "Popen", return_value=child), \
-                            mock.patch.object(merge_gate, "process_start", return_value=Started("fixture-child")), \
-                            mock.patch.object(merge_gate, "live_group", side_effect=None if remains_live else [True, True, False],
-                                              return_value=True), \
-                            mock.patch.object(process_group, "send_process_group") as send, \
-                            mock.patch.object(time, "monotonic", side_effect=lambda: clock), \
-                            mock.patch.object(time, "sleep", side_effect=advance) as pause:
-                        arguments = ["git", "status"]
-                        if remains_live:
-                            with self.assertRaisesRegex(GateRefused, "UNRESOLVED: command group 1234 still has members"):
-                                _ = merge_gate.command(arguments, self.checkout)
-                        else:
-                            result = merge_gate.command(arguments, self.checkout)
-                            self.assertEqual((result.returncode, result.stdout), (0, "output"))
-                        send.assert_called_once_with(1234, signal.SIGKILL)
-                        pause.assert_called_once_with(0.5)
-                        self.assertEqual(recovery.unresolved, remains_live)
-                        expected = {"1234": "fixture-child"} if remains_live else {}
-                        self.assertEqual(json.loads(recovery.path.read_text())["groups"], expected)
-                finally:
-                    merge_gate.ACTIVE_GATE_RECOVERY.reset(active)
+    def test_command_stops_the_member_that_keeps_stderr_open(self) -> None:
+        self.configure_gate("program_stop_seconds=15\nprogram_sample_seconds=0.05")
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        source = """import subprocess, sys
+member = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                          stdout=subprocess.DEVNULL, stderr=sys.stderr)
+print(member.pid)
+print("command stderr", file=sys.stderr)
+"""
+        with mock.patch.dict(os.environ, processes.environment(self.environment), clear=True), \
+                merge_gate.gate_recovery(self.checkout) as recovery:
+            config = admission_records.read_memory_config()
+            recovery.rollback_deadline = time.monotonic() + config.program_stop_seconds
+            result = merge_gate.command([sys.executable, "-c", source], self.checkout)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stderr, "command stderr\n")
+            self.assertIsInstance(process_start(int(result.stdout)), (Gone, Zombie))
+            self.assertEqual(json.loads(recovery.path.read_text())["groups"], {})
 
     def test_recovery_kills_a_term_ignoring_member_after_its_leader_ends(self) -> None:
         self.supply_jobserver(b"Q")
