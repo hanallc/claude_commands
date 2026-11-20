@@ -254,6 +254,30 @@ def retain_asset(item: ReviewItem, assets: dict[str, str]) -> None:
         assets['submission:'+item.key] = submission_assets(item.key, origin)
 
 
+def retain_question_delivery(item: ReviewItem, assets: dict[str, str], status: change_page.DeliveryStatus,
+                             sources: ReviewSourceStamps) -> None:
+    source = item.source
+    if isinstance(source, review_items.ChangeSource):
+        row = source.row['#']
+        page = change_page.ReviewPage(source.path, source.path.parent, (row,), '')
+        question = source.slots.question
+    elif item.state == ReviewState.WAITING and isinstance(
+            source, (review_items.QuestionSource, review_items.InvestigationSource,
+                     review_items.ProposalSource, review_items.EfficiencySource)):
+        page = review_actions.delivery_page(item, status)
+        row = page.rows[0]
+        path = status.path(page, row)
+        sources.append(path)
+        question = status.slots(page, row).question
+    else:
+        return
+    if not isinstance(question, change_page.OpenQuestion) or isinstance(question, change_page.OpenFeedback):
+        return
+    sources.append(status.closeout_path(page, row))
+    if change_page.review_question_failed(status, page, row, question):
+        assets['question-delivery:'+item.key] = change_page.question_failure_html(True)
+
+
 def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str:
     """Render the saved evidence and references for one lazy card."""
     evidence = origin.evidence
@@ -387,6 +411,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     assets: dict[str, str] = {}
     submission_keys: dict[str, str] = {}
     unavailable_cards: set[str] = set()
+    status = change_page.DeliveryStatus(root)
     for item in review_items.read(root, members=members, show='active', sources=sources, assign_ids=False):
         path = review_items.source_path(item)
         with guard_source(path, sources, entry=item.id):
@@ -394,6 +419,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
             try:
                 record_assets: dict[str, str] = {}
                 retain_asset(item, record_assets)
+                retain_question_delivery(item, record_assets, status, sources)
                 validate_body_inputs(item, record_assets)
                 summary = card_entry(item, members, names)
             except (UnicodeError, TypeError, ValueError, OSError, RuntimeError) as error:
@@ -613,13 +639,13 @@ class ReviewSnapshotCache:
         started = time.perf_counter()
         records = current.records.copy()
         assets = current.assets.copy()
-        asset_keys = (key, 'image:'+key, 'submission:'+key)
+        asset_keys = (key, 'image:'+key, 'submission:'+key, 'question-delivery:'+key)
         previous_key = replaced_key or key
         previous = records.get(previous_key)
         if previous_key != key:
             _ = records.pop(previous_key, None)
         for removed in {previous_key, key}:
-            for asset in (removed, 'image:'+removed, 'submission:'+removed):
+            for asset in (removed, 'image:'+removed, 'submission:'+removed, 'question-delivery:'+removed):
                 _ = assets.pop(asset, None)
         submission_keys = current.submission_keys.copy()
         if previous is not None:
@@ -882,6 +908,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     footer = ('' if response is not None else '<p class="review-source">Owner: '+names.html(item.owner, owner)
               +' · Source: '+names.html(item.source_unit, review_items.name(item.source_unit, inputs.members))+'</p>')
     fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
+    body += inputs.assets.get('question-delivery:'+item.key, '')
     body += inputs.assets.get('submission:'+item.key, '')
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div><div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+exchange+'</div>'

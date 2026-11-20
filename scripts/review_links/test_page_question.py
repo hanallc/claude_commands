@@ -9,13 +9,12 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from scripts.lib import atomic_file, process_start
 from scripts.message import send_result
 from scripts.production import delivery_state, staff
-from scripts.review_links import change_page, page_question
-from scripts.review_links import question_record
+from scripts.review_links import change_page, image_store, page_question, question_record
 
 
 def question_outcome(outcome: send_result.Outcome = "sent", detail: str = "fixture receipt"
@@ -198,8 +197,15 @@ class PageQuestionTests(unittest.TestCase):
             publish(path, attempt)
 
         with patch.object(change_page, "publish_question_attempt", side_effect=fail_after_question_save):
-            with self.assertRaisesRegex(OSError, "Cannot update the delivery intent"):
-                _ = self.ask()
+            refused = self.ask()
+        assert isinstance(refused, change_page.PageQuestionSend)
+        self.assertIsInstance(refused.job, change_page.NoQuestionJob)
+        failed = self.attempt(refused)
+        self.assertEqual(failed.state, delivery_state.QuestionSendState.FAILED)
+        self.assertEqual(failed.error, "Cannot update the delivery intent.")
+        self.assertIsInstance(failed.owner, delivery_state.NoQuestionSendOwner)
+        self.assertEqual(len(self.store.questions('image-1')), 1)
+        change_page.deliver(refused, self.status)
         self.status = change_page.DeliveryStatus(self.status.root)
         change_page.recover_review_messages(self.status)
         self.assertEqual(self.sent, [])
@@ -227,27 +233,37 @@ class PageQuestionTests(unittest.TestCase):
         change_page.deliver(retry, self.status)
         self.assertEqual(len(self.sent), 1)
 
-    def test_stop_after_the_send_marker_stays_unknown_with_or_without_a_receipt(self) -> None:
-        transport = FakeQuestionTransport()
+    def test_recovery_reuses_the_send_marker_with_or_without_a_receipt(self) -> None:
+        store = image_store.ImageQuestionStore(self.status.root / image_store.IMAGES_FOLDER)
         for number, accepted in enumerate((False, True)):
             with self.subTest(accepted=accepted):
-                item = f"image-{number}"
-                first = self.ask(item)
+                item = f"{number:012x}"
+                folder = store.root / item
+                folder.mkdir(parents=True)
+                image: image_store.ImageRecord = {"id": item, "file": "gate.png", "caption": "The gate",
+                    "owner": "fixture-owner", "subject": "Test", "registered_at": "2026-11-20T12:00:00+00:00"}
+                image_store.write_record(folder, image)
+                target = change_page.image_question_target(folder / image_store.RECORD, image)
+                first = page_question.ask(store, target, "Which check passed?", self.status)
                 path = self.status.path(first.page, first.row)
                 attempt = self.attempt(first)
                 with self.status.locked():
                     change_page.advance_question_attempt(path, attempt,
                                                          replace(attempt, state=delivery_state.QuestionSendState.SENDING))
-                if accepted:
-                    _ = transport.send(attempt.recipient_id, attempt.message, attempt.message_id)
                 _ = self.job(first).release()
                 self.status = change_page.DeliveryStatus(self.status.root)
                 self.assertEqual(self.effective(first), delivery_state.QuestionSendState.UNKNOWN)
-                with patch.object(change_page, "send_question", side_effect=transport.send):
+                outcome = question_outcome("skipped" if accepted else "sent")
+                with patch.object(change_page, "send_question", return_value=outcome) as send:
                     change_page.recover_review_messages(self.status)
-                    change_page.deliver(self.ask(item), self.status)
-                self.assertEqual(len(transport.calls), int(accepted))
-                self.assertEqual(len(transport.receipts), int(accepted))
+                    change_page.recover_review_messages(self.status)
+                send.assert_called_once_with(attempt.recipient_id, attempt.message, attempt.message_id)
+                recovered = self.attempt(first)
+                self.assertEqual(recovered.state, delivery_state.QuestionSendState.SENT)
+                self.assertEqual(recovered.attempt_id, attempt.attempt_id)
+                self.assertEqual(recovered.receipt, delivery_state.QuestionSendReceipt("kept" if accepted else "sent",
+                                                                                       "fixture receipt"))
+                self.assertEqual([question.question_id for question in store.questions(item)], ["Q1"])
 
     def test_stale_job_cannot_replace_the_new_result(self) -> None:
         first = self.ask()
@@ -312,7 +328,7 @@ class PageQuestionTests(unittest.TestCase):
             ("sent", state.SENT), ("kept", state.SENT), ("queued", state.QUEUED),
             ("failed", state.FAILED), ("refused", state.FAILED), ("skipped", state.SENT),
             ("replaced", state.FAILED), ("held", state.UNKNOWN), ("pending", state.UNKNOWN),
-            ("retry", state.FAILED),
+            ("retry", state.UNKNOWN),
         )
         for outcome, expected in cases:
             with (self.subTest(outcome=outcome), patch.object(change_page, "alert_delivery_failures"),
@@ -321,7 +337,11 @@ class PageQuestionTests(unittest.TestCase):
                 change_page.deliver(delivery, self.status)
                 result = self.attempt(delivery)
                 self.assertEqual(result.state, expected)
-                self.assertEqual(send.call_count, 2 if expected is state.FAILED else 1)
+                tries = 2 if expected in (state.FAILED, state.UNKNOWN) else 1
+                self.assertEqual(send.call_args_list, [call(result.recipient_id, result.message, result.message_id)] * tries)
+                path = self.status.path(delivery.page, delivery.row)
+                self.assertNotIn('"resend_requests"', path.read_text())
+                self.assertEqual(set(self.status.take_deferred_questions()), {path} if expected is state.UNKNOWN else set())
                 if outcome == "skipped":
                     self.assertEqual(result.receipt, delivery_state.QuestionSendReceipt("kept", "fixture receipt"))
 
