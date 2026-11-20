@@ -331,7 +331,6 @@ class FailedProbeTests(OffloadCommandFixture):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         result = build_targets.ssh_target_eligibility(target, self.repository, "hana", "test",
                                                      targets.ANY_ELIGIBLE_TARGET, new_step=True)
-        self.assertIsInstance(result, targets.EligibleTarget)
         descriptor = os.open(self.stub_directory / "continue-probe", os.O_WRONLY)
         try:
             _ = os.write(descriptor, b"continue\ncontinue\ncontinue\n")
@@ -340,6 +339,7 @@ class FailedProbeTests(OffloadCommandFixture):
         with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
         elapsed = time.monotonic() - started
+        self.assertIsInstance(result, targets.ExcludedTarget)
         self.assertIsInstance(eligibility.read_failed_probe("box"), eligibility.NoFailedProbe)
         self.assertEqual(eligibility.linux_version_decline_path("box", "hana").read_text(), decline)
         self.assertEqual(stale_source.read_text(), "current repository tree")
@@ -557,9 +557,9 @@ fi
         self.assertEqual(os.waitstatus_to_exitcode(status), 143)
         result = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("box"),
             self.repository, "hana", "test", targets.ANY_ELIGIBLE_TARGET, new_step=True)
-        self.assertIsInstance(result, targets.EligibleTarget)
         with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+        self.assertIsInstance(result, build_targets.FailedProbeExclusion)
         self.assertEqual(self.free(), "free")
 
     def test_recovery_preserves_the_repository_decline_when_tools_still_differ(self) -> None:
@@ -575,9 +575,9 @@ fi
         self.install_script_copy_tools()
         result = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("box"),
             self.repository, "hana", "test", targets.ANY_ELIGIBLE_TARGET, new_step=True)
-        self.assertIsInstance(result, targets.EligibleTarget)
         with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+        self.assertIsInstance(result, build_targets.FailedProbeExclusion)
         self.assertEqual(record.read_text(), previous)
         self.assertIsInstance(eligibility.read_failed_probe("box"), eligibility.FailedProbe)
 

@@ -98,12 +98,14 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(argv[-1], "true", "Routing must not evaluate a shell")
         return offload.CommandOutput(0 if self.reachable else 255, "", "")
 
-    def answer(self, kind: str = "test", local: bool = False) -> list[list[str]]:
+    def answer(self, kind: str = "test", local: bool = False, *, target: str = "") -> list[list[str]]:
         output = io.StringIO()
         arguments = ["build_targets.py", "eligible", "--kind", kind, "--repo-root", str(self.root),
                      "--package", "linux-part"]
         if local:
             arguments += ["--local", "requires local files"]
+        if target:
+            arguments += ["--target", target]
         with mock.patch.object(sys, "argv", arguments), redirect_stdout(output):
             self.assertEqual(build_targets.main(), 0)
         return [line.split("\t") for line in output.getvalue().splitlines()[1:]]
@@ -129,14 +131,35 @@ class SshEligibilityTests(unittest.TestCase):
                 self.root, "linux-part", "test", targets.ANY_ELIGIBLE_TARGET), 0)
         return output.getvalue().splitlines()[0]
 
-    def reserve(self, name: str = "linux", *, recover_only: bool = False) -> int:
+    def reserve(self, name: str = "linux", *, recover_only: bool = False, new_step: bool = False) -> int:
         args = build_targets.CliArguments()
         args.kind, args.repo_root, args.package = "test", str(self.root), "linux-part"
         args.pid, args.target = 501, name
         args.reservation_file = str(self.root / "reservation.tsv")
         args.claim_identity_file = str(self.root / "reservation.identity")
         args.recover_only = recover_only
+        args.new_step = new_step
         return build_targets.command_reserve(args)
+
+    def test_new_reservation_defers_to_linux_probe_recovery_unless_pinned(self) -> None:
+        self.mac_offload_off()
+        paths = mac_test.state_paths("linux")
+        (paths.directory / "failed_probe").touch()
+        self.assertEqual(self.reserve("", new_step=True), 1)
+        self.assertFalse((self.root / "reservation.tsv").exists())
+        self.assertEqual(mac_test.read_claims(paths), ())
+        self.assertEqual(self.commands, [])
+
+        self.assertEqual(self.reserve(new_step=True), 0)
+        claim, = mac_test.read_claims(paths)
+        self.assertEqual(claim.record["pid"], 501)
+
+    def test_kind_eligibility_excludes_failed_linux_probe_unless_pinned(self) -> None:
+        self.mac_offload_off()
+        (mac_test.state_paths("linux").directory / "failed_probe").touch()
+        self.assertEqual(self.linux()[:3], ["linux", "excluded", "failed probe"])
+        pinned, = self.answer(target="linux")
+        self.assertEqual(pinned[:3], ["linux", "eligible", "-"])
 
 
     def test_a_mac_block_stops_a_memory_wait_from_reusing_its_reservation(self) -> None:

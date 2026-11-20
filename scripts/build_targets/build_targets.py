@@ -632,7 +632,7 @@ def command_recover_probe(args: CliArguments) -> int:
         if isinstance(repository, eligibility.UnknownRepository):
             return 0
         paths = mac_test.state_paths(target.name)
-        if mac_test.free_now(paths, target.settings, Path(args.repo_root)) != "bad":
+        if not mac_test.needs_probe_recovery(mac_test.free_now(paths, target.settings, Path(args.repo_root))):
             return 0
         request = offload.OffloadRequest(
             Path(args.repo_root), args.package, f"probe-{os.getpid()}", offload.NoResultFile(), (),
@@ -726,9 +726,9 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
         if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
             raise
         return ExcludedTarget(target, f"state unreadable: {error}")
-    if answer in ("blocked", "backoff"):
+    if isinstance(answer, str) and answer in ("blocked", "backoff"):
         return ExcludedTarget(target, answer)
-    if answer == "bad":
+    if mac_test.needs_probe_recovery(answer):
         return EligibleTarget(target)
     # Only an eligible step pays for the offload runner's import.
     from scripts.mac_test import offload
@@ -762,8 +762,18 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
 
 
 @dataclass(frozen=True)
-class TargetWithFailedProbe(EligibleTarget):
-    """The target meets policy, but its last reachability probe failed."""
+class FailedProbeExclusion(ExcludedTarget):
+    """Automatic routing excludes the target while its probe is pending."""
+
+    reason: str = "failed probe"
+
+
+def linux_probe_excludes(target: SshTarget, selection: TargetSelection, answer: mac_test.FreeNowAnswer) -> bool:
+    """An exact pin can use a Linux target before probe recovery."""
+    from scripts.mac_test import eligibility
+
+    return (target.platform == "linux" and selection != Pinned(target.name)
+            and isinstance(answer, eligibility.FailedProbe))
 
 
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
@@ -818,7 +828,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     if target.platform == "macos" or isinstance(routing, LocalRequired):
         answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session,
                                  configuration=configuration)
-        if new_step and not isinstance(selection, Pinned) and answer == "bad":
+        if new_step and not isinstance(selection, Pinned) and mac_test.needs_probe_recovery(answer):
             start_probe_recovery(target, repo_root, package, kind)
         if target.platform == "macos":
             return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer,
@@ -835,11 +845,12 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     paths = mac_test.state_paths(target.name)
     answer = mac_test.free_now(paths, target.settings, repo_root, session=session,
                                  configuration=configuration)
-    if answer == "bad":
-        failed_probe = isinstance(eligibility.read_failed_probe(target.name), eligibility.FailedProbe)
+    if isinstance(answer, eligibility.FailedProbe) or answer == "bad":
         if new_step and not isinstance(selection, Pinned):
             start_probe_recovery(target, repo_root, package, kind)
-        return TargetWithFailedProbe(target) if failed_probe else EligibleTarget(target)
+        if linux_probe_excludes(target, selection, answer):
+            return FailedProbeExclusion(target)
+        return EligibleTarget(target)
     if answer != "free":
         return ExcludedTarget(target, answer)
     from scripts.mac_test import offload
@@ -1077,6 +1088,7 @@ def command_reserve(args: CliArguments) -> int:
         destination.unlink(missing_ok=True)
     if args.kind not in ("test", "check", "doc", "lint", "example", "build", "final"):
         return 1
+    selection = Pinned(args.target) if args.target else ROUTED
     busy_mac = False
     for target in read_targets():
         if not isinstance(target, SshTarget) or (args.target and target.name != args.target):
@@ -1095,7 +1107,9 @@ def command_reserve(args: CliArguments) -> int:
         identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
         if isinstance(identity, claim_state.NoClaimIdentity):
             answer = mac_test.free_now(paths, target.settings, Path(args.repo_root), session=session)
-            if answer not in ("free", "busy") and not (answer == "bad" and args.new_step):
+            if answer not in ("free", "busy") and not (
+                    args.new_step and mac_test.needs_probe_recovery(answer)
+                    and not linux_probe_excludes(target, selection, answer)):
                 continue
         policy = eligibility.mac_step_eligibility(config, Path(args.repo_root), args.package, verb, target.name, kind=args.kind)
         if isinstance(policy, eligibility.IneligibleMacStep):

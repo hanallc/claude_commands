@@ -299,7 +299,14 @@ class InvalidBlockDuration:
 
 BlockDuration = ValidBlockDuration | InvalidBlockDuration
 INVALID_BLOCK_DURATION = InvalidBlockDuration()
-FreeNowAnswer = Literal["free", "off", "backoff", "blocked", "busy", "state", "bad"]
+type FreeNowAnswer = Literal["free", "off", "backoff", "blocked", "busy", "state", "bad"] | eligibility.FailedProbe
+
+
+def needs_probe_recovery(answer: FreeNowAnswer) -> bool:
+    """A failed probe or a version decline can start recovery."""
+    from scripts.mac_test import eligibility
+
+    return isinstance(answer, eligibility.FailedProbe) or answer == "bad"
 
 
 @dataclass(frozen=True)
@@ -2225,8 +2232,9 @@ def free_now(
     ) for candidate in scopes)
     if held:
         return "busy"
-    if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe):
-        return "bad"
+    probe = eligibility.read_failed_probe(paths.target)
+    if isinstance(probe, eligibility.FailedProbe):
+        return probe
     if repository_name is not None and eligibility.linux_version_decline_path(paths.target, repository_name).exists():
         return "bad"
     return "free"
@@ -2239,7 +2247,7 @@ def command_free_now(args: CliArguments, paths: StatePaths) -> int:
     if not args.settings and args.target:
         settings = config_path(args.target)
     answer = free_now(paths, settings, Path(args.repo_root), args.copy, session=args.session)
-    print(answer)
+    print("bad" if needs_probe_recovery(answer) else answer)
     return 0 if answer == "free" else 1
 
 

@@ -2207,19 +2207,29 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             _ = settings.write_text(good.replace("floor_sweep_timeout_s=180", "floor_sweep_timeout_s=broken"))
             repository = eligibility.KnownRepository("hana")
             with (mock.patch.object(eligibility, "repository_identity", return_value=repository),
-                  mock.patch.object(eligibility, "read_failed_probe", return_value=eligibility.FailedProbe()),
+                  mock.patch.object(eligibility, "read_failed_probe", return_value=eligibility.FailedProbe()) as read_probe,
                   mock.patch.object(build_targets, "start_probe_recovery") as start):
                 evidence = self.read_target(fixture, request)
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
-                self.assertEqual(evidence.eligibility, placement.TemporaryExclusion("failed probe"))
+                read_probe.assert_called_once_with(destination.target)
+                assert isinstance(evidence.eligibility, placement.TemporaryExclusion), evidence
+                self.assertEqual(evidence.eligibility.reason, "failed probe")
                 start.assert_called_once()
                 fixture.server.publish_host_evidence(evidence)
                 reply, = fixture.server.handle_request(request)
                 assert isinstance(reply, wire.PlacementWait), reply
-                self.assertEqual(reply.eligibility, (placement.CandidateEligibility(destination, evidence.eligibility),))
+                self.assertEqual(reply.eligibility,
+                                 (placement.CandidateEligibility(destination, placement.TemporaryExclusion("failed probe")),))
 
                 pinned = replace(request, episode=f"{request.episode}-pinned",
                     constraints=replace(request.constraints, selection=placement.PinnedHost(destination.target)))
+                fixture.server.publish_host_evidence(replace(
+                    evidence, eligibility=placement.TemporaryExclusion("failed probe")))
+                refused, = fixture.server.handle_request(pinned)
+                assert isinstance(refused, wire.PlacementWait), refused
+                self.assertEqual(refused.eligibility, reply.eligibility)
+
+                fixture.server.publish_host_evidence(evidence)
                 self.assertEqual(assignment_for(fixture, pinned).destination, destination)
 
             _ = settings.write_text(good)
