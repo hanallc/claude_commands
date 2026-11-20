@@ -939,8 +939,8 @@ class HanaController:
         use = _permit_use(row)
         if (not row.claims or not valid_boot
                 or not spending.settings.enabled and use is hana_spend.PermitUse.NEW_WORK):
-            if row.state == Lifecycle.READY and not row.claims and valid_boot and spending.settings.enabled:
-                if now - row.idle_since < settings.idle_stop_seconds:
+            if row.state == Lifecycle.READY and not row.claims and valid_boot:
+                if spending.settings.enabled and now - row.idle_since < settings.idle_stop_seconds:
                     return
                 self._stop(row, now, StopCause.IDLE)
             elif (row.state != Lifecycle.STARTING or not isinstance(row.start, DemandStart)

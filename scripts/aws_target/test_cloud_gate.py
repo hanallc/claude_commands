@@ -869,17 +869,30 @@ class CloudGateTests(CostFixture):
         self.assertEqual(len(self.fake.launches), 1)
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[-1].state, ledger.GateAbsent)
 
-    def test_switch_off_recovers_the_running_box_after_a_lost_launch_reply(self) -> None:
+    def test_switch_off_leaves_an_uncertain_launch_for_cleanup(self) -> None:
         worker, _ = self.steering_fixture()
         self.fake.launch_timeouts = 1
         with self.assertRaises(subprocess.TimeoutExpired):
             _ = worker.launch(self.folder, self.request, self.deployment)
         override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=off')
-
-        self.assertEqual(worker.launch(self.folder, self.request, self.deployment), 'i-fixture')
+        self.fake.describe_errors = [AwsUnavailable(
+            'An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation')]
+        calls = len(self.fake.commands)
+        self.assertEqual(worker.launch(self.folder, self.request, self.deployment),
+                         cloud_gate.LocalFallback(cloud_gate.CLOUD_GATE_OFF))
+        self.assertEqual(self.fake.commands[calls:], [])
         self.assertEqual(len(self.fake.launches), 1)
-        self.assertEqual(self.book.read_snapshot().gate_reservations[-1].state, ledger.GateRunning('i-fixture'))
+
+        self.assertFalse(cloud_gate.cleanup_folder(self.folder, worker))
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[-1].state, ledger.GateLaunchPending)
         self.assertFalse(self.fake.terminated)
+        self.assertTrue(cloud_gate.cleanup_folder(self.folder, worker))
+        self.assertEqual(self.book.read_snapshot().gate_reservations[-1].state,
+                         ledger.GateTerminated(int(self.now), 'i-fixture'))
+        lookups = [command for command in self.fake.commands[calls:] if '--filters' in command]
+        self.assertEqual(len(lookups), 2)
+        token = ledger.text(self.fake.launches[0], 'ClientToken')
+        self.assertTrue(all('Name=client-token,Values=' + token in command for command in lookups))
 
     def test_quota_refusal_at_zero_live_vcpus_expires_at_the_cooldown(self) -> None:
         worker, variants = self.steering_fixture()

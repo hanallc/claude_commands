@@ -793,12 +793,8 @@ class GateWorker:
                         if refusal:
                             if not saved_arguments and retry == 0:
                                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-                                return LocalFallback(refusal)
-                            # A previous request may have launched this box. Look it up without another launch.
-                            instances = _instances_for_launch(api, arguments)
-                            if len(instances) != 1:
-                                return LocalFallback(refusal)
-                            break
+                            # Cleanup resolves any launch that AWS may have accepted.
+                            return LocalFallback(refusal)
                     try:
                         if retry == 0:
                             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(

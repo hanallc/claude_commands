@@ -13,7 +13,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.aws_target import ledger
@@ -111,7 +111,11 @@ source_allowed_environment=RUST_BACKTRACE
 
 
 def set_hana_switch(folder: Path, value: str) -> None:
-    _ = write_config_fixture(folder / 'build_targets.conf', f'enabled.hana-aws={value}\n')
+    path = folder / 'build_targets.conf'
+    if not path.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+        _ = path.write_bytes((FIXTURES / path.name).read_bytes())
+    override_fixture_settings(path, f'enabled.hana-aws={value}')
 
 
 def write_hana_config(path: Path | None = None) -> Path:

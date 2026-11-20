@@ -1037,6 +1037,15 @@ class HanaBoxTests(CostFixture):
         self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
         self.assertEqual(ledger.mapping(self.record()['operation'])['action'], hana_box.Action.STOP.value)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+
+        set_hana_switch(self.root, 'on')
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimCommitted)
+        for _step in range(3):
+            self.assertEqual(self.tick(), hana_box.Lifecycle.STARTING)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.READY)
+        self.assertEqual(ledger.mapping(self.record()['delivered'])['execution'], 'execution-two')
 
     def test_switch_off_refuses_to_start_a_pending_claim(self) -> None:
         self.assertIsInstance(self.controller.request('execution-one'), hana_box.ClaimCommitted)
