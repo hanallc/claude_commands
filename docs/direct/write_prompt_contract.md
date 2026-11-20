@@ -78,17 +78,18 @@ Codex review prompts also include section 3's command block.
 5. `## Project Context`: include the current context. Omit plan **Style** metadata.
 6. `## Work Specification`: include the following instructions verbatim.
    "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
-   Delete a test that your change makes a duplicate, or that pins behavior the Work Order removes. List each deleted test and the test that still covers the behavior in your summary. This is not weakening.
    For tests, prohibit constant comparisons, implementation copies, library tests, configured mock tests, existence checks, and duplicate behavior tests.
-   Implementation, fix and test prompts carry these two test rules verbatim:
+   Implementation, fix and test prompts carry this block verbatim:
 
    <TestRules>
+   "Delete a test that your change makes a duplicate, or that pins behavior the Work Order removes. List each deleted test and the test that still covers the behavior in your summary. This is not weakening."
+
    1. For a fix, add a table row to the existing test of the same behavior.
       Add a new test only when no test covers the behavior.
       A table row is a new entry in an existing `subTest` table. A new `def test_` is a new test.
    2. Write or keep a rare-case test only when the defect cannot be undone: it deletes or corrupts user work or saved state that no later run repairs. A refusal that only prints a message and exits gets no test. A rare case that a main-path test of the same function already reaches gets no test.
 
-      Keep every main-path test.
+      Keep every main-path test, except one that the deletion rule above allows.
    </TestRules>
 
    For tests, include this instruction verbatim: "Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after."
