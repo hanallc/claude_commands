@@ -529,13 +529,11 @@ class MergeGateLedgerTests(MergeGateFixture):
             self.assertEqual(selected.commit, head)
 
     def test_nightly_without_a_build_cache_sends_the_result_and_removes_its_copy(self) -> None:
-        from scripts.production import showrunners
-
         _ = self.git(self.checkout, "rm", "Cargo.toml")
         tip = self.commit(self.checkout, "repository without a build cache")
         _ = self.git(self.checkout, "push", "origin", "HEAD:integration")
         self.write(self.state / "red-hooks", "red")
-        with mock.patch.object(showrunners, "tell", return_value="sent to quiet") as notice:
+        with mock.patch.object(gate, "tell_nightly_owner", return_value="told quiet") as notice:
             result = self.run_gate("--nightly")
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -653,7 +651,7 @@ class MergeGateLedgerTests(MergeGateFixture):
             _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), production))
         with mock.patch.dict(os.environ, environment), \
                 mock.patch.object(showrunners, "timer_docs", return_value={"quiet": production}), \
-                mock.patch.object(showrunners, "tell", return_value="could not tell quiet: offline") as send, \
+                mock.patch.object(gate, "tell_nightly_owner", return_value="could not tell quiet: offline") as send, \
                 redirect_stdout(output):
             _ = gate.tell_nightly_red(gate.GateArguments(merge_branch="integration"),
                                         "fixture-tree", ["hooks/test_first.py"])

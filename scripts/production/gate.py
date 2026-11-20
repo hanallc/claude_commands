@@ -78,6 +78,7 @@ from scripts.copies import copies
 from scripts.lib import build_folder_lock, build_folders, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import atomic_sample, sync_folder, write_text_atomic
 from scripts.lib.build_steps import gate_job_for_command, read_step_names
+from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
     affected_modules, change_review, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
 )
@@ -3219,6 +3220,36 @@ def _nightly_diagnostic_excerpt(lines: Sequence[str]) -> str:
     return f"{shown}\n{omitted} other diagnostic lines omitted." if omitted > 0 else shown
 
 
+def nightly_notice_deadline() -> float:
+    seconds = send_budget.seconds()
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("The notice budget must be finite and positive.")
+    return time.monotonic() + seconds
+
+
+def send_nightly_notice(address: str, key: str, text: str, *, recipient: str, sender: str, deadline: float) -> str:
+    command = session_send.send_argv("--to", address, "--from", sender, "--key", key,
+                                    "--text", text, send_script=showrunners.SEND)
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        try:
+            sent = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  check=False, timeout=remaining)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            return f"could not tell {recipient}: {failure_detail(sent)}" if sent.returncode else f"told {recipient}"
+    return f"could not tell {recipient}: the notice deadline expired"
+
+
+def tell_nightly_owner(owner: str, key: str, text: str) -> str:
+    deadline = nightly_notice_deadline()
+    address = showrunners.current_address(owner, deadline=deadline)
+    if not address:
+        return f"{owner} is not running: tell it when it starts"
+    return send_nightly_notice(address, key, text, recipient=owner, sender="showrunners", deadline=deadline)
+
+
 def _notify_nightly_type_authors(repo: Path, tip: str, result_id: str, type_failures: Sequence[GateJobResult],
                                  tests_passed: bool, production: staff.StaffId) -> NightlyTypeNotices:
     pattern = re.compile(r"\s*(.+):([1-9]\d*):\d+ - (?:error|warning|information|note):.*")
@@ -3252,23 +3283,31 @@ def _notify_nightly_type_authors(repo: Path, tip: str, result_id: str, type_fail
                 complete = False
                 continue
             by_unit.setdefault(author.id, (author, []))[1].append(NightlyUnitDiagnostic(line, path))
+    if not by_unit:
+        return NightlyTypeNotices()
+    try:
+        deadline = nightly_notice_deadline()
+    except ValueError as error:
+        return NightlyTypeNotices((f"Could not send type diagnostics. {error}",))
     details: list[str] = []
     for author, items in by_unit.values():
         lines = [item.text for item in items]
         diagnostics_text = _nightly_diagnostic_excerpt(lines)
         try:
-            notice = showrunners.send_to_address(f"session:{author.current_session}",
+            outcome = send_nightly_notice(f"session:{author.current_session}",
                 f"gate-nightly:{result_id}:{author.id}",
                 "The nightly type check is red on your change. Fix it in your next phase.\n"
                 + diagnostics_text + "\n" + _nightly_type_recheck(items),
-                recipient=author.name, sender="gate")
-            delivered = not notice.failed
-        except (OSError, ValueError, subprocess.SubprocessError):
-            delivered = False
+                recipient=author.name, sender="gate", deadline=deadline)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            outcome = f"could not tell {author.name}: {error}"
+        delivered = outcome == f"told {author.name}"
         complete = complete and delivered
-        heading = f"Sent to {author.name}" if delivered else f"Could not send to {author.name}"
-        details.extend([f"{heading}:", *lines])
-    if tests_passed and complete and by_unit:
+        heading = f"Sent to {author.name}:" if delivered else outcome
+        if not delivered:
+            print(f"Nightly author notice: {outcome}", flush=True)
+        details.extend([heading, *lines])
+    if tests_passed and complete:
         first = max(by_unit.values(), key=lambda entry: len(entry[1]))[0]
         return NightlyTypeNotices(tuple(details), NightlyFixAssigned(first.id, datetime.now(UTC).isoformat()))
     return NightlyTypeNotices(tuple(details))
@@ -3296,8 +3335,8 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
         if result_id:
             detail += f"\nAssign the fix, then run gate.py nightly-assigned --result {result_id} --unit UNIT."
         owner = nightly_owner_name(args)
-        outcome = showrunners.tell(owner, f"merge-gate-nightly:{tree}",
-                                   f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
+        outcome = tell_nightly_owner(owner, f"merge-gate-nightly:{tree}",
+                                     f"Nightly merge gate is red: {args.merge_branch} tree {tree}. " + detail)
         print(f"Nightly notice: {outcome}", flush=True)
         if outcome == f"told {owner}":
             return NightlyNoticeReceived(datetime.now(UTC).isoformat())
