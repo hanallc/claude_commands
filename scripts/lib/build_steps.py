@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 from types import MappingProxyType
 
-from scripts.build_queue.admission_jobs import StepJob as StepJob
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob as StepJob
 from scripts.build_queue.snapshot_codec import RAW_ID, format_queue_name, public_queue_text, select_queue_name
-from scripts.buildlog.parse import CARGO_BUILD_VERBS
+from scripts.buildlog.parse import CARGO_BUILD_VERBS, CI_CARGO_FRONT, cargo_front_call
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
 from scripts.message.owner_role import OwnerRole
@@ -54,19 +54,10 @@ class StepNames:
         owner = unit if template and role is OwnerRole.UNIT and not ci else ""
         return select_queue_name(current_name, " ".join(part for part in (owner, shown) if part))
 
-
-    def about_template(self, job: StepJob, unit: str) -> tuple[str, str]:
-        """Return the description template and the unit it names."""
-        owner = job.unit or (unit if unit != "—" else "")
-        template = self.settings.get(f"about.{job.step}", "")
-        if "{unit}" in template and not owner:
-            template = self.settings.get(f"about.{job.step}-without-unit", "")
-        return template, owner
-
-    def about(self, job: StepJob, unit: str) -> str:
+    def about(self, job: StepJob) -> str:
         """Describe the job when a template applies."""
-        template, owner = self.about_template(job, unit)
-        return template.format(unit=owner, branch=job.branch, modules=job.modules)
+        template = self.settings.get(f"about.{job.step}", "")
+        return template.format(branch=job.branch, modules=job.modules)
 
     def changes(self, job: StepJob) -> str:
         """What the job changes: a branch name, or the default text."""
@@ -227,6 +218,24 @@ def copies_run_command(argv: Sequence[str]) -> CopiesRunCommand | OtherCommand:
     return CopiesRunCommand(source, tuple(arguments[separator + 1:])) if source else OTHER_COMMAND
 
 
+def build_call_arguments(argv: Sequence[str]) -> Sequence[str]:
+    """Read the Cargo or gate command from recorded arguments."""
+    program = _program(argv)
+    if isinstance(program, OtherCommand):
+        return ()
+    name, arguments = program
+    if name == "queue_place.py" and arguments and arguments[0] == "admit":
+        separator = next((index for index, word in enumerate(arguments) if word == "--"), None)
+        return build_call_arguments(arguments[separator + 1:]) if separator is not None else ()
+    if name == CI_CARGO_FRONT:
+        return ("cargo", *cargo_front_call(arguments).arguments)
+    if name == "cargo-tile-real":
+        return ("cargo", *arguments)
+    if name in ("cargo", "cargo-nextest") or name in GATE_PROGRAMS.values():
+        return (name, *arguments)
+    return ()
+
+
 def process_arguments(process: Path) -> list[str]:
     """Read the arguments of a process from procfs."""
     return [word for word in read_proc_text(process / "cmdline").split("\0") if word]
@@ -286,6 +295,11 @@ def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
     if "--tests-only" in arguments:
         return _test_job(arguments, affected=False)
     return StepJob("integrate", unit=_option(arguments, "--unit"), branch=branch)
+
+
+def gate_job_for_command(argv: Sequence[str]) -> StepJob | GateJobNotRecorded:
+    job = command_job(argv)
+    return job if isinstance(job, StepJob) else GATE_JOB_NOT_RECORDED
 
 
 # Show each step as the queue records it, for a caller that reads no configuration.

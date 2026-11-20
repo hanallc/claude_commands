@@ -14,22 +14,28 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest import mock
 
+from scripts.direct import phase_wait_holder
+from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY, VerifyTokenWaitFixture
-from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture
-from scripts.direct.verify_mac_offload_test_support import ROUTING_WAIT_STUB
+from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, recorded_holders, wait_for_verify_state, wait_rows
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
-from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
+from scripts.build_queue.admission_test_support import PrivateHostEvidence, caller_admission, caller_provider_controls
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.test_hang_guard import FixtureHang, TEST_HANG_GUARD_SECS
 from scripts.lib.build_folders_test_support import tool_folders
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.production import staff
+from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import isolated_staff_file
 
 
 FIRST_SESSION = fixture_runtime_id("thread-first")
 NEXT_SESSION = fixture_runtime_id("thread-second")
+
+# Allow 15 seconds for scheduling delays while the probe reads private fixture state.
+TARGET_PROBE_TIMEOUT_SECONDS = 15
 
 
 def isolate_run_sources(environment: dict[str, str], root: Path) -> None:
@@ -40,37 +46,30 @@ def isolate_run_sources(environment: dict[str, str], root: Path) -> None:
                         "UNIT_DETACHED_RUN": "1"})
 
 
-def wait_rows(session: Path) -> list[dict[str, object]]:
-    """Read the real recorder's history through its private session state."""
-    state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
-    return [row for line in Path(cast(str, state["history_file"])).read_text().splitlines()
-            if str((row := cast(dict[str, object], json.loads(line)))["event_type"]).startswith("wait_")]
-
-
 def named_holder(kind: str, resource: str, owner: str, *, unit: bool = False) -> dict[str, object]:
     return {"state": "NamedHolder", "resource_kind": kind, "resource": resource,
             "holder": {"state": "UnitHolder", "unit": owner} if unit else
                       {"state": "SessionHolder", "session_id": owner}}
 
 
-def recorded_holders(rows: list[dict[str, object]]) -> list[object]:
-    return [row["holder"] for row in rows if row["event_type"] in ("wait_started", "wait_holder_seen")]
-
-
-RECORDER_OBSERVER = '''import json, os, runpy, sys
+RECORDER_OBSERVER = '''import json, os, sys
 from pathlib import Path
-arguments = sys.argv[1:]
-if arguments and arguments[0].endswith("progress_history.py"):
+
+from scripts.direct import progress_history
+
+def main():
+    arguments = sys.argv[1:]
     with Path(os.environ["TEST_RECORDER_CALLS"]).open("a") as output:
-        output.write(json.dumps(arguments[1:]) + "\\n")
+        output.write(json.dumps(arguments) + "\\n")
     failure = Path(os.environ["TEST_RECORDER_FAILURE"])
-    if arguments[1] == os.environ.get("TEST_FAIL_RECORDER") and not failure.exists():
+    if arguments[0] == os.environ.get("TEST_FAIL_RECORDER") and not failure.exists():
         failure.touch()
-        raise SystemExit(1)
-    sys.argv = arguments
-    runpy.run_path(arguments[0], run_name="__main__")
-    raise SystemExit(0)
-os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *arguments])
+        return 1
+    progress_history.main()
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 
 EVENT_CLIENT = '''import json, os, sys
@@ -91,7 +90,7 @@ raise SystemExit(75 if episode["outcome"] == "LeftQueue" else 0)
 '''
 
 
-class RecordedWaitFixture(VerifyTokenWaitFixture):
+class _RecordedWaitFixture(VerifyTokenWaitFixture):
     """Seed private wait history once for each test class."""
 
     @override
@@ -100,8 +99,15 @@ class RecordedWaitFixture(VerifyTokenWaitFixture):
         isolate_run_sources(self.environment, self.root)
         self.record_phase(self.root / "session")
 
+    @override
+    def setUp(self) -> None:
+        self.root: Path = self.fixture_root
+        self.addCleanup(shutil.rmtree, self.root)
+        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
+        self.environment: dict[str, str] = self.fixture_environment.copy()
 
-class VerifyMemoryWaitHolderTests(RecordedWaitFixture):
+
+class VerifyMemoryWaitHolderTests(_RecordedWaitFixture):
     event_errors: str = ""
 
     @override
@@ -115,22 +121,20 @@ class VerifyMemoryWaitHolderTests(RecordedWaitFixture):
         waits = self.root / "waits"
         waits.mkdir()
         _ = (waits / "first-queued-at").write_text("100\n")
-        observer = self.root / "recorder-python"
-        _ = observer.write_text(f"#!{sys.executable}\n" + RECORDER_OBSERVER)
-        observer.chmod(0o755)
+        _ = (self.root / "recorder-observer.py").write_text(RECORDER_OBSERVER)
         _ = (self.root / "event-client.py").write_text(EVENT_CLIENT)
-
-    def run_events(self, episodes: list[dict[str, object]], *, failure: str = "") -> None:
-        _ = (self.root / "episodes.json").write_text(json.dumps(episodes))
-        self.environment["TEST_FAIL_RECORDER"] = failure
         script = self.root / "memory-events.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
             + shell_functions(VERIFY, "verify_helper", "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
                               "phase_wait_finish_all", "collect_routing_wait", "start_routing_wait",
                               "buildlog_memory_event")
             + shell_functions(VERIFY.parents[1] / "lint/invoke.sh", "buildlog_now") + '''
-PY=$TEST_EVENT_ROOT/recorder-python
-PHASE_WAIT_RECORDER=$2
+PY=$TEST_REAL_PYTHON
+VERIFY_START_DIR=${2%/*}
+export PYTHONPATH=${2%/scripts/direct/progress_history.py}
+verify_helper --start
+STEP_RECORD_SCRIPT=$2
+PHASE_WAIT_RECORDER=$TEST_EVENT_ROOT/recorder-observer.py
 PHASE_WAIT_SESSION=$UNIT_RUN_DIR
 HOLD_WAIT_DIR=$TEST_EVENT_ROOT/waits
 BOARD_DIR=$UNIT_RUN_DIR
@@ -145,6 +149,11 @@ for ((episode=0; episode<$3; episode++)); do
     printf '%s|%s\\n' "$BUILDLOG_MEM_OUTCOME" "$BUILDLOG_MEM_WAIT_S" >> "$TEST_EVENT_ROOT/outcomes"
 done
 ''')
+
+    def run_events(self, episodes: list[dict[str, object]], *, failure: str = "") -> None:
+        _ = (self.root / "episodes.json").write_text(json.dumps(episodes))
+        self.environment["TEST_FAIL_RECORDER"] = failure
+        script = self.root / "memory-events.sh"
         result = subprocess.run(["bash", str(script), str(VERIFY.parents[1] / "lint/memory_gate.sh"),
                                  str(VERIFY.with_name("progress_history.py")), str(len(episodes))],
                                 cwd=self.root, env=self.environment, capture_output=True, text=True,
@@ -260,10 +269,14 @@ done
 
 
 class VerifyTokenHolderTests(VerifyTokenWaitFixture):
-    def test_token_wait_names_the_owner_and_updates_it_on_the_next_pass(self) -> None:
+    @override
+    def build_fixture(self) -> None:
+        super().build_fixture()
         isolate_run_sources(self.environment, self.root)
+        self.record_phase(self.root / "board")
+
+    def test_token_wait_names_the_owner_and_updates_it_on_the_next_pass(self) -> None:
         board = self.root / "board"
-        self.record_phase(board)
         real_sleep = shutil.which("sleep")
         if real_sleep is None:
             self.fail("The fixture needs sleep.")
@@ -310,7 +323,7 @@ exit 0
         self.assertEqual(wait_rows(board)[-1]["event_type"], "wait_finished")
 
 
-class VerifyRecordedTokenIdentityTests(RecordedWaitFixture):
+class VerifyRecordedTokenIdentityTests(_RecordedWaitFixture):
     @override
     def build_fixture(self) -> None:
         super().build_fixture()
@@ -321,15 +334,18 @@ class VerifyRecordedTokenIdentityTests(RecordedWaitFixture):
         self.write_token_record("progress_history_state.json", {"owner_staff_id": owner.id})
         waits = self.root / "identity-waits"
         waits.mkdir()
-        observer = self.root / "identity-python"
-        _ = observer.write_text('''#!/bin/sh
-printf '%s\\n' "${VERIFY_PY_HELPER:-recorder}" >> "$TEST_HOLDER_PY_CALLS"
-if [ "${1##*/}" = progress_history.py ]; then
-    printf '%s\\n' "$@" >> "$TEST_IDENTITY_ROOT/identity-recorder-args"
-fi
-exec "$TEST_REAL_PYTHON" "$@"
+        functions = shell_functions(VERIFY, "verify_helper").replace(
+            "verify_helper() {", "run_verify_helper() {", 1)
+        functions += shell_functions(VERIFY, "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish")
+        _ = (self.root / "identity-functions.sh").write_text(functions + '''
+verify_helper() {
+    printf '%s\\n' "${VERIFY_PY_HELPER:-recorder}" >> "$TEST_HOLDER_PY_CALLS"
+    if [[ "${1##*/}" == progress_history.py ]]; then
+        printf '%s\\n' "$@" >> "$TEST_IDENTITY_ROOT/identity-recorder-args"
+    fi
+    run_verify_helper "$@"
+}
 ''')
-        observer.chmod(0o755)
         self.environment.update({"TEST_HOLDER_PY_CALLS": str(self.root / "identity-python-calls"),
                                  "TEST_REAL_PYTHON": sys.executable,
                                  "TEST_IDENTITY_ROOT": str(self.root)})
@@ -352,9 +368,11 @@ exec "$TEST_REAL_PYTHON" "$@"
     def record_token_passes(self, body: str = 'phase_wait_start token "cargo token"\n') -> list[dict[str, object]]:
         recorded_count = len(wait_rows(self.root / "session"))
         script = self.root / "identity-wait.sh"
-        _ = script.write_text('set -euo pipefail\n' + shell_functions(
-            VERIFY, "verify_helper", "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish") + '''
-PY=$TEST_IDENTITY_ROOT/identity-python
+        _ = script.write_text('''set -euo pipefail
+source "$TEST_IDENTITY_ROOT/identity-functions.sh"
+PY=$TEST_REAL_PYTHON
+VERIFY_START_DIR=${1%/*}
+run_verify_helper --start
 PHASE_WAIT_SESSION=$TEST_IDENTITY_ROOT/session
 PHASE_WAIT_RECORDER=$1
 HOLD_WAIT_DIR=$TEST_IDENTITY_ROOT/identity-waits
@@ -364,6 +382,32 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
                                 cwd=self.root, env=self.environment, capture_output=True, text=True,
                                 timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return self.recorded_interval(recorded_count)
+
+    def record_token_owner(self, owner: str) -> list[dict[str, object]]:
+        session = self.root / "session"
+        arguments = ["token", owner, str(self.root / "token-board"),
+                     self.environment["BUILD_HOLD_DIR"], str(self.root)]
+
+        def holder_main() -> int:
+            phase_wait_holder.main()
+            return 0
+
+        holder = invoke_cli(phase_wait_holder, holder_main, arguments, self.environment, self.root)
+        self.assertEqual(holder.returncode, 0, holder.stdout + holder.stderr)
+        recorded_count = len(wait_rows(session))
+        worker = self.environment["CODEX_THREAD_ID"]
+        start = invoke_recorder(
+            ["start-wait", "--session-dir", str(session), "--kind", "WaitingForMemoryOrSlot",
+             "--reason", "cargo token", "--worker-thread-id", worker, "--owner-session", worker,
+             *holder.stdout.splitlines()], self.environment, self.root)
+        self.assertEqual(start.returncode, 0, start.stdout + start.stderr)
+        finish = invoke_recorder(["finish-wait", "--session-dir", str(session), "--wait-id", start.stdout.strip()],
+                                 self.environment, self.root)
+        self.assertEqual(finish.returncode, 0, finish.stdout + finish.stderr)
+        return self.recorded_interval(recorded_count)
+
+    def recorded_interval(self, recorded_count: int) -> list[dict[str, object]]:
         rows = wait_rows(self.root / "session")[recorded_count:]
         self.assertEqual(rows[0]["event_type"], "wait_started", rows)
         self.assertEqual(rows[-1]["event_type"], "wait_finished", rows)
@@ -380,22 +424,29 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
         self.assertEqual((self.root / "identity-python-calls").read_text().splitlines(),
                          ["PHASE_WAIT_HOLDER", "recorder", "recorder"])
         arguments = (self.root / "identity-recorder-args").read_text().splitlines()
-        self.assertIn("--director", arguments)
+        self.assertEqual(arguments[arguments.index("--verify-phase-id") + 1], "6")
+        self.assertNotIn("--director", arguments)
         self.assertNotIn("--worker-thread-id", arguments)
         self.assertEqual(arguments[arguments.index("--owner-session") + 1],
                          fixture_runtime_id("fixture-director"))
+        self.assertEqual(rows[0]["phase_id"], "6")
+        self.assertNotIn("pass_instance_id", rows[0])
 
     def test_saved_worker_record_names_the_session_without_a_roster(self) -> None:
         reference = self.worker_reference("fixture-first")
         self.write_token_record("impl_worker_saved.json", {"slot": "writer", "staff_id": reference,
                                                           "model": "fixture"})
         self.acquire_identity_token("writer")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
-                         [named_holder("slot", "cargo", FIRST_SESSION)])
+        rows = self.record_token_passes()
+        self.assertEqual(recorded_holders(rows), [named_holder("slot", "cargo", FIRST_SESSION)])
         arguments = (self.root / "identity-recorder-args").read_text().splitlines()
-        self.assertEqual(arguments[arguments.index("--worker-thread-id") + 1],
+        self.assertEqual(arguments[arguments.index("--verify-phase-id") + 1], "6")
+        self.assertEqual(arguments[arguments.index("--owner-session") + 1],
                          fixture_runtime_id("thread-impl"))
+        self.assertNotIn("--worker-thread-id", arguments)
         self.assertNotIn("--director", arguments)
+        self.assertEqual(rows[0]["team_slot"], "impl")
+        self.assertEqual(rows[0]["wait_attribution"], {"state": "WorkerPass"})
 
     def test_dispatch_pass_names_the_worker_session_without_worker_files(self) -> None:
         state = cast(dict[str, object], json.loads(
@@ -403,8 +454,7 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
         state["pass"] = {
             "impl": {"worker_name": "impl", "worker_id": self.worker_reference("fixture-first")}}
         self.write_token_record("progress_history_state.json", state)
-        self.acquire_identity_token("impl")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
+        self.assertEqual(recorded_holders(self.record_token_owner("impl")),
                          [named_holder("slot", "cargo", FIRST_SESSION)])
 
     def test_dispatch_worker_name_resolves_when_the_dispatch_slot_differs(self) -> None:
@@ -413,8 +463,7 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
         state["pass"] = {
             "impl": {"worker_name": "impl2", "worker_id": self.worker_reference("fixture-first")}}
         self.write_token_record("progress_history_state.json", state)
-        self.acquire_identity_token("impl2")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
+        self.assertEqual(recorded_holders(self.record_token_owner("impl2")),
                          [named_holder("slot", "cargo", FIRST_SESSION)])
 
     def test_duplicate_dispatch_worker_names_use_the_owner_unit(self) -> None:
@@ -424,21 +473,18 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
             "impl": {"worker_name": "impl2", "worker_id": self.worker_reference("fixture-first")},
             "test": {"worker_name": "impl2", "worker_id": self.worker_reference("fixture-second")}}
         self.write_token_record("progress_history_state.json", state)
-        self.acquire_identity_token("impl2")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
+        self.assertEqual(recorded_holders(self.record_token_owner("impl2")),
                          [named_holder("slot", "cargo", "wait", unit=True)])
 
     def test_saved_worker_stem_wins_over_a_roster_slot_match(self) -> None:
         self.write_token_record("impl_worker_writer.json", {
             "staff_id": self.worker_reference("fixture-first")})
-        self.acquire_identity_token("writer")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
+        self.assertEqual(recorded_holders(self.record_token_owner("writer")),
                          [named_holder("slot", "cargo", FIRST_SESSION)])
 
     def test_missing_worker_staff_row_uses_the_recorded_owner_unit(self) -> None:
         self.write_token_record("impl_worker_writer.json", {"slot": "writer", "staff_id": "missing-worker"})
-        self.acquire_identity_token("writer")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
+        self.assertEqual(recorded_holders(self.record_token_owner("writer")),
                          [named_holder("slot", "cargo", "wait", unit=True)])
 
     def test_ambiguous_worker_records_do_not_choose_a_session(self) -> None:
@@ -446,8 +492,7 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
             "slot": "writer", "staff_id": self.worker_reference("fixture-first")})
         self.write_token_record("impl_worker_second.json", {
             "slot": "writer", "staff_id": self.worker_reference("fixture-second")})
-        self.acquire_identity_token("writer")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
+        self.assertEqual(recorded_holders(self.record_token_owner("writer")),
                          [named_holder("slot", "cargo", "wait", unit=True)])
 
     def test_occupied_slot_retries_until_a_saved_identity_appears(self) -> None:
@@ -478,7 +523,7 @@ phase_wait_start token "cargo token"
                 self.assertEqual(calls.read_text().splitlines(), ["recorder", "recorder"])
 
 
-class RecordedHoldWaitFixture(VerifyHoldWaitFixture):
+class _RecordedHoldWaitFixture(VerifyHoldWaitFixture):
     """Copy a real recorded phase before each wait test."""
 
     recorded_environment: ClassVar[dict[str, str]]
@@ -491,16 +536,18 @@ class RecordedHoldWaitFixture(VerifyHoldWaitFixture):
         fixture = seed.fixture
         fixture.root = fixture.fixture_root
         fixture.environment = fixture.fixture_environment.copy()
+        _ = fixture.fixture_seed.rename(fixture.root)
         try:
-            _ = shutil.copytree(fixture.fixture_seed, fixture.root, symlinks=True)
             isolate_run_sources(fixture.environment, fixture.root)
             _ = VerifyHoldWaitFixture.record_phase(seed)
+            seed.prepare_recorded_seed()
             cls.recorded_environment = {key: value for key, value in fixture.environment.items()
                                         if fixture.fixture_environment.get(key) != value}
-            shutil.rmtree(fixture.fixture_seed)
-            _ = shutil.copytree(fixture.root, fixture.fixture_seed, symlinks=True)
         finally:
-            shutil.rmtree(fixture.root)
+            _ = fixture.root.rename(fixture.fixture_seed)
+
+    def prepare_recorded_seed(self) -> None:
+        """Prepare more files for this test class."""
 
     @override
     def setUp(self) -> None:
@@ -513,7 +560,7 @@ class RecordedHoldWaitFixture(VerifyHoldWaitFixture):
         return self.fixture.root / "history/runs/unit-run.jsonl"
 
 
-class VerifyHoldHolderTests(RecordedHoldWaitFixture):
+class VerifyHoldHolderTests(_RecordedHoldWaitFixture):
     def start_hold_step(self) -> subprocess.Popen[str]:
         """Call the real hold wrapper before the real cargo launcher."""
         script = self.fixture.root / "held-step.sh"
@@ -554,17 +601,6 @@ run_once cargo check
         self.assertTrue(any(event["args"][:1] == ["check"] for event in self.fixture.cargo_events()))
 
 
-POLL_SLEEP = '''#!/bin/sh
-if [ "$1" != "${BUILD_TARGETS_POLL_S}" ]; then exec "$TEST_REAL_SLEEP" "$@"; fi
-if ! find "$TMPDIR" -name 'phase-wait.*.resource' -print -quit | read -r marker; then exit 0; fi
-count=0
-[ ! -f "$PACKAGE_ROOT/target-passes" ] || read -r count < "$PACKAGE_ROOT/target-passes"
-count=$((count + 1))
-printf '%s\\n' "$count" > "$PACKAGE_ROOT/target-passes"
-touch "$PACKAGE_ROOT/target-poll-$count"
-exec "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$PACKAGE_ROOT/target-resume-$count"
-'''
-
 RUN_HISTORY = '''
 session = Path(os.environ["UNIT_RUN_DIR"])
 state = json.loads((session / "progress_history_state.json").read_text())
@@ -575,49 +611,64 @@ with (Path(os.environ["PACKAGE_ROOT"]) / "run-waits.jsonl").open("a") as output:
 '''
 
 
-RESERVATION_RACE_TOOL = '''import os, runpy, sys
+RESERVATION_RACE_TOOL = '''import os, sys
 from pathlib import Path
-root = Path(os.environ["PACKAGE_ROOT"])
-if sys.argv[1] == "reserve" and not (root / "reservation-raced").exists():
-    if os.environ["TEST_RACE_WITH_CLAIM"] == "0":
-        raise SystemExit(1)
-    with open(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.mac_test import mac_test
-    paths = mac_test.state_paths("linux-box")
-    scope = mac_test.target_claim_scope(paths, str(root))
-    claim = mac_test.claim_path(paths, scope)
-    claim.parent.mkdir(parents=True, exist_ok=True)
-    claim.write_text(os.environ["TEST_RACE_CLAIM_JSON"])
-    (root / "reservation-raced").write_text(str(claim))
-try:
-    runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
-except SystemExit as result:
-    if sys.argv[1] == "reserve":
+
+with open(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root:
+    exec(package_root.read(), {"__file__": package_root.name})
+from scripts.build_targets import build_targets
+from scripts.direct.wait_for_test_state import wait_for_file
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.mac_test import mac_test
+
+def main():
+    root = Path(os.environ["PACKAGE_ROOT"])
+    reserve = sys.argv[1] == "reserve"
+    inject = reserve and not (root / "reservation-raced").exists()
+    if inject:
+        if os.environ["TEST_RACE_WITH_CLAIM"] == "0":
+            return 1
+        paths = mac_test.state_paths("linux-box")
+        scope = mac_test.target_claim_scope(paths, str(root))
+        claim = mac_test.claim_path(paths, scope)
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(claim, os.environ["TEST_RACE_CLAIM_JSON"])
+        (root / "reservation-raced").write_text(str(claim))
+    status = build_targets.main()
+    if reserve:
         with (root / "reservation-results").open("a") as output:
-            output.write(str(result.code) + "\\n")
-    raise
+            output.write(str(status) + "\\n")
+    if inject and status == 11:
+        # Temporary hold; queue 44ds (A busy Linux reservation gets no second assignment from old evidence) removes it.
+        # See verify.sh:3174 and admission_service.py:4250.
+        wait_for_file(root / "reservation-observed")
+    return status
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 
 
-class VerifyTargetWaitHolderTests(RecordedHoldWaitFixture):
-    def prepare_target_wait(self) -> Path:
+class VerifyTargetWaitHolderTests(_RecordedHoldWaitFixture):
+    @override
+    def prepare_recorded_seed(self) -> None:
         root = self.fixture.root
+        binaries = root / "bin"
         claims = Path(self.fixture.environment["MAC_TEST_STATE_DIR"]) / "claims"
         claims.mkdir(parents=True, exist_ok=True)
-        real_sleep = shutil.which("sleep")
-        if real_sleep is None:
-            self.fail("The fixture needs sleep.")
-        self.fixture.write_executable(self.fixture.bin_directory / "sleep", POLL_SLEEP)
+        settings = Path(self.fixture.environment["MAC_TEST_CONFIG"])
+        _ = write_config_fixture(settings, f"probe_timeout_s={TARGET_PROBE_TIMEOUT_SECONDS}\n", template="mac_test")
         local_wait = root / "target-local-wait.py"
-        _ = local_wait.write_text(ROUTING_WAIT_STUB)
+        _ = local_wait.write_text(f"""import sys
+sys.path.insert(0, {str(VERIFY.parents[2])!r})
+from scripts.direct.verify_hold_wait_test_support import wait_for_target_holder
+wait_for_target_holder(sys.argv[3])
+""")
         self.fixture.environment.update({"BUILD_TARGETS_SCRIPT": str(VERIFY.parents[1] / "build_targets/build_targets.py"),
             "TEST_REAL_TARGETS": str(VERIFY.parents[1] / "build_targets/build_targets.py"),
-            "TEST_REAL_SLEEP": real_sleep, "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(local_wait),
+            "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(local_wait),
             "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
-        admission = caller_admission(self.fixture, root, self.fixture.environment)
-        controls = caller_provider_controls(self.fixture, admission)
-        controls.starting["mac"] = root / "target-starting"
-        git = self.fixture.bin_directory / "git"
+        git = binaries / "git"
         source = git.read_text().replace("wanted=rev-parse\n", '''if [[ "$*" == "rev-parse HEAD" ]]; then
     printf '%040d\\n' 1
     exit 0
@@ -625,16 +676,24 @@ fi
 wanted=rev-parse
 ''')
         self.fixture.write_executable(git, source)
-        runner = self.fixture.runner
+        runner = root / "runner.py"
         source = runner.read_text().replace('if "--assignment-file" in arguments:', '''import atexit
 def hold_after_cleanup():
     if os.environ.get("TEST_REHOLD_FINAL") == "1" and globals().get("attempt") == 1:
-        Path(os.environ["TEST_CLAIM_FILE"]).write_text(os.environ["TEST_NEXT_CLAIM"])
+        assigned_mac_test.write_json(Path(os.environ["TEST_CLAIM_FILE"]), json.loads(os.environ["TEST_NEXT_CLAIM"]))
 atexit.register(hold_after_cleanup)
 if "--assignment-file" in arguments:''', 1)
         source = source.replace('raise SystemExit(runner_status)', RUN_HISTORY + 'raise SystemExit(runner_status)')
         self.fixture.write_executable(runner, source)
-        return claims / f"{root.name}.json"
+
+    def prepare_target_wait(self, *, pauses: int) -> Path:
+        root = self.fixture.root
+        admission = caller_admission(self.fixture, root, self.fixture.environment)
+        controls = caller_provider_controls(self.fixture, admission)
+        controls.starting["mac"] = root / "target-starting"
+        self.fixture.environment.update({"TEST_TARGET_PAUSES": str(pauses),
+                                         "TEST_TARGET_ADMISSION": str(admission.state_dir)})
+        return Path(self.fixture.environment["MAC_TEST_STATE_DIR"]) / "claims" / f"{root.name}.json"
 
     def claim(self, path: Path, owner: str) -> dict[str, object]:
         row: dict[str, object] = {"claim_id": f"claim-{owner}", "episode": f"episode-{owner}",
@@ -642,12 +701,22 @@ if "--assignment-file" in arguments:''', 1)
             "pid": os.getpid(), "proc_start": admission_records.process_start_time(os.getpid()),
             "what": "private fixture work", "worktree": str(self.fixture.root),
             "since": datetime.now(timezone.utc).isoformat(), "holder_session": owner}
-        _ = path.write_text(json.dumps(row))
+        write_text_atomic(path, json.dumps(row))
         return row
 
-    def pause(self, process: subprocess.Popen[str], number: int) -> list[dict[str, object]]:
-        self.fixture.wait_for_path(self.fixture.root / f"target-poll-{number}", (process,))
-        return wait_rows(Path(self.fixture.environment["UNIT_RUN_DIR"]))
+    def pause(self, process: subprocess.Popen[str], number: int,
+              expected: dict[str, object]) -> list[dict[str, object]]:
+        marker = self.fixture.root / f"target-holder-{number}"
+        session = Path(self.fixture.environment["UNIT_RUN_DIR"])
+        try:
+            # verify suppresses duplicates before the recorder (verify.sh:1671), so a wrong repeated holder reaches the guard.
+            wait_for_verify_state(marker.exists, marker.parent, process, marker.name)
+        except (TimeoutError, FixtureHang):
+            recorded = recorded_holders(wait_rows(session))
+            raise self.failureException(
+                f"The wait for holder {expected!r} expired. Holders recorded so far were {recorded!r}."
+            ) from None
+        return wait_rows(session)
 
     def resume(self, number: int) -> None:
         (self.fixture.root / f"target-resume-{number}").touch()
@@ -668,10 +737,11 @@ if "--assignment-file" in arguments:''', 1)
         return snapshots
 
     def test_pinned_linux_reservation_race_waits_only_with_a_live_claim(self) -> None:
-        _ = self.prepare_target_wait()
+        _ = self.prepare_target_wait(pauses=1)
         root = self.fixture.root
         settings = root / "linux-box.conf"
-        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\nslots=1\n",
+        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\nslots=1\n"
+                                 + f"probe_timeout_s={TARGET_PROBE_TIMEOUT_SECONDS}\n",
                                  template="mac_test")
         _ = (root / "build_targets.conf").write_text(
             "targets=linux-box,natedev\nkind.linux-box=ssh\nplatform.linux-box=linux\n"
@@ -692,8 +762,21 @@ if "--assignment-file" in arguments:''', 1)
         with self.subTest(reservation="live claim"):
             self.fixture.environment["TEST_RACE_WITH_CLAIM"] = "1"
             process = self.start("check", "sample", "--target", "linux-box", "--no-cache")
-            rows = self.pause(process, 1)
-            self.assertEqual(recorded_holders(rows), [named_holder("slot", "linux-box", NEXT_SESSION)])
+            admission = caller_admission(self.fixture, root, self.fixture.environment)
+
+            def claim_observed() -> bool:
+                with admission.loop_turn():
+                    return any(isinstance(evidence := reader.latest, PrivateHostEvidence)
+                               and isinstance(evidence.holder_claim, placement.ProviderClaimReference)
+                               and evidence.holder_claim.claim_id == owner["claim_id"]
+                               for key, reader in admission.server.host_readers.items()
+                               if key.destination.target == "linux-box")
+
+            wait_for_verify_state(claim_observed, admission.state_dir, process, "the provider reading for the new claim")
+            (root / "reservation-observed").touch()
+            expected = named_holder("slot", "linux-box", NEXT_SESSION)
+            rows = self.pause(process, 1, expected)
+            self.assertEqual(recorded_holders(rows), [expected])
             self.assertEqual((root / "reservation-results").read_text().splitlines(), ["11"])
             self.assertEqual(self.fixture.runner_events(), [])
             claim = Path((root / "reservation-raced").read_text())
@@ -706,16 +789,17 @@ if "--assignment-file" in arguments:''', 1)
             self.assertEqual(self.fixture.local_runs(), [])
 
     def test_pinned_check_names_a_busy_claim_and_its_next_owner(self) -> None:
-        claim = self.prepare_target_wait()
+        claim = self.prepare_target_wait(pauses=2)
+        first = named_holder("slot", "mac", FIRST_SESSION)
+        second = named_holder("slot", "mac", NEXT_SESSION)
         _ = self.claim(claim, FIRST_SESSION)
         process = self.start_pinned_route()
-        rows = self.pause(process, 1)
-        self.assertEqual(recorded_holders(rows), [named_holder("slot", "mac", FIRST_SESSION)])
+        rows = self.pause(process, 1, first)
+        self.assertEqual(recorded_holders(rows), [first])
         _ = self.claim(claim, NEXT_SESSION)
         self.resume(1)
-        rows = self.pause(process, 2)
-        self.assertEqual(recorded_holders(rows), [named_holder("slot", "mac", FIRST_SESSION),
-                                                 named_holder("slot", "mac", NEXT_SESSION)])
+        rows = self.pause(process, 2, second)
+        self.assertEqual(recorded_holders(rows), [first, second])
         claim.unlink()
         self.resume(2)
         code, output = self.finish(process)
@@ -725,38 +809,40 @@ if "--assignment-file" in arguments:''', 1)
         self.assertEqual(self.fixture.local_runs(), [])
 
     def test_pinned_final_names_both_busy_intervals_and_closes_each_before_running(self) -> None:
-        claim = self.prepare_target_wait()
+        claim = self.prepare_target_wait(pauses=2)
+        first = named_holder("slot", "mac", FIRST_SESSION)
+        second = named_holder("slot", "mac", NEXT_SESSION)
         next_claim = self.claim(claim, NEXT_SESSION)
         _ = self.claim(claim, FIRST_SESSION)
         self.fixture.environment.update({"TEST_REHOLD_FINAL": "1", "TEST_CLAIM_FILE": str(claim),
                                          "TEST_NEXT_CLAIM": json.dumps(next_claim)})
         process = self.start("final", "--target", "mac", "--no-cache")
-        rows = self.pause(process, 1)
-        self.assertEqual(recorded_holders(rows)[-1], named_holder("slot", "mac", FIRST_SESSION))
+        rows = self.pause(process, 1, first)
+        self.assertEqual(recorded_holders(rows)[-1], first)
         claim.unlink()
         self.resume(1)
-        rows = self.pause(process, 2)
-        self.assertEqual(recorded_holders(rows)[-1], named_holder("slot", "mac", NEXT_SESSION))
+        rows = self.pause(process, 2, second)
+        self.assertEqual(recorded_holders(rows)[-1], second)
         claim.unlink()
         self.resume(2)
         code, output = self.finish(process)
         self.assertEqual(code, 0, output)
         rows = wait_rows(Path(self.fixture.environment["UNIT_RUN_DIR"]))
-        self.assertEqual(recorded_holders(rows), [named_holder("slot", "mac", FIRST_SESSION),
-                                                 named_holder("slot", "mac", NEXT_SESSION)])
+        self.assertEqual(recorded_holders(rows), [first, second])
         snapshots = self.assert_closed_before_remote_steps()
         self.assertEqual(len(snapshots), 2)
         self.assertEqual([sum(row["event_type"] == "wait_finished" for row in
                               cast(list[dict[str, object]], snapshot["waits"])) for snapshot in snapshots], [1, 2])
 
     def test_pinned_starting_target_records_an_unnamed_holder(self) -> None:
-        _ = self.prepare_target_wait()
+        _ = self.prepare_target_wait(pauses=1)
+        expected: dict[str, object] = {"state": "HolderNotNamed"}
         starting = self.fixture.root / "target-starting"
         starting.touch()
         process = self.start_pinned_route()
-        rows = self.pause(process, 1)
+        rows = self.pause(process, 1, expected)
         holder, = recorded_holders(rows)
-        self.assertEqual(cast(dict[str, object], holder)["state"], "HolderNotNamed")
+        self.assertEqual(cast(dict[str, object], holder)["state"], expected["state"])
         starting.unlink()
         self.resume(1)
         code, output = self.finish(process)
@@ -764,17 +850,19 @@ if "--assignment-file" in arguments:''', 1)
         _ = self.assert_closed_before_remote_steps()
 
     def test_mac_only_wait_names_each_claim_owner(self) -> None:
-        claim = self.prepare_target_wait()
+        claim = self.prepare_target_wait(pauses=2)
+        first = named_holder("slot", "mac", FIRST_SESSION)
+        second = named_holder("slot", "mac", NEXT_SESSION)
         _ = self.claim(claim, FIRST_SESSION)
         free = self.fixture.root / "mac-free"
         self.fixture.environment.update({"TEST_RUNNER_BUSY_UNTIL": str(free), "TEST_RUNNER_BUSY_REASON": "busy"})
         process = self.start("test", "sample", "--mac", "holder test", "--no-cache")
-        rows = self.pause(process, 1)
-        self.assertIn(named_holder("slot", "mac", FIRST_SESSION), recorded_holders(rows))
+        rows = self.pause(process, 1, first)
+        self.assertIn(first, recorded_holders(rows))
         _ = self.claim(claim, NEXT_SESSION)
         self.resume(1)
-        rows = self.pause(process, 2)
-        self.assertEqual(recorded_holders(rows)[-1], named_holder("slot", "mac", NEXT_SESSION))
+        rows = self.pause(process, 2, second)
+        self.assertEqual(recorded_holders(rows)[-1], second)
         claim.unlink()
         free.touch()
         self.resume(2)
@@ -783,18 +871,20 @@ if "--assignment-file" in arguments:''', 1)
         _ = self.assert_closed_before_remote_steps()
 
     def test_routing_hold_names_the_new_holder_on_the_next_pass(self) -> None:
-        claim = self.prepare_target_wait()
+        claim = self.prepare_target_wait(pauses=2)
+        first = named_holder("slot", "natedev", FIRST_SESSION)
+        second = named_holder("slot", "natedev", NEXT_SESSION)
         self.hold(FIRST_SESSION)
         holders = Path(self.fixture.environment["BUILD_HOLD_DIR"])
         _ = self.claim(claim, FIRST_SESSION)
         self.fixture.environment["TEST_RUNNER_BUSY_UNTIL"] = str(self.fixture.root / "mac-free")
         process = self.start("test", "sample", "--no-cache")
-        rows = self.pause(process, 1)
-        self.assertEqual(recorded_holders(rows)[-1], named_holder("slot", "natedev", FIRST_SESSION))
+        rows = self.pause(process, 1, first)
+        self.assertEqual(recorded_holders(rows)[-1], first)
         os.rename(holders / FIRST_SESSION, holders / NEXT_SESSION)
         self.resume(1)
-        rows = self.pause(process, 2)
-        self.assertEqual(recorded_holders(rows)[-1], named_holder("slot", "natedev", NEXT_SESSION))
+        rows = self.pause(process, 2, second)
+        self.assertEqual(recorded_holders(rows)[-1], second)
         (holders / NEXT_SESSION).unlink()
         self.resume(2)
         code, output = self.finish(process)
@@ -803,7 +893,7 @@ if "--assignment-file" in arguments:''', 1)
         self.assertEqual(len(self.fixture.local_runs()), 1)
 
 
-class VerifyMemoryRouteHolderTests(RecordedHoldWaitFixture):
+class VerifyMemoryRouteHolderTests(_RecordedHoldWaitFixture):
     def prepare_memory_route(self) -> Path:
         isolate_run_sources(self.fixture.environment, self.fixture.root)
         _ = self.record_phase()
