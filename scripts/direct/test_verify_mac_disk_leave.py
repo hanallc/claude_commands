@@ -55,7 +55,10 @@ runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
         config = self.root / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=mac,natedev,linux")
                               + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
-        _ = write_config_fixture(self.root / "linux.conf", "kinds=doc\n", template="mac_test")
+        _ = write_config_fixture(self.root / "linux.conf", "kinds=test\n", template="mac_test")
+        state = self.home / ".local/state/build-targets/linux"
+        state.mkdir(parents=True, exist_ok=True)
+        _ = (state / "unreachable_until").write_text("1000000000000\n")
         self.assert_disk_decline_leaves_for_mac(disabled_linux=True)
 
     def assert_disk_decline_leaves_for_mac(self, *, disabled_linux: bool = False) -> None:
