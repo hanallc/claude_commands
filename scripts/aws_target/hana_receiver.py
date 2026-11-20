@@ -567,29 +567,14 @@ def receive(settings: guest.SafetySettings, descriptor: dict[str, object], contr
         raise ValueError('The Hana permit is invalid')
     permit_fields = cast(dict[str, object], raw)
     generation = permit_fields.get('generation')
-    if (not isinstance(generation, str) or not generation.isdecimal()
-            or int(generation) <= 0 or permit_fields.get('boot_id') != boot
+    if (not isinstance(generation, str) or permit_fields.get('boot_id') != boot
             or not isinstance(control.get('token'), str) or not isinstance(control.get('execution'), str)):
         raise ValueError('The Hana permit identity is invalid')
+    expected = control.get('expected_generation')
+    if type(expected) is not int:
+        raise ValueError('The Hana permit generation changed')
     permit = guest.WorkPermit(hana_result.seconds_field(permit_fields, 'expires_at'), generation, boot)
-    with guest.guest_lock(paths):
-        if paths.fence.exists():
-            raise ValueError('Hana shutdown is fenced')
-        previous = guest.read_identity(paths.generation)
-        current = guest.read_permit(paths.permit)
-        if not (isinstance(current, guest.WorkPermit) and current == permit):
-            expected = control.get('expected_generation')
-            if type(expected) is not int or expected != int(previous or '0'):
-                raise ValueError('The Hana permit generation changed')
-            if not guest.fresh_permit(settings, permit, generation, boot, clock):
-                raise ValueError('The Hana permit is expired or exceeds its window')
-            if previous and int(generation) <= int(previous):
-                raise ValueError('The Hana permit generation did not increase')
-            # A failed partial write refuses permission until a controller recovery.
-            guest.atomic_record(paths.permit, asdict(permit))
-            _ = paths.generation.write_text(generation)
-        elif not guest.fresh_permit(settings, permit, generation, boot, clock):
-            raise ValueError('The Hana permit expired')
+    guest.write_permit(settings, permit, expected_generation=expected, paths=paths, clock=clock)
     reply.update(token=control['token'], generation=int(generation), execution=control['execution'])
     return reply
 

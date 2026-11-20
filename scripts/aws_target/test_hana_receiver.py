@@ -1,7 +1,7 @@
 """Check command admission and the runtime payload in a fixture."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 from io import BytesIO
 import json
@@ -55,6 +55,45 @@ class MountedSupervisor(hana_receiver.GuestCommandSupervisor):
 
 
 
+class HanaPermitReceiverTests(unittest.TestCase):
+    def test_renewal_replays_only_after_the_atomic_replace_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = hana_guest.GuestPaths(root, root / 'boot')
+            _ = paths.boot_id.write_text('boot')
+            settings = hana_guest.SafetySettings(True, 10, 1, 180, 2, 2, 10)
+            descriptor: dict[str, object] = {'version': 1, 'deployment': 'deployment', 'start_token': 'start',
+                                             'expires': 1200}
+            original = hana_guest.WorkPermit(1050, '1', 'boot')
+            renewal = hana_guest.WorkPermit(1100, '2', 'boot')
+            first: dict[str, object] = {'deployment': 'deployment', 'start_token': 'start', 'token': 'initial',
+                'execution': 'fixture', 'permit': asdict(original), 'expected_generation': 0}
+            next_permit = {**first, 'token': 'renewal', 'permit': asdict(renewal), 'expected_generation': 1}
+            write = os.replace
+
+            def refuse_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+                self.assertEqual(Path(destination), paths.permit)
+                self.assertEqual(json.loads(Path(source).read_text()), asdict(renewal))
+                raise OSError('fixture rename failure')
+
+            _ = hana_receiver.receive(settings, descriptor, first, paths=paths, clock=lambda: 1000)
+            with mock.patch.object(os, 'replace', side_effect=refuse_replace):
+                with self.assertRaisesRegex(OSError, 'fixture rename failure'):
+                    _ = hana_receiver.receive(settings, descriptor, next_permit, paths=paths, clock=lambda: 1000)
+            self.assertEqual(hana_guest.read_permit(paths.permit), original)
+            with mock.patch.object(os, 'replace', wraps=write) as rename:
+                reply = hana_receiver.receive(settings, descriptor, next_permit, paths=paths, clock=lambda: 1000)
+                self.assertEqual(reply['generation'], 2)
+                self.assertEqual(hana_receiver.receive(
+                    settings, descriptor, next_permit, paths=paths, clock=lambda: 1000), reply)
+                self.assertEqual(rename.call_count, 1)
+            with hana_guest.guest_lock(paths):
+                self.assertEqual(hana_guest.bound_permit(settings, paths, clock=lambda: 1000, uptime=lambda: 5),
+                                 hana_guest.PermitDeadline(renewal, 105))
+            with self.assertRaisesRegex(ValueError, 'generation changed'):
+                _ = hana_receiver.receive(settings, descriptor, first, paths=paths, clock=lambda: 1000)
+
+
 class HanaReceiverSettingsTests(unittest.TestCase):
     def test_source_supervision_uses_the_shared_deadline_without_a_compiler(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -91,10 +130,9 @@ class HanaReceiverSettingsTests(unittest.TestCase):
                 root = Path(temporary)
                 paths = hana_guest.GuestPaths(root, root / 'boot')
                 _ = paths.boot_id.write_text('boot')
-                _ = paths.generation.write_text('1')
                 permit = hana_guest.WorkPermit(1100, '1', 'boot')
                 settings = hana_guest.SafetySettings(True, 10, 1, 180, 2, 2, 10)
-                hana_guest.write_permit(settings, permit, paths=paths, clock=lambda: 1000)
+                hana_guest.write_permit(settings, permit, expected_generation=0, paths=paths, clock=lambda: 1000)
                 request = request_for(b'')
                 request = replace(request, manifest=replace(request.manifest, runtime_abi=abi))
                 prefix = 'https://fixture.s3.us-east-2.amazonaws.com/'

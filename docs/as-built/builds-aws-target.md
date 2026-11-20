@@ -235,16 +235,17 @@ Tool setup runs after the guard and requires the bounded data mount.
 A failed setup or missing disk cannot prevent the guard from requesting poweroff.
 The mount bounds both device discovery and mount execution through `mount_timeout_seconds`.
 
-Phase D must deliver `/run/hana-aws/work-permit.json` and `/run/hana-aws/generation` as private, root-owned files.
-The permit fields are `expires_at` (UTC epoch seconds), `generation`, and `boot_id`.
+The receiver installs the private, root-owned record `/run/hana-aws/active-work-permit.json`.
+The record holds `expires_at` in UTC epoch seconds, `generation`, and `boot_id`.
 The boot ID must match `/proc/sys/kernel/random/boot_id`.
-The guard and watchdog only read the permit and identity files.
+The receiver atomically replaces the record through a private temporary file before it acknowledges the permit.
+The guard and watchdog read the same record for the permit and generation.
+The receiver, guard, and watchdog ignore the legacy `work-permit.json` and `generation` files.
+A folder with only legacy permit files starts with no installed permit and expects a prior generation of zero.
 Missing, unreadable, malformed, expired, or mismatched permits grant no permission.
 `permit_max_seconds=1800` bounds one renewal window.
 A permit beyond that window grants no permission.
 Phase C reserves permission for longer steps.
-Phase D must deliver renewals through `write_permit()`.
-The writer uses a private temporary file and atomic rename.
 
 On the first read, safety records the permit's boot-clock deadline in `/run/hana-aws/permit-deadline.json`.
 An unchanged permit retains that deadline across later reads and service restarts.
@@ -423,7 +424,8 @@ Each bootstrap, start, or publication attempt still needs accepted spending.
 A publication includes the expected prior generation and the current execution identity.
 Command permission requires a current active claim, verified boot, acknowledged permit, and accepted spending.
 Renewal retains the execution identity and advances the permit generation.
-A refused or lost publication does not extend the guest deadline.
+A failed install leaves the active permit unchanged.
+An exact replay can acknowledge the installed permit while it is fresh.
 The controller reserves exposure until stop confirmation through the Phase C ledger.
 It reconciles automatic restarts without a caller, including while placement is disabled.
 An automatic restart cannot reuse an interrupted execution's boot challenge.

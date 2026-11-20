@@ -171,10 +171,9 @@ class HanaRunnerTests(unittest.TestCase):
         self.paths = guest.GuestPaths(self.root / 'root-control', self.root / 'boot-id')
         self.paths.directory.mkdir(mode=0o700)
         _ = self.paths.boot_id.write_text('boot')
-        _ = self.paths.generation.write_text('1')
         self.permit = guest.WorkPermit(1100, '1', 'boot')
-        guest.atomic_record(self.paths.permit, {'expires_at': 1100, 'generation': '1', 'boot_id': 'boot'})
         self.settings = replace(guest.read_settings(self.fixture.configuration), enabled=True)
+        guest.write_permit(self.settings, self.permit, expected_generation=0, paths=self.paths, clock=lambda: 1000)
         self.descriptor = {'version': 1, 'deployment': 'deployment', 'start_token': 'start', 'expires': 1200}
         self.access = hana_protocol.HanaExecutionAccess(
             'https://fixture.s3.us-east-2.amazonaws.com/observation',

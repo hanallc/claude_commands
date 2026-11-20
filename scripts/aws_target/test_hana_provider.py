@@ -699,7 +699,7 @@ class HanaProviderTests(CostFixture):
         self.assertNotIn('AWS_SESSION_TOKEN', self.fake.environments[-1])
         self.assertEqual(self.fake.environments[-1]['AWS_CONFIG_FILE'], '/dev/null')
 
-    def test_receiver_checks_boot_generation_expiry_and_shutdown_fence(self) -> None:
+    def test_receiver_ignores_legacy_state_and_checks_the_shutdown_fence(self) -> None:
         folder = self.root / 'guest'
         folder.mkdir()
         boot = self.root / 'boot-id'
@@ -711,9 +711,21 @@ class HanaProviderTests(CostFixture):
         control: dict[str, object] = {'deployment': IDENTITY.deployment, 'start_token': 'fixture-start', 'token': 'fixture-token',
             'expected_generation': 0, 'execution': 'fixture-execution',
             'permit': {'expires_at': self.clock.now + settings.permit_max_seconds, 'generation': '1', 'boot_id': 'fixture-boot'}}
+        legacy = json.dumps(control['permit'])
+        _ = (folder / 'work-permit.json').write_text(legacy)
+        _ = (folder / 'generation').write_text('1')
+        with hana_guest.guest_lock(paths):
+            self.assertIs(hana_guest.bound_permit(settings, paths, clock=self.clock, uptime=lambda: 1),
+                          hana_guest.PermitRefusal.NOT_INSTALLED)
+        with self.assertRaisesRegex(ValueError, 'generation changed'):
+            _ = hana_receiver.receive(settings, descriptor, {**control, 'expected_generation': 1},
+                                      paths=paths, clock=self.clock)
         reply = hana_receiver.receive(settings, descriptor, control, paths=paths, clock=self.clock)
         self.assertEqual(reply['generation'], 1)
-        self.assertEqual(hana_guest.read_identity(paths.generation), '1')
+        self.assertEqual(hana_guest.read_permit(paths.permit),
+                         hana_guest.WorkPermit(self.clock.now + settings.permit_max_seconds, '1', 'fixture-boot'))
+        self.assertEqual((folder / 'work-permit.json').read_text(), legacy)
+        self.assertEqual((folder / 'generation').read_text(), '1')
         self.assertEqual(hana_receiver.receive(settings, descriptor, control, paths=paths, clock=self.clock), reply)
         _ = paths.fence.write_text('{}')
         with self.assertRaisesRegex(ValueError, 'shutdown is fenced'):
