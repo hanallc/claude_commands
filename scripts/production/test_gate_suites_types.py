@@ -12,9 +12,11 @@ import json
 import tempfile
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from dataclasses import replace
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import ClassVar, TextIO, cast, final, override
 from unittest import mock
@@ -91,14 +93,15 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
     def test_nightly_sends_each_type_diagnostic_to_its_author_unit(self) -> None:
-        config = Path(self.environment["CONF_DIR"])
+        config = copy_config_fixture(Path(self.environment["CONF_DIR"]), self.root / "author-config")
+        self.environment["CONF_DIR"] = str(config)
         for name, keys in (
             ("send", ("delivery_timeout", "kill_grace", "remote_transport_seconds",
                       "waits_review_seconds", "caller_margin_seconds")),
             ("postmaster", ("wait_seconds", "claim_grace_seconds")),
             ("codex_daemon", ("timeout_seconds",)),
         ):
-            _ = write_config_fixture(config / f"{name}.conf", "".join(f"# range: 0.001..\n{key}=1\n" for key in keys))
+            self.write(config / f"{name}.conf", "".join(f"# range: 0.001..\n{key}=1\n" for key in keys))
         history = self.root / "history"
         source = "scripts/receipt.py"
         hidden_source = "scripts/receipt detail.py"
@@ -399,7 +402,8 @@ class NightlyPushTests(unittest.TestCase):
             "nightly_result_push=on\nnightly_result_modules=8\nnightly_assign_minutes=30\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "CONF_DIR": str(config),
-            "GATE_STATE_DIR": str(self.root / "state"), "USER_ZONE": "America/New_York"})))
+            "GATE_STATE_DIR": str(self.root / "state"), "USER_ZONE": "America/New_York",
+            "HERDR_UPKEEP_DEADLINE": "inf"})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         owner = fixture_member("showrunner", name="sdlc")
         _ = fixture_member("unit", name="fixes", parent=owner.id)
@@ -665,6 +669,57 @@ class NightlyPushTests(unittest.TestCase):
         with gate.nightly_red_lock() as directory:
             self.assertEqual(gate.read_nightly_red(directory / "a-stalled.json"), first)
             self.assertIsInstance(gate.read_nightly_red(directory / "b-ready.json").alerted, gate.NightlyAlertSent)
+
+    def test_upkeep_deadline_leaves_time_for_later_nightly_results(self) -> None:
+        finished = datetime(2026, 11, 11, 8, tzinfo=UTC)
+        NightlyClock.current = finished + timedelta(minutes=31)
+        _ = (self.root / "config/gate.conf").write_text(
+            "# whole: 1..\nnightly_assign_minutes=30\n", encoding="utf-8")
+        stalled = gate.NightlyRedResult("a-stalled", "main", "tree", finished.isoformat(), (), "passed", "failed")
+        with gate.nightly_red_lock() as directory:
+            gate.save_nightly_red(directory, stalled)
+            gate.save_nightly_red(directory, replace(stalled, id="b-queued"))
+            gate.save_nightly_red(directory, replace(stalled, id="c-ready"))
+
+        elapsed = 50.0
+        supervisor_deadline = 60.0
+        send_budget_seconds = 193.0
+
+        def monotonic() -> float:
+            return elapsed
+
+        def send(command: list[str], *, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal elapsed
+            key = command[command.index("--key") + 1]
+            self.assertGreater(timeout, 0)
+            if key.endswith(":a-stalled"):
+                elapsed += timeout
+                raise subprocess.TimeoutExpired(command, timeout)
+            self.assertLess(elapsed, supervisor_deadline)
+            self.assertLess(elapsed + timeout, supervisor_deadline)
+            if key.endswith(":b-queued"):
+                return subprocess.CompletedProcess(command, 1, "QUEUED: fixture delivery paused\n", "")
+            return subprocess.CompletedProcess(command, 0, "SENT: fixture\n", "")
+
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {"HERDR_UPKEEP_DEADLINE": str(supervisor_deadline)}),
+              mock.patch.object(time, "monotonic", side_effect=monotonic),
+              mock.patch.object(showrunners, "monotonic", side_effect=monotonic),
+              mock.patch.object(gate, "datetime", NightlyClock),
+              mock.patch.object(gate, "nightly_owner_name", return_value="sdlc"),
+              mock.patch.object(send_budget, "seconds", return_value=send_budget_seconds),
+              mock.patch.object(showrunners, "current_address", return_value="uds:/fixture"),
+              mock.patch.object(subprocess, "run", side_effect=send) as sent,
+              redirect_stdout(output)):
+            self.assertEqual(gate.main(["nightly-check"]), 0)
+
+        self.assertEqual(sent.call_count, 3)
+        self.assertIn("the notice deadline expired", output.getvalue())
+        self.assertIn("QUEUED: fixture delivery paused", output.getvalue())
+        with gate.nightly_red_lock() as directory:
+            self.assertEqual(gate.read_nightly_red(directory / "a-stalled.json"), stalled)
+            self.assertIsInstance(gate.read_nightly_red(directory / "b-queued.json").alerted, gate.NightlyAlertUnsent)
+            self.assertIsInstance(gate.read_nightly_red(directory / "c-ready.json").alerted, gate.NightlyAlertSent)
 
     def test_nightly_check_retries_an_assigned_push_without_claiming_receipt(self) -> None:
         directory = self.root / "state/nightly-red"

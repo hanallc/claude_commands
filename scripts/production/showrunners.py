@@ -542,8 +542,8 @@ def send_to_address(address: str, key: str, text: str, *, recipient: str,
     except subprocess.TimeoutExpired:
         return NoticeDelivery((f"could not tell {recipient}: the notice deadline expired",), failed=(recipient,))
     if sent.returncode != 0:
-        return NoticeDelivery((f"could not tell {recipient}: {sent.stderr.strip() or f'send.py exited {sent.returncode}'}",),
-                              failed=(recipient,))
+        reason = sent.stdout.strip() or sent.stderr.strip() or f"send.py exited {sent.returncode}"
+        return NoticeDelivery((f"could not tell {recipient}: {reason}",), failed=(recipient,))
     return NoticeDelivery((f"told {recipient}",))
 
 
@@ -558,9 +558,10 @@ def deliver(production_name: str, key: str, text: str, *,
 
 
 def tell(production_name: str, key: str, text: str, *, sender: str = "showrunners",
-         bounded: bool = False) -> str:
+         bounded: bool = False, deadline: float | None = None) -> str:
     """Send one line and preserve the existing human-readable delivery report."""
-    deadline = notice_deadline(send_budget.seconds()) if bounded else None
+    if bounded:
+        deadline = min(deadline if deadline is not None else math.inf, notice_deadline(send_budget.seconds()))
     return deliver(production_name, key, text, sender=sender, deadline=deadline).lines[0]
 
 

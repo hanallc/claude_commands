@@ -2996,7 +2996,8 @@ def nightly_time(at: str) -> str:
     return datetime.fromisoformat(at).astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def send_nightly_red(directory: Path, result: NightlyRedResult, assignment: NightlyFixAssigned) -> bool:
+def send_nightly_red(directory: Path, result: NightlyRedResult, assignment: NightlyFixAssigned, *,
+                     deadline: float = math.inf) -> bool:
     from scripts.notify import push_texts, review
 
     if isinstance(result.delivery, NightlyPushAccepted) or conf.read("gate").text("nightly_result_push") == "off":
@@ -3012,7 +3013,7 @@ def send_nightly_red(directory: Path, result: NightlyRedResult, assignment: Nigh
     command = push_texts.user_send_argv(rendered, key=f"nightly-result:{result.id}")
     # This window exceeds the complete datetime range. Accepted results never expire.
     command.extend(["--repeat-minutes", str(timedelta.max.days * 1440)])
-    deadline = showrunners.notice_deadline(send_budget.user_seconds(review.user_send_seconds()))
+    deadline = min(deadline, showrunners.notice_deadline(send_budget.user_seconds(review.user_send_seconds())))
     try:
         sent = showrunners.run_notice(command, deadline=deadline)
     except subprocess.TimeoutExpired as error:
@@ -3054,7 +3055,7 @@ def assign_nightly_red(unit: str, identity: str = "") -> int:
     return 0
 
 
-def alert_nightly_unassigned(directory: Path, result: NightlyRedResult) -> bool:
+def alert_nightly_unassigned(directory: Path, result: NightlyRedResult, *, deadline: float) -> bool:
     """Tell the production owner once in each assignment window that a red result has no assigned fix."""
 
     window = timedelta(minutes=conf.read("gate").whole("nightly_assign_minutes"))
@@ -3068,7 +3069,7 @@ def alert_nightly_unassigned(directory: Path, result: NightlyRedResult) -> bool:
         f"Nightly merge gate result {result.id} has no assigned fix after {minutes} minutes: "
         + f"{result.branch} tree {result.tree}. Type check: {result.types}. Full tests: {result.tests}. "
         + f"The user gets the result push only after assignment: gate.py nightly-assigned --result {result.id} --unit UNIT.",
-        bounded=True)
+        bounded=True, deadline=deadline)
     print(f"Nightly assignment alert: {outcome}", flush=True)
     if outcome != f"told {owner}":
         return False
@@ -3082,14 +3083,23 @@ def check_nightly_assignments() -> int:
         return 0
     changed = False
     failed = False
+    # Upkeep sets this deadline from job.timeout_seconds before it starts the worker.
+    # Reserve half the remaining time for upkeep and cleanup.
+    supervisor_deadline = float(os.environ.get("HERDR_UPKEEP_DEADLINE", "inf"))
+    began = time.monotonic()
+    notices_end = began + max(0.0, supervisor_deadline - began) / 2
     with nightly_red_lock() as directory:
-        for path in sorted(directory.glob("*.json")):
+        paths = sorted(directory.glob("*.json"))
+        for index, path in enumerate(paths):
+            # Share unused time with the remaining results.
+            now = time.monotonic()
+            deadline = now + max(0.0, notices_end - now) / (len(paths) - index)
             try:
                 result = read_nightly_red(path)
                 if isinstance(result.assignment, NightlyFixUnassigned):
-                    changed = alert_nightly_unassigned(directory, result) or changed
+                    changed = alert_nightly_unassigned(directory, result, deadline=deadline) or changed
                 elif isinstance(result.delivery, NightlyPushPending):
-                    changed = send_nightly_red(directory, result, result.assignment) or changed
+                    changed = send_nightly_red(directory, result, result.assignment, deadline=deadline) or changed
             except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"Nightly result check: {error}", file=sys.stderr)
                 failed = True
