@@ -20,6 +20,7 @@ from unittest import mock
 from scripts.aws_target import aws_trial, gate_box, ledger
 from scripts.aws_target import test_aws_trial as trial_tests
 from scripts.aws_target.ledger_test_support import write_gate_config
+from scripts.lib import bubble_wrapped_tests
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import gate
 from scripts.test_times import gate_record
@@ -131,6 +132,9 @@ subprocess.run = fail_log_put
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         write_gate_config(root / 'cloud_gate.conf')
         trial_tests.write_guest_config(root, slow_test_s=0.5)
+        configuration = root / 'bubble_wrapped_tests.conf'
+        _ = configuration.write_text(f'bubblewrap={bubble_wrapped_tests.SYSTEM / "bin/bwrap"}\n')
+        _ = self.enterContext(mock.patch.object(bubble_wrapped_tests, 'CONFIG', configuration))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(root)})))
 
     def test_trial_and_route_share_one_guest(self) -> None:
@@ -218,7 +222,7 @@ subprocess.run = fail_log_put
         self.assertNotIn('#basedpyright', script)
         self.assertIn('#chromium', script)
         self.assertIn('github:NixOS/nixpkgs/fixture-revision#bubblewrap', script)
-        self.assertIn('stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial', script)
+        self.assertIn('stage=bwrap unavailable:', script)
         self.assertLessEqual(len(script.encode()), 16384)
         result = subprocess.run(['sh', '-n'], input=script, text=True, capture_output=True,
                                 timeout=TEST_HANG_GUARD_SECS, check=False)
@@ -230,12 +234,13 @@ subprocess.run = fail_log_put
                 self.assertIn(f'-o "$box_dir/{name}"', script)
         session = shlex.split(script[script.index('nix --extra-experimental-features'):])[-1]
         self.assertLess(session.index("gate_curl 'GET guest'"), session.index('exec python3'))
-        check = session.index('if ! bwrap --ro-bind / / true; then')
+        check = session.index('if ! "$1" --unshare-user')
         self.assertLess(session.index('stage=tools ready'), check)
         self.assertLess(session.index('runuser -u gate-trial'), check)
         self.assertLess(session.index('export PATH="$tool_path:$PATH"'), check)
         self.assertLess(check, session.index('stage=bwrap ready'))
         self.assertLess(session.index('stage=bwrap ready'), session.index('exec python3'))
+        self.assertTrue(session.rstrip().endswith('gate-readiness /run/current-system/sw/bin/bwrap'))
 
     def test_full_gate_downloads_program_and_request_without_inlining_modules(self) -> None:
         modules = [f'scripts/fixture/test_module_{index:04d}.py' for index in range(740)]
@@ -272,7 +277,7 @@ subprocess.run = fail_log_put
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
-        self.production_boot_stubs(('', 'boot', 'nix', 'tools shell', 'tools ready', 'bwrap unavailable',
+        self.production_boot_stubs(('', 'boot', 'nix', 'tools shell', 'tools ready', 'bwrap unavailable', 'bwrap path missing',
                                     'source ready', 'tests start', 'result upload'))
 
     def test_transfer_failures_remove_signed_urls_from_boot_and_result(self) -> None:
@@ -345,7 +350,6 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
             'nix': 'Tool preparation failed (exit 7)',
             'tools shell': 'Tool preparation failed (exit 7)',
             'tools ready': 'The box failed at stage tools ready (exit 7)',
-            'bwrap unavailable': 'stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial (exit 1)',
             'result upload': 'The box failed at stage result upload (exit 1)',
             'paired request download': 'The box failed at stage tools ready (exit 7)',
         }
@@ -353,6 +357,9 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 tools, box, repo = root / 'bin', root / 'box', root / 'repo'
+                system = root / 'system'
+                executable = system / 'bin/bwrap'
+                bwrap_failure = f'stage=bwrap unavailable: {executable} or its namespaces do not work for gate-trial'
                 tools.mkdir()
                 (root / 'home').mkdir()
                 if failure == 'boot error write':
@@ -482,7 +489,9 @@ elif name == 'runuser':
     command = ['HOME=' + str(root / 'home') if word.startswith('HOME=') else word for word in command]
     sys.exit(subprocess.call(command))
 elif name == 'bwrap':
-    assert args == ['--ro-bind', '/', '/', 'true'], args
+    if os.environ['FAIL_STAGE'] != 'bwrap path missing':
+        assert args == ['--unshare-user', '--unshare-pid', '--unshare-net', '--unshare-cgroup',
+                        '--unshare-ipc', '--unshare-uts', '--cap-drop', 'ALL', '--ro-bind', '/', '/', 'true'], args
     fail('bwrap unavailable')
 elif name == 'ps':
     if 'etimes,pcpu,rss,args' in args:
@@ -519,6 +528,9 @@ else:
                     command = tools / name
                     _ = command.write_text(stub)
                     command.chmod(0o700)
+                if failure != 'bwrap path missing':
+                    executable.parent.mkdir(parents=True)
+                    executable.symlink_to(tools / 'bwrap')
                 (tools / 'python3').symlink_to(sys.executable)
                 links = {'production': 'true', 'gate_time_limit_s': '2.5', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
                          'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': request_mode,
@@ -534,7 +546,11 @@ else:
                     links['module_seconds'] = 'https://fixture.invalid/artifacts/attempt/module_seconds.json'
                 signed = {key: value + '?key=' + key + '&signature=' + TRANSFER_MARKER
                           if key != 'origin' and value.startswith('https://') else value for key, value in links.items()}
-                script = gate_box.user_data(signed, 'f' * 40, 20, 5, 1800)
+                configuration = root / 'bubble_wrapped_tests.conf'
+                _ = configuration.write_text(f'bubblewrap={executable}\n')
+                with (mock.patch.object(bubble_wrapped_tests, 'CONFIG', configuration),
+                      mock.patch.object(bubble_wrapped_tests, 'SYSTEM', system)):
+                    script = gate_box.user_data(signed, 'f' * 40, 20, 5, 1800)
                 if failure == 'boot error record':
                     script = script.replace('"error":"%s (exit %s)"', '"error":"%s (exit %s)","detail":"%s"')
                     script = script.replace('"$message" "$status" > "$file"',
@@ -594,12 +610,14 @@ else:
                     detail = ledger.text(results[-1], field)
                     self.assertIn(f'{stage} failed (curl exit 7, HTTP 403)', detail)
                     self.assertNotIn('CalledProcessError', detail)
-                if failure in ('bwrap unavailable', 'result upload'):
+                bwrap_refused = failure in ('bwrap unavailable', 'bwrap path missing')
+                if bwrap_refused or failure == 'result upload':
                     self.assertEqual(reply.returncode, 1, log + reply.stderr)
                     self.assertIn('shutdown -h now', trace)
                     self.assertLess(trace.index('upload result'), trace.index('shutdown -h now'))
-                if failure in boot_errors:
-                    self.assertEqual(results[-1]['error'], boot_errors[failure], log)
+                if bwrap_refused or failure in boot_errors:
+                    error = f'{bwrap_failure} (exit 1)' if bwrap_refused else boot_errors[failure]
+                    self.assertEqual(results[-1]['error'], error, log)
                     if failure == 'boot error record':
                         self.assertTrue(TRANSFER_MARKER in (box / 'boot-error.json').read_text())
                         self.assertEqual(results[-1]['detail'], '[URL removed]')
@@ -611,9 +629,9 @@ else:
                         self.assertIn('Traceback', ledger.text(uploads[-2], 'body'))
                     if failure == 'paired request download':
                         self.assertIn('GET request failed (curl exit 7, HTTP 403)', log)
-                    if failure == 'bwrap unavailable':
-                        self.assertIn('stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial',
-                                      ledger.text(uploads[-2], 'body'))
+                    if bwrap_refused:
+                        self.assertIn(bwrap_failure, ledger.text(uploads[-2], 'body'))
+                        self.assertEqual('bwrap' in trace, failure == 'bwrap unavailable')
                         self.assertNotIn('stage=tools checked', log)
                         self.assertNotIn('stage=tests start', log)
                 else:

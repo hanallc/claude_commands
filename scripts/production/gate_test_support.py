@@ -371,6 +371,7 @@ class MergeGateFixture(unittest.TestCase):
         _ = self.enterContext(LauncherHangGuard(self.id()).protect())
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.restore_fixture(suites_for_case(self))
+        _ = self.enterContext(mock.patch.object(bubble_wrapped_tests, "CONFIG", self.wrapper_configuration))
         _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
         self.admission = caller_admission(self, self.root, self.environment)
         self.admission_started = True
@@ -403,6 +404,10 @@ class MergeGateFixture(unittest.TestCase):
             self.admission = caller_admission(self, self.root, self.environment)
 
     @property
+    def wrapper_configuration(self) -> Path:
+        return self.root / "config/bubble_wrapped_tests.conf"
+
+    @property
     def module_count(self) -> int:
         return len(self.suites) + int("lib" in self.suites)
 
@@ -414,15 +419,12 @@ class MergeGateFixture(unittest.TestCase):
 
     @contextlib.contextmanager
     def fake_module_scopes(self) -> Generator[Path]:
-        """Use private scope files and retain the variables for the fixture tools."""
+        """Use private scope files for the fixture tools."""
         cgroups = self.root / "builds.slice"
         self.write(cgroups / "cgroup.kill", "")
         self.write(cgroups / "cgroup.events", "populated 0\n")
-        configuration = self.root / "config/bubble_wrapped_tests.conf"
-        self.write(configuration, f"bubblewrap={bubble_wrapped_tests.SYSTEM / 'bin/bwrap'}\n"
-                   + "kept_environment=PATH HOME BUILDLOG_BUILDS_CGROUP CONF_DIR GATE_TEST_STATE GATE_TEST_REPO\n")
         with mock.patch.dict(self.environment, {"BUILDLOG_BUILDS_CGROUP": str(cgroups)}), \
-                mock.patch.dict(os.environ, self.environment), mock.patch.object(bubble_wrapped_tests, "CONFIG", configuration):
+                mock.patch.dict(os.environ, self.environment):
             yield cgroups
 
     @contextlib.contextmanager
@@ -603,6 +605,10 @@ class MergeGateFixture(unittest.TestCase):
         copy_runtime(self.bin.parent)
         self.bin.mkdir()
         self.state.mkdir()
+        self.write(self.wrapper_configuration,
+                   f"bubblewrap={bubble_wrapped_tests.SYSTEM / 'bin/bwrap'}\n"
+                   + "kept_environment=PATH HOME BUILDLOG_BUILDS_CGROUP CONF_DIR GATE_TEST_STATE GATE_TEST_REPO "
+                   + "GATE_TEST_WAIT GATE_TEST_ISOLATION GATE_TEST_PYTHONPATH\n")
         _ = write_config_fixture(self.root / "config/buildlog.conf")
         for configuration in (self.root, Path(self.environment["CONF_DIR"])):
             _ = write_config_fixture(configuration / "gate.conf", GATE_TEST_SETTINGS)
@@ -739,6 +745,8 @@ class MergeGateFixture(unittest.TestCase):
                        "(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)]; ")
         source += ("from scripts.production import gate; \n"
                    + "from pathlib import Path\nimport os\nfrom scripts.message import session_send\n"
+                   + "from scripts.lib import bubble_wrapped_tests\n"
+                   + f"bubble_wrapped_tests.CONFIG = Path({str(self.wrapper_configuration)!r})\n"
                    + "session_send.SEND_SCRIPT = Path(os.environ['GATE_TEST_STATE']).parent / 'bin/send.py'\n"
                    + "entry = gate\n"
                    + preamble + "\n"

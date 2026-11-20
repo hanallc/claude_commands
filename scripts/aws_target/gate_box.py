@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, cast
 from enum import StrEnum
 import math
 
+from scripts.lib import bubble_wrapped_tests, conf
 from scripts.lib.python_startup import sitecustomize as python_startup
 
 if TYPE_CHECKING:
@@ -565,7 +566,7 @@ log_push_pid=$!
 '''
 
 
-BWRAP_UNAVAILABLE_STAGE = 'bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial'
+BWRAP_UNAVAILABLE_STAGE = 'bwrap unavailable: '
 
 
 def boot_trap(cold: str, warm: str, *, production: bool) -> str:
@@ -585,7 +586,7 @@ def boot_trap(cold: str, warm: str, *, production: bool) -> str:
         stage=$(sed -n 's/^[0-9T:Z-]\{{20\}} stage=//p' "$box_dir/boot.log" | tail -n 1)
         if [ "$stage" = 'tool preparation' ]; then
             message='Tool preparation failed'
-        elif [ "$stage" = '{BWRAP_UNAVAILABLE_STAGE}' ]; then
+        elif [ "${{stage#'{BWRAP_UNAVAILABLE_STAGE}'}}" != "$stage" ]; then
             message="stage=$stage"
         else
             message="The box failed at stage ${{stage:-boot}}"
@@ -610,7 +611,8 @@ GATE_IMAGE_OWNER_TAG = 'cloud-claude-gate-image'
 def user_data(links: dict[str, str], revision: str, lifetime_minutes: int, log_push_s: float,
               module_time_limit_s: float) -> str:
     """Run directly in amazon-init on each boot."""
-    from scripts.lib import conf
+    executable = bubble_wrapped_tests.executable_path(conf.read(bubble_wrapped_tests.CONFIG))
+    namespaces = shlex.join(bubble_wrapped_tests.NAMESPACE_OPTIONS)
     packages = conf.read_or_repository('cloud_gate').words('packages')
     tools = ' '.join(shlex.quote(f'github:NixOS/nixpkgs/{revision}#{name}') for name in packages)
     if links['step'] == 'size':
@@ -646,12 +648,12 @@ tool_path=$PATH
 unset __NIXOS_SET_ENVIRONMENT_DONE __ETC_PROFILE_SOURCED
 . /etc/profile
 export PATH="$tool_path:$PATH"
-if ! bwrap --ro-bind / / true; then
-    printf "%s stage={BWRAP_UNAVAILABLE_STAGE}\\n" "$(date -u +%FT%TZ)" >&2
+if ! "$1" {namespaces} --ro-bind / / true; then
+    printf "%s stage={BWRAP_UNAVAILABLE_STAGE}%s or its namespaces do not work for gate-trial\\n" "$(date -u +%FT%TZ)" "$1" >&2
     exit 1
 fi
 printf "%s stage=bwrap ready\\n" "$(date -u +%FT%TZ)" >&2
-exec python3 "$box_dir/guest.py"'
+exec python3 "$box_dir/guest.py"' gate-readiness {shlex.quote(str(executable))}
 '''
     deadline = (f'systemd-run --unit=cloud-gate-expiry --on-calendar=@{int(links["expires"])} /run/current-system/sw/bin/shutdown -h now'
                 if production else f'shutdown -h +{lifetime_minutes}')

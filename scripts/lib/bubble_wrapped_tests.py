@@ -26,6 +26,10 @@ CHECKOUT = Path(__file__).resolve().parents[2]
 SYSTEM = Path("/run/current-system/sw")
 CONFIG = CHECKOUT / "config/bubble_wrapped_tests.conf"
 HOME = "/home/test"
+NAMESPACE_OPTIONS = (
+    "--unshare-user", "--unshare-pid", "--unshare-net",
+    "--unshare-cgroup", "--unshare-ipc", "--unshare-uts", "--cap-drop", "ALL",
+)
 MODULE_VALUES = (
     "BUILDLOG_DIR", "BUILDLOG_LIVE_MEMORY_TRIPWIRE", "HERDR_BIN", "HERDR_PANE_RECORD_DIR",
     "SESSION_TEMP_ROOT", "STAFF_FILE", "TEST_TIMES_OUT",
@@ -74,6 +78,15 @@ def _kept_environment(settings: conf.ConfigRead, environment: Mapping[str, str])
     return {key: environment[key] for key in keys if key in environment}
 
 
+def executable_path(settings: conf.ConfigRead) -> Path:
+    """Read the configured path for the machine that runs Bubblewrap."""
+    executable = Path(settings.text("bubblewrap", recover_invalid=False))
+    expected = SYSTEM / "bin/bwrap"
+    if executable != expected:
+        raise BubblewrapUnavailable(f"Bubblewrap requires {expected}. The configuration names {executable}.")
+    return executable
+
+
 def command(argv: Sequence[str], job_folder: Path, *, lease_fd: int | None = None) -> list[str]:
     """Build a guarded command. The caller owns the job folder lease."""
     if not argv:
@@ -97,9 +110,9 @@ def command(argv: Sequence[str], job_folder: Path, *, lease_fd: int | None = Non
             # The kernel ends nested processes when PID 1 of the outer job exits.
             return ["/usr/bin/env", "-i", *(f"{key}={value}" for key, value in values.items()), *argv]
 
-        executable = Path(settings.text("bubblewrap", recover_invalid=False))
-        if executable != SYSTEM / "bin/bwrap" or not executable.is_file() or not os.access(executable, os.X_OK):
-            raise BubblewrapUnavailable(f"Bubblewrap is unavailable at {SYSTEM / 'bin/bwrap'}")
+        executable = executable_path(settings)
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise BubblewrapUnavailable(f"Bubblewrap is unavailable at {executable}")
         checkout = Path.cwd().resolve() if inputs is None else inputs.checkout.resolve()
         working = checkout
         if inputs is None:
@@ -120,8 +133,7 @@ def command(argv: Sequence[str], job_folder: Path, *, lease_fd: int | None = Non
         uid, gid = os.getuid(), os.getgid()
         _ = (account / "passwd").write_text(f"test:x:{uid}:{gid}:Test account:{HOME}:/bin/sh\n", encoding="ascii")
         _ = (account / "group").write_text(f"test:x:{gid}:\n", encoding="ascii")
-        arguments = [str(executable), "--unshare-user", "--unshare-pid", "--unshare-net",
-                     "--unshare-cgroup", "--unshare-ipc", "--unshare-uts", "--cap-drop", "ALL",
+        arguments = [str(executable), *NAMESPACE_OPTIONS,
                      "--die-with-parent", "--clearenv", "--proc", "/proc", "--dev", "/dev",
                      "--tmpfs", "/tmp", "--tmpfs", "/dev/shm", "--dir", HOME]
         if lease_fd is None:

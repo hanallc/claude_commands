@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta, tzinfo
 from scripts.agents import remote
 from scripts.copies import copies
 from scripts.direct import progress_history
-from scripts.lib import build_folders
+from scripts.lib import build_folders, bubble_wrapped_tests
 from scripts.production import change_review, gate, staff, showrunners
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 from scripts.production.gate_modules import GateRefused
@@ -67,6 +67,17 @@ class MergeGateTypesTests(GateSuitesFixture):
         history, = self.gate_history()
         self.assertEqual(history["shape"], "types")
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+
+    def test_nested_guard_keeps_the_type_checker_fixture_paths(self) -> None:
+        with (mock.patch.object(bubble_wrapped_tests, "guarded", return_value=True),
+              bubble_wrapped_tests.gate_inputs(self.checkout, self.environment, read_only=())):
+            command = bubble_wrapped_tests.command([str(self.bin / "basedpyright")], self.state)
+        result = subprocess.run(command, cwd=self.checkout,
+                                env=bubble_wrapped_tests.host_environment(self.environment),
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.state / "types-ran").read_text(), "ran")
 
     def test_nightly_type_error_names_the_file_without_requiring_full_test_runs(self) -> None:
         from scripts.production import showrunners
