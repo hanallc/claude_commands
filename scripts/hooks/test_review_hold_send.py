@@ -37,12 +37,13 @@ class ReviewHoldSendTests(unittest.TestCase):
             "# range: 0.001..\nreview_hold_idle_minutes=60\n", encoding="utf-8")
         self.environment = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.config), "CONF_DIR": str(conf)}
 
-    def write_session(self, config: Path) -> Path:
+    def write_session(self, config: Path, *, session: str = SESSION) -> Path:
         sessions = config / "sessions"
         sessions.mkdir(parents=True)
         record = sessions / "42.json"
-        _ = record.write_text(json.dumps({"pid": 42, "sessionId": SESSION, "name": NAME,
-                                          "messagingSocketPath": str(self.socket), "updatedAt": 1}), encoding="utf-8")
+        socket = self.socket if session == SESSION else config / "other.sock"
+        _ = record.write_text(json.dumps({"pid": 42, "sessionId": session, "name": NAME,
+                                          "messagingSocketPath": str(socket), "updatedAt": 1}), encoding="utf-8")
         return record
 
     def open_hold(self) -> Path:
@@ -72,8 +73,8 @@ class ReviewHoldSendTests(unittest.TestCase):
         self.assertEqual(decision["hookEventName"], "PreToolUse")
         self.assertEqual(decision["permissionDecision"], "deny")
         reason = decision["permissionDecisionReason"]
-        self.assertIn("The session is in a review.", reason)
-        self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to 'review owner'", reason)
+        self.assertIn(f"{NAME} is in a review.", reason)
+        self.assertIn(f"~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to session:{SESSION} ", reason)
         self.assertIn("Send the same text", reason)
         self.assertIn("KEPT", reason)
         self.assertNotIn(MESSAGE, reason)
@@ -102,11 +103,25 @@ class ReviewHoldSendTests(unittest.TestCase):
         _ = self.open_hold()
         self.assert_allowed(NAME, "URGENT: The build needs attention.")
 
-    def test_allows_a_send_when_a_session_file_is_invalid(self) -> None:
-        record = self.write_session(self.config)
+    def test_denies_a_held_session_beside_an_invalid_session_file(self) -> None:
+        record = self.write_session(self.home / ".claude2")
+        _ = self.write_session(self.config)
         _ = self.open_hold()
-        _ = record.with_name("43.json").write_text("{unreadable", encoding="utf-8")
-        self.assert_allowed(NAME)
+        for invalid in ("{incomplete", "[]", json.dumps({"name": NAME})):
+            with self.subTest(invalid=invalid):
+                _ = record.write_text(invalid, encoding="utf-8")
+                self.assert_denied(NAME)
+
+    def test_denies_a_name_shared_with_a_held_session(self) -> None:
+        _ = self.write_session(self.home / ".claude2", session="other-session")
+        _ = self.write_session(self.config)
+        _ = self.open_hold()
+        self.assert_denied(NAME)
+
+    def test_denies_a_held_session_by_id(self) -> None:
+        _ = self.write_session(self.config)
+        _ = self.open_hold()
+        self.assert_denied(f"session:{SESSION}")
 
     def test_allows_a_send_when_the_hold_file_is_invalid(self) -> None:
         _ = self.write_session(self.config)

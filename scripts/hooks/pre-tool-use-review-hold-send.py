@@ -18,29 +18,35 @@ from scripts.message import review_hold
 
 def matching_sessions(target: str) -> dict[str, str]:
     """Return matching session IDs and names from the Claude registry files."""
-    by_socket = target.startswith("uds:")
-    field = "messagingSocketPath" if by_socket else "name"
-    value = target.removeprefix("uds:") if by_socket else target
+    if target.startswith("uds:"):
+        field, value = "messagingSocketPath", target.removeprefix("uds:")
+    elif target.startswith("session:"):
+        field, value = "sessionId", target.removeprefix("session:")
+    else:
+        field, value = "name", target
     matches: dict[str, str] = {}
     if not value:
         return matches
     for config in config_dirs():
         try:
             paths = list((config / "sessions").iterdir())
-        except FileNotFoundError:
+        except OSError:
             continue
         for path in paths:
             if path.suffix != ".json" or not path.stem.isdecimal():
                 continue
-            raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+            try:
+                raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
             if not isinstance(raw, dict):
-                raise ValueError("expected a session record")
+                continue
             record = cast(dict[str, object], raw)
             if record.get(field) != value:
                 continue
             session = record.get("sessionId")
             if not isinstance(session, str) or not session:
-                raise ValueError("expected a session ID")
+                continue
             name = record.get("name")
             matches[session] = name if isinstance(name, str) and name else f"session:{session}"
     return matches
@@ -60,16 +66,22 @@ def main() -> None:
         if not isinstance(target, str) or not isinstance(message, str) or message.startswith(review_hold.URGENT_PREFIX):
             return
         matches = matching_sessions(target)
-        if len(matches) != 1:
-            return
-        ((session, name),) = matches.items()
-        if not review_hold.has_open_hold(session, time.time()):
-            return
     except Exception:
         return
 
-    reason = ("The session is in a review. Send the same text with "
-              + f"`~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to {shlex.quote(name)} "
+    at = time.time()
+    for session, name in matches.items():
+        try:
+            if review_hold.has_open_hold(session, at):
+                break
+        except Exception:
+            continue
+    else:
+        return
+
+    address = shlex.quote(f"session:{session}")
+    reason = (f"{name} is in a review. Send the same text with "
+              + f"`~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to {address} "
               + '--from "<your session name>" --text "<same text>"`. '
               + "It keeps the message until the review ends and returns KEPT.")
     print(json.dumps({"hookSpecificOutput": {
