@@ -113,12 +113,6 @@ def stub_build_tool_path(directory: Path) -> str:
     return str(directory)
 
 
-def with_interrupts(command: list[str]) -> list[str]:
-    if sys.platform == "linux" and signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
-        return ["env", "--default-signal=INT", *command]
-    return command
-
-
 def processes_carrying(marker: str) -> set[int]:
     """Live processes, other than this one, whose environment holds `marker`; a zombie's reads empty."""
     needle = marker.encode()
@@ -165,8 +159,8 @@ def wait_for_marker_exit(marker: str, timeout: float, *, guardian: int = 0) -> s
     return processes_carrying(marker) - {guardian}
 
 
-def reap(marker: str) -> dict[int, str]:
-    """Kill every process carrying `marker` and wait until none is left.
+def reap(marker: str, *, guardian: int = 0) -> dict[int, str]:
+    """Kill marked processes except the specified guardian.
 
     verify.sh runs each step in its own process group and its step owner in
     its own session, so a kill of verify's group leaves the step's tree
@@ -174,7 +168,7 @@ def reap(marker: str) -> dict[int, str]:
     each one found until a scan finds no new one catches the whole tree.
     """
     stopped: dict[int, str] = {}
-    while fresh := processes_carrying(marker) - stopped.keys():
+    while fresh := processes_carrying(marker) - stopped.keys() - {guardian}:
         for pid in fresh:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGSTOP)
@@ -1440,7 +1434,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
 '''
         invoke = 'source "$TEST_REAL_DIRECT/../lint/invoke.sh"\n'
         _ = script.write_text(invoke + functions + setup + '\neval "$1"\n', encoding="utf-8")
-        return self.enterContext(launch_process(with_interrupts(["bash", str(script), body]), cwd=self.root,
+        return self.enterContext(launch_process(["bash", str(script), body], cwd=self.root,
                                    env={**self.environment, "TEST_REAL_DIRECT": str(VERIFY.parent),
                                         "TEST_TOKEN_RECORD": str(self.board / "locks/cargo.d/holder_pid"),
                                         **(extra or {})},
@@ -1476,7 +1470,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> ManagedProcess[str]:
         return self.enterContext(launch_process(
-            with_interrupts(self.prepare_verify(*arguments, extra=extra)),
+            self.prepare_verify(*arguments, extra=extra),
             cwd=self.root,
             env={**self.environment, **(extra or {})},
             stdout=subprocess.PIPE,
@@ -1626,15 +1620,11 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         _ = reap(self.child_marker())
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
-    def assert_nothing_outlives(self) -> None:
-        # Runs after every other cleanup: a process a call left behind
-        # holds no token and no turn, but `build_hold.py quiet` counts it
-        # as a cargo run for as long as it lives.
-        # Lint recorders intentionally detach from their caller. Wait for their
-        # exit events; a two-second grace period races their work under load.
-        remaining = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS)
+    def assert_nothing_outlives(self, *, guardian: int = 0) -> None:
+        # Wait for detached lint recorders to exit.
+        remaining = wait_for_marker_exit(self.child_marker(), TEST_HANG_GUARD_SECS, guardian=guardian)
         if remaining:
-            survivors = reap(self.child_marker())
+            survivors = reap(self.child_marker(), guardian=guardian)
             for pid in remaining:
                 _ = survivors.setdefault(pid, "exited before reap")
             commands = "\n".join(f"{pid}: {command}" for pid, command in sorted(survivors.items()))

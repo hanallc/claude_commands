@@ -106,12 +106,10 @@ class VerifyStepOwnerTests(unittest.TestCase):
         _ = (self.root / "step.py").write_text('''import json
 import os
 from pathlib import Path
-import signal
 import sys
 with open(sys.argv[1] + "/scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.direct.wait_for_test_state import wait_for_file
 
-signal.signal(signal.SIGTERM, signal.SIG_DFL)
 root = Path(os.environ["TEST_ROOT"])
 name = sys.argv[2]
 ready = root / (name + ".pid")
@@ -123,12 +121,15 @@ wait_for_file(root / (name + ".release"))
 ''')
         self.environment["TEST_REPO"] = str(VERIFY.parent.parent.parent)
 
-    def wrapper(self, *command: str) -> subprocess.CompletedProcess[str]:
+    def start_wrapper(self, *command: str) -> ManagedProcess[str]:
         arguments = ["bash", "-c", self.shell + '\nbuildlog_exec "$@"', "step-owner-test", *command]
-        with launch(arguments, cwd=self.root, env=self.environment,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+        return launch(arguments, cwd=self.root, env=self.environment,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def wrapper(self, *command: str) -> subprocess.CompletedProcess[str]:
+        with self.start_wrapper(*command) as process:
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-            return subprocess.CompletedProcess(arguments, process.wait(), output, errors)
+            return subprocess.CompletedProcess(process.args, process.wait(), output, errors)
 
     def background_sweep(self) -> ManagedProcess[str]:
         script = self.shell + '''
@@ -208,8 +209,7 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" fixture cargo --pid "$$"
         for victim in ("os.getpid()", "os.getppid()"):
             for signum, expected in ((signal.SIGKILL, 137), (signal.SIGTERM, 143)):
                 with self.subTest(victim=victim, signal=signum):
-                    source = ("import os, signal; signal.signal(signal.SIGTERM, signal.SIG_DFL); "
-                              f"os.kill({victim}, {int(signum)})")
+                    source = f"import os; os.kill({victim}, {int(signum)})"
                     result = self.wrapper(sys.executable, "-c", source)
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
@@ -219,17 +219,59 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" fixture cargo --pid "$$"
                 result = self.wrapper(sys.executable, "-c", f"raise SystemExit({status})")
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
 
-    def test_signal_before_workload_launch_reaches_its_group(self) -> None:
+    def test_term_before_workload_launch_closes_the_owner_pipe(self) -> None:
+        guardian = self.root / "guardian.py"
+        _ = guardian.write_text("""\
+import os
+from pathlib import Path
+import runpy
+import select
+import sys
+
+owner_read, status_write, result_write = map(int, sys.argv[2:5])
+if not select.select([owner_read], [], [], 10)[0]:
+    raise TimeoutError("The owner pipe did not close.")
+supervisor = runpy.run_path(sys.argv[1])
+status = supervisor["supervise"](owner_read, status_write, result_write, sys.argv[5:])
+assert status == 0
+Path(os.environ["TEST_ROOT"], "guardian-finished").touch()
+""")
+        self.environment["TEST_GUARDIAN"] = str(guardian)
         launch = "with process_supervisor.launch("
-        forward = "def forward(signum: int) -> None:\n"
         self.assertIn(launch, self.shell)
-        self.assertIn(forward, self.shell)
-        self.shell = self.shell.replace(
-            forward, forward + '    Path(os.environ["TEST_ROOT"], "forwarded").write_text(str(signum))\n', 1)
-        self.shell = self.shell.replace(launch, "os.kill(os.getpid(), signal.SIGTERM)\n" + launch, 1)
-        result = self.wrapper(sys.executable, "-c", "import signal; signal.pause()")
+        terminate_after_spawn = f"""\
+start_process = subprocess.Popen
+def start_guardian(command, **options):
+    guardian = start_process([*command[:3], os.environ["TEST_GUARDIAN"], *command[3:]], **options)
+    os.kill(os.getpid(), {int(signal.SIGTERM)})
+    return guardian
+subprocess.Popen = start_guardian
+
+"""
+        self.shell = self.shell.replace(launch, terminate_after_spawn + launch, 1)
+        result = self.wrapper(sys.executable, "-c", "pass")
         self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
-        self.assertEqual((self.root / "forwarded").read_text(), str(int(signal.SIGTERM)))
+        self.assertTrue((self.root / "guardian-finished").exists(), result.stdout + result.stderr)
+        self.assertFalse((self.root / "board" / "locks" / "cargo.d" / "owned").exists())
+
+    def test_term_after_workload_launch_stops_the_group(self) -> None:
+        launch_workload = "with process_supervisor.launch("
+        self.assertIn(launch_workload, self.shell)
+        self.shell = self.shell.replace(
+            launch_workload, 'os.environ["TEST_STEP_OWNER"] = str(os.getpid())\n' + launch_workload, 1)
+        with self.start_wrapper(sys.executable, "-c", """
+import os, signal, subprocess, sys
+
+member = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
+assert os.getpgid(member.pid) == os.getpgrp()
+print("workload and child started", flush=True)
+os.kill(int(os.environ["TEST_STEP_OWNER"]), signal.SIGTERM)
+signal.pause()
+""") as process:
+            # The group members hold the output pipes open until they exit.
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 143, output + errors)
+            self.assertIn("workload and child started", output)
 
 
 if __name__ == "__main__":

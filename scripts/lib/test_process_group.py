@@ -5,7 +5,6 @@ from __future__ import annotations
 from scripts.lib.checkout_test_support import copy_startup
 
 import ast
-from collections.abc import Callable
 from contextlib import redirect_stderr
 import io
 import json
@@ -20,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from typing import cast, override
+from typing import override
 from unittest.mock import MagicMock, patch
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -247,19 +246,6 @@ class ShellProcessGroupTests(PrivateGroupFixture):
             env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
 
-    def forward(self) -> Callable[[int], None]:
-        """Load only the embedded function that forwards signals."""
-        source = (self.root / "scripts/direct/verify.sh").read_text()
-        embedded = source.split("STEP_OWNER_PY='", 1)[1].split("\n'\n", 1)[0]
-        tree = ast.parse(embedded)
-        statements = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
-        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "forward"]
-        self.assertEqual(len(functions), 1)
-        module = ast.Module(body=[*statements, functions[0]], type_ignores=[])
-        namespace: dict[str, object] = {"child": self.private_child().pid}
-        exec(compile(module, str(self.root / "scripts/direct/verify.sh"), "exec"), namespace)
-        return cast(Callable[[int], None], namespace["forward"])
-
     def fake_helper(self, status: int) -> None:
         _ = (self.root / "scripts/lib/process_group.py").write_text(
             "import pathlib, sys\n"
@@ -274,7 +260,9 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         assert definition is not None
         watch = self.root / "watch"
         watch.mkdir(exist_ok=True)
-        driver = """
+        (self.root / "helper-arguments").unlink(missing_ok=True)
+        (watch / "individual-signals").unlink(missing_ok=True)
+        driver = r"""
 RUN_STEP_PID="$1"
 STEP_RECORD_SCRIPT="$2"
 TREE_WATCH_DIR="$3"
@@ -282,13 +270,20 @@ PY="$HOME/no-helper"
 TREE_CHANGED_STATUS=77
 CMD=check
 RUN_STARTED=0
+find_mac_runner_pid() { runner_pid=""; }
 after_tree_change() { return 0; }
 stop_tree_watch() { :; }
 release_token() { :; }
 note_event() { :; }
 interrupt_hold_wait() { :; }
 verify_cleanup() { :; }
-final_pass_finish() { :; }
+verify_helper() { :; }
+finish_verify_run() { :; }
+stop_interrupted_run_log() { :; }
+kill() {
+    printf '%s\n' "$*" >> "$TREE_WATCH_DIR/individual-signals"
+    builtin kill "$@"
+}
 """
         return subprocess.run(
             ["bash", "-c", driver + definition.group() + f"\n{function} 15\n", "fixture",
@@ -297,14 +292,18 @@ final_pass_finish() { :; }
         )
 
     def test_copied_verify_cancellation_uses_the_local_helper(self) -> None:
-        self.fake_helper(0)
         child = self.private_child()
+        individual_signals = self.root / "watch" / "individual-signals"
         for function, status, signum in (("cancel_tree_run", 77, "KILL"), ("verify_interrupted", 143, "15")):
-            with self.subTest(function=function):
-                result = self.cancel_step(function, child)
-                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
-                self.assertEqual((self.root / "helper-arguments").read_text(), f"{child.pid} {signum}")
-                self.assertNotIn("process group helper failed", result.stderr)
+            for helper_status in (0, 3):
+                with self.subTest(function=function, helper_status=helper_status):
+                    self.fake_helper(helper_status)
+                    result = self.cancel_step(function, child)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    self.assertEqual((self.root / "helper-arguments").read_text(), f"{child.pid} {signum}")
+                    self.assertNotIn("process group helper failed", result.stderr)
+                    self.assertFalse(individual_signals.exists(), "Cancellation must use the group helper.")
+                    self.assertIsNone(child.poll(), "Cancellation must leave the individual child alive.")
 
     def test_verify_cancellation_reports_missing_or_refused_local_helpers(self) -> None:
         child = self.private_child()
@@ -339,36 +338,6 @@ final_pass_finish() { :; }
                 self.assertTrue((self.root / "session/locks/cargo.d").exists())
                 self.assertIsNone(child.poll(), "helper refusal must not signal the individual child")
                 shutil.rmtree(self.root / "session")
-
-    def test_verify_forward_uses_its_local_helper_without_an_individual_signal(self) -> None:
-        self.fake_helper(0)
-        forward = self.forward()
-        with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
-            forward(signal.SIGTERM)
-        individual.assert_not_called()
-        self.assertTrue((self.root / "helper-arguments").read_text().endswith(f" {signal.SIGTERM}"))
-
-    def test_verify_helper_failure_reports_the_cause_without_individual_fallback(self) -> None:
-        forward = self.forward()
-        for failure in ("missing", "refused"):
-            with self.subTest(failure=failure):
-                self.fake_helper(2)
-                if failure == "missing":
-                    (self.root / "scripts/lib/process_group.py").unlink()
-                with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
-                    with self.assertRaises(SystemExit) as refused:
-                        forward(signal.SIGTERM)
-                individual.assert_not_called()
-                self.assertIn("process group helper failed", str(refused.exception))
-                self.assertIn("process_group.py" if failure == "missing" else "fixture helper diagnostic", str(refused.exception))
-
-    def test_verify_only_uses_individual_fallback_for_a_missing_group(self) -> None:
-        self.fake_helper(3)
-        forward = self.forward()
-        with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
-            forward(signal.SIGTERM)
-        arguments = (self.root / "helper-arguments").read_text().split()
-        individual.assert_called_once_with(int(arguments[0]), signal.SIGTERM)
 
 
 class ProcessGroupSourceTests(unittest.TestCase):

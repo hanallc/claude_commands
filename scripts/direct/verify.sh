@@ -3926,23 +3926,15 @@ if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
     supersede_older_waiters
 fi
 
-# Fork before starting each step. The child creates its own session, records
-# its group leader under the token guard, and only then starts the command.
-# This also covers the first instant of a step, when a killed verify cannot
-# leave a command that a periodic process scan has not found yet.
+# The guardian ends the step when the owner pipe closes.
+# The workload records its group leader under the token guard before it starts the command.
 STEP_OWNER_PY='
 import fcntl
 import json
 import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
-import threading
-
-forwarded_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-if sys.argv[1] != "--workload":
-    signal.pthread_sigmask(signal.SIG_BLOCK, forwarded_signals)
 
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
@@ -3956,20 +3948,6 @@ def identity(pid):
     if not isinstance(result, Started):
         raise RuntimeError("cannot read the step owner start")
     return result.start
-
-def forward(signum: int) -> None:
-    library = Path(os.environ["VERIFY_PROCESS_GROUP_LIB"])
-    sent = subprocess.run(
-        [str(library / "py"), str(library / "process_group.py"), str(child), str(signum)],
-        capture_output=True, text=True,
-    )
-    if sent.returncode == 3:
-        try:
-            os.kill(child, signum)
-        except ProcessLookupError:
-            pass
-    elif sent.returncode:
-        raise SystemExit("verify.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
 
 if sys.argv[1] == "--workload":
     lock = Path(sys.argv[2])
@@ -3993,41 +3971,9 @@ if sys.argv[1] == "--workload":
         fcntl.flock(guard, fcntl.LOCK_UN)
     sys.exit(shell_status(subprocess.call(command)))
 
-forwarding = threading.Lock()
-finished = False
-forward_error: OSError | SystemExit | None = None
-
-def receive_signals() -> None:
-    global forward_error
-    while True:
-        signum = signal.sigwait(forwarded_signals)
-        with forwarding:
-            if finished:
-                return
-            try:
-                forward(signum)
-            except (OSError, SystemExit) as error:
-                forward_error = error
-                return
-
 with process_supervisor.launch([sys.executable, "-I", "-S", "-c", os.environ["VERIFY_STEP_OWNER_SOURCE"],
                                 "--workload", *sys.argv[1:]]) as workload:
-    child = workload.pid
-    threading.Thread(target=receive_signals, daemon=True).start()
-    try:
-        # A bounded wait lets the main thread report a forwarding error.
-        while forward_error is None:
-            try:
-                status = workload.wait(timeout=1)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-    finally:
-        with forwarding:
-            finished = True
-    if forward_error is not None:
-        raise forward_error
-    sys.exit(shell_status(status))
+    sys.exit(shell_status(workload.wait()))
 '
 
 # Preserve the shared invocation policy (including systemd scopes and its

@@ -234,6 +234,8 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(json.loads((self.runner_state / "forwarded-environment.json").read_text()), automatic_environment)
 
     def test_int_during_long_busy_poll_stops_every_child(self) -> None:
+        if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+            self.skipTest("The caller ignores SIGINT.")
         real_sleep = shutil.which("sleep")
         assert real_sleep is not None
         self.route_waits_through_sleep('#!/bin/sh\n'
@@ -250,7 +252,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(self.last_call()["outcome"], "interrupted")
         self.assertEqual(self.last_call()["status"], 130)
         self.assertEqual(self.local_runs(), [])
-        self.assert_nothing_outlives()
+        self.assert_nothing_outlives(guardian=process.session_id)
 
     def test_busy_then_blocked_refuses_instead_of_polling(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
@@ -584,7 +586,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         self.assertEqual(self.last_call()["outcome"], "interrupted")
         self.assertEqual(self.last_call()["status"], 143)
         self.assertEqual(self.local_runs(), [])
-        self.assert_nothing_outlives()
+        self.assert_nothing_outlives(guardian=process.session_id)
 
     def test_missing_runner_refuses_instead_of_running_locally(self) -> None:
         self.runner.unlink()

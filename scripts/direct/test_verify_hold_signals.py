@@ -64,6 +64,8 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_group_signals_end_memory_wait_and_all_children(self) -> None:
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             with self.subTest(signal=signum.name):
+                if signum == signal.SIGINT and signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+                    self.skipTest("The caller ignores SIGINT.")
                 if signum != signal.SIGTERM:
                     self.assertTrue(self.doCleanups(), "the preceding signal fixture did not stop")
                     self.setUp()

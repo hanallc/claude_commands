@@ -25,6 +25,8 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
         for signal_number in (signal.SIGTERM, signal.SIGINT):
             for before_pid in (False, True):
                 with self.subTest(signal_number=signal_number, before_pid=before_pid):
+                    if signal_number == signal.SIGINT and signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+                        self.skipTest("The caller ignores SIGINT.")
                     self.clear_observations()
                     self.check_signal_before_runner_start(delay_tee=False, before_pid=before_pid,
                                                           signal_number=signal_number)

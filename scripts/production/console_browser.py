@@ -11,11 +11,10 @@ import re
 import json
 import os
 import select
-import signal
 import subprocess
 import time
 
-from scripts.lib import cancellation, process_supervisor
+from scripts.lib import process_supervisor
 
 SETTLE_SECONDS = 0.25
 
@@ -140,13 +139,9 @@ class PageResult:
 def managed_process(command: Sequence[str], *, cwd: Path, env: Mapping[str, str],
                     stderr: BinaryIO) -> Generator[process_supervisor.ManagedProcess[bytes]]:
     """Keep the workload session alive only while the checker owns it."""
-    with cancellation.defer_cleanup_signals(), process_supervisor.launch(
+    with process_supervisor.launch(
             command, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr) as child:
-        previous = signal.pthread_sigmask(signal.SIG_UNBLOCK, cancellation.CANCELLATION_SIGNALS)
-        try:
-            yield child
-        finally:
-            _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        yield child
 
 
 class Pipe:

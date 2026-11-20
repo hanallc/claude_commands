@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import BinaryIO, Literal, cast
+from typing import BinaryIO, cast
 import unittest
 from unittest.mock import patch
 
@@ -180,51 +180,21 @@ for _ in range(int(sys.argv[1])):
 print(*children, flush=True)
 """
 CHECK_LINUX_CLEANUP = """
-import os, resource, select, sys
-from unittest.mock import patch
+import resource, sys
 from scripts.lib import process_supervisor
 
 expected = int(sys.argv[-2])
 check = sys.argv[-1]
 clear = process_supervisor._clear_linux_children
-kill = os.kill
-read = os.read
-
-def kill_and_observe_exit(pid, signum):
-    descriptor = os.pidfd_open(pid)
-    try:
-        kill(pid, signum)
-        assert select.select([descriptor], [], [], 5)[0]
-        assert os.waitid(os.P_PIDFD, descriptor, os.WEXITED | os.WNOWAIT | os.WNOHANG)
-    finally:
-        os.close(descriptor)
-
-def check_cleanup(child, status_write, child_events, deadline):
+def check_cleanup(child, status_write, deadline):
     assert child.returncode == 0
     assert len(process_supervisor._linux_children()) == expected
-    if select.select([child_events], [], [], 0)[0]:
-        read(child_events, 128)
-    assert not select.select([child_events], [], [], 0)[0]
-
     if check == "descriptor-limit":
         _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         assert expected > 8
         resource.setrlimit(resource.RLIMIT_NOFILE, (8, hard))
 
-    if check == "coalesced":
-        reads = 0
-        def count_events(descriptor, size):
-            nonlocal reads
-            if descriptor == child_events:
-                reads += 1
-            return read(descriptor, size)
-
-        # Make all children waitable before the guardian reads SIGCHLD.
-        with patch.object(os, "kill", side_effect=kill_and_observe_exit), patch.object(os, "read", side_effect=count_events):
-            clear(child, status_write, child_events, deadline)
-        assert reads == 1, reads
-    else:
-        clear(child, status_write, child_events, deadline)
+    clear(child, status_write, deadline)
 
 process_supervisor.CLEANUP_SECONDS = 10
 process_supervisor._clear_linux_children = check_cleanup
@@ -267,7 +237,7 @@ assert scans == 2, "The guardian must scan twice after the workload exits."
 raise SystemExit(status)
 """
 CUSTOM_GUARDIAN = """
-import signal, subprocess, sys
+import errno, signal, subprocess, sys
 from pathlib import Path
 from unittest.mock import patch
 from scripts.lib.process_supervisor import launch
@@ -275,7 +245,15 @@ original = subprocess.Popen
 def replace_guardian(arguments, **options):
     return original([sys.executable, "-c", sys.argv[1], *arguments[4:]], **options)
 with patch.object(subprocess, "Popen", side_effect=replace_guardian):
-    workload = launch([sys.executable, "-c", *sys.argv[3:]])
+    try:
+        workload = launch([sys.executable, "-c", *sys.argv[3:]])
+    except OSError as error:
+        if sys.argv[2] != "refusal" or error.errno != errno.EINVAL or "SIGCHLD ignored" not in str(error):
+            raise
+        raise SystemExit(0)
+if sys.argv[2] == "refusal":
+    workload.close()
+    raise AssertionError("The guardian must refuse to start.")
 if sys.argv[2] == "release":
     assert sys.stdin.read(1) == "x"
 elif sys.argv[2] == "pause":
@@ -486,11 +464,9 @@ signal.pause()
             finally:
                 owner.stdin.close()
 
-    def check_linux_cleanup(
-        self, check: Literal["empty", "adopted", "coalesced", "descriptor-limit"], descendants: int,
-    ) -> None:
+    def check_linux_cleanup(self, descendants: int, *, low_descriptor_limit: bool = False) -> None:
         with launch([sys.executable, "-c", CUSTOM_GUARDIAN, CHECK_LINUX_CLEANUP, "wait",
-                     ADOPTED_CHILDREN, str(descendants), check],
+                     ADOPTED_CHILDREN, str(descendants), "descriptor-limit" if low_descriptor_limit else "default"],
                     cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as owner:
             assert owner.stdin is not None
             try:
@@ -503,19 +479,15 @@ signal.pause()
 
     @unittest.skipUnless(sys.platform == "linux", "Linux guardians adopt orphaned descendants.")
     def test_cleanup_returns_when_the_guardian_has_no_children(self) -> None:
-        self.check_linux_cleanup("empty", 0)
+        self.check_linux_cleanup(0)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux guardians adopt orphaned descendants.")
     def test_cleanup_reaps_adopted_descendants(self) -> None:
-        self.check_linux_cleanup("adopted", 2)
-
-    @unittest.skipUnless(sys.platform == "linux", "Linux guardians read SIGCHLD from a descriptor.")
-    def test_cleanup_reaps_every_exit_after_one_sigchld(self) -> None:
-        self.check_linux_cleanup("coalesced", 3)
+        self.check_linux_cleanup(2)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux guardians adopt orphaned descendants.")
     def test_cleanup_reaps_children_with_a_low_descriptor_limit(self) -> None:
-        self.check_linux_cleanup("descriptor-limit", 9)
+        self.check_linux_cleanup(9, low_descriptor_limit=True)
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS scans the system process list.")
     def test_close_ignores_unrelated_pid_churn(self) -> None:
@@ -540,6 +512,22 @@ else:
         self.assertEqual(outer.wait(TEST_HANG_GUARD_SECS), 0)
         outer.close()
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux guardians adopt orphaned descendants.")
+    def test_launch_refuses_when_the_guardian_reads_sigchld_as_ignored(self) -> None:
+        owner = self.owner(CUSTOM_GUARDIAN, """
+import signal, sys
+from unittest.mock import patch
+from scripts.lib import process_supervisor
+
+getsignal = signal.getsignal
+def ignored_sigchld(signum):
+    return signal.SIG_IGN if signum == signal.SIGCHLD else getsignal(signum)
+
+with patch.object(signal, "getsignal", side_effect=ignored_sigchld):
+    raise SystemExit(process_supervisor.supervise(*map(int, sys.argv[1:4]), sys.argv[4:]))
+""", "refusal", "pass")
+        self.assertEqual(owner.wait(TEST_HANG_GUARD_SECS), 0)
+
     @unittest.skipUnless(sys.platform == "linux", "Linux provides PID descriptors.")
     def test_workload_signal_uses_a_pidfd(self) -> None:
         child = self.owner("import os, signal; print(os.getpid(), flush=True); signal.pause()")
@@ -549,8 +537,9 @@ else:
         self.assertEqual(child.wait(TEST_HANG_GUARD_SECS), -signal.SIGTERM)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux guardians adopt orphaned descendants.")
-    def test_guardian_reaps_an_adopted_child_while_its_workload_runs(self) -> None:
-        workload = self.enterContext(launch([sys.executable, "-c", """
+    def test_guardian_reaps_an_adopted_child_while_the_owner_pipe_stays_open(self) -> None:
+        for workload_exits_first in (False, True):
+            with self.subTest(workload_exits_first=workload_exits_first), launch([sys.executable, "-c", """
 import os, signal, sys
 parent = os.fork()
 if parent == 0:
@@ -560,24 +549,30 @@ if parent == 0:
     os._exit(0)
 assert os.waitpid(parent, 0) == (parent, 0)
 print(0, flush=True)
-signal.pause()
-"""], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE))
-        first, = self.line(workload)
-        second, = self.line(workload)
-        self.assertIn(0, (first, second))
-        child = first or second
-        descriptor = os.pidfd_open(child)
-        try:
-            waiter = select.poll()
-            waiter.register(descriptor, select.POLLHUP)
-            assert workload.stdin is not None
-            _ = workload.stdin.write(b"x")
-            workload.stdin.flush()
-            self.assertTrue(waiter.poll(10_000), "The guardian must reap the adopted child.")
-            self.assertFalse(Path(f"/proc/{child}").exists())
-        finally:
-            os.close(descriptor)
-        self.assertIsNone(workload.poll())
+if sys.argv[1] == "running":
+    signal.pause()
+""", "exited" if workload_exits_first else "running"],
+                    cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as workload:
+                first, = self.line(workload)
+                second, = self.line(workload)
+                self.assertIn(0, (first, second))
+                child = first or second
+                descriptor = os.pidfd_open(child)
+                try:
+                    events = select.poll()
+                    events.register(descriptor, select.POLLHUP)
+                    if workload_exits_first:
+                        self.assertEqual(workload.wait(TEST_HANG_GUARD_SECS), 0)
+                    assert workload.stdin is not None
+                    self.assertEqual(workload.stdin.write(b"x"), 1)
+                    workload.stdin.flush()
+                    self.assertTrue(any(flags & select.POLLHUP for _, flags in events.poll(10_000)),
+                                    "The guardian must reap the adopted child before owner cleanup.")
+                    if not workload_exits_first:
+                        self.assertIsNone(workload.poll())
+                    self.assertFalse(Path(f"/proc/{child}").exists())
+                finally:
+                    os.close(descriptor)
 
     def test_workload_exit_keeps_its_guardian_and_descendant_until_close(self) -> None:
         workload = self.owner("""
@@ -624,29 +619,23 @@ raise SystemExit(23)
         self.assertEqual(child.returncode, -signal.SIGTERM)
         self.assertEqual(os.getsid(child.session_id), child.session_id)
 
-    @unittest.skipUnless(sys.platform == "linux", "Linux guardians check the SIGCHLD disposition.")
-    def test_startup_refuses_ignored_sigchld(self) -> None:
-        owner = self.enterContext(launch([
-            "bash", "-c", 'trap "" CHLD; exec "$@"', "start-guardian", sys.executable, "-c", """
-import errno, sys
-from scripts.lib.process_supervisor import launch
-
-try:
-    _ = launch([sys.executable, "-c", "print(-1)"])
-except OSError as error:
-    assert error.errno == errno.EINVAL
-    assert "SIGCHLD ignored" in str(error)
-    print(1, flush=True)
-else:
-    raise AssertionError("The guardian must refuse startup.")
-"""], cwd=ROOT, stdout=subprocess.PIPE))
-        self.assertEqual(self.line(owner), [1])
-        self.assertEqual(owner.wait(TEST_HANG_GUARD_SECS), 0)
-
     def test_startup_failure_reports_the_failed_executable(self) -> None:
         with self.assertRaises(FileNotFoundError) as failure:
             _ = process_supervisor.launch(["/nonexistent/workload-fixture"])
         self.assertEqual(cast(object, failure.exception.filename), "/nonexistent/workload-fixture")
+
+    @unittest.skipUnless(sys.platform == "linux", "The Linux guardian passes the caller environment as is.")
+    def test_guardian_preserves_caller_environment_bytes(self) -> None:
+        locales: tuple[dict[str, str], ...] = ({}, {"LC_CTYPE": ""}, {"LC_CTYPE": "C"})
+        for locale in locales:
+            environment = {"FIXTURE_VALUE": os.fsdecode(b"original\n\xff"), **locale}
+            expected = b"".join(os.fsencode(f"{key}={value}") + b"\0" for key, value in environment.items())
+            with self.subTest(locale=locale), launch(
+                ["/usr/bin/env", "-0"], env=environment, stdout=subprocess.PIPE,
+            ) as workload:
+                output, _ = workload.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(workload.returncode, 0)
+                self.assertEqual(output, expected)
 
     def test_unittest_and_module_runner_own_their_workloads(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="supervisor-runner-")))

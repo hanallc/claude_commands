@@ -26,6 +26,7 @@ CLEANUP_SECONDS = 30
 _SESSION_REGISTRATION = "DEVTOOLS_SESSION_REGISTRATION"
 _CLEANUP_SUCCEEDED = b"K"
 _LAUNCH_CANCELLED = b"C"
+_LINUX_RESCAN_SECONDS = 0.01
 _MAC_RESCAN_SECONDS = 0.05
 _MAC_START_TIME = Struct("=120xQQ")
 _writer_lock = threading.Lock()
@@ -255,9 +256,11 @@ def launch(command: Sequence[str], *, cwd: Path | None = None, env: Mapping[str,
         try:
             result_write = _register_nested_guardian() if sys.platform == "darwin" else -1
             try:
+                caller_environment = os.environ if env is None else env
                 guardian = subprocess.Popen(
                     [sys.executable, "-I", "-S", str(Path(__file__).resolve()),
-                     str(owner_read), str(status_write), str(result_write), *command],
+                     str(owner_read), str(status_write), str(result_write),
+                     json.dumps(caller_environment.get("LC_CTYPE")), *command],
                     cwd=cwd, env=env, stdin=stdin, stdout=stdout, stderr=stderr, text=text,
                     pass_fds=(owner_read, status_write) + ((result_write,) if result_write >= 0 else ()),
                     start_new_session=True,
@@ -311,20 +314,13 @@ class CleanupDeadline:
         return remaining
 
 
-def _linux_child_events() -> int:
+def _enable_linux_subreaper() -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     # PR_SET_CHILD_SUBREAPER makes the guardian adopt orphaned descendants.
     if cast(int, libc.prctl(36, 1, 0, 0, 0)) != 0:
         raise OSError(ctypes.get_errno(), "cannot adopt descendants")
     if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
         raise OSError(errno.EINVAL, "The guardian cannot reap children with SIGCHLD ignored.")
-    signal_set = (ctypes.c_ulong * 16)()
-    _ = cast(int, libc.sigemptyset(ctypes.byref(signal_set)))
-    _ = cast(int, libc.sigaddset(ctypes.byref(signal_set), signal.SIGCHLD))
-    descriptor = cast(int, libc.signalfd(-1, ctypes.byref(signal_set), os.O_CLOEXEC | os.O_NONBLOCK))
-    if descriptor < 0:
-        raise OSError(ctypes.get_errno(), "cannot watch guardian children")
-    return descriptor
 
 
 def _linux_children() -> set[int]:
@@ -340,8 +336,7 @@ def _reap_linux_child(child: subprocess.Popen[bytes], status_write: int) -> int:
     return pid
 
 
-def _clear_linux_children(child: subprocess.Popen[bytes], status_write: int, child_events: int,
-                          deadline: CleanupDeadline) -> None:
+def _clear_linux_children(child: subprocess.Popen[bytes], status_write: int, deadline: CleanupDeadline) -> None:
     while True:
         try:
             while True:
@@ -355,29 +350,22 @@ def _clear_linux_children(child: subprocess.Popen[bytes], status_write: int, chi
             _ = deadline.remaining()
             with suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
-        if not select.select([child_events], [], [], deadline.remaining())[0]:
-            raise TimeoutError("A guardian child did not exit before the cleanup deadline.")
-        _ = os.read(child_events, 128)
+        # New descendants can become children after the previous scan.
+        _ = select.select([], [], [], min(_LINUX_RESCAN_SECONDS, deadline.remaining()))
 
 
-def _watch_linux(owner_read: int, status_write: int, child: subprocess.Popen[bytes], child_events: int) -> None:
-    # Block SIGCHLD after launch so the workload keeps its original signal mask.
-    _ = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})
+def _watch_linux(owner_read: int, status_write: int, child: subprocess.Popen[bytes]) -> None:
     try:
-        ready: list[int] = []
         while True:
-            if owner_read in ready and not os.read(owner_read, 1):
+            ready = select.select([owner_read], [], [], _LINUX_RESCAN_SECONDS)[0]
+            if ready and not os.read(owner_read, 1):
                 break
-            if child_events in ready:
-                _ = os.read(child_events, 128)
-            # Drain exited children after a notification. Check ownership during the drain.
             with suppress(ChildProcessError):
                 while _reap_linux_child(child, status_write):
                     if select.select([owner_read], [], [], 0)[0]:
                         break
-            ready = select.select([owner_read, child_events], [], [])[0]
     finally:
-        _clear_linux_children(child, status_write, child_events, CleanupDeadline())
+        _clear_linux_children(child, status_write, CleanupDeadline())
 
 
 def _signal_linux_member(pid: int, session: int, signum: int) -> None:
@@ -530,19 +518,16 @@ def _watch_mac(owner_read: int, status_write: int, child: subprocess.Popen[bytes
                 os.close(descriptor)
 
 
-def _supervise(owner_read: int, status_write: int, command: Sequence[str]) -> int:
+def _supervise(owner_read: int, status_write: int, command: Sequence[str], environment: dict[str, str]) -> int:
     """Watch the owner pipe until the workload can be removed."""
     if select.select([owner_read], [], [], 0)[0] and not os.read(owner_read, 1):
         return 0
-    # The guardian inherits the owner's mask. The workload needs to take signals.
-    _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGTERM, signal.SIGHUP, signal.SIGINT))
     with ExitStack() as descriptors:
         try:
             if sys.platform == "linux":
-                child_events = _linux_child_events()
-                _ = descriptors.callback(os.close, child_events)
-                child = subprocess.Popen(command, process_group=0)
-                watch = partial(_watch_linux, owner_read, status_write, child, child_events)
+                _enable_linux_subreaper()
+                child = subprocess.Popen(command, env=environment, process_group=0)
+                watch = partial(_watch_linux, owner_read, status_write, child)
             else:
                 registrations, register = socket.socketpair(type=socket.SOCK_DGRAM)
                 _ = descriptors.enter_context(registrations)
@@ -551,7 +536,7 @@ def _supervise(owner_read: int, status_write: int, command: Sequence[str]) -> in
                 registrations.setblocking(False)
                 descriptor = register.fileno()
                 info = os.fstat(descriptor)
-                environment = {**os.environ, _SESSION_REGISTRATION: f"{descriptor}:{info.st_dev}:{info.st_ino}"}
+                environment[_SESSION_REGISTRATION] = f"{descriptor}:{info.st_dev}:{info.st_ino}"
                 child = subprocess.Popen(command, env=environment, pass_fds=(descriptor,), process_group=0)
                 watch = partial(_watch_mac, owner_read, status_write, child, registrations)
         except OSError as error:
@@ -565,14 +550,22 @@ def _supervise(owner_read: int, status_write: int, command: Sequence[str]) -> in
     return 0
 
 
-def supervise(owner_read: int, status_write: int, result_write: int, command: Sequence[str]) -> int:
+def supervise(owner_read: int, status_write: int, result_write: int, launch_arguments: Sequence[str]) -> int:
     """Report the result of this guardian's cleanup to its parent guardian."""
+    encoded_lc_ctype, *command = launch_arguments
+    lc_ctype = cast(str | None, json.loads(encoded_lc_ctype))
+    # Python startup can add or replace LC_CTYPE. Restore the caller's value for the workload.
+    environment = dict(os.environ)
+    if lc_ctype is None:
+        _ = environment.pop("LC_CTYPE", None)
+    else:
+        environment["LC_CTYPE"] = lc_ctype
     if result_write < 0:
-        return _supervise(owner_read, status_write, command)
+        return _supervise(owner_read, status_write, command, environment)
     os.set_inheritable(result_write, False)
     result = b"E"
     try:
-        status = _supervise(owner_read, status_write, command)
+        status = _supervise(owner_read, status_write, command, environment)
         result = _CLEANUP_SUCCEEDED
         return status
     finally:

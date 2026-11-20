@@ -259,7 +259,10 @@ With `--promote`, it also advances `~/.claude` main and the Mac.
 On failure, it undoes the merge and prints the failed suites' output.
 
 **Managed test processes.** `scripts/lib/process_supervisor.py` gives each managed test process a guardian. It starts cleanup when the owner's pipe closes, including after SIGKILL.
-Linux guardians adopt orphaned descendants, including descendants in new sessions. A guardian signals its own children and waits on its SIGCHLD descriptor. It reaps until no children remain.
+Linux guardians adopt orphaned descendants, including descendants in new sessions.
+The guardian waits up to 10 ms on the owner pipe between checks for exited children.
+It reaps exited children while the owner pipe stays open, even after the workload exits.
+When the owner pipe closes, the guardian kills and reaps its remaining children until none remain.
 macOS guardians rescan their session for a bounded time. A detached session needs a registered guardian to take part in cleanup.
 Each registered macOS guardian reports its result through a private pipe. A launch that fails before the guardian starts reports cancellation.
 One deadline covers all cleanup steps. The guardian reports failure if it reaches the deadline.

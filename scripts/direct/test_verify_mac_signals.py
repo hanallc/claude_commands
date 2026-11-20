@@ -13,6 +13,8 @@ class VerifyMacSignalsTests(VerifyMacOffloadFixture):
     def test_runner_receives_each_forwarded_signal_before_local_work(self) -> None:
         for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             with self.subTest(signal_number=signal_number):
+                if signal_number == signal.SIGINT and signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+                    self.skipTest("The caller ignores SIGINT.")
                 self.clear_observations()
                 process = self.start_verify(
                     "test",
