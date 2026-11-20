@@ -48,7 +48,6 @@ import fcntl
 import hashlib
 import inspect
 from importlib import import_module
-from itertools import chain
 import json
 import math
 import os
@@ -433,9 +432,8 @@ class SharedCPUPool:
     def acquire(self) -> SharedCPUSlot:
         """Wait for a CPU slot or cancellation while no module runs.
 
-        Check the deadline before each scan. A timeout can overrun by one scan.
-        A scan reads at most the pool size in records, with MAX_GATE_RECORD_BYTES per record.
-        For a legacy FIFO with no known slot count, use the pipe capacity as the scan limit.
+        Check the active deadline before each scan and each record read.
+        Each record read is limited to MAX_GATE_RECORD_BYTES.
         """
         started = time.monotonic()
         config = admission_records.read_memory_config()
@@ -443,8 +441,6 @@ class SharedCPUPool:
         sample_seconds = min(stop_seconds, config.program_sample_seconds)
         if not math.isfinite(sample_seconds) or sample_seconds <= 0:
             raise GateRefused("program_sample_seconds must be finite and positive")
-        recovery = ACTIVE_GATE_RECOVERY.get()
-        repo = recovery.repo if isinstance(recovery, GateRecovery) else ""
         status = os.fstat(self.descriptor)
         named_fifo = stat.S_ISFIFO(status.st_mode) and status.st_nlink > 0
         print("waits for a CPU slot", flush=True)
@@ -466,8 +462,7 @@ class SharedCPUPool:
                             raise GateRecoveryUnresolved(f"CPU slot wait reached its deadline.\n{details}")
                         raise TimeoutError("gate time limit while waiting for a CPU slot")
                     if named_fifo:
-                        current = recover_fifo_slots(self.descriptor, deadline=deadline, repo=repo,
-                                                     pool_size=self.fifo_size)
+                        current = recover_fifo_slots(self.descriptor, deadline=deadline)
                         if current is not None:
                             unresolved = current
                     now = time.monotonic()
@@ -925,12 +920,12 @@ class GateRecovery:
             if not stat.S_ISFIFO(status.st_mode) or (status.st_dev, status.st_ino) != (token.device, token.inode):
                 self.update_token(token)
 
-    def recover(self, *, deadline: float = math.inf) -> None:
+    def recover(self) -> None:
         """Stop recorded groups before removing their folders and undoing the merge."""
         config = admission_records.read_memory_config()
         started = time.monotonic()
-        stop_deadline = min(deadline, started + config.program_stop_seconds)
-        grace = min(stop_deadline, started + config.program_stop_seconds / 2)
+        stop_deadline = started + config.program_stop_seconds
+        grace = started + config.program_stop_seconds / 2
         stopping: set[int] = set()
         for pid, start in self.groups.items():
             identity = process_start(pid)
@@ -990,7 +985,7 @@ class GateRecovery:
                 except BlockingIOError:
                     print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
                     return
-                rollback_deadline = min(deadline, time.monotonic() + config.program_stop_seconds)
+                rollback_deadline = time.monotonic() + config.program_stop_seconds
                 try:
                     _ = cleanup.enter_context(scratch.copy_lock(repo, deadline=rollback_deadline))
                 except scratch.CopyLockTimeout as error:
@@ -1295,10 +1290,6 @@ def recover_gate_record(path: Path, repo: str) -> None:
         return
     if recovery is None:
         return
-    recover_loaded_gate_record(recovery, repo, deadline=math.inf)
-
-
-def recover_loaded_gate_record(recovery: GateRecovery, repo: str, *, deadline: float) -> None:
     owner = process_start(recovery.pid)
     if isinstance(owner, Unreadable):
         report_gate_recovery(recovery.path, f"cannot read gate owner {recovery.pid}")
@@ -1307,7 +1298,7 @@ def recover_loaded_gate_record(recovery: GateRecovery, repo: str, *, deadline: f
         return
     active = ACTIVE_GATE_RECOVERY.set(recovery)
     try:
-        recovery.recover(deadline=deadline)
+        recovery.recover()
     except (GateRefused, OSError) as error:
         if isinstance(error, GateRollbackConflict) and recovery.repo == repo:
             raise
@@ -1357,36 +1348,20 @@ def lock_fifo_record_directory(directory: Path, cleanup: ExitStack) -> bool:
     return True
 
 
-def fifo_records(descriptor: int, *, deadline: float, pool_size: int = 0,
-                 cleanup: ExitStack | None = None) -> FifoRecordScan:
+def fifo_records(descriptor: int, *, deadline: float, cleanup: ExitStack | None = None) -> FifoRecordScan:
     status = os.fstat(descriptor)
     identity = status.st_dev, status.st_ino
-    capacity = fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ)
-    try:
-        seeded = seeded_fifo_size(descriptor)
-    except GateFIFOSizeUnresolved:
-        seeded = 0
-    budget = min(seeded or pool_size or capacity, capacity)
-    active = ACTIVE_GATE_RECOVERY.get()
     root = gate_state_dir() / "active-runs"
     scan = FifoRecordScan()
     with closing(fifo_record_paths(root, deadline)) as paths:
-        candidates = paths
-        if isinstance(active, GateRecovery):
-            own_record = (active.path,) if active.tokens else ()
-            candidates = chain(own_record, (path for path in paths if path != active.path))
-        for path in candidates:
-            if time.monotonic() >= deadline:
-                break
-            if not budget:
-                scan.complete = False
-                break
+        for path in paths:
             if cleanup is not None and path.parent not in scan.locked_directories:
                 try:
                     scan.locked_directories[path.parent] = lock_fifo_record_directory(path.parent, cleanup)
                 except OSError:
                     scan.locked_directories[path.parent] = False
-            budget -= 1
+            if time.monotonic() >= deadline:
+                break
             try:
                 record = read_gate_recovery(path, fifo_identity=identity)
             except GateRecordError as error:
@@ -1394,7 +1369,7 @@ def fifo_records(descriptor: int, *, deadline: float, pool_size: int = 0,
                 continue
             if record is not None:
                 scan.records.append((record, [token for token in record.tokens if (token.device, token.inode) == identity]))
-    scan.complete = scan.complete and time.monotonic() < deadline
+    scan.complete = time.monotonic() < deadline
     return scan
 
 
@@ -1454,8 +1429,7 @@ def recover_configured_fifo() -> None:
         report_gate_recovery(path, error)
 
 
-def recover_fifo_slots(descriptor: int, *, deadline: float = math.inf, repo: str | None = None, pool_size: int = 0
-                       ) -> list[UnresolvedGateSlot] | None:
+def recover_fifo_slots(descriptor: int, *, deadline: float = math.inf) -> list[UnresolvedGateSlot] | None:
     """Return unowned FIFO slots or report the records that block recovery."""
     with ExitStack() as locked:
         try:
@@ -1466,11 +1440,15 @@ def recover_fifo_slots(descriptor: int, *, deadline: float = math.inf, repo: str
             pool_locked = False
         if time.monotonic() >= deadline:
             return None
-        scan = fifo_records(descriptor, deadline=deadline, pool_size=pool_size, cleanup=locked if pool_locked else None)
+        scan = fifo_records(descriptor, deadline=deadline, cleanup=locked if pool_locked else None)
         unresolved = scan.unresolved
+        if not scan.complete:
+            return unresolved or None
         live_slots = 0
         dead: list[tuple[GateRecovery, list[HeldGateToken]]] = []
         for record, tokens in scan.records:
+            if time.monotonic() >= deadline:
+                return unresolved or None
             owner = process_start(record.pid)
             if isinstance(owner, Started) and owner.start == record.start:
                 if any(token.operation != "held" for token in tokens):
@@ -1478,11 +1456,7 @@ def recover_fifo_slots(descriptor: int, *, deadline: float = math.inf, repo: str
                 else:
                     live_slots += len(tokens)
                 continue
-            if repo is not None and scan.locked_directories.get(record.path.parent) and time.monotonic() < deadline:
-                recover_loaded_gate_record(record, repo, deadline=deadline)
-                tokens = [token for token in tokens if token in record.tokens]
-                if not tokens:
-                    continue
+            # Normal gate recovery checks the processes and reclaims their folders outside the pool lock.
             if isinstance(owner, Unreadable) or record.groups or record.folders or record.scope:
                 unresolved.append(unresolved_gate_slot(record.path, "the gate still needs cleanup before slot recovery"))
                 continue
@@ -1490,7 +1464,9 @@ def recover_fifo_slots(descriptor: int, *, deadline: float = math.inf, repo: str
                 unresolved.append(unresolved_gate_slot(record.path, "the recovery lock is held"))
                 continue
             dead.append((record, tokens))
-        if unresolved or not scan.complete:
+        if time.monotonic() >= deadline:
+            return unresolved or None
+        if unresolved:
             if pool_locked:
                 try:
                     # A known slot count can prove that live gates account for every missing slot.
@@ -1499,14 +1475,9 @@ def recover_fifo_slots(descriptor: int, *, deadline: float = math.inf, repo: str
                         return []
                 except (OSError, GateFIFOSizeUnresolved):
                     pass
-            if not scan.complete:
-                unresolved.extend(unresolved_gate_slot(record.path, "the FIFO record scan is incomplete")
-                                  for record, _ in dead)
-            return unresolved or None
+            return unresolved
         if not dead:
-            return None if time.monotonic() >= deadline else []
-        if time.monotonic() >= deadline:
-            return [unresolved_gate_slot(record.path, "the dead gate still holds a recorded slot") for record, _ in dead]
+            return []
         try:
             available = fifo_bytes(descriptor)
             size = fifo_pool_size(descriptor, scan.records, available)
@@ -1517,6 +1488,8 @@ def recover_fifo_slots(descriptor: int, *, deadline: float = math.inf, repo: str
         restore = size - live_slots - available
         if restore < 0:
             return [unresolved_gate_slot(record.path, "the FIFO and live gates exceed the recorded slot count") for record, _ in dead]
+        if time.monotonic() >= deadline:
+            return None
         if restore:
             saved = b"".join(bytes.fromhex(token.value) for _, tokens in dead for token in tokens)
             # Each byte represents one slot. Use saved bytes first.
@@ -1528,6 +1501,8 @@ def recover_fifo_slots(descriptor: int, *, deadline: float = math.inf, repo: str
                 return [unresolved_gate_slot(record.path, error) for record, _ in dead]
         # Keep the slot count in a record until the recount clears the last token.
         for record, tokens in sorted(dead, key=lambda item: any(token.pool_size for token in item[1])):
+            if time.monotonic() >= deadline:
+                return None
             record.tokens[:] = [token for token in record.tokens if token not in tokens]
             if record.tokens or record.rollback:
                 record.save()
