@@ -12,6 +12,7 @@ import json
 import os
 import re
 import resource
+import select
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE, SelectorKey
 import shlex
 import socket
@@ -31,6 +32,7 @@ from scripts.message.session_send import session_send_argv
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
 from typing import cast, override
@@ -1270,14 +1272,30 @@ class ClientTests(unittest.TestCase):
 
     def test_expired_build_retries_after_an_estimator_io_error(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:
-            fixture.configure(wait_reply_seconds=0.1, waiting_pass_seconds=0.1,
-                              reconnect_seconds=0.1, min_pass_gap_seconds=0.05)
+            fixture.configure(reconnect_seconds=1)
             seed = fixture.request(step="build", since=fixture.clock.now() - 60)
             argv = ["cargo", "build", "-p", "cargo-mend", "--bin", "cargo-mend"]
             estimates = 0
             admissions: list[wire.AdmitRequest] = []
             expired_orders: list[float] = []
             handle = fixture.server.handle_request
+            read_line = cast(Callable[[socket.socket, bytearray, float], bytes], getattr(client, "_line"))
+            exchange = LauncherHangGuard("Estimator retry replies")
+
+            def receive_reply(connection: socket.socket, pending: bytearray, deadline: float) -> bytes:
+                while b"\n" not in pending:
+                    if not select.select([connection], [], [], 0)[0]:
+                        try:
+                            remaining = exchange.remaining()
+                        except TimeoutError as error:
+                            raise AssertionError("the queue did not send the estimator retry reply") from error
+                        fixture.server.run_once(remaining)
+                        continue
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        raise client.TransportUnavailable("closed connection")
+                    pending.extend(chunk)
+                return read_line(connection, pending, deadline)
 
             def estimate(*_args: object, **_kwargs: object) -> records.ExpectedPeak:
                 nonlocal estimates
@@ -1295,14 +1313,12 @@ class ClientTests(unittest.TestCase):
                     admissions.append(request)
                 return handle(request, connection)
 
-            def bound_expiry_replies(reply: wire.Reply) -> wire.Reply:
+            def record_expiry_order(reply: wire.Reply) -> wire.Reply:
                 if isinstance(reply, wire.Wait):
                     cause = reply.reason.cause if isinstance(reply.reason, records.HeadAdmissionStatus) else reply.reason
                     if isinstance(cause, records.EstimateExpired):
                         row = fixture.server.waiters[seed.episode].row
                         expired_orders.append(row.get("order_since", row["since"]))
-                        if len(expired_orders) >= 4 and estimates == 2:
-                            return wire.Refused("the estimator did not retry")
                 return reply
 
             def refresh() -> wire.AdmitRequest:
@@ -1310,10 +1326,11 @@ class ClientTests(unittest.TestCase):
 
             with mock.patch.object(client, "CLOCK", fixture.clock), \
                     mock.patch.object(fixture.server, "handle_request", side_effect=observe), \
-                    mock.patch.object(fixture.server, "reply_filter", side_effect=bound_expiry_replies), \
+                    mock.patch.object(fixture.server, "reply_filter", side_effect=record_expiry_order), \
+                    mock.patch.object(client, "_line", new=receive_reply), \
                     mock.patch.object(step_estimator, "git_identity",
                                       return_value=(records.UnknownRepository(), "tree")), \
-                    mock.patch.object(step_estimator, "expected_peak", side_effect=estimate), fixture.serving():
+                    mock.patch.object(step_estimator, "expected_peak", side_effect=estimate):
                 reply = shell_place.request_place(shell_place.RefreshedRequest(refresh), client.WaitOutput())
             self.assertIsInstance(reply, wire.Admitted)
             self.assertEqual(estimates, 3)
