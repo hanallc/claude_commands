@@ -284,3 +284,24 @@
   2. 20 repeated runs pass, TMPDIR=/tmp, 2 GB scope.
   3. basedpyright zero errors and warnings on changed files.
   4. Full natedev gate passes (reds that also occur on base do not count).
+
+### Phase 395 — the failed probe mark test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** mac_test/test_failed_probe_mark.py uses half its gate CPU (rank 21: 26.6 CPU s median, 21 tests, 26.3 s wall; slowest tests 4.9, 4.7 and 3.3 s) with every assertion kept.
+- **Spec:**
+  1. Test hold: read the code and write the change now. Measure after natemerge releases units: module_cost.py (`--tests 20 --commands 20`) on the base and on the result, fresh TMPDIR, bytecode on.
+  2. Cut the cost at its cause: repeated mirror copies, shell probes, Git calls and process starts become one shared fixture where tests only read it; fixed waits become events the test drives.
+  3. Change mac_test or build_targets production code only when the same cost also hits production runs.
+  4. Tests read no /tune-changeable value; pin each config value the fixture reads. The test runs on the Mac too; no Linux-only entry or Mac skip.
+  5. If the floor is above half, report the floor and an architecture proposal.
+- **Files:** `scripts/mac_test/test_failed_probe_mark.py` and its test support; production files only for a production cause.
+- **Workers:** 1 writer. One test module.
+  - impl: test_failed_probe_mark.py and its support.
+- **Constraints from prior phases:** AWS account blocked: measure locally. No test or profile makes load on purpose. Phase 382 changed the mac_test cleanup shim; keep its savings.
+- **Acceptance gate:**
+  1. Local module_cost.py CPU at most half of the base.
+  2. 20 repeated runs pass, TMPDIR=/tmp, 2 GB scope.
+  3. basedpyright zero errors and warnings on changed files.
+  4. Full natedev gate passes (reds that also occur on base do not count).
