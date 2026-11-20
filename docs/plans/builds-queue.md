@@ -3238,6 +3238,13 @@ Tests: one row each in the existing Mac offload busy-mirror test and the existin
 
 Tests: one row in the existing live Git registration sweep test, failing first.
 
+### Phase 44do — The Builds page marks no bypassed gate as the next start  · status: todo
+**From the 44dh closure (pass 2), 2026-11-19:** the builds landing rule moves this gap out of 44dh. After 44dh merges.
+
+1. When the queue holds only a gate past its route-check deadline and a landing-held gate, `result.policy.local_head` is empty, so the explanation has no head (memory_admit.py:2965). The page fallback then marks the expired gate `first_in_line` (memory_feed.py:2667) and the hover shows its memory comparison (memory_live.html:849). `memory_status` already reports zero next need. Fix: with no local head, the page marks no row as first in line.
+
+Tests: one row in `test_the_memory_status_names_the_one_reason_a_start_waits` (test_memory_feed.py:3126), failing first.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
