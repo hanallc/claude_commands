@@ -824,11 +824,70 @@ class IndexTests(unittest.TestCase):
         ):
             with self.subTest(threshold=threshold):
                 _ = write_config_fixture(config / "test_times.conf", f"NEXTEST_SLOW_TEST_S={threshold}")
-                tests = parse.test_results(lines)[0]
+                tests = parse.test_results(lines).timing_rows
                 self.assertEqual({test["test"] for test in tests}, expected)
                 self.write(self.host_file, step("threshold", step="nextest", tests=tests))
                 _ = index.update()
                 self.assertEqual({row[0] for row in self.rows("SELECT test FROM tests")}, expected)
+
+    def test_fast_passes_get_a_gpu_class_only_with_proof(self) -> None:
+        config = configure_cleanup(self, self.root)
+        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_SPILL_PAGES=65536\nINDEX_TOUCH_MINUTES=60")
+        passed = "PASS [ 0.010s] hana tests::fast\n"
+        summary = "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n"
+        partial = "Summary [ 0.020s] 2 tests run: 2 passed, 0 skipped\n"
+        retry = "TRY 1 FAIL [ 0.008s] (───) hana tests::fast\n"
+        captured = parse.log_facts("nextest", """\
+PASS [ 0.010s] hana tests::fast
+  stdout ───
+PASS [ 0.001s] hana tests::printed
+Summary [ 0.011s] 2 tests run: 2 passed, 0 skipped
+  ──────────
+PASS [ 0.010s] hana tests::gpu
+Summary [ 0.020s] 2 tests run: 2 passed, 1 skipped
+""")
+        self.assertEqual(captured["tests_skipped"], 1)
+        malformed: dict[str, object] = {
+            "string-names": {"by_binary": {"hana": "x"}, "complete": True},
+            "nested-names": {"by_binary": {"hana": [["tests::fast"]]}, "complete": True},
+            "array-by-binary": {"by_binary": ["tests::fast"], "complete": True},
+            "numeric-complete": {"by_binary": {"hana": ["tests::fast"]}, "complete": 1},
+        }
+        self.write(self.host_file,
+                   step("complete", step="nextest", **parse.log_facts("nextest", passed + summary)),
+                   step("hidden", step="nextest", **parse.log_facts("nextest", summary)),
+                   step("duplicate", step="nextest", **parse.log_facts("nextest", passed + passed + summary)),
+                   step("failed", step="nextest", status=101, **parse.log_facts("nextest", passed + summary)),
+                   step("partial", step="nextest", **parse.log_facts("nextest", passed + partial)),
+                   step("retry", step="nextest", **parse.log_facts("nextest", retry + summary)),
+                   step("missing-proof", step="nextest", **parse.log_facts(
+                       "nextest", passed + "PASS [ 0.010s] hana tests::other\n" + partial)),
+                   step("captured-output", step="nextest", **captured),
+                   step("legacy", step="nextest", tests_run=1,
+                        tests=[{"binary": "hana", "test": "tests::fast", "status": "passed"}]),
+                   *(step(name, step="nextest", tests_run=1, observed_tests=observed)
+                     for name, observed in malformed.items()))
+        _ = index.update()
+        self.assertEqual(self.rows("SELECT step_id FROM tests ORDER BY step_id"), [("legacy",), ("retry",)])
+        classes = index.NextestGpuClass
+        with closing(index.read_only()) as database:
+            proof = {("hana", "tests::fast"): classes.NO_GPU}
+            for verdict in (classes.NO_GPU, classes.GPU):
+                proof["hana", "tests::fast"] = verdict
+                self.assertEqual(index.nextest_gpu_class(database, "complete", proof), verdict)
+                for step_id in ("legacy", "hidden", "duplicate", "failed", "partial", "retry"):
+                    with self.subTest(step_id=step_id, verdict=verdict):
+                        self.assertEqual(index.nextest_gpu_class(database, step_id, proof), classes.UNKNOWN)
+            proof["hana", "tests::fast"] = classes.NO_GPU
+            self.assertEqual(index.nextest_gpu_class(database, "missing-proof", proof), classes.UNKNOWN)
+            proof["hana", "tests::printed"] = classes.NO_GPU
+            proof["hana", "tests::gpu"] = classes.GPU
+            self.assertEqual(index.nextest_gpu_class(database, "captured-output", proof), classes.UNKNOWN)
+            proof["hana", "x"] = classes.NO_GPU
+            for step_id in malformed:
+                with self.subTest(step_id=step_id):
+                    self.assertEqual(index.nextest_gpu_class(database, step_id, proof), classes.UNKNOWN)
 
     def cargo_build_rows(self, *commands: list[str]) -> list[tuple[object, ...]]:
         self.write(self.host_file, *(step(f"build-{number:03}", argv=argv) for number, argv in enumerate(commands)))

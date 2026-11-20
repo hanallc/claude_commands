@@ -818,6 +818,20 @@ gate_wait_usd_per_minute=0
                 self.assertTrue(any(action in cast(list[str], row['Action']) and row['Resource'] == '*'
                                     and row['Effect'] == 'Allow' and 'Condition' not in row for row in statements))
 
+    def test_scaler_policy_reads_quota_request_history_for_only_the_spot_quotas(self) -> None:
+        document = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))
+        resources = ledger.mapping(document['Resources'])
+        policy = ledger.mapping(ledger.mapping(resources['GateGpuTrialScalerPolicy'])['Properties'])
+        statements = [row for row in ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement')
+                      if 'servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota' in cast(list[str], row['Action'])]
+        self.assertEqual(len(statements), 1)
+        statement, = statements
+        self.assertEqual((statement['Effect'], statement['Action']),
+                         ('Allow', ['servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota']))
+        codes = sorted({code for _regions, code, _desired, _label in deploy.quota_targets('us-east-2')})
+        self.assertEqual(statement['Resource'], [
+            {'Fn::Sub': 'arn:${AWS::Partition}:servicequotas:*:${AWS::AccountId}:ec2/' + code} for code in codes])
+
     def test_initial_failure_saves_each_error_and_the_table_names_its_time(self) -> None:
         self.failure = 'describe-spot-price-history'
         self.failure_reason = 'UnauthorizedOperation: fixture price read denied'
