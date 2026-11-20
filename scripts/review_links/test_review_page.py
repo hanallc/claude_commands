@@ -4886,9 +4886,13 @@ window.fetch=(url,options)=>{
    await follow('BUILDS/c2');
    check(expanded(otherKey) && notice.hidden && addressItem()===otherKey,
     'A new link resolves the shown ID and clears the missing item notice.');
+   row(otherKey).querySelector('.list-toggle').click();
    await follow('unknown/C1');
    check(!notice.hidden && notice.textContent==='This review is no longer on the Review page.',
     'An unknown ID shows the missing item notice.');
+   await follow(otherKey);
+   check(expanded(otherKey) && notice.hidden && addressItem()===otherKey,
+    'A row key opens the Change and clears the missing item notice.');
   }else if(CASE==='restored'){
    check(!row() && row(otherKey) && !expanded(otherKey) && !notice.hidden && addressItem()===key,
     'A missing saved key does not open a card with the same shown ID.');
