@@ -704,7 +704,7 @@ def register_scratch_clone(path: Path, source: CloneSourceCommit | CloneSource, 
                            generated_from: CloneSourceCommit | CloneSource = CloneSource.UNAPPROVED,
                            scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
     """Record a scratch clone and the source commit used to check its envrc."""
-    fields: dict[str, object] = {"test_hana_clone": True}
+    fields: dict[str, object] = {"test_hana_clone": True, "clone_path": str(path.resolve())}
     if isinstance(source, CloneSourceCommit):
         fields.update(source_path=source.repository, source_commit=source.commit)
     if isinstance(generated_from, CloneSourceCommit):
