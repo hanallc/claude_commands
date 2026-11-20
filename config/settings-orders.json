@@ -16,6 +16,7 @@
     "source_allowed_ignored": 1
   },
   "lint": {
+    "sweep": 11,
     "sweep_build_floor_gib.natedev": 6
   },
   "merge_gate": {
