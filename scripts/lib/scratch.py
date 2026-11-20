@@ -1614,7 +1614,14 @@ class WorktreeRegistration:
         if metadata.parent != (common / "worktrees").resolve():
             return None
         backlink_path = metadata / "gitdir"
-        backlink = backlink_path.read_text().rstrip("\r\n")
+        inspected = backlink_path.lstat()
+        if not stat.S_ISREG(inspected.st_mode):
+            raise RemovalRefused(f"{backlink_path}: expected a regular file")
+        fd = os.open(backlink_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, encoding="utf-8") as stream:
+            if not os.path.samestat(inspected, os.fstat(stream.fileno())):
+                raise RemovalRefused(f"{backlink_path}: worktree backlink changed before open")
+            backlink = stream.read().rstrip("\r\n")
         if not backlink:
             raise RemovalRefused(f"{backlink_path}: empty worktree backlink")
         if not (metadata / backlink).samefile(checkout.toplevel / ".git"):
@@ -2084,11 +2091,46 @@ class FolderOperationScope(Enum):
     ALL = "all"
 
 
+@dataclass(frozen=True)
+class UnreadableFolderOperation:
+    reason: str
+
+
+@dataclass(frozen=True)
+class TaskEndJournalReading:
+    status: os.stat_result
+    operation: FolderOperation | UnreadableFolderOperation
+
+
+@dataclass(frozen=True)
+class TaskEndJournals:
+    root: Path
+    readings: dict[Path, TaskEndJournalReading]
+
+    def checked_operation(self, journal: OperationJournal) -> FolderOperation:
+        """Use the first reading only while the journal still matches it."""
+        reading = self.readings.get(journal.path)
+        current = journal.path.lstat()
+        if (reading is None or not os.path.samestat(reading.status, current)
+                or reading.status.st_ctime_ns != current.st_ctime_ns
+                or reading.status.st_mtime_ns != current.st_mtime_ns):
+            raise FolderRecoveryRequired(f"{journal.path}: a folder operation changed during task cleanup")
+        if isinstance(reading.operation, UnreadableFolderOperation):
+            raise RemovalRefused(reading.operation.reason)
+        return reading.operation
+
+
+_TASK_END_JOURNALS: ContextVar[TaskEndJournals | None] = ContextVar("scratch_task_end_journals", default=None)
+
+
 def scoped_folder_operations(paths: Iterable[Path] | FolderOperationScope, removal: CoordinatedRemoval,
                              records: Sequence[Path]) -> Iterator[ScopedFolderOperation]:
     scope = () if paths is FolderOperationScope.ALL else resolved_removal_paths(paths)
     journals = [OperationJournal(record) for record in records]
-    pending = [(journal, journal.read()) for journal in journals]
+    task_end = _TASK_END_JOURNALS.get()
+    pending = [(journal, task_end.checked_operation(journal)
+                if task_end is not None and journal.path.parent == task_end.root else journal.read())
+               for journal in journals]
     for journal, operation in pending:
         aliases = tuple(alias for path in resolved_removal_paths(operation.paths())
                         for alias in removal.aliases(path).paths)
@@ -3888,7 +3930,6 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     _ = checked_task(task, False)
-    removed = TaskCleanup()
     kept: dict[Path, str] = {}
     moment = time.time() if now is None else now
 
@@ -3898,6 +3939,39 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
             return False
         return True
 
+    readings: dict[Path, TaskEndJournalReading] = {}
+    # Save the task end before recovery can add a hold for the retained source.
+    with locked_holds(scratch_settings=scratch_settings):
+        for path in operation_records(scratch_settings, "*.json"):
+            journal = OperationJournal(path)
+            try:
+                status = path.lstat()
+                try:
+                    operation = journal.read()
+                except RemovalRefused as error:
+                    kept[path] = str(error)
+                    readings[path] = TaskEndJournalReading(status, UnreadableFolderOperation(str(error)))
+                    continue
+                step = operation.step
+                if (isinstance(step, PublishAdoption) and not isinstance(step, PublishAdoptionAfterTaskEnd)
+                        and step.paths.destination.task == task and selected(step.paths.hidden)):
+                    operation = FolderOperation(operation.source, operation.source_id,
+                                                PublishAdoptionAfterTaskEnd(step.paths, step.stage_id))
+                    journal.save(operation)
+                    status = path.lstat()
+                readings[path] = TaskEndJournalReading(status, operation)
+            except (OSError, ScratchError) as error:
+                kept[path] = str(error)
+    token = _TASK_END_JOURNALS.set(TaskEndJournals(operation_journal_root(scratch_settings), readings))
+    try:
+        return finish_task_end(task, moment, selected, kept, scratch_settings)
+    finally:
+        _TASK_END_JOURNALS.reset(token)
+
+
+def finish_task_end(task: str, moment: float, selected: Callable[[Path], bool],
+                    kept: dict[Path, str], scratch_settings: conf.ConfigRead) -> TaskCleanup:
+    removed = TaskCleanup()
     attempted: dict[Path, Path] = {}
 
     def remove_task_folder(path: Path, *, require_task: bool = True) -> bool:
@@ -3917,19 +3991,6 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
         removed.append(path)
         return True
 
-    # Save the task end before recovery can add a hold for the retained source.
-    with locked_holds(scratch_settings=scratch_settings):
-        for path in operation_records(scratch_settings, "*.json"):
-            journal = OperationJournal(path)
-            try:
-                operation = journal.read()
-                step = operation.step
-                if (isinstance(step, PublishAdoption) and not isinstance(step, PublishAdoptionAfterTaskEnd)
-                        and step.paths.destination.task == task and selected(step.paths.hidden)):
-                    journal.save(FolderOperation(operation.source, operation.source_id,
-                                                 PublishAdoptionAfterTaskEnd(step.paths, step.stage_id)))
-            except (OSError, ScratchError) as error:
-                kept[path] = str(error)
     for folder in folders(scratch_settings=scratch_settings):
         if folder.task == task and selected(folder.path):
             _ = remove_task_folder(folder.path)
@@ -3969,15 +4030,20 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
                     kept[held] = "the container has unfinished copy removals"
                     record["ended"] = moment
                     continue
-                _ = remove_empty_copy_pairs(copies, source_deletion=SourceDeletion.STANDARD,
-                                            ending_task=task, scratch_settings=scratch_settings)
-                # A container hold never takes recursive deletion through the copies root.
-                if held != copies and held.exists():
-                    outcome = remove_folder(held, EmptyFolderRemoval(), ending_task=task, scratch_settings=scratch_settings)
-                    if isinstance(outcome, KeptFolder):
-                        kept[held] = outcome.reason
-                        record["ended"] = moment
-                        continue
+                try:
+                    _ = remove_empty_copy_pairs(copies, source_deletion=SourceDeletion.STANDARD,
+                                                ending_task=task, scratch_settings=scratch_settings)
+                    # A container hold allows only empty directory removal.
+                    if held != copies and held.exists():
+                        outcome = remove_folder(held, EmptyFolderRemoval(), ending_task=task, scratch_settings=scratch_settings)
+                        if isinstance(outcome, KeptFolder):
+                            kept[held] = outcome.reason
+                            record["ended"] = moment
+                            continue
+                except (ScratchError, OSError) as error:
+                    kept[held] = str(error)
+                    record["ended"] = moment
+                    continue
                 if held == copies and any(copy_paths()):
                     kept[held] = "the container has retained copies"
                     record["ended"] = moment

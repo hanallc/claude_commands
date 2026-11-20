@@ -118,9 +118,11 @@ The check inspects these entries without following symbolic links.
 
 For an interrupted scratch move, the journal records a task end before recovery can hold the retained source.
 Recovery checks for process use through all mount aliases before it releases the retained source's hold.
-A task end reports unreadable journals and continues with the other folders.
+A task end reads each journal once and checks for changes before using that reading.
+It reports unreadable journals, keeps folders that it cannot verify, and records the end of later holds.
 A scoped sweep recovers a move only when its roots include the source and the destination.
 The sweep checks the file identity of the Git registration's backlink target.
+The sweep reads only regular backlink files, without following symbolic links.
 The sweep keeps the worktree if the backlink cannot be read or its target cannot be found.
 
 `copies.py list` reads slot leases and remote mirror rows.

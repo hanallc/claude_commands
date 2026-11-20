@@ -1864,6 +1864,32 @@ assert scratch.removal_mark(path).is_file()
             self.assertEqual(scratch.holds()[str(other)]["ended"], moment)
             self.assertEqual((other / "work").read_text(), "keep")
 
+        with self.subTest(unreadable_journal_with_empty_pair=True):
+            task = "gate:container"
+            copies_root = self.base / "copies"
+            pair = copies_root / "empty-pair"
+            pair.mkdir(parents=True)
+            _ = scratch.hold(copies_root, task, "copy container")
+            later = self.base / "later"
+            later.mkdir()
+            _ = (later / "work").write_text("keep")
+            _ = scratch.hold(later, task, "unfinished work")
+            journal = scratch.operation_journal(self.base / "pending-source", conf.read("scratch")).path
+            moment = time.time()
+
+            with mock.patch.object(scratch, "read_operation_fields", wraps=scratch.read_operation_fields) as read:
+                result = scratch.end(task, now=moment)
+
+            read.assert_called_once_with(journal)
+            reasons = {item.path: item.reason for item in result.kept}
+            self.assertIn("cannot read folder operation", reasons[journal])
+            self.assertEqual(journal.read_text(), "{")
+            self.assertTrue(pair.is_dir())
+            holds = scratch.holds()
+            self.assertEqual(holds[str(copies_root)]["ended"], moment)
+            self.assertEqual(holds[str(later)]["ended"], moment)
+            self.assertEqual((later / "work").read_text(), "keep")
+
     def test_main_removes_a_session_clone_after_its_task_transfer(self) -> None:
         source = self.base / "source"
         source.mkdir()

@@ -984,6 +984,29 @@ class IdleTests(TmpSweepCase):
             self.assertTrue(backlink.samefile(hidden / ".git"))
             self.assertEqual(registration.read_text(), str(backlink) + "\n")
 
+        with self.subTest(backlink="fifo"):
+            later = write(self.tmp.parent / "later-sweep" / "idle" / "note").parent
+            roots = tmp_sweep.Roots((), (), (), scratch=(str(hidden.parent), str(later.parent)))
+            registration.unlink()
+            os.mkfifo(registration)
+            read_text = Path.read_text
+
+            def read_regular_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                self.assertNotEqual(path, registration, "The sweep tried to read the FIFO backlink")
+                return read_text(path, encoding=encoding, errors=errors)
+
+            try:
+                with mock.patch.object(Path, "read_text", read_regular_text):
+                    result = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
+
+                self.assertIn(str(hidden), result.kept.get(tmp_sweep.GitWork.UNREADABLE.value, []))
+                self.assertTrue((hidden / ".git").is_file())
+                self.assertTrue(registration.is_fifo())
+                self.assertIn(str(later), [entry["path"] for entry in result.deleted])
+                self.assertFalse(later.exists())
+            finally:
+                registration.unlink()
+
         with self.subTest(backlink="destination"):
             _ = registration.write_text(str(destination / ".git") + "\n")
 
