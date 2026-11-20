@@ -1,9 +1,7 @@
-"""Write session review counts and read the global action count.
+"""Write session review counts.
 
 Usage: counts_row.py <notifier instance dir>
        counts_row.py --unit <staff id>
-       counts_row.py --for-you
-       counts_row.py --for-you-console
 
 assignment.py updates review counts when a source changes or a deadline passes.
 The review cache is `<showrunner state>/counts/<staff id>`.
@@ -12,8 +10,6 @@ Its second line contains the next deadline, or an empty value.
 The remaining lines contain watched paths and optional unit details.
 The final unit detail uses `source=unit:<staff id>`.
 The cache time records when the read began.
-The console host reads its action stores through the shared reader.
-The Mac reads the count from the console host.
 """
 from __future__ import annotations
 try:

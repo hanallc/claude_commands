@@ -831,6 +831,29 @@ run() {
 }
 
 run_step() {
+    local -a command=("$@")
+    local cargo_index=0 BUILDLOG_VERIFY_POSITION=1
+    if [[ "${command[0]:-}" == env ]]; then
+        cargo_index=1
+        while :; do
+            case "${command[cargo_index]:-}" in
+                -u) (( cargo_index += 2 )) ;;
+                *=*) (( cargo_index += 1 )) ;;
+                *) break ;;
+            esac
+        done
+    fi
+    if [[ "${command[cargo_index]:-}" == cargo ]]; then
+        (( cargo_index += 1 ))
+        if [[ "${command[cargo_index]:-}" == +* ]]; then (( cargo_index += 1 )); fi
+        case "${CMD:-}:${command[cargo_index]:-}" in
+            final:nextest) BUILDLOG_VERIFY_POSITION=2 ;;
+            lint:clippy) BUILDLOG_VERIFY_POSITION=${VERIFY_STEP_COUNT:-1} ;;
+        esac
+    fi
+    local -x BUILDLOG_VERIFY_VERB="${CMD:-}" BUILDLOG_VERIFY_CALL="${VERIFY_CALL_TEXT:-}"
+    local -x BUILDLOG_VERIFY_TOTAL="${VERIFY_STEP_COUNT:-1}"
+    export BUILDLOG_VERIFY_POSITION
     if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
         if buildlog_step_compiles "$@"; then
             local STEP_WRITES_TREE=0
@@ -1502,6 +1525,24 @@ if [[ "$CMD" == example-test ]]; then
 fi
 
 
+# Use the same safe characters and single quotes as shlex.join.
+format_verify_call() {
+    local LC_ALL=C arg
+    VERIFY_CALL_TEXT=verify
+    if [[ "${1:-}" == --session-dir ]]; then shift 2; fi
+    for arg in "$@"; do
+        case "$arg" in
+            ''|*[!a-zA-Z0-9_@%+=:,./-]*)
+                arg="'${arg//\'/\'\"\'\"\'}'"
+                ;;
+        esac
+        VERIFY_CALL_TEXT+=" $arg"
+    done
+}
+format_verify_call "${VERIFY_ORIGINAL_ARGS[@]}"
+VERIFY_STEP_COUNT=1
+if [[ "$CMD" == final ]]; then VERIFY_STEP_COUNT=2; fi
+
 parse_routing_arguments "$@"
 parse_command_arguments "${ARGS[@]}"
 set -- ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}
@@ -1642,11 +1683,14 @@ phase_wait_start() {
     fi
     local args=(start-wait --session-dir "$PHASE_WAIT_SESSION"
         --kind WaitingForMemoryOrSlot --reason "$reason")
-    local owner="${CODEX_THREAD_ID:-}"
-    if [[ -n "$owner" ]]; then
-        args+=(--worker-thread-id "$owner" --owner-session "$owner")
+    local owner="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
+    args+=(--owner-session "$owner")
+    if [[ -n "${UNIT_PHASE_ID:-}" ]]; then
+        args+=(--verify-phase-id "$UNIT_PHASE_ID")
+    elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then
+        args+=(--worker-thread-id "$owner")
     else
-        args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
+        args+=(--director)
     fi
     if id="$(verify_helper "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})"; then
         if [[ -n "$id" ]]; then
@@ -3541,6 +3585,7 @@ trap - INT TERM HUP
 # rule applies here too — the thing that runs the work opens the window.
 PROGRESS_HISTORY="${BUILD_HELPER_ROOT}/direct/progress_history.py"
 ACTIVITY_SESSION_DIR="${UNIT_SESSION_DIR:-}"
+ACTIVITY_PHASE_ID="${UNIT_PHASE_ID:-}"
 
 # A phase runs two workers against one target/ directory and one Cargo lock,
 # so every cargo run below has to be serialized against its peers. Taking the
@@ -4223,6 +4268,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
     # "test hana" answered neither.
     if verify_helper "${PROGRESS_HISTORY}" start-activity \
         --session-dir "${ACTIVITY_SESSION_DIR}" \
+        --phase-id "${ACTIVITY_PHASE_ID}" \
         --label "Verification" \
         --activity "verify.sh ${CMD}${*:+ $*}" >/dev/null 2>&1; then
         ACTIVITY_ACTIVE=1
@@ -4238,6 +4284,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
             esac
             verify_helper "${PROGRESS_HISTORY}" finish-activity \
                 --session-dir "${ACTIVITY_SESSION_DIR}" \
+                --phase-id "${ACTIVITY_PHASE_ID}" \
                 --status "${status}" \
                 --result "${result}" >/dev/null 2>&1 || true
         }
@@ -4728,6 +4775,10 @@ case "$CMD" in
         [[ $# -eq 0 ]] || { usage; exit 2; }
         if [[ -n "$PKG" ]]; then require_member "$PKG"; fi
         require_taplo
+        # Only mend and clippy take queue steps. Repairs reuse their positions.
+        VERIFY_STEP_COUNT=0
+        if lint_config_enabled mend; then VERIFY_STEP_COUNT=$((VERIFY_STEP_COUNT + 1)); fi
+        if lint_config_enabled clippy; then VERIFY_STEP_COUNT=$((VERIFY_STEP_COUNT + 1)); fi
         run_lint_sequence
         ;;
     doc)

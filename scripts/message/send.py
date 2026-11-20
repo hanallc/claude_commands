@@ -4936,6 +4936,7 @@ class WorkerResultReceipt:
     marker: str
     wait_for_idle: bool = False
     before_input: Callable[[], object] = lambda: None
+    worker_only: bool = False
 
     def received(self, worker: staff.StaffRow, membership: staff.StaffSnapshot) -> bool:
         from scripts.production import worker_admission
@@ -4961,8 +4962,9 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
     from scripts.herdr import herdr
 
     holder = membership.parent_of(worker)
+    worker_only = isinstance(receipt, WorkerResultReceipt) and receipt.worker_only
     if holder is None:
-        return Result("failed", f"{worker.name}: worker holder is unavailable")
+        return Result("retry" if worker_only else "failed", f"{worker.name}: worker holder is unavailable")
     if not reason:
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker):
@@ -5045,6 +5047,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
             reason = "worker is stopped"
         else:
             reason = "worker pane is closed"
+    if worker_only:
+        return Result("retry", reason)
     if isinstance(selection, FixedStaffLookup):
         return Result("failed", reason)
     address = f"session:{holder.current_session}"

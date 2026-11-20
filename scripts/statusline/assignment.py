@@ -18,6 +18,11 @@ from scripts.lib import git_files
 from scripts.production import staff
 from scripts.statusline import adhoc_items, rebuild_row
 
+try:
+    from scripts.review_links import for_you
+except Exception:
+    for_you = None
+
 
 def assignment(record: staff.StaffSnapshot, session_id: str) -> tuple[str, str]:
     """Return the assignment text and its color role."""
@@ -138,6 +143,19 @@ def counts_rows(record: staff.StaffSnapshot, session_id: str) -> str:
     return "".join(lines)
 
 
+def status_action_count(config: Path) -> str:
+    """Keep the other rows available if an action count fails."""
+    if for_you is None:
+        return "unavailable"
+    try:
+        system = os.environ.get("STATUSLINE_SYSTEM") or os.uname().sysname
+        if system == "Darwin":
+            return for_you.console_action_count()
+        return for_you.global_action_count(rebuild_row.read(config))
+    except Exception:
+        return "unavailable"
+
+
 def main(rebuild: rebuild_row.RebuildAnswer | None = None) -> None:
     payload = cast(dict[str, object], json.load(sys.stdin))
     try:
@@ -150,8 +168,11 @@ def main(rebuild: rebuild_row.RebuildAnswer | None = None) -> None:
                 if option == "--arg" and name == "pwd"), os.getcwd())
     branch = current_branch(payload, pwd) if role == "unit-director" else ""
     rebuild_config = rebuild_row.DEFAULT_CONFIG
+    action_args: list[str] = []
     if rebuild is None:
-        rebuild = rebuild_row.read(rebuild_config)
+        action_args = ["--arg", "for_you", status_action_count(rebuild_config)]
+        # The cache can expire during the count. Read it again without reading the needs.
+        rebuild = rebuild_row._read_cache(rebuild_config, time.time)  # pyright: ignore[reportPrivateUsage]
     if rebuild.refresh_due:
         try:
             _ = subprocess.Popen(
@@ -166,7 +187,7 @@ def main(rebuild: rebuild_row.RebuildAnswer | None = None) -> None:
                      "--arg", "counts", counts_rows(record, session_id),
                      "--arg", "branch", branch,
                      "--arg", "adhoc", adhoc_items.row(session_id),
-                     "--arg", "rebuild", rebuild.row(), *sys.argv[1:]])
+                     *action_args, *sys.argv[1:]])
 
 
 if __name__ == "__main__":

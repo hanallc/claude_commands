@@ -477,6 +477,10 @@ class AppliedCheckTests(unittest.TestCase):
         self.assertEqual(check("Config::old_field", "Config::new_field", "src/config.rs",
                                applied.replace("new_field", "old_field")), RenameNotApplied("src/config.rs"))
 
+    def test_a_struct_field_rename_ignores_another_structs_old_field(self) -> None:
+        source = "struct Wrap { new: u8 }\nstruct Other { old: u8 }\n"
+        self.assertEqual(check("Wrap::old", "Wrap::new", "src/lib.rs", source), AppliedInCode())
+
     def test_a_top_level_item_of_a_file_module_is_under_the_module(self) -> None:
         source = "pub fn new_fn() {}\nmod tests { fn reads() { super::new_fn(); } }\n"
         self.assertEqual(check("paths::old_fn", "paths::new_fn", "src/paths.rs", source), AppliedInCode())
@@ -496,18 +500,21 @@ class AppliedCheckTests(unittest.TestCase):
         self.assertEqual(check("crate::OldType", "crate::NewType", "src/types.rs", "pub struct NewType;\n"),
                          NoAppliedCheck("rename"))
 
-    def test_a_file_that_holds_both_names_has_no_check(self) -> None:
+    def test_a_file_that_holds_both_names_outside_the_same_scope_has_no_check(self) -> None:
         both = (("paths::old_fn", "paths::new_fn", "src/paths.rs", "pub fn new_fn() {}\nmod tests { fn old_fn() {} }\n"),
                 ("Parser::next", "Parser::advance", "src/parser.rs",
                  "pub struct Parser;\nimpl Parser { fn advance() {} }\nimpl Iterator for Parser { fn next() {} }\n"),
-                ("Config::enabled", "Config::is_enabled", "src/config.rs",
-                 "pub struct Config { is_enabled: bool }\nimpl Config { pub fn enabled(&self) -> bool { self.is_enabled } }\n"),
                 ("ffi::old", "ffi::new", "src/ffi.rs", 'pub fn new() {}\nextern "C" { fn old(); }\n'),
                 ("ffi::old", "ffi::new", "src/lib.rs", "mod ffi { pub fn new() {} items! { fn old() {} } }\n"),
                 ("Kind::Old", "Kind::New", "src/kind.rs", "struct Kind;\nimpl Kind { fn New() {} }\n"
                  + "mod other { struct Kind; impl Kind { fn Old() {} } }\n"))
         for before, after, path, source in both:
             self.assertEqual(check(before, after, path, source), NoAppliedCheck("rename"), source)
+
+    def test_an_item_rename_refuses_when_the_parent_still_declares_both_names(self) -> None:
+        source = "pub struct Config { is_enabled: bool }\nimpl Config { pub fn enabled(&self) -> bool { self.is_enabled } }\n"
+        self.assertEqual(check("Config::enabled", "Config::is_enabled", "src/config.rs", source),
+                         RenameNotApplied("src/config.rs"))
 
     def test_a_parent_name_that_more_than_one_item_has_gives_no_check(self) -> None:
         source = "mod a { enum Kind { Gone } }\nmod b { enum Kind { New } }\n"
@@ -613,6 +620,40 @@ class AppliedCheckTests(unittest.TestCase):
 
 
 class FileRenameTests(unittest.TestCase):
+    def test_a_binding_with_division_is_an_item_rename(self) -> None:
+        rename = approved_renames.classify_rename("src/lib.rs", "let old = total / count;", "let new = total / count;")
+        self.assertEqual(rename, approved_renames.ItemRename(BindingRename(0, "", "old", "new")))
+
+    def test_file_instruction_grammar_consumes_all_clauses(self) -> None:
+        parse = approved_renames.classify_rename
+        first = FileRename("src/foot.rs", "src/summary_foot.rs")
+        second = FileRename("src/foot_tests.rs", "src/summary_foot_tests.rs")
+        for suffix in (
+            " and foot_tests.rs to summary_foot_tests.rs.",
+            ", plus `foot_tests.rs` to `summary_foot_tests.rs`.",
+            ". Rename the companion file foot_tests.rs to summary_foot_tests.rs.",
+            "; Rename foot_tests.rs to summary_foot_tests.rs. Update the module declaration, imports, "
+            + "path attribute and documentation references.",
+        ):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(parse(first.old, "foot.rs", "Rename foot.rs to summary_foot.rs" + suffix),
+                                 approved_renames.FileRenamePlan(first, (second,)))
+        for after in (
+            "Rename foot.rs to summary_foot.rs. Apply the same prefix to its companion tests.",
+            "Rename foot.rs to summary_foot.rs. Update imports and apply the same prefix to its tests.",
+            "Rename the directory foot to summary_foot.",
+            "Rename crate::foot to crate::summary_foot.",
+        ):
+            with self.subTest(after=after):
+                self.assertIsInstance(parse(first.old, "foot.rs", after), approved_renames.UnparsedFileRenames)
+        self.assertEqual(parse(first.old, "foot.rs", "Rename foot.rs to summary_foot.rs; "
+                               + "update ledger/mod.rs and all super::lock paths"), approved_renames.FileRenamePlan(first))
+        self.assertIsInstance(parse(first.old, "Foot::Old", "Foot::New"), approved_renames.ItemRename)
+
+    def test_file_rename_plan_refuses_the_same_source_under_two_path_spellings(self) -> None:
+        after = "Rename foot.rs to summary_foot.rs and src/foot.rs to src/other.rs."
+        self.assertEqual(approved_renames.stated_file_renames("rename", "src/foot.rs", after), ())
+
     def test_a_file_rename_is_read_from_the_finding_path_and_the_paths_its_after_names(self) -> None:
         path = "crates/cargo-berth/src/ledger/lock.rs"
         accepted = (

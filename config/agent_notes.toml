@@ -1,45 +1,82 @@
 # All deadlines stay at or below the former notes job's 120-second limit.
 [job]
+# The job only validates this interval as a finite positive number.
+# The systemd timer sets when the job runs.
 interval_seconds = 120
 timeout_seconds = 120
 
 [mac_usage]
 # 60 s drew HTTP 429 that moved between the four Claude accounts (2026-11-01).
+# Sets the target time between Claude usage reads of each account directory on the Mac.
+# One pass can read several due accounts.
+# Use a finite positive number.
 interval_seconds = 120
 # Each Codex read starts an app-server that moves about 1 MB. A 120 s cadence cost about 1.8 GB per day on the Mac.
+# Sets the target time between Codex usage reads of each Codex home on the Mac.
+# One pass can read several due homes.
+# Use a finite positive number.
 codex_interval_seconds = 1800
 
 [parts.notes]
+# Sets the minimum time after a successful account note update before the next scheduled update.
+# Use a finite positive number.
 interval_seconds = 120
 timeout_seconds = 60
 [parts.quota]
+# Sets the minimum time after a successful quota check before the next scheduled check.
+# Use a finite positive number.
 interval_seconds = 120
 timeout_seconds = 30
 [parts.pacer]
+# Sets the minimum time after a successful Codex pacer run before the next scheduled run.
+# Use a finite positive number.
 interval_seconds = 120
 timeout_seconds = 30
 [parts.refusals]
+# Sets the minimum time after a successful quota refusal check before the next scheduled check.
+# Use a finite positive number.
 interval_seconds = 120
 timeout_seconds = 60
 [parts.watchdog]
+# Sets the minimum time after a successful unit watchdog run before the next scheduled run.
+# Use a finite positive number.
 interval_seconds = 120
 timeout_seconds = 45
+# parts.logins.interval_seconds sets the minimum time after a successful login reminder check before the next scheduled check.
+# Use a finite positive number.
 [parts.logins]
 interval_seconds = 120
 timeout_seconds = 45
 [parts.prune]
+# Sets the minimum time after a successful phase note prune before the next scheduled prune.
+# Use a finite positive number.
 interval_seconds = 120
 timeout_seconds = 60
 [parts.vault]
+# Sets the minimum time after a successful vault check for note changes before the next scheduled check.
+# Use a finite positive number.
 interval_seconds = 120
 timeout_seconds = 60
 
 [vault]
+# Limits how long each Git command in the vault commit process can run.
+# Use a finite positive number.
 git_seconds = 30
+# Sets how many paths the vault commit subject names. The subject counts the other paths as "N more".
+# Use a positive integer. A commit with one path more than this names all its paths.
 named_paths = 4
 
 [watchdog]
+# Limits how long the watchdog waits for one recovery dispatch.
+# Use a finite positive number.
 dispatch_seconds = 5
+# Limits how long each detached recovery can run.
+# Use a finite positive number.
 recovery_seconds = 240
+# Sets the dispatch budget of a watchdog pass. After this time from the pass start, the pass starts no new recovery.
+# A recovery that starts before the limit can finish its dispatch after it.
+# Use a finite positive number.
 pass_dispatch_seconds = 30
+# Sets how long the watchdog treats a recovery with no result as still running.
+# Use a finite positive number.
 result_seconds = 300
