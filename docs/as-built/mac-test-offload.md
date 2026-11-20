@@ -42,18 +42,22 @@ A cached idle result can stay in use until its age limit after CI starts.
 The Mac Cargo gate at `scripts/mac_test/cargo_gate/gate.zsh` checks placement for agent and SSH calls.
 The `cargo`, `cargo-nextest`, and `rustc` links use this gate.
 For a placed call, `worker_budget` in `config/mac_gate.conf` sets the jobserver slots and caps nextest test threads.
-The initial budget is four slots per placement.
-The gate uses one FIFO and one lock for each placement.
-Independent commands in a placement take the lock in turn. This gives only one command the implicit slot.
-The command holds the lock through exec, and the gate checks placement again after lock acquisition.
-The gate publishes the placement pipe in `CARGO_MAKEFLAGS` and seeds it with one fewer token than the budget.
-A nested gate call for the same placement uses the inherited descriptors.
-The gate leaves compile arguments intact. Cargo uses the gate budget even when an explicit compile width is smaller.
+The initial budget is four slots per build root.
+The gate permits one independent build root per placement and refuses an overlap without waiting.
+If two roots start at the same time, both can receive a refusal.
+The root record stays live while its PID runs with the recorded start time.
+A background descendant of a finished root does not prevent the next root from starting.
+Each root gets an unlinked pipe with `worker_budget - 1` tokens. The gate publishes the pipe in `CARGO_MAKEFLAGS`.
+A verified nested call uses the same pipe. Each Cargo process has one implicit slot.
+With `N` concurrent Cargo processes sharing the pipe, the compile bound is `worker_budget - 1 + N`.
+Cargo can use the pipe budget when an explicit compile width is smaller.
 Cargo resolves aliases and then finds the nextest gate links on its external command path.
+The gate resolves a relative `CARGO_HOME` against the working directory.
 The gate exports `NEXTEST_TEST_THREADS` and caps explicit test thread options before `--`.
 It preserves smaller caller values from the environment and test thread options.
 The exported value takes priority over the profile default. The audited repository profiles had no `test-threads` setting.
 The gate refuses test thread values that it cannot bound.
+A direct `cargo-ntr` through the normal `PATH` and an absolute path to the real nextest binary bypass the cap.
 Mac `mend-fix` uses the same budget for mend and the follow-up Clippy command.
 The gate leaves interactive calls under the `user` label at their existing width.
 

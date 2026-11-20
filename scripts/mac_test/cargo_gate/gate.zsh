@@ -23,9 +23,25 @@ agent_call=0
 state=$HOME/.local/state/mac-gate
 umask 077
 mkdir -p "$state/records" || exit 2
+jobserver_prefix=$state/jobserver-
+root_record='' fifo=''
 process_start() {
-    local stamp=$(ps -p "$1" -o lstart= 2>/dev/null) || return 1
-    print -r -- "${(j: :)${=stamp}}"
+    local process_row
+    local -a fields
+    process_row=$(env -u TZ ps -p "$1" -o state= -o lstart= 2>/dev/null) || return 1
+    fields=(${=process_row})
+    [[ $#fields == 6 && $fields[1] != Z* ]] || return 1
+    print -r -- "${(j: :)fields[2,-1]}"
+}
+process_key() {
+    print -r -- "$1-${2//[^A-Za-z0-9]/_}"
+}
+read_record() {
+    IFS=$'\t' read -r recorded_pid recorded_start recorded_label 2>/dev/null < "$1" &&
+        [[ $recorded_pid == <-> && -n $recorded_start ]]
+}
+record_is_live() {
+    [[ $(process_start "$recorded_pid") == "$recorded_start" ]]
 }
 label=user
 if (( agent_call )); then
@@ -34,6 +50,8 @@ if (( agent_call )); then
     refuse() {
         local refusal=$(conf_value mac_gate refusal_exit_code) || exit 2
         print -u2 -r -- "mac cargo gate refused: $1${2-; run it through mac_queue_run.py}"
+        [[ -z $fifo ]] || rm -f -- "$fifo"
+        [[ -z $root_record ]] || rm -f -- "$root_record"
         exit $refusal
     }
     placement=${MAC_PLACEMENT:-}
@@ -165,36 +183,46 @@ fi
 # Cargo can exec cargo-nextest in the recorded process.
 ancestor=${MAC_GATE_RECORD:-}
 recorded=0
-if [[ $ancestor == <-> && -r $state/records/$ancestor ]]; then
-    IFS=$'\t' read -r recorded_pid recorded_start recorded_label < "$state/records/$ancestor"
+if [[ $ancestor == (<->|<->-[A-Za-z0-9_]*) && $ancestor != *[^A-Za-z0-9_-]* ]] &&
+    read_record "$state/records/$ancestor" && [[ $recorded_label == "$label" ]]; then
     cursor=$PPID
     [[ $recorded_pid != $$ ]] || cursor=$$
     while [[ $cursor == <-> && $cursor != 0 ]]; do
-        if [[ $cursor == $recorded_pid && $recorded_label == "$label" && -n $recorded_start &&
-              $(process_start "$cursor") == $recorded_start ]]; then
-            recorded=1
+        if [[ $cursor == $recorded_pid ]]; then
+            record_is_live && recorded=1
             break
         fi
         parent=$(ps -p "$cursor" -o ppid= 2>/dev/null)
         cursor=${parent//[[:space:]]/}
     done
 fi
-if (( agent_call )); then
-    if (( ! recorded )); then
-        # Each independent Cargo command owns an implicit slot. Give that slot to
-        # one command at a time. The command keeps the lock through exec.
-        pool_dir=$state/pools/episode-$episode
-        fifo=$pool_dir/attempt-$attempt.fifo
-        mkdir -p "$pool_dir" && exec {placement_lock}>>"$fifo.lock" \
-            || refuse 'cannot open the placement jobserver lock' ''
-        python3 -IS -c 'import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)' "$placement_lock" \
-            || refuse 'cannot lock the placement jobserver' ''
-    fi
-    check_placement
-fi
 if (( ! recorded )); then
-    # Remove expired state only when this call writes a record.
+    started=$(process_start $$) || exit 2
+    root_key=$(process_key "$$" "$started")
+    root_record=$state/records/$root_key
+    # Publish before reading other records. Two overlapping roots cannot both pass.
+    print -r -- "$$"$'\t'"$started"$'\t'"$label" > "$root_record" || exit 2
+    export MAC_GATE_RECORD=$root_key
     if (( agent_call )); then
+        for file in "$state/records/"(<->|<->-[A-Za-z0-9_]*)(N); do
+            [[ $file != "$root_record" ]] || continue
+            if read_record "$file"; then
+                if record_is_live; then
+                    [[ $recorded_label != "$label" ]] || refuse 'placement already has a live build root' ''
+                    continue
+                fi
+            else
+                # A root can still be writing this record.
+                record_owner=${${file:t}%%-*}
+                process_start "$record_owner" >/dev/null && continue
+            fi
+            rm -f -- "$file"
+        done
+    fi
+fi
+if (( agent_call )); then
+    check_placement
+    if (( ! recorded )); then
         for file in "$state/checks/"*.live(N); do
             IFS=$'\t' read -r checked cached < "$file"
             if [[ $checked != <->(|.<->) ]] || (( EPOCHREALTIME - checked >= recheck )); then
@@ -206,18 +234,14 @@ if (( ! recorded )); then
             zstat -A modified +mtime "$file" 2>/dev/null || continue
             (( EPOCHREALTIME - modified[1] <= limit + 1 )) || rm -f -- "$file"
         done
-        for file in "$state/records/"<->(N); do
-            IFS=$'\t' read -r recorded_pid recorded_start recorded_label < "$file"
-            current_start=$(process_start "$recorded_pid")
-            [[ -n $current_start && $current_start == $recorded_start ]] || rm -f -- "$file"
+        for file in "$jobserver_prefix"<->-[A-Za-z0-9_]*(N); do
+            fifo_owner=${file#"$jobserver_prefix"}
+            owner_pid=${fifo_owner%%-*}
+            owner_start=$(process_start "$owner_pid")
+            [[ -n $owner_start && $fifo_owner == "$(process_key "$owner_pid" "$owner_start")" ]] \
+                || rm -f -- "$file"
         done
     fi
-    started=$(process_start $$)
-    print -r -- "$$"$'\t'"$started"$'\t'"$label" > "$state/records/$$.new"
-    mv -f -- "$state/records/$$.new" "$state/records/$$"
-    export MAC_GATE_RECORD=$$
-fi
-if (( agent_call )); then
     jobserver_identity() {
         local -A read_info write_info
         zstat -s -H read_info -f "$pool_read" 2>/dev/null &&
@@ -236,8 +260,8 @@ if (( agent_call )); then
         jobserver_identity && [[ $REPLY == ${inherited_pool#*:} ]] \
             || refuse 'ancestor jobserver descriptors are unavailable' ''
     else
-        [[ -e $fifo ]] || mkfifo "$fifo" || refuse 'cannot create the placement jobserver' ''
-        [[ -p $fifo ]] || refuse 'invalid placement jobserver' ''
+        fifo=$jobserver_prefix$root_key
+        mkfifo "$fifo" || refuse 'cannot create the jobserver' ''
         pipe_buf=$(getconf PIPE_BUF "$fifo" 2>/dev/null)
         if [[ $pipe_buf != <-> ]] || (( worker_budget - 1 > pipe_buf )); then
             refuse 'worker_budget exceeds the jobserver pipe limit' ''
@@ -245,19 +269,10 @@ if (( agent_call )); then
         # Open both ends before separate opens so neither end blocks at startup.
         exec {pool_hold}<>"$fifo" && exec {pool_read}<"$fifo" && exec {pool_write}>"$fifo" \
             || refuse 'cannot open the jobserver' ''
+        rm -f -- "$fifo" || refuse 'cannot unlink the jobserver' ''
+        fifo=''
         exec {pool_hold}>&- || refuse 'cannot close the jobserver setup descriptor' ''
         jobserver_identity || refuse 'cannot identify the jobserver' ''
-        # The previous command can release its lock before the kernel closes
-        # its pipe descriptors. Remove any remaining bytes before seeding.
-        zmodload zsh/system || exit 2
-        while true; do
-            sysread -t 0 -i "$pool_read" -s "$pipe_buf" unused_tokens
-            case $? in
-                0) ;;
-                4) break ;;
-                *) refuse 'cannot clear the placement jobserver' '' ;;
-            esac
-        done
         # Cargo and rustc already own one implicit slot.
         printf '%*s' "$(( worker_budget - 1 ))" '' >&$pool_write || refuse 'cannot seed the jobserver' ''
         export MAC_GATE_JOBSERVER="$pool_read,$pool_write:$REPLY"
@@ -268,7 +283,11 @@ if (( agent_call )); then
         # Cargo resolves aliases before it searches PATH for nextest.
         # Keep Cargo from inserting its own bin ahead of the gate links.
         cargo_home=${CARGO_HOME:-$HOME/.cargo}
-        [[ $cargo_home == /* ]] || refuse 'CARGO_HOME must be absolute' ''
+        if [[ $cargo_home != /* ]]; then
+            cargo_cwd=$(pwd -P) || refuse 'cannot resolve the working directory for Cargo home' ''
+            cargo_home="${cargo_cwd%/}/$cargo_home"
+            export CARGO_HOME=$cargo_home
+        fi
         cargo_home_bin=${cargo_home%/}/bin
         [[ $cargo_home_bin != *:* && $nextest_bin != *:* && -x $nextest_bin/cargo-nextest && -x $nextest_bin/cargo-ntr ]] \
             || refuse 'cannot route Cargo nextest through the gate' ''

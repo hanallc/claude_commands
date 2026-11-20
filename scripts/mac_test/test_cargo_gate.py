@@ -23,21 +23,19 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 GATE = Path(__file__).with_name("cargo_gate") / "bin"
 FIXTURE_WORKER_BUDGET = "3"
-PAUSE_GATE = '''
-def pause_gate(marker):
-    import socket
-    if event := os.environ.get("GATE_TEST_FIFO_EVENT"):
-        with socket.socket(fileno=int(event)) as channel:
-            channel.sendall(marker)
-            assert channel.recv(1) == b"+"
-'''
-PROGRAM = '''import json, os, shutil, stat, subprocess, sys, tomllib
+PROGRAM = '''import json, os, shutil, socket, stat, subprocess, sys, tomllib
 from pathlib import Path
-''' + PAUSE_GATE + '''
+
+def hold_jobserver():
+    with socket.socket(fileno=int(os.environ["GATE_TEST_ROOT_EVENT"])) as channel:
+        channel.sendall(b"r")
+        assert channel.recv(1) == b"+"
+
 root = Path(os.environ["GATE_TEST_ROOT"])
 arguments = sys.argv[1:]
 if Path(sys.argv[0]).name == "cargo" and arguments:
     home = Path(os.environ.get("CARGO_HOME") or root / ".cargo")
+    home = Path.cwd() / home
     config = home / "config.toml"
     if config.exists():
         alias = tomllib.loads(config.read_text()).get("alias", {}).get(arguments[0])
@@ -78,7 +76,14 @@ with (root / "runs").open("a") as stream:
         "nextest_threads":os.environ.get("NEXTEST_TEST_THREADS"),
         "record":os.environ.get("MAC_GATE_RECORD"),
         "records":[path.read_text() for path in records.iterdir()]}) + "\\n")
-pause_gate(b"r")
+if arguments == ["hold-root"]:
+    hold_jobserver()
+elif arguments == ["leave-child"] and os.fork() == 0:
+    with open(os.devnull, "w") as discard:
+        os.dup2(discard.fileno(), 1)
+        os.dup2(discard.fileno(), 2)
+    hold_jobserver()
+    os._exit(0)
 if sys.argv[1:] == ["child"]:
     raise SystemExit(subprocess.call([os.environ["GATE_TEST_BIN"] + "/rustc", "quoted value"], pass_fds=pool))
 raise SystemExit(int(os.environ.get("REAL_STATUS", "0")))
@@ -130,27 +135,14 @@ class CargoGateTests(unittest.TestCase):
         check = root / "check.py"
         _ = check.write_text(CHECK)
         parser = fake / "python3"
-        _ = parser.write_text(f"#!{sys.executable}\n" + '''import fcntl, os, socket, sys
-from pathlib import Path
-if sys.argv[1] == "-IS":
-    if event := os.environ.get("GATE_TEST_LOCK_EVENT"):
-        with socket.socket(fileno=int(event)) as channel:
-            try:
-                fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                channel.sendall(b"b")
-            else:
-                channel.sendall(b"f")
-else:
-    with (Path(os.environ["GATE_TEST_ROOT"]) / "parsers").open("a") as stream:
-        stream.write("parser\\n")
-os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-''')
+        _ = parser.write_text("#!/bin/zsh -f\nprint parser >> \"$GATE_TEST_ROOT/parsers\"\nexec "
+                              + shlex.quote(sys.executable) + ' "$@"\n')
         parser.chmod(0o755)
         ps = fake / "ps"
         list_processes = f"printf '%s' {shlex.quote(process_list)}" if process_list else '/bin/ps "$@"'
         _ = ps.write_text('#!/bin/zsh -f\nprint -r -- \"$*\" >> \"$GATE_TEST_ROOT/ps-calls\"\nif [[ ${@[-1]} == lstart= ]]; then\n'
-                          + ' kill -0 "$2" 2>/dev/null || exit 1\n print "Mon Nov  9 12:00:00 2026"\n'
+                          + ' process_state=$(/bin/ps -p "$2" -o state=) || exit 1\n'
+                          + ' print "$process_state Mon Nov  9 12:00:00 2026"\n'
                           + f'else\n {list_processes}\nfi\n')
         ps.chmod(0o755)
         _ = write_config_fixture(root / "config/mac_gate.conf",
@@ -174,8 +166,8 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
         return environment
 
     def run_gate(self, environment: dict[str, str], *arguments: str, name: str = "cargo",
-                 pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([str(GATE / name), *arguments], env=environment, capture_output=True, text=True,
+                 pass_fds: tuple[int, ...] = (), cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([str(GATE / name), *arguments], cwd=cwd, env=environment, capture_output=True, text=True,
                               pass_fds=pass_fds, timeout=TEST_HANG_GUARD_SECS)
 
     def runs(self, root: Path) -> list[dict[str, object]]:
@@ -227,7 +219,7 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
                     records = cast(list[str], rows[0]["records"])
                     self.assertEqual(len(records), 1)
                     pid, stamp, label = records[0].strip().split("\t")
-                    self.assertEqual(pid, rows[0]["record"])
+                    self.assertTrue(str(rows[0]["record"]).startswith(f"{pid}-"))
                     self.assertEqual(stamp, "Mon Nov 9 12:00:00 2026")
                     self.assertEqual(label, "placement episode/attempt" if placement else "user")
                     self.assertEqual((root / "checks").exists(), placement)
@@ -280,8 +272,8 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
                 self.assertEqual(row["cargo_jobs"], "2")
                 self.assertIsNone(row["nextest_threads"])
                 self.assertEqual(row["argv"], list(arguments))
-                fifo, = (root / ".local/state/mac-gate/pools").glob("*/*.fifo")
-                self.assertEqual(fifo.stat().st_ino, row["jobserver_inode"])
+                self.assertIsInstance(row["jobserver_inode"], int)
+                self.assertEqual(list((root / ".local/state/mac-gate").glob("jobserver-*")), [])
 
     def test_a_single_jobserver_slot_needs_no_pipe_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -357,81 +349,58 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
             _ = (home_bin.parent / "config.toml").write_text(
                 '[alias]\nnx = "nextest run"\nnxr = "nextest run -j12"\n'
             )
-            environment.update(CARGO_HOME=str(home_bin.parent), SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
-            calls = (("nx", "-j12"), ("nxr",), ("ntr", "-j12"))
-            for arguments in calls:
-                result = self.run_gate(environment, *arguments)
+            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
+            calls = ((str(home_bin.parent), ("nx", "-j12")), ("cargo-home", ("nxr",)),
+                     (str(home_bin.parent), ("ntr", "-j12")))
+            for home, arguments in calls:
+                result = self.run_gate({**environment, "CARGO_HOME": home}, *arguments, cwd=root)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            for row, arguments in zip(self.runs(root), calls, strict=True):
+            for row, (_, arguments) in zip(self.runs(root), calls, strict=True):
                 command = ["ntr"] if arguments[0] == "ntr" else ["nextest", "run"]
                 self.assertEqual(row["argv"], [*command, f"-j{FIXTURE_WORKER_BUDGET}"])
                 self.assertEqual(row["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
                 self.assertEqual(len(cast(list[str], row["records"])), 1)
 
-    def test_parallel_calls_share_the_fifo_and_live_setup_survives_cleanup(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            environment = self.fixture(root)
-            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
-            getconf = root / "fake/getconf"
-            real_getconf = getconf.resolve()
-            getconf.unlink()
-            _ = getconf.write_text(f"#!{sys.executable}\nimport os, sys\n" + PAUSE_GATE + '''
-if sys.argv[1] == "PIPE_BUF" and "GATE_TEST_FIFO_EVENT" in os.environ:
-    os.utime(sys.argv[2], (1, 1))
-    pause_gate(b"f")
-getconf = os.environ["GATE_TEST_GETCONF"]
-os.execv(getconf, [getconf, *sys.argv[1:]])
-''')
-            getconf.chmod(0o755)
-            environment["GATE_TEST_GETCONF"] = str(real_getconf)
-            setup, setup_child = socket.socketpair()
-            queued, queued_child = socket.socketpair()
-            command = [str(GATE / "cargo"), "build"]
-            with setup, setup_child, queued, queued_child:
-                setup.settimeout(TEST_HANG_GUARD_SECS)
-                queued.settimeout(TEST_HANG_GUARD_SECS)
-                with subprocess.Popen(command + ["--first"], env={
-                    **environment, "GATE_TEST_FIFO_EVENT": str(setup_child.fileno()),
-                }, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                    pass_fds=(setup_child.fileno(),)) as first:
+    def test_only_the_live_root_blocks_a_second_root(self) -> None:
+        for background in (False, True):
+            with self.subTest(background=background), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**self.fixture(root), "SSH_CONNECTION": "fake", "MAC_PLACEMENT": "episode/attempt"}
+                event, holder = socket.socketpair()
+                command = "leave-child" if background else "hold-root"
+                with event, holder, subprocess.Popen(
+                    [str(GATE / "cargo"), command], env={**environment, "GATE_TEST_ROOT_EVENT": str(holder.fileno())},
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, pass_fds=(holder.fileno(),),
+                ) as first:
+                    holder.close()
+                    event.settimeout(TEST_HANG_GUARD_SECS)
                     try:
-                        self.assertEqual(setup.recv(1), b"f")
-                        state = root / ".local/state/mac-gate"
-                        fifo, = (path for path in state.rglob("*") if path.is_fifo())
-                        inode = fifo.stat().st_ino
-                        other = self.run_gate({**environment, "MAC_PLACEMENT": "episode/other"}, "build", "--other")
-                        self.assertEqual(other.returncode, 0, other.stdout + other.stderr)
-                        self.assertEqual(fifo.stat().st_ino, inode)
-                        setup.sendall(b"+")
-                        self.assertEqual(setup.recv(1), b"r")
-                        with subprocess.Popen(command + ["--second"], env={
-                            **environment, "GATE_TEST_LOCK_EVENT": str(queued_child.fileno()),
-                        }, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            pass_fds=(queued_child.fileno(),)) as second:
-                            try:
-                                self.assertEqual(queued.recv(1), b"b")
-                                self.assertEqual(
-                                    [row["argv"] for row in self.runs(root)], [["build", "--other"], ["build", "--first"]]
-                                )
-                            finally:
-                                try:
-                                    setup.sendall(b"+")
-                                    first_output = first.communicate(timeout=TEST_HANG_GUARD_SECS)
-                                    second_output = second.communicate(timeout=TEST_HANG_GUARD_SECS)
-                                finally:
-                                    if second.returncode is None:
-                                        second.kill()
-                            self.assertEqual(second.returncode, 0, "".join(second_output))
+                        self.assertEqual(event.recv(1), b"r")
+                        if not background:
+                            cache, = (root / ".local/state/mac-gate/checks").glob("*.live")
+                            _ = cache.write_text("0\t" + environment["MAC_PLACEMENT"] + "\n")
+                            refusal = self.run_gate(environment, "build")
+                            self.assertEqual(refusal.returncode, 125, refusal.stdout + refusal.stderr)
+                            self.assertIn("placement already has a live build root", refusal.stderr)
+                            self.assertEqual(len(self.runs(root)), 1)
+                            self.assertEqual((root / "checks").read_text().splitlines(), ["check"])
+                            event.sendall(b"+")
+                        output = first.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(first.returncode, 0, "".join(output))
+
+                        result = self.run_gate(environment, "build")
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        before, after = self.runs(root)
+                        self.assertNotEqual(before["record"], after["record"])
+                        self.assertEqual(after["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
+                        self.assertEqual(len(cast(list[str], after["records"])), 1)
+                        if background:
+                            self.assertNotEqual(before["jobserver_inode"], after["jobserver_inode"])
+                            event.sendall(b"+")
+                            self.assertEqual(event.recv(1), b"")
                     finally:
                         if first.returncode is None:
                             first.kill()
-                    self.assertEqual(first.returncode, 0, "".join(first_output))
-            other_row, first_row, second_row = self.runs(root)
-            self.assertNotEqual(other_row["jobserver_inode"], inode)
-            for row in (first_row, second_row):
-                self.assertEqual(row["jobserver_inode"], inode)
-                self.assertEqual(row["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
 
     def test_placed_nextest_refuses_unreadable_test_thread_options(self) -> None:
         for arguments in (("-vj",), ("-vjbad",), ("--test-threads=",), ("-xj12",)):
