@@ -25,6 +25,7 @@ from unittest.mock import ANY, patch
 from weakref import finalize
 
 from scripts.production import fake_unit_host, staff, worker_admission
+from scripts.production.production_doc import EnrolledPaths
 from scripts.herdr import herdr_types
 from scripts.agents import pane_record, restart, stop_resume
 from scripts.agents.stop_results import SourceReleased
@@ -3077,14 +3078,16 @@ class WorkerPaneTests(StaffTestCase):
         doc = main / "production-live.md"
         log = main / "LOG.md"
         notes = main / "notes"
-        paths = worker_panes.EnrolledPaths(main=main, live_doc=doc, log=log, notes=notes, integration=integration)
+        paths = EnrolledPaths(main=main, live_doc=doc, log=log, notes=notes, integration=integration)
         self.parent_id = fixture_member("showrunner", name="showrunner", doc=staff.LiveDoc("natedev", doc),
                                         worktree=staff.PresentWorktree("natedev", integration)).id
         _ = staff.set_run(self.parent.id, staff.OpenRun(run))
         self.world.foreground.clear()
         self.world.add(self.parent, "w1:p0")
+        assignments: tuple[tuple[staff.WorkerRole, Literal["claude", "codex"]], ...] = (
+            ("review", "claude"), ("astra-reviewer", "codex"))
         with patch.object(worker_panes, "resolve_production_paths", return_value=paths):
-            for role, family in (("review", "claude"), ("astra-reviewer", "codex")):
+            for role, family in assignments:
                 with self.subTest(role=role, family=family):
                     selected = worker_panes.LaunchPolicy(models_registry.LaunchSettings(family, "fixture", "high", ""),
                                                          "read-only", "plan")

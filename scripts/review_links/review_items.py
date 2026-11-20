@@ -927,8 +927,8 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
     for doc in documents:
         with guard_source(doc, sources):
             member = members.by_doc(local_machine(), doc.resolve())
-            if member is not None and (current := record_store.local_document(member)) is not None:
-                scopes[current] = member.id
+            if member is not None and (local_doc := record_store.local_document(member)) is not None:
+                scopes[local_doc] = member.id
     if include_registered:
         with guard_source(state_root() / "review-folders", sources):
             if exact:
