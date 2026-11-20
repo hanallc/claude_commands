@@ -14,9 +14,14 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_page, cloud_gate, console_help, ledger, ledger_test_support, quota_requests, run_cost, spot_table
+from scripts.aws_target import (
+    aws_page, cloud_gate, console_help, ledger, ledger_test_support, quota_requests, run_cost, spend, spot_table,
+)
+from scripts.aws_target import config as aws_config
 from scripts.aws_target.aws_cli import AwsCli
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import page_frame
 
@@ -285,6 +290,202 @@ class AwsPageSettledAmountsTests(ledger_test_support.CostFixture):
             'Settled AWS amounts: 8 of 9 did not change after they settled (checked Nov 19).',
             '2026-11-12 changed from USD 7.73 to USD 7.81 (+0.08).',
         ])
+
+
+class AwsPageSpendReferenceTests(PageCostFixture):
+    """Record the existing spend and publication behavior for Phase 1."""
+
+    midnight: int = ledger_test_support.instant('2026-01-15T00:00:00Z')
+    book: ledger.CostLedger  # pyright: ignore[reportUninitializedInstanceVariable]
+    folder: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.costs({'fallback_usd_per_hour': '1', 'limit_reserve_usd': '0',
+                    'cost_explorer_interval_seconds': '60'})
+        self.book = ledger.CostLedger(self.state)
+        self.book.record_inventory(ledger.ResourceInventory(self.midnight - 86400, (), 'fixture inventory',
+                                                            builder_removed=True))
+        self.book.observe(ledger.InstanceObservation(self.midnight - 86400, 'terminated', 'fixture observation'))
+        self.folder = self.root / 'page'
+
+    def refresh(self, now: int, amount: str) -> None:
+        start = self.midnight - 86400
+        usd = Decimal(amount)
+        reading = ledger.ChargeRead('2026-01-14', now, start, self.midnight, usd, Decimal(0), Decimal(0),
+                                    (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', usd, usd, 'Hrs'),), False)
+        result = self.book.refresh_charges(self.settings, now, lambda _start, _end: (reading,))
+        self.assertIsInstance(result, ledger.ChargeRead)
+        assert isinstance(result, ledger.ChargeRead)
+        self.assertEqual(result.actual_usd, Decimal(amount))
+
+    def publish(self, now: int) -> aws_page.PageData:
+        path = aws_page.publish(self.state, now, self.folder, settings_path=self.settings)
+        return self.published_data(path.read_text())
+
+    @staticmethod
+    def published_data(source: str) -> aws_page.PageData:
+        payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
+        return cast(aws_page.PageData, json.loads(payload))
+
+    def assert_spend_tiles(self, data: aws_page.PageData, today: str, yesterday: str, month: str) -> None:
+        self.assertEqual(data['spend']['unavailable'], '')
+        self.assertEqual([tile['usd'] for tile in data['spend']['tiles']], [today, yesterday, month])
+
+    def assert_month_admission(self, now: int, amount: Decimal) -> None:
+        state = self.book.read_snapshot()
+        decision = self.book.spending_decision(state, self.settings, now)
+        assert isinstance(decision, ledger.SpendingAllowed)
+        costs, policy = decision.evidence.costs, decision.evidence.policy
+        assert isinstance(costs, ledger.CostEstimate) and isinstance(policy, aws_config.SpendingSettings)
+        for cap, reason in ((amount, 'monthly_limit'), (amount.next_plus(), '')):
+            self.assertEqual(self.book.reservation_cap(state, replace(policy, monthly_limit_usd=cap), now, costs),
+                             reason)
+
+    def test_row_57_formats_the_month_after_summing_the_bills(self) -> None:
+        checked = self.midnight + 7200
+        directory = self.state / 'charges'
+        directory.mkdir()
+        for offset in (1, 2):
+            start = self.midnight - 86400 * offset
+            day = datetime.fromtimestamp(start, UTC).date().isoformat()
+            usd = Decimal('1.004')
+            reading = ledger.ChargeRead(day, checked, start, start + 86400, usd, Decimal(0), Decimal(0),
+                                        (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', usd),), False)
+            record = ledger.charge_record(reading)
+            record['amount_reads'] = [{'at': reading.period_end + 1, 'actual_usd': str(usd)},
+                                      {'at': checked, 'actual_usd': str(usd)}]
+            _ = (directory / f'{day}.json').write_text(json.dumps(record))
+        actual = spend.read_spend(self.settings, self.state, checked, '2026-01-15')
+        assert isinstance(actual, spend.Spend)
+        self.assertEqual([(row.day, row.usd) for row in actual.days if row.source == 'AWS bill'],
+                         [('2026-01-14', Decimal('1.004')), ('2026-01-13', Decimal('1.004'))])
+        published = self.publish(checked)
+        self.assert_spend_tiles(published, '$0.00', '$1.00', '$2.01')
+        self.assertEqual(published['settled_notes'], ['Settled AWS amounts: 2 of 2 did not change after they settled (checked Jan 15).'])
+
+    def test_row_64_page_and_guard_use_their_evaluation_times(self) -> None:
+        self.refresh(self.midnight, '2')
+        self.book.observe(ledger.InstanceObservation(self.midnight, 'running', 'fixture builder'))
+        earlier = self.publish(self.midnight + 3600)
+        self.assert_spend_tiles(earlier, '$1.00', '$2.00', '$3.00')
+        now = self.midnight + 7200
+        decision = self.book.guard(self.settings, 'admission', now, lambda _event: True, clock=lambda: 0)
+        assert isinstance(decision, ledger.SpendingAllowed)
+        costs = decision.evidence.costs
+        assert isinstance(costs, ledger.CostEstimate)
+        self.assertEqual((costs.at, costs.daily.usd, costs.monthly.usd), (now, Decimal(2), Decimal(4)))
+        self.assert_spend_tiles(self.publish(now), '$2.00', '$2.00', '$4.00')
+
+    def test_row_65_page_and_guard_can_use_different_saved_bills(self) -> None:
+        self.refresh(self.midnight, '2')
+        self.assert_spend_tiles(self.publish(self.midnight), '$0.00', '$2.00', '$2.00')
+        path = self.folder / aws_page.PAGE_NAME
+        earlier = path.read_bytes()
+        now = self.midnight + 60
+        self.refresh(now, '5')
+        decision = self.book.guard(self.settings, 'admission', now, lambda _event: True, clock=lambda: 0)
+        assert isinstance(decision, ledger.SpendingAllowed)
+        costs = decision.evidence.costs
+        assert isinstance(costs, ledger.CostEstimate)
+        self.assertEqual((costs.daily.usd, costs.monthly.usd), (Decimal(0), Decimal(5)))
+        self.assertEqual(path.read_bytes(), earlier)
+        self.assert_spend_tiles(self.publish(now), '$0.00', '$5.00', '$5.00')
+
+    def test_row_n03_page_reads_the_new_bill_before_reconciliation(self) -> None:
+        self.refresh(self.midnight, '2')
+        self.assert_spend_tiles(self.publish(self.midnight), '$0.00', '$2.00', '$2.00')
+        now = self.midnight + 60
+        reconcile = self.book._reconcile_charge  # pyright: ignore[reportPrivateUsage]
+        seen: list[Decimal] = []
+
+        def publish_before_reconciliation(state: ledger.LedgerEvidence, bill: ledger.ChargeRead) -> None:
+            if bill.actual_usd == 5:
+                saved, = self.book.read_snapshot().reconciliations
+                self.assertEqual(saved.usd, Decimal(2))
+                self.assertEqual(self.book.accrued_cost(self.settings, now, window='month').limit_count, Decimal(2))
+                self.assert_spend_tiles(self.publish(now), '$0.00', '$5.00', '$5.00')
+                self.assert_month_admission(now, Decimal(5))
+                seen.append(bill.actual_usd)
+            reconcile(state, bill)
+
+        with mock.patch.object(self.book, '_reconcile_charge', side_effect=publish_before_reconciliation):
+            self.refresh(now, '5')
+        self.assertEqual(seen, [Decimal(5)])
+        saved, = self.book.read_snapshot().reconciliations
+        self.assertEqual(saved.usd, Decimal(5))
+        self.assertEqual(self.book.accrued_cost(self.settings, now, window='month').limit_count, Decimal(5))
+        self.assert_spend_tiles(self.publish(now), '$0.00', '$5.00', '$5.00')
+        self.assert_month_admission(now, Decimal(5))
+
+    def test_row_n04_page_can_read_a_launch_after_measuring_spend(self) -> None:
+        self.refresh(self.midnight, '2')
+        now = self.midnight + 3600
+        proposal = ledger.GateReservation('fixture-zero', now, now + 3600, Decimal(0), Decimal(0),
+                                          instance_type='m7a.8xlarge', region='us-east-1')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, proposal), ledger.GateReserved)
+        earlier = self.publish(now)
+        self.assert_spend_tiles(earlier, '$0.00', '$2.00', '$2.00')
+        self.assertEqual(earlier['launch_state'], {'kind': 'no-evidence'})
+        read_spend = spend.read_spend
+
+        def append_after_spend(path: Path, directory: Path, at: int, day: str
+                               ) -> spend.Spend | aws_config.MeasurementUnavailable:
+            result = read_spend(path, directory, at, day)
+            cloud_gate.append_launch(directory, {'attempt': proposal.attempt, 'time': now, 'result': 'launched',
+                'instance_type': proposal.instance_type, 'region': proposal.region, 'mode': 'merge-gate'},
+                gate_job=GATE_JOB_NOT_RECORDED)
+            return result
+
+        with mock.patch.object(spend, 'read_spend', side_effect=append_after_spend):
+            mixed = self.publish(now)
+        self.assertEqual(mixed['spend'], earlier['spend'])
+        self.assertEqual(mixed['launch_state'], {'kind': 'working', 'last_good_at': now, 'latest_attempt_at': now})
+        following = self.publish(now)
+        self.assert_spend_tiles(following, '$0.00', '$2.00', '$2.00')
+        self.assertEqual(following['launch_state'], mixed['launch_state'])
+        self.assertTrue(following['spend']['tiles'][0]['note'].endswith('1 gate runs.'))
+        self.assertTrue(mixed['spend']['tiles'][0]['note'].endswith('0 gate runs.'))
+
+        priced = replace(proposal, attempt='fixture-priced', region='us-east-2')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, priced), ledger.GateReserved)
+        self.assertEqual(self.book.accrued_cost(self.settings, now, window='day').limit_count, Decimal(0))
+        cloud_gate.append_launch(self.state, {'attempt': priced.attempt, 'time': now, 'result': 'launched',
+            'instance_type': 'm7a.4xlarge', 'region': 'us-east-2', 'mode': 'merge-gate'},
+            gate_job=GATE_JOB_NOT_RECORDED)
+        self.assertEqual(tuple(self.book.accrued_cost(self.settings, now, window=window).limit_count
+                               for window in ('day', 'month')), (Decimal(1), Decimal(3)))
+        self.assert_month_admission(now, Decimal(3))
+        self.costs({'daily_limit_usd': '1'})
+        self.assertEqual(self.book.reserve_gate(self.settings, replace(proposal, attempt='fixture-cap-probe')),
+                         ledger.GateCapReached('daily_limit'))
+
+    def test_row_n14_earlier_publisher_can_replace_a_newer_page(self) -> None:
+        for seconds in (0, 60):
+            with self.subTest(newer_evaluation=seconds != 0):
+                now = self.midnight + seconds * 10 + 120
+                self.refresh(now - 60, '2')
+                self.assert_spend_tiles(self.publish(now - 60), '$0.00', '$2.00', '$2.00')
+                publications: list[Path] = []
+
+                def publish_newer_first(path: Path, source: str, *, new_file_mode: int | None = None) -> None:
+                    if not publications:
+                        publications.append(path)
+                        self.refresh(now, '5')
+                        newer = self.publish(now + seconds)
+                        self.assert_spend_tiles(newer, '$0.00', '$5.00', '$5.00')
+                        self.assertEqual(newer['read_at'], now + seconds)
+                    write_text_atomic(path, source, new_file_mode=new_file_mode)
+
+                with mock.patch.object(aws_page, 'write_text_atomic', side_effect=publish_newer_first):
+                    overwritten = self.publish(now)
+                self.assertEqual(publications, [self.folder / aws_page.PAGE_NAME])
+                self.assert_spend_tiles(overwritten, '$0.00', '$2.00', '$2.00')
+                self.assertEqual(overwritten['read_at'], now)
+                self.assertEqual(self.book.accrued_cost(self.settings, now + seconds, window='month').limit_count,
+                                 Decimal(5))
+                self.assert_month_admission(now + seconds, Decimal(5))
 
 
 @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the AWS table checks")
