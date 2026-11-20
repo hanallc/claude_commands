@@ -92,8 +92,7 @@ if [ "$FOLLOW_PUBLISHED" = false ]; then
   export SHA BRANCH PUSHED SCRIPT_DIR DEFAULT_BRANCH
   publish_status=0
   if [ "$BRANCH" = "$DEFAULT_BRANCH" ]; then
-    publication_output="$(SETTINGS_PUSH_COMMIT="$SHA" SETTINGS_PUSH_BRANCH="$BRANCH" \
-      "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/main_push_lock.py" \
+    publication_output="$("${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/main_push_lock.py" \
       --checkout "$PWD" -- bash -euo pipefail -c publish_branch)" || publish_status=$?
   else
     publication_output="$(bash -euo pipefail -c publish_branch)" || publish_status=$?
@@ -108,7 +107,7 @@ if [ "$FOLLOW_PUBLISHED" = false ]; then
   fi
   read -r SHA publication_state <<< "$receipt"
   if [ "$publication_state" = pushed ]; then PUSHED=true; else PUSHED=false; fi
-  if [ "$PUBLISH_ONLY" = true ] || [ "$publication_state" = queued ]; then
+  if [ "$PUBLISH_ONLY" = true ]; then
     printf '%s\n' "$receipt"
     exit 0
   fi

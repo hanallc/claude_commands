@@ -788,7 +788,7 @@ def tree_without(checkout: Path, tree: str, paths: Iterable[str], environment: d
 
 def check_move(checkout: Path, move: CheckoutMove, *,
                replace_registry: bool = False, registry_move: bool = False,
-               keep_live_json: bool = False, replay_registry: RegistryReplay = registry_rows.replay_pending) -> WaitingRows:
+               replay_registry: RegistryReplay = registry_rows.replay_pending) -> WaitingRows:
     """Check the move on a private index before Git changes the checkout."""
     pending = read_journal(journal_path())
     index = index_path(checkout)
@@ -801,9 +801,6 @@ def check_move(checkout: Path, move: CheckoutMove, *,
         index_before = git(checkout, "write-tree", environment=environment).strip()
         staged = changed_paths(checkout, move.head, index_before, *waiting_paths(checkout))
         plan = hold(checkout, move, pending, replace_registry=replace_registry, replay_registry=replay_registry)
-        if keep_live_json:
-            plan["before"][SETTINGS_JSON] = plan["after"][SETTINGS_JSON] = live_text(checkout / SETTINGS_JSON)
-            staged.discard(SETTINGS_JSON)
         target_entries = {path: index_entry(checkout, move.tip, path) for path in plan["after"]}
         merged_entries: dict[str, str] = {}
         for path in sorted(staged & target_entries.keys()):

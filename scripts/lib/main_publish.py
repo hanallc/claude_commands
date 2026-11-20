@@ -10,7 +10,7 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import NamedTuple, cast
+from typing import cast
 
 from scripts.lib import land_main, main_push_lock, waiting_rows
 from scripts.lib.land_main import CommandTimeLimit as CommandTimeLimit, NoTimeLimit as NoTimeLimit, UNLIMITED_GIT
@@ -129,21 +129,21 @@ def ready(checkout: Path, *, fetch_limit: CommandTimeLimit | NoTimeLimit = UNLIM
                 raise Refusal(f"main holds other commit {short} {subject} that origin does not have; main is unchanged")
         if not git(checkout, "merge-base", "--is-ancestor", "origin/main", head).returncode:
             return
-        target = _rebuilt(checkout, commits, "origin/main")
+        target = _rebuilt(checkout, commits)
         try:
             waiting_rows.move_to(checkout, target, fast_forward=not commits, expected_head=head)
         except (OSError, UnicodeError) as error:
             raise Refusal(f"main is unchanged: {' '.join(str(error).split())}") from error
 
 
-def _rebuilt(checkout: Path, commits: list[tuple[str, str, str]], onto: str) -> str:
+def _rebuilt(checkout: Path, commits: list[tuple[str, str, str]]) -> str:
     """Copy each publisher commit onto origin/main without the worktree; drop a commit that origin has."""
     def run(*arguments: str, input_text: str | None = None,
             environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["git", "-C", str(checkout), *arguments], input=input_text, text=True,
                               capture_output=True, env=environment, check=False)
 
-    tip = run("rev-parse", onto).stdout.strip()
+    tip = run("rev-parse", "origin/main").stdout.strip()
     for commit_id, short, subject in commits:
         parents = run("rev-list", "--parents", "-n", "1", commit_id).stdout.split()[1:]
         if len(parents) != 1:
@@ -166,31 +166,6 @@ def _rebuilt(checkout: Path, commits: list[tuple[str, str, str]], onto: str) -> 
             raise Refusal(f"cannot copy {short} {subject}: {first_line(made)}; main is unchanged")
         tip = made.stdout.strip()
     return tip
-
-
-class PreparedDeferredCommit(NamedTuple):
-    commit: str
-    origin_tip: str
-
-
-def prepare_deferred_commit(checkout: Path, commit: str, base: str, branch: str, *,
-                            validated_base: str = "") -> PreparedDeferredCommit:
-    """Reapply the saved settings commits to the fetched branch."""
-    reference = f"refs/settings-publish/origin/{branch}"
-    fetched = git(checkout, "fetch", "origin", f"+refs/heads/{branch}:{reference}")
-    if fetched.returncode:
-        raise Refusal(first_line(fetched))
-    origin = waiting_rows.git(checkout, "rev-parse", reference).strip()
-    if validated_base and git(checkout, "merge-base", "--is-ancestor", validated_base, commit).returncode:
-        raise Refusal("merge branch moved during validation")
-    if (not git(checkout, "merge-base", "--is-ancestor", commit, origin).returncode
-            or not git(checkout, "merge-base", "--is-ancestor", origin, commit).returncode):
-        return PreparedDeferredCommit(commit, origin)
-    if validated_base:
-        raise Refusal("merge branch moved during validation")
-    listed = waiting_rows.git(checkout, "log", "--format=%H %h %s", "--reverse", f"{base}..{commit}")
-    commits = [cast(tuple[str, str, str], tuple(line.split(" ", 2))) for line in listed.splitlines()]
-    return PreparedDeferredCommit(_rebuilt(checkout, commits, origin), origin)
 
 
 def commit(checkout: Path, conf: Path, message: str, before: ExistingFile | MissingFile,

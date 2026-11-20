@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import hashlib
 import json
 import os
 import re
@@ -26,7 +25,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
+from typing import NamedTuple, TypedDict, cast
 from uuid import uuid4
 
 from scripts.lib import file_lock
@@ -53,33 +52,6 @@ class SettingsWaiting(NamedTuple):
 
 class SettingsGapBusy(NamedTuple):
     """Another process holds the gap lock or edits the line."""
-
-
-class DirectSettingsPush(TypedDict):
-    kind: Literal["direct"]
-    checkout: str
-    commit: str
-    base: str
-    branch: str
-    validated_base: str
-    settings_json_only: NotRequired[bool]
-    journal_order: NotRequired[int]
-
-
-class FastTrackSettingsPush(TypedDict):
-    kind: Literal["fast-track"]
-    attempt: str
-
-
-type DeferredSettingsPush = DirectSettingsPush | FastTrackSettingsPush
-
-
-def settings_only(paths: Sequence[str]) -> bool:
-    def settings_path(name: str) -> bool:
-        path = Path(name)
-        return name == "settings.json" or (path.parent == Path("config") and path.suffix == ".conf")
-
-    return bool(paths) and all(settings_path(name) for name in paths)
 
 
 class LineItem(TypedDict):
@@ -236,72 +208,18 @@ def _settings_item(item: LineItem) -> bool:
     return item["label"] == SETTINGS_LABEL and not item["batch"] and not item["commits"]
 
 
-class PublicationReceipt(TypedDict):
-    commit: str
-    state: Literal["pushed", "contained"]
-
-
-def _publication_path(checkout: Path, commit: str) -> Path:
-    key = hashlib.sha256(json.dumps([str(checkout.resolve()), commit]).encode()).hexdigest()
-    return line_path().parent / "settings-publication" / f"{key}.json"
-
-
-def publication_receipt(checkout: Path, commit: str) -> PublicationReceipt | None:
-    try:
-        return cast(PublicationReceipt, json.loads(_publication_path(checkout, commit).read_bytes()))
-    except FileNotFoundError:
-        return None
-
-
-def record_publication(checkout: Path, requested: str, receipt: PublicationReceipt) -> None:
-    path = _publication_path(checkout, requested)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(path, json.dumps(receipt) + "\n", new_file_mode=0o600)
-
-
-def _spool(name: str) -> Path:
-    path = line_path().parent / name
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _request_path(request: DeferredSettingsPush) -> Path:
-    if request["kind"] == "direct":
-        identity = [request["kind"], request["checkout"], request["commit"]]
-    else:
-        identity = [request["kind"], request["attempt"]]
-    token = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
-    return _spool("settings-journal") / f"{token}.json"
-
-
-def deferred_pushes() -> list[DeferredSettingsPush]:
-    entries: list[tuple[int, DeferredSettingsPush]] = []
-    for path in _spool("settings-journal").glob("*.json"):
-        try:
-            with path.open("rb") as source:
-                entries.append((os.fstat(source.fileno()).st_mtime_ns,
-                                cast(DeferredSettingsPush, json.load(source))))
-        except FileNotFoundError:
-            continue
-    return [request for _, request in sorted(entries, key=lambda entry: entry[0])]
-
-
-def finish_push(request: DeferredSettingsPush) -> None:
-    _request_path(request).unlink(missing_ok=True)
-
-
 def _settings_row() -> LineItem:
     return {"label": SETTINGS_LABEL, "batch": "", "commits": [],
             "added": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
-def enqueue_settings(request: DeferredSettingsPush | None = None) -> SettingsWaiting:
+def enqueue_settings() -> SettingsWaiting:
     """Record a publication request without waiting for the line editor."""
-    if request is not None:
-        write_text_atomic(_request_path(request), json.dumps(request) + "\n", new_file_mode=0o600)
     with line_lock(wait=False) as line:
         if line is file_lock.LockResult.BUSY:
-            write_text_atomic(_spool("settings-wake") / uuid4().hex, "")
+            wakes = line_path().parent / "settings-wake"
+            wakes.mkdir(exist_ok=True)
+            write_text_atomic(wakes / uuid4().hex, "")
         else:
             _mark_settings()
     return SettingsWaiting()

@@ -704,13 +704,14 @@ Git, executable stand-ins, and selected unit and child-handoff cases retain real
 The runner takes each land item under the line lock.
 The units board shows `<Nth> in line` for each checkpoint that waits.
 
-A shared settings change takes effect before publication.
+Tune, zone, and the registry writer apply their changes before publication.
+When the gap is free, these tools can publish immediately.
 When a land runs or a publisher holds the gap, a caller places one `settings publish` item at the front.
 `next` holds the gap and removes the settings item before it starts the publisher.
 The publisher inherits the gap lock, and Git runs after the runner releases the line lock.
 A failed publication keeps the journal entries and lets the runner return the next land.
 The notes timer requests another gap for pending entries without taking the publication locks.
-When the gap is free, a settings push can use it immediately.
+Ask natemerge for a gap before you push a hand commit to main during a land.
 
 For an approved edit to the live `settings.json` on natedev, use
 `~/.claude/scripts/lib/py ~/.claude/scripts/lib/live_settings.py publish-json --message "<approved reason>"`.

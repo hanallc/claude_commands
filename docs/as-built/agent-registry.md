@@ -70,8 +70,7 @@ It preserves unrelated edits, file mode, comments, and spacing.
 The live write never waits for the main push lock, so the new value is in effect at once.
 Publication follows the live write. During a land, the publisher reserves the next gap.
 A failed publication keeps the rows live and reports `the rows are live; main does not have them yet`.
-The notes timer then publishes them through `publish_pending`.
-It returns the live text after publication. The `store` command builds `configuration_shell` from that text without a second read.
+`store_registry` returns the live text. The `store` command builds `configuration_shell` from that text.
 
 Publication applies only to the real registry under the Git root of `~/.claude`.
 `MODELS_CONFIG_PUBLISH=0` disables publication.

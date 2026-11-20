@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import pwd
 import fcntl
 import shlex
 import socket
@@ -16,7 +17,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import conf, live_settings, main_publish, models_registry, tune, waiting_rows
+from scripts.lib import conf, live_settings, main_publish, models_registry, tune, user_zone, waiting_rows, zone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import PublicationTestCase, pending_rows
 from scripts.production import land_queue, land_runs
@@ -594,6 +595,74 @@ class TuneTests(PublicationTestCase):
                 self.assertEqual(repo.remote_tip(), base)
             self.assertEqual(land_queue.take_next(), "")
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
+
+    def test_settings_publish_paths_leave_the_live_land_line_unchanged(self) -> None:
+        live_line = Path(pwd.getpwuid(os.getuid()).pw_dir, ".local/state/merge-gate/land_queue.json")
+
+        def live_snapshot() -> tuple[bytes, int] | None:
+            try:
+                with live_line.open("rb") as source:
+                    return source.read(), os.fstat(source.fileno()).st_mtime_ns
+            except FileNotFoundError:
+                return None
+
+        before = live_snapshot()
+        self.addCleanup(lambda: self.assertEqual(live_snapshot(), before))
+
+        repo = self.repository
+        settings = self.seed_settings('{"autoCompactWindow": 208800}\n')
+        config = repo.config.parent
+        zone_file = config / "user_zone.conf"
+        _ = zone_file.write_text("zone=America/New_York\n")
+        registry = config / "models.conf"
+        current = "[fixture]\nmodel=old\n"
+        _ = registry.write_text(current)
+        _ = repo.git(repo.checkout, "add", "config/user_zone.conf", "config/models.conf")
+        _ = repo.git(repo.checkout, "commit", "-qm", "Seed the zone and registry")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
+        base = repo.head()
+        broadcast = repo.root / "broadcast.py"
+        _ = broadcast.write_text("print('fixture - sent')\n")
+
+        environment = {**repo.env, "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "1",
+                       "USER_ZONE_CONF": str(zone_file), "ZONE_BROADCAST": str(broadcast), "TMPDIR": str(repo.root)}
+        with (mock.patch.dict(os.environ, environment, clear=True),
+              mock.patch.object(user_zone, "CONF", str(zone_file)),
+              mock.patch.object(models_registry, "DEFAULT_PATH", registry),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            with land_runs.landing([base]):
+                self.assertEqual(tune.main(["example", "amount", "4", "--why", "fixture", "--user-words", "yes"]),
+                                 0, output.getvalue() + errors.getvalue())
+                self.assertEqual(zone.main(["set", "Europe/Paris"]), 0, output.getvalue() + errors.getvalue())
+                pending = waiting_rows.read_journal(waiting_rows.journal_path())
+                self.assertEqual([(change.stem, change.value) for change in pending.changes],
+                                 [("example", "4"), ("user_zone", "Europe/Paris")])
+
+                land_queue.remove(land_queue.SETTINGS_LABEL)
+                self.assertIn("main: waits for the land that runs now", live_settings.publish_waiting())
+                land_queue.remove(land_queue.SETTINGS_LABEL)
+                contents = current.replace("model=old", "model=new")
+                self.assertEqual(models_registry.store_registry(registry, current, contents, "Set fixture model"),
+                                 contents)
+                self.assertIn(land_queue.SETTINGS_LABEL, land_queue.listing())
+
+                _ = settings.write_text('{"autoCompactWindow": 308800}\n')
+                self.assertEqual(live_settings.main(["publish-json", "--message", "Approve the window"]), 0)
+                land_queue.add("fixture phase", batch="", commits=[base], first=False, before=None)
+                self.assertEqual(land_queue.line_path(), Path(repo.env["MERGE_GATE_STATE_DIR"]) / "land_queue.json")
+                items = land_queue.read_items()
+                self.assertIsInstance(items, list)
+                assert isinstance(items, list)
+                self.assertEqual([item["label"] for item in items], [land_queue.SETTINGS_LABEL, "fixture phase"])
+                self.assertEqual(repo.remote_tip(), base)
+
+            self.assertEqual(land_queue.take_next(), "fixture phase", errors.getvalue())
+            self.assertEqual(land_queue.listing(), "the land line is empty")
+
+        for path, expected in (("config/example.conf", "amount=4"), ("config/user_zone.conf", "zone=Europe/Paris"),
+                               ("config/models.conf", "model=new"), ("settings.json", "308800")):
+            with self.subTest(path=path):
+                self.assertIn(expected, repo.git(repo.origin, "show", f"main:{path}"), errors.getvalue())
 
     def test_mac_delivery_retries_unacknowledged_json_fields(self) -> None:
         repo = self.repository
