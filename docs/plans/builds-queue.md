@@ -3207,6 +3207,15 @@ Tests (after the hold): the config reader tests and the hana_render tests.
 4. Existing chains: report them; repair none by hand.
 Tests (after the hold): a copy of a copy of a copy has alternates only to the root; it reads every commit, including one made only in the middle copy; removing the middle copy leaves it readable.
 
+### Phase 44dk — Follow-up findings from the copy borrow change  · status: todo
+**From the 44dj closure review (pass 5), 2026-11-19:** three gaps that main also has. The builds landing rule moves them out of 44dj. After 44dj merges.
+
+1. A task clone (`test_hana_clone`) registers before setup and records no `borrows_from`. Until `.git` appears, removal can delete its root (copies.py:845, :866; scratch.py:1138). Fix: the task clone records its root stores at registration, as a workspace does.
+2. A setup stopped before `.git` publication can leave a marked stage with a commit and no index. Task cleanup reads its staged deletions as unsaved work, so the record stays and keeps the root (copies.py:787; scratch.py:2094, :2393).
+3. `checkout_storage` for a bare repository omits its own `objects` path. When that path is a symbolic link into a managed source, removal can delete the store, and `owned_workspaces` loses the removal order (scratch.py:1088; copies.py:1716).
+
+Tests: one row each in the existing removal tests, each failing first.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
