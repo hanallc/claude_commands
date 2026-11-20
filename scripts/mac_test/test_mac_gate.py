@@ -17,10 +17,11 @@ from unittest import mock
 from scripts.aws_target import cloud_gate, gate_box
 from scripts.buildlog import store
 from scripts.copies import copies
+from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import scratch
-from scripts.lib.git_test_support import commit_repository
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_gate
@@ -77,6 +78,7 @@ sys.path.insert(0, os.environ['MAC_GATE_FIXTURE_ROOT'])
 from scripts.lib import scratch
 from scripts.mac_test import mac_gate
 from scripts.aws_target import cloud_gate
+from scripts.copies import copies
 
 root = Path(os.environ['FAKE_QUEUE_STATE'])
 folder = root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
@@ -92,6 +94,9 @@ if phase == 'prepare':
     for name in ('request.json', 'module_seconds.json'):
         shutil.copyfile(source / name, folder / name)
     checkout = (source / 'local-repo').read_text()
+    mirror = copies.RemoteMirror('fixture', copies.SelectedRepository('fixture'), 'localhost', checkout, folder.name)
+    with copies.remote_lease(mirror):
+        copies.register_remote(mirror)
     cloud_gate.save(folder / 'checkout.json', {'path': checkout})
     command = [sys.executable, __file__]
     argv_file.write_text(json.dumps([*command, 'guest']))
@@ -234,6 +239,7 @@ class MacGateTests(unittest.TestCase):
                 self.assertIn(reason, result)
 
     def test_bundle_supplies_a_missing_commit_and_base(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, fixture_git_environment(self.root), clear=True))
         old = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
         clones = {kind: self.root / f'mac scratch {kind}' for kind in ('behind', 'dirty', 'current')}
         for kind in ('behind', 'dirty'):
@@ -378,6 +384,7 @@ class MacGateTests(unittest.TestCase):
     def cancel_route(self, root: Path, *, explicit: bool, cleanup_refused: bool = False,
                      prepare_bundle: bool = False) -> None:
         environment = {**queue_fixture(root, LOCAL_MAC_SSH),
+                       **copies_environment(root),
                        'MAC_GATE_FIXTURE_ROOT': str(Path(__file__).resolve().parents[2])}
         gate_root = root / 'gate-root'
         gate_root.mkdir()

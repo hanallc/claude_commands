@@ -478,7 +478,7 @@ def caller_watch(caller: int) -> Generator[None]:
         if writer >= 0:
             os.close(writer)
         if failed.is_set():
-            process_group.send_process_group(pid, signal.SIGTERM)
+            process_group.terminate_owned_process_group()
 
 
 def main(argv: list[str] | None = None) -> int:
