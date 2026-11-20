@@ -240,7 +240,7 @@ def for_you_payload() -> ForYouPayload:
     for row in (row for row in snapshot.rows if row.status == "open"):
         if len(entries) == 2:
             break
-        place = "/console/review.html?" + urlencode({"type": "for-you", "show": "open", "item": row.key})
+        place = review_link.REVIEW_PAGE_PATH + "?" + urlencode({"type": "for-you", "show": "open", "item": row.key})
         entries.append({"key": row.key, "kind": row.kind, "title": row.title, "command": row.command,
                         "machine": row.machine, "requested_by": row.requested_by, "href": place_query("review", place)})
     return {**count, "entries": entries}
@@ -266,7 +266,11 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
                        + ('<span id="nav-quota" role="img" aria-label="" hidden></span>' if quota else '')
                        + f'<span class="tooltip" aria-hidden="true">{label}'
                        + ('<span class="new-text" hidden> · New</span>' if available else ' · Not available') + '</span></a>')
-    content = DOCUMENT.replace("<!-- ENTRIES -->", "\n".join(entries)).replace("/* Quota tokens. */", console_theme.QUOTA_TOKENS)
+    for_you_place = review_link.REVIEW_PAGE_PATH + "?type=for-you&show=open"
+    script_path = json.dumps(review_link.REVIEW_PAGE_PATH)[1:-1].replace("'", r"\u0027").replace("<", r"\u003c")
+    content = DOCUMENT.replace("<!-- FOR YOU LINK -->", html.escape(place_query("review", for_you_place), quote=True))
+    content = content.replace("/* Review page path */", script_path)
+    content = content.replace("<!-- ENTRIES -->", "\n".join(entries)).replace("/* Quota tokens. */", console_theme.QUOTA_TOKENS)
     rebuilds_path = rebuilds.path if isinstance(rebuilds, AvailablePage) else ""
     settings = conf.read("review_links")
     content = content.replace("<!-- REBUILDS -->", f'data-url="{html.escape(rebuilds_path, quote=True)}"')
@@ -556,7 +560,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
 <header><strong>For you <span data-panel-count>?</span></strong><button type="button" id="close-actions" aria-label="Close actions">×</button></header>
 <p class="panel-note" role="status" data-for-you-note>The action count is unavailable.</p>
 <div data-for-you-entries></div>
-<footer><a data-for-you-card href="?page=review&amp;at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen">Open For you →</a></footer>
+<footer><a data-for-you-card href="<!-- FOR YOU LINK -->">Open For you →</a></footer>
 </section>
 <template id="for-you-entry"><article>
 <div class="short-head"><span data-entry-rebuild><!-- FOR YOU REBUILD --></span><span data-entry-action><!-- FOR YOU ACTION --></span><strong></strong></div>
@@ -690,7 +694,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       const filters=new URLSearchParams(previous.search);
       for(const [key,value] of new URLSearchParams(previous.hash.slice(1))) filters.set(key,value);
       filters.set('type',kind);legacyReviewPlace(filters,kind);
-      url.searchParams.set('at.review','/console/review.html#'+filters);
+      url.searchParams.set('at.review','/* Review page path */#'+filters);
       history.replaceState(null,'',url);identity='review';
     }
     const selected = pages.find(entry => entry.dataset.page === identity) || entries[0];
