@@ -162,6 +162,7 @@ choice 3 preserves the gate. With no gating issues, continue to
 
 <FixDispatch>
 Apply <LongLivedWorkers/>.
+Every fix prompt carries the two test rules verbatim, a short follow-up to a retained worker included. Never write 'add a test that fails on <hash>' without them.
 When a repair round fails or its next edit replaces a run's tree, apply <WorkerRuns/>.
 
 Before you assign a repair, have a worker quote the failing log line and the
@@ -190,14 +191,12 @@ under <RoleReassignment/> when needed. Only then open `fix2`, `fix3`… when no
 open worker can take another file set. Each worker's task and kind are `fix`, its
 ninth argument remains its slot, and it gets its own
 `fix_prompt_${FIX_ROUND}[_<slot>].md`. Each worker repairs its findings.
-Cover each testable finding under the two test rules in [write_prompt_contract.md](write_prompt_contract.md), item 6.
-Name the covering table row or test in the summary.
-The test must fail without the repair. A finding about what is
-drawn gets a test that renders and reads the pixels back, or a live pixel check
-the prompt names; a test of components, constants or hand-written pointer hits
-does not count. It names each test for the behavior it pins and puts the
-finding id only in its summary; an id in code outlives the review that defined
-it. <ClosureReview/> is the cold read, so no worker is spent
+A finding gets a test only when test rule 2 in write_prompt_contract.md item 6 allows one. Then add a table row, and the row must fail without the repair. Every other finding closes by the reviewer's read of the diff; say `no test: <reason>` in the summary.
+For a finding about what is drawn, use the live pixel check the prompt names.
+Use a test instead if rule 2 allows one. Render the view and read its pixels in that test.
+A test of components, constants or hand-written pointer hits does not count.
+Name each test for the behavior it checks. Put the finding id only in the summary.
+<ClosureReview/> is the cold read, so no worker is spent
 on one here. A worker's file set is its findings' files plus their test targets;
 its prompt names every other worker's files as read only.
 

@@ -145,7 +145,7 @@ this, verbatim:
 List each existing assertion or test that the diff removes, weakens, changes
 (same assertion, other expected value) or turns off (ignore, skip, xfail), with
 its path, test name, old text and new text. If there is none, write "none".
-Each one that the work order does not call for is a finding.
+Each one that neither the work order nor the worker's deletion list accounts for is a finding.
 ```
 
 In cargo-liner-tile checkpoint e21d5b93, a weakened `assert_eq!` in a
@@ -209,6 +209,7 @@ The questions are the lens, so each prompt carries only its own:
   bare Option<T> values replaced or justified at an external boundary?
   6. Does it meet every target in the repository's targets file, when present?
   A miss is a defect.
+  7. Which added test breaks a test rule of item 6, or repeats an existing test? Each is a finding; the repair is deletion.
 - `rerun` — Copy the five questions and their real cases from <TeamReview/>
   verbatim. Apply them to each record, mark, lock, claim, state file, moved or
   deleted file, and list of steps the change writes or runs. Treat unsafe rerun
@@ -339,9 +340,7 @@ contains only:
 - Three questions:
 
   1. For each id, is it `FIXED`, `NOT FIXED`, or `UNCLEAR`, with file/line evidence?
-  2. For each id, does its test coverage meet the two test rules in [write_prompt_contract.md](write_prompt_contract.md), item 6?
-     State whether the covering test fails without the repair.
-     Mark an id `NOT FIXED` when those rules require coverage and that coverage is missing.
+  2. For each id with a test, does the test meet the two test rules, and does it fail without the repair? An id without a test is `FIXED` when the diff answers it. Name any test the repair added that the rules do not allow.
   3. Does this repair break any caller, consumer, transition, or invariant of its changed symbols?
 - The `## Three Gods` section of <WritePromptContract/>, verbatim; a repair
   hunk that breaks one is a finding of the repair.
@@ -364,6 +363,7 @@ the turn; fire on the final path-limited diff when its message arrives;
 answer the questions from the final diff only.
 
 After the main pass agrees, record `accepted` for fixed, `still_open` for not
-fixed/unclear, or `reopened` with the invalidating hunk. Open any new defect
-introduced by the repair, then return to <Synthesize/>.
+fixed/unclear, or `reopened` with the invalidating hunk.
+A new Minor or nit from a closure review goes to the ledger as a nit. It does not open a round.
+Open any other new defect introduced by the repair, then return to <Synthesize/>.
 </ClosureReview>

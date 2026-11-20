@@ -78,19 +78,18 @@ Codex review prompts also include section 3's command block.
 5. `## Project Context`: include the current context. Omit plan **Style** metadata.
 6. `## Work Specification`: include the following instructions verbatim.
    "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
+   Delete a test that your change makes a duplicate, or that pins behavior the Work Order removes. List each deleted test and the test that still covers the behavior in your summary. This is not weakening.
    For tests, prohibit constant comparisons, implementation copies, library tests, configured mock tests, existence checks, and duplicate behavior tests.
    Implementation, fix and test prompts carry these two test rules verbatim:
 
+   <TestRules>
    1. For a fix, add a table row to the existing test of the same behavior.
       Add a new test only when no test covers the behavior.
-   2. Write or keep a rare-case test only when its defect meets at least one condition below.
-      Rare cases include an edge case, a refusal, malformed input, and a failure path.
-
-      - The user sees a wrong result.
-      - The defect damages saved state, such as a file, Git, a ledger, staff, or a config.
-      - The defect loses work, such as a commit, an edit, a message, or a worker result.
+      A table row is a new entry in an existing `subTest` table. A new `def test_` is a new test.
+   2. Write or keep a rare-case test only when the defect cannot be undone: it deletes or corrupts user work or saved state that no later run repairs. A refusal that only prints a message and exits gets no test. A rare case that a main-path test of the same function already reaches gets no test.
 
       Keep every main-path test.
+   </TestRules>
 
    For tests, include this instruction verbatim: "Never commit a test project to the repo. A test makes the project it needs in a tempdir at run time (Rust tempfile::TempDir, Python tempfile.TemporaryDirectory), which removes it after."
    Every implementation, fix, test, research and review prompt carries this instruction verbatim:
@@ -131,6 +130,22 @@ Codex review prompts also include section 3's command block.
     Run `targeted_test.py` for a unit. Run `merge_gate.py` for a merge. Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
 
+<WhenYouWriteNoTest>
+
+## When you write no test
+1. Write a test only for a behavior the Work Order's Tests field names.
+2. Write no test for a refusal, a message text, a doc, a prompt or a config wording.
+3. Write no test for a helper, a fixture or test support code.
+4. Write no test for a case that an existing test of the same function reaches.
+5. For a fix, add one row to an existing table. If no table fits, say so; do not add a function.
+6. A rare case gets a test only when the defect destroys work or saved state for good.
+7. A test that needs a subprocess, a sleep or a real Git repository needs a reason in the summary.
+8. When your change makes a test a duplicate, delete it and name it in the summary.
+9. If you add more tests than you delete in a fix round, state the count and the reason.
+10. "No test: <reason>" is a complete answer. A reviewer does not reopen it for coverage alone.
+
+</WhenYouWriteNoTest>
+
 <MergeWorkerCommands>
 Apply section 3's command block from <WritePromptContract/> with this replacement for its exit 3 line:
 
@@ -158,7 +173,7 @@ assignment**:
 | Slot | Opens as | Owns |
 | --- | --- | --- |
 | `impl` | the phase's implementation | the Work Order's production files |
-| `test` | tests for the same specification | test targets under `tests/` and new test files |
+| `test` | the tests the Work Order's `Tests:` field names, then writer work | test targets under `tests/` and new test files |
 
 **The Work Order's `Workers:` field sets the assignment and overrides this table.**
 Its first line names the assignment — `1 writer + 1 tester` is the table above,
@@ -304,8 +319,7 @@ Otherwise require the worker to run `board.sh role` as its first tool call.
 
 A busy turn does not reserve its worker's next role. Reassign it when that turn
 ends; when the new work must run concurrently and every open worker is busy, open
-an extra worker named for its work (`review`, `fix2`) and keep it for reuse. Never
-abandon unwritten tests: assign them to an open worker or open one.
+an extra worker named for its work (`review`, `fix2`) and keep it for reuse.
 
 A writer with no remaining task posts `done` and ends its turn.
 Apply <ReviewPromptContract/> to a reviewer's completion.

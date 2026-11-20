@@ -82,7 +82,7 @@ code review that checks the same worktree.
 `single` runs steps 1–13, then plan review, shrink, add-on check, both cleanup
 halves, and phase completion. It makes no checkpoint. A complete `single` task
 runs the as-built pass without a commit. A standing plan skips shrink and run
-closeout; `<StandingPlanRefill/>` in `commands/unit/direct.md` supplies its next
+closeout; `<StandingPlanRefill/>` in `docs/direct/style_unit.md` supplies its next
 ticket.
 
 The document table is a map of possible inputs and outputs. It is not a rule to

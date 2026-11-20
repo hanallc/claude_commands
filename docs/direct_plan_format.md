@@ -111,6 +111,8 @@ This is the meat — do not paraphrase a resolved design down to a summary.>
      reads `opens as impl`. Writers hold disjoint files; every hub file has
      exactly one owner. Rule 7. -->
 
+**Tests:** <the named tests this phase adds, one line each: the behavior and why a break hurts the user, saved state or work. `none` is a valid value. A worker writes no test that this field does not name.>
+
 **State:** <optional: lasting state this phase writes, or `none` — records,
 marks, locks, claims, state files, file moves or deletes, or a list of steps
 where one step can fail>

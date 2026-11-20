@@ -29,6 +29,8 @@ Apply this to implementation, review, fixes, escalation, and plan revisions:
   naming feedback. Reviewers must ask whether a more accurate type requires a
   better boundary, distinct states, or a small restructuring.
 
+These type rules are for Rust. In Python, use `None` for one absent state, and one `Enum` for two or more states of one domain. Do not add a class with no field, or with one field and no method, to name a state. In Python such a marker class is a finding.
+
 ## Phase style review
 
 Follow the runner's filled assignment from `config/review/style.md` when
