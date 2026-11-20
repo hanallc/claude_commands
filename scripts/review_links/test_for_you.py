@@ -239,7 +239,7 @@ class ForYouTests(unittest.TestCase):
         run = self.root / "alice-run"
         run.mkdir()
         _ = (run / "progress_history_state.json").write_text(
-            json.dumps({"phase": {"id": "restore-access", "status": "active"}}))
+            json.dumps({"open_phases": [{"id": "restore-access", "status": "active"}]}))
         member = staff.StaffRow(staff.StaffId("staff-a"), "unit", "Alice", staff.StaffRoot(),
                                 current_session=staff.StaffId("session-a"), run=staff.OpenRun(run))
         need.add_need("mac", "a" * 40, "Apply settings.", "staff-a", "staff-a")

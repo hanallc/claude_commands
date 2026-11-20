@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.style.ledger_test_support import legacy_overlapping_tickets
 from scripts.style.ledger_test_support import ticket_owner_id
 
 import io
@@ -90,7 +91,8 @@ class StylePlanTests(StylePlanFixture):
                                        (str(decision), by_path[paths[name]].finding_id))
         ledger.ticket_add("2", ticket_owner_id("names"), "proposal", "names", "crates/alpha", [paths["ticketed"]],
                           [rule], proposal=str(issue), finding_ids=(by_path[paths["ticketed"]].finding_id,))
-        ledger.ticket_assign("2", "demo-style-names")
+        with legacy_overlapping_tickets():
+            ledger.ticket_assign("2", "demo-style-names")
         for index, excluded in enumerate(("declined", "unanswered", "types", "waived", "unfiled", "built"), 2):
             decision = issue.with_name(excluded + ".md")
             text = issue.read_text()
@@ -216,7 +218,8 @@ class StylePlanTests(StylePlanFixture):
         findings = ledger.proposal_findings(issue)
         definition = next(item for item in rules.load_rules(self.repo) if item.rule_id == type_rule)
         ledger.ticket_add("2001", ticket_owner_id("types"), "read", "types", "crates/alpha", [self.sources[1]], [type_rule])
-        ledger.ticket_assign("2001", "style/main")
+        with legacy_overlapping_tickets():
+            ledger.ticket_assign("2001", "style/main")
         _ = ledger.ticket_base("2001")
         for index, path in enumerate(self.sources[:2]):
             _ = ledger.hold(type_rule, path, 1, "type work", "type", "before", "after", definition.blob,
