@@ -2189,21 +2189,28 @@ finish_tree_watch() {
     TREE_WATCH_DIR=""
 }
 
+# Match the checkout selection for Python on standard input.
+doc_staged_helper() {
+    local folder script="$VERIFY_START_DIR/doc_step.py"
+    folder=$(pwd -P) || return
+    while :; do
+        if [[ -f "${folder%/}/scripts/lib/py" ]]; then
+            if [[ "$folder" != "${VERIFY_START_DIR%/*/*}" ]]; then
+                VERIFY_PY_HELPER=DOC_STEP_PY "$PY" - "$script" "$@" < "$script"
+                return
+            fi
+            break
+        fi
+        [[ "$folder" != / ]] || break
+        folder=${folder%/*}
+        folder=${folder:-/}
+    done
+    verify_helper "$script" "$@"
+}
+
 # Read the staged tree through the copy owner's private index.
 doc_tree() {
-    VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" "$DOC_REPO_TOP" "${1:-}" <<'PYDOC'
-from pathlib import Path
-import sys
-with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.buildlog.treekey import committed_tree_key
-from scripts.copies import copies
-
-tree = copies.staged_tree(Path(sys.argv[2]))
-if sys.argv[3] == "with-key":
-    print(tree, committed_tree_key(tree.encode("ascii")))
-else:
-    print(tree)
-PYDOC
+    doc_staged_helper "${1:-tree}" "$DOC_REPO_TOP"
 }
 
 doc_checkout() {
@@ -2271,52 +2278,7 @@ step_close_checkout() {
 }
 
 doc_record() {
-    local current_tree
-    current_tree="$(doc_tree)" || return
-    if [[ "$current_tree" != "$DOC_TREE" ]]; then
-        echo 'verify.sh: the staged tree changed while doc ran; no doc pass record was written.'
-        return 0
-    fi
-    VERIFY_PY_HELPER=DOC_RECORD_PY "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID" <<'PYDOC'
-from datetime import datetime, timezone
-import json
-import os
-from pathlib import Path
-import sys
-import tempfile
-import time
-
-records = Path.home() / ".local/state/verify/doc_pass"
-records.mkdir(parents=True, exist_ok=True)
-cutoff = time.time() - 14 * 24 * 60 * 60
-for old in records.glob("*.json"):
-    try:
-        if old.stat().st_mtime < cutoff:
-            old.unlink()
-    except FileNotFoundError:
-        pass
-record = dict(repo_top=str(Path(sys.argv[1]).resolve()), tree_id=sys.argv[2],
-              time=datetime.now(timezone.utc).isoformat(), call_id=sys.argv[3])
-with tempfile.NamedTemporaryFile(mode="w", dir=records, prefix=".doc-", delete=False) as output:
-    temporary = Path(output.name)
-    try:
-        json.dump(record, output)
-        output.flush()
-        os.fsync(output.fileno())
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-try:
-    temporary.replace(records / (sys.argv[2] + ".json"))
-    directory_fd = os.open(records, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-finally:
-    temporary.unlink(missing_ok=True)
-print("verify.sh: doc pass recorded for tree " + sys.argv[2])
-PYDOC
+    doc_staged_helper record "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID"
 }
 
 # note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in
@@ -4965,7 +4927,7 @@ case "$CMD" in
             load_metadata
             CARGO_TARGET_DIR="$TARGET_DIRECTORY"
         fi
-        CARGO_TARGET_DIR="$(VERIFY_PY_HELPER=DOC_TARGET_PATH_PY "$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
+        CARGO_TARGET_DIR="$(verify_helper "$VERIFY_START_DIR/doc_step.py" target-path "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
         export CARGO_TARGET_DIR
         DOC_COPY_LEASE_FD=""
         DOC_SOURCE_KEY=""
@@ -4973,7 +4935,7 @@ case "$CMD" in
             if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
                 DOC_TREE=$(doc_tree)
             else
-                DOC_SOURCE=$(doc_tree with-key)
+                DOC_SOURCE=$(doc_tree source)
                 read -r DOC_TREE DOC_SOURCE_KEY <<< "$DOC_SOURCE"
             fi
         fi

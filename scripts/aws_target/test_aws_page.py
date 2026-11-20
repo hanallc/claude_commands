@@ -1,6 +1,7 @@
 """Check the published AWS table and quota case instructions."""
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from html import unescape
 import json
@@ -12,7 +13,8 @@ from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_page, console_help, ledger, ledger_test_support, spot_table
+from scripts.aws_target import aws_page, console_help, ledger, ledger_test_support, run_cost, spot_table
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import page_frame
@@ -254,10 +256,13 @@ class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
         east, west, north = 'us-east-2', 'us-west-2', 'eu-north-1'
         candidate_only = 'eu-south-2'
         self.text_setting('region', east)
-        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+        config = self.root / 'cloud_gate.conf'
+        _ = write_config_fixture(config,
             f'regions={east} {west} {north}\nspot_candidate_regions={west} {east} {candidate_only}\n'
             + 'instance_types=c7a.4xlarge c7a.8xlarge m7a.4xlarge m7a.8xlarge\n'
-            + 'gate_wait_usd_per_minute=0\nmax_gate_minutes=12\n')
+            + 'gate_wait_usd_per_minute=0.02\nmax_gate_minutes=12\n'
+            + f'region_transfer_usd={json.dumps({east: 0.30, west: 0.08})}\n'
+            + f'region_extra_gate_seconds={json.dumps({west: 30})}\n')
         _ = (self.state / 'gate-deployment.json').write_text(json.dumps({'regions': [
             {'region': east, 'subnets': [{'id': 'subnet-east', 'zone': east + 'a'}]},
             {'region': west, 'subnets': [{'id': 'subnet-west', 'zone': west + 'a'}]},
@@ -274,7 +279,8 @@ class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
             ledger.RegionalSpotPrice(east, east + 'b', 'm7a.4xlarge', Decimal('0.01'), now - 99999),
             ledger.RegionalSpotPrice(east, east + 'b', 'c7a.8xlarge', Decimal('0.01'), now),
             ledger.RegionalSpotPrice(east, east + 'b', 'm7a.8xlarge', Decimal('2'), now),
-            ledger.RegionalSpotPrice(west, west + 'a', 'c7a.4xlarge', Decimal('0.01'), now - 99999),
+            ledger.RegionalSpotPrice(west, west + 'a', 'c7a.4xlarge', Decimal('0.6'), now),
+            ledger.RegionalSpotPrice(west, west + 'a', 'm7a.8xlarge', Decimal('0.01'), now - 99999),
             ledger.RegionalSpotPrice(north, north + 'a', 'c7a.4xlarge', Decimal('0.01'), now),
         ))
         ledger.write_spot_prices(self.state, prices)
@@ -289,7 +295,26 @@ class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
         self.assertEqual([row[0] for row in table['rows']], [east, west, north])
         self.assertEqual(table['rows'][0], [east, 'c7a.4xlarge', '0.6000', '10.0', '0.1000',
                                            'm7a.8xlarge', '1.8000', '5.0', '0.1500', '0.0100 or more'])
-        self.assertEqual(table['rows'][1:], [[region, *(['—'] * 8), 'no current price'] for region in (west, north)])
+        self.assertEqual(table['rows'][1], [west, 'c7a.4xlarge', '0.6000', '10.0', '0.1900',
+                                           *(['—'] * 4), 'no current price'])
+        self.assertEqual(table['rows'][2], [north, *(['—'] * 8), 'no current price'])
+
+        payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
+        page = cast(aws_page.PageData, json.loads(payload))
+        merge_gates = next(costs for costs in page['runs'] if costs['scope'] == 'merge-gate')
+        gate_prices = merge_gates['prices'][0]
+        size = 'c7a.4xlarge'
+        column = gate_prices['headers'].index(size)
+        prices_by_region = {row[0]: row[column] for row in gate_prices['rows']}
+        end = datetime.fromtimestamp(now, UTC)
+        days = conf.read(self.settings).whole('run_cost_days')
+        evidence = run_cost.run_evidence(history, end - timedelta(days=days), end, east)
+        pricing = run_cost.GateRunPricing.from_config(conf.read(config), evidence, east, ('merge-gate',))
+        for row in table['rows'][:2]:
+            region = row[0]
+            with self.subTest(region=region):
+                self.assertEqual(prices_by_region[region], row[4])
+                self.assertEqual(prices_by_region[region], f'{pricing.expected_usd(Decimal("0.6"), size, region):.4f}')
         self.assertLess(source.index('id="placement-scores"'), source.index('id="gate-time-price"'))
         self.assertIn('fill(document.getElementById("gate-time-price"), data.gateTimePrice,', source)
 
