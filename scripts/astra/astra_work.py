@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 
+from scripts.direct import recorder_state
 from scripts.lib.atomic_file import create_text_atomic
 
 AstraRole = Literal["astra-designer", "astra-reviewer"]
@@ -72,19 +73,8 @@ def _text(value: dict[str, object], key: str) -> str:
 def phase_work(run_directory: str | Path, phase_id: str) -> PhaseWork:
     directory = Path(run_directory).expanduser().resolve()
     try:
-        state = _object(cast(object, json.loads(
-            (directory / "progress_history_state.json").read_text(encoding="utf-8"))))
-        phases: list[dict[str, object]] = []
-        parked = state.get("open_phases", [])
-        if not isinstance(parked, list):
-            raise ValueError("invalid open_phases")
-        phases.extend(_object(item) for item in cast(list[object], parked))
-        current = state.get("phase")
-        if isinstance(current, dict):
-            phase = cast(dict[str, object], current)
-            if phase.get("status") == "active":
-                phases.append(phase)
-        matches = [phase for phase in phases if phase.get("id") == phase_id]
+        state = recorder_state.read_state(directory / recorder_state.STATE_FILENAME)
+        matches = [phase for phase in recorder_state.open_phases(state) if phase.get("id") == phase_id]
         if not phase_id or len(matches) != 1:
             raise ValueError(f"phase {phase_id} does not resolve to one open phase")
         return PhaseWork(str(directory), _text(state, "run_id"), phase_id,
@@ -176,6 +166,9 @@ def main(arguments: list[str]) -> int:
                     or destination.read_text(encoding="utf-8").partition("\n")[2] != text):
                 raise ValueError(f"brief already exists with different or incomplete content: {destination}")
         print(destination)
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return 1
     except (OSError, UnicodeError, ValueError) as error:
         print(f"astra_work: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
         return 2

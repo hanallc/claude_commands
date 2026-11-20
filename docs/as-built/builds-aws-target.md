@@ -3,8 +3,10 @@
 ## Current model
 
 AWS runs temporary Spot boxes for merge gates, paired AWS trials, and the GPU size trial.
-Normal build jobs use `mac` and `natedev`, in that order.
-AWS has no permanent builder or build offload route.
+The configured build target order is `hana-aws,mac,natedev`.
+Hana placement has been enabled since 2026-11-17.
+The queue tries `hana-aws` first for eligible Hana check and clippy steps.
+The former permanent `aws-build` target is absent.
 Cloud gates use `~/.local/state/build-targets/aws` without an `aws` target registration.
 `regions` in `cloud_gate.conf` holds all 19 regions of `spot_candidate_regions`.
 The saved deployment record identifies the regions available for launch.
@@ -243,16 +245,21 @@ Tool setup runs after the guard and requires the bounded data mount.
 A failed setup or missing disk cannot prevent the guard from requesting poweroff.
 The mount bounds both device discovery and mount execution through `mount_timeout_seconds`.
 
-Phase D must deliver `/run/hana-aws/work-permit.json` and `/run/hana-aws/generation` as private, root-owned files.
+The root receiver writes the permit to `/run/hana-aws/work-permit.json`.
+It writes the generation to `/run/hana-aws/generation`.
+Keep both files private and owned by root.
+The receiver service runs as root with `UMask=0077`.
 The permit fields are `expires_at` (UTC epoch seconds), `generation`, and `boot_id`.
 The boot ID must match `/proc/sys/kernel/random/boot_id`.
 The guard and watchdog only read the permit and identity files.
 Missing, unreadable, malformed, expired, or mismatched permits grant no permission.
 `permit_max_seconds=1800` bounds one renewal window.
 A permit beyond that window grants no permission.
-Phase C reserves permission for longer steps.
-Phase D must deliver renewals through `write_permit()`.
-The writer uses a private temporary file and atomic rename.
+The controller can renew permission for longer steps.
+For a changed permit, the receiver uses an atomic rename under the shared lock.
+It then writes the generation in a separate operation.
+If the generation write fails, a retry can confirm the same fresh permit without repairing the generation file.
+The guard, watchdog, and command admission still require the permit generation to match that file.
 
 On the first read, safety records the permit's boot-clock deadline in `/run/hana-aws/permit-deadline.json`.
 An unchanged permit retains that deadline across later reads and service restarts.
@@ -282,7 +289,7 @@ The caller waits for command completion outside the lock.
 It prepares an unprivileged command with a separate slice under `hana-work.slice`.
 Both the parent slice and each command enforce `step_cpu_limit` and `step_memory_gib` from configuration.
 The initial limits are 4 vCPUs and 24 GiB RAM.
-Phase F2 must use this command path after checking the actual data mount.
+The receiver checks the actual data mount before it starts the command through this path.
 `test_hana_guest.py` tests the decisions with injected clocks and verifies rendered units when `systemd-analyze` exists.
 No safety test needs AWS or a running systemd manager.
 
@@ -291,8 +298,7 @@ No safety test needs AWS or a running systemd manager.
 `scripts/aws_target/hana_spend.py` reserves spending before it returns a guest permit.
 `HanaSpending` uses the account ledger lock for starts, renewals, lifecycle observations, and storage deletion.
 It makes no AWS call and delivers no permit to a guest.
-Phase D must deliver permits and schedule lifecycle reconciliation without an active caller.
-Placement remains disabled.
+The lifecycle controller delivers permits through signed control and reconciles the box without an active caller.
 
 `reserve_storage()` reserves the root and data volumes before provisioning.
 It checks current account caps and the Hana budget before returning a saved reservation.
@@ -387,7 +393,7 @@ A saved idle-stop intent refuses a later claim until stop confirmation.
 A confirmed interruption takes priority over a pending stop.
 The controller records `INTERRUPTED` and refuses a manual restart.
 A stopped observation with an unknown cause preserves `INTERRUPTED`.
-If EC2 restarts the box without a claim, the controller saves its stop decision before it calls the provider.
+If the controller stops an unclaimed restart, it saves its stop decision before it calls the provider.
 The decision records the generation and whether an interruption came before the restart.
 Another running observation keeps the stop in progress.
 If the running box enters a new generation, the controller saves a new stop decision for that generation.
@@ -396,6 +402,23 @@ The controller records `IDLE_STOPPED` if that decision followed an interruption.
 A stopped observation from a different generation preserves `INTERRUPTED` if the old decision followed an interruption.
 An unclaimed stop with no prior interruption ends at `STOPPED_UNKNOWN`.
 The decision applies whether the controller or the guest stops the box.
+
+The controller cannot use a saved `STOPPED_UNKNOWN` row to infer a Spot interruption from the next compute generation.
+The compute ledger records exposure times, but it lacks the last running observation and the reason for the stop.
+The exposure record does not identify a guard window or a reservation.
+The provider records lack the generation and the acceptance time of a start or stop.
+An EC2 restart and a start in the AWS console can produce the same saved records.
+
+After you confirm Hana is stopped, run `deploy.py hana-release-unknown-stop` to preview the release.
+With `--approve-release`, the command saves a stop decision and records the approval time.
+The command requires `STOPPED_UNKNOWN` and closed compute exposure in the newest ledger generation.
+A claim, pending operation, saved demand start, or replacement duty prevents approval.
+The command makes no AWS call and needs no AWS credentials.
+Hana remains in `STOPPING` and refuses claims until the controller confirms the stop.
+If the controller finds Hana running, it saves a stop decision for the running generation and stops Hana.
+The controller sets `IDLE_STOPPED` after a fresh stopped observation with closed compute exposure for the stop decision.
+Repeat the command to check whether the release waits for confirmation or is already complete.
+Later claims use the usual image, spending, and permit checks.
 
 Phase C reserves compute before the next boot identity exists through `reserve_start()`.
 `check_start()` rechecks current caps before bootstrap, start, and permit publication.
@@ -425,13 +448,14 @@ Its `recover()` method reads status without repeating a mutation.
 It must distinguish a completed request from an unresolved request before reporting `MutationSettled`.
 The provider refreshes bootstrap access before a demand start.
 It must verify root receiver responses against deployment and demand-start identities.
-It must install a renewed generation and permit together before acknowledging publication.
+It installs the renewed permit first and the generation second, and acknowledges publication after both writes.
+A retry after a failed generation write can acknowledge while the generation file is old; this is a known defect.
 `hana_provider.AwsHanaProvider` supplies the concrete AWS provider.
 The controller constructs it with the scaler profile and a sanitized credential environment.
 An unprovisioned tick makes no provider call.
 `Deployment.prepare_hana` and `Deployment.hana_setup` in `deploy.py` prepare and provision a separate Hana stack through the existing deployment helpers.
 The user runs `prepare --workload hana`, then `hana-setup --approve-resources`.
-Without approval, `hana-setup` prints only its local plan.
+Without approval or `--plan`, `hana-setup` prints a local resource summary.
 The existing preparation writer, preflight verifier, encrypted admin executor, stack waiter, and progress display serve both workloads.
 The separate template is `docs/plans/builds-aws/hana-cloudformation.json`.
 The stack creates the launch template, security group, private control bucket, and scaler policy.
@@ -446,8 +470,8 @@ Setup shows a `/tune` command when the effective ceiling key is editable.
 If the configuration rejects the command, setup reports the error and the suggested ceiling.
 The suggested ceiling includes `spot_ceiling_margin` and rounds up to a cent.
 It reserves setup costs within both account and workload limits before the stack request.
-`reserve_setup()` permits only approved resource setup while placement remains disabled.
-It does not permit demand starts or guest command admission.
+`reserve_setup()` reserves compute for approved resource setup.
+Demand starts and guest command admission require their own authorization.
 Setup uses the existing stack after a launch failure.
 After all launch requests receive a refusal, prepared setup can change the ceiling on that stack.
 Setup reserves compute at the new ceiling and saves the launch template version before it attempts the next launch.
@@ -611,6 +635,8 @@ Source uploads and result downloads have separate limits.
 Provider errors expose safe action names rather than cloud identifiers or signed URLs.
 
 The provider persists its operation before dispatch and holds a separate mutation lock.
+Existing writes store the lifecycle generation and UTC epoch seconds for dispatch, acceptance, or cancellation.
+Acceptance writes identify a direct response or a bootstrap observation.
 Recovery takes that lock without blocking an active mutation.
 Recovery fences an operation that has not reached dispatch.
 A late worker cannot dispatch that fenced operation.
@@ -649,15 +675,13 @@ They also cover stale recovery responses, concurrent cap refusals, and interrupt
 Fixtures in `scripts/aws_target/fixtures/` supply settings for `aws_target` tests.
 The tests do not read tracked configuration.
 
-## Removed builder: 2026-11-04
+## Removed builder: 2026-11-10
 
-`builder-removal.json` records the removal on 2026-11-04.
+`builder-removal.json` records the removal. Commit `1b1fa1842` removed the target on 2026-11-10.
 The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
 `routing.json` records `enabled: false`.
-The target registry contains `mac,natedev`.
-The builder configuration and offload route have been removed.
-Builder slots, warm mirrors, idle shutdown, and queue-based starts are historical features.
-Only historical cost, ownership, and teardown compatibility remain.
+The registry no longer includes the former `aws` target.
+The ledger and teardown retain historical records for the former builder.
 The foundation template has no builder instance, launch template, data volume, roles or stop action.
 The `remove-builder` command and the `down` compute stage are removed.
 The foundation template has no builder parameters or outputs, such as `EnableCompute` or `ComputeEnabled`, since 2026-11-15.
@@ -927,16 +951,14 @@ Run one `deploy.py up` at a time. Two runs from different state folders can save
 
 `buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
 The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
-The hourly job calls `aws_target.hourly`: the Spot snapshot, then the billed hours check.
-`python3 scripts/aws_target/aws_target.py snapshot` runs the same two steps manually.
-No systemd unit change or NixOS rebuild is required.
-The old `aws-target.service` remains disabled.
-`aws_target.py tick` reads account charges only.
+The hourly job refreshes the Spot snapshot and placement scores. It also checks billed hours.
+`python3 scripts/aws_target/aws_target.py snapshot` runs the same operations manually.
+`aws_target.py tick` reconciles the Hana lifecycle and refreshes account charges.
 `price_refresh_seconds` limits snapshot attempts to one per configured interval.
 `deploy.py up` runs the same reader with `force=True` after the stack update, so prices fill at once.
 A forced read does not move the interval, so the next hourly read still runs.
 The hourly timer starts one hour after the last run ends, so two hourly reads are always more than 3600 s apart.
-A price read is therefore never older than one hour plus the run time.
+A failed regional read can leave older values in the snapshot.
 It tries `deploy_price_fill_attempts=3` times, `deploy_price_fill_pause_s=10` seconds apart, while IAM shows the new policy.
 The deploy prints the reasons and sends no alert; a failed fill does not fail the deploy, and the hourly refresh sends the alert.
 The snapshot takes `spot-prices.lock` without blocking.
@@ -1166,17 +1188,16 @@ Placement does not try a type and region whose median box time, boot included, i
 The user, 2026-11-14: a slow type costs more gate time than its lower price saves.
 The median uses the type's runs in that region, or its runs in all regions when the region has none.
 A type without runs is tried; `lifetime_minutes` is not a measurement.
-Placement also does not try a type in a region whose Spot quota in the hourly snapshot is below one box of that type.
-The showrunner, 2026-11-14: a region with a pending quota request must not get launch attempts.
-A G or VT type uses the G and VT quota; other types use the Standard quota.
-A quota that is missing or older than `price_max_age_seconds` does not cause a skip.
-Each skip prints `Cloud gate skips <type> in <region>`.
-When every variant is skipped, the gate falls back to natedev before a launch.
-Available variants precede variants under a capacity cooldown.
+The worker ranks alternatives by recent quota refusals, estimated live quota use, and recent zone refusals.
+The quota check adds the new box to known live gate vCPUs.
+A G or VT type uses the G and VT quota. Other types use the Standard quota.
+The check uses quotas from the hourly snapshot within `price_max_age_seconds`.
+The worker prints `Cloud gate skips <type> in <region>` for a type above the median time limit.
+If that limit removes every variant, the gate falls back to natedev.
 Within each group, variants with a current price come first, ranked by the expected USD per run.
 The user, 2026-11-14: "base our spot Requests on lowest price per run".
-Equal costs follow the `instance_types` order.
-Without any current price, the configured region, type, and zone order stays.
+If any variant has a current price, equal costs and unpriced variants follow the `instance_types` order, then input order.
+If every variant lacks a current price, the worker preserves input order within each capacity group.
 That cost includes the hourly Spot price times the expected box hours and the remote region transfer charge.
 It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
 `region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
@@ -1238,7 +1259,9 @@ The administrator IAM policy is outside the repository and needs `servicequotas:
 Credential refusals print their message once and stop the command with a nonzero exit status.
 AWS failures still print the AWS error code and allow the next region's request.
 It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
-The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
+The configured request is 136 Standard Spot vCPUs per gate region.
+`cloud_gate_slots=16` in `build_admission.conf` limits concurrent cloud gates in the queue.
+`slots=9` in `cloud_gate.conf` limits the module count for one paired trial.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each gate region from `regions`.
 A region in `spot_candidate_regions` only has no gate stack and gets no quota request.
 The GPU quota request uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
@@ -1411,10 +1434,10 @@ Existing configuration values remain unchanged.
 | --- | --- | --- |
 | `stack_name` | `hana-build` | Keep Hana resources separate from gate resources. |
 | `availability_zone` | `us-east-2c` | Use this zone for the first launch candidate. |
-| `ami_id` | Empty | Require the reviewed Hana safety image. |
-| `ami_owner_id` | Empty | Require the reviewed image owner. |
-| `vpc_id` | Empty | Require an explicit network. |
-| `subnet_id` | Empty | Require an explicit public subnet in the disk zone. |
+| `ami_id` | Empty | Use the reviewed image from the registration. |
+| `ami_owner_id` | Empty | Use the owner from the registration. |
+| `vpc_id` | Empty | Use the VPC from the registration. |
+| `subnet_id` | Empty | Use the subnet from the registration. |
 | `aws_timeout_s` | `10` | Bound small provider and receiver requests. |
 | `result_transfer_timeout_s` | `120` | Allow time to transfer up to 32 MiB of result JSON in either direction. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
@@ -1584,18 +1607,25 @@ Hana retains the configured SSH target family and uses signed control instead of
 `hana_placement_adapter.py` implements configuration policy, lifecycle evidence, exact claims, and release.
 `hana_generation.py` keeps the canonical boot identity safe for guest imports.
 
-The inactive target registration permits only the normalized Hana repository and check or clippy judgments.
+The active `hana-aws` target accepts one assigned step at a time.
+The route accepts check and lint judgments for the normalized Hana repository.
+These judgments run direct `cargo check` or `cargo clippy` commands.
 The command policy rejects repairs, builds, nextest, final steps, path overrides, and unknown wrappers.
-The active target order remains unchanged, and `enabled=off` still prevents placement.
+`enabled=on` enables the route in `hana_aws.conf`.
+The queue checks the Hana image and capacity before it assigns work.
+A pinned request uses only its requested target.
 
 Provider evidence reads lifecycle and execution records through the existing background worker.
-The stopped Hana target shares one spending preview across placement probes in the admission process.
+The adapter checks the spending preview only for an idle, stopped box.
+A ready box with a verified boot generation can pass placement without a spending preview.
+The admission process shares one stopped-box preview across placement probes.
 The preview expires after `preview_max_age_s` seconds, which defaults to two.
 Changes to the ledger, launch history, lifecycle journal, bills, or spending configuration invalidate the preview.
 The cache skips previews that use configuration recovered from Git.
 A full preview uses the account ledger lock and reads the launch history once.
 The preview gives placement evidence only.
-The controller still performs its full reservation and start checks.
+For a stopped box, the controller still performs its full reservation and start checks.
+Guest command admission requires a valid permit.
 The controller alone owns demand starts, spending reservations, and idle-stop serialization.
 One exact lifecycle claim excludes all other Hana worktrees.
 Boot generations include the deployment, demand-start token, and verified boot identity.

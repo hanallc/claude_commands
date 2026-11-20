@@ -319,6 +319,11 @@ class StylePlanTests(StylePlanFixture):
         ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/handle.rs", handle),),
                                          pairs=(("lock::LockError", "lock::LockFailure"),))
         self.renamed_ledger(handle, "LockFailure")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn("lock::LockError -> lock::LockFailure not applied", output)
+        moved = "crates/alpha/src/ledger/mutation_lock.rs"
+        self.write(moved, (self.repo / moved).read_text().replace("LockError", "LockFailure"))
         self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
         path = self.repo / "crates/alpha/src/ledger/handle.rs"
         _ = path.write_text(path.read_text().replace("super::mutation_lock::LockFailure", "super::mutation_lock::LockFault"))
@@ -374,9 +379,14 @@ class StylePlanTests(StylePlanFixture):
                 self.assertEqual(result, 1, output)
                 self.assertIn(self.RENAMED_REFUSAL, output)
 
-    def test_approved_file_rename_leaves_the_renamed_file_free_when_another_finding_names_it(self) -> None:
+    def test_approved_file_rename_checks_contents_with_an_approved_declaration(self) -> None:
         self.assertEqual(self.renamed_declaration_gate((("lock::LockError", "lock::LockFailure"),)),
                          (0, "approved proposal\n"))
+        new = "crates/alpha/src/ledger/mutation_lock.rs"
+        self.write(new, (self.repo / new).read_text() + "pub struct Other;\n")
+        result, output = self.reference_gate("1")
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.RENAMED_REFUSAL, output)
 
     def test_approved_file_rename_refuses_a_declaration_rename_that_no_finding_names(self) -> None:
         result, output = self.renamed_declaration_gate(())

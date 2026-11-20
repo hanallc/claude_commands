@@ -28,15 +28,19 @@ from scripts.style import crate_run as crates
 from scripts.style import coverage_report
 from scripts.style import rules
 from scripts.style import style_ledger as ledger_api
+from scripts.style import style_sync as owner_resolver
 from scripts.style.approved_renames import BindingRename
 from scripts.style.ledger_test_support import machine_rename_fixture
 from scripts.style.test_bulk_rename import ScriptedServer, word_edits, CargoProjectTests
 from scripts.style.style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
 from scripts.build_queue import admission_protocol as wire, queue_place
 from scripts.build_queue import first_step
+from scripts.buildlog.store import host_name
 from scripts.copies import copies
-from scripts.copies.copies_test_support import AdmissionWaitReached, copies_environment
+from scripts.copies.copies_test_support import AdmissionWaitReached
 from scripts.lib import build_folders, copy_record, scratch
+from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 from scripts.style.style_reader_test_support import oracle_reader
@@ -117,12 +121,77 @@ def available(_repo: Path, _path: str) -> None:
     pass
 
 
+def _configuration(root: Path) -> dict[str, str]:
+    config = root / "config"
+    config.mkdir()
+    machine = host_name()
+    _ = (config / "build_folders.conf").write_text("\n".join((
+        "# whole: 1..64",
+        "names.repository_key_length=8",
+        f"roots.slots={root / 'slots'}",
+        f"roots.slot_cargo={root / 'cargo'}",
+        "# whole: 1..",
+        f"slots.{machine}.default_max=2",
+        "# range: 0.001..",
+        "slots.wait_seconds=30",
+        "patterns.editable={repository}-{owner}/{purpose}",
+        "patterns.tool={purpose}{suffix}",
+        "# range: 0.001..60",
+        "locks.probe_wait_seconds=0.25",
+        "# range: 0.001..1",
+        "locks.probe_retry_seconds=0.005",
+        "",
+    )))
+    _ = (config / "copies.conf").write_text("\n".join((
+        f"remote_registry={root / 'remote-mirrors'}",
+        "git_timeout_seconds=10",
+        "guard_timeout_seconds=10",
+        "wait_seconds=0.01",
+        "owner.style=style",
+        "owner.verify=verify",
+        "",
+    )))
+    _ = (config / "scratch.conf").write_text(
+        f"visible_root={root / 'visible'}\n"
+        + f"holds_file={root / 'holds.json'}\n"
+        + "# whole: 1..\ndefault_life_seconds=86400\n# whole: 1..\nrepo_depth=3\n"
+        + "repo_skip=target node_modules .git\n# whole: 1..\nrecord_lock_attempts=3\n"
+    )
+    _ = (config / "build_steps.conf").write_text("names.style=style\nnames.test=test\n")
+    temporary = root / "temporary"
+    temporary.mkdir()
+    return {
+        "HOME": str(root / "gate-home"),
+        "TMPDIR": str(temporary),
+        "CONF_DIR": str(config),
+        "COPIES_CONFIG": str(config / "copies.conf"),
+        "SCRATCH_ROOT": str(root / "scratch"),
+        "SCRATCH_COPIES_ROOT": str(root / "copies"),
+        "SCRATCH_HOLDS": str(root / "holds.json"),
+        "SESSION_TEMP_ROOT": str(root / "session"),
+        "SESSION_FORMER_ROOT": str(root / "former-session"),
+        "CODEX_THREAD_ID": "",
+        "CLAUDE_CODE_SESSION_ID": "",
+        "CLAUDE_SESSION_FOLDER": "",
+        "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(root)),
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+
+
 class CrateRunTests(CargoProjectTests):
     fixture_root: ClassVar[Path]
+    cold_seed: ClassVar[Path]
     fixture_seed: ClassVar[Path]
     fixture_environment: ClassVar[dict[str, str]]
+    fixture_base: ClassVar[str]
+    fixture_tree: ClassVar[str]
     frozen_seed: ClassVar[Path]
     single_file_frozen_seed: ClassVar[Path]
+    cold_slot_tests: ClassVar[frozenset[str]] = frozenset({
+        "test_worker_validation_waits_before_it_takes_a_validation_slot",
+        "test_nested_proof_keeps_the_canonical_owner_with_the_real_resolver",
+        "test_crate_trees_keep_ownership_and_use_two_standing_caches",
+    })
     single_file_frozen_tests: ClassVar[frozenset[str]] = frozenset({
         "test_legacy_manifest_adopts_existing_worker_and_creates_missing_worker",
         "test_owner_removal_preserves_each_nonterminal_crate_worker",
@@ -140,7 +209,6 @@ class CrateRunTests(CargoProjectTests):
     })
     frozen_tests: ClassVar[frozenset[str]] = frozenset({
         "test_worker_names_separate_run_and_package_at_the_last_dot",
-        "test_crate_trees_keep_ownership_and_use_two_standing_caches",
         "test_one_crate_has_canonical_branch_before_assignment_and_preserves_checkpoint_ancestry",
         "test_two_crates_integrate_serially_without_reselecting",
         "test_empty_selection_names_holding_tickets_and_finding_count_per_crate",
@@ -178,8 +246,11 @@ class CrateRunTests(CargoProjectTests):
     @classmethod
     @override
     def setUpClass(cls) -> None:
+        clean_environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, clean_environment, clear=True)))
         # Build the complete class seed without the base class seed.
         seeds = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="crate-run-seed-")))
+        cls.cold_seed = seeds / "cold"
         cls.fixture_seed = seeds / "initial"
         cls.frozen_seed = seeds / "frozen"
         cls.single_file_frozen_seed = seeds / "single-file-frozen"
@@ -188,9 +259,15 @@ class CrateRunTests(CargoProjectTests):
         try:
             fixture.prepare_fixture()
             cls.fixture_root = fixture.root
+            cls.fixture_base = fixture.base
+            cls.fixture_tree = fixture.tree
             cls.fixture_environment = {key: value for key, value in os.environ.items()
                                        if environment.get(key) != value}
             fixture.authority.close()
+            _ = shutil.copytree(fixture.root, cls.cold_seed, symlinks=True)
+            with (copies.standing("style", fixture.repo, copies.CommittedSource(fixture.base), step="style"),
+                  copies.standing("style", fixture.repo, copies.CommittedSource(fixture.base), step="test")):
+                pass
             _ = shutil.copytree(fixture.root, cls.fixture_seed, symlinks=True)
             fixture.authority = fixture.ledger()
             fixture.freeze()
@@ -208,12 +285,15 @@ class CrateRunTests(CargoProjectTests):
 
     @override
     def set_up_project(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, _configuration(self.root))))
         self.create_project()
 
     @override
     def setUp(self) -> None:
         self.root: Path = self.fixture_root
-        if self._testMethodName in self.single_file_frozen_tests:
+        if self._testMethodName in self.cold_slot_tests:
+            seed = self.cold_seed
+        elif self._testMethodName in self.single_file_frozen_tests:
             seed = self.single_file_frozen_seed
         elif self._testMethodName in self.frozen_tests:
             seed = self.frozen_seed
@@ -225,10 +305,11 @@ class CrateRunTests(CargoProjectTests):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.fixture_environment)))
         _ = self.enterContext(oracle_reader())
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = self.enterContext(fake_cargo_output_roots())
         self.queue: StyleQueueFake = self.enterContext(unqueued_style_children())
         # Each test has fixed copies settings and keeps its own settings dictionary.
         _ = self.enterContext(mock.patch.object(copies, "config_settings", return_value=copies.config_settings()))
-        _ = self.base
+        self.base, self.tree = self.fixture_base, self.fixture_tree
         _ = self.authority
 
     def prepare_fixture(self) -> None:
@@ -239,12 +320,6 @@ class CrateRunTests(CargoProjectTests):
         _ = self.git("config", "gc.autoDetach", "false")
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = fixture_member("showrunner", name="style-fixture")
-        self.enterContext(mock.patch.dict(os.environ, {
-            **copies_environment(self.root),
-            "HOME": str(self.root / "gate-home"),
-            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
-            "SCRATCH_HOLDS": str(self.root / "holds.json"),
-        }))
         _ = (self.repo / "Cargo.toml").write_text((self.repo / "Cargo.toml").read_text()
                                                  + '\n[workspace]\nmembers=[".", "beta"]\n')
         (self.repo / "beta/src").mkdir(parents=True)
@@ -511,7 +586,6 @@ class CrateRunTests(CargoProjectTests):
                     pass
                 def remove(path: Path) -> None:
                     if path == worker and boundary == "after git deletion":
-                        import shutil
                         shutil.rmtree(path / ".git")
                         raise RuntimeError(boundary)
                     original_remove(path)
@@ -585,7 +659,6 @@ class CrateRunTests(CargoProjectTests):
         self.assertFalse(worker.exists())
 
     def test_nested_proof_keeps_the_canonical_owner_with_the_real_resolver(self) -> None:
-        from scripts.style import style_sync as owner_resolver
         self.freeze(paths=("src/lib.rs",))
         observed: set[Path] = set()
         observed_caches: set[Path] = set()
@@ -618,6 +691,7 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual([Path(path).name for path in paths], ["crate-first-beta.gamma", "crate-first.beta-gamma"])
 
     def test_crate_trees_keep_ownership_and_use_two_standing_caches(self) -> None:
+        self.freeze()
         original = self.git("rev-parse", "HEAD")
         manifest = self.batch.read()
         with self.batch.frozen_checkout(manifest) as frozen:

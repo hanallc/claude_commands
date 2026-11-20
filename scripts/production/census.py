@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from enum import Enum
 from typing import Literal, NamedTuple, cast
 
 from scripts.lib import conf
@@ -16,9 +17,18 @@ type RunState = Literal["running", "finished_queued", "missing"]
 RUN_STATES: tuple[RunState, ...] = ("running", "finished_queued", "missing")
 
 
+class CensusMachineReachability(Enum):
+    REACHED = "reached"
+    NOT_REACHED = "not reached"
+
+
 class CensusMachine(NamedTuple):
     name: str
-    reachable: bool
+    reachability: CensusMachineReachability
+
+
+class CensusMachineUnreported(NamedTuple):
+    """The census session has no machine field."""
 
 
 class CensusShell(NamedTuple):
@@ -28,12 +38,25 @@ class CensusShell(NamedTuple):
     started_at: float | None
 
 
+class CensusProcessIdentity(NamedTuple):
+    """A PID and a start identity from the census."""
+
+    pid: int
+    started: str
+
+
+class CensusProcessUnreported(NamedTuple):
+    """The census supplies no process identity."""
+
+
 class CensusSession(NamedTuple):
     """A session that a handler tile shows. `status` is None when the accounts command has no entry."""
 
     session: str
     status: str | None
     shells: tuple[CensusShell, ...] = ()
+    machine: str | CensusMachineUnreported = CensusMachineUnreported()
+    process: CensusProcessIdentity | CensusProcessUnreported = CensusProcessUnreported()
 
 
 class CensusRun(NamedTuple):
@@ -152,8 +175,22 @@ def _session(value: object, where: str) -> CensusSession:
     """A census without `shells` lists no background commands."""
     fields = _object(value, where)
     shells = _list(fields, "shells", where) if "shells" in fields else []
-    return CensusSession(_text(fields, "session", where), _optional_text(fields, "status", where),
-                         tuple(_shell(shell, f"{where}.shells[{index}]") for index, shell in enumerate(shells)))
+    name = _text(fields, "session", where)
+    status = _optional_text(fields, "status", where)
+    commands = tuple(_shell(shell, f"{where}.shells[{index}]") for index, shell in enumerate(shells))
+    if ("pid" in fields) != ("process_start" in fields):
+        raise _BadField(f"{where}.pid and process_start must occur together")
+    if "pid" not in fields:
+        machine = _text(fields, "machine", where) if "machine" in fields else CensusMachineUnreported()
+        return CensusSession(name, status, commands, machine)
+    pid = fields["pid"]
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        raise _BadField(f"{where}.pid is not an integer")
+    started = _text(fields, "process_start", where)
+    machine_name = _text(fields, "machine", where)
+    if not machine_name.strip():
+        raise _BadField(f"{where}.machine is empty")
+    return CensusSession(name, status, commands, machine_name, CensusProcessIdentity(pid, started))
 
 
 def _worker(value: object, where: str) -> CensusWorker:
@@ -176,7 +213,8 @@ def _machine(value: object, where: str) -> CensusMachine:
     reachable = fields.get("reachable")
     if not isinstance(reachable, bool):
         raise _BadField(f"{where}.reachable is not true or false")
-    return CensusMachine(_text(fields, "name", where), reachable)
+    reachability = CensusMachineReachability.REACHED if reachable else CensusMachineReachability.NOT_REACHED
+    return CensusMachine(_text(fields, "name", where), reachability)
 
 
 def parse(text: str) -> Census | CensusFailed:
