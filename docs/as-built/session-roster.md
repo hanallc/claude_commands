@@ -153,6 +153,23 @@ Codex rows:
 - `roster.py` and `inventory.py` use package imports for repository modules.
   Account helpers load lazily, so label-only callers do not load account discovery.
 
+### `agents status` command
+
+`shutdown.py` sends `status` to `status_entry.py` before it loads the lifecycle commands.
+`agents status` starts the SSH request before it reads local inventory and prints the local report first.
+The command uses the 120 s peer timeout and reports an unreachable peer separately from an unavailable report.
+`--here` reports only this machine's sessions.
+
+The production staff owner sends its staff snapshot and account role map on the peer command's stdin.
+If the data is absent or invalid, the peer can read staff over SSH even with `--here`.
+It also reads roles from their authority when needed.
+The supplied data applies to this command only.
+
+Inventory skips unit and pane discovery if the account has no selected sessions.
+The report still includes unattributed sessions.
+Inventory reads the first record of each run log and preserves the plan ranking.
+It reads Git state for distinct checkout folders with at most four workers and preserves session order.
+
 ### `roster.py` command
 
 `roster.py [--json] [--kind claude|codex] [--here] [--all]` hides closed workers by default in text and JSON.

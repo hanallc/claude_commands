@@ -156,6 +156,10 @@ class RoleMapUnavailable(ValueError):
     """Neither the authority nor a valid saved map can be read."""
 
 
+class RoleMapAnomaly(ValueError):
+    """The role map contains recoverable invalid data."""
+
+
 class RoleAccountUnavailable(ValueError):
     """A role has no account that can launch on this machine."""
 
@@ -347,7 +351,18 @@ def _object(path: Path) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _groups(raw: dict[str, object]) -> StoredGroupSelections:
+def _report_anomaly(message: str) -> None:
+    print(f"accounts: anomaly: {message}", file=sys.stderr)
+
+
+def _refuse_anomaly(message: str) -> None:
+    raise RoleMapAnomaly(message)
+
+
+def _groups(
+    raw: dict[str, object],
+    report_anomaly: Callable[[str], None] = _report_anomaly,
+) -> StoredGroupSelections:
     groups = StoredGroupSelections()
     for group in CLAUDE_GROUPS:
         if group not in raw:
@@ -366,7 +381,7 @@ def _groups(raw: dict[str, object]) -> StoredGroupSelections:
         if (not isinstance(fields.get("move_id"), str) or not fields["move_id"]
                 or fields.get("cause") not in ("by hand", "refusal", "auto")
                 or fields.get("window") not in ("weekly", "five_hour", "unknown")):
-            print(f"accounts: anomaly: invalid {group} transition metadata", file=sys.stderr)
+            report_anomaly(f"invalid {group} transition metadata")
             groups[group] = cast(str, fields["label"])
             continue
         selected = StoredGroupSelection(label=cast(str, fields["label"]), move_id=cast(str, fields["move_id"]),
@@ -378,7 +393,7 @@ def _groups(raw: dict[str, object]) -> StoredGroupSelections:
                 if not isinstance(reset, str) or datetime.fromisoformat(reset).tzinfo is None:
                     raise ValueError
             except ValueError:
-                print(f"accounts: anomaly: invalid {group} reset", file=sys.stderr)
+                report_anomaly(f"invalid {group} reset")
             else:
                 selected["reset"] = reset
         if "why" in fields:
@@ -386,12 +401,12 @@ def _groups(raw: dict[str, object]) -> StoredGroupSelections:
             if isinstance(why, str):
                 selected["why"] = why
             else:
-                print(f"accounts: anomaly: invalid {group} reason", file=sys.stderr)
+                report_anomaly(f"invalid {group} reason")
         groups[group] = selected
     return groups
 
 
-def decode_role_map(text: str) -> RoleMap:
+def _decode_role_map(text: str, report_anomaly: Callable[[str], None]) -> RoleMap:
     value = cast(object, json.loads(text))
     if not isinstance(value, dict):
         raise ValueError("role map must contain an object")
@@ -402,8 +417,19 @@ def decode_role_map(text: str) -> RoleMap:
     upcoming = fields.get("upcoming_moves", [])
     if not isinstance(upcoming, list) or not all(isinstance(line, str) for line in cast(list[object], upcoming)):
         raise ValueError("invalid upcoming moves")
-    return RoleMap(_groups(cast(dict[str, object], groups)), workers, _workers_claude_account(fields),
+    return RoleMap(_groups(cast(dict[str, object], groups), report_anomaly),
+                   workers, _workers_claude_account(fields),
                    upcoming_moves=tuple(cast(list[str], upcoming)))
+
+
+def decode_role_map(text: str) -> RoleMap:
+    """Decode the role map and report recoverable anomalies."""
+    return _decode_role_map(text, _report_anomaly)
+
+
+def decode_role_map_strict(text: str) -> RoleMap:
+    """Refuse a supplied role map if it contains an anomaly."""
+    return _decode_role_map(text, _refuse_anomaly)
 
 
 def _map_document(value: RoleMap) -> RoleMapDocument:

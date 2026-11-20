@@ -28,7 +28,7 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
-from scripts.agents import test_stop_resume, worker_lifecycle
+from scripts.agents import set_model, status_entry, test_stop_resume, worker_lifecycle
 from scripts.direct import progress_history
 from scripts.copies import copies
 from scripts.copies import remote_test_support
@@ -101,7 +101,7 @@ class AgentsUsageTests(unittest.TestCase):
         assert row is not None and isinstance(row.worktree, staff.PresentWorktree)
         _ = staff.set_worktree(row.id, staff.RemovedWorktree(row.worktree.machine, row.worktree.path),
                                expected=row.worktree)
-        with mock.patch.object(shutdown, "_selected_account", return_value=Account("claude", TARGET_LOGIN, "claude2")):
+        with mock.patch.object(status_entry, "_selected_account", return_value=Account("claude", TARGET_LOGIN, "claude2")):
             code, output, errors = self.invoke(["status", "--here", "--json"])
             self.assertEqual(code, 0, errors)
             report = cast(dict[str, object], json.loads(output))
@@ -166,6 +166,32 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(option[0], 0)
         self.assertTrue(option[1].startswith("usage: agents"))
         self.assertEqual(option, self.invoke(["help"]))
+
+        root = Path(__file__).resolve().parents[2]
+        status_help = subprocess.run(
+            [str(root / "scripts/lib/py"), "-c", """
+import runpy
+import sys
+
+sys.modules["scripts.agents.producer_lifecycle"] = None
+sys.argv = [sys.argv[1], "status", "--help"]
+runpy.run_path(sys.argv[0], run_name="__main__")
+""", str(root / "scripts/agents/shutdown.py")],
+            cwd=root, capture_output=True, text=True, check=False, timeout=30,
+        )
+        code, output, errors = self.invoke(["status", "--help"])
+        self.assertEqual((status_help.returncode, status_help.stdout, status_help.stderr),
+                         (code, output, errors))
+        self.assertEqual(code, 0)
+        self.assertIn("positional arguments:\n  account", output)
+
+        with (mock.patch.object(set_model, "COMMAND", "select-model"),
+              mock.patch.object(set_model, "ARGUMENTS", "TARGET MODEL")):
+            for arguments in (["--help"], ["status", "--help"]):
+                with self.subTest(arguments=arguments):
+                    code, output, errors = self.invoke(arguments)
+                    self.assertEqual((code, errors), (0, ""))
+                    self.assertIn("agents select-model TARGET MODEL", output)
 
     def test_unknown_command_prints_usage_and_exits_two(self) -> None:
         status, output, errors = self.invoke(["unknown-command"])
