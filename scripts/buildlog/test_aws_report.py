@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.lint.memory_test_support import write_config_fixture
 
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 import json
@@ -35,16 +36,21 @@ def utc_fixture(spends: tuple[ledger.DailySpend, ...]) -> ledger.UtcAccountSpend
     for spend in spends:
         day = date.fromisoformat(spend.day)
         start, end = ledger.period_bounds(day, ZoneInfo('UTC'))
-        intervals = (ledger.ChargedInterval(start, end, spend.usd, 'fixture', 'fixed'),)
-        estimate = ledger.EstimatedUtcDaySpend(intervals, spend.groups)
+        estimate = ledger.EstimatedUtcDaySpend(tuple(
+            ledger.GroupedSpendInterval(ledger.ChargedInterval(start, end, group.usd, 'fixture', 'fixed'), group.group)
+            for group in spend.groups))
         source: ledger.EstimatedUtcDaySpend | ledger.SettledWatchAmount = estimate
         if spend.source == 'AWS bill':
+            usage_types = ('USE1-SpotUsage:m7a.8xlarge', 'USE1-SpotUsage:m7a.4xlarge',
+                           'USE1-EBS:VolumeUsage.gp3', 'USE1-PublicIPv4:InUseAddress', 'USE1-DataTransfer')
+            by_group = {group.group: group.usd for group in spend.groups}
+            usage = tuple(ledger.UsageTypeCost(usage_type, by_group.get(group, Decimal(0)))
+                          for group, usage_type in zip(ledger.SPEND_GROUPS[:len(usage_types)], usage_types, strict=True))
             bill = ledger.ChargeRead(spend.day, end, start, end, spend.usd, Decimal(0), spend.query_usd,
-                                     provisional=spend.provisional_bill)
+                                     usage, provisional=spend.provisional_bill)
             source = ledger.SettledWatchAmount(bill, ledger.SettledChargeUnchanged(spend.usd))
-        days.append(ledger.UtcDaySpend(day, source, spend.groups, intervals, estimate, spend.runs))
-    month = ledger.UtcMonthSpend(date(2026, 1, 1), tuple(days))
-    return ledger.UtcAccountSpend(tuple(days), (month,), ())
+        days.append(ledger.UtcDaySpend(day, source, estimate, spend.runs))
+    return ledger.UtcAccountSpend(tuple(days), ())
 
 
 class AwsReportTests(MeasurementFixture):
@@ -246,6 +252,8 @@ class AwsReportTests(MeasurementFixture):
         idle = ledger.ChargeRead('2026-01-13', NOW, MIDNIGHT - 2 * 86400, MIDNIGHT - 86400,
                                  Decimal('.006'), Decimal(0), Decimal(0))
         _ = (charges / '2026-01-13.json').write_text(json.dumps(ledger.charge_record(idle)))
+        self.book().reconcile(ledger.CostReconciliation(
+            idle.at, idle.period_start, idle.period_end, idle.actual_usd, 'Cost Explorer', idle.query_usd))
         _ = (charges / 'private-alias.json').write_text(json.dumps(ledger.charge_record(idle)))
         events: list[dict[str, object]] = []
         for attempt, mode, at, box_s, gate_s in (
@@ -574,7 +582,11 @@ class AwsReportTests(MeasurementFixture):
             with self.subTest(amount=amount):
                 dust = ledger.ChargeRead(reading.day, at, reading.period_start, reading.period_end,
                     amount, reading.estimated_usd, reading.query_usd, (ledger.UsageTypeCost('storage', amount),))
-                _ = (self.state / 'charges' / f'{dust.day}.json').write_text(json.dumps(ledger.charge_record(dust)))
+                with self.book().transaction() as state:
+                    _ = (self.state / 'charges' / f'{dust.day}.json').write_text(json.dumps(ledger.charge_record(dust)))
+                    state.reconciliations = [replace(row, usd=dust.actual_usd)
+                                             if row.source == 'Cost Explorer' and row.period_start == dust.period_start
+                                             else row for row in state.reconciliations]
                 with mock.patch.object(time, 'time', return_value=float(at)):
                     output = self.render('2026-01-16')
                 self.assertNotIn(f'AWS bill (account, UTC {DAY},', output)

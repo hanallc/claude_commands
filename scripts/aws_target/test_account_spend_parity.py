@@ -755,7 +755,9 @@ class AccountSpendParityTests(SpendReferenceFixture):
         other = self.root / 'report-settings.conf'
         _ = other.write_text(self.original_settings)
         self.record('66')
-        self.assertEqual(spend.read_spend(other, self.book.directory, self.now, utc_day(self.now)), self.page())
+        alternate = spend.read_spend(other, self.book.directory, self.now, utc_day(self.now))
+        assert isinstance(alternate, spend.Spend)
+        self.assertEqual(next(row.usd for row in alternate.days if row.day == utc_day(self.now)), Decimal(12))
         evidence = ledger.capture_spend_evidence(self.book.directory, self.now)
         assert isinstance(evidence, ledger.SpendEvidenceAt)
         account = ledger.utc_account_spend(evidence)
@@ -944,6 +946,10 @@ print(floor.day, floor.usd, decision.reason)
         evidence = ledger.capture_spend_evidence(self.book.directory, self.now, settings_path=self.settings)
         assert isinstance(evidence, ledger.SpendEvidenceAt)
         self.assertEqual(len(evidence.launches), 1)
+        evidence.launches[0]['attempt'] = 'changed copy'
+        evidence.state.inventories.clear()
+        self.assertEqual(evidence.launches[0]['attempt'], 'fixture')
+        self.assertEqual(len(evidence.state.inventories), 1)
         with ledger.verify_spend_revision(self.book.directory, evidence) as revision:
             self.assertIsInstance(revision, ledger.SpendRevisionVerified)
             self.assertEqual(ledger.capture_spend_evidence(self.book.directory, self.now, settings_path=self.settings),
@@ -1021,7 +1027,7 @@ print(floor.day, floor.usd, decision.reason)
                 if key == 'settled changed':
                     self.assertEqual(report.settlement_notes[0].settlement,
                                      ledger.SettledChargeChanged(Decimal(4), Decimal(2)))
-                self.assertIs(measurement.read_inputs(evidence, self.book.directory).state, evidence.state)
+                self.assertEqual(measurement.read_inputs(evidence, self.book.directory).state, evidence.state)
                 self.assertEqual(self.book.read_snapshot(), evidence.state)
 
     def test_utc_spend_uses_only_earlier_scoped_rates(self) -> None:
@@ -1048,6 +1054,54 @@ print(floor.day, floor.usd, decision.reason)
         self.assertEqual(report.months[0].usd, Decimal(7))
         self.assertEqual(tuple(interval.usd for interval in today.intervals),
                          (Decimal('1.5'), Decimal('.5'), Decimal(1)))
+
+    def test_utc_spend_keeps_reconciliations_on_days_without_a_refused_record(self) -> None:
+        self.scene('UTC-saved-reconciliation', now=JAN3 + HOUR)
+        with self.book.transaction() as state:
+            state.hana_storage.append(ledger.HanaStorageExposure(
+                JAN1, Decimal(90), ledger.HanaExposureClosed(JAN3)))
+            for start in (JAN1, JAN2):
+                state.reconciliations.append(ledger.CostReconciliation(
+                    self.now, start, start + DAY, Decimal(5), 'Cost Explorer'))
+
+        def completed_days() -> tuple[Decimal, ...]:
+            return tuple(row.usd for row in self.captured_utc_spend().days[:-1]
+                         if isinstance(row, ledger.UtcDaySpend))
+
+        self.assertEqual(completed_days(), (Decimal(8), Decimal(8)))
+        self.write_bill(JAN1, '5', name='wrong.json')
+        self.assertEqual(completed_days(), (Decimal(3), Decimal(8)))
+
+    def test_utc_spend_keeps_storage_carry_with_unscoped_ipv4(self) -> None:
+        self.scene('UTC-distinct-carry')
+        self.saved_utc_bill(JAN1, '.34', storage_bill('.34'), read_at=JAN2 + HOUR)
+        self.book.record_inventory(ledger.ResourceInventory(
+            JAN2, (ledger.PricedResource('public IPv4', Decimal(62)),), 'fixture IPv4', True))
+        today = self.captured_utc_spend().days[-1]
+        assert isinstance(today, ledger.UtcDaySpend)
+        self.assertEqual(today.usd, Decimal('1.17'))
+        self.assertEqual(next(group.usd for group in today.groups if group.group == 'storage'), Decimal('.17'))
+
+    def test_utc_spend_limits_idle_carry_to_days_without_a_saved_marker(self) -> None:
+        self.scene('UTC-idle-carry', now=JAN3 + 12 * HOUR)
+        address = ledger.UsageTypeCost('USE1-PublicIPv4:IdleAddress', Decimal(1))
+        self.saved_utc_bill(JAN1, '3', storage_bill('2'), address, read_at=JAN2 + HOUR)
+        self.run_builder(JAN1 + HOUR, JAN2 - HOUR)
+        idle = self.captured_utc_spend().days[1]
+        assert isinstance(idle, ledger.UtcDaySpend)
+        self.assertEqual(idle.usd, Decimal(3))
+
+        self.saved_utc_bill(JAN2, '0', read_at=JAN3 + HOUR)
+        marked = self.captured_utc_spend().days[1]
+        assert isinstance(marked, ledger.UtcDaySpend)
+        self.assertEqual(marked.usd, Decimal(0))
+        self.assertIsInstance(marked.source, ledger.EstimatedUtcDaySpend)
+        self.assertEqual(len(self.captured_utc_spend().settlement_notes), 1)
+
+        self.run_builder(JAN3, JAN3 + HOUR)
+        active = self.captured_utc_spend().days[-1]
+        assert isinstance(active, ledger.UtcDaySpend)
+        self.assertEqual(active.usd, Decimal(2))
 
     def test_utc_spend_keeps_the_minimum_once_and_ignores_rejected_bills(self) -> None:
         self.scene('UTC-minimum', now=JAN2 + HOUR)

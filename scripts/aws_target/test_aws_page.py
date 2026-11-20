@@ -478,6 +478,59 @@ class AwsPageSpendReferenceTests(ledger_test_support.SpendReferenceFixture):
         self.assert_month_guard(now, Decimal(5))
         self.assert_month_admission(now, Decimal(5))
 
+    def test_interrupted_sub_cent_refresh_keeps_the_earlier_page(self) -> None:
+        self.refresh(self.midnight, '5')
+        self.assert_spend_tiles(self.publish(self.midnight), '$0.00', '$5.00', '$5.00')
+        path = self.folder / aws_page.PAGE_NAME
+        earlier = path.read_bytes()
+        now = self.midnight + 60
+        reconcile = self.book._reconcile_charge  # pyright: ignore[reportPrivateUsage]
+
+        def interrupt_refresh(state: ledger.LedgerEvidence, bill: ledger.ChargeRead) -> None:
+            if bill.actual_usd == Decimal('.006'):
+                raise OSError('fixture interrupted sub-cent refresh')
+            reconcile(state, bill)
+
+        with mock.patch.object(self.book, '_reconcile_charge', side_effect=interrupt_refresh):
+            with self.assertRaisesRegex(OSError, 'fixture interrupted sub-cent refresh'):
+                self.refresh(now, '.006')
+        saved, = self.book.read_snapshot().reconciliations
+        self.assertEqual(saved.usd, Decimal(5))
+        bill_path = self.state / 'charges' / '2026-01-14.json'
+        self.assertEqual(ledger.read_charge(bill_path).actual_usd, Decimal('.006'))
+
+        self.assert_spend_tiles(self.publish(now), '$0.00', '$5.00', '$5.00')
+        self.assertEqual(path.read_bytes(), earlier)
+
+        self.refresh(now, '.006')
+        self.assert_spend_tiles(self.publish(now), '$0.00', '$0.00', '$0.00')
+
+    def test_changes_to_deployment_or_placement_keep_the_earlier_page(self) -> None:
+        _ = self.publish(self.midnight)
+        path = self.folder / aws_page.PAGE_NAME
+        earlier = path.read_bytes()
+        now = self.midnight + 60
+        renderer = aws_page.render_report_page
+        sources = ((ledger.GATE_DEPLOYMENT_FILE, '{"regions": []}'),
+                   (ledger.SPOT_PLACEMENT_FILE, '{"version": 1, "readings": []}'))
+        for name, initial in sources:
+            with self.subTest(name=name):
+                source = self.state / name
+                _ = source.write_text(initial)
+
+                def change_source(directory: Path, report: spend.UtcSpendReport, started: float) -> str:
+                    _ = source.write_text(source.read_text() + '\n')
+                    with (mock.patch.object(run_cost, 'read_deployed_gate_variants', side_effect=AssertionError),
+                          mock.patch.object(ledger, 'read_spot_placement_scores', side_effect=AssertionError)):
+                        return renderer(directory, report, started)
+
+                with mock.patch.object(aws_page, 'render_report_page', side_effect=change_source) as render:
+                    with mock.patch.object(aws_page, 'write_text_atomic', wraps=write_text_atomic) as publish:
+                        _ = self.publish(now)
+                    publish.assert_not_called()
+                self.assertEqual(render.call_count, 3)
+                self.assertEqual(path.read_bytes(), earlier)
+
     def test_row_n04_page_retries_when_a_launch_changes_the_revision(self) -> None:
         self.refresh(self.midnight, '2')
         now = self.midnight + 3600
@@ -1154,7 +1207,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
         with self.subTest(prices='snapshot changes between reads'):
             updated_prices = tuple(replace(price, usd_per_hour=price.usd_per_hour * Decimal('1.5'))
                                    for price in prices)
-            with mock.patch.object(ledger, 'read_spot_prices', side_effect=(tuple(prices), updated_prices)) as read:
+            with mock.patch.object(ledger, 'spot_prices_from', side_effect=(tuple(prices), updated_prices)) as read:
                 updated_source = publish()
             updated_page = cast(aws_page.PageData, payload(updated_source, 'aws-prices-data'))
             updated_gate = updated_page['runs'][0]['prices'][0]['rows'][east_index][column]
@@ -1162,7 +1215,7 @@ class AwsPageGateTimePriceTests(PageCostFixture):
             updated_card = cast(aws_page.TableData, updated_data['table'])
             self.assertEqual(updated_gate, '0.1000')
             self.assertEqual(updated_card['rows'][0][4], updated_gate)
-            read.assert_called_once_with(self.state)
+            self.assertEqual(read.call_count, 1)
 
         values, policy = conf.read(config), conf.read(self.settings)
         with self.subTest(deployment='valid types with a null entry'):

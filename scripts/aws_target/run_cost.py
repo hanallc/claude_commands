@@ -61,11 +61,20 @@ def deployed_gate_variants(deployment: dict[str, object], types: tuple[str, ...]
 def read_deployed_gate_variants(directory: Path, types: tuple[str, ...], home: str) -> tuple[GateLaunchVariant, ...]:
     """Read the local deployment. Return no variants if the deployment is unavailable."""
     try:
-        deployment = ledger.mapping(cast(object, json.loads((directory / 'gate-deployment.json').read_text())))
-        if 'regions' not in deployment:
-            deployment = {**deployment, 'regions': [{**deployment, 'region': deployment.get('region', home)}]}
-        return deployed_gate_variants(deployment, types).variants
+        deployment = ledger.mapping(cast(object, json.loads((directory / ledger.GATE_DEPLOYMENT_FILE).read_text())))
+        return gate_variants_from(deployment, types, home)
     except (OSError, ValueError, TypeError):
+        return ()
+
+
+def gate_variants_from(deployment: dict[str, object], types: tuple[str, ...], home: str) -> tuple[GateLaunchVariant, ...]:
+    if not deployment:
+        return ()
+    if 'regions' not in deployment:
+        deployment = {**deployment, 'regions': [{**deployment, 'region': deployment.get('region', home)}]}
+    try:
+        return deployed_gate_variants(deployment, types).variants
+    except (KeyError, ValueError, TypeError):
         return ()
 
 
@@ -161,6 +170,10 @@ def billed_readings(book: ledger.CostLedger, start: datetime, end: datetime, *,
     """Read bill amounts for the UTC days in [start, end)."""
     readings = (tuple(reading for reading in book.read_bills() if ledger.is_billed_day(reading))
                 if bill_policy is LegacyBillPolicy.LEGACY else book.validated_bills(bill_policy.cutoff))
+    return readings_in_window(readings, start, end)
+
+
+def readings_in_window(readings: Sequence[ledger.ChargeRead], start: datetime, end: datetime) -> list[ledger.ChargeRead]:
     first, following = start.date().isoformat(), end.date().isoformat()
     return [reading for reading in readings if first <= reading.day < following]
 
@@ -316,9 +329,14 @@ def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, ho
 
     A bill without Spot usage for a type counts as zero hours."""
     readings = billed_readings(book, start, end, bill_policy=bill_policy)
+    return day_hours_from(book.read_snapshot(), readings, start, end, home, builder, scope, max_ratio)
+
+
+def day_hours_from(snapshot: ledger.LedgerEvidence, readings: Sequence[ledger.ChargeRead], start: datetime,
+                   end: datetime, home: str, builder: str, scope: SpotHoursScope, max_ratio: Decimal
+                   ) -> dict[DayKey, HoursCheck]:
     read_days = {reading.day for reading in readings}
     bills = bills_from_readings(readings)
-    snapshot = book.read_snapshot()
     boxes = _box_hours(snapshot, start, end, home, builder)
     reserved_by_region: dict[tuple[str, str], Decimal] = defaultdict(Decimal)
     seen_generations: set[int] = set()
@@ -343,9 +361,13 @@ def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, ho
 def hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
                  scope: SpotHoursScope, max_ratio: Decimal, *, bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY) -> dict[tuple[str, str], HoursCheck]:
     """The hours check of each type in sizes and region, summed over the days in [start, end) with a bill."""
+    daily = day_hours_checks(book, start, end, home, builder, scope, max_ratio, bill_policy=bill_policy)
+    return sum_hours_checks(daily, max_ratio)
+
+
+def sum_hours_checks(daily: Mapping[DayKey, HoursCheck], max_ratio: Decimal) -> dict[tuple[str, str], HoursCheck]:
     billed: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
     unbilled: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
-    daily = day_hours_checks(book, start, end, home, builder, scope, max_ratio, bill_policy=bill_policy)
     for (size, region, _day), check in daily.items():
         (unbilled if check.billed_hours is None else billed)[size, region].append(check)
     checks: dict[tuple[str, str], HoursCheck] = {}
@@ -526,11 +548,16 @@ class GateRunPricing:
 def current_zone_prices(directory: Path, now: float, max_age: int) -> dict[tuple[str, str, str], Decimal]:
     """Use the latest current Spot price for each region, type, and zone."""
     try:
-        return {(row.region, row.instance_type, row.zone): row.usd_per_hour
-                for row in sorted(ledger.read_spot_prices(directory), key=lambda row: row.read_at)
-                if 0 <= now - row.read_at <= max_age}
+        return zone_prices_from(ledger.read_spot_prices(directory), now, max_age)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return {}
+
+
+def zone_prices_from(prices: Sequence[ledger.RegionalSpotPrice], now: float, max_age: int
+                     ) -> dict[tuple[str, str, str], Decimal]:
+    return {(row.region, row.instance_type, row.zone): row.usd_per_hour
+            for row in sorted(prices, key=lambda row: row.read_at)
+            if 0 <= now - row.read_at <= max_age}
 
 
 def gate_launch_history(directory: Path, now: float, window_seconds: int) -> tuple[dict[str, object], ...]:
@@ -583,6 +610,19 @@ def read_gate_pricing_inputs(directory: Path, now: int, values: conf.ConfigRead,
     zone_prices = current_zone_prices(directory, now, policy.whole('price_max_age_seconds')) if deployed else {}
     history = read_placement_run_history(directory, now, values, policy, home)
     return GatePricingInputs(deployed, deployed_gate_prices(deployed, zone_prices), history.evidence)
+
+
+def gate_pricing_from(evidence: ledger.SpendEvidenceAt, launches: Sequence[dict[str, object]]) -> GatePricingInputs:
+    policy, values = evidence.account_configuration, evidence.gate_configuration
+    home = evidence.builder_region
+    deployed = gate_variants_from(evidence.gate_deployment, values.words('instance_types'), home)
+    zone_prices = zone_prices_from(evidence.spot_prices, evidence.at, policy.whole('price_max_age_seconds'))
+    end = datetime.fromtimestamp(evidence.at, UTC)
+    start = end - timedelta(days=policy.whole('run_cost_days'))
+    window = max(policy.whole('price_max_age_seconds'), values.whole('capacity_cooldown_seconds'),
+                 policy.whole('run_cost_days') * 86400)
+    rows = tuple(row for row in launches if float(str(row['time'])) >= evidence.at - window)
+    return GatePricingInputs(deployed, deployed_gate_prices(deployed, zone_prices), run_evidence(rows, start, end, home))
 
 
 @dataclass(frozen=True)
@@ -657,7 +697,11 @@ class GateRunHistory:
 
 def read_gate_run_history(book: ledger.CostLedger, start: datetime, end: datetime, home: str) -> GateRunHistory:
     """Read all launch rows to match runs that finish in the window."""
-    rows = book.launches()
+    return gate_run_history_from(book.launches(), start, end, home)
+
+
+def gate_run_history_from(rows: Sequence[dict[str, object]], start: datetime, end: datetime,
+                          home: str) -> GateRunHistory:
     runs = runs_from_rows(rows, start, end, home).runs
     return GateRunHistory(runs, _run_evidence(runs, rows, start, end, home))
 

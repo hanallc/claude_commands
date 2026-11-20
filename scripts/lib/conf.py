@@ -6,7 +6,7 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -161,7 +161,7 @@ class ConfigRead:
 
     file: str | Path
     source: Path
-    settings: dict[str, Setting] | _UnreadableFile
+    settings: Mapping[str, Setting] | _UnreadableFile
     repository_allowed: bool
     stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
 
@@ -171,7 +171,7 @@ class ConfigRead:
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         bad = "<missing>"
 
-        def read_key(settings: dict[str, Setting]) -> tuple[Result, str | None]:
+        def read_key(settings: Mapping[str, Setting]) -> tuple[Result, str | None]:
             nonlocal bad
             try:
                 setting = _setting(settings, key)
@@ -207,7 +207,7 @@ class ConfigRead:
         if warn:
             _key_warning(self.source, key, reason, bad, self.stamp)
         current_limit = ""
-        if isinstance(self.settings, dict):
+        if not isinstance(self.settings, _UnreadableFile):
             current = self.settings.get(self.effective_key(key))
             if current is not None and current.limit.startswith(("# whole:", "# range:", "# one of:")):
                 current_limit = current.limit
@@ -251,7 +251,7 @@ class ConfigRead:
 
     def effective_key(self, key: str) -> str:
         """Return the host override key when the live file has one."""
-        if isinstance(self.settings, dict):
+        if not isinstance(self.settings, _UnreadableFile):
             return effective_key(self.settings, key, host_name=_local_host_name())
         return key
 
@@ -397,13 +397,13 @@ def _local_host_name() -> str:
     return socket.gethostname().partition(".")[0]
 
 
-def effective_key(settings: dict[str, Setting], key: str, *, host_name: str) -> str:
+def effective_key(settings: Mapping[str, Setting], key: str, *, host_name: str) -> str:
     """Select the override for the specified short host name when it exists."""
     candidate = f"{key}.{host_name}"
     return candidate if candidate in settings else key
 
 
-def _setting(settings: dict[str, Setting], key: str) -> Setting:
+def _setting(settings: Mapping[str, Setting], key: str) -> Setting:
     try:
         return settings[effective_key(settings, key, host_name=_local_host_name())]
     except KeyError:
