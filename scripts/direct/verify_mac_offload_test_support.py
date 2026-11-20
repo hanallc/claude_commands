@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from scripts.build_queue import admission_records
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_queue.admission_test_support import (
     PrivateHostEvidence, caller_admission, caller_provider_controls, private_provider_evidence,
@@ -214,10 +214,15 @@ def hold_recorder_exits(timeout: float = TEST_HANG_GUARD_SECS) -> Generator[None
     launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
     start = threading.Thread.start
 
-    def launch_owned(*arguments: object, **options: object) -> subprocess.Popen[bytes]:
-        process = launch(*arguments, **options)
-        children.append(process)
-        return process
+    def launch_owned(args: object, *arguments: object, **options: object) -> subprocess.Popen[bytes]:
+        if isinstance(args, list) and cast(Sequence[object], args)[2:3] == ["hold-event"]:
+            environment = verify_test_environment()
+            environment["BUILDLOG_DIR"] = os.environ["BUILDLOG_DIR"]
+            options["env"] = environment
+            process = launch(args, *arguments, **options)
+            children.append(process)
+            return process
+        return launch(args, *arguments, **options)
 
     def start_owned(thread: threading.Thread) -> None:
         if thread.name != "hold-event-recorder":
@@ -1244,24 +1249,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             ],
         }
         self.environment = {
+            **verify_test_environment(),
             **config_environment(self.root),
-            **{
-                name: value
-                for name, value in os.environ.items()
-                if name
-                not in {
-                    "CODEX_THREAD_ID",
-                    "CODEX_SESSION_ID",
-                    "BUILDLOG_MAC",
-                    "BUILDLOG_MAC_REASON",
-                    "BUILDLOG_LOCAL_REASON",
-                    "BUILDLOG_MAC_S",
-                    "BASH_ENV",
-                    "ENV",
-                }
-                # Fixture calls must not update the outer run or use its folders.
-                and not name.startswith(("BASH_FUNC_", "UNIT_", "GIT_"))
-            },
             "HOME": str(self.home),
             "PATH": stub_build_tool_path(self.bin_directory),
             "RUSTUP_HOME": str(self.root / "rustup"),
@@ -1327,7 +1316,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         _ = (configuration / settings_source.name).write_text("\n".join(settings_lines) + "\n", encoding="utf-8")
         self.environment.update({key: value for key, value in private.items() if key not in ("HOME", "CONF_DIR")})
         seed_interpreter_cache(self.root / "cache")
-        _ = self.environment.pop("CLAUDE_PYTHON", None)
 
     def write_executable(self, path: Path, source: str) -> None:
         # Private tools may start as links; replacing one must never edit its target.
@@ -1346,7 +1334,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
         path = self.runner_state / f"direct-{target}-{verb}.assignment"
         settings = self.root / ("linux.conf" if target == "peer" else "mac settings.conf")
-        with mock.patch.dict(os.environ, self.environment):
+        with mock.patch.dict(os.environ, self.environment, clear=True):
             args = offload.parser().parse_args(["run", "--repo-root", str(self.root),
                 "--package", "sample", "--settings", str(settings), "--target", target,
                 "--verb", verb, "--kind", kind, "--call-id", f"fixture-{os.getpid()}-{target}-{verb}",

@@ -2197,29 +2197,29 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             self.record_removed(ledger, rule, path, deleting)
         self.assertEqual(self.cell_rows(ledger, path), [])
 
-    def test_names_checkpoint_leaves_forbidden_words_judgments_stale_on_the_edited_path(self) -> None:
+    def test_names_checkpoint_leaves_values_judgments_stale_on_the_edited_path(self) -> None:
         names = self.rule("read")
-        forbidden = self.rule("forbidden-words", "tier: C\nfamily: values\ninput_scope: file\n")
+        values = self.rule("file-values", "tier: C\nfamily: values\ninput_scope: file\n")
         path = self.sources[0]
         ledger = self.ledger()
         ledger.set_tip(self.initial_tip, "main")
-        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [names, forbidden])
+        ledger.ticket_add("1", ticket_owner_id("names"), "read", "names", "crates/alpha", [path], [names, values])
         ledger.ticket_assign("1", "main")
         self.assertEqual(ledger.ticket_base("1"), self.initial_tip)
-        # Even a verdict recorded under this ticket is not its family's judgment.
-        for rule in (names, forbidden):
+        # Record the verdict for both families before the edit.
+        for rule in (names, values):
             self.record(rule, path, self.initial_tip, ticket="1")
-        self.write(path, "// A new comment needs its own word check.\npub fn renamed() {}\n")
+        self.write(path, "// The file has a new comment.\npub fn renamed() {}\n")
         checkpoint = self.commit("Names checkpoint adds a comment")
         ledger.ticket_checkpoint("1", checkpoint)
         _ = ledger.ticket_merge("1")
         ledger.set_tip(checkpoint, "main")
         self.assertEqual(self.states(names)[path], "current")
-        self.assertEqual(self.states(forbidden)[path], "stale")
+        self.assertEqual(self.states(values)[path], "stale")
         tickets = style_plan.candidate_tickets(
             self.repo, ledger, style_plan.BusyFiles(berth_board.Board(()), frozenset()), "values",
             base=style_plan.NoUnitBranch())
-        self.assertTrue(any(path in ticket.files and forbidden in ticket.rules for ticket in tickets))
+        self.assertTrue(any(path in ticket.files and values in ticket.rules for ticket in tickets))
 
     def test_structure_checkpoint_requires_every_rule_and_accepts_any_verdict_at_head(self) -> None:
         first = self.rule("structure-first", "tier: D\nfamily: modules\n")

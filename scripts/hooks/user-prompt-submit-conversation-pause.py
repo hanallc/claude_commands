@@ -102,6 +102,16 @@ def main() -> None:
             conversation_pause.scheduled_senders,
             lambda: conversation_pause.read_scheduled_prompts(session_id),
         )
+        now = conversation_pause.now_epoch()
+        if source in (conversation_pause.PromptSource.PEER, conversation_pause.PromptSource.SCHEDULED):
+            try:
+                kept = conversation_pause.keep_native_review_prompt(session_id, prompt, now)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                print(f"review hold: {error}", file=sys.stderr)
+            else:
+                if kept:
+                    print(json.dumps({"decision": "block", "reason": "Kept for the end of the review."}), flush=True)
+                    return
         if source is conversation_pause.PromptSource.SCHEDULED:
             conversation_pause.consume_scheduled_prompt(session_id, prompt)
         # Read the staff pointer so long waits retain the current run.
@@ -122,19 +132,38 @@ def main() -> None:
         if not prompt.strip():
             activity_source = "UnknownPrompt"
         _record_activity(session_id, activity_source, prompt, record)
-        reply = conversation_pause.message_arrived(
-            session_id, source, prompt, conversation_pause.now_epoch(), record=record)
-        if reply is conversation_pause.NoReply.NOTHING:
-            return
-        result: dict[str, object] = {
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": reply.context,
-            },
-        }
-        if isinstance(reply, conversation_pause.ShownToUser):
-            result["systemMessage"] = reply.system_message
-        print(json.dumps(result))
+        reply = conversation_pause.message_arrived(session_id, source, prompt, now, record=record)
+        emitted = False
+
+        def emit(held_messages: str = "") -> None:
+            nonlocal emitted
+            pause_context = "" if reply is conversation_pause.NoReply.NOTHING else reply.context
+            context = "\n\n".join(filter(None, (pause_context, held_messages)))
+            if not context:
+                return
+            result: dict[str, object] = {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
+                },
+            }
+            if isinstance(reply, conversation_pause.ShownToUser):
+                result["systemMessage"] = reply.system_message
+            print(json.dumps(result), flush=True)
+            emitted = True
+
+        from scripts.hooks import review_hold_delivery
+        from scripts.message import review_hold
+
+        try:
+            if source is conversation_pause.PromptSource.TYPED:
+                review_hold.record_user_prompt(session_id, now, emit, record_keys=review_hold_delivery.record_keys)
+            else:
+                review_hold.deliver_if_disabled(session_id, now, emit, record_keys=review_hold_delivery.record_keys)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f"review hold: {error}", file=sys.stderr)
+        if not emitted:
+            emit()
     finally:
         _ = signal.alarm(0)
 

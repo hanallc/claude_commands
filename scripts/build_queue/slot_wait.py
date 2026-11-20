@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import subprocess
 from threading import Thread
 
@@ -19,6 +20,8 @@ from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RAW_ID, RE
                                      SHORT_OWNER_STEPS, VERIFY_VERBS, OtherCommand, StepJob, StepNames, VerifyCommand, command_job,
                                      command_script, current_command_job, is_recorded_step, queue_identifier, script_file, verify_command)
 from scripts.build_queue import admission_wire as wire
+from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_CALL_VERBS,
+                                                GateJobNotRecorded, NotVerifyCall, VerifyCall, VerifyStep)
 from scripts.message.owner_role import OwnerRole
 
 
@@ -145,12 +148,15 @@ class SlotCaller:
     work: str
 
     @cached_property
-    def step(self) -> QueueRowName | NoNamedStep:
-        """Read the command only when the slot must wait."""
+    def named_job(self) -> tuple[QueueRowName | NoNamedStep, StepJob | GateJobNotRecorded, VerifyStep]:
+        """Classify the command when the slot must wait."""
         if self.command:
-            return command_slot_name(self.command, RECORDED_STEP_NAMES, job_reader=current_command_job)
-        return recorded_step(self.work, RECORDED_STEP_NAMES)
+            return command_slot_job(self.command, RECORDED_STEP_NAMES, job_reader=current_command_job)
+        return recorded_step(self.work, RECORDED_STEP_NAMES), GATE_JOB_NOT_RECORDED, NotVerifyCall()
 
+    @property
+    def step(self) -> QueueRowName | NoNamedStep:
+        return self.named_job[0]
 
 SLOT_CALLER: ContextVar[SlotCaller | None] = ContextVar("slot_caller", default=None)
 
@@ -227,6 +233,18 @@ printf '%s' "$VERIFY_PACKAGE"
 """
 
 
+@cache
+def verify_value_options() -> frozenset[str]:
+    """Read the options that consume two words in the Verify parser."""
+    try:
+        parser = verify_package_parser()
+    except (OSError, AssertionError):
+        return frozenset()
+    cases = re.finditer(r"^[ \t]+(--[\w-]+(?:\|--[\w-]+)*)\)(.*?);;", parser, re.MULTILINE | re.DOTALL)
+    return frozenset(flag for case in cases if re.search(r"\bshift[ \t]+2\b", case.group(2))
+                     for flag in case.group(1).split("|"))
+
+
 @lru_cache(maxsize=128)
 def verify_package(step: str, arguments: tuple[str, ...]) -> str:
     """Pass literal arguments to the verify parser without starting a build."""
@@ -239,10 +257,10 @@ def verify_package(step: str, arguments: tuple[str, ...]) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
-def command_slot_name(command: Sequence[str], names: StepNames, *,
-                      job_reader: Callable[[Sequence[str]], StepJob | OtherCommand] = command_job
-                      ) -> QueueRowName | NoNamedStep:
-    """Name the first build job, or the first script in the command."""
+def command_slot_job(command: Sequence[str], names: StepNames, *,
+                     job_reader: Callable[[Sequence[str]], StepJob | OtherCommand] = command_job,
+                     ) -> tuple[QueueRowName | NoNamedStep, StepJob | GateJobNotRecorded, VerifyStep]:
+    """Keep the gate job or Verify call with the step name."""
     script = ""
     try:
         for argv in command_programs(command):
@@ -250,18 +268,21 @@ def command_slot_name(command: Sequence[str], names: StepNames, *,
             verify = verify_command(argv)
             if isinstance(job, StepJob):
                 if not isinstance(verify, VerifyCommand):
-                    return QueueRowName.step(job.step, "", names)
+                    return QueueRowName.step(job.step, "", names), job, NotVerifyCall()
                 if job.step in VERIFY_VERBS:
                     arguments = verify.arguments
                     if arguments[:1] == ("--session-dir",):
                         arguments = arguments[2:]
                     package = verify_package(job.step, arguments[1:])
-                    return QueueRowName.step(job.step, package, names)
+                    # The slot waits for the whole call.
+                    facts = (VerifyCall(job.step, shlex.join(("verify", *arguments)), 1, 1)
+                             if job.step in VERIFY_CALL_VERBS else NotVerifyCall())
+                    return QueueRowName.step(job.step, package, names), GATE_JOB_NOT_RECORDED, facts
             if not script:
                 script = command_script(argv)
     except (ValueError, RecursionError):
         pass
-    return QueueRowName.script(script) if script else NoNamedStep.FOUND
+    return (QueueRowName.script(script) if script else NoNamedStep.FOUND), GATE_JOB_NOT_RECORDED, NotVerifyCall()
 
 
 class SlotWaitExpired(RuntimeError):
@@ -310,9 +331,9 @@ def wait_for_slot(repository: str, machine: str, root: Path, maximum: int, *, ep
         session = os.environ.get("CLAUDE_CODE_SESSION_ID", "") or os.environ.get("CODEX_THREAD_ID", "")
         identity = wire.Identity(session, showrunner, work, "")
     else:
-        step = caller.step
+        step, job, verify = caller.named_job
         identity = wire.Identity(caller.staff_id, caller.showrunner,
-                                 step if isinstance(step, QueueRowName) else "", str(caller.source))
+                                 step if isinstance(step, QueueRowName) else "", str(caller.source), job=job, verify=verify)
     del unit, purpose
     request = wire.RepositorySlotRequest(episode, wire.Owner(pid, start), since,
         repository, machine, str(root), maximum, deadline, identity)

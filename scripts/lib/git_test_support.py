@@ -8,12 +8,19 @@ from pathlib import Path
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
+_FIXTURE_NAME = "Test"
+_FIXTURE_EMAIL = "test@example.invalid"
+
 
 def write_fixture_git_config(directory: Path) -> Path:
     """Write a private Git configuration and return its path."""
     # Disable detached maintenance so Git cannot remove objects during snapshot copies.
     path = directory / "git-config"
-    _ = path.write_text("[maintenance]\n\tauto = false\n", encoding="utf-8")
+    _ = path.write_text(
+        f"[user]\n\tname = {_FIXTURE_NAME}\n\temail = {_FIXTURE_EMAIL}\n"
+        + "[maintenance]\n\tauto = false\n",
+        encoding="utf-8",
+    )
     return path
 
 
@@ -29,7 +36,7 @@ def commit_repository(repository: Path, message: str, *paths: str, allow_empty: 
     """Stage selected paths (all by default), commit, and return the new HEAD."""
     for arguments in (
         ["add", "--", *(paths or (".",))],
-        ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        ["-c", f"user.name={_FIXTURE_NAME}", "-c", f"user.email={_FIXTURE_EMAIL}",
          "-c", "commit.gpgsign=false", "commit", *(["--allow-empty"] if allow_empty else []), "-qm", message],
     ):
         _ = subprocess.run(["git", "-C", str(repository), *arguments], check=True,

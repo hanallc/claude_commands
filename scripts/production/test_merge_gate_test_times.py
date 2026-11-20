@@ -89,11 +89,11 @@ class MergeGateTestTimesTests(MergeGateFixture):
                           environment: dict[str, str], log: Path, *,
                           kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE
                           ) -> merge_gate.RunningGateJob:
+            self.assertIs(kind, merge_gate.GateJobKind.TEST_MODULE)
             job = start(suite, path, argv, repo, environment, log, kind=kind)
             # Supply a measured peak to test its path into the record.
             job.peak_memory_mib = 12.5
-            if kind is merge_gate.GateJobKind.TEST_MODULE:
-                launches.append((argv, log.parent, environment))
+            launches.append((argv, log.parent, environment))
             return job
 
         def observe_finish(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
@@ -127,7 +127,6 @@ class MergeGateTestTimesTests(MergeGateFixture):
         self.assertCountEqual(modules, [
             ("hooks", "test_first.py", 1), ("hooks", "test_first.py", 2),
             ("notify", "test_first.py", 1), ("direct", "test_first.py", 1),
-            (*gate_record.TYPE_CHECK_JOB, 1),
         ])
         first = modules[("hooks", "test_first.py", 1)]
         retried = modules[("hooks", "test_first.py", 2)]
@@ -185,14 +184,14 @@ class MergeGateTestTimesTests(MergeGateFixture):
         record = self.only_record()
         self.assertEqual((record["status"], record["aborted"]), (1, False))
         self.assertEqual([(suite["suite"], suite["status"]) for suite in record["suites"]], [("hooks", 1)])
-        modules = [row for row in record["modules"] if (row["suite"], row["module"]) != gate_record.TYPE_CHECK_JOB]
+        modules = record["modules"]
         self.assertEqual([row["attempt"] for row in modules], [1, 2])
         for row in modules:
             self.assertNotEqual(row["status"], 0)
             self.assertIn("test-times.json", row["times_missing"])
             self.assertEqual((row["restart"], row["tests_run"], row["tests_s"], row["tests"]), ("", 0, 0.0, []))
 
-    def test_full_and_reused_runs_keep_the_type_job_without_missing_times(self) -> None:
+    def test_full_and_reused_runs_record_no_type_job(self) -> None:
         first = self.run_gate("--tests-only", "--full")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         full = self.only_record()
@@ -208,17 +207,12 @@ class MergeGateTestTimesTests(MergeGateFixture):
                          ("reused", "", "tests-only", 0))
         self.assertEqual(reused["suites"], [])
         self.assertEqual(self.module_events(), [])
-        self.assertEqual(len(reused["modules"]), 1)
-        for record in (full, reused):
-            types, = [row for row in record["modules"] if (row["suite"], row["module"]) == gate_record.TYPE_CHECK_JOB]
-            self.assertEqual((types["attempt"], types["status"], types["restart"], types["times_missing"]), (1, 0, "", ""))
-            self.assertEqual((types["tests"], types["tests_run"], types["failures"], types["errors"], types["skipped"],
-                              types["tests_s"]), ([], 0, 0, 0, 0, 0))
+        self.assertEqual(reused["modules"], [])
+        self.assertTrue(full["modules"])
+        self.assertFalse(any((row["suite"], row["module"]) == gate_record.TYPE_CHECK_JOB
+                             for row in full["modules"]))
 
     def test_record_write_and_config_failures_keep_the_output_and_verdict(self) -> None:
-        # Each compared run uses the same completed type environment.
-        with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
-            _ = merge_gate.typecheck_python()
         with mock.patch.object(merge_gate, "process_memory_mib", return_value={os.getpid(): 16.0}), \
                 mock.patch.object(merge_gate, "one_minute_load", return_value=0.0):
             # A first passing run gives each compared run the same time limit history.

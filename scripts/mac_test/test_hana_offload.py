@@ -33,6 +33,8 @@ from scripts.buildlog import record, store, treekey
 from scripts.copies import copies
 from scripts.direct import runner_result
 from scripts.lib import conf, process_start
+from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.shell_test_support import refusing_bash_startup
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, offload
 
@@ -135,12 +137,15 @@ source_forbidden_paths=*.key
 
     def test_accepted_compiler_result_uses_the_existing_result_adapter_after_settlement(self) -> None:
         root = self.root
-        for compiler_status, problem, fault in (
-            (0, '', ''), (0, 'release', ''), (7, 'release', ''), (7, 'fence', ''),
-            (0, '', 'the Hana result'), (7, 'fence', 'the Hana result'), (7, '', 'the Hana attempt charge'),
-            (7, 'release', 'the placement report'), (0, '', 'the attempt'),
+        for compiler_status, problem, fault, stderr_error in (
+            (0, '', '', None), (0, 'release', '', None), (7, 'release', '', None), (7, 'fence', '', None),
+            (0, '', 'the Hana result', None), (7, 'fence', 'the Hana result', None),
+            (7, '', 'the Hana attempt charge', None), (7, 'release', 'the placement report', None),
+            (0, '', 'the attempt', None),
+            (0, '', 'the Hana result', OSError), (7, 'release', 'the Hana result', OSError),
+            (7, 'release', 'the placement report', OSError), (7, '', 'the Hana result', ValueError),
         ):
-            with (self.subTest(compiler_status=compiler_status, problem=problem, fault=fault),
+            with (self.subTest(compiler_status=compiler_status, problem=problem, fault=fault, stderr_error=stderr_error),
                   tempfile.TemporaryDirectory(dir=root) as folder):
                 self.root = Path(folder)
                 self.controller = offload.ProcessController()
@@ -149,9 +154,11 @@ source_forbidden_paths=*.key
                 self.lifecycle = box.HanaController(self.root, self.root / 'account.conf', self.transport.settings,
                     cast(box.HanaProvider, cast(object, self.fixture.objects)))
                 self.output, self.error = BytesIO(), BytesIO()
-                self.check_accepted_compiler_result(compiler_status, problem=problem, fault=fault)
+                self.check_accepted_compiler_result(compiler_status, problem=problem, fault=fault,
+                                                    stderr_error=stderr_error)
 
-    def check_accepted_compiler_result(self, compiler_status: int, *, problem: str, fault: str) -> None:
+    def check_accepted_compiler_result(self, compiler_status: int, *, problem: str, fault: str,
+                                       stderr_error: type[Exception] | None) -> None:
         completed = self.fixture.command_result(compiler_status)
         result = offload.ResultFile(self.root / 'runner.result')
         request = replace(self.request, result=result)
@@ -177,10 +184,15 @@ source_forbidden_paths=*.key
             if name == fault:
                 raise OSError('The fixture record write failed')
 
+        def write_diagnostic(message: str) -> None:
+            if stderr_error is not None and message.startswith('offload: '):
+                raise stderr_error('The fixture diagnostic write failed')
+
         def run(*_arguments: object) -> offload.MacOffloadResult:
             return self.run_claimed()
 
         with (self.context(),
+              mock.patch.dict(os.environ, {'BUILDLOG_DIR': str(self.root / 'buildlog')}),
               mock.patch.object(self.fixture.objects, 'execution_result', return_value=hana_result.encode_result(completed)),
               mock.patch.object(hana, 'release_assigned', return_value=release_result) as release,
               mock.patch.object(record, 'publish_hana_result', side_effect=partial(write_record, 'the Hana result')),
@@ -191,7 +203,7 @@ source_forbidden_paths=*.key
               mock.patch.object(time, 'monotonic', side_effect=lambda: clock),
               mock.patch.object(time, 'sleep', side_effect=advance),
               mock.patch.object(sys, 'argv', argv),
-              mock.patch.object(sys.stderr, 'write') as stderr,
+              mock.patch.object(sys.stderr, 'write', side_effect=write_diagnostic) as stderr,
               mock.patch.object(offload, 'request_from_arguments', return_value=request),
               mock.patch.object(offload, 'run_offload', side_effect=run),
               mock.patch.object(offload, 'ProcessController', return_value=self.controller),
@@ -220,7 +232,9 @@ source_forbidden_paths=*.key
             self.assertEqual(sent.path, placement.DispatchPathSettled())
         if fault:
             messages.append(f'offload: Cannot record {fault} (OSError).')
-        self.assertEqual(stderr.call_args_list, [call for message in messages for call in (mock.call(message), mock.call('\n'))])
+        expected_writes = ([mock.call(message) for message in messages] if stderr_error is not None
+                           else [call for message in messages for call in (mock.call(message), mock.call('\n'))])
+        self.assertEqual(stderr.call_args_list, expected_writes)
         self.assertIsInstance(self.controller.pending,
                               offload.PendingHanaOperation if cleanup_pending else offload.SettledDispatchOperations)
         evidence = self.controller.attempt_evidence
@@ -231,8 +245,11 @@ source_forbidden_paths=*.key
 
     def finish_claimed(self, outcome: offload.MacOffloadResult,
                        result: offload.ResultDestination = offload.NO_RESULT_FILE) -> int:
+        request = replace(self.request, result=result)
+        status = offload.publish_offload_result(self.controller, request, outcome)
         with (mock.patch.object(offload, 'report_placement_result'), mock.patch.object(offload, 'persist_attempt')):
-            return offload.finish_offload(self.controller, replace(self.request, result=result), outcome, time.monotonic())
+            offload.report_offload_completion(self.controller, request, outcome, time.monotonic())
+        return status
 
     def test_buildlog_write_failure_preserves_the_accepted_exit_status(self) -> None:
         with (self.context(),
@@ -346,7 +363,7 @@ route_test
         command = 'VERIFY_FIXTURE=("$@")\n' + ''.join(functions) + stubs
         return subprocess.run(['bash', '-c', command, 'verify.sh', sys.executable,
             str(scripts / 'direct' / 'runner_result.py'), str(result), str(status)],
-            cwd=self.root, check=False, capture_output=True, text=True, timeout=5)
+            cwd=self.root, env=verify_test_environment(), check=False, capture_output=True, text=True, timeout=5)
 
     def establish_pinned_hana_assignment(self) -> None:
         install_hana_spending_settings(self.transport.settings)
@@ -365,10 +382,15 @@ route_test
 
     def test_pinned_verify_refuses_the_same_way_during_setup(self) -> None:
         self.establish_pinned_hana_assignment()
+        startup = refusing_bash_startup(self.root)
         with hana_command_lock(self.lifecycle.directory) as access:
             self.assertIs(access, HanaCommandAccess.ACQUIRED)
-            result = self.pinned_verify()
-        self.assertEqual((result.returncode, result.stderr), (2, 'verify.sh: target hana-aws refused: Hana is busy\n'))
+            for bash_env in ('', str(startup)):
+                with (self.subTest(caller_startup=bool(bash_env)),
+                      mock.patch.dict(os.environ, {'BASH_ENV': bash_env})):
+                    result = self.pinned_verify()
+                    self.assertEqual((result.returncode, result.stderr),
+                                     (2, 'verify.sh: target hana-aws refused: Hana is busy\n'))
 
     def test_setup_hold_refuses_without_a_provider_claim(self) -> None:
         with self.context(), mock.patch.object(hana, 'claim_assigned', return_value=hana.HanaClaimResourcesHeld()), \
@@ -903,7 +925,8 @@ route_test
 
             with mock.patch.object(hana, 'release_assigned', side_effect=release):
                 outcome = self.run_claimed()
-            self.assertEqual(offload.finish_offload(self.controller, self.request, outcome, time.monotonic()), 0)
+            self.assertEqual(offload.publish_offload_result(self.controller, self.request, outcome), 0)
+            offload.report_offload_completion(self.controller, self.request, outcome, time.monotonic())
             replay = execution.replay_accepted_result(self.root, self.fixture.request)
         self.assertIsInstance(outcome, offload.PassedOnTarget)
         sent = cast(wire.ExecutionReport, report.call_args.args[0])
