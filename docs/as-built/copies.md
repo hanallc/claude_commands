@@ -123,6 +123,8 @@ Cleanup holds the lock and checks the identities of those two files before it re
 Recovery leaves the files if the clone is already absent when recovery starts.
 
 The borrow check keeps sources that live Git alternates reference.
+It keeps a potential source while a registered copy has no published Git checkout.
+An idle copy with an ended task can leave even if setup did not publish a checkout.
 It also keeps sources when it cannot read a copy record.
 It checks the copy folders in the registry and the adopted copies in the holds file.
 It skips an unregistered folder if the folder's parent is directly under the copies root and contains `.git`.

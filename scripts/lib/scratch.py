@@ -72,7 +72,6 @@ except FileNotFoundError:
     pass
 
 import argparse
-from codecs import escape_decode
 import fcntl
 import json
 import os
@@ -986,7 +985,8 @@ def registered_copy_paths() -> Iterator[Path]:
         record = task_of(path)
         if (isinstance(record, copy_record.UnreadableRecord)
                 or isinstance(record, copy_record.Registered)
-                and (os.path.lexists(path / ".git") or (path / "HEAD").is_file())):
+                and (record.fields.get("test_hana_clone") is True
+                     or os.path.lexists(path / ".git") or (path / "HEAD").is_file())):
             paths.add(path)
     yield from sorted(paths)
 
@@ -1020,6 +1020,40 @@ def _unregistered_borrow_candidate(path: Path) -> UnregisteredBorrowCandidate:
     return UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER
 
 
+_ALTERNATE_ESCAPES = {
+    b"a": b"\a", b"b": b"\b", b"t": b"\t", b"n": b"\n", b"v": b"\v",
+    b"f": b"\f", b"r": b"\r", b"\\": b"\\", b'"': b'"',
+}
+_ALTERNATE_OCTAL = re.compile(rb"[0-3][0-7]{2}")
+
+
+def _unquote_alternate(entry: bytes, alternates: Path) -> bytes:
+    """Decode a quoted Git alternate path."""
+    decoded = bytearray()
+    index = 1
+    while index < len(entry):
+        byte = entry[index]
+        index += 1
+        if byte == ord('"'):
+            if not entry[index:].strip(b" \t"):
+                return bytes(decoded)
+            break
+        if byte != ord("\\"):
+            decoded.append(byte)
+            continue
+        escape = entry[index:index + 1]
+        if escape in _ALTERNATE_ESCAPES:
+            decoded.extend(_ALTERNATE_ESCAPES[escape])
+            index += 1
+            continue
+        octal = entry[index:index + 3]
+        if not _ALTERNATE_OCTAL.fullmatch(octal):
+            break
+        decoded.append(int(octal, 8))
+        index += 3
+    raise ValueError(f"{alternates}: invalid quoted alternate path")
+
+
 def object_alternates(objects: Path) -> Iterator[Path]:
     """Read the paths in the live alternates file."""
     alternates = objects / "info/alternates"
@@ -1038,8 +1072,8 @@ def object_alternates(objects: Path) -> Iterator[Path]:
             entry = line.removesuffix(b"\n")
             if not entry or entry.startswith(b"#"):
                 continue
-            if entry.startswith(b'"') and entry.endswith(b'"'):
-                entry, _ = escape_decode(entry[1:-1])
+            if entry.startswith(b'"'):
+                entry = _unquote_alternate(entry, alternates)
             if not entry or b"\0" in entry:
                 raise ValueError(f"{alternates}: invalid alternate path")
             yield objects / os.fsdecode(entry)
@@ -1054,7 +1088,7 @@ def checkout_storage(checkout: Path) -> tuple[Path, ...]:
     except git_files.NotACheckout:
         objects = checkout / "objects"
         if (checkout / "HEAD").is_file() and objects.is_dir():
-            return tuple(object_alternates(objects))
+            return (objects, *object_alternates(objects))
         return ()
     objects = git.common_dir / "objects"
     return (git.git_dir, objects, *object_alternates(objects))
@@ -1071,6 +1105,7 @@ def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | 
     protection: Live | Ended | Unknown = Ended("no copy borrows from it")
     try:
         folder = path.resolve()
+        copies_root = copy_record.copies_root()
         children = set(registered_copy_paths())
         children.update(candidate.path for candidate in folders(scratch_settings=scratch_settings))
         for child in sorted(children):
@@ -1081,7 +1116,8 @@ def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | 
             if stat.S_ISLNK(mode):
                 protection = Unknown(f"{child}: cannot check borrowed objects through a link")
                 break
-            if child.resolve() == folder:
+            checkout = child.resolve()
+            if checkout == folder:
                 continue
             other = task_of(child, scratch_settings=scratch_settings)
             if isinstance(other, copy_record.NotRegistered):
@@ -1093,7 +1129,19 @@ def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | 
                 protection = Unknown(other.reason + "; cannot rule out borrowed objects")
                 break
             try:
-                borrowed = storage_in_folder(checkout_storage(child), folder)
+                storage = checkout_storage(child)
+                if not storage and (checkout.parent.parent == copies_root
+                                    or other.fields.get("test_hana_clone") is True):
+                    if task_has_end_evidence(other) or isinstance(task_end(other.task), Ended):
+                        with collector_lease(child, wait=False) as free, busy_locks(child, create=False) as idle:
+                            if free and idle:
+                                storage = checkout_storage(child)
+                                if not storage:
+                                    continue
+                    if not storage:
+                        protection = Unknown(f"{child}: copy setup has no checkout yet")
+                        break
+                borrowed = storage_in_folder(storage, folder)
             except (OSError, ValueError, RuntimeError) as error:
                 protection = Unknown(f"{child}: cannot check borrowed objects: {error}")
                 break

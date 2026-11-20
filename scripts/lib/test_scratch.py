@@ -2296,6 +2296,41 @@ print(scratch.target('gate:proof', 'tree', False))
                 alternates.unlink()
                 self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
 
+        with self.subTest(borrower="setup"), tempfile.TemporaryDirectory(dir=source.parent) as directory:
+            borrower = Path(directory)
+            scratch.register_copy(borrower, task="gate:borrower", owner_unit="maker", source_path=str(source),
+                                  source_commit="a" * 40, copy_commit="", target_mode="none",
+                                  seed_source="", borrows_from=str(source / ".git"))
+            self.assertEqual(scratch.record_lifetime(source, time.time()),
+                             scratch.Unknown(f"{borrower}: copy setup has no checkout yet"))
+            self.assertEqual(scratch.end("gate:borrower"), [borrower])
+            self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
+
+        with tempfile.TemporaryDirectory(dir=source.parent) as directory:
+            borrower = Path(directory)
+            self.git(borrower, "init", "-q")
+            scratch.atomic_record(borrower / copy_record.RECORD, {"task": "gate:borrower"})
+            objects = borrower / ".git/objects"
+            alternates = objects / "info/alternates"
+            relative = os.fsencode(os.path.relpath(source / ".git/objects", objects))
+            quoted = b'"' + relative + b'"'
+            for name, entry, valid in (
+                ("octal", rb'"\056' + relative[1:] + b'"', True),
+                ("trailing spaces", quoted + b"  \t", True),
+                ("bad tail", quoted + b" other", False),
+                ("bad escape", rb'"\x2e' + relative[1:] + b'"', False),
+            ):
+                with self.subTest(alternate=name):
+                    _ = alternates.write_bytes(entry + b"\n")
+                    if valid:
+                        self.assertEqual(scratch.record_lifetime(source, time.time()),
+                                         scratch.Live(f"borrowed: {borrower} still uses its git objects"))
+                    else:
+                        with self.assertRaisesRegex(ValueError, "invalid quoted alternate path"):
+                            _ = tuple(scratch.object_alternates(objects))
+                        reason = f"{borrower}: cannot check borrowed objects: {alternates}: invalid quoted alternate path"
+                        self.assertEqual(scratch.record_lifetime(source, time.time()), scratch.Unknown(reason))
+
     def test_outside_checkout_does_not_inspect_the_copies_root(self) -> None:
         copies = self.base / "unrelated-copies"
         resolve = Path.resolve
