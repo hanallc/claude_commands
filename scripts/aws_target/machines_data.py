@@ -6,7 +6,8 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
+from fractions import Fraction
 import heapq
 from pathlib import Path
 import re
@@ -101,6 +102,21 @@ class MachineStep:
     limits: tuple[MachineLimit, ...]
 
 
+@dataclass(frozen=True, order=True)
+class CostRatioCutover:
+    ratio: Fraction
+    exclusive: bool = False
+
+    def includes(self, ratio: Fraction) -> bool:
+        return ratio > self.ratio or (ratio == self.ratio and not self.exclusive)
+
+
+@dataclass(frozen=True)
+class CostRatioStep:
+    start: CostRatioCutover
+    extra_usd_per_month: Decimal
+
+
 @dataclass(frozen=True)
 class MeasuredWorkload:
     name: str
@@ -114,6 +130,7 @@ class MeasuredWorkload:
     live_ratio: Decimal
     live_extra_usd_per_month: Decimal
     steps: tuple[MachineStep, ...]
+    cost_steps: tuple[CostRatioStep, ...]
     assumptions: tuple[str, ...]
 
     @property
@@ -152,6 +169,7 @@ class AllJobsProjection:
     live_ratio: Decimal
     live_extra_usd_per_month: Decimal
     steps: tuple[AllJobsStep, ...]
+    cost_steps: tuple[CostRatioStep, ...]
     assumption: str
 
 
@@ -200,8 +218,21 @@ def _sum_jobs(jobs: Sequence[MeasuredWorkload]) -> AllJobsProjection:
         steps.append(AllJobsStep(limits[0].ratio, limits[-1].ratio, added, extra, hours,
                                  extra / hours if hours else NoHoursSaved(), limits))
     live_extra = sum((job.live_extra_usd_per_month for job in jobs), Decimal(0))
-    return AllJobsProjection(jobs[0].live_ratio, live_extra, tuple(steps),
+    return AllJobsProjection(jobs[0].live_ratio, live_extra, tuple(steps), _sum_cost_steps(jobs),
         'Each job uses the full quota in its estimate, so the total hours saved are an upper estimate.')
+
+
+def _sum_cost_steps(jobs: Sequence[MeasuredWorkload]) -> tuple[CostRatioStep, ...]:
+    changes: dict[CostRatioCutover, list[tuple[int, Decimal]]] = defaultdict(list)
+    for index, job in enumerate(jobs):
+        for step in job.cost_steps:
+            changes[step.start].append((index, step.extra_usd_per_month))
+    active: dict[int, Decimal] = {}
+    steps: list[CostRatioStep] = []
+    for start in sorted(changes):
+        active.update(changes[start])
+        steps.append(CostRatioStep(start, sum(active.values(), Decimal(0))))
+    return tuple(steps)
 
 
 @dataclass(frozen=True)
@@ -310,6 +341,31 @@ def _requests(rows: Sequence[dict[str, object]], home: str, start: datetime,
     return launched, refused
 
 
+@dataclass(frozen=True)
+class _RunAllocation:
+    faster_shares: tuple[MachineRunShare, ...]
+    extra_usd_per_run: Decimal
+    seconds_saved_per_run: Decimal
+    reference_share: Decimal
+
+
+def _allocate(faster: Sequence[cloud_gate.GateRankedChoice],
+              choices: dict[ledger.GateRateCandidate, MachineChoice], base: Decimal) -> _RunAllocation:
+    shares: list[MachineRunShare] = []
+    extra = saved = Decimal(0)
+    left = Decimal(1)
+    for row in faster:
+        assert isinstance(row.decision, cloud_gate.FasterWithinRatio)
+        assert isinstance(row.estimate, run_cost.GatePlacementEstimate)
+        machine = ledger.GateRateCandidate(row.variant.instance_type, row.variant.region)
+        share = left * choices[machine].free_share
+        shares.append(MachineRunShare(machine, share))
+        left -= share
+        extra += share * (row.estimate.aws_spend_usd - base)
+        saved += share * row.decision.saved_seconds
+    return _RunAllocation(tuple(shares), extra, saved, left)
+
+
 def _steps(rows: Sequence[cloud_gate.GateRankedChoice], types: tuple[str, ...], ratios: Sequence[Decimal],
            reference: cloud_gate.GateRankedChoice, choices: dict[ledger.GateRateCandidate, MachineChoice],
            monthly_checks: Decimal) -> tuple[MachineStep, ...]:
@@ -319,21 +375,10 @@ def _steps(rows: Sequence[cloud_gate.GateRankedChoice], types: tuple[str, ...], 
     allowed_before: set[ledger.GateRateCandidate] = set()
     steps: list[MachineStep] = []
     for ratio in ratios:
-        allowed: set[ledger.GateRateCandidate] = set()
-        shares: list[MachineRunShare] = []
-        extra = saved = Decimal(0)
-        left = Decimal(1)
-        for row in cloud_gate.rank_gate_choices(rows, types, ratio).choices:
-            if not isinstance(row.decision, cloud_gate.FasterWithinRatio):
-                continue
-            assert isinstance(row.estimate, run_cost.GatePlacementEstimate)
-            machine = ledger.GateRateCandidate(row.variant.instance_type, row.variant.region)
-            allowed.add(machine)
-            share = left * choices[machine].free_share
-            shares.append(MachineRunShare(machine, share))
-            left -= share
-            extra += share * (row.estimate.aws_spend_usd - base)
-            saved += share * row.decision.saved_seconds
+        faster = tuple(row for row in cloud_gate.rank_gate_choices(rows, types, ratio).choices
+                       if isinstance(row.decision, cloud_gate.FasterWithinRatio))
+        allocation = _allocate(faster, choices, base)
+        allowed = {row.machine for row in allocation.faster_shares}
         limit = MachineLimit(ratio, (ratio - _RULE_OFF) * base * monthly_checks)
         if steps and allowed == allowed_before:
             previous = steps[-1]
@@ -341,13 +386,44 @@ def _steps(rows: Sequence[cloud_gate.GateRankedChoice], types: tuple[str, ...], 
                 previous.extra_usd_per_month, previous.hours_saved_per_month, previous.usd_per_hour_saved,
                 (*previous.limits, limit))
             continue
-        added = tuple(row.machine for row in shares if row.machine not in allowed_before)
-        shares.append(MachineRunShare(reference_machine, left))
-        monthly_extra = extra * monthly_checks
-        monthly_saved = saved * monthly_checks / _HOURS_IN_SECONDS
-        steps.append(MachineStep(ratio, ratio, added, tuple(shares), monthly_extra, monthly_saved,
+        added = tuple(row.machine for row in allocation.faster_shares if row.machine not in allowed_before)
+        shares = (*allocation.faster_shares, MachineRunShare(reference_machine, allocation.reference_share))
+        monthly_extra = allocation.extra_usd_per_run * monthly_checks
+        monthly_saved = allocation.seconds_saved_per_run * monthly_checks / _HOURS_IN_SECONDS
+        steps.append(MachineStep(ratio, ratio, added, shares, monthly_extra, monthly_saved,
             monthly_extra / monthly_saved if monthly_saved else NoHoursSaved(), (limit,)))
         allowed_before = allowed
+    return tuple(steps)
+
+
+def _cost_cutover(price: Decimal, base: Decimal) -> CostRatioCutover:
+    """Find where the gate's rounded product first reaches this price."""
+    previous = price.next_minus()
+    with localcontext() as context:
+        context.prec += 2
+        midpoint = (price + previous) / 2
+    return CostRatioCutover(Fraction(midpoint) / Fraction(base), exclusive=+midpoint < price)
+
+
+def _cost_steps(rows: Sequence[cloud_gate.GateRankedChoice], types: tuple[str, ...],
+                choices: dict[ledger.GateRateCandidate, MachineChoice], base: Decimal,
+                monthly_checks: Decimal) -> tuple[CostRatioStep, ...]:
+    off = CostRatioCutover(Fraction(1))
+    steps = [CostRatioStep(off, Decimal(0))]
+    if not base:
+        return tuple(steps)
+    highest = max(row.estimate.aws_spend_usd for row in rows if isinstance(row.estimate, run_cost.GatePlacementEstimate))
+    ranking = cloud_gate.rank_gate_choices(rows, types, (highest / base).next_plus())
+    candidates: list[tuple[CostRatioCutover, cloud_gate.GateRankedChoice]] = []
+    for row in ranking.choices:
+        if isinstance(row.decision, cloud_gate.FasterWithinRatio):
+            assert isinstance(row.estimate, run_cost.GatePlacementEstimate)
+            start = max(off, _cost_cutover(row.estimate.aws_spend_usd, base))
+            candidates.append((start, row))
+    for start in sorted({start for start, _ in candidates} - {off}):
+        faster = tuple(row for cutover, row in candidates if cutover <= start)
+        allocation = _allocate(faster, choices, base)
+        steps.append(CostRatioStep(start, allocation.extra_usd_per_run * monthly_checks))
     return tuple(steps)
 
 
@@ -441,15 +517,14 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
     assert isinstance(reference.estimate, run_cost.GatePlacementEstimate)
     monthly_checks = Decimal(checks * _DAYS_PER_WEEK * _WEEKS_PER_YEAR) / (_MONTHS_PER_YEAR * (end - start).days)
     steps = _steps(ranked_rows, types, ratios, reference, choices, monthly_checks)
+    cost_steps = _cost_steps(ranked_rows, types, choices, reference.estimate.aws_spend_usd, monthly_checks)
     live_ratio = gate.value('faster_box_max_cost_ratio', conf.decimal)
-    live_extra = next((step.extra_usd_per_month for step in steps if any(
-        limit.ratio == live_ratio for limit in step.limits)), None)
-    if live_extra is None:
-        live_extra = _steps(ranked_rows, types, (live_ratio,), reference, choices, monthly_checks)[0].extra_usd_per_month
+    live = Fraction(live_ratio)
+    live_extra = next(step.extra_usd_per_month for step in reversed(cost_steps) if step.start.includes(live))
     return MeasuredWorkload(name, mode, tuple(choices.values()),
         ledger.GateRateCandidate(reference.variant.instance_type, reference.variant.region), checks,
         monthly_checks, reference.estimate.aws_spend_usd * monthly_checks, concurrency,
-        live_ratio, live_extra, steps, tuple(assumptions))
+        live_ratio, live_extra, steps, cost_steps, tuple(assumptions))
 
 
 def read_machines_data(directory: Path, now: int,

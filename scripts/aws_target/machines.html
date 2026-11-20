@@ -95,7 +95,7 @@ if (location.protocol !== 'file:') createPageRefresh(refreshMachines, () => 0, (
 
 const model = document.getElementById('machines-model');
 if (model) {
- const {choices, projections, jobProjections, liveExtra} = JSON.parse(model.textContent);
+ const {choices, projections, jobProjections, costSteps} = JSON.parse(model.textContent);
  const slider = pageSettingControls.connectSlider(document.getElementById('cost-limit'));
  const amount = document.getElementById('monthly-limit');
  const goRoot = document.getElementById('save-limit');
@@ -114,20 +114,24 @@ if (model) {
  const projection = item => projections[item.step_index];
  const jobStep = (job, ratio) => job.steps.findLast(step => step.first_ratio <= ratio);
  const monthlyCeiling = item => (item.ceiling_cents / 100).toFixed(2);
- const originalLive = slider.liveText;
- const estimateAtLive = () => {
-  if (slider.liveText === originalLive) return liveExtra;
-  const ratio = slider.live;
-  if (ratio < first || ratio > last) return NaN;
-  return projection(choices.findLast(item => item.ratio <= ratio)).extra;
- };
+ function liveCost(steps) {
+  const match = /^(\+?\d+)(?:\.(\d*))?$/.exec(slider.liveText);
+  if (!match) return undefined;
+  const [, whole, fraction = ''] = match;
+  const numerator = BigInt(whole + fraction);
+  const denominator = 10n ** BigInt(fraction.length);
+  return steps.findLast(step => {
+   const live = numerator * BigInt(step.denominator);
+   const start = BigInt(step.numerator) * denominator;
+   return step.exclusive ? live > start : live >= start;
+  })?.extra_cents;
+ }
  const go = pageSettingControls.connectGo(goRoot, slider, amount, () => ({
   newValue:slider.format(slider.value),
-  monthlyChange:projection(stop(slider.value)).extra - estimateAtLive(),
+  monthlyChange:(projection(stop(slider.value)).extra_cents - liveCost(costSteps)) / 100,
   monthlyChangeParts:jobProjections.map(job => ({
    name:job.name,
-   monthlyChange:jobStep(job, slider.value).extra -
-    (slider.liveText === originalLive ? job.live_extra : jobStep(job, slider.live).extra),
+   monthlyChange:(jobStep(job, slider.value).extra_cents - liveCost(job.cost_steps)) / 100,
   })).filter(part => part.monthlyChange !== 0),
   liveNote:slider.value === first ? 'off' : '',
  }));
@@ -151,19 +155,19 @@ if (model) {
   const {left, right, top, bottom} = chartBounds();
   const colors = getComputedStyle(chart);
   const color = name => colors.getPropertyValue(name).trim();
-  const highest = Math.max(choices.at(-1).ceiling_cents / 100, ...projections.map(row => row.extra));
+  const highest = Math.max(choices.at(-1).ceiling_cents, ...projections.map(row => row.extra_cents));
   const x = ratio => first === last ? left : left + (right - left) * (ratio - first) / (last - first);
-  const y = usd => highest === 0 ? bottom : bottom - (bottom - top) * usd / highest;
+  const y = cents => highest === 0 ? bottom : bottom - (bottom - top) * cents / highest;
   paint.font = '11px system-ui';
   paint.fillStyle = color('--ink-2');
-  for (const dollars of highest === 0 ? [0] : [0, highest / 2, highest]) {
+  for (const cents of highest === 0 ? [0] : [0, highest / 2, highest]) {
    paint.strokeStyle = color('--line');
    paint.beginPath();
-   paint.moveTo(left, y(dollars));
-   paint.lineTo(right, y(dollars));
+   paint.moveTo(left, y(cents));
+   paint.lineTo(right, y(cents));
    paint.stroke();
    paint.textAlign = 'right';
-   paint.fillText(currency.format(dollars), left - 6, y(dollars) + 4, left - 9);
+   paint.fillText(currency.format(cents / 100), left - 6, y(cents) + 4, left - 9);
   }
   paint.textAlign = 'center';
   for (const ratio of new Set([first, slider.value, last])) {
@@ -176,7 +180,7 @@ if (model) {
   paint.setLineDash([5, 4]);
   paint.beginPath();
   choices.forEach((item, index) => {
-   const point = [x(item.ratio), y(item.ceiling_cents / 100)];
+   const point = [x(item.ratio), y(item.ceiling_cents)];
    if (index) paint.lineTo(...point);
    else paint.moveTo(...point);
   });
@@ -185,27 +189,27 @@ if (model) {
   paint.strokeStyle = color('--accent');
   paint.lineWidth = 2;
   paint.beginPath();
-  paint.moveTo(left, y(projection(choices[0]).extra));
+  paint.moveTo(left, y(projection(choices[0]).extra_cents));
   for (let index = 1; index < choices.length; index++) {
    const item = choices[index];
-   paint.lineTo(x(item.ratio), y(projection(choices[index - 1]).extra));
-   paint.lineTo(x(item.ratio), y(projection(item).extra));
+   paint.lineTo(x(item.ratio), y(projection(choices[index - 1]).extra_cents));
+   paint.lineTo(x(item.ratio), y(projection(item).extra_cents));
   }
   paint.stroke();
   paint.fillStyle = color('--accent');
   paint.beginPath();
-  paint.arc(x(slider.value), y(projection(stop(slider.value)).extra), 4, 0, 2 * Math.PI);
+  paint.arc(x(slider.value), y(projection(stop(slider.value)).extra_cents), 4, 0, 2 * Math.PI);
   paint.fill();
  }
 
  function draw() {
   const item = stop(slider.value);
-  const {extra, hours, cost_per_hour} = projection(item);
+  const {extra_cents, hours, cost_per_hour_cents} = projection(item);
   const ratio = slider.format(item.ratio);
-  document.getElementById('extra-cost').textContent = currency.format(extra);
+  document.getElementById('extra-cost').textContent = currency.format(extra_cents / 100);
   document.getElementById('saved-hours').textContent = decimal.format(hours) + ' h';
   document.getElementById('saved-hour-cost').textContent =
-   cost_per_hour === null ? '—' : currency.format(cost_per_hour);
+   cost_per_hour_cents === null ? '—' : currency.format(cost_per_hour_cents / 100);
   document.getElementById('monthly-cap').textContent = 'At this run count, the limit allows up to ' +
    currency.format(item.ceiling_cents / 100) + ' more a month. More runs can raise the monthly cost.';
   steps.forEach((row, index) => {
@@ -214,9 +218,9 @@ if (model) {
    row.querySelector('button').setAttribute('aria-pressed', String(selected));
   });
   jobs.forEach((job, index) => {
-   const {extra, shares} = jobStep(jobProjections[index], item.ratio);
+   const {extra_cents, shares} = jobStep(jobProjections[index], item.ratio);
    job.querySelector('[data-job-ratio]').textContent = ratio;
-   job.querySelector('[data-job-extra]').textContent = currency.format(extra);
+   job.querySelector('[data-job-extra]').textContent = currency.format(extra_cents / 100);
    job.querySelectorAll('[data-choice]').forEach(row => {
     const choice = row.dataset.choice;
     const allowed = Object.hasOwn(shares, choice);
@@ -225,7 +229,7 @@ if (model) {
    });
   });
   go.setLabel('Set the limit to ' + ratio);
-  goButton.disabled = slider.atLive || !Number.isFinite(estimateAtLive()) || !amount.validity.valid;
+  goButton.disabled = slider.atLive || liveCost(costSteps) === undefined || !amount.validity.valid;
   drawChart();
  }
 

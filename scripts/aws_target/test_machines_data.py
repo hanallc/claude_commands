@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from fractions import Fraction
 from io import StringIO
 import json
 from pathlib import Path
@@ -190,7 +191,8 @@ names.test-all=fixture all
             live_extra_usd_per_month=extra, steps=(
                 replace(gate.steps[0], last_ratio=Decimal('1.50'), limits=limits[:-1]),
                 machines_data.MachineStep(last, last, (FAST,), (), extra, hours, extra / hours, limits[-1:]),
-            ))
+            ), cost_steps=(gate.cost_steps[0],
+                           machines_data.CostRatioStep(machines_data.CostRatioCutover(Fraction(last)), extra)))
         gate = replace(gate, live_ratio=live)
         total = replace(data, workloads=(gate, targeted, data.workloads[2])).total
         assert isinstance(total, machines_data.AllJobsProjection)
@@ -262,13 +264,24 @@ names.test-all=fixture all
         self.assertEqual(merge.sentence, 'The records for fixture gate hold 1 completed run on 1 machine size in this period.')
 
     def test_live_cost_uses_the_live_ratio_between_slider_values(self) -> None:
+        self.spot = tuple(replace(row, usd_per_hour=Decimal('.5904')) if row.region == FAST.region else row
+                          for row in self.spot)
+        self.write_prices()
         path = self.configuration.gate.source
-        _ = path.write_text(path.read_text().replace('faster_box_max_cost_ratio=1.50', 'faster_box_max_cost_ratio=1.26'))
+        _ = path.write_text(path.read_text().replace('faster_box_max_cost_ratio=1.50', 'faster_box_max_cost_ratio=1.24'))
         self.configuration = replace(self.configuration, gate=conf.read(path))
         merge = self.merge()
-        self.assertEqual(merge.live_ratio, Decimal('1.26'))
+        self.assertEqual(merge.live_ratio, Decimal('1.24'))
+        self.assertEqual(merge.steps[0].extra_usd_per_month, 0)
+        self.assertLess(merge.cost_steps[1].start.ratio, Fraction(merge.steps[1].first_ratio))
+        self.assertFalse(merge.cost_steps[1].start.includes(Fraction('1.22')))
+        self.assertTrue(merge.cost_steps[1].start.includes(Fraction('1.23')))
         self.assertEqual(merge.live_extra_usd_per_month, merge.steps[1].extra_usd_per_month)
         self.assertGreater(merge.live_extra_usd_per_month, 0)
+        for step in merge.steps:
+            ratio = Fraction(step.first_ratio)
+            cost = next(cost for cost in reversed(merge.cost_steps) if cost.start.includes(ratio))
+            self.assertEqual(cost.extra_usd_per_month, step.extra_usd_per_month)
 
     def test_removed_deployment_region_stays_measured_and_leaves_the_projection(self) -> None:
         self.write_deployment(SMALL.region, FASTER.region)

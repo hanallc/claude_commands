@@ -39,21 +39,28 @@ class _SliderChoice(TypedDict):
 
 
 class _MonthlyProjection(TypedDict):
-    extra: float
+    extra_cents: int
     hours: float
-    cost_per_hour: float | None
+    cost_per_hour_cents: int | None
 
 
 class _JobStepProjection(TypedDict):
     first_ratio: float
-    extra: float
+    extra_cents: int
     shares: dict[int, float]
+
+
+class _CostRatioStep(TypedDict):
+    numerator: str
+    denominator: str
+    exclusive: bool
+    extra_cents: int
 
 
 class _JobProjection(TypedDict):
     name: str
-    live_extra: float
     steps: list[_JobStepProjection]
+    cost_steps: list[_CostRatioStep]
 
 
 def page_url() -> str:
@@ -179,18 +186,29 @@ def _projection_data(total: machines_data.AllJobsProjection) -> tuple[list[_Slid
             ceiling = (limit.ceiling_extra_usd_per_month / _CENT).to_integral_value(rounding=ROUND_CEILING)
             choices.append(_SliderChoice(ratio=float(limit.ratio), ceiling_cents=int(ceiling), step_index=index))
         projections.append(_MonthlyProjection(
-            extra=float(step.extra_usd_per_month), hours=float(step.hours_saved_per_month),
-            cost_per_hour=float(step.usd_per_hour_saved) if isinstance(step.usd_per_hour_saved, Decimal) else None,
+            extra_cents=_money_cents(step.extra_usd_per_month), hours=float(step.hours_saved_per_month),
+            cost_per_hour_cents=(_money_cents(step.usd_per_hour_saved)
+                                 if isinstance(step.usd_per_hour_saved, Decimal) else None),
         ))
     return choices, projections
 
 
+def _money_cents(usd: Decimal) -> int:
+    return int(usd.quantize(_CENT, rounding=ROUND_HALF_UP).scaleb(2))
+
+
+def _cost_projection(steps: tuple[machines_data.CostRatioStep, ...]) -> list[_CostRatioStep]:
+    return [_CostRatioStep(numerator=str(step.start.ratio.numerator), denominator=str(step.start.ratio.denominator),
+                           exclusive=step.start.exclusive, extra_cents=_money_cents(step.extra_usd_per_month))
+            for step in steps]
+
+
 def _job_projection(workload: machines_data.MeasuredWorkload) -> _JobProjection:
     machines = {choice.machine: index for index, choice in enumerate(workload.choices)}
-    steps = [_JobStepProjection(first_ratio=float(step.first_ratio), extra=float(step.extra_usd_per_month),
+    steps = [_JobStepProjection(first_ratio=float(step.first_ratio), extra_cents=_money_cents(step.extra_usd_per_month),
                                 shares={machines[row.machine]: float(row.share) for row in step.shares})
              for step in workload.steps]
-    return _JobProjection(name=workload.name, live_extra=float(workload.live_extra_usd_per_month), steps=steps)
+    return _JobProjection(name=workload.name, steps=steps, cost_steps=_cost_projection(workload.cost_steps))
 
 
 def _controls(data: machines_data.MachinesPageData, total: machines_data.AllJobsProjection,
@@ -210,7 +228,7 @@ def _controls(data: machines_data.MachinesPageData, total: machines_data.AllJobs
     choices, projections = _projection_data(total)
     model = json.dumps({'choices': choices, 'projections': projections,
                         'jobProjections': [_job_projection(job) for job in jobs],
-                        'liveExtra': float(total.live_extra_usd_per_month)}).replace('<', r'\u003c')
+                        'costSteps': _cost_projection(total.cost_steps)}).replace('<', r'\u003c')
     return (
         f'<div id="machine-controls" class="machine-controls">{slider}{amount}</div>'
         + ('<div class="machine-tiles" aria-live="polite">'

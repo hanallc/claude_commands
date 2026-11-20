@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from fractions import Fraction
 from http.server import ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -43,6 +44,10 @@ status.aws_machines.age_limit_seconds=3900
 D = Decimal
 
 
+def cost_step(ratio: str, extra: str) -> machines_data.CostRatioStep:
+    return machines_data.CostRatioStep(machines_data.CostRatioCutover(Fraction(ratio)), D(extra))
+
+
 def fixture_data(*, aws_closed: bool = False) -> machines_data.MachinesPageData:
     """Give the page three measured machines and two single-size workloads."""
     small = ledger.GateRateCandidate('c7a.4xlarge', 'eu-south-2')
@@ -71,6 +76,7 @@ def fixture_data(*, aws_closed: bool = False) -> machines_data.MachinesPageData:
     )
     workload = machines_data.MeasuredWorkload(WORKLOAD_NAME, 'merge-gate', choices, small, 1075, D(4658),
         D('62.72'), ((1, 611), (2, 272), (3, 125), (4, 43), (5, 19), (6, 5)), D('1.50'), D('14.14'), steps,
+        (cost_step('1', '0'), cost_step('1.25', '14.14'), cost_step('2.15', '15.10')),
         ('A month has 52 weeks divided by 12.',
          f'The measured run rate, overlap, and share of Spot refusals repeat for {WORKLOAD_NAME}.',
          'The estimate uses a quota of 136 vCPUs for Sweden.'))
@@ -101,7 +107,8 @@ def fixture_two_jobs() -> machines_data.MachinesPageData:
             extra, hours, extra / hours, limits[7:]),
     )
     targeted = machines_data.MeasuredWorkload('targeted test', 'targeted-test', (small, large), small.machine,
-        608, D(2635), base, ((1, 608),), gate.live_ratio, extra, steps, ('The measured run rate repeats.',))
+        608, D(2635), base, ((1, 608),), gate.live_ratio, extra, steps,
+        (cost_step('1', '0'), cost_step('1.35', '5.08')), ('The measured run rate repeats.',))
     return replace(data, workloads=(gate, targeted, data.workloads[2]))
 
 
@@ -328,10 +335,12 @@ await fetch('/probe?result=' + encodeURIComponent(result));
         workload = data.workloads[0]
         assert isinstance(workload, machines_data.MeasuredWorkload)
         for live, live_extra, monthly_change in (
-                ('1.249', '4.00', '+$10.14'), ('1.2750', '14.14', '$0.00'),
+                ('1.24999999999999999', '4.00', '+$10.14'), ('1.2750', '14.14', '$0.00'),
                 ('1.25000000000000001', '14.14', '$0.00')):
             with self.subTest(live=live):
-                live_workload = replace(workload, live_ratio=D(live), live_extra_usd_per_month=D(live_extra))
+                cost_steps = (*workload.cost_steps[:1], cost_step('1.23', '4'), *workload.cost_steps[1:])
+                live_workload = replace(workload, live_ratio=D(live), live_extra_usd_per_month=D(live_extra),
+                                        cost_steps=cost_steps)
                 markup = machines_page.render(replace(data, workloads=(live_workload, *data.workloads[1:])), NOW)
                 parts = f'gate {monthly_change} a month. ' if monthly_change != '$0.00' else ''
                 expected = json.dumps(f'Change from {live} to 1.25. {parts}Total {monthly_change} a month.')
@@ -348,6 +357,61 @@ const passed = untouched && edited && !document.querySelector('[data-setting-con
 void fetch('/probe?result=' + encodeURIComponent(passed ? 'passed' : JSON.stringify({untouched, edited, summary})));
 </script>""".replace('EXPECTED', expected)
                 self.browser(markup, probe)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for the Machines page checks')
+    def test_browser_uses_the_off_step_live_ratio_from_a_tune_reply(self) -> None:
+        data = fixture_data()
+        workload = data.workloads[0]
+        assert isinstance(workload, machines_data.MeasuredWorkload)
+        steps = (workload.steps[0], replace(workload.steps[1], extra_usd_per_month=D('2.30')), workload.steps[2])
+        workload = replace(workload, live_ratio=D('1.00'), live_extra_usd_per_month=D(0), steps=steps,
+            cost_steps=(cost_step('1', '0'), cost_step('1.23', '2.30'), workload.cost_steps[2]))
+        markup = machines_page.render(replace(data, workloads=(workload, *data.workloads[1:])), NOW)
+        probe = """<script>
+(async () => {
+ const input = document.getElementById('cost-limit-value');
+ const go = document.querySelector('[data-setting-go]');
+ const root = document.getElementById('save-limit');
+ function choose(value) {
+  input.value = value;
+  input.dispatchEvent(new Event('input', {bubbles:true}));
+  go.click();
+ }
+ const saved = new Promise(resolve => root.addEventListener('setting-saved', resolve, {once:true}));
+ choose('1.25');
+ root.querySelector('[data-setting-save]').click();
+ await saved;
+ choose('1.20');
+ const summary = root.querySelector('[data-setting-summary]').textContent;
+ const expected = 'Change from 1.24 to 1.20. gate -$2.30 a month. Total -$2.30 a month.';
+ await fetch('/probe?result=' + encodeURIComponent(summary === expected ? 'passed' : summary));
+})();
+</script>"""
+        self.browser(markup, probe, expected_saves=('1.25',), tune_reply_live='1.24')
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for the Machines page checks')
+    def test_browser_subtracts_the_displayed_amounts_in_cents(self) -> None:
+        data = fixture_data()
+        workload = data.workloads[0]
+        assert isinstance(workload, machines_data.MeasuredWorkload)
+        steps = (workload.steps[0], replace(workload.steps[1], extra_usd_per_month=D('1.010')),
+                 replace(workload.steps[2], extra_usd_per_month=D('1.015')))
+        workload = replace(workload, live_extra_usd_per_month=D('1.010'), steps=steps,
+            cost_steps=(cost_step('1', '0'), cost_step('1.25', '1.010'), cost_step('2.15', '1.015')))
+        markup = machines_page.render(replace(data, workloads=(workload, *data.workloads[1:])), NOW)
+        probe = """<script>
+const input = document.getElementById('cost-limit-value');
+const tile = document.getElementById('extra-cost');
+const before = tile.textContent;
+input.value = '2.15';
+input.dispatchEvent(new Event('input', {bubbles:true}));
+document.querySelector('[data-setting-go]').click();
+const summary = document.querySelector('[data-setting-summary]').textContent;
+const expected = 'Change from 1.50 to 2.15. gate +$0.01 a month. Total +$0.01 a month.';
+const passed = before === '$1.01' && tile.textContent === '$1.02' && summary === expected;
+void fetch('/probe?result=' + encodeURIComponent(passed ? 'passed' : summary));
+</script>"""
+        self.browser(markup, probe)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for the Machines page checks')
     def test_browser_refreshes_an_untouched_off_step_preview(self) -> None:
@@ -373,7 +437,8 @@ void fetch('/probe?result=' + encodeURIComponent(passed ? 'passed' : JSON.string
 </script>""".replace('INITIAL', str(NOW))
         self.browser(machines_page.render(data, NOW), probe, newer_markup=machines_page.render(data, NOW + 1))
 
-    def browser(self, markup: str, probe: str, *, expected_saves: tuple[str, ...] = (), newer_markup: str = '') -> None:
+    def browser(self, markup: str, probe: str, *, expected_saves: tuple[str, ...] = (), newer_markup: str = '',
+                tune_reply_live: str = '') -> None:
         page = markup.replace('</body>', probe + '</body>').encode()
         newer = newer_markup.replace('</body>', probe + '</body>').encode()
         published_newer = threading.Event()
@@ -428,7 +493,7 @@ void fetch('/probe?result=' + encodeURIComponent(passed ? 'passed' : JSON.string
             document, key, value = command[tune_fields]
             self.assertEqual((document, key), ('cloud_gate', RATIO_KEY))
             saves.append(value)
-            _ = self.gate.write_text(f'{key}={value}\n')
+            _ = self.gate.write_text(f'{key}={tune_reply_live or value}\n')
             return subprocess.CompletedProcess(command, 0)
 
         profile = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.root)))
