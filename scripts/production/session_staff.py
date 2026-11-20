@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
+from scripts.lib.copy_record import unit_owner
 from scripts.production import staff
 from scripts.production import unit_config as configuration
 from scripts.agents import remote
@@ -669,7 +670,6 @@ def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
         if not matches:
             matches = [row for row in units if row.name == reference.value]
         if not matches:
-            unit_owner = cast(Callable[[str], str], import_module("scripts.copies.copies").unit_owner)
             matches = [row for row in units if unit_owner(row.name) == reference.value]
     else:
         from scripts.production import unit_names

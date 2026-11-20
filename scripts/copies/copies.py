@@ -34,6 +34,7 @@ from uuid import UUID
 
 
 from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, scratch
+from scripts.lib.copy_record import unit_owner as unit_owner
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -435,11 +436,6 @@ def guard_choice_limit() -> int:
     except (KeyError, ValueError) as error:
         raise CopyError(f"{path}: invalid copies configuration: {error}") from error
     return limit
-
-
-def unit_owner(name: str) -> str:
-    """Keep the recorded unit name and append one unit suffix."""
-    return name.removesuffix("-unit") + "-unit"
 
 
 def source_owner(source: Path) -> str:
