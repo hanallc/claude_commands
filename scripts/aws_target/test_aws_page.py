@@ -418,8 +418,11 @@ class AwsCombinedTableTests(PageCostFixture):
     document.querySelector("#regions [data-region='us-east-2']").click();
     check(sizes().join() === "m7a.8xlarge", "The hidden region's size row is absent");
     const cells = [...document.querySelector("#hours details tbody tr").cells];
-    check(cells.slice(1, 5).map(cell => cell.textContent).join("|") === "us-east-2|0.0|0.0|0.0",
-          "A small billed amount keeps its row even when the hours round to zero");
+    check(cells.slice(1, 5).map(cell => cell.textContent).join("|") === "us-east-2|0.0|0.0|less than 0.1 hours",
+          "A marked difference still shows when the hours round to zero");
+    check(document.querySelector("#hours p").textContent
+          === "Yes. AWS billed less than 0.1 hours more than our records, in 1 row.",
+          "The answer and row show the same small difference");
     east.click();
     check(sizes().includes("c7a.4xlarge"), "The row returns when its region is selected");
 """)
@@ -629,6 +632,7 @@ class AwsCombinedTableTests(PageCostFixture):
 """)
 
     def test_hours_answer_and_disclosure_use_the_existing_rule(self) -> None:
+        self.costs({'billed_hours_gap_max_ratio': '0.15'})
         checks = {
             ('c7a.4xlarge', 'us-east-1'): run_cost.hours_check(Decimal('1.5'), Decimal('1'), Decimal('.15')),
             ('c7a.4xlarge', 'us-east-2'): run_cost.hours_check(Decimal('1.5'), Decimal('1'), Decimal('.15'),
@@ -649,6 +653,9 @@ class AwsCombinedTableTests(PageCostFixture):
     const toggleRegion = region => document.querySelector(`#regions [data-region='${region}']`).click();
     check(answer() === "Yes. AWS billed 4.2 hours more than our records, in 2 rows.", "Sum marked higher bills");
     check(cells(table().tHead.rows[0]) === "type|region|AWS billed|our records|difference|Hana reserved", "Hours headings");
+    check(table().tHead.rows[0].cells[5].title ===
+          "The check adds these hours reserved for Hana in this region to our recorded hours when it checks for a higher bill.",
+          "Hana reserved has a tooltip");
     check(rows().map(cells).join("\\n") === [
       "c7a.4xlarge|eu-west-1|5.7|2.0|+3.7|1.0",
       "c7a.4xlarge|us-east-1|1.5|1.0|+0.5|—",
@@ -663,7 +670,9 @@ class AwsCombinedTableTests(PageCostFixture):
     check(answer() === "Yes. AWS billed 0.5 hours more than our records, in 1 row.", "One marked higher bill");
     toggleRegion("us-east-1");
     toggleRegion("us-west-1");
-    check(answer() === "No. AWS billed 1.5 hours and our records show 1.0 hours.", "An in-limit row uses the totals");
+    check(answer() === "No. AWS billed 1.5 hours and our records show 1.0 hours. "
+          + "No row is more than 15% above its recorded hours plus any hours reserved for Hana.",
+          "An in-limit higher bill explains the configured limit");
     check(!table() && details().open, "The region filter leaves only the disclosure open");
     check(details().querySelector("tbody tr").cells[5].textContent === "0.5", "The in-limit row used Hana reserved");
     toggleRegion("us-east-2");
@@ -671,6 +680,52 @@ class AwsCombinedTableTests(PageCostFixture):
     check(answer() === "No. AWS billed 2.1 hours less than our records, in 1 row.", "One marked lower bill");
     check(rows().length === 1 && cells(rows()[0]) === "m7a.8xlarge|us-west-1|0.0|2.1|-2.1",
           "A marked lower bill has a negative difference and does not use Hana reserved");
+""")
+
+    def test_hours_answer_sums_the_displayed_differences(self) -> None:
+        limit = Decimal('.15')
+        self.costs({'billed_hours_gap_max_ratio': str(limit)})
+        checks = {
+            ('c7a.4xlarge', 'us-east-1'): run_cost.hours_check(Decimal('1.24'), Decimal('1.06'), limit),
+            ('c7a.4xlarge', 'us-east-2'): run_cost.hours_check(Decimal('1.16'), Decimal('1.00'), limit),
+        }
+        with mock.patch.object(run_cost, 'hours_checks', return_value=checks):
+            self.run_browser_checks('', """
+    const section = document.getElementById("hours");
+    const answer = () => section.querySelector("p").textContent;
+    const rows = () => [...section.querySelectorAll(":scope > .scroll tbody tr")];
+    const amounts = row => [...row.cells].slice(2, 5).map(cell => cell.textContent).join("|");
+    check(rows().map(amounts).join(";") === "1.2|1.1|+0.2;1.2|1.0|+0.2",
+          "Each difference rounds after subtraction");
+    check(answer() === "Yes. AWS billed 0.4 hours more than our records, in 2 rows.",
+          "The answer sums the displayed differences");
+    document.querySelector("#regions [data-region='us-east-2']").click();
+    check(answer() === "Yes. AWS billed 0.2 hours more than our records, in 1 row.",
+          "The filtered row still matches the answer");
+""")
+
+    def test_hours_keep_unbilled_rows_and_regions_from_all_checks(self) -> None:
+        limit = Decimal('.2')
+        checks = {
+            ('c7a.4xlarge', 'us-west-2'): run_cost.hours_check(None, Decimal('1.25'), limit),
+            ('c7a.4xlarge', 'ca-west-1'): run_cost.hours_check(None, Decimal(0), limit,
+                                                             hana_reserved_hours=Decimal('.5')),
+        }
+        with mock.patch.object(run_cost, 'hours_checks', return_value=checks):
+            self.run_browser_checks('', """
+    const section = document.getElementById("hours");
+    const details = section.querySelector("details");
+    check(section.querySelector("p").textContent === "No AWS bill is available yet for the recorded hours.",
+          "The answer explains that every row is unbilled");
+    check(!section.querySelector(":scope > .scroll"), "No unbilled row is marked");
+    check(!details.open && details.querySelector("summary").textContent === "All rows (1)",
+          "The closed disclosure includes the unbilled row");
+    details.querySelector("summary").click();
+    const cells = [...details.querySelector("tbody tr").cells].map(cell => cell.textContent);
+    check(cells.join("|") === "c7a.4xlarge|us-west-2|—|1.2|—", "The unbilled row keeps its recorded hours");
+    check(document.querySelector("#regions [data-region='us-west-2']"), "The filter includes the unbilled region");
+    check(document.querySelector("#regions [data-region='ca-west-1']"),
+          "The filter includes a region with a check and no displayed row");
 """)
 
 

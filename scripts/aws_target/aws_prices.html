@@ -546,25 +546,39 @@ function drawScope() {
 
 function hoursTable(rows) {
   const headers = ["type", "region", "AWS billed", "our records", "difference"];
-  if (rows.some(row => row.cells[5] !== "—")) headers.push("Hana reserved");
-  return tableElement([{
+  const hasReserved = rows.some(row => row.cells[5] !== "—");
+  if (hasReserved) headers.push("Hana reserved");
+  const table = tableElement([{
     headers, right: headers.map((_header, index) => index).slice(2),
     rows: rows.map(row => row.cells), region_axis: "type-region-rows",
   }], false);
+  if (hasReserved) {
+    table.querySelector("thead th:last-child").title =
+      "The check adds these hours reserved for Hana in this region to our recorded hours when it checks for a higher bill.";
+  }
+  return table;
 }
 
-function hoursAnswer(compared, marked) {
-  const more = marked.filter(row => row.billed > row.recorded);
-  const difference = rows => rows.reduce((total, row) => total + row.billed - row.recorded, 0);
+function hoursAnswer(compared, marked, limitPercent) {
+  const more = marked.filter(row => row.limit_result === "higher_bill");
+  const difference = rows => {
+    const tenths = Math.abs(rows.reduce((total, row) => total + row.difference_tenths, 0));
+    return tenths ? `${(tenths / 10).toFixed(1)} hours` : "less than 0.1 hours";
+  };
   const rowCount = rows => `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
   if (more.length) {
-    return `Yes. AWS billed ${difference(more).toFixed(1)} hours more than our records, in ${rowCount(more)}.`;
-  }
-  if (marked.length) {
-    return `No. AWS billed ${Math.abs(difference(marked)).toFixed(1)} hours less than our records, in ${rowCount(marked)}.`;
+    return `Yes. AWS billed ${difference(more)} more than our records, in ${rowCount(more)}.`;
   }
   const total = key => compared.reduce((hours, row) => hours + row[key], 0).toFixed(1);
-  return `No. AWS billed ${total("billed")} hours and our records show ${total("recorded")} hours.`;
+  const billed = total("billed");
+  const recorded = total("recorded");
+  const answer = marked.length
+    ? `No. AWS billed ${difference(marked)} less than our records, in ${rowCount(marked)}.`
+    : `No. AWS billed ${billed} hours and our records show ${recorded} hours.`;
+  if (Number(billed) > Number(recorded)) {
+    return answer + ` No row is more than ${limitPercent} above its recorded hours plus any hours reserved for Hana.`;
+  }
+  return answer;
 }
 
 function drawHours() {
@@ -581,8 +595,9 @@ function drawHours() {
     section.appendChild(element("p", "There are no machine hours to compare in the selected regions.", "answer"));
     return;
   }
-  const marked = compared.filter(row => row.marked);
-  const answer = compared.length ? hoursAnswer(compared, marked) : "No AWS bill is available yet for the recorded hours.";
+  const marked = compared.filter(row => row.limit_result !== "within_limit");
+  const answer = compared.length ? hoursAnswer(compared, marked, data.hours.limit_percent)
+    : "No AWS bill is available yet for the recorded hours.";
   section.appendChild(element("p", answer, "answer"));
   if (marked.length) section.appendChild(hoursTable(marked));
   const details = element("details");

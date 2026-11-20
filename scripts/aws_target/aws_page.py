@@ -228,12 +228,14 @@ class ComparedHoursRowData(TypedDict):
     cells: list[str]
     billed: float
     recorded: float
-    marked: bool
+    difference_tenths: int
+    limit_result: Literal['within_limit', 'higher_bill', 'lower_bill']
 
 
 class HoursComparisonData(TypedDict):
     kind: Literal['comparison']
     rows: list[ComparedHoursRowData | UnbilledHoursRowData]
+    limit_percent: str
 
 
 class HoursComparisonUnavailableData(TypedDict):
@@ -276,14 +278,19 @@ def hours_row_data(row: spot_table.MachineHoursRow) -> ComparedHoursRowData | Un
     recorded = round(check.box_hours, 1)
     if billed is None:
         return {'kind': 'unbilled', 'region': row.region, 'cells': [row.size, row.region, '—', f'{recorded:.1f}', '—', '—']}
-    displayed_bill = round(billed, 1)
-    difference = displayed_bill - recorded
+    difference = round(billed - check.box_hours, 1)
+    limit_result: Literal['within_limit', 'higher_bill', 'lower_bill'] = 'within_limit'
+    if check.hours_gap_over:
+        limit_result = 'higher_bill' if billed > check.box_hours else 'lower_bill'
+    if difference:
+        shown_difference = f'{difference:+.1f}'
+    else:
+        shown_difference = 'less than 0.1 hours' if check.hours_gap_over else '0.0'
     reserved = check.hana_reserved_hours
-    cells = [row.size, row.region, f'{displayed_bill:.1f}', f'{recorded:.1f}',
-             f'{difference:+.1f}' if difference else '0.0',
+    cells = [row.size, row.region, f'{billed:.1f}', f'{recorded:.1f}', shown_difference,
              f'{reserved:.1f}' if billed >= check.box_hours and reserved > 0 else '—']
     return {'kind': 'compared', 'region': row.region, 'cells': cells, 'billed': float(billed),
-            'recorded': float(check.box_hours), 'marked': check.hours_gap_over}
+            'recorded': float(check.box_hours), 'difference_tenths': int(difference * 10), 'limit_result': limit_result}
 
 
 def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.SpotPlacementReading],
@@ -544,11 +551,14 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               gate_switch: cloud_gate.CloudGateSetting = cloud_gate.CloudGateSwitch.ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
-    regions = {row[0] for row in placement.rows}
+    regions = {row[0] for row in placement.rows} | tables.hours.checked_regions
     hours: HoursComparisonData | HoursComparisonUnavailableData
     if isinstance(tables.hours, spot_table.HoursComparison):
-        regions.update(row.region for row in tables.hours.rows)
-        hours = {'kind': 'comparison', 'rows': [hours_row_data(row) for row in tables.hours.rows]}
+        percent = format(tables.hours.max_gap_ratio, '%').removesuffix('%')
+        if '.' in percent:
+            percent = percent.rstrip('0').rstrip('.')
+        hours = {'kind': 'comparison', 'rows': [hours_row_data(row) for row in tables.hours.rows],
+                 'limit_percent': f'{percent}%'}
     else:
         hours = {'kind': 'unavailable', 'reason': tables.hours.reason}
     return {

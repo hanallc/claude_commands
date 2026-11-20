@@ -1469,10 +1469,11 @@ class HoursCheckTests(CostFixture):
                 self.assertEqual(aws_page.hours_row_data(row)['cells'][4], '+0.2')
                 self.assertEqual(row.check.hours_gap_over, mark)
 
-    def test_hours_difference_matches_the_displayed_values(self) -> None:
+    def test_hours_difference_rounds_only_after_subtracting(self) -> None:
         for billed, recorded, cells in (
             ('0.96', '1', ['1.0', '1.0', '0.0']),
-            ('4.24', '4.26', ['4.2', '4.3', '-0.1']),
+            ('4.24', '4.26', ['4.2', '4.3', '0.0']),
+            ('1.24', '1.06', ['1.2', '1.1', '+0.2']),
         ):
             with self.subTest(billed=billed, recorded=recorded):
                 check = run_cost.hours_check(Decimal(billed), Decimal(recorded), self.limit)
@@ -1488,7 +1489,11 @@ class HoursCheckTests(CostFixture):
         self.bill(self.day(2), {})
         check('There are no machine hours to compare.')
         self.gate(self.size, self.home, self.day(1), 3600)
-        check('No AWS bill is available yet for the recorded hours.')
+        hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+        assert isinstance(hours, spot_table.HoursComparison)
+        row, = hours.rows
+        self.assertEqual(aws_page.hours_row_data(row)['cells'], [self.size, self.home, '—', '1.0', '—', '—'])
+        self.assertFalse(row.check.hours_gap_over)
 
     def test_spot_table_keeps_gate_hours_and_shows_the_hana_allowance(self) -> None:
         day = self.day(1)
