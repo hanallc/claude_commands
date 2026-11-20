@@ -150,11 +150,14 @@ read -r command
         history = self.record_phase()
         self.hold_after_first_step()
         observation = self.observe_waits()
-        pid_saved, ready = self.observe_step_hold_waiter()
+        pid_saved, ready, exited = self.observe_step_hold_waiter()
         process = self.start("final")
         self.wait_for_call(process)
-        wait_for_verify_state(lambda: pid_saved.exists() and ready.exists(), ready.parent, process,
-                              "verify saved the PID and the step hold waiter reached its file wait")
+        wait_for_verify_state(lambda: pid_saved.exists() and (ready.exists() or exited.exists()),
+                              ready.parent, process, "the first step hold waiter became ready or exited")
+        if not ready.exists():
+            pid = pid_saved.read_text().strip()
+            self.fail(f"Step hold waiter PID {pid} exited without a ready marker")
         process.send_signal(signal.SIGTERM)
         code, output = self.finish(process)
         self.assertEqual(code, 143, output)

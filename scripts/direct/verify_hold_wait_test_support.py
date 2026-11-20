@@ -637,22 +637,31 @@ if arguments[:1] == ["metadata"]:''',
         )
         self.fixture.write_executable(cargo, source)
 
-    def observe_step_hold_waiter(self) -> tuple[Path, Path]:
-        """Mark when verify saves the PID and when the child enters the hold wait."""
+    def observe_step_hold_waiter(self) -> tuple[Path, Path, Path]:
+        """Record the first step hold waiter's PID, readiness, and exit."""
         pid_saved = self.fixture.root / "step-hold-pid-saved"
         ready = self.fixture.root / "step-hold-ready"
+        exited = self.fixture.root / "step-hold-exited"
         script = self.fixture.verify_script
         source = script.read_text()
         function = shell_function(source, "wait_for_placement")
         launch = '    "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT"'
         wait = '    wait "$HOLD_WAITER_PID" || true'
         assert function.count(launch) == function.count(wait) == 1
-        held = '    if [[ "$PHASE_RESOURCE_WAIT" == "natedev:build hold" ]]; then\n'
-        observed = function.replace(launch, held + '''        local BUILD_TARGETS_POLL_S=$TEST_STEP_HOLD_GUARD
-        local -x TEST_STEP_HOLD_READY=$TEST_STEP_HOLD_MARKER
+        observed = function.replace(launch, '''    local -x TEST_STEP_HOLD_READY=
+    if [[ "$PHASE_RESOURCE_WAIT" == "natedev:build hold" && ! -e "$TEST_STEP_HOLD_PID_SAVED" ]]; then
+        local BUILD_TARGETS_POLL_S=$TEST_STEP_HOLD_GUARD
+        TEST_STEP_HOLD_READY=$TEST_STEP_HOLD_MARKER
     fi
 ''' + launch)
-        observed = observed.replace(wait, held + '        : > "$TEST_STEP_HOLD_PID_SAVED"\n    fi\n' + wait)
+        observed = observed.replace(wait, r'''    if [[ -n "$TEST_STEP_HOLD_READY" ]]; then
+        printf '%s\n' "$HOLD_WAITER_PID" > "$TEST_STEP_HOLD_PID_SAVED.tmp"
+        mv -- "$TEST_STEP_HOLD_PID_SAVED.tmp" "$TEST_STEP_HOLD_PID_SAVED"
+    fi
+''' + wait + '''
+    if [[ -n "$TEST_STEP_HOLD_READY" ]]; then
+        : > "$TEST_STEP_HOLD_EXITED"
+    fi''')
         self.fixture.write_executable(script, source.replace(function, observed, 1))
 
         waiter = script.with_name("local_release_wait.py")
@@ -668,6 +677,7 @@ if arguments[:1] == ["metadata"]:''',
             "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(waiter),
             "TEST_STEP_HOLD_PID_SAVED": str(pid_saved),
             "TEST_STEP_HOLD_MARKER": str(ready),
+            "TEST_STEP_HOLD_EXITED": str(exited),
             "TEST_STEP_HOLD_GUARD": str(TEST_HANG_GUARD_SECS),
         })
-        return pid_saved, ready
+        return pid_saved, ready, exited
