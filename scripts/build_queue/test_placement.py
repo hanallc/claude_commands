@@ -2073,6 +2073,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
     def test_mac_probe_recovers_the_committed_mirror_root(self) -> None:
         with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
             settings, request, _destination = self.target_settings_fixture(fixture, platform="macos")
+            _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.mac=on\n")
             _ = write_config_fixture(settings, "linux_only.hana=\n")
             mac_settings = fixture.root / "mac_test.conf"
             _ = write_config_fixture(mac_settings, "mirror_root=~/fixture-mirrors\n")
