@@ -102,6 +102,8 @@ Act through `the_list.py` and tell the owner, as for any instruction from nate.
 
 ## Lists and unread updates
 
+At each round, read the status, next step and done-when of every item. Rewrite or send back each one that nate cannot read in ten seconds.
+
 `list` prints `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list`.
 After adding an item, print the complete visible list.
 For managed follow-ups, State includes the next check time. Label overdue checks accurately and restore their schedule.

@@ -66,11 +66,12 @@ Ask the style unit about a hard case.
 ## Work with showrunners and morty
 
 Check your assignments on The List. Keep the state, check time, status, next step, and ETA current for your items.
-An ETA is the time when the whole item is done: `Mon D HH:MM ZONE` or a date. Without a time, write `No time yet`, `Waiting for nate`, `Paused`, or `Delivered`. Put each cause, condition, and part time in the status.
-Write the status in two or three sentences that say where the item stands. Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
+Write each item for nate as if he had said 'explain it more simply'. Latest status: at most two short sentences that say where the item stands. Next step: one sentence for each actor, with who, what and when. Done when: one sentence. Put no hash, id, file name or history in these fields. Evidence is one short line for each fact; designs, reasons and number lists stay in your work record.
+An ETA is the time when the whole item is done: `Mon D HH:MM ZONE` or a date. Without a time, write `No time yet`, `Waiting for nate`, `Paused`, or `Delivered`.
+Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
 Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
 Use `the_list.py update --id L<n>` to update your items.
-Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
+Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, `--add-evidence`, `--title`, or `--done-when`.
 Write no time in `--source`.
 The List is shared. Each item has one producer, who keeps its status, next step, ETA and check time current.
 Add an item for your own work with `the_list.py add --producer <your staff ID> --owner <showrunner staff ID> --title <text> --source <source> --done-when <result that closes it>`. Name what to track, its owner, and the result that closes it.

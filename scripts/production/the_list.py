@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-from scripts.lib import file_lock
+from scripts.lib import conf, file_lock
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
@@ -1370,7 +1370,8 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
     return _update(keeper, identity, changes, source=source).item
 
 
-_PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check", "evidence", "add_evidence")
+_PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check", "evidence", "add_evidence",
+                           "title", "done_when")
 _PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
 
 
@@ -1946,7 +1947,30 @@ def producer_id(members: staff.StaffSnapshot, reference: str) -> staff.StaffId:
     return matches[0].id
 
 
-def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> ItemChanges:
+def _check_cli_text_limits(changes: ItemChanges, add_evidence: str | None) -> None:
+    lengths: list[tuple[str, str, int]] = []
+    for field, value in (("latest_status", changes.get("latest_status")), ("next_step", changes.get("next_step")),
+                         ("done_when", changes.get("done_when"))):
+        if value is not None:
+            lengths.append((f"{field}_max_chars", "--" + field.replace("_", "-"), len(value)))
+    if "evidence" in changes:
+        longest = max(map(len, changes["evidence"].splitlines()), default=0)
+        lengths.append(("evidence_line_max_chars", "--evidence", longest))
+    if add_evidence is not None:
+        lengths.append(("evidence_line_max_chars", "--add-evidence", len(add_evidence)))
+    if not lengths:
+        return
+    settings = conf.read("the_list")
+    for key, option, length in lengths:
+        limit = settings.origin(key, conf.positive_whole)
+        if not isinstance(limit, conf.UsableLiveValue):
+            raise ListError(f"{option} needs a valid {key} in {settings.source}")
+        if length > limit.value:
+            unit = "characters per line" if key == "evidence_line_max_chars" else "characters"
+            raise ListError(f"{option} limit is {limit.value} {unit}. write it for nate: two short sentences")
+
+
+def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot, add_evidence: str | None) -> ItemChanges:
     options = cast(dict[str, object], vars(args))
     changes: ItemChanges = {}
     text_fields: tuple[Literal["title", "unit", "next_step", "latest_status", "evidence", "done_when"], ...] = (
@@ -1985,6 +2009,7 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> Item
         changes["blocked_by"] = tuple(dependencies)
     if isinstance(related_to, list):
         changes["related_to"] = tuple(int(text.removeprefix("L").removeprefix("#")) for text in cast(list[str], related_to))
+    _check_cli_text_limits(changes, add_evidence)
     return changes
 
 
@@ -2119,12 +2144,13 @@ def main(argv: list[str] | None = None) -> int:
                 options = cast(dict[str, object], vars(args))
                 _check_producer_update_fields(key for key, value in options.items()
                                               if value is not None and key not in {"command", "id", "source"})
-                _ = _update(keeper, identity, _cli_changes(args, record), source=source or "",
+                _ = _update(keeper, identity, _cli_changes(args, record, add_evidence), source=source or "",
                             add_evidence=add_evidence or "", assigned_to=caller)
                 return 0
             if source is None:
                 parser.error("update requires --source for morty")
-            changed = _update(keeper, identity, _cli_changes(args, record), source=source, add_evidence=add_evidence or "")
+            changed = _update(keeper, identity, _cli_changes(args, record, add_evidence), source=source,
+                              add_evidence=add_evidence or "")
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper, caller=caller.id)
@@ -2174,7 +2200,7 @@ def main(argv: list[str] | None = None) -> int:
             edit_reviews = link if name == "link" else unlink
             _ = edit_reviews(keeper, identity, resolved, source=source)
         elif name == "add":
-            changes = _cli_changes(args, record)
+            changes = _cli_changes(args, record, add_evidence)
             if assigned_to is not AllItems.INCLUDED and changes.get("producer") != assigned_to:
                 raise ListError(f"To add an item, use --producer {caller.name} or your staff ID.")
             if add_evidence is not None:
