@@ -3258,6 +3258,14 @@ Tests: one row in the existing placement retry test for a busy local refusal wit
 
 Tests: the module passes 24 runs, 8 at a time, with no read of another process's `/proc` entries.
 
+### Phase 44dw — Admission fixtures write their own reply deadline  · status: todo
+**From builds, 2026-11-20 06:18 EST (found by verify, phase 43z).** Before 44dv. Base: main 740aae528. Evidence: /tmp/claude/unit/c48c71f4-70c9-4f7b-b4bb-ce60eed7f1f4/phases/43z/mac_idle_report.md.
+
+1. `buildlog/test_mac_idle.py` failed 1 of 6 runs on main under CPU load. Its fixture (:87) writes only `min_pass_gap_seconds`, so it reads the tunable `query_timeout_seconds=0.5` from config/build_admission.conf:115. A slow fixture reply then empties the waiter list at scripts/buildlog/mac_idle.py:510. Rule: a test never reads a tunable value. The fixture writes its own deadline.
+2. Find every other admission fixture that writes a partial `build_admission.conf` and so reads a tunable from the repository config. Fix it where it lives: one shared fixture writer in admission_test_support that sets every timing key a test depends on, not a copy in each module.
+
+Tests: test_mac_idle.py passes 24 runs, 8 at a time, under CPU load. No admission test reads a timing value from config/build_admission.conf.
+
 ### Phase 44dv — Admission tests run on the Mac, with no skip  · status: todo
 **From builds, 2026-11-20 05:30 EST (found by report).** After the group merges; not urgent. User rule: tests run on the Mac too; no Mac skip.
 
