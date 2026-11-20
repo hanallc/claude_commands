@@ -1731,6 +1731,26 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Order:** after phase 97; writes and reviews now; tests run in the next test slot.
 
+### Phase 99 — A drawn-defect check joins the existing render test of its scene  · status: todo
+**Depends on:** Phase 97
+
+#### Work Order
+
+**Goal:** sdlc, 15:03 EST Nov 20, queue item rendertest. The user approved the rule 2026-11-20 about 15:00 ("yes that's fine"). Evidence: /session/fastest/testplan/report_process.md and report_growth.md. Name: rendertest.
+**Spec:**
+1. A new check for a drawn defect goes into an existing render test of the same scene when one exists.
+2. Make a new render test only when none exists.
+3. The check still reads pixels.
+4. The worker states the measured time of each new test in its summary.
+Fit with the phase 97 test rules: one place for each rule, no copies.
+**Files:** `docs/direct/write_prompt_contract.md` item 6 (`<TestRules>`), `docs/direct/repair_rounds.md` (the drawn-finding lines).
+**Tests:** none; doc wording (test rule P5 item 2).
+**Acceptance gate:** the phase 97 assign launcher test still passes on this tip.
+
+**Workers:** the director writes the doc edit; 1 reviewer.
+
+**Order:** on the phase 97 branch; one hash with phase 97.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
