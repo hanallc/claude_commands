@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.lib.process_start import Started, process_start
+from scripts.lib.process_start import Gone, ProcessStart, Started, Unreadable, process_start
 from scripts.build_queue import landing_test_gate
 from scripts.production.production_doc import ProductionDocument
 from scripts.production import checkpoint_gate, land_queue, land_runs, merge_checkpoint, merge_gate
@@ -67,6 +67,24 @@ class LandRunTests(unittest.TestCase):
         self.assertEqual(land_runs.running_lands(), {"f" * 40: ""})
         self.assertEqual(sorted(path.name for path in folder.iterdir()), ["broken.json", "live.json", "partial.json"])
 
+    def test_record_runner_removes_only_dead_or_replaced_runner_records(self) -> None:
+        folder = land_runs.runners_dir()
+        folder.mkdir()
+        for pid in (100, 101, 102, 103):
+            _ = (folder / f"{pid}.json").write_text(json.dumps({"pid": pid, "start": "10", "commits": []}))
+        lands = land_runs.lands_dir()
+        lands.mkdir()
+        land = lands / "100.json"
+        land_record = json.dumps({"pid": 100, "start": "10", "commits": ["a" * 40]})
+        _ = land.write_text(land_record)
+        starts: dict[int, ProcessStart] = {
+            100: Gone(), 101: Started("11"), 102: Unreadable("permission denied"), 103: Started("10"), 104: Started("12"),
+        }
+        with patch.object(land_runs, "process_start", side_effect=starts.__getitem__):
+            land_runs.record_runner(104)
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), ["102.json", "103.json", "104.json"])
+        self.assertEqual(land.read_text(), land_record)
+
     def test_a_live_record_without_a_reference_does_not_protect_tests(self) -> None:
         start = process_start(os.getpid())
         assert isinstance(start, Started)
@@ -87,6 +105,15 @@ class LandRunTests(unittest.TestCase):
                                  "builds", "--batch", str(batch)], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(str(batch), result.stdout)
+        self.assertIsInstance(landing_test_gate.read(), landing_test_gate.NoProtectedLandingTests)
+
+    def test_close_claim_releases_a_skipped_item_while_the_runner_is_live(self) -> None:
+        land_queue.add("builds skipped", batch="", commits=["a" * 40], first=False, before=None)
+        self.assertEqual(land_queue.take_next(os.getpid()), "builds skipped")
+        self.assertIsInstance(landing_test_gate.read(), landing_test_gate.RunningLandingTests)
+        result = subprocess.run([sys.executable, "-m", "scripts.production.land_queue", "close-claim"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIsInstance(landing_test_gate.read(), landing_test_gate.NoProtectedLandingTests)
 
     def test_a_short_hash_holds_its_full_commit(self) -> None:

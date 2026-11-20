@@ -9,7 +9,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, redirect_stdout
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
 import os
@@ -524,8 +524,7 @@ def held_reservation(request: QueueRequest, *,
 @contextmanager
 def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
                 sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
-                before_check: Callable[[], None] = no_hold_wait,
-                test_command: tuple[str, ...] = ()) -> Generator[QueuePlace]:
+                before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
     """Use full commands for purpose selection; retain named batch reservations.
 
     A complete Cargo command sizes from its step history, as each Cargo step does.
@@ -570,9 +569,7 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                 raise QueuePlaceRefused("owner no longer exists")
             owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
             def refresh() -> wire.AdmitRequest:
-                request = admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar),
-                                                        episode, profile)
-                return replace(request, identity=replace(request.identity, test_command=test_command))
+                return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
             grant = reservation.enter_context(held_reservation(RefreshedRequest(refresh), before_check=before_check))
         sample_path = (Path(grant.grant.max_path).with_suffix("") if isinstance(grant, HeldReservation)
                        else temporary / "program")

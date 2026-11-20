@@ -112,6 +112,8 @@ def record_runner(pid: int) -> None:
     owner = process_start(pid)
     if not isinstance(owner, Started):
         raise ValueError("the land runner has no live process identity")
+    for _ in _active_records(runners_dir(), prune=True):
+        pass
     path = runners_dir() / f"{pid}.json"
     _write_land(path, {"pid": pid, "start": owner.start, "commits": []})
     (_claims_dir() / path.name).unlink(missing_ok=True)

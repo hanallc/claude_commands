@@ -5,10 +5,8 @@ from __future__ import annotations
 from contextlib import nullcontext, redirect_stderr
 from dataclasses import replace
 import io
-import json
 import os
 import subprocess
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -17,12 +15,11 @@ from scripts.build_queue import first_step, memory_feed, placement, queue_place,
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.test_placement import (PlacementFixture, adopt_assignment, assignment_for, consume_permission,
     placement_request, publish_candidate)
-from scripts.buildlog import repository, store, treekey
+from scripts.buildlog import repository
 from scripts.lib import build_folders
 from scripts.lib.process_start import Started
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import write_pressure_reading
-from scripts.production import land_queue, land_runs, staff
+from scripts.production import land_queue, land_runs
 
 
 REPOSITORY = records.RepositoryIdentity("https://github.com/natepiano/claude_commands", "claude_commands")
@@ -93,55 +90,6 @@ class LandingAdmissionTests(unittest.TestCase):
                 self.assertEqual(reply.reason, records.WaitsForLandingTest())
                 self.assertEqual(fixture.caller_reservations(), {})
 
-    def test_a_stopped_test_reclaims_its_queue_time_after_a_newer_waiter(self) -> None:
-        for landing in (True, False):
-            with self.subTest(landing=landing), AdmissionFixture(skip_idle_spacing=True) as fixture:
-                if landing:
-                    queue_land()
-                fixture.hold_starts()
-                old = fixture.request(step="test", need=GIB, since=fixture.clock.now() - 40)
-                old = replace(old, profile=replace(old.profile, repository=REPOSITORY))
-                member = SimpleNamespace(id=staff.StaffId("fixed-test-owner"))
-
-                def staff_member(session: str) -> SimpleNamespace | None:
-                    return member if session in ("old-session", "new-session") else None
-
-                with (patch.object(staff, "local_by_current_session", side_effect=staff_member),
-                      patch.object(treekey, "tree_key", return_value="test-tree")):
-                    old = replace(old, identity=replace(old.identity, session_id="old-session"))
-                    peer = fixture.connect(old)
-                    self.assertIsInstance(peer.replies()[-1], wire.Wait)
-                    if not landing:
-                        boot_file = fixture.proc.path / "sys/kernel/random/boot_id"
-                        boot_file.parent.mkdir(parents=True)
-                        _ = boot_file.write_text("fixture-boot\n")
-                        stop_log = store.root() / store.host_name() / "hold-builds-fixture.jsonl"
-                        stop_log.parent.mkdir(parents=True, exist_ok=True)
-                        _ = stop_log.write_text(json.dumps({"boot_id": "fixture-boot", "action": "stopped",
-                            "pid": old.owner.pid, "proc_start": old.owner.start_time}) + "\n")
-                        os.utime(stop_log, (fixture.clock.now(), fixture.clock.now()))
-                    peer.close()
-                    fixture.end_owner(old.owner)
-                    fixture.restart()
-                    newer = fixture.request(step="test", need=GIB, since=fixture.clock.now() - 2)
-                    newer = replace(newer, profile=old.profile)
-                    new_peer = fixture.connect(newer)
-                    self.assertIsInstance(new_peer.replies()[-1], wire.Wait)
-                    again = fixture.request(step="test", need=GIB)
-                    again = replace(again, profile=old.profile, identity=replace(again.identity, session_id="new-session"))
-                    retry = fixture.connect(again)
-                    self.assertIsInstance(retry.replies()[-1], wire.Wait)
-                    view, = fixture.connect(wire.ViewRequest()).replies()
-                    assert isinstance(view, wire.ViewReply)
-                    self.assertEqual([(row["pid"], row["since"]) for _, row in view.reading.ordered],
-                                     [(again.owner.pid, old.since), (newer.owner.pid, newer.since)])
-                    if landing:
-                        land_queue.remove("builds first")
-                    write_pressure_reading(fixture.root / "pressure")
-                    _ = fixture.run_pass()
-                    self.assertEqual(list(fixture.caller_reservations()), [again.episode])
-                    fixture.release(only_admitted(retry.replies()))
-
     def test_a_relative_local_clone_waits_and_its_repository_is_resolved_once(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:
             source = fixture.root / "source"
@@ -156,16 +104,33 @@ class LandingAdmissionTests(unittest.TestCase):
             workdir = clone / "nested"
             workdir.mkdir()
             queue_land()
-            request = replace(fixture.request(step="test", need=GIB), cwd=str(workdir))
+            owner = fixture.request(step="test", need=GIB)
             with patch.object(repository, "repository_key", wraps=repository.repository_key) as lookup:
+                request = client.step_request(["cargo", "test"], str(workdir), owner.owner, owner.since, "", owner.episode)
+                resolved = lookup.call_count
+                self.assertGreater(resolved, 0)
                 wait, = fixture.connect(request).replies()
                 assert isinstance(wait, wire.Wait)
                 self.assertEqual(wait.reason, records.WaitsForLandingTest())
-                resolved = lookup.call_count
-                self.assertGreater(resolved, 0)
                 _ = fixture.run_pass()
                 _ = fixture.run_pass()
                 self.assertEqual(lookup.call_count, resolved)
+
+    def test_service_protection_never_starts_git(self) -> None:
+        with AdmissionFixture(skip_idle_spacing=True) as fixture:
+            git("init", "-q", str(fixture.root))
+            git("-C", str(fixture.root), "remote", "add", "origin", REPOSITORY.key)
+            queue_land()
+            known = fixture.request(step="test", need=GIB)
+            known = replace(known, cwd=str(fixture.root), profile=replace(known.profile, repository=REPOSITORY))
+            unknown = replace(fixture.request(step="test", need=GIB), cwd=str(fixture.root))
+
+            with patch("scripts.build_queue.admission_service.subprocess.Popen",
+                       side_effect=AssertionError("service started a subprocess while deciding landing protection")):
+                wait, = fixture.connect(known).replies()
+                assert isinstance(wait, wire.Wait)
+                self.assertEqual(wait.reason, records.WaitsForLandingTest())
+                fixture.release(only_admitted(fixture.connect(unknown).replies()))
 
     def test_four_older_tests_wait_and_keep_their_order_after_the_land(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:

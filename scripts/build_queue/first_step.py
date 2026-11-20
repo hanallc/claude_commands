@@ -164,7 +164,7 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
             break
     def refresh() -> wire.AdmitRequest:
         request = client.step_request(arguments, str(source), owner, position.since, '', position.episode, profile, run=run)
-        return replace(request, identity=replace(request.identity, job=job, test_command=tuple(command)))
+        return replace(request, identity=replace(request.identity, job=job))
     output = client.WaitOutput()
     answer = queue_place.request_place(queue_place.RefreshedRequest(refresh), output)
     if isinstance(answer, wire.Refused):

@@ -14,7 +14,6 @@ Usage:
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
@@ -23,11 +22,14 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import land_runs, waits_on
+from scripts.production import land_runs
+
+if TYPE_CHECKING:
+    import argparse
 
 HASH = re.compile(r"[0-9a-f]{7,40}")
 
@@ -178,6 +180,8 @@ def place_of(line: dict[str, Place], commit: str) -> Place | None:
 
 def land_view(repo: Path) -> LandView:
     """Read the lands; one git call for each listed commit finds the commits it carries."""
+    from scripts.production import waits_on
+
     running, line = land_runs.running_lands(), places()
     carried_running = frozenset(commit for listed in running for commit in waits_on.carried(repo, listed))
     carried_line: dict[str, Place] = {}
@@ -289,6 +293,8 @@ def listing() -> str:
 
 
 def parser() -> argparse.ArgumentParser:
+    import argparse
+
     root = argparse.ArgumentParser(description="Keep the line of checkpoint lands.")
     commands = root.add_subparsers(dest="command", required=True)
     added = commands.add_parser("add", help="add an item to the end of the line, or at a named place")
@@ -310,17 +316,18 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-class Arguments(argparse.Namespace):
-    command: str = ""
-    label: str = ""
-    batch: str = ""
-    commit: list[str] | None = None
-    first: bool = False
-    before: str | None = None
-    claimant: int = 0
-
-
 def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    class Arguments(argparse.Namespace):
+        command: str = ""
+        label: str = ""
+        batch: str = ""
+        commit: list[str] | None = None
+        first: bool = False
+        before: str | None = None
+        claimant: int = 0
+
     args = parser().parse_args(argv, namespace=Arguments())
     try:
         match args.command:

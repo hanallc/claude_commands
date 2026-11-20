@@ -5,13 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from scripts.build_queue import admission_records as records, admission_wire as wire
-from scripts.buildlog import repository
-from scripts.lib import git_files
+from scripts.build_queue import admission_wire as wire
 from scripts.production import land_queue, land_runs
 
 
-_REPOSITORY = "https://github.com/natepiano/claude_commands"
+REPOSITORY_KEY = "https://github.com/natepiano/claude_commands"
 TEST_STEPS = frozenset({"merge-gate", "targeted-test", "test", "t", "nextest"})
 
 
@@ -71,35 +69,3 @@ class PassProtection:
             self.revision = revision
             self.protected = read()
         return self.protected
-
-
-def request_folder(request: TestRequest) -> str:
-    if isinstance(request, wire.AdmitRequest):
-        return request.cwd
-    if isinstance(request, wire.PlacementRequest) and isinstance(request.local, wire.LocalAdmissionContext):
-        return request.local.cwd
-    return request.profile.worktree
-
-
-def is_test_repository(source: records.RepositoryIdentity | records.UnknownRepository, folder: str) -> bool:
-    if isinstance(source, records.RepositoryIdentity) and "://" in source.key:
-        return source.key == _REPOSITORY
-    if not Path(folder).is_absolute():
-        return False
-    seen: set[Path] = set()
-    while True:
-        try:
-            checkout = git_files.locate(Path(folder))
-            origin = Path(repository.source_git_dir(str(checkout.common_dir)))
-            root = origin.parent if origin != checkout.common_dir else checkout.toplevel
-            if root in seen:
-                return False
-            seen.add(root)
-            key = repository.repository_key(str(root))
-            if key == _REPOSITORY:
-                return True
-            if not Path(key).is_absolute():
-                return False
-            folder = key if Path(key).is_dir() else key + ".git"
-        except (OSError, ValueError):
-            return False

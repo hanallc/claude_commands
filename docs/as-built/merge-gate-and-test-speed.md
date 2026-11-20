@@ -723,8 +723,9 @@ The runner takes each item with `next` under the line lock.
 The merge command binds the claim before it validates its arguments and closes it on exit.
 The running land replaces the claim when it registers the commits.
 Admission checks the runner and the merge command against their process start times.
-The runner can call `close-claim` before it puts a skipped item in `held.txt`.
+Call `lq close-claim` in the runner before it puts a skipped item in `held.txt`.
 The next dequeue also closes the previous claim.
+A runner record write removes records for dead or replaced runners.
 Admission ignores the paused entries in `held.txt`.
 The units board reads the line to show `<Nth> in line` for a checkpoint that waits to land.
 

@@ -172,7 +172,7 @@ class CargoLifetimeTests(unittest.TestCase):
                         self.assertTrue(Path(record.sidecar).parent.name.startswith(
                             f"{prefix}{child.pid}-{record.owner.start_time}-"))
                 os.kill(int(str(data["pid"])), signal.SIGUSR1)
-                output, errors = child.communicate(timeout=8)
+                output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(child.returncode, 0, output + errors)
                 paths, temporary, module_path = calls.read_text().splitlines()
                 self.assertNotIn(str(front_dir), paths.split(os.pathsep))

@@ -373,8 +373,7 @@ def cloud_reservation(repo: Path, sidecar: Path, work: gate.SuiteMode | StepJob,
     def refresh() -> wire.AdmitRequest:
         request = admission_client.step_request([step], str(repo), owner, since, str(sidecar), episode,
             profile, run=wire.RunIdentity(pid, start))
-        identity = replace(request.identity, job=job, test_command=(step, *sys.argv[1:]))
-        return replace(request, place=wire.CloudPlace('aws', group), identity=identity)
+        return replace(request, place=wire.CloudPlace('aws', group), identity=replace(request.identity, job=job))
     with ExitStack() as held_slot:
         try:
             held = held_slot.enter_context(queue_place.held_reservation(queue_place.RefreshedRequest(refresh)))

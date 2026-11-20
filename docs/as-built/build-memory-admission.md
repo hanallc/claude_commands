@@ -31,18 +31,18 @@ Markers for other queues, dead holders, reused pids, and released reservations d
 
 The land line protects checkpoint work while its runner lives.
 A live dequeue claim or a live landing with a test reference also protects checkpoint work.
-An older landing record without a test reference keeps its previous behavior.
+Enable this change between lands.
+A land that started before this change does not hold tests.
 Admission holds `claude_commands` requests for `merge-gate`, `targeted-test`, `test`, `t`, and `nextest` during protection.
 A `LandingTestReference` in the request permits tests for its live land.
 The copy wrapper registers the landing before its first admission and passes the reference to its child.
-The service resolves a test's repository once per request and follows relative local origins from the clone root.
+The client sends the repository key and resolves relative local origins from the clone root.
+The service compares repository keys.
+Requests without a key are outside this rule.
 Each pass reads protection and checks file revisions before local and cloud grants.
 The service also checks protection before it consumes permission to start a routed assignment.
-A held test stays in the queue and shows `waits for the merge test`.
+A held test keeps its queue time and shows `waits for the merge test`.
 It cannot become the head, retain a continuation slot, or cause a head stall alert.
-The service restores the queue time after a stop when the staff ID, tree, and command match.
-It uses the last landing wait or a confirmed build hold stop from this boot.
-The existing replay retention limits how long the service keeps orders for ended processes.
 
 ### Installed writers and private test state
 

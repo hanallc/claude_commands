@@ -4886,10 +4886,10 @@ class ServiceTests(unittest.TestCase):
                       chosen.identity.session_id: UnitLabels("chosen", unit="urgent")}
             admit = cast(Callable[..., None], getattr(fixture.server, "_admit"))
 
-            def admit_and_change_labels(waiters: list[service.WaitingAdmission], config: records.MemoryConfig,
-                                        share_percent: int, *,
-                                        cargo_folder: placement.CargoFolder | placement.NoCargoFolder) -> None:
-                admit(waiters, config, share_percent, cargo_folder=cargo_folder)
+            def admit_and_change_labels(waiters: list[service.WaitingAdmission],
+                                        prepared: list[service.ReservationRecord | wire.LaunchAdmitted],
+                                        config: records.MemoryConfig) -> None:
+                admit(waiters, prepared, config)
                 labels[older.identity.session_id] = UnitLabels("older", unit="urgent")
                 labels[chosen.identity.session_id] = UnitLabels("chosen", unit="other")
                 del fixture.server.waiters[removed.episode]

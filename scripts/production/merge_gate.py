@@ -455,7 +455,7 @@ def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait, *,
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
     try:
         program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
-        with queue_place(program, repo, test_command=(mode.value, *sys.argv[1:]),
+        with queue_place(program, repo,
                          before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
             yield place
     except QueuePlaceRefused as error:

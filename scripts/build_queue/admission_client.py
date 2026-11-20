@@ -1194,37 +1194,64 @@ def verify_call() -> records.VerifyStep:
     return records.NotVerifyCall()
 
 
+def _local_origin_key(directory: str, key: str) -> str:
+    """Resolve a local origin from its checkout root."""
+    from scripts.buildlog import repository
+    from scripts.lib import git_files
+
+    seen: set[Path] = set()
+    while Path(key).is_absolute():
+        try:
+            checkout = git_files.locate(Path(directory))
+            common = checkout.common_dir
+            source = Path(repository.source_git_dir(str(common)))
+            root = checkout.toplevel if source == common else source.parent
+            if root in seen:
+                break
+            seen.add(root)
+            key = repository.repository_key(str(root))
+            directory = key
+        except (OSError, ValueError):
+            break
+    return key
+
+
 def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sidecar: str,
                  episode: str, profile: records.InferFromArgv | wire.Profile | InferProfileAtUse = INFER_PROFILE_AT_USE,
                  *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
                  ) -> wire.AdmitRequest:
     from scripts.build_queue import landing_test_gate, step_estimator, admission_records as records
-    from scripts.buildlog import repository, store
+    from scripts.buildlog import record, repository, store
 
     if isinstance(run, wire.NoRun):
         run = parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
     if isinstance(profile, InferProfileAtUse):
         profile = records.INFER_FROM_ARGV
-    if (isinstance(profile, records.ProgramProfile) and profile.step in landing_test_gate.TEST_STEPS
-            and isinstance(profile.repository, records.UnknownRepository)):
-        key = repository.repository_key(cwd)
-        if key != store.UNKNOWN_IDENTITY:
-            profile = replace(profile, repository=records.RepositoryIdentity(key, key.rsplit("/", 1)[-1]))
     config = records.read_memory_config()
     estimate = step_estimator.step_estimate(argv, cwd, profile, lambda: datetime.fromtimestamp(CLOCK.now(), UTC),
                                   store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
                                   build_history_generation=lambda: build_history_generation(config))
+    request_profile = estimate.profile
+    if request_profile.step in landing_test_gate.TEST_STEPS:
+        source = request_profile.repository
+        key = source.key if isinstance(source, records.RepositoryIdentity) else store.UNKNOWN_IDENTITY
+        if isinstance(request_profile, records.ProgramProfile) and isinstance(source, records.UnknownRepository):
+            key = repository.repository_key(cwd)
+        if Path(key).is_absolute():
+            key = _local_origin_key(record.git_directory(argv, cwd), key)
+        if key != store.UNKNOWN_IDENTITY and (isinstance(source, records.UnknownRepository) or key != source.key):
+            request_profile = replace(request_profile, repository=records.RepositoryIdentity(key, key.rsplit("/", 1)[-1]))
     width_value = records.test_threads(argv)
     width_value = width_value or (int(os.environ["NEXTEST_TEST_THREADS"]) if os.environ.get("NEXTEST_TEST_THREADS", "").isdecimal() else None)
     width_value_typed: records.TestWidth = (records.RequestedTestWidth(width_value) if width_value else
-        records.UnspecifiedTestWidth() if estimate.profile.step == "nextest" else records.NoTestWidth())
+        records.UnspecifiedTestWidth() if request_profile.step == "nextest" else records.NoTestWidth())
     call = os.environ.get("BUILDLOG_CALL_ID", "")
-    identity = replace(step_identity(estimate.profile.step, estimate.profile.worktree), verify=verify_call())
-    if isinstance(estimate.profile, records.ProgramProfile):
-        identity = replace(identity, folder=estimate.profile.worktree)
+    identity = replace(step_identity(request_profile.step, request_profile.worktree), verify=verify_call())
+    if isinstance(request_profile, records.ProgramProfile):
+        identity = replace(identity, folder=request_profile.worktree)
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,
         identity,
-        records.CallRecord(call) if call else records.NoCallRecord(), width_value_typed, estimate.profile,
+        records.CallRecord(call) if call else records.NoCallRecord(), width_value_typed, request_profile,
         isinstance(estimate.cache, records.FreshTest), float(os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT", "0")), run,
         route=records.direct_cargo_route())
 
