@@ -1482,7 +1482,7 @@ window.fetch=(url,options)=>{
    'An Open item opens directly from its key.');
   check(document.querySelectorAll('[data-list-item]').length<=100,'The first window mounts at most 100 summaries.');
   const firstToggle=row('page-owner/C399').querySelector('.list-toggle');
-  const secondToggle=document.querySelector('.list-toggle[aria-expanded="false"]');
+  const secondToggle=row('page-owner/C381').querySelector('.list-toggle');
   secondToggle.click();
   check(firstToggle.getAttribute('aria-expanded')==='false' && secondToggle.getAttribute('aria-expanded')==='true',
    'Opening the second Review row closes the first row.');
@@ -1828,8 +1828,11 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
                 server.shutdown()
                 thread.join(5)
         self.assertEqual(results,[[]])
-        self.assertEqual(set(requested_bodies), {'page-owner/C399', key, 'page-owner/C2', 'page-owner/C4', 'page-owner/C6'},
-                         'Only opened keys request a body.')
+        self.assertEqual(
+            set(requested_bodies),
+            {'page-owner/C399', 'page-owner/C381', key, 'page-owner/C2', 'page-owner/C4', 'page-owner/C6'},
+            'Only opened keys request a body.',
+        )
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_tab_reaches_adjacent_rows_after_a_distant_scroll(self) -> None:
