@@ -3291,6 +3291,21 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual([path.name for path in (self.root / "queue").iterdir()], ["session-recipient.jsonl"])
         self.assertEqual((self.log()[-1]["via"], self.log()[-1]["postmaster"]), ("relay", "failed"))
 
+    def test_unwritten_relay_mismatch_refuses_and_releases_the_send_key(self) -> None:
+        self.session("recipient", "Recipient")
+        options = local_options(["--to", "session:recipient", "--from", "Sender", "--key", "notice",
+                                 "--repeat-minutes", "30", "--text", "body"])
+        events = stream(INIT, call("changed body"), answer(OK))
+        result = send.read_relay(
+            send.RelayTransportResponse(0, events, "", RELAY_FIXTURE_TARGET, send.RelayRequestNotForwarded()), "body")
+        with mock.patch.object(send, "relay", side_effect=(result, self.outcome)) as relay:
+            first = send.send(options)
+            self.assertIsInstance(first, send.RefusedRelayRequest)
+            self.assertEqual(first, send.RefusedRelayRequest("refused", "SendMessage used a different target or payload"))
+            self.assertEqual(self.claims("notice"), {})
+            self.assertEqual(send.send(options).outcome, "sent")
+            self.assertEqual(relay.call_count, 2)
+
     def test_queued_relay_reports_recipient_that_exits_during_delivery(self) -> None:
         self.session("recipient", "Recipient")
         def relay(message: send.Message, timeout: float) -> send.Result:
