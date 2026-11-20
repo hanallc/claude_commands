@@ -283,6 +283,24 @@ names.test-all=fixture all
             cost = next(cost for cost in reversed(merge.cost_steps) if cost.start.includes(ratio))
             self.assertEqual(cost.extra_usd_per_month, step.extra_usd_per_month)
 
+    def test_live_cost_uses_the_end_ranges_for_host_overrides(self) -> None:
+        path = self.configuration.gate.source
+        config = path.read_text()
+        for value in ('0.99', '12'):
+            with self.subTest(value=value), mock.patch('socket.gethostname', return_value='fixture-host'):
+                _ = path.write_text(f'{config}\nfaster_box_max_cost_ratio.fixture-host={value}\n')
+                self.configuration = replace(self.configuration, gate=conf.read(path))
+                data = self.read()
+                job = data.workloads[0]
+                total = data.total
+                assert isinstance(job, machines_data.MeasuredWorkload)
+                assert isinstance(total, machines_data.AllJobsProjection)
+                self.assertEqual(job.live_ratio, Decimal(value))
+                self.assertGreater(job.cost_steps[-1].extra_usd_per_month, 0)
+                expected = Decimal(0) if value == '0.99' else job.cost_steps[-1].extra_usd_per_month
+                self.assertEqual(job.live_extra_usd_per_month, expected)
+                self.assertEqual(total.live_extra_usd_per_month, expected)
+
     def test_removed_deployment_region_stays_measured_and_leaves_the_projection(self) -> None:
         self.write_deployment(SMALL.region, FASTER.region)
         merge = self.merge()

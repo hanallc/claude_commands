@@ -359,6 +359,30 @@ void fetch('/probe?result=' + encodeURIComponent(passed ? 'passed' : JSON.string
                 self.browser(markup, probe)
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for the Machines page checks')
+    def test_browser_uses_the_end_costs_for_live_ratios_outside_the_ranges(self) -> None:
+        data = fixture_data()
+        job = data.workloads[0]
+        assert isinstance(job, machines_data.MeasuredWorkload)
+        for live, selected, extra, change in (
+                ('0.99', 1.0, '0.00', '+$14.14'), ('12', 3.0, '15.10', '-$0.96')):
+            with self.subTest(live=live):
+                workload = replace(job, live_ratio=D(live), live_extra_usd_per_month=D(extra))
+                markup = machines_page.render(replace(data, workloads=(workload, *data.workloads[1:])), NOW)
+                expected = [selected, f'${extra}', f'${extra}',
+                            f'Change from {live} to 1.25. gate {change} a month. Total {change} a month.']
+                probe = """<script>
+const input = document.getElementById('cost-limit-value');
+const initial = [input.valueAsNumber, document.getElementById('extra-cost').textContent,
+                 document.querySelector('[data-job-extra]').textContent];
+input.value = '1.25';
+input.dispatchEvent(new Event('input', {bubbles:true}));
+document.querySelector('[data-setting-go]').click();
+const actual = JSON.stringify([...initial, document.querySelector('[data-setting-summary]').textContent]);
+void fetch('/probe?result=' + encodeURIComponent(actual === JSON.stringify(EXPECTED) ? 'passed' : actual));
+</script>""".replace('EXPECTED', json.dumps(expected))
+                self.browser(markup, probe)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for the Machines page checks')
     def test_browser_uses_the_off_step_live_ratio_from_a_tune_reply(self) -> None:
         data = fixture_data()
         workload = data.workloads[0]

@@ -519,8 +519,9 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
     steps = _steps(ranked_rows, types, ratios, reference, choices, monthly_checks)
     cost_steps = _cost_steps(ranked_rows, types, choices, reference.estimate.aws_spend_usd, monthly_checks)
     live_ratio = gate.value('faster_box_max_cost_ratio', conf.decimal)
-    live = Fraction(live_ratio)
-    live_extra = next(step.extra_usd_per_month for step in reversed(cost_steps) if step.start.includes(live))
+    live = Fraction(max(live_ratio, _RULE_OFF))
+    live_extra = next((step.extra_usd_per_month for step in reversed(cost_steps) if step.start.includes(live)),
+                      cost_steps[0].extra_usd_per_month)
     return MeasuredWorkload(name, mode, tuple(choices.values()),
         ledger.GateRateCandidate(reference.variant.instance_type, reference.variant.region), checks,
         monthly_checks, reference.estimate.aws_spend_usd * monthly_checks, concurrency,

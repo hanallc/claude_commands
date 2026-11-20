@@ -115,7 +115,7 @@ if (model) {
  const jobStep = (job, ratio) => job.steps.findLast(step => step.first_ratio <= ratio);
  const monthlyCeiling = item => (item.ceiling_cents / 100).toFixed(2);
  function liveCost(steps) {
-  const match = /^(\+?\d+)(?:\.(\d*))?$/.exec(slider.liveText);
+  const match = /^([+-]?\d+)(?:\.(\d*))?$/.exec(slider.liveText);
   if (!match) return undefined;
   const [, whole, fraction = ''] = match;
   const numerator = BigInt(whole + fraction);
@@ -124,7 +124,7 @@ if (model) {
    const live = numerator * BigInt(step.denominator);
    const start = BigInt(step.numerator) * denominator;
    return step.exclusive ? live > start : live >= start;
-  })?.extra_cents;
+  })?.extra_cents ?? steps[0].extra_cents;
  }
  const go = pageSettingControls.connectGo(goRoot, slider, amount, () => ({
   newValue:slider.format(slider.value),
