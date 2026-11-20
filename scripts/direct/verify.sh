@@ -2835,9 +2835,10 @@ placement_once() {
     local token=none reply line route="" status=0 monitor=0 refresh_source=${1:-0}
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
+    local parent_run=${BUILDLOG_RUN:-}
     # A step with its own slot can leave its grant without a memory handoff.
-    local BUILDLOG_RUN=${BUILDLOG_RUN:-}
-    if [[ -n "${COPIES_STEP_SOURCE:-${VERIFY_SLOT_SOURCE:-}}" ]]; then BUILDLOG_RUN=""; fi
+    local BUILDLOG_RUN=$parent_run
+    if [[ -n "${VERIFY_SLOT_SOURCE:-}" ]]; then BUILDLOG_RUN=""; fi
     export BUILDLOG_RUN
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
@@ -2892,7 +2893,7 @@ placement_once() {
         PLACEMENT_ASSIGNMENT_FILE="$BUILDLOG_FIRST_STEP_ASSIGNMENT"
         IFS=$'\t' read -r PLACEMENT_PROVIDER STEP_ASSIGNED_TARGET STEP_ASSIGNED_HOST STEP_ASSIGNED_SLOT \
             PLACEMENT_EPISODE PLACEMENT_ATTEMPT <<< "$BUILDLOG_FIRST_STEP_ROUTE"
-        PLACEMENT_OWNER_PID="${BUILDLOG_RUN%%:*}"
+        PLACEMENT_OWNER_PID="${parent_run%%:*}"
         PLACEMENT_SINCE="$BUILDLOG_FIRST_STEP_SINCE"
         export BUILDLOG_PLACEMENT_EPISODE="$PLACEMENT_EPISODE"
         unset BUILDLOG_FIRST_STEP_ASSIGNMENT BUILDLOG_FIRST_STEP_ROUTE BUILDLOG_FIRST_STEP_SINCE
