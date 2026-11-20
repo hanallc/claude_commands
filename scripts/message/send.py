@@ -776,6 +776,10 @@ class WorkerResultUnconfirmed(Result):
     """The prompt may have sent input, and the transcript receipt is missing."""
 
 
+class BlockedWorkerResult(Result):
+    """The worker needs input, and the result must wait for the pane."""
+
+
 class RecordedDeliveryAcceptance(Result):
     """This keyed send has durable acceptance; later bookkeeping must not repeat it."""
 
@@ -5077,8 +5081,11 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:
                 reason = f"worker is {state.status.value}"
-                if isinstance(receipt, WorkerResultReceipt) and state.status != herdr.AgentStatus.BLOCKED:
-                    return Result("retry", reason)
+                if isinstance(receipt, WorkerResultReceipt):
+                    if state.status != herdr.AgentStatus.BLOCKED or worker_only:
+                        return Result("retry", reason)
+                    if allow_holder_fallback and not isinstance(selection, FixedStaffLookup):
+                        return BlockedWorkerResult("retry", reason)
         elif state is None:
             reason = "worker observation is unavailable"
         elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):

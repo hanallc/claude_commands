@@ -133,6 +133,7 @@ class RunRecord(StopFields):
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
     delivered_at: NotRequired[float]
+    blocked_notice_accepted: NotRequired[Literal[True]]
     # Set when the run ended without its supervisor: "supervisor gone".
     completion_pending: NotRequired[bool]
     ended: NotRequired[str]
@@ -304,7 +305,8 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                     and ("delivered_at" not in raw or type(raw["delivered_at"]) in (int, float))
                     and ("completion_pending" not in raw or isinstance(raw["completion_pending"], bool))
                     and all(key not in raw or raw[key] is True
-                            for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded"))
+                            for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded",
+                                        "blocked_notice_accepted"))
                     and ("pane_dispatch_id" not in raw or isinstance(pane_dispatch, str)
                          or (isinstance(pane_dispatch, dict)
                              and isinstance(cast(dict[str, object], pane_dispatch).get("unavailable"), str))))
@@ -976,6 +978,7 @@ DEFERRED_WORKER_RESULT = "deferred: "
 FAILED_WORKER_SUBMISSION = "submission failed: "
 UNCONFIRMED_WORKER_RESULT = "unconfirmed: "
 WORKER_INPUT_CHECKPOINT = UNCONFIRMED_WORKER_RESULT + "the prompt may have sent input"
+BLOCKED_WORKER_NOTICE_REPEAT_MINUTES = 52_596_000
 
 
 def _worker_result_pending(delivery: str) -> bool:
@@ -1575,8 +1578,15 @@ def deliver(record: RunRecord, result: CommandResult, *,
                     return _save_delivery(path, DEFERRED_WORKER_RESULT + "the resumed worker is unavailable")
                 worker = resumed
                 receipt = replace(receipt, worker_only=True)
-            delivery = send.deliver_worker_text(worker, membership, marker + "\n" + result_message(record, result),
-                sender="detached-runs", timeout=send_budget.seconds(), reason=reason, receipt=receipt)
+            text = marker + "\n" + result_message(record, result)
+            timeout = send_budget.seconds()
+            delivery = send.deliver_worker_text(worker, membership, text,
+                sender="detached-runs", timeout=timeout, reason=reason, receipt=receipt)
+            if isinstance(delivery, send.BlockedWorkerResult):
+                if not _cancels_pass(record):
+                    return _defer_blocked_worker_result(path, worker, membership, delivery.detail)
+                delivery = send.deliver_worker_text(worker, membership, text,
+                    sender="detached-runs", timeout=timeout, reason=delivery.detail, receipt=receipt)
         except _WorkerPassDeliveryBlocked as blocked:
             status = str(blocked)
             if unconfirmed and status not in (OTHER_PASS_DELIVERY, COVERED_BY_DONE):
@@ -1595,6 +1605,40 @@ def deliver(record: RunRecord, result: CommandResult, *,
             if target is WorkerResultTarget.DIRECTOR:
                 saved_delivery = INTERRUPTED_PASS_DELIVERY + saved_delivery
         return _save_delivery(path, saved_delivery)
+
+
+def _defer_blocked_worker_result(path: Path, worker: staff.StaffRow, membership: staff.StaffSnapshot,
+                                 reason: str) -> str:
+    """Keep the result pending and send a separate notice to the holder."""
+    from scripts.message import send
+
+    deferred = DEFERRED_WORKER_RESULT + reason
+    with record_lock(path):
+        record = _read_record(path)
+        record["delivery"] = deferred
+        record["completion_pending"] = True
+        write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+    if record.get("blocked_notice_accepted"):
+        return deferred
+    holder = membership.parent_of(worker)
+    assert holder is not None
+    address = f"session:{holder.current_session}"
+    label = send.one_line(record["label"], limit=80)
+    notice = f"Worker {worker.name}: needs input. The result for {label} waits.\n{path}"
+    options = send.parse(["--here", "--to", address, "--from", "detached-runs",
+                          "--timeout", str(send_budget.seconds()), "--text", notice,
+                          "--key", f"detached-run-blocked:{record['run_id']}",
+                          "--recipient-key", f"staff:{holder.id}",
+                          "--repeat-minutes", str(BLOCKED_WORKER_NOTICE_REPEAT_MINUTES)])
+    sent = send.send(options._replace(selection=send.WorkerHolderRecipient(address, holder.id)))
+    if sent.outcome in ("sent", "queued", "skipped"):
+        with record_lock(path):
+            record = _read_record(path)
+            record["blocked_notice_accepted"] = True
+            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+    else:
+        print(f"detached_runs: {record['run_id']}: blocked worker notice {sent.outcome}: {sent.detail}", file=sys.stderr)
+    return deferred
 
 
 def _save_delivery(path: Path, delivery: str) -> str:

@@ -4137,10 +4137,56 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assert_holder_result(self.record(row), "duplicate native identities")
 
     def test_blocked_worker_result_reaches_its_holder(self) -> None:
+        _ = self.enterContext(patch.object(send, "STATE", self.fixture.root / "messages"))
         row = self.fixture.worker()
-        self.fixture.world.add(row, "w1:p1")
-        self.fixture.world.locations["w1:p1"]["agent_status"] = "blocked"
-        self.assert_holder_result(self.record(row), "worker is blocked")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane)
+        self.fixture.world.locations[pane]["agent_status"] = "blocked"
+        record = self.record(row)
+        path = Path(record["log"]).with_suffix(".json")
+
+        self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved.get("status"), "finished")
+        self.assertEqual(saved.get("delivery"), "deferred: worker is blocked")
+        self.assertIs(saved.get("completion_pending"), True)
+        self.assertNotIn("delivered_at", saved)
+        self.assertEqual(self.inputs, [])
+        (target, notice), = self.notices
+        self.assertEqual(target, f"session:{self.fixture.parent.current_session}")
+        self.assertIn(f"Worker {row.name}:", notice)
+        self.assertIn("needs input", notice)
+        self.assertIn(record["label"], notice)
+        self.assertIn(str(path), notice)
+        self.assertNotIn("private verification output", notice)
+
+        for status, manual in (("blocked", True), ("working", False), ("blocked", False)):
+            with self.subTest(status=status, manual=manual):
+                self.fixture.world.locations[pane]["agent_status"] = status
+                if manual:
+                    self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+                else:
+                    self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                saved = worker_lifecycle.read_json_object(path)
+                self.assertEqual(saved.get("delivery"), f"deferred: worker is {status}")
+                self.assertIs(saved.get("completion_pending"), True)
+                self.assertNotIn("delivered_at", saved)
+                self.assertEqual(self.inputs, [])
+                self.assertEqual(self.notices, [(target, notice)])
+
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        (destination, text), = self.inputs
+        self.assertEqual(destination, pane)
+        self.assertIn(f"Detached run: {record['run_id']}", text)
+        self.assertIn("private verification output", text)
+        self.assertEqual(self.notices, [(target, notice)])
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved.get("delivery"), f"sent: worker {row.name} at {pane}")
+        self.assertIn("delivered_at", saved)
+        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
+        self.assertEqual(self.inputs, [(destination, text)])
 
     def test_unreadable_transcript_result_reaches_its_holder_without_input(self) -> None:
         row = self.fixture.worker(family="codex")
