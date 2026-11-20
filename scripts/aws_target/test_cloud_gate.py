@@ -42,7 +42,7 @@ from scripts.build_targets import target_config
 from scripts.production import affected_modules
 from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
-from scripts.lib import conf
+from scripts.lib import bubble_wrapped_tests, conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
@@ -1667,6 +1667,17 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
     def test_aws_outage_before_launch_allows_fallback(self) -> None:
         self.fake.upload_error = 'EndpointConnectionError'
         self.assertEqual(self.execute()['status'], 'fallback')
+        self.assertEqual(self.fake.launches, [])
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent(int(self.now)))
+
+    def test_invalid_bubblewrap_path_returns_a_named_fallback(self) -> None:
+        configuration = self.root / 'bubble_wrapped_tests.conf'
+        _ = configuration.write_text('bubblewrap=/usr/bin/bwrap\n')
+        with mock.patch.object(bubble_wrapped_tests, 'CONFIG', configuration):
+            outcome = self.execute()
+
+        self.assertEqual(outcome['status'], 'fallback')
+        self.assertIn('/usr/bin/bwrap', ledger.text(outcome, 'reason'))
         self.assertEqual(self.fake.launches, [])
         self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent(int(self.now)))
 

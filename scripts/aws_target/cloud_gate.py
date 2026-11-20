@@ -37,7 +37,7 @@ from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOU
 from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.buildlog import store
-from scripts.lib import conf, git_index
+from scripts.lib import bubble_wrapped_tests, conf, git_index
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.process_start import process_start, Started, Unreadable
 from scripts.lib.atomic_file import write_text_atomic
@@ -1008,7 +1008,8 @@ class GateWorker:
                     self.terminate(attempt, instance, result_seen_at=result_seen_at)
                     interruption_confirmed = bool(interruption_code)
             return {'status': 'complete', 'instance': instance, 'result_file': RESULT_FILE}
-        except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError,
+                bubble_wrapped_tests.BubblewrapUnavailable) as error:
             launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
             # Saved arguments mean AWS may have accepted the launch; a saved variant alone does not.
             if 'arguments' not in launch:
