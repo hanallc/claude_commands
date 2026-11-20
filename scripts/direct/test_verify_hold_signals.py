@@ -22,6 +22,7 @@ from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     WaitObservation,
     read_cycle_file,
+    wait_for_verify_state,
 )
 
 
@@ -149,8 +150,10 @@ read -r command
         history = self.record_phase()
         self.hold_after_first_step()
         observation = self.observe_waits()
+        ready = self.observe_step_hold_waiter()
         process = self.start("final")
-        _ = self.wait_for_call(process)
+        self.wait_for_call(process)
+        wait_for_verify_state(ready.exists, ready.parent, process, "the step hold waiter started")
         process.send_signal(signal.SIGTERM)
         code, output = self.finish(process)
         self.assertEqual(code, 143, output)

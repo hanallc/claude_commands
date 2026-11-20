@@ -42,7 +42,7 @@ from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import inotify
 from scripts.lib.build_folders_test_support import tool_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.shell_test_support import shell_function, shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -622,7 +622,6 @@ if sys.argv[1:2] == ["call"]:
     holders.mkdir(exist_ok=True)
     from datetime import datetime
     now = datetime.now().astimezone().isoformat()
-    (holders / "hana").write_text(json.dumps({"holder": "hana", "since": now, "for": "between steps", "release_eta": "unknown"}))
     release = Path(os.environ["BUILD_HOLD_RELEASE_DIR"])
     cycle_id = "c" * 32
     (release / cycle_id).mkdir(parents=True, exist_ok=True)
@@ -631,6 +630,28 @@ if sys.argv[1:2] == ["call"]:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps({"id": cycle_id, "opened_at": now, "release_started_at": "", "holders": {"hana": {"since": now, "released_at": ""}}, "recipients": {}, "entries": []}))
     os.replace(temporary, path)
+    temporary = root / "pending-hold"
+    temporary.write_text(json.dumps({"holder": "hana", "since": now, "for": "between steps", "release_eta": "unknown"}))
+    os.replace(temporary, holders / "hana")
 if arguments[:1] == ["metadata"]:''',
         )
         self.fixture.write_executable(cargo, source)
+
+    def observe_step_hold_waiter(self) -> Path:
+        """Mark the step wait after verify saves the waiter's PID."""
+        ready = self.fixture.root / "step-hold-ready"
+        script = self.fixture.verify_script
+        source = script.read_text()
+        function = shell_function(source, "wait_for_placement")
+        launch = '    "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT"'
+        wait = '    wait "$HOLD_WAITER_PID" || true'
+        assert function.count(launch) == function.count(wait) == 1
+        held = '    if [[ "$PHASE_RESOURCE_WAIT" == "natedev:build hold" ]]; then\n'
+        observed = function.replace(launch, held + '        local BUILD_TARGETS_POLL_S=$TEST_STEP_HOLD_GUARD\n    fi\n' + launch)
+        observed = observed.replace(wait, held + '        : > "$TEST_STEP_HOLD_READY"\n    fi\n' + wait)
+        self.fixture.write_executable(script, source.replace(function, observed, 1))
+        self.fixture.environment.update({
+            "TEST_STEP_HOLD_READY": str(ready),
+            "TEST_STEP_HOLD_GUARD": str(TEST_HANG_GUARD_SECS),
+        })
+        return ready
