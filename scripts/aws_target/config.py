@@ -74,6 +74,7 @@ class SpendingSettings:
     cost_explorer_interval_seconds: int
     cost_explorer_read_usd: Decimal
     cost_explorer_lookback_days: int
+    bill_complete_after_seconds: int
     notification_recipient: str
     notification_timeout_s: int
     notification_retry_s: int
@@ -160,7 +161,8 @@ def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
     return SpendingSettings(daily, monthly, reserve, fallback, max(fixed, sum((cost for _, cost in components), Decimal(0))),
                             components, zone, seconds("price_refresh_seconds"), seconds("price_max_age_seconds"),
                             seconds("observation_max_age_seconds"), seconds("cost_explorer_interval_seconds"),
-                            explorer, seconds("cost_explorer_lookback_days"), live_text("notification_recipient"), seconds("notification_timeout_s"),
+                            explorer, seconds("cost_explorer_lookback_days"), seconds("bill_complete_after_seconds"),
+                            live_text("notification_recipient"), seconds("notification_timeout_s"),
                             seconds("notification_retry_s"), live_text("cost_explorer_tag_key"),
                             live_text("cost_explorer_tag_value"), tuple(limits), seconds('box_minimum_seconds'),
                             live_text('instance_type'), spot_bid)

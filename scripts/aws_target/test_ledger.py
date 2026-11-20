@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from contextlib import redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import date
 from decimal import Decimal
 import fcntl
 import io
@@ -742,6 +743,287 @@ class LedgerTests(CostFixture):
                 self.assertIsInstance(result, ledger.SpendingRefused)
                 if isinstance(result, ledger.SpendingRefused):
                     self.assertEqual(result.reason, "monthly_limit")
+
+    def write_complete_bill_fixture(self, reading: ledger.ChargeRead, name: str = '') -> None:
+        directory = self.state / 'charges'
+        directory.mkdir(exist_ok=True)
+        path = directory / (name or reading.day + '.json')
+        _ = path.write_text(json.dumps(ledger.charge_record(reading)))
+
+    def test_guard_matches_the_old_path_without_a_complete_day(self) -> None:
+        self.replace('observation_max_age_seconds', '345600')
+        start = self.start
+        end = start + 86400
+        now = end + 2 * 86400
+        self.running(end - 4 * 3600)
+        self.observe(end, 'stopped')
+        bill = ledger.ChargeRead('2026-01-15', now, start, end, Decimal(2), Decimal(0), Decimal(0))
+        settings = config.read_settings(self.settings)
+        for cause, saved, name in (
+                ('no file', bill, ''),
+                ('bad name', bill, 'wrong.json'),
+                ('bad label', replace(bill, day='2026-01-14'), '2026-01-15.json'),
+                ('bad bounds', replace(bill, period_start=start + 1), '2026-01-15.json'),
+                ('future read', replace(bill, at=now + 1), '2026-01-15.json'),
+                ('damaged read', bill, '2026-01-15.json'),
+                ('early read', replace(bill, at=now - 1), '2026-01-15.json'),
+                ('subcent amount', replace(bill, actual_usd=Decimal('.006')), '2026-01-15.json'),
+                ('not an account bill', replace(bill, account_bill=False), '2026-01-15.json')):
+            with self.subTest(cause=cause):
+                path = self.state / 'charges' / name
+                if name:
+                    self.write_complete_bill_fixture(saved, name)
+                    if cause == 'damaged read':
+                        record = ledger.charge_record(saved)
+                        record['at'] = 'invalid'
+                        _ = path.write_text(json.dumps(record))
+                with mock.patch.object(self.book, 'read_complete_day_amounts', return_value=()):
+                    old = self.book.placement_spending_preview(self.book.read_snapshot(), self.settings, now)
+                self.assertEqual(self.book.read_complete_day_amounts(settings, now), ())
+                actual = self.book.placement_spending_preview(self.book.read_snapshot(), self.settings, now)
+                self.assertEqual(actual, old)
+                if name:
+                    path.unlink()
+
+    def test_complete_bill_replaces_the_estimate_with_the_newest_amount(self) -> None:
+        self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'monthly_limit_usd': '5'})
+        start = self.start
+        end = start + 86400
+        now = end + 2 * 86400 + 3600
+        self.running(end - 4 * 3600)
+        self.observe(end, 'stopped')
+        for amount, at, outcome in (('6', now - 3600, ledger.SpendingRefused),
+                                    ('3', now - 1800, ledger.SpendingAllowed),
+                                    ('2', now, ledger.SpendingAllowed)):
+            with self.subTest(amount=amount):
+                bill = ledger.ChargeRead('2026-01-15', at, start, end, Decimal(amount), Decimal(0), Decimal(0))
+                self.write_complete_bill_fixture(bill)
+                decision = self.guard(now)
+                self.assertIsInstance(decision, outcome)
+                costs = decision.evidence.costs
+                assert isinstance(costs, ledger.CostEstimate)
+                self.assertEqual(costs.monthly.usd, Decimal(amount))
+                self.assertEqual(costs.daily.usd, Decimal(0))
+
+    def test_complete_bill_rejects_a_duplicate_timestamp(self) -> None:
+        start = self.start
+        end = start + 86400
+        now = end + 2 * 86400
+        day = '2026-01-15'
+        bill = ledger.ChargeRead(day, now, start, end, Decimal('.50'), Decimal(0), Decimal(0))
+        self.write_complete_bill_fixture(bill)
+        settings = config.read_settings(self.settings)
+        self.assertEqual(self.book.read_complete_day_amounts(settings, now),
+                         (ledger.CompleteDayAmount(start, end, Decimal('.50')),))
+        path = self.state / 'charges' / (day + '.json')
+        _ = path.write_text(path.read_text().replace('{', '{"at": "invalid", ', 1))
+        self.assertEqual(self.book.read_bills(), (bill,))
+        self.assertEqual(self.book.read_complete_day_amounts(settings, now), ())
+
+    def test_complete_bill_keeps_pending_gate_compute(self) -> None:
+        self.replace('observation_max_age_seconds', '345600')
+        start = self.start
+        end = start + 86400
+        now = end + 2 * 86400
+        self.inventory(start)
+        self.observe(start, 'stopped')
+        pending = ledger.GateReservation('pending', end - 2 * 3600, now, Decimal('.02'), Decimal(0),
+                                         region='us-east-2')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, pending), ledger.GateReserved)
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-01-15', now, start, end, Decimal('.50'), Decimal(0), Decimal(0)))
+        costs = self.guard(now).evidence.costs
+        assert isinstance(costs, ledger.CostEstimate)
+        self.assertEqual(costs.monthly.usd, Decimal('1.50'))
+
+    def test_complete_bill_keeps_open_allowance_and_query_fees(self) -> None:
+        self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'cost_explorer_read_usd': '.01'})
+        start = self.start
+        end = start + 86400
+        now = end + 2 * 86400
+        self.inventory(start)
+        self.observe(start, 'stopped')
+        opened = ledger.GateReservation('open', start, now + 3600, Decimal(0), Decimal(3), region='us-east-2')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, opened), ledger.GateReserved)
+        bill = ledger.ChargeRead('2026-01-15', now, start, end, Decimal(2), Decimal(0), Decimal(0))
+        self.write_complete_bill_fixture(bill)
+        costs = self.guard(now).evidence.costs
+        assert isinstance(costs, ledger.CostEstimate)
+        self.assertEqual(costs.monthly.usd, Decimal('5.03'))
+        self.assertEqual(costs.daily.usd, Decimal(0))
+
+    def test_accrued_cost_uses_each_day_source_and_the_guard_limit_count(self) -> None:
+        self.costs({'bill_complete_after_seconds': '86400', 'monthly_limit_usd': '10.03',
+                    'cost_explorer_read_usd': '.01'})
+        first = instant('2026-01-01T00:00:00+00:00')
+        second = first + 86400
+        third = second + 86400
+        now = third + 3600
+        self.running(first)
+        self.observe(first + 4 * 3600, 'stopped')
+        self.observe(second, 'running')
+        self.observe(second + 3 * 3600, 'stopped')
+        self.observe(third, 'running')
+        with self.book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation(
+                'future', now + 3600, now + 7200, Decimal(1), Decimal(0), region='us-east-2'))
+        counted_bill = ledger.ChargeRead('2026-01-01', now, first, second, Decimal(2), Decimal(0), Decimal(0))
+        self.write_complete_bill_fixture(counted_bill)
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-01-02', now, second, third, Decimal(5), Decimal(0), Decimal(0), provisional=False))
+
+        accrued = self.book.accrued_cost(self.settings, now, window='month')
+        fee = Decimal('.01')
+        self.assertEqual(accrued.days, (
+            ledger.AccruedDay(date(2026, 1, 1), Decimal('2.01'), 'billed_not_final', None, fee),
+            ledger.AccruedDay(date(2026, 1, 2), Decimal('3.01'), 'estimate', Decimal(5), fee),
+            ledger.AccruedDay(date(2026, 1, 3), Decimal('1.01'), 'estimate', None, fee),
+        ))
+        self.assertEqual(accrued.cost, Decimal('6.03'))
+        self.assertEqual(sum((day.cost for day in accrued.days), Decimal(0)), accrued.cost)
+        self.assertEqual(accrued.reserves, Decimal(1))
+        self.assertEqual(accrued.limit_count, accrued.cost + accrued.reserves + accrued.headroom)
+        self.write_complete_bill_fixture(replace(counted_bill, provisional=False))
+        finalized = self.book.accrued_cost(self.settings, now, window='month')
+        self.assertEqual(finalized, replace(accrued, days=(
+            replace(accrued.days[0], state='billed_final'), *accrued.days[1:],
+        )))
+        legacy_bill = ledger.charge_record(counted_bill)
+        del legacy_bill['provisional']
+        path = self.state / 'charges' / (counted_bill.day + '.json')
+        _ = path.write_text(json.dumps(legacy_bill))
+        self.assertEqual(self.book.accrued_cost(self.settings, now, window='month'), accrued)
+        legacy_bill['provisional'] = None
+        _ = path.write_text(json.dumps(legacy_bill))
+        self.assertFalse(ledger.read_charge(path).provisional)
+        self.assertEqual(self.book.accrued_cost(self.settings, now, window='month'), accrued)
+        daily = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual(daily, ledger.AccruedCost(
+            Decimal('1.01'), Decimal('5.01'), Decimal(1), Decimal(3), accrued.days[-1:]))
+        decision = self.guard(now)
+        self.assertIsInstance(decision, ledger.SpendingRefused)
+        assert isinstance(decision, ledger.SpendingRefused)
+        self.assertEqual(decision.reason, 'monthly_limit')
+        notice, = self.notices
+        self.assertEqual(notice.estimate_usd + config.read_settings(self.settings).limit_reserve_usd, accrued.limit_count)
+        self.assertEqual(accrued.limit_count, Decimal('10.03'))
+
+    def test_accrued_cost_estimates_a_day_with_a_damaged_charge_file(self) -> None:
+        start = self.start
+        now = start + 3600
+        self.running(start)
+        directory = self.state / 'charges'
+        directory.mkdir()
+        _ = (directory / '2026-01-15.json').write_text('{')
+
+        accrued = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual(accrued.cost, Decimal(1))
+        self.assertEqual(tuple(day.state for day in accrued.days), ('estimate',))
+        self.assertIsNone(accrued.days[0].aws_amount_so_far)
+        self.assertIsInstance(accrued.limit_count, ledger.CostEvidenceUnavailable)
+        self.assertIsInstance(self.guard(now), ledger.SpendingUnavailable)
+
+    def test_accrued_cost_keeps_the_estimate_with_a_partial_bill(self) -> None:
+        start = self.start
+        now = start + 10 * 3600
+        self.running(start)
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-01-15', now, start, start + 3600, Decimal(2), Decimal(0), Decimal(0)))
+
+        accrued = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual(accrued.cost, Decimal(10))
+        self.assertEqual(accrued.limit_count, Decimal(13))
+        self.assertEqual(accrued.days, (
+            ledger.AccruedDay(date(2026, 1, 15), Decimal(10), 'estimate', None, Decimal(0)),
+        ))
+
+    def test_accrued_cost_includes_the_minimum_charge_at_now(self) -> None:
+        now = self.start
+        self.inventory(now)
+        self.observe(now, 'stopped')
+        with self.book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation(
+                'ended', now, now + 60, Decimal('.60'), Decimal(0),
+                ledger.GateTerminated(now, 'fixture'), region='us-east-2'))
+
+        accrued = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual(accrued.cost, Decimal('.01'))
+        self.assertEqual(accrued.days, (
+            ledger.AccruedDay(date(2026, 1, 15), Decimal('.01'), 'estimate', None, Decimal(0)),
+        ))
+
+    def test_complete_bill_qualifies_at_utc_midnight(self) -> None:
+        self.replace('observation_max_age_seconds', '345600')
+        start = self.start
+        end = start + 86400
+        midnight = end + 2 * 86400
+        self.running(end - 4 * 3600)
+        self.observe(end, 'stopped')
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-01-15', midnight, start, end, Decimal(2), Decimal(0), Decimal(0)))
+        for now, day, monthly in ((midnight - 1, '2026-01-17', '4'), (midnight, '2026-01-18', '2')):
+            with self.subTest(day=day):
+                costs = self.guard(now).evidence.costs
+                assert isinstance(costs, ledger.CostEstimate)
+                self.assertEqual(costs.daily, ledger.DailyTotal(day, Decimal(0)))
+                self.assertEqual(costs.monthly, ledger.MonthlyTotal('2026-01', Decimal(monthly)))
+
+    def test_complete_bill_leaves_the_month_total_at_rollover(self) -> None:
+        self.replace('observation_max_age_seconds', '345600')
+        start = instant('2026-01-28T00:00:00+00:00')
+        end = start + 86400
+        month_start = instant('2026-02-01T00:00:00+00:00')
+        self.running(end - 4 * 3600)
+        self.observe(end, 'stopped')
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-01-28', end + 2 * 86400, start, end, Decimal(2), Decimal(0), Decimal(0)))
+        for now, month, total in ((month_start - 1, '2026-01', '2'), (month_start, '2026-02', '0')):
+            with self.subTest(month=month):
+                costs = self.guard(now).evidence.costs
+                assert isinstance(costs, ledger.CostEstimate)
+                self.assertEqual(costs.monthly, ledger.MonthlyTotal(month, Decimal(total)))
+
+    def test_eastern_guard_adjusts_only_complete_utc_days_inside_the_month(self) -> None:
+        self.text_setting('accounting_zone', 'America/New_York')
+        self.replace('observation_max_age_seconds', '518400')
+        start = instant('2026-02-01T00:00:00+00:00')
+        end = start + 86400
+        now = end + 3 * 86400
+        self.running(start + 5 * 3600)
+        self.observe(start + 9 * 3600, 'stopped')
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-02-01', now, start, end, Decimal(9), Decimal(0), Decimal(0)))
+        costs = self.guard(now).evidence.costs
+        assert isinstance(costs, ledger.CostEstimate)
+        self.assertEqual(costs.monthly, ledger.MonthlyTotal('2026-02', Decimal(4)))
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-02-02', now, end, end + 86400, Decimal(2), Decimal(0), Decimal(0)))
+        costs = self.guard(now).evidence.costs
+        assert isinstance(costs, ledger.CostEstimate)
+        self.assertEqual(costs.monthly, ledger.MonthlyTotal('2026-02', Decimal(6)))
+        self.assertEqual(costs.daily.usd, Decimal(0))
+
+    def test_account_reservation_adjusts_a_complete_day_and_keeps_the_open_allowance(self) -> None:
+        self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'monthly_limit_usd': '6'})
+        start = self.start
+        end = start + 86400
+        now = end + 2 * 86400
+        self.inventory(start)
+        self.observe(start, 'stopped')
+        request = ledger.GateReservation('open', start, now + 3600, Decimal(0), Decimal(3), region='us-east-2')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, request), ledger.GateReserved)
+        reading = ledger.ChargeRead('2026-01-15', now, start, end, Decimal(2), Decimal(0), Decimal(0),
+            (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(2)),))
+        self.write_complete_bill_fixture(reading)
+        self.write_complete_bill_fixture(replace(reading, actual_usd=Decimal(9), usage_types=(
+            ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(9)),)), 'previous.json')
+        proposed = ledger.GateReservation('next', now, now + 60, Decimal(0), Decimal(0), region='us-east-2')
+        with mock.patch.object(self.book, 'read_complete_day_amounts', return_value=()):
+            self.assertEqual(self.book.reserve_gate(self.settings, proposed), ledger.GateCapReached('monthly_limit'))
+        self.replace('monthly_limit_usd', '5')
+        self.assertEqual(self.book.reserve_gate(self.settings, proposed), ledger.GateCapReached('monthly_limit'))
+        self.replace('monthly_limit_usd', '6')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, proposed), ledger.GateReserved)
 
     def test_reserve_equality_refuses_and_changed_headroom_is_read_at_use(self) -> None:
         self.running(self.start)

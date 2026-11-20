@@ -176,7 +176,8 @@ def day_report(args: list[str]) -> int:
     _ = index.update()
     connection = index.read_only()
     try:
-        print(report.report(connection, day, usage_day=day if args else ""))
+        day_selection = report.ReportDaySelection.EXPLICIT_DATE if args else report.ReportDaySelection.CURRENT_DAY
+        print(report.report(connection, day, day_selection=day_selection))
     finally:
         connection.close()
     return 0

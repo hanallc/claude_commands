@@ -29,8 +29,16 @@ Older readers treat the record as delivered.
 A retry after a recipient change can send the same notice to both recipients. A duplicate notice is safer than a lost notice.
 Code older than this change still sends a pending notice after its period ends. That ends when every branch has this change.
 
+Floors from Eastern accounting days before the UTC change can overstate the November 2026 month count by at most USD 1.99.
+These floors leave the month window on December 1, 2026.
+A legacy notice ID expires when its period ends.
+The code has no special handling for these cases.
+
 `report.py` reads the AWS state folder without target registration.
 Its AWS section retains the account bill, daily gate spend, and historical builder comparisons.
+The AWS lead line uses one UTC accounting day for cost, uptime, steps, and savings.
+An explicit report date selects the UTC day with that date.
+A report without a date uses the UTC day at the report time.
 `sync.hosts.aws=aws-build` identifies historical steps.
 The report shows no synchronization status for the removed builder.
 
@@ -664,6 +672,9 @@ They verify that neither the controller lock nor the ledger lock remains held du
 Regression tests cover expired bootstrap, start, and publication recovery.
 They also cover stale recovery responses, concurrent cap refusals, and interruptions during idle stops.
 
+Fixtures in `scripts/aws_target/fixtures/` supply settings for `aws_target` tests.
+The tests do not read tracked configuration.
+
 ## Removed builder: 2026-11-10
 
 `builder-removal.json` records the removal. Commit `1b1fa1842` removed the target on 2026-11-10.
@@ -905,7 +916,30 @@ Paired trials use this booked cost for completed gates.
 Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
-The bill remains the minimum cost for its reconciliation period.
+Reports keep the existing reconciliation floors.
+The account checks adjust the existing total for each complete UTC day inside the limit window.
+They subtract that day's existing usage and add the newest complete AWS amount.
+An account bill qualifies when the name, day label, and bounds match one full UTC day.
+The bill must exclude credits and give at least USD 0.01 before rounding.
+The read time must be valid and at least `bill_complete_after_seconds` after the day ends.
+The read time cannot be in the future.
+The adjustment preserves query fees and any open gate allowances or reservations already in the total.
+The report's costs pane must call `CostLedger.accrued_cost` for the current day or month to date.
+The function returns `cost`, `limit_count`, and the cost and bill state for each UTC day in the window.
+`cost` is the ledger estimate plus the same complete-day adjustment that the guard uses.
+`limit_count` is the admission guard's value, equal to `cost` plus reserves and headroom.
+The function reports an unavailable limit count when the admission guard cannot calculate it.
+The per-day costs add up to `cost` and include separately named query fees and any rounding adjustment.
+The pane displays a counted bill as “Billed, final” only when the bill sets `provisional` to JSON `false`.
+The pane displays all other counted bills as “Billed, not final”.
+The pane displays other days as “Estimate”.
+An estimate can show `aws_amount_so_far` when a valid saved bill has yet to meet the age requirement.
+The tooltip labels this value “AWS amount so far”.
+The pane's “Time on AWS” row reads `run_cost.hana_billed_hours` for one UTC day.
+The reader returns billed Spot hours for Hana's configured region and machine types.
+The file name, day label, and bounds must match the requested full UTC day.
+A valid bill with no matching usage gives zero hours.
+A missing or damaged bill gives no record.
 Missing cost rows contribute zero.
 The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
 The spending limits do not change.
@@ -1048,7 +1082,8 @@ The next line names the cheapest merge gate by estimate.
 Below them, two tables show the refused requests and the launched boxes of each type and region.
 Refused requests are capacity and quota refusals.
 The last table shows billed hours / box hours for each type and region, from `run_cost.hours_checks`.
-A cell is `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`, with `over` when `hours_gap_over` is set.
+A cell shows `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`.
+The cell lists any Hana reservation after the recorded box hours and marks a gap above the limit with `over`.
 A type and region without a bill read shows `not billed`. Only types with hours have a row.
 An unreadable cost ledger shows a note in place of the billed hours.
 
@@ -1117,21 +1152,34 @@ It compares the billed Spot hours with the recorded box hours for each type, reg
    Its time runs from each `running` observation in the cost ledger to the next other state.
    A `running` observation with no later state counts to the window end.
    Reason: on 2026-11-08 the builder box ran 8.8 h, and the check reported its Spot hours as a gate gap.
-3. The gap ratio is `abs(billed - box) / box`.
-   A gap above `billed_hours_gap_max_ratio=0.15` in `aws_target.conf` is over.
-   Billed hours with no box hours are also over.
+3. The check counts the first exposure per generation in the configured Hana region and splits its hours at UTC midnight.
+   The check counts open exposures through check time and adds the same regional total to the upper bound for each Hana type.
+   The check uses the gate and builder hours for the original ratio comparison when the bill is below them or the Hana allowance is zero.
+   A positive allowance raises the upper limit to `(box hours + Hana exposure hours) × (1 + limit)`.
+   Both comparisons use `billed_hours_gap_max_ratio` from `aws_target.conf`.
+
+Hana exposure hours can hide that many hours from an unknown box of any configured Hana type in the region on that day.
+
 `run_cost.day_hours_checks` gives one `HoursCheck` per type, region and day in the window.
 Days run from the window start day up to, but not including, the end day, like the bill split.
 `run_cost.hours_checks` sums the days with a bill read for each type and region, for the billed hours table on the AWS page.
-`HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
-Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
+`HoursCheck` records `billed_hours`, `box_hours`, `hana_reserved_hours`, `hours_gap_ratio`, and `hours_gap_over`.
+The gap ratio is the distance outside the range divided by the bound on that side.
+Without a bill read, the recorded and reserved hours count every day in the window.
 `aws_target.hourly` checks the last `run_cost_days` days after its price read.
 `buildlog hourly` and `aws_target.py snapshot` both call it.
-It checks the types the snapshot reads: `instance_types`, `price_compare_instance_types` and `gpu_instance_types`.
-Each type, region and day that is over sends one `aws.hours_gap` user notice.
-The key `aws-hours-gap:<type>:<region>:<day>` is saved in `hours-gap-notices.json` before delivery.
-A failed delivery removes the claim, so the next hourly run sends it again.
-A claim for a day before the window is dropped.
+The notices and the table use the same list of gate types and Hana's primary and fallback types.
+If the Hana region or type settings are unavailable, both use the gate types and a zero Hana allowance.
+For each type, region, and UTC day above the limit, the check sends a message to bob's fixed staff ID.
+The message gives the billed hours, ledger hours, gap, and limit.
+The message includes exposure hours for the region and day when a Hana allowance applies.
+It asks bob to file an investigation and add it to the list.
+The check saves the key `aws-hours-gap:<type>:<region>:<day>` in `hours-gap-notices.json` after `SENT`, `SKIPPED`, or `QUEUED`.
+After a failure or timeout, the next hourly run tries again.
+The check uses the sender's full time budget for the subprocess.
+The check uses only its claim file to suppress duplicate messages.
+The check keeps the two claims from the old phone route, which bob tracks in investigation I7.
+The check removes claims for days before the window.
 Live, 2026-11-14: the days since 2026-11-12 are within 4.5 %.
 Before that day, the box hours were 7 to 13 % above the bill.
 
@@ -1162,6 +1210,13 @@ Failed or slow regions retain their hourly rows.
 The live read never writes `spot-prices.json`.
 `launch.json` saves `spot_price_reads`, with `region`, `seconds`, and `used` for each regional call.
 Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
+Every launch, refusal, fallback, and finish row in this file includes `gate_job`.
+It uses the queue's tagged `StepJob` record with `step`, `unit`, `branch`, and `modules`.
+When the job is unknown, the field contains `{"kind":"GateJobNotRecorded"}`.
+Readers accept rows with missing or unreadable `gate_job` values.
+The controller saves the job with the attempt ID in `current.json`.
+The request and every launch history row for the attempt use that saved job.
+An attempt uses `GateJobNotRecorded` if its saved job is missing or unreadable.
 Resumed launches keep the saved ranking and evidence without another live read.
 Placement does not try a type and region whose median box time, boot included, is above `max_gate_minutes=12`.
 The user, 2026-11-14: a slow type costs more gate time than its lower price saves.
@@ -1673,7 +1728,13 @@ Run the gate setup command on natedev.
 python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
 ```
 
-The GPU probe prints its verdict. The verdict is available only in the command output.
+Approved gate setup removes the old `gate-probe.json` before it can change gate resources.
+An interruption or early setup failure leaves the record absent.
+When the probe ends, it saves the verdicts in a private record beside `gate-deployment.json`.
+The record includes the deployment ID, the UTC end time, and any failed checks.
+Run `deploy.py probe-status` to read the saved verdicts and record age without contacting AWS.
+The command shows verdicts only for a readable record that matches the current deployment.
+It checks the recorded regions and instance types against `gate-deployment.json`.
 
 After the GPU setup probe passes, set `hana_gpu_route_enabled=on` in `config/cloud_gate.conf`.
 The route checks the deployment record for every type in `hana_gpu_instance_types`.

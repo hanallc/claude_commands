@@ -769,5 +769,23 @@ conf_reads.record('disabled')
         self.assertEqual(live.value, Decimal("7.25"))
 
 
+class HanaConfigurationTests(unittest.TestCase):
+    source: Path = Path(__file__).resolve().parents[2] / "config/hana_aws.conf"
+
+    def test_render_configuration_has_no_host_suffixes(self) -> None:
+        settings = conf.settings(self.source.read_text())
+        self.assertTrue(settings)
+        for key in settings:
+            with self.subTest(key=key):
+                self.assertNotIn('.', key)
+
+    def test_execution_values_have_no_copies_in_hana_configuration(self) -> None:
+        settings = conf.settings(self.source.read_text())
+        for key in ('execution_compiler_version', 'execution_shell_timeout_s', 'execution_command_timeout_s'):
+            self.assertNotIn(key, settings)
+        self.assertEqual(sum(line.startswith('free_floor_gib=')
+            for line in self.source.read_text().splitlines()), 1)
+
+
 if __name__ == "__main__":
     _ = unittest.main()
