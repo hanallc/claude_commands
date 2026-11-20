@@ -818,12 +818,19 @@ class MirrorUseBusy:
 
 
 @dataclass(frozen=True)
+class MirrorUseScanRefused:
+    """The receiver reports an unavailable scan before launch."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
 class UnresolvedSlotStartup:
     """The provider cannot start while an earlier run holds its slot."""
 
 
 RemoteRunStatus = (ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
-                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorUseBusy)
+                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorUseBusy | MirrorUseScanRefused)
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -1091,6 +1098,7 @@ class ProcessController:
         held_status_line = ""
         mismatch = ""
         mirror_refused = False
+        start_settled = False
         build_target_directory = ""
         received_bytes = 0
         finished_output = False
@@ -1107,6 +1115,7 @@ class ProcessController:
                 identity = self.claim_identity
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_settled=" + pending_start_key(identity)):
+                    start_settled = True
                     self.pending = SettledDispatchOperations()
                     pending_start_path(self.claim_target, identity).unlink(missing_ok=True)
                     if not isinstance(status, ReportedMacStatus):
@@ -1114,6 +1123,7 @@ class ProcessController:
                     continue
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_pending=" + pending_start_key(identity)):
+                    start_settled = False
                     self.pending = PendingStartOperation()
                     continue
                 if mirror_busy_refusal(marker):
@@ -1158,6 +1168,9 @@ class ProcessController:
                     print(held_status_line, end="", flush=True)
                     held_status_line = ""
                 status = MISSING_MAC_STATUS
+                if (not start_settled and marker.startswith("copies: ")
+                        and marker.endswith(": mirror process scan unavailable")):
+                    status = MirrorUseScanRefused(marker)
                 cleanup = CleanupUnconfirmed()
                 print(line, end="", flush=True)
             finished_output = True
@@ -1185,6 +1198,9 @@ class ProcessController:
         if mirror_refused:
             return MirrorUseBusy()
         if isinstance(status, UnresolvedSlotStartup):
+            return status
+        if (isinstance(status, MirrorUseScanRefused) and start_settled and exit_status == 2
+                and isinstance(self.pending, SettledDispatchOperations)):
             return status
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
 
@@ -2643,6 +2659,9 @@ def claimed_run(
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+        if isinstance(remote_status, MirrorUseScanRefused):
+            release_allowed = True
+            return DeclinedMacRun("copy", elapsed_seconds(started), f"copy: mirror-use: {remote_status.reason}")
         if not isinstance(remote_status, (ReportedMacStatus, MacNextestSetupFailed)):
             if isinstance(controller.pending, PendingStartOperation):
                 settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
