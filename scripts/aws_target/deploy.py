@@ -491,6 +491,18 @@ class DeployedHanaNetwork(HanaNetwork):
 
 
 @dataclass(frozen=True)
+class RecordedHanaInstance:
+    deployment: str
+    instance: str
+    region: str
+
+
+@dataclass(frozen=True)
+class NoRecordedHanaInstance:
+    """The local Hana records name no instance."""
+
+
+@dataclass(frozen=True)
 class HanaSetupInputs:
     settings: DeploymentSettings
     parameters: dict[str, str]
@@ -817,7 +829,7 @@ class Deployment:
             decision = self._guard()
             prepared = self._hana_output()._write_preparation(settings, parameters, inputs.template, decision)
             path = self.directory / 'hana' / 'setup.json'
-            if not path.exists():
+            if not path.exists() and not isinstance(inputs.network, DeployedHanaNetwork):
                 _save_hana_setup(path, {'version': HANA_SETUP_VERSION, 'deployment': parameters['DeploymentId'],
                                        'stack': settings.stack_name, 'region': settings.region})
             return prepared
@@ -2113,17 +2125,28 @@ class Deployment:
         if for_setup:
             resume_stop = saved.get('requested') is True and saved.get('stop_pending') is True and bool(saved.get('instance'))
             evidence = self._read_preparation_evidence(output, settings, template, allow_expired=resume_stop)
-        identity = (ledger.text(saved, 'deployment') if saved else
-                    ledger.text(prepared_parameters(output), 'DeploymentId') if for_setup else uuid4().hex)
-        saved_settings = replace(settings, region=ledger.text(saved, 'region')) if saved.get('requested') else settings
-        stack = self._read_stack(saved_settings) if saved.get('requested') else {}
-        if stack and stack.get('StackStatus') != 'REVIEW_IN_PROGRESS':
-            network = self._existing_hana_network(saved_settings, stack, saved, registered)
+        recorded = self._recorded_hana_instance(saved)
+        if isinstance(recorded, RecordedHanaInstance):
+            saved_settings = replace(settings, region=recorded.region)
+        else:
+            saved_settings = replace(settings, region=ledger.text(saved, 'region')) if saved.get('requested') else settings
+        read_stack = saved.get('requested') or (isinstance(recorded, NoRecordedHanaInstance)
+                                               and not isinstance(registered, hana_image.RegisteredImage))
+        stack = self._read_stack(saved_settings) if read_stack else {}
+        if stack or isinstance(recorded, RecordedHanaInstance):
+            network = self._existing_hana_network(saved_settings, stack, saved, recorded)
         elif isinstance(registered, hana_image.RegisteredImage):
             network = HanaNetwork(registered.vpc, registered.subnet)
         else:
             discovered = self._deployment_network(account, self._api(settings))
             network = HanaNetwork(discovered.vpc, discovered.subnet_in(settings.availability_zone))
+        if isinstance(recorded, RecordedHanaInstance):
+            if for_setup and (not saved.get('requested') or not saved.get('instance')):
+                raise DeploymentRefused('The Hana instance has no matching setup record. Review the saved deployment.')
+            identity = recorded.deployment
+        else:
+            identity = (ledger.text(saved, 'deployment') if saved else
+                        ledger.text(prepared_parameters(output), 'DeploymentId') if for_setup else uuid4().hex)
         parameters = {
             'DeploymentId': identity, 'Image': settings.ami_id, 'InstanceType': limits.instance_type,
             'FallbackInstanceTypes': ','.join(limits.fallback_instance_types),
@@ -2139,16 +2162,31 @@ class Deployment:
                 raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
         return HanaSetupInputs(settings, parameters, template, stack, network, approved_parameters)
 
+    def _recorded_hana_instance(self, saved: dict[str, object]) -> RecordedHanaInstance | NoRecordedHanaInstance:
+        try:
+            lifecycle = remote.read_record(self.directory / 'hana' / 'lifecycle.json')
+        except FileNotFoundError:
+            lifecycle = {}
+        identity = ledger.mapping(lifecycle.get('identity', {}))
+        if 'instance' in identity:
+            recorded = RecordedHanaInstance(*(ledger.text(identity, key) for key in ('deployment', 'instance', 'region')))
+            if any(key in saved and saved[key] != identity[key] for key in ('deployment', 'instance', 'region')):
+                raise DeploymentNetworkUnavailable('The Hana lifecycle and setup name different deployments. Review the saved records.')
+            return recorded
+        if 'instance' in saved:
+            return RecordedHanaInstance(*(ledger.text(saved, key) for key in ('deployment', 'instance', 'region')))
+        return NoRecordedHanaInstance()
+
     def _existing_hana_network(self, settings: DeploymentSettings, stack: dict[str, object], saved: dict[str, object],
-                               registered: hana_image.RegisteredImage | hana_image.PendingImageRegistration |
-                               hana_image.NoRegisteredImage) -> HanaNetwork:
+                               recorded: RecordedHanaInstance | NoRecordedHanaInstance) -> HanaNetwork:
         unavailable = 'The existing Hana deployment has no confirmed subnet. Review the saved deployment.'
         try:
             parameters = {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
-                          for row in ledger.rows(stack, 'Parameters')}
-            vpc = ledger.text(parameters, 'VpcId')
-            outputs = self._stack_outputs(stack, require_outputs=True)
-            instance = outputs.get('Instance') or str(saved.get('instance', ''))
+                          for row in ledger.rows(stack, 'Parameters')} if 'Parameters' in stack else {}
+            if isinstance(recorded, RecordedHanaInstance):
+                instance = recorded.instance
+            else:
+                instance = self._stack_outputs(stack, require_outputs=True).get('Instance', '')
             if instance or 'pending_launch' in saved:
                 filters = ('--instance-ids', instance) if instance else (
                     '--filters', f'Name=client-token,Values={PendingHanaLaunch.decode(saved["pending_launch"]).token}',
@@ -2156,12 +2194,15 @@ class Deployment:
                 reply = self._api(settings).call('describe-instances', *filters)
                 instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
                 if instances or instance:
-                    if (len(instances) != 1 or (instance and instances[0].get('InstanceId') != instance)
-                            or instances[0].get('VpcId') != vpc):
+                    if len(instances) != 1 or (instance and instances[0].get('InstanceId') != instance):
                         raise DeploymentNetworkUnavailable(unavailable)
                     row, = instances
+                    vpc = ledger.text(row, 'VpcId')
+                    if parameters.get('VpcId', vpc) != vpc:
+                        raise DeploymentNetworkUnavailable(unavailable)
                     return DeployedHanaNetwork(vpc, ledger.text(row, 'SubnetId'),
                                                ledger.text(ledger.mapping(row['Placement']), 'AvailabilityZone'))
+            vpc = ledger.text(parameters, 'VpcId')
         except (AwsUnavailable, KeyError, ledger.LedgerUnavailable, OSError, subprocess.SubprocessError) as error:
             raise DeploymentNetworkUnavailable(unavailable) from error
         subnet = parameters.get('SubnetId')
@@ -2173,8 +2214,6 @@ class Deployment:
                 return HanaNetwork(vpc, ledger.text(prepared, 'SubnetId'))
         except (OSError, json.JSONDecodeError, ledger.LedgerUnavailable):
             pass
-        if isinstance(registered, hana_image.RegisteredImage) and registered.vpc == vpc:
-            return HanaNetwork(vpc, registered.subnet)
         raise DeploymentNetworkUnavailable(unavailable)
 
     def _hana_approved_parameters(self, settings: DeploymentSettings, network: HanaNetwork, parameters: dict[str, str],

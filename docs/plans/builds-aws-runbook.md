@@ -484,9 +484,9 @@ The registration applies the cost tag only to the image.
 It finds a public subnet in `availability_zone` with the deployment network resolver.
 It saves the image, owner, VPC, and subnet in the local `hana/image.json` record.
 An empty `ami_id` or `ami_owner_id` in `config/hana_aws.conf` uses the saved image record.
-Hana preparation and setup keep the VPC of the existing stack and the subnet of the deployed instance.
+Hana preparation and setup keep the deployed instance subnet even if the stack is missing.
 The deployment admin uses its existing `ec2:DescribeInstances` permission to read the instance subnet.
-Before an instance exists, the saved preparation supplies the subnet, followed by the image record.
+Before an instance exists, an existing stack uses its subnet parameter or the matching saved preparation.
 Run `prepare --workload hana` to restore missing preparation files from the deployed network.
 For a new setup, the image record supplies the network when available.
 Otherwise, setup resolves the network in the configured zone.

@@ -2035,7 +2035,8 @@ class HanaSetupFailureTests(CostFixture):
         fake = FakeEc2()
         instance = fake.launch(tagged=True)
         subject = self.subject(fake)
-        _ = self.write_leftover(subject, fake, instance=instance)
+        _ = self.write_leftover(subject, fake, instance=instance,
+                                preparation_calls=('describe-stacks', 'describe-instances'))
         workload = conf.read(self.workload)
         _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture', workload.text('ami_id'),
             workload.text('ami_owner_id'), 'fixture-vpc', 'fixture-subnet',

@@ -1040,6 +1040,46 @@ class HanaSetupTests(CostFixture):
             self.assertFalse(parameters.exists())
             self.assertEqual(preflight.read_bytes(), before)
 
+    def test_prepare_keeps_the_recorded_instance_subnet_when_the_stack_is_missing(self) -> None:
+        self.save_image()
+        subject = self.subject(FakeAws(self.clock))
+        record = {'deployment': IDENTITY.deployment, 'instance': IDENTITY.instance, 'region': IDENTITY.region}
+        setup = self.state / 'hana/setup.json'
+        lifecycle = self.state / 'hana/lifecycle.json'
+        subnet = 'fixture-deployed-subnet'
+
+        def api_call(operation: str, *arguments: str, service: str, timeout_s: float | None) -> dict[str, object]:
+            self.assertIsNone(timeout_s)
+            if operation == 'describe-stacks':
+                self.assertEqual(service, 'cloudformation')
+                raise aws_cli.AwsUnavailable('ValidationError: Stack does not exist')
+            self.assertEqual((service, operation, arguments), ('ec2', 'describe-instances', ('--instance-ids', IDENTITY.instance)))
+            return {'Reservations': [{'Instances': [{
+                'InstanceId': IDENTITY.instance, 'VpcId': 'fixture-vpc', 'SubnetId': subnet,
+                'Placement': {'AvailabilityZone': self.base_settings().availability_zone},
+            }]}]}
+
+        with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
+                fake_aws_calls(api_call), mock.patch.object(subject, '_deployment_network') as discover:
+            _ = setup.write_text(json.dumps({**record, 'requested': True, 'stack': conf.read(self.workload).text('stack_name')}))
+            from_setup = subject.prepare_hana()
+            setup.unlink()
+            _ = lifecycle.write_text(json.dumps({'identity': record}))
+            from_lifecycle = subject.prepare_hana()
+            self.assertFalse(setup.exists())
+            self.assertEqual(from_lifecycle.parameters['DeploymentId'], IDENTITY.deployment)
+            self.assertEqual(from_setup.parameters['SubnetId'], 'fixture-deployed-subnet')
+            self.assertEqual(from_lifecycle.parameters['SubnetId'], 'fixture-deployed-subnet')
+            bundle = subject.output / 'hana'
+            self.assertEqual(deploy.prepared_parameters(bundle)['SubnetId'], 'fixture-deployed-subnet')
+
+            subnet = ''
+            evidence = {path: path.read_bytes() for path in bundle.iterdir()}
+            with self.assertRaisesRegex(deploy.DeploymentNetworkUnavailable, 'no confirmed subnet'):
+                _ = subject.prepare_hana()
+            self.assertEqual({path: path.read_bytes() for path in bundle.iterdir()}, evidence)
+            discover.assert_not_called()
+
     def test_setup_polls_an_already_stopped_box_once(self) -> None:
         fake = FakeAws(self.clock, state='stopped')
         calls: list[str] = []
