@@ -745,9 +745,9 @@ Before enrollment, start a built-in helper. Give it this prompt:
 > rules: <the doc's Production rules that concern looks>. Return only the
 > verdict and the table.
 
-Read the verdict and end the helper. When enrolled, send the example writes
-below to the unit that owns the guide. Save each canonical candidate it
-lists, without viewing it, into a slot still empty: `mkdir -p
+Read the verdict and end the helper. When enrolled, send the following
+example writes to the unit that owns the guide.
+Save each listed candidate in an empty slot. Do not open the image: `mkdir -p
 <guide>/examples/<stem> && magick <shot> -crop <crop> +repage
 <guide>/examples/<stem>/<slot>.png`. Saving it approves it for use now; add
 `- <stem>/<slot>.png — <why it is clear> — showrunner, <date>` to

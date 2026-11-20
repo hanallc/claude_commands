@@ -270,13 +270,13 @@ The output file will be `/tmp/claude/bevy_migration_deps_$(basename "${CODEBASE}
 
 <Pass1_ApplicabilityFilter>
 
-**Launch 10 parallel subagents for quick applicability filtering:**
+**Assign the applicability checks.**
 
 When enrolled, assign read-only workers through `/showrunner:worker` within the worker limit.
 Keep orders and replies in the existing run directory. Send script work that writes to a unit.
 Before enrollment, launch the ten general-purpose helpers in one `Agent` message.
 
-**For each subagent (1-10):**
+**For each tranche (1–10):**
 
 Name the assignment `bevy-pass1-${N}`.
 
