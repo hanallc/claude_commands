@@ -1064,6 +1064,14 @@ locks.probe_retry_seconds=0.005
         cleanup.assert_called_once_with()
         self.assertFalse(path.parent.exists())
 
+    def test_retry_after_removal_does_not_leave_a_lock(self) -> None:
+        path = self.root / "tree"
+        path.mkdir()
+        self.assertTrue(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+        with self.assertRaises(FileNotFoundError):
+            _ = folders.remove_build_folder(path, lambda: shutil.rmtree(path))
+        self.assertFalse(path.with_suffix(".lock").exists())
+
     def test_release_removed_folder_only_releases_a_free_pair_for_an_absent_path(self) -> None:
         outcome = folders.FolderPairRelease
         for name, expected in (("released", outcome.RELEASED), ("present", outcome.FOLDER_PRESENT),

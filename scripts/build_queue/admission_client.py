@@ -1847,7 +1847,7 @@ def down_alert() -> int:
         session_outcome = send(session_send_argv(BUILDS_SESSION, sender="build-admission", lint_settings=settings), message)
         release_outcomes = ("failed", "refused", "retry")
         retained = session_outcome not in release_outcomes
-        if session_outcome != "sent":
+        if session_outcome not in ("sent", "kept"):
             from scripts.notify import push_texts
             command = push_texts.user_send_argv(push_texts.render("alert.blocked",
                 sender="build-admission", title="Build queue service is down",

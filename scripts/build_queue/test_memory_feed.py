@@ -6,7 +6,6 @@ from scripts.build_queue import admission_records, admission_service, placement,
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
-import fcntl
 import json
 import io
 import os
@@ -43,7 +42,8 @@ from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
-from scripts.lib import atomic_file, build_folders, build_slots, conf, test_hang_guard
+from scripts.lib import atomic_file, build_slots, conf, test_hang_guard
+from scripts.lib.build_slots_test_support import private_slot_config, write_private_slot_roots
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
@@ -59,11 +59,12 @@ REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
 STEVIE_OUTPUT = memory_feed.stevie_output
 UNIT_LABELS_FOR = unit_labels.unit_labels_for
 STEVIE = Path("/fixture/bin/stevie")
+FIXTURE_MACHINE = "fixture"
 
 
 def needs_all_page_proof_views(repo: Path) -> bool:
-    """Use all views while the nightly run holds its slot."""
-    return lease_record(repo).get("work") == "test-nightly" and build_folders.build_folder_state(repo) == "held"
+    """Use all views when the checkout lease shows nightly work."""
+    return lease_record(repo).get("work") == "test-nightly"
 
 
 class FeedStopped(Exception):
@@ -266,6 +267,7 @@ class MemoryFeedTests(unittest.TestCase):
                 self.assertEqual(REQUEST_TOKEN_DUMP(), expected)
 
     def test_run_slot_numbers_use_the_run_machine_root(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "home")})))
         mac_machine = "private-mac-host"
         _ = (self.root / "machines.conf").write_text(f"mac.hosts={mac_machine}\n")
         roots = {"natedev": self.root / "linux-slots", mac_machine: self.root / "mac-slots"}
@@ -360,6 +362,7 @@ class MemoryFeedTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        write_private_slot_roots(self.root / "build_folders.conf", self.root, FIXTURE_MACHINE)
         self.output = self.root / "page"
         self.configuration = self.root / "memory_feed.conf"
         _ = write_config_fixture(self.root / "build_steps.conf",
@@ -387,7 +390,7 @@ class MemoryFeedTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(admission_client, "view",
             side_effect=AssertionError("The test must supply a private queue reading")))
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={}))
-        _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value="fixture"))
+        _ = self.enterContext(mock.patch.object(memory_feed, "host_name", return_value=FIXTURE_MACHINE))
         _ = self.enterContext(mock.patch.object(memory_feed, "PROC", self.root / "proc"))
         _ = self.enterContext(mock.patch.object(memory_feed, "SYS_BLOCK", self.root / "sys" / "block"))
         _ = self.enterContext(mock.patch.object(memory_feed, "CI_CGROUP", self.root / "ci"))
@@ -1154,7 +1157,6 @@ process.stdout.write(JSON.stringify({
                 assert_status_states(self, page, seconds, cast(dict[str, object], json.loads((self.output / "memory.json").read_text())))
 
     def test_page_proof_removes_chrome_files_after_exit_and_a_killed_child(self) -> None:
-        _ = write_config_fixture(self.root / "build_folders.conf")
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         chrome = self.root / "chrome"
         report = self.root / "chrome-report.json"
@@ -2044,10 +2046,10 @@ process.stdout.write(JSON.stringify({
 
     def test_copies_sends_the_wrapped_step_and_staff_unit_in_the_slot_request(self) -> None:
         from scripts.copies import copies
-        from scripts.lib import build_slots
 
         owner = "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"
         source = self.root / "repository"
+        pool = private_slot_config(self.root / "slot-request", repository="hana")
         runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "hana", staff.StaffRoot(),
                                current_session=staff.StaffId("runner-session"))
         member = staff.StaffRow(staff.StaffId(owner), "unit", "startup", staff.ReportsTo(runner.id),
@@ -2064,13 +2066,13 @@ process.stdout.write(JSON.stringify({
         )
         for command, step, job, verify, about in cases:
             with (self.subTest(step=step),
-                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": runner.current_session}),
+                  mock.patch.dict(os.environ, {
+                      "CONF_DIR": str(pool.settings.parent), "CLAUDE_CODE_SESSION_ID": runner.current_session}),
                   mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((runner, member))),
                   mock.patch.object(copies, "source_commit", return_value="abc"),
                   mock.patch.object(copies, "slot_source", return_value=source),
                   mock.patch.object(copies, "main_checkout", return_value=source),
                   mock.patch.object(build_slots, "_try_slot", side_effect=build_slots.SlotsFull("hana", "fixture", 1)),
-                  mock.patch.object(build_slots, "configured_slot_root", return_value=self.root / "slots"),
                   mock.patch.object(admission_client, "repository_slot", return_value=wire.Refused("fixture refusal")) as send):
                 with self.assertRaisesRegex(RuntimeError, "fixture refusal"):
                     with copies.command_tree(owner, source, copies.CommittedSource("HEAD"),
@@ -2078,6 +2080,7 @@ process.stdout.write(JSON.stringify({
                         self.fail("The slot is full")
                 send.assert_called_once()
                 request = cast(wire.RepositorySlotRequest, send.call_args.args[0])
+                self.assertEqual(request.root, str(pool.slots.resolve()))
                 saved = wire.parse_request(wire.encode_request(request))
                 assert isinstance(saved, wire.RepositorySlotRequest)
                 self.assertEqual(saved.identity.step, step)
@@ -3643,42 +3646,223 @@ process.stdout.write(JSON.stringify({
             with self.subTest(gpu_slot=code):
                 self.assertEqual(memory_feed.memory_status(gpu_wait, self.fixture_room(available), 0)["code"], code)
 
-    def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
+    def tool_process(self, pid: int, command: str, kib: int, *, parent: int = 1,
+                     children: tuple[int, ...] = (), shared_kib: int = 0) -> Path:
+        proc = self.root / "proc"
+        write_process(proc, pid, kib * 1024, parent=parent)
+        process = proc / str(pid)
+        _ = (process / "cmdline").write_bytes(command.encode().replace(b" ", b"\0") + b"\0")
+        _ = (process / "status").write_text(
+            f"VmRSS: {kib + 2 * shared_kib} kB\nRssAnon: {kib} kB\nRssShmem: {2 * shared_kib} kB\n")
+        _ = (process / "smaps_rollup").write_text(f"Pss_Anon: {kib} kB\nPss_Shmem: {shared_kib} kB\n")
+        task = process / "task" / str(pid)
+        task.mkdir(parents=True, exist_ok=True)
+        _ = (task / "children").write_text(" ".join(map(str, children)))
+        return process
+
+    def tool_scope_unit(self, scope: Path, command: str) -> Path:
+        unit = self.root / "runtime" / "systemd" / "transient" / scope.name
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        _ = unit.write_text(f"[Scope]\nDescription=[systemd-run] {command}\n")
+        return unit
+
+    def tool_split(self, *waiting: int) -> memory_feed.BuildToolRam:
+        waiters: list[admission_records.RankedWaiter] = [
+            {"pid": pid, "start_time": str(pid), "need": 1024, "since": 0, "order": admission_records.NormalOrder()}
+            for pid in waiting]
+        with (mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}),
+              mock.patch.object(memory_feed, "PROC", self.root / "proc"),
+              mock.patch.object(memory_feed, "CGROUP", self.root),
+              mock.patch.object(gate, "builds_slice_cgroup", return_value=self.root / "builds.slice")):
+            return memory_feed.build_tool_ram((), 0, waiters)
+
+    def test_detect_scope_estimates_test_only_and_mixed_charges(self) -> None:
+        _ = self.tool_process(101, "python -m unittest", 10, children=(102,))
+        _ = self.tool_process(102, "python3 -c child", 20, parent=101, children=(103,))
+        _ = self.tool_process(103, "sleep 10", 10, parent=102)
+        _ = self.tool_process(104, "other", 50)
+        builds = self.root / "builds.slice"
+        scope = builds / "builds-detached.slice" / "detached-detect-20261117T192504-3473301-5b4c.scope"
+        cases: tuple[tuple[tuple[int, ...], int], ...] = (
+            ((101, 102, 103), 100),
+            ((101, 102, 103, 104), 40),
+            ((), 0),
+        )
+        for members, expected in cases:
+            with self.subTest(members=members):
+                write_scope(builds, anonymous=100 * 1024)
+                write_scope(scope.parent, anonymous=100 * 1024)
+                write_scope(scope, members=members, anonymous=100 * 1024)
+                self.assertEqual(self.tool_split(), memory_feed.BuildToolRam(0, 0, (100 - expected) * 1024,
+                                                                           python_tests=expected * 1024))
+
+    def test_detached_test_scope_keeps_its_class_after_the_runner_exits(self) -> None:
+        _ = self.tool_process(102, "python3 -c child", 20)
+        builds = self.root / "builds.slice"
+        run_id = "20261117T192504-3473301-5b4c"
+        scope = builds / "builds-detached.slice" / f"detached-python-tests-{run_id}.scope"
+        child_group = scope / "children"
+        write_scope(builds, anonymous=100 * 1024)
+        write_scope(scope.parent, anonymous=100 * 1024)
+        write_scope(scope, anonymous=100 * 1024)
+        write_scope(child_group, members=(102,), anonymous=70 * 1024)
+        record = self.root / "detached_runs" / f"{run_id}.json"
+        record.parent.mkdir()
+        _ = record.write_text('{"status": "finished", "kind": "python-tests"}')
+        expected = memory_feed.BuildToolRam(0, 0, 0, python_tests=100 * 1024)
+        with (mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.root)}),
+              mock.patch.object(memory_feed.ToolProcessReader, "command", side_effect=AssertionError("live command read"))):
+            self.assertEqual(self.tool_split(), expected)
+            record.unlink()
+            self.assertEqual(self.tool_split(), expected)
+
+    def test_detached_scope_without_test_evidence_counts_as_other_tools(self) -> None:
+        builds = self.root / "builds.slice"
+        detached = builds / "builds-detached.slice"
+        for name, command in (
+            ("run-test.scope", "python3 -c child"),
+            ("detached-other-20261117T192504-3473301-5b4c.scope", "python3 -m unittest"),
+        ):
+            with self.subTest(name=name):
+                _ = self.tool_process(102, command, 20)
+                scope = detached / name
+                unit = self.tool_scope_unit(scope, "/usr/bin/python3 -m unittest")
+                write_scope(builds, anonymous=100 * 1024)
+                write_scope(detached, anonymous=100 * 1024)
+                write_scope(scope, members=(102,), anonymous=100 * 1024)
+                self.assertEqual(self.tool_split(), memory_feed.BuildToolRam(0, 0, 100 * 1024))
+                unit.unlink()
+                _ = scope.rename(self.root / name)
+
+    def test_tool_group_split_names_both_byte_counts(self) -> None:
+        builds = self.root / "builds.slice"
+        detached = builds / "builds-detached.slice"
+        scope = detached / "test.scope"
+        _ = self.tool_process(101, "python3 -m unittest", 10)
+        _ = self.tool_process(102, "other", 20)
+        write_scope(detached, anonymous=30 * 1024)
+        write_scope(scope, members=(101, 102), anonymous=30 * 1024)
+        with (mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}),
+              mock.patch.object(memory_feed, "PROC", self.root / "proc")):
+            shares = memory_feed.split_tool_groups(builds, set(), set(), set(), ())[scope]
+        self.assertNotIsInstance(shares, tuple)
+        self.assertEqual(shares.python_tests_bytes, 10 * 1024)
+        self.assertEqual(shares.waiting_runs_bytes, 0)
+
+    def test_shared_pages_in_mixed_group_count_once_for_waiting_wrappers(self) -> None:
+        builds = self.root / "builds.slice"
+        for pid, command, parent, children, shared in (
+            (101, "bash /fixture/verify.sh test", 1, (102,), 15),
+            (102, "python3 local_release_wait.py", 101, (), 15),
+            (103, "other", 1, (), 0),
+        ):
+            process = self.tool_process(pid, command, 10 if shared else 50,
+                                        parent=parent, children=children, shared_kib=shared)
+            _ = (process / "cgroup").write_text("0::/builds.slice/mixed.scope\n")
+        write_scope(builds, anonymous=100 * 1024)
+        write_scope(builds / "mixed.scope", members=(101, 102, 103), anonymous=100 * 1024)
+        self.assertEqual(self.tool_split(102), memory_feed.BuildToolRam(0, 0, 50 * 1024, waiting_runs=50 * 1024))
+
+    def test_waiting_verify_shell_with_options_counts_as_a_wrapper(self) -> None:
+        builds = self.root / "builds.slice"
+        shell = self.tool_process(101, "bash -e /fixture/verify.sh test", 10, children=(102,))
+        owner = self.tool_process(102, "python3 local_release_wait.py", 10, parent=101)
+        for process in (shell, owner):
+            _ = (process / "cgroup").write_text("0::/builds.slice/verify.scope\n")
+        write_scope(builds, anonymous=20 * 1024)
+        write_scope(builds / "verify.scope", members=(101, 102), anonymous=20 * 1024)
+        self.assertEqual(self.tool_split(102), memory_feed.BuildToolRam(0, 0, 0, waiting_runs=20 * 1024))
+
+    def test_waiting_tools_skip_unrelated_processes_and_cgroup_subtrees(self) -> None:
+        builds = self.root / "builds.slice"
+        shell = self.tool_process(101, "bash /fixture/verify.sh test", 10, children=(102,))
+        owner = self.tool_process(102, "python3 local_release_wait.py", 10, parent=101)
+        thread = owner / "task" / "104"
+        thread.mkdir()
+        _ = (thread / "children").write_text("103")
+        helper = self.tool_process(103, "python3 verify_helper.py", 10, parent=102)
+        _ = self.tool_process(199, "other", 20)
+        for process in (shell, owner):
+            _ = (process / "cgroup").write_text("0::/builds.slice/verify.scope\n")
+        _ = (helper / "cgroup").write_text("0::/builds.slice/verify.scope/helper.scope\n")
+        write_scope(builds, anonymous=50 * 1024)
+        write_scope(builds / "verify.scope", members=(101, 102), anonymous=30 * 1024)
+        write_scope(builds / "verify.scope" / "helper.scope", members=(103,), anonymous=10 * 1024)
+        unrelated = builds / "unrelated.scope" / "child.scope"
+        write_scope(unrelated.parent, anonymous=20 * 1024)
+        write_scope(unrelated, members=(199,), anonymous=20 * 1024)
+        with (mock.patch.object(gate, "process_table", wraps=gate.process_table) as table,
+              mock.patch.object(Path, "read_text", autospec=True, side_effect=Path.read_text) as read):
+            tools = self.tool_split(102)
+        table.assert_not_called()
+        self.assertNotIn(mock.call(unrelated / "cgroup.procs"), read.call_args_list)
+        self.assertEqual(tools, memory_feed.BuildToolRam(0, 0, 20 * 1024, waiting_runs=30 * 1024))
+
+    def test_python_tests_and_waiting_wrappers_split_tools_without_counting_cargo_twice(self) -> None:
+        gib = admission_records.GIB
         for cargo_use in (0, 2 * admission_records.GIB):
             with self.subTest(cargo_use=cargo_use), AdmissionFixture(root=self.root / str(cargo_use)) as fixture:
                 python = fixture.fixture_owner(700001, "100")
                 process = fixture.proc.path / str(python.pid)
                 _ = process.joinpath("comm").write_text("python3\n")
                 _ = process.joinpath("cmdline").write_bytes(b"python3\0-m\0unittest\0")
-                python_use = 4 * admission_records.GIB
+                proc = fixture.proc.path
+                shell, waiter_pid, helper, unknown = 700010, 700011, 700012, 700013
+                for pid, parent, use, command in (
+                    (shell, 1, gib // 4, b"bash\0/fixture/verify.sh\0test\0"),
+                    (waiter_pid, shell, gib // 4, b"python3\0local_release_wait.py\0"),
+                    (helper, shell, gib // 2, b"python3\0verify_helper.py\0"),
+                    (unknown, 1, gib, b"python3\0tree_watch.py\0"),
+                ):
+                    write_process(proc, pid, use, parent=parent)
+                    process = proc / str(pid)
+                    _ = (process / "cmdline").write_bytes(command)
+                    _ = (process / "smaps_rollup").write_text(f"Pss_Anon: {use // 1024} kB\nPss_Shmem: 0 kB\n")
+                    task = process / "task" / str(pid)
+                    task.mkdir(parents=True)
+                    children = {shell: f"{waiter_pid} {helper}"}
+                    _ = (task / "children").write_text(children.get(pid, ""))
+                python_use = 4 * gib
                 builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
                 detached = builds / "builds-detached.slice"
-                write_scope(builds, current=python_use + cargo_use, anonymous=python_use + cargo_use)
-                write_scope(detached, current=python_use + cargo_use, anonymous=python_use + cargo_use)
-                write_scope(detached / "python.scope", members=(python.pid,),
+                write_scope(builds, current=python_use + cargo_use + 2 * gib, anonymous=python_use + cargo_use + 2 * gib)
+                write_scope(detached, current=python_use + cargo_use + 2 * gib, anonymous=python_use + cargo_use + 2 * gib)
+                python_scope = detached / "detached-python-tests-20261117T192504-3473301-5b4c.scope"
+                write_scope(python_scope, members=(python.pid,),
                     current=python_use + cargo_use, anonymous=python_use + cargo_use)
+                write_scope(detached / "verify.scope", members=(shell, waiter_pid, helper, unknown),
+                            current=2 * gib, anonymous=2 * gib)
                 if cargo_use:
                     cargo = fixture.fixture_owner(700002, "200")
-                    sidecar = fixture.scope(cargo, folder="builds.slice/builds-detached.slice/python.scope/cargo.scope",
+                    sidecar = fixture.scope(cargo, folder=str((python_scope / "cargo.scope").relative_to(builds.parent)),
                         current=cargo_use, anonymous=cargo_use)
                     request = replace(fixture.request(owner=cargo, need=8 * admission_records.GIB), sidecar=str(sidecar))
                     grant = only_admitted(fixture.server.handle_request(request))
                     self.assertEqual(len(fixture.server.reservations), 1)
                     self.assertIn(grant.reservation, [record.reservation_id for record in fixture.server.reservations.values()])
-                fixture.free(60 * admission_records.GIB - python_use - cargo_use)
+                fixture.free(60 * gib - python_use - cargo_use - 2 * gib)
                 _ = fixture.run_pass()
                 reply, = fixture.server.handle_request(wire.ViewRequest())
                 assert isinstance(reply, wire.ViewReply)
-                reading = reply.reading
-                with mock.patch.object(admission_client, "view", return_value=reading):
-                    page = memory_feed.reading()
-                self.assertEqual(page["used"], cargo_use / admission_records.GIB)
-                self.assertEqual(page["ram"]["other_build_tools_bytes"], python_use)
-                build_rows = [row for row in page["walk"] if not row.get("ci", False)]
-                self.assertEqual(len(build_rows), int(bool(cargo_use)))
-                self.assertEqual(page["leftovers"], [])
-                self.assertTrue(all(row.get("queued", False) for row in build_rows))
-                room = reading.explanation.room
+                inputs = reply.reading.explanation.decided_from
+                for start_time, wrapper_use in ((str(waiter_pid), gib), ("reused pid", 0)):
+                    waiter: admission_records.Waiter = {"pid": waiter_pid, "start_time": start_time,
+                        "since": inputs.now, "need": 60 * gib, "step": "nextest", "folder": "/fixture"}
+                    reading = gate.queue_read_from(replace(inputs, ordered=[(Path("waiter"), waiter)]),
+                                                   admission_policy_fixture())
+                    with (mock.patch.object(admission_client, "view", return_value=reading),
+                          mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")}),
+                          mock.patch.object(memory_feed, "PROC", proc)):
+                        page = memory_feed.reading()
+                    ram = page["ram"]
+                    self.assertEqual((ram["python_tests_bytes"], ram["waiting_runs_bytes"], ram["other_build_tools_bytes"]),
+                                     (python_use, wrapper_use, 2 * gib - wrapper_use))
+                    self.assertEqual(ram["build_tools_bytes"], python_use + 2 * gib)
+                    self.assertEqual(page["used"], cargo_use / gib)
+                    build_rows = [row for row in page["walk"] if not row.get("ci", False)]
+                    self.assertEqual(len(build_rows), int(bool(cargo_use)))
+                    self.assertTrue(all(row.get("queued", False) for row in build_rows))
+                room = reply.reading.explanation.room
                 assert isinstance(room, admission_records.MemoryRoom)
                 self.assertEqual(len(room.runs), int(bool(cargo_use)))
                 self.assertEqual(room.used, cargo_use)
@@ -3832,31 +4016,28 @@ process.stdout.write(JSON.stringify({
 
 
 class BuildsPageProofTests(unittest.TestCase):
-    def test_held_nightly_lease_selects_all_page_proof_views(self) -> None:
+    def test_only_a_nightly_lease_selects_all_page_proof_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            _ = write_config_fixture(Path(directory) / "build_folders.conf")
             checkout = Path(directory) / "checkout"
             checkout.mkdir()
-            with mock.patch.dict(os.environ, {"CONF_DIR": directory}):
-                self.assertFalse(needs_all_page_proof_views(checkout))
-                _ = build_slots.lease_path(checkout).write_text(json.dumps({"work": "test-nightly"}), encoding="utf-8")
-                with checkout.with_name(checkout.name + ".lock").open("wb") as lock:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    self.assertTrue(needs_all_page_proof_views(checkout))
-                self.assertFalse(needs_all_page_proof_views(checkout))
+            lease = build_slots.lease_path(checkout)
+            self.assertFalse(needs_all_page_proof_views(checkout))
+            _ = lease.write_text(json.dumps({"work": "test-all"}), encoding="utf-8")
+            self.assertFalse(needs_all_page_proof_views(checkout))
+            _ = lease.write_text(json.dumps({"work": "test-nightly"}), encoding="utf-8")
+            self.assertTrue(needs_all_page_proof_views(checkout))
 
     def test_builds_page_renders_the_queue_and_tooltips_in_chrome(self) -> None:
         source = Path(__file__).resolve()
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         proof = source.with_name("memory_page_proof.mjs")
+        all_views = needs_all_page_proof_views(source.parents[2])
+        mode = [] if all_views else ["--gate"]
         environment = {**os.environ, "PYTHON": sys.executable}
         for setting in ("MEMORY_PAGE_SHOT", "SWAP_BEFORE_PAGE", "STEADY_BASELINE"):
             _ = environment.pop(setting, None)
         with tempfile.TemporaryDirectory(prefix="builds-page-proof-") as directory:
-            _ = write_config_fixture(Path(directory) / "build_folders.conf")
-            with mock.patch.dict(os.environ, {"CONF_DIR": directory}):
-                all_views = needs_all_page_proof_views(source.parents[2])
-            mode = [] if all_views else ["--gate"]
+            write_private_slot_roots(Path(directory) / "build_folders.conf", Path(directory), FIXTURE_MACHINE)
             result = subprocess.run([executable, str(proof), *mode, directory],
                 env={**environment, "CONF_DIR": directory, "TMPDIR": directory}, text=True, capture_output=True,
                 timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)

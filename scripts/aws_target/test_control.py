@@ -1397,7 +1397,8 @@ class HoursCheckTests(CostFixture):
         self.assertEqual(claims['claimed'], [f'aws-hours-gap:{fallback}:{self.other}:{day.date().isoformat()}'])
         table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
         row = next(row for row in table.rows if row[0] == fallback)
-        self.assertEqual(row[table.headers.index(self.other)], '2.0/0.0 + 1.00 reserved (100%) over')
+        self.assertEqual(row[table.headers.index(self.other)], '2.0/0.0 (100%) over')
+        self.assertEqual(table.reserved_by_region, {self.other: '1.0'})
 
     def test_unusable_hana_size_setting_preserves_gate_notices_and_table(self) -> None:
         text_setting(self.root / 'hana_aws.conf', 'fallback_instance_types', 'm6a.4xlarge,')
@@ -1451,8 +1452,16 @@ class HoursCheckTests(CostFixture):
         # The other region has no Spot hours on the billed day.
         self.assertEqual(cells[self.size][self.other], '0.0/0.5 (100%) over')
         self.assertEqual(cells[gpu][self.home], 'not billed')
-        self.assertIn(f'above {self.limit:.0%}', tables.hours_note)
+        self.assertIn(f'above {self.limit:.0%}', tables.hours.note)
         self.assertEqual(tables.hours.title, 'Billed hours / box hours')
+
+    def test_billed_hours_legend_shows_the_exact_gap_limit(self) -> None:
+        for ratio, pct in (('0.155', '15.5%'), ('0.150', '15%'), ('0.0000123', '0.00123%')):
+            with self.subTest(ratio=ratio):
+                self.replace('billed_hours_gap_max_ratio', ratio)
+                hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+                self.assertIn(f' {pct} ', hours.note)
+                self.assertIn('sizes Hana can use', hours.note)
 
     def test_spot_table_keeps_gate_hours_and_shows_the_hana_allowance(self) -> None:
         day = self.day(1)
@@ -1460,10 +1469,12 @@ class HoursCheckTests(CostFixture):
         self.gate(self.size, self.other, day, 3600)
         self.exposures.append(ledger.HanaComputeExposure(at, at + 7200, 1, Decimal('.25'),
             ledger.HanaExposureClosed(at + 7200), self.size, region=self.other))
-        self.bill(day, {(self.size, self.other): Decimal(3)})
+        fallback = 'm6a.4xlarge'
+        self.bill(day, {(self.size, self.other): Decimal(3), (fallback, self.other): Decimal('0.9')})
         table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
-        row = next(row for row in table.rows if row[0] == self.size)
-        self.assertEqual(row[table.headers.index(self.other)], '3.0/1.0 + 2.00 reserved (0%)')
+        cells = {row[0]: row[table.headers.index(self.other)] for row in table.rows}
+        self.assertEqual(cells, {self.size: '3.0/1.0 (0%)', fallback: '0.9/0.0 (0%)'})
+        self.assertEqual(table.reserved_by_region, {self.other: '2.0'})
 
     def test_failed_notice_stays_pending_and_old_days_leave_the_claims(self) -> None:
         one = self.day(1)

@@ -44,6 +44,10 @@ while len(list(root.glob("started-*"))) < int(os.environ["TOGETHER"]) and time.m
 if to == os.environ.get("REFUSED") or len(list(root.glob("started-*"))) < int(os.environ["TOGETHER"]):
     print("QUEUED: relay timed out after 40 s")
     raise SystemExit(1)
+if to in os.environ.get("KEPT_FOR", "").split():
+    print(f"KEPT: {to} is in a review; delivered at its end")
+else:
+    print("SENT: delivered")
 """.replace("__TEST_HANG_GUARD_SECS__", str(TEST_HANG_GUARD_SECS))
 
 
@@ -279,6 +283,15 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual(result, 0, output + errors)
         self.assertEqual(len(self.sends()), 5)
         self.assertEqual(errors.splitlines(), ["broadcast: roster: sessions/broken.json: invalid JSON"])
+
+    def test_kept_messages_report_storage_without_increasing_the_sent_count(self) -> None:
+        self.peer_rows = [replace(entry("Mac Claude", "session:mac-claude"), machine="mac")]
+        result, output, errors = self.run_main("--all", "Review update.", here=False,
+                                              KEPT_FOR="session:id-hana session:mac-claude")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertRegex(output, r"\[session:id-hana\] - kept: in a review")
+        self.assertIn("mac: session:mac-claude - kept: in a review", output)
+        self.assertRegex(output.splitlines()[-2], r"^4 sent in \d+ s$")
 
     def test_showrunners_with_no_members_say_none_and_send_nothing(self) -> None:
         self.rows = [row for row in self.rows if row.role != "showrunner"]

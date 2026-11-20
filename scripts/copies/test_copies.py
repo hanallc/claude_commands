@@ -201,7 +201,8 @@ source_check_seconds=1
         self.write_config(self.settings)
         # A run inside a build slot carries that slot's Cargo cache; the test's gates lease their own.
         environment = {key: value for key, value in os.environ.items()
-                       if not key.startswith("GIT_") and key not in ("UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR")}
+                       if not key.startswith("GIT_")
+                       and key not in ("UNIT_RUN_DIR", "CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR")}
         environment.update({
             **slot_configuration.environment,
             "HOME": str(home),
@@ -1115,6 +1116,24 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertEqual(projects[key + "/child"], {"hasTrustDialogAccepted": True})
             self.assertIn("/other", projects)
             self.assertIn(str(self.source.resolve()), projects)
+
+    def test_mirror_receiver_names_the_check_that_refused_it(self) -> None:
+        tree = self.base / "mirrors" / "hana"
+        tree.mkdir(parents=True)
+        _ = (tree / floor_claims.MIRROR_SESSION).write_text("reader\n")
+        receive = ("mirror-receive", "--path", str(tree), "--owner", "verify",
+                   "--repository", "hana", "--session", "writer", "--", sys.executable, "-c", "pass")
+        with floor_claims.mirror_lock_path(tree).open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            refused = self.cli(*receive)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("busy; held by session reader (mirror lease)", refused.stderr)
+
+        processes = copies.MirrorProcessScan(tmp_sweep.ProcessUsesUnavailable(), frozenset())
+        with mock.patch.object(copies, "scan_mirror_processes", return_value=processes):
+            refused = self.cli(*receive)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("busy; held by session reader (mirror process check)", refused.stderr)
 
     def test_copies_removal_clears_clone_trust_before_deleting_the_folder(self) -> None:
         paths = self.clone_trust_files()
