@@ -1552,7 +1552,8 @@ The receiver reads and processes the fence before the permit in every pass.
 A control step can fail during a read, a write, decoding, or validation.
 The receiver continues to process the other control requests in the same pass.
 A fence sends SIGKILL to the upload process and reaps it before the receiver acknowledges the fence.
-The fence observation includes the recorded upload start time, and the controller saves the observation during settlement.
+The fence observation includes the upload start time when the receiver has recorded it.
+During settlement, the controller saves the fence observation when it carries timing.
 The receiver records an upload attempt before the PUT and records its result before it publishes the observation.
 After a restart, the receiver records an unconfirmed upload as `HanaResultUploadFailed` and reports the loss.
 Command and fence documents and execution observations have a 64 KiB protocol limit.

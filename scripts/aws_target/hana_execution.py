@@ -760,7 +760,7 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
             row = _read_journal(directory, execution)
             if row['phase'] == 'settled':
                 return _settled_dispatch(row)
-            if fence_observation is not None:
+            if fence_observation is not None and fence_observation.timing:
                 saved_observation = _checked_observation(row, request)
                 if isinstance(saved_observation, hana_protocol.HanaExecutionObservation):
                     timing: hana_protocol.HanaCommandTiming = {**saved_observation.timing, **fence_observation.timing}
