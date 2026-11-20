@@ -2181,7 +2181,8 @@ def main() -> int:
                     cast(str | None, args.excluded), cast(str | None, args.scratch))):
                 raise Refusal("--from-child is separate from unit checkpoint arguments")
             handoff = child_request(args)
-            with merge_lock(handoff.production.checkout, handoff.production.name):
+            with (merge_lock(handoff.production.checkout, handoff.production.name),
+                  land_queue.landing([handoff.checkpoint], [handoff.child.name])):
                 return run_handoff(handoff)
         except checkpoint_gate.Stop as error:
             if error.state in ("cancelled", "held"):

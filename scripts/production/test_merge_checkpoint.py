@@ -44,7 +44,9 @@ def setUpModule() -> None:
     configure_test_environment()
     state = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(state.cleanup)
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"ZONE_STATE": state.name}))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        "ZONE_STATE": state.name, "XDG_STATE_HOME": str(Path(state.name) / "state"),
+    }))
 
 
 class CheckpointTestFolderTests(unittest.TestCase):

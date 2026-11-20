@@ -132,11 +132,20 @@ def broadcast(text: str, *, here: bool) -> tuple[bool, str]:
     return delivered, summary
 
 
-def broadcast_on_mac(text: str) -> tuple[bool, str]:
-    done = _ssh('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/broadcast.py" --here '
-                + f"--from {SENDER} --all {shlex.quote(text)}")
+def broadcast_on_mac(text: str, *, zone: str) -> tuple[bool, str]:
+    read_zone = "from scripts.lib.user_zone import CONF, stored_zone\nprint(stored_zone(CONF))"
+    command = (
+        'current=$(USER_ZONE_CONF="$HOME/.claude/config/user_zone.conf" '
+        + f'"$HOME/.claude/scripts/lib/py" -c {shlex.quote(read_zone)}) && '
+        + f'[ "$current" = {shlex.quote(zone)} ] || {{ echo "the zone is not live on the Mac" >&2; exit 1; }}; '
+        + '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/broadcast.py" --here '
+        + f"--from {SENDER} --all {shlex.quote(text)}"
+    )
+    done = _ssh(command)
     if isinstance(done, str):
         return False, f"not sent: {done}"
+    if done.returncode and not done.stdout:
+        return False, _first_line(done)
     delivered, summary = _counted(done.stdout)
     return delivered and done.returncode == 0, summary
 
@@ -165,7 +174,7 @@ def drain(checkout: Path | None, *, pulled: PurePosixPath | None) -> list[str]:
             if isinstance(outcome, main_publish.MacPullFailed):
                 return [f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}"]
         main_publish.clear_pull_only(pull.mac, confirmed=pull)
-    delivered, summary = broadcast_on_mac(change.text) if change.text else (True, "no message")
+    delivered, summary = broadcast_on_mac(change.text, zone=change.label) if change.text else (True, "no message")
     if not delivered:
         return [f"mac: pulled the {change.label} change; its message still waits: {summary}"]
     if change.text:

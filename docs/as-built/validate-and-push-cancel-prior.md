@@ -11,7 +11,7 @@ After a direct push, `validate_and_push.sh --cancel-prior` cancels the branch's 
 | File | Role |
 | --- | --- |
 | `scripts/validate_and_push/validate_and_push.sh` | The `--cancel-prior` flag and `cancel_prior_runs`. |
-| `scripts/validate_and_push/push_direct.sh` | Pushes the default branch through `scripts/lib/land_main.py` under the main push lock. Then it prints the CI handoff. |
+| `scripts/validate_and_push/push_direct.sh` | Lands the default branch through `scripts/lib/land_main.py` under the main push lock, waits for the sha's run, and prints the CI handoff. |
 | `scripts/validate_and_push/test_cancel_prior.sh` | Test with stubbed `git` and `gh`. |
 | `commands/showrunner/produce.md` | The cancel-prior rule at <MergeCheckpoint/> (the `merge_checkpoint.py` call) and <CIPoint/> (`ci_points.py ci start`). |
 

@@ -30,7 +30,7 @@ from scripts.lib import land_main, live_settings, main_publish
 from scripts.message import sessions
 
 from scripts.production.merge_checkpoint import promote, request_from
-from scripts.production import merge_checkpoint
+from scripts.production import land_queue, land_runs, merge_checkpoint
 from scripts.production import change_review
 from scripts.production.production_doc import Production, ProductionDocument
 
@@ -47,11 +47,29 @@ def setUpModule() -> None:
     configure_test_environment()
     state = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(state.cleanup)
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"ZONE_STATE": state.name}))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        "ZONE_STATE": state.name, "XDG_STATE_HOME": str(Path(state.name) / "state"),
+    }))
 
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_child_handoff_registers_the_land_before_running(self) -> None:
+        _ = self.child_production()
+        checkpoint = self.checkpoint()
+
+        def run(request: merge_checkpoint.ChildHandoffRequest) -> int:
+            self.assertEqual(land_runs.running_lands().get(request.checkpoint), request.child.name)
+            return 0
+
+        with (mock.patch.object(merge_checkpoint, "run_handoff", side_effect=run),
+              mock.patch.object(land_queue, "landing", wraps=land_queue.landing) as register):
+            result = self.run_handoff(checkpoint)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        register.assert_called_once_with([checkpoint], ["example-style"])
+        with mock.patch.dict(os.environ, self.env):
+            self.assertTrue(land_runs.has_gap())
+
     def assert_promotion_keeps_waiting_setting(self, *, same_file: bool) -> None:
         path = "config/example.conf"
         baseline = "# whole: 1..10\namount=2\npublished=1\n"

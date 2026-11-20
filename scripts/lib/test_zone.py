@@ -12,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from collections.abc import Callable
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +21,7 @@ from unittest import mock
 from scripts.lib.git_test_support import git_fixture_environment
 from scripts.lib import live_settings, main_publish, zone, user_zone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import land_queue, land_runs
 
 SCRIPT = Path(__file__).with_name("zone.py")
 INITIAL_ZONE = "America/Chicago"
@@ -274,6 +274,45 @@ class SetTests(unittest.TestCase):
             self.assertIn("broadcast.py", self.log("ssh.log")[-1][-1])
             self.assertFalse(self.queued().exists())
 
+    def test_a_pull_of_old_main_keeps_the_zone_notice_queued(self) -> None:
+        mac_home = self.root / "mac"
+        mac = mac_home / ".claude"
+        mac_conf = mac / "config/user_zone.conf"
+        mac_conf.parent.mkdir(parents=True)
+        wrapper = mac / "scripts/lib/py"
+        wrapper.parent.mkdir(parents=True)
+        sent = self.root / "mac-notice"
+        source = SCRIPT.resolve().parents[2]
+        _ = wrapper.write_text(
+            "#!/bin/sh\ncase \"$1\" in\n"
+            + f"  -c) PYTHONPATH={shlex.quote(str(source))} exec {shlex.quote(sys.executable)} -S \"$@\" ;;\n"
+            + f"  */broadcast.py) touch {shlex.quote(str(sent))}; echo 'mac: fixture - sent' ;;\n"
+            + "esac\n")
+        wrapper.chmod(0o755)
+        _ = (self.fakes / "ssh.py").write_text(
+            "import os, subprocess, sys\nfrom pathlib import Path\n"
+            + "command = sys.argv[-1]\n"
+            + "if 'live_settings.py' in command:\n    sys.exit(255)\n"
+            + "if 'broadcast.py' in command:\n"
+            + f"    sys.exit(subprocess.call(['/bin/sh', '-c', command], env={{**os.environ, 'HOME': {str(mac_home)!r}}}))\n"
+            + f"live = subprocess.check_output(['git', '-C', {str(self.checkout)!r}, 'show', 'main:config/user_zone.conf'])\n"
+            + f"Path({str(mac_conf)!r}).write_bytes(live)\n"
+            + "print('rc=0')\n")
+        base = self.git(self.checkout, "rev-parse", "HEAD").strip()
+        with (mock.patch.dict(os.environ, self.env, clear=True),
+              mock.patch.object(user_zone, "CONF", self.checkout / "config/user_zone.conf"),
+              mock.patch.object(live_settings, "request_publication", return_value=land_queue.SETTINGS_WAIT_NOTICE)):
+            with land_runs.landing([base]):
+                self.assertEqual(zone.set_zone("Curacao"), 0)
+                self.assertEqual(mac_conf.read_text(), CONF_TEXT)
+                self.assertFalse(sent.exists())
+                self.assertTrue(self.queued().exists())
+            _ = live_settings.publish(self.checkout)
+            self.assertIn("mac: took the America/Curacao change", "\n".join(zone.drain(self.checkout, pulled=None)))
+        self.assertEqual(mac_conf.read_text(), CONF_TEXT.replace(INITIAL_ZONE, "America/Curacao"))
+        self.assertTrue(sent.exists())
+        self.assertFalse(self.queued().exists())
+
     def test_an_ambiguous_name_changes_nothing(self) -> None:
         result = self.run_zone("set", "AST")
         self.assertEqual(result.returncode, 2)
@@ -338,20 +377,21 @@ class SetTests(unittest.TestCase):
         self.assertFalse(self.queued().exists())
 
     def test_zone_uses_the_live_settings_time_limits(self) -> None:
-        original_run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        original_communicate = subprocess.Popen[str].communicate
         observed: dict[str, list[float | None]] = {}
 
-        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            timeout = cast(float | None, options.get("timeout"))
+        def communicate(process: subprocess.Popen[str], input: str | None = None,
+                        timeout: float | None = None) -> tuple[str, str]:
+            command = cast(list[str], process.args)
             if command[0] == "git" and command[3] in ("fetch", "push"):
                 observed.setdefault(command[3], []).append(timeout)
             elif command[0] == self.env["ZONE_SSH"]:
                 observed.setdefault("ssh", []).append(timeout)
-            return original_run(command, **options)
+            return original_communicate(process, input, timeout)
 
         with mock.patch.dict(os.environ, self.env, clear=True), \
                 mock.patch.object(user_zone, "CONF", self.checkout / "config/user_zone.conf"), \
-                mock.patch.object(subprocess, "run", side_effect=run):
+                mock.patch.object(subprocess.Popen, "communicate", communicate):
             status = zone.set_zone("Curacao")
         self.assertEqual(status, 0)
         self.assertEqual(observed, {"fetch": [10, 10], "push": [10], "ssh": [10, 20]})

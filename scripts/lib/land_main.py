@@ -15,6 +15,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+from collections.abc import Mapping
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -88,15 +89,34 @@ class NoTimeLimit:
 UNLIMITED_GIT = NoTimeLimit()
 
 
+def _run_process_group(command: list[str], *, timeout: float | None, capture_output: bool = False,
+                       pass_fds: tuple[int, ...] = (), cwd: Path | None = None,
+                       env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    output = subprocess.PIPE if capture_output else None
+    with subprocess.Popen(command, cwd=cwd, env=env, pass_fds=pass_fds, start_new_session=True,
+                          stdout=output, stderr=output, text=True) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise
+        return subprocess.CompletedProcess(command, process.returncode, stdout or "", stderr or "")
+
+
 def land(checkout: Path, commit: str, branch: str = "main", *,
          time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> Landed:
     """Push only a fast-forward and run any pending default-branch hook."""
+    timeout = time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None
+
     def git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        command = ["git", "-C", str(checkout), *arguments]
         try:
-            return subprocess.run(["git", "-C", str(checkout), *arguments],
-                                  capture_output=True, text=True, check=False,
-                                  pass_fds=gap_descriptors() if arguments[0] == "push" else (),
-                                  timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
+            if arguments[0] == "push":
+                return _run_process_group(command, timeout=timeout, capture_output=True, pass_fds=gap_descriptors())
+            return subprocess.run(command, capture_output=True, text=True, check=False, timeout=timeout)
         except subprocess.TimeoutExpired as error:
             details = "; ".join(output.decode(errors="replace").strip()
                                 for output in (error.stderr, error.stdout) if output)
@@ -139,19 +159,13 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         rerun = (f"cd {shlex.quote(str(root))} && LANDED_SHA={shlex.quote(sha)} "
                  + f"LANDED_BRANCH={shlex.quote(branch)} bash {shlex.quote(str(hook))}")
         try:
-            with subprocess.Popen(["bash", str(hook)], cwd=root, start_new_session=True,
-                                  env={**os.environ, "LANDED_SHA": sha, "LANDED_BRANCH": branch}) as process:
-                try:
-                    code = process.wait(timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    return Landed(sha, branch, pushed, HookFailed(124, rerun))
-            if code:
-                return Landed(sha, branch, pushed, HookFailed(code, rerun))
+            hook_result = _run_process_group(["bash", str(hook)], cwd=root, timeout=timeout,
+                                             env={**os.environ, "LANDED_SHA": sha, "LANDED_BRANCH": branch})
+            if hook_result.returncode:
+                return Landed(sha, branch, pushed, HookFailed(hook_result.returncode, rerun))
             write_text_atomic(record, sha + "\n")
+        except subprocess.TimeoutExpired:
+            return Landed(sha, branch, pushed, HookFailed(124, rerun))
         except OSError:
             return Landed(sha, branch, pushed, HookFailed(1, rerun))
         return Landed(sha, branch, pushed, HookDone())

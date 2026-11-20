@@ -32,6 +32,7 @@ class MacWakeTests(unittest.TestCase):
         environment = {key: value for key, value in os.environ.items()
                        if key not in ("MAC_WAKE_PROGRAM", "ZONE_SSH")}
         environment["ZONE_STATE"] = str(self.root / "zone")
+        environment["XDG_STATE_HOME"] = str(self.root / "state")
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
         _ = self.enterContext(mock.patch.object(platform, "system", return_value="Linux"))
         self.launched = []
