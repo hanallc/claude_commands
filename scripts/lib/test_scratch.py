@@ -2274,15 +2274,27 @@ print(scratch.target('gate:proof', 'tree', False))
 
     def test_registered_borrow_evidence_keeps_the_source(self) -> None:
         source = self.copy("source", task="until:2000-01-01T0000Z")
-        borrower = source.parent / "borrower"
-        borrower.mkdir()
-        self.git(borrower, "init", "-q")
-        for stores in ((source / ".git",), (self.base / "other.git", source / ".git")):
-            with self.subTest(stores=stores):
-                scratch.atomic_record(borrower / copy_record.RECORD,
-                                      {"task": "gate:borrower", "borrows_from": "\n".join(map(str, stores))})
+        other = self.base / "other.git"
+        self.git(self.base, "init", "-q", "--bare", str(other))
+        copy_record.root().mkdir(exist_ok=True)
+        rows = (
+            ("one-store", source.parent, (source / ".git",), {"borrows_from": str(source / ".git")}),
+            ("two-stores", source.parent, (other, source / ".git"), {"borrows_from": str(other)}),
+            ("old-scratch", copy_record.root(), (source / ".git",), {"test_hana_clone": True}),
+        )
+        for name, root, stores, fields in rows:
+            with self.subTest(borrower=name), tempfile.TemporaryDirectory(dir=root) as directory:
+                borrower = Path(directory)
+                self.git(borrower, "init", "-q")
+                objects = borrower / ".git/objects"
+                alternates = objects / "info/alternates"
+                _ = alternates.write_text(
+                    "".join(os.path.relpath(store / "objects", objects) + "\n" for store in stores))
+                scratch.atomic_record(borrower / copy_record.RECORD, {"task": "gate:borrower", **fields})
                 self.assertEqual(scratch.record_lifetime(source, time.time()),
                                  scratch.Live(f"borrowed: {borrower} still uses its git objects"))
+                alternates.unlink()
+                self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Ended)
 
     def test_outside_checkout_does_not_inspect_the_copies_root(self) -> None:
         copies = self.base / "unrelated-copies"
@@ -2373,6 +2385,7 @@ print(scratch.target('gate:proof', 'tree', False))
         record = scratch.task_of(child)
         assert isinstance(record, copy_record.Registered)
         scratch.atomic_record(child / copy_record.RECORD, {**record.fields, "borrows_from": str(parent / ".git")})
+        _ = (child / ".git/objects/info/alternates").write_text(str(parent / ".git/objects") + "\n")
         for held in (busy.parent, self.base / "copies", self.base):
             with self.subTest(held=held):
                 _ = scratch.hold(held, "gate:ancestor", "copy container")

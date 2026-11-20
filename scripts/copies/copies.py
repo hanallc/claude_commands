@@ -7,7 +7,6 @@ except FileNotFoundError:
     pass
 
 import argparse
-from codecs import escape_decode
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
@@ -31,7 +30,7 @@ import tempfile
 import time
 from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 
 from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, scratch
@@ -61,6 +60,7 @@ RSYNC_RECEIVER_WRITE_TIME_FLAGS = "-rlpc"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
+CLONE_STAGE_OWNER = ".copies-stage-owner"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
 
 
@@ -660,23 +660,10 @@ def git_object_store(source: Path) -> Path:
 
 def alternate_object_stores(objects: Path) -> tuple[Path, ...]:
     """Read the direct alternates of one object store."""
-    alternates = objects / "info/alternates"
     try:
-        descriptor = os.open(alternates, os.O_RDONLY | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return ()
-    with os.fdopen(descriptor, "rb") as source:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise CopyError(f"{alternates}: expected a regular file")
-        entries = source.read().split(b"\n")
-    stores: list[Path] = []
-    for entry in entries:
-        if not entry or entry.startswith(b"#"):
-            continue
-        if entry.startswith(b'"') and entry.endswith(b'"'):
-            entry, _ = escape_decode(entry[1:-1])
-        stores.append((objects / os.fsdecode(entry)).resolve())
-    return tuple(stores)
+        return tuple(store.resolve() for store in scratch.object_alternates(objects))
+    except (OSError, ValueError) as error:
+        raise CopyError(str(error)) from error
 
 
 @dataclass(frozen=True)
@@ -765,34 +752,52 @@ def initialize_shared_git(stage: Path, source: Path, roots: tuple[Path, ...]) ->
         _ = git(stage, "config", f"branch.{name}.merge", branch)
 
 
+def clone_stage_identity(status: os.stat_result) -> bytes:
+    return f"{status.st_dev}:{status.st_ino}\n".encode("ascii")
+
+
+def owns_clone_stage(stage: Path) -> bool:
+    """Require a marker that identifies this directory."""
+    try:
+        status = stage.lstat()
+        marker_path = stage / CLONE_STAGE_OWNER
+        if not stat.S_ISDIR(status.st_mode) or marker_path.is_symlink():
+            return False
+        descriptor = os.open(marker_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    with os.fdopen(descriptor, "rb") as marker:
+        return (stat.S_ISREG(os.fstat(descriptor).st_mode)
+                and marker.read(128) == clone_stage_identity(status))
+
+
 def initialize_git(tree: Path, source: Path) -> None:
     """Create private Git metadata while the caller holds the busy mark."""
-    new_checkout = not (tree / ".git").exists()
-    stage = tree / CLONE_STAGE
-    # Clear an interrupted stage while the busy mark protects the checkout.
     for leftover in tree.glob(CLONE_STAGE + "*"):
-        if leftover.is_symlink() or not leftover.is_dir():
-            continue
-        if (leftover == stage or re.fullmatch(r"\.gate-clone-[a-z0-9_]{8}", leftover.name)
-                and ((leftover / "template/objects/info/alternates").is_file()
-                     or (leftover / ".git").is_dir() or not any(leftover.iterdir()))):
+        if owns_clone_stage(leftover):
             shutil.rmtree(leftover)
-    if not new_checkout:
+    if (tree / ".git").exists():
         prepare_git_metadata(tree, source, new_checkout=False)
         return
+    stage = tree / CLONE_STAGE
+    if os.path.lexists(stage):
+        stage = tree / f"{CLONE_STAGE}-{uuid4().hex}"
     stage.mkdir()
     try:
+        _ = (stage / CLONE_STAGE_OWNER).write_bytes(clone_stage_identity(stage.stat()))
+        checkout = stage / "checkout"
         if any(active.tree == source for active in ACTIVE_GATES.get()):
-            _ = git(source, "clone", "--no-local", "--no-checkout", "--quiet", "--", str(source), str(stage))
+            _ = git(source, "clone", "--no-local", "--no-checkout", "--quiet", "--", str(source), str(checkout))
         else:
             source_objects = git_object_store(source)
             roots = root_object_stores(source_objects)
             if roots == (source_objects,):
-                _ = git(source, "clone", "--shared", "--no-checkout", "--quiet", "--", str(source), str(stage))
+                _ = git(source, "clone", "--shared", "--no-checkout", "--quiet", "--", str(source), str(checkout))
             else:
-                initialize_shared_git(stage, source, roots)
-        prepare_git_metadata(stage, source, new_checkout=True)
-        _ = (stage / ".git").rename(tree / ".git")
+                checkout.mkdir()
+                initialize_shared_git(checkout, source, roots)
+        prepare_git_metadata(checkout, source, new_checkout=True)
+        _ = (checkout / ".git").rename(tree / ".git")
     finally:
         shutil.rmtree(stage)
 
@@ -840,8 +845,6 @@ def register_scratch_clone(path: Path, source: CloneSourceCommit | CloneSource, 
     fields: dict[str, object] = {"test_hana_clone": True}
     if isinstance(source, CloneSourceCommit):
         fields.update(source_path=source.repository, source_commit=source.commit)
-    if (path / ".git").is_dir():
-        fields["borrows_from"] = borrowed_store_record(alternate_object_stores(git_object_store(path)))
     if isinstance(generated_from, CloneSourceCommit):
         fields["generated_source"] = True
     _ = scratch.update_record(path, lambda record: {
@@ -1709,6 +1712,10 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
             continue
         found.append((tree, record))
     selected = dict(found)
+    try:
+        storage = {tree: scratch.checkout_storage(tree) for tree in selected}
+    except (OSError, ValueError, RuntimeError) as error:
+        raise CopyError(f"cannot check borrowed objects: {error}") from error
     ordered: list[tuple[Path, copy_record.Registered]] = []
     visited: set[Path] = set()
     visiting: set[Path] = set()
@@ -1717,13 +1724,14 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
         if tree in visited:
             return
         if tree in visiting:
-            raise CopyError(f"{tree}: borrowed objects form a cycle; repair the copy records")
+            raise CopyError(f"{tree}: borrowed objects form a cycle")
         visiting.add(tree)
-        for child, record in found:
+        folder = tree.resolve()
+        for child, paths in storage.items():
             try:
-                borrowed = child != tree and scratch.borrows_from(record, tree)
-            except ValueError as error:
-                raise CopyError(f"repair record {child / copy_record.RECORD}: {error}") from error
+                borrowed = child != tree and scratch.storage_in_folder(paths, folder)
+            except (OSError, ValueError, RuntimeError) as error:
+                raise CopyError(f"{child}: cannot check borrowed objects: {error}") from error
             if borrowed:
                 visit(child)
         visiting.remove(tree)

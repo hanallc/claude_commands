@@ -1624,6 +1624,7 @@ with patch.object(subprocess, 'run', pause_clone):
             **(record.fields if isinstance(record, copy_record.Registered) else {}),
             "borrows_from": str(link / ".git"),
         })
+        _ = (child / ".git/objects/info/alternates").write_text(str(link / ".git/objects") + "\n")
         self.assertEqual([tree for tree, _ in copies.owned_workspaces(self.owner_id)], [child, parent])
 
     def test_first_use_owns_git_and_never_changes_source_branch(self) -> None:
@@ -2968,7 +2969,8 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_owner_removal_deletes_borrowers_before_their_sources(self) -> None:
         with copies.workspace(self.owner_id, self.source, self.head, name="a-parent", branch="worker") as parent:
-            pass
+            _ = self.git(parent, "repack", "-a", "-d")
+            (parent / ".git/objects/info/alternates").unlink()
         with copies.workspace(self.owner_id, parent, self.head, name="z-child", branch="worker") as child:
             pass
         copies.remove_trees(self.owner_id)
@@ -2982,8 +2984,11 @@ with patch.object(subprocess, 'run', pause_clone):
             record = scratch.task_of(parent)
             assert isinstance(record, copy_record.Registered)
             self.assertNotIn("ended_task", record.fields)
+            _ = self.git(parent, "repack", "-a", "-d")
+            (parent / ".git/objects/info/alternates").unlink()
         with copies.workspace("other-unit", parent, self.head, name="borrower", branch="worker") as child:
-            pass
+            self.assertEqual((child / ".git/objects/info/alternates").read_text().splitlines(),
+                             [str(parent / ".git/objects")])
         with self.assertRaisesRegex(copies.CopyError, "borrowed"):
             copies.remove_trees(self.owner_id)
         self.assertTrue(parent.exists())
@@ -3086,7 +3091,8 @@ with patch.object(subprocess, 'run', pause_clone):
 
             def interrupt_git(repo, *arguments, **options):
                 result = git(repo, *arguments, **options)
-                if repo.name == copies.CLONE_STAGE and arguments[0] == stop:
+                in_stage = repo.parent.name == copies.CLONE_STAGE
+                if arguments[0] == stop and (in_stage or stop == "checkout"):
                     os._exit(19)
                 return result
 
@@ -3097,7 +3103,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
             def interrupt_rename(path, destination):
                 result = rename(path, destination)
-                if path.parent.name == copies.CLONE_STAGE and stop == "rename":
+                if path.parent.parent.name == copies.CLONE_STAGE and stop == "rename":
                     os._exit(19)
                 return result
 
@@ -3107,20 +3113,34 @@ with patch.object(subprocess, 'run', pause_clone):
             with copies.workspace(copies.caller_owner(), source, commit, name=stop, branch="worker"):
                 pass
             """)
-        for stop in ("init", "alternates", "fetch", "rename"):
+        for stop in ("init", "alternates", "fetch", "rename", "checkout"):
             with self.subTest(stop=stop):
+                if stop == "checkout":
+                    user_directory = source / copies.CLONE_STAGE
+                    user_directory.mkdir()
+                    _ = (user_directory / "keep.txt").write_text("tracked workspace file\n")
+                    _ = self.git(source, "add", copies.CLONE_STAGE)
+                    _ = self.git(source, "commit", "-qm", "track the user directory")
+                    commit = self.git(source, "rev-parse", "HEAD")
                 interrupted = self.python_run(program, str(source), commit, stop)
                 self.assertEqual(interrupted.returncode, 19, interrupted.stderr)
                 path = copies.workspace_path(self.owner_id, source, stop)
                 self.assertTrue((path / copies.CLONE_STAGE).is_dir())
-                old_alternates = path / ".gate-clone-legacy00/template/objects/info/alternates"
+                old_stage = path / ".gate-clone-retry"
+                old_alternates = old_stage / "template/objects/info/alternates"
                 old_alternates.parent.mkdir(parents=True)
                 _ = old_alternates.write_text(str(self.source / ".git/objects") + "\n")
+                _ = (old_stage / copies.CLONE_STAGE_OWNER).write_bytes(copies.clone_stage_identity(old_stage.stat()))
                 with copies.workspace(self.owner_id, source, commit, name=stop, branch="worker") as tree:
                     self.assertEqual(tree, path)
                     self.assertEqual(self.git(tree, "rev-parse", "HEAD"), commit)
                     self.assertEqual(self.git(tree, "status", "--porcelain"), "")
-                    self.assertEqual(list(tree.glob(".gate-clone*")), [])
+                    if stop == "checkout":
+                        user_directory = tree / copies.CLONE_STAGE
+                        self.assertEqual((user_directory / "keep.txt").read_text(), "tracked workspace file\n")
+                        self.assertEqual(list(tree.glob(".gate-clone*")), [user_directory])
+                    else:
+                        self.assertEqual(list(tree.glob(".gate-clone*")), [])
 
     def test_interrupted_remove_finishes_even_after_record_is_deleted(self) -> None:
         with copies.workspace(self.owner_id, self.source, self.head, name='deleted-record', branch='deleted-record') as tree:
@@ -3232,7 +3252,7 @@ with patch.object(subprocess, 'run', pause_clone):
 
         def failed_clone(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
             if arguments[:1] == ("clone",):
-                stage = Path(arguments[-1])
+                stage = Path(arguments[-1]).parent
                 self.assertEqual(stage.parent, partial)
                 _ = (stage / "partial").write_text("unfinished clone")
                 raise copies.CopyError("clone failed")

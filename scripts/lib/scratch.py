@@ -72,6 +72,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+from codecs import escape_decode
 import fcntl
 import json
 import os
@@ -984,7 +985,8 @@ def registered_copy_paths() -> Iterator[Path]:
         path = Path(held)
         record = task_of(path)
         if (isinstance(record, copy_record.UnreadableRecord)
-                or isinstance(record, copy_record.Registered) and "borrows_from" in record.fields):
+                or isinstance(record, copy_record.Registered)
+                and (os.path.lexists(path / ".git") or (path / "HEAD").is_file())):
             paths.add(path)
     yield from sorted(paths)
 
@@ -1018,23 +1020,59 @@ def _unregistered_borrow_candidate(path: Path) -> UnregisteredBorrowCandidate:
     return UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER
 
 
-def borrows_from(record: copy_record.Registered, path: Path) -> bool:
-    """Check every recorded store against the folder that removal would delete."""
-    borrowed = record.fields.get("borrows_from", "")
-    if not isinstance(borrowed, str):
-        raise ValueError("invalid borrows_from")
-    folder = path.resolve()
-    return any(Path(store).resolve().is_relative_to(folder) for store in borrowed.split("\n") if store)
+def object_alternates(objects: Path) -> Iterator[Path]:
+    """Read the paths in the live alternates file."""
+    alternates = objects / "info/alternates"
+    try:
+        descriptor = os.open(alternates, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if os.path.lexists(alternates):
+            raise
+        return
+    with os.fdopen(descriptor, "rb") as source:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"{alternates}: expected a regular file")
+        while line := source.readline(65536):
+            if len(line) == 65536 or b"\0" in line:
+                raise ValueError(f"{alternates}: invalid alternate path")
+            entry = line.removesuffix(b"\n")
+            if not entry or entry.startswith(b"#"):
+                continue
+            if entry.startswith(b'"') and entry.endswith(b'"'):
+                entry, _ = escape_decode(entry[1:-1])
+            if not entry or b"\0" in entry:
+                raise ValueError(f"{alternates}: invalid alternate path")
+            yield objects / os.fsdecode(entry)
+
+
+def checkout_storage(checkout: Path) -> tuple[Path, ...]:
+    """Read the Git directories and direct alternates that the checkout uses."""
+    if (checkout / ".git").is_symlink():
+        raise ValueError(f"{checkout / '.git'}: symbolic link")
+    try:
+        git = git_files.at(checkout)
+    except git_files.NotACheckout:
+        objects = checkout / "objects"
+        if (checkout / "HEAD").is_file() and objects.is_dir():
+            return tuple(object_alternates(objects))
+        return ()
+    objects = git.common_dir / "objects"
+    return (git.git_dir, objects, *object_alternates(objects))
+
+
+def storage_in_folder(storage: tuple[Path, ...], folder: Path) -> bool:
+    """Check whether removal would delete a path that holds Git objects."""
+    return any(Path(os.path.normpath(path)).is_relative_to(folder)
+               or path.resolve().is_relative_to(folder) for path in storage)
 
 
 def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | Ended | Unknown:
     """Check the copy registry for borrowers of this folder's Git objects."""
     protection: Live | Ended | Unknown = Ended("no copy borrows from it")
     try:
+        folder = path.resolve()
         children = set(registered_copy_paths())
-        if (path / ".git/objects").is_dir():
-            children.update(folder.path for folder in folders(scratch_settings=scratch_settings)
-                            if (folder.path / ".git/objects/info/alternates").is_file())
+        children.update(candidate.path for candidate in folders(scratch_settings=scratch_settings))
         for child in sorted(children):
             try:
                 mode = child.lstat().st_mode
@@ -1043,7 +1081,7 @@ def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | 
             if stat.S_ISLNK(mode):
                 protection = Unknown(f"{child}: cannot check borrowed objects through a link")
                 break
-            if child.resolve() == path.resolve():
+            if child.resolve() == folder:
                 continue
             other = task_of(child, scratch_settings=scratch_settings)
             if isinstance(other, copy_record.NotRegistered):
@@ -1055,9 +1093,9 @@ def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | 
                 protection = Unknown(other.reason + "; cannot rule out borrowed objects")
                 break
             try:
-                borrowed = borrows_from(other, path)
-            except ValueError as error:
-                protection = Unknown(f"repair record {child / copy_record.RECORD}: {error}")
+                borrowed = storage_in_folder(checkout_storage(child), folder)
+            except (OSError, ValueError, RuntimeError) as error:
+                protection = Unknown(f"{child}: cannot check borrowed objects: {error}")
                 break
             if borrowed:
                 protection = Live(f"borrowed: {child} still uses its git objects")
