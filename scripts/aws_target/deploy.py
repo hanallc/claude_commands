@@ -2112,7 +2112,7 @@ class Deployment:
         evidence: dict[str, object] = {}
         if for_setup:
             resume_stop = saved.get('requested') is True and saved.get('stop_pending') is True and bool(saved.get('instance'))
-            evidence = self._hana_output()._read_preparation_evidence(settings, template, allow_expired=resume_stop)
+            evidence = self._read_preparation_evidence(output, settings, template, allow_expired=resume_stop)
         identity = (ledger.text(saved, 'deployment') if saved else
                     ledger.text(prepared_parameters(output), 'DeploymentId') if for_setup else uuid4().hex)
         saved_settings = replace(settings, region=ledger.text(saved, 'region')) if saved.get('requested') else settings
@@ -2445,7 +2445,7 @@ class Deployment:
     def confirm_preparation_evidence(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
                                     *, renew: bool = False, current_fingerprint: str = '', allow_expired: bool = False) -> None:
         """Verify saved preparation before either workload can create resources."""
-        preflight = self._read_preparation_evidence(settings, template, renew=renew, allow_expired=allow_expired)
+        preflight = self._read_preparation_evidence(self.output, settings, template, renew=renew, allow_expired=allow_expired)
         expected = current_fingerprint or fingerprint(settings, parameters, template)
         if preflight.get('fingerprint') != expected or fingerprint(settings, parameters, template) != expected:
             raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
@@ -2453,12 +2453,12 @@ class Deployment:
             preflight['at'] = int(self.clock())
             write_text_atomic(self.output / 'preflight.json', json.dumps(preflight, sort_keys=True) + '\n')
 
-    def _read_preparation_evidence(self, settings: DeploymentSettings, template: bytes, *, renew: bool = False,
-                                   allow_expired: bool = False) -> dict[str, object]:
-        preflight = remote.read_record(self.output / 'preflight.json')
+    def _read_preparation_evidence(self, output: Path, settings: DeploymentSettings, template: bytes, *,
+                                   renew: bool = False, allow_expired: bool = False) -> dict[str, object]:
+        preflight = remote.read_record(output / 'preflight.json')
         age = int(self.clock()) - ledger.instant(preflight, 'at')
         if ((not renew and (age < 0 or (not allow_expired and age > settings.preflight_max_age_s)))
-                or (self.output / 'template.json').read_bytes() != template):
+                or (output / 'template.json').read_bytes() != template):
             raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
         return preflight
 

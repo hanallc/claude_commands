@@ -491,7 +491,7 @@ class HanaSetupFailureTests(CostFixture):
     def subject(self, fake: FakeEc2, *, waiter_timeout: bool = False, retain_on_delete: bool = False,
                 spot_prices: tuple[tuple[str, str], ...] = (('us-east-2b', '0.10'),),
                 launch_errors: tuple[str, ...] = (), volume_errors: tuple[str, ...] = (),
-                legacy_stack: bool = False) -> deploy.Deployment:
+                legacy_instance: str = '') -> deploy.Deployment:
         preexisting = fake.stack
         status = 'CREATE_COMPLETE' if preexisting else 'CREATE_IN_PROGRESS'
         created = self.clock.now
@@ -533,8 +533,8 @@ class HanaSetupFailureTests(CostFixture):
                 if status == 'CREATE_COMPLETE':
                     outputs = {'ControlBucket': 'control-bucket', 'LaunchTemplate': 'fixture-template',
                                'LaunchTemplateVersion': '1', 'SecurityGroup': 'fixture-group'}
-                    if legacy_stack:
-                        outputs.update(Instance='fixture-instance', DataVolume='fixture-disk')
+                    if legacy_instance:
+                        outputs.update(Instance=legacy_instance, DataVolume='fixture-disk')
                     stack['Outputs'] = [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]
                 return subprocess.CompletedProcess(arguments, 0, json.dumps({'Stacks': [stack]}), '')
             if operation == 'run-instances':
@@ -601,7 +601,8 @@ class HanaSetupFailureTests(CostFixture):
         _ = self.enterContext(mock.patch.object(deploy.Deployment, '_api', side_effect=api))
         return deploy.Deployment(self.settings, self.state, self.root / 'output', clock=self.clock, notify=lambda _event: True)
 
-    def write_leftover(self, subject: deploy.Deployment, fake: FakeEc2, *, instance: str = '') -> int:
+    def write_leftover(self, subject: deploy.Deployment, fake: FakeEc2, *, instance: str = '',
+                       preparation_calls: tuple[str, ...] = ('describe-stacks',)) -> int:
         limits = hana_spend.read_settings(conf.read(self.workload))
         reservation = hana_spend.HanaSpending(self.book, self.settings, limits).reserve_setup(
             self.clock.now, self.clock.now + limits.permit_max_seconds)
@@ -617,7 +618,7 @@ class HanaSetupFailureTests(CostFixture):
         self.clock.advance(limits.permit_max_seconds + 1)
         before_prepare = len(fake.operations)
         _ = subject.prepare_hana()
-        self.assertEqual(fake.operations[before_prepare:], ['describe-stacks'])
+        self.assertEqual(tuple(fake.operations[before_prepare:]), preparation_calls)
         del fake.operations[before_prepare:]
         return generation
 
@@ -953,11 +954,12 @@ class HanaSetupFailureTests(CostFixture):
 
     def test_hana_setup_refuses_a_stack_with_legacy_instance_outputs(self) -> None:
         fake = FakeEc2(stack=True)
-        subject = self.subject(fake, legacy_stack=True)
-        _ = self.write_leftover(subject, fake)
+        subject = self.subject(fake, legacy_instance=fake.launch(tagged=True))
+        reads = ('describe-stacks', 'describe-instances')
+        _ = self.write_leftover(subject, fake, preparation_calls=reads)
         with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'down --workload hana --approve-destroy first'):
             _ = subject.hana_setup(approve_resources=True)
-        self.assertEqual(fake.operations, ['describe-stacks'])
+        self.assertEqual(tuple(fake.operations), reads)
 
     def test_hana_setup_refuses_a_legacy_stack_instance_even_without_its_output(self) -> None:
         fake = FakeEc2(stack=True, resources={'Instance': ('AWS::EC2::Instance', 'fixture-instance')})
