@@ -23,6 +23,7 @@ from typing import Literal, NotRequired, TypedDict, cast
 from scripts.lib import build_folders, conf, conf_reads, git_index, registry_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.transcripts import config_dirs
+from scripts.production.production_doc import require_no_live_file_conflicts
 
 WAITING_PATHS = ":(glob)config/*.conf"
 REGISTRY_PATH = "config/models.conf"
@@ -529,6 +530,9 @@ def recover_move(checkout: Path, head: str) -> None:
         return
     if head not in (plan["source"], plan["target"]):
         raise OSError("HEAD is outside the pending settings move")
+    require_no_live_file_conflicts(checkout, plan["source"])
+    if plan["target"] != plan["source"]:
+        require_no_live_file_conflicts(checkout, plan["target"])
 
     if (writes := plan.get("writes")) is None:
         check_move_without_receipt(checkout, plan, head)
@@ -647,6 +651,7 @@ def check_move(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
                replace_registry: bool = False, registry_move: bool = False,
                replay_registry: RegistryReplay = registry_rows.replay_pending) -> WaitingRows:
     """Check the move on a private index before Git changes the checkout."""
+    require_no_live_file_conflicts(checkout, move.tip)
     index = index_path(checkout)
     folder = (build_folders.tool_folder("models-ff-index") if registry_move
               else tempfile.TemporaryDirectory(prefix="waiting-rows-index-"))

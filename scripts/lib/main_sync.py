@@ -37,6 +37,9 @@ from typing import cast
 from scripts.lib import conf, waiting_rows
 from scripts.message import session_send
 from scripts.lib.process_failure import failure_detail
+from scripts.production.production_doc import (
+    LiveFileConflict as LiveFileConflict, ProductionPathsError, live_file_conflicts as live_file_conflicts,
+)
 
 STATE_ENV = "MAIN_SYNC_STATE_DIR"
 DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "main-sync")
@@ -193,7 +196,7 @@ def sync(checkout: Path) -> Outcome:
         return Outcome("in-progress", f"{checkout} has a git operation in progress ({busy[0]})")
     try:
         waiting_rows.restore_live(checkout)
-        fetched = _git(checkout, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main",
+        fetched = _git(checkout, "fetch", "-q", "--no-tags", "--refmap=", "origin", "refs/heads/main",
                        timeout=FETCH_TIMEOUT_SECONDS)
         if fetched.returncode:
             try:
@@ -204,11 +207,21 @@ def sync(checkout: Path) -> Outcome:
                       + "the job retries" if warm else f"run github-warmup at a terminal on {socket.gethostname()}")
             return Outcome("fetch-failed", f"git fetch origin main failed in {checkout}: {_first_line(fetched)}; {advice}")
         with waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
-            move = waiting_rows.move_target(checkout, "origin/main", pending, fast_forward=True)
+            fetched_tip = _git(checkout, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
+            if fetched_tip.returncode:
+                return Outcome("fetch-failed", _first_line(fetched_tip))
+            tip = fetched_tip.stdout.strip()
+            conflicts = live_file_conflicts(checkout, tip)
+            if conflicts:
+                return Outcome("live-file-conflict", "\n".join(str(conflict) for conflict in conflicts))
+            tracked = _git(checkout, "update-ref", "refs/remotes/origin/main", tip)
+            if tracked.returncode:
+                return Outcome("fetch-failed", _first_line(tracked))
+            move = waiting_rows.move_target(checkout, tip, pending, fast_forward=True)
             return _advance(checkout, move, pending)
     except waiting_rows.Diverged:
         return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")
-    except (OSError, UnicodeError, ValueError) as error:
+    except (OSError, UnicodeError, ValueError, ProductionPathsError) as error:
         return Outcome("ff-failed", f"the move to origin/main failed in {checkout}: {' '.join(str(error).split())}")
 
 

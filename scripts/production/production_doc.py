@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import NamedTuple, cast
+from typing import NamedTuple, cast, override
 from zoneinfo import ZoneInfo
 
 from scripts.agents import remote
@@ -52,6 +52,16 @@ class ProtectedCheckout:
     path: Path
     repository: Path  # Canonical Git common directory.
     branch: str
+
+
+@dataclass(frozen=True)
+class LiveFileConflict:
+    live_path: Path
+    incoming_path: Path
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.live_path}: conflicts with incoming {self.incoming_path}"
 
 
 @dataclass(frozen=True)
@@ -202,6 +212,13 @@ def _enrolled_paths(document: ProductionDocument, main: Path, owner: staff.Staff
     return EnrolledPaths(main, document.doc, document.log, notes, document.checkout)
 
 
+def legacy_document_path(doc: Path) -> Path:
+    """Return the tracked document path for history queries."""
+    if doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
+        return doc.with_name(doc.name.removesuffix(LIVE_DOCUMENT_SUFFIX) + ".md")
+    return doc
+
+
 def resolve_production_paths(doc: Path) -> EnrolledPaths | LegacyProduction:
     """Resolve an enrolled document and its owner from the local staff record."""
     try:
@@ -218,13 +235,68 @@ def resolve_production_paths(doc: Path) -> EnrolledPaths | LegacyProduction:
         owners = [row for row, path in rows if path == live_doc]
         if not owners and live_doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
             # The move writes the live document before updating its staff binding.
-            old = live_doc.with_name(live_doc.name.removesuffix(LIVE_DOCUMENT_SUFFIX) + ".md").relative_to(main)
+            old = legacy_document_path(live_doc).relative_to(main)
             owners = [row for row, path in rows if path in (main / old, document.checkout / old)]
         if len(owners) != 1:
             raise ProductionPathsError(f"{live_doc}: expected one showrunner with this document")
         return _enrolled_paths(document, main, owners[0])
     except (OSError, UnicodeError, RuntimeError, ValueError) as error:
         raise ProductionPathsError(f"{doc}: {error}") from error
+
+
+def _repository_live_paths(checkout: git_files.Checkout) -> dict[Path, Path]:
+    paths: dict[Path, Path] = {}
+    for row in local_production_documents():
+        assert isinstance(row.doc, staff.LiveDoc)
+        doc = row.doc.path.resolve()
+        try:
+            if git_files.locate(doc.parent).common_dir != checkout.common_dir:
+                continue
+            lines = doc.read_text(encoding="utf-8").splitlines()
+        except (FileNotFoundError, git_files.NotACheckout):
+            continue
+        declared = optional_field(lines, MERGE_CHECKOUT_FIELD)
+        if isinstance(declared, FieldPresent):
+            production = _read_enrolled(doc, row.name, lines, declared)
+            main = production.merge_checkout
+            assert isinstance(main, Path)
+            enrolled = _enrolled_paths(production, main, row)
+            for live in (enrolled.live_doc, enrolled.log, enrolled.notes):
+                paths[live] = live.relative_to(main)
+    return paths
+
+
+def live_file_conflicts(repository: Path, incoming: str) -> tuple[LiveFileConflict, ...]:
+    """Compare protected paths with the incoming tree entries."""
+    try:
+        checkout = git_files.locate(repository)
+        live_paths = _repository_live_paths(checkout)
+        if not live_paths:
+            return ()
+        tip = subprocess.run(
+            ["git", "-C", str(checkout.toplevel), "rev-parse", "--verify", "--end-of-options", f"{incoming}^{{tree}}"],
+            capture_output=True, text=True, check=False)
+        if tip.returncode:
+            raise ProductionPathsError(f"{repository}: cannot resolve incoming tree: {tip.stderr.strip()}")
+        tree = subprocess.run(
+            ["git", "-C", str(checkout.toplevel), "ls-tree", "-r", "-z", "--name-only", tip.stdout.strip()],
+            capture_output=True, text=True, errors="surrogateescape", check=False)
+        if tree.returncode:
+            raise ProductionPathsError(f"{repository}: cannot read incoming tree: {tree.stderr.strip()}")
+        entries = tuple(Path(name) for name in tree.stdout.split("\0") if name)
+        return tuple(LiveFileConflict(live, entry) for live, relative in sorted(live_paths.items())
+                     for entry in entries if entry.is_relative_to(relative) or relative.is_relative_to(entry))
+    except (OSError, UnicodeError, RuntimeError, ValueError) as error:
+        raise ProductionPathsError(f"{repository}: cannot check live files: {error}") from error
+
+
+def require_no_live_file_conflicts(checkout: Path, incoming: str) -> None:
+    try:
+        conflicts = live_file_conflicts(checkout, incoming)
+    except ProductionPathsError as error:
+        raise OSError(str(error)) from error
+    if conflicts:
+        raise OSError("\n".join(str(conflict) for conflict in conflicts))
 
 
 def protected_checkouts() -> frozenset[ProtectedCheckout]:
