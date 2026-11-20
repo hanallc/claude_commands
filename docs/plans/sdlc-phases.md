@@ -1527,7 +1527,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. No merge path runs basedpyright. The nightly run still type checks `scripts`. basedpyright: 0 errors, 0 warnings. Full gate green.
 
-### Phase 89 — A session in a review gets its messages at the review end; an urgent message goes through at once  · status: todo
+### Phase 89 — A session in a review gets its messages at the review end; an urgent message goes through at once  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1552,6 +1552,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. A fixture review session gets no delivery while its count is above 0, gets one oldest-first list at 0, and gets an urgent message at once. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** while a session has an open review, `send.py` holds each message to it and delivers the held list at the review end. `--urgent` goes through the hold at once. A held send reports KEPT. A SessionStart hook delivers messages held for a session when it starts. On main 138c42247 (merged as 088fe8f12, hash ee9927b72).
 
 ### Phase 90 — A merge takes a moved main with no retest when the new main commits change only disjoint non-code files  · status: dropped
 **Result (2026-11-19):** dropped with no merge. bob stopped it at 18:18 EST for the user's side (item 140 (a)). The case that started it, a settings.json commit on main, still retests under the rule. The rule passes only 29 of 554 main moves in 7 days. Review also found that the "non-code" files hold test inputs. The branch `sdlc-phases-90` stays off the merge line. A direct push to main still asks natemerge for a gap first.
