@@ -5,58 +5,63 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
+from scripts.build_targets.execution_transport import HanaGpuNextestTransport
+
 from scripts.aws_target.hana_placement import (
-    ExecutionTransport, SshCommandTransport, HanaControlTransport, HanaHostGeneration,
+    ExecutionTransport, HanaControlTransport, HanaHostGeneration,
     DisabledHanaRoute, EnabledHanaRoute, HanaRouteSettings, HanaCheck, HanaClippyJudgment,
-    HanaStepRefused, HanaStepPolicy, HanaLifecycleEvidence, HanaUnprovisioned,
+    HanaStepRefused, HanaStepPolicy, HanaUnprovisioned,
     HanaLifecycleUnavailable, HanaClaimResult, HanaClaimPending, HanaClaimAdopted,
-    HanaClaimRefused, HanaClaimRetained, generation_text,
+    HanaClaimRefused, HanaClaimRetained, HanaClaimResourcesHeld, HanaClaimRelease, HanaClaimReleased,
+    HanaClaimReleaseRefused, generation_text,
 )
+from scripts.build_queue import execution_identity
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from scripts.aws_target import hana_box as box
-    from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
+    from scripts.aws_target.hana_execution import HanaSettlement
+    from scripts.aws_target.hana_placement import HanaEvidenceRequest
+    from scripts.build_queue import admission_records as records, placement
     from scripts.build_targets.target_config import SshTarget
     from scripts.lib import conf
     from scripts.mac_test import claim_state
 
 def read_execution_transport(target: SshTarget) -> ExecutionTransport:
     """Select the configured transport before reading SSH settings."""
-    from scripts.lib import conf
+    from scripts.build_targets import target_config
 
-    values = conf.read(target.settings).values()
-    transport = values.get('execution_transport', 'ssh')
-    if transport == 'ssh':
-        return SshCommandTransport(target.settings)
-    if transport != 'hana-control' or target.platform != 'linux':
-        raise conf.Unusable('execution_transport: expected ssh or Linux hana-control')
-    host = values.get('host', '')
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', host):
-        raise conf.Unusable('host: expected a safe Hana reporting alias')
-    return HanaControlTransport(target.settings, host)
-
+    return target_config.read_execution_transport(target)
 
 def read_settings(configuration: conf.ConfigRead) -> HanaRouteSettings:
     """Read the workload without reading credentials or deployment records."""
     from scripts.buildlog.repository import remote_identity
     from scripts.lib import conf
 
-    enabled = configuration.text('enabled')
-    if enabled not in ('on', 'off'):
-        raise conf.Unusable('enabled: expected on or off')
-    if enabled == 'off':
+    def repository_key(value: str) -> str:
+        if value != remote_identity(value, str(configuration.source.parent)):
+            raise ValueError('expected a normalized repository identity')
+        return value
+
+    def permitted_kinds(value: str) -> tuple[placement.CommandKind, ...]:
+        from typing import cast
+
+        kinds = tuple(part.strip() for part in value.split(','))
+        if len(set(kinds)) != len(kinds) or any(kind not in ('check', 'lint') for kind in kinds):
+            raise ValueError('Hana permits only check and lint judgments')
+        return cast('tuple[placement.CommandKind, ...]', kinds)
+
+    if not configuration.value('enabled', conf.on_off):
         return DisabledHanaRoute()
-    key = configuration.text('repository_identity')
-    if not key or key != remote_identity(key, str(configuration.source.parent)):
-        raise conf.Unusable('repository_identity: expected a normalized repository identity')
-    kinds = tuple(part.strip() for part in configuration.text('kinds').split(','))
-    if not kinds or len(set(kinds)) != len(kinds) or any(kind not in ('check', 'lint') for kind in kinds):
-        raise conf.Unusable('kinds: Hana permits only check and lint judgments')
-    maximum, floor = configuration.whole('max_steps'), configuration.whole('free_floor_gib')
-    if maximum != 1 or floor < 1:
-        raise conf.Unusable('Hana requires one step and a positive free disk floor')
-    # The checks above narrow external strings at the configuration boundary.
-    from typing import cast
-    return EnabledHanaRoute(key, cast('tuple[placement.CommandKind, ...]', kinds), maximum, floor)
+    key = configuration.value('repository_identity', repository_key)
+    kinds = configuration.value('kinds', permitted_kinds)
+    def single_step(value: str) -> int:
+        if conf.positive_whole(value) != 1:
+            raise ValueError('Hana requires one step')
+        return 1
+
+    maximum = configuration.value('max_steps', single_step)
+    floor = configuration.value('free_floor_gib', conf.positive_whole)
+    return EnabledHanaRoute(key, kinds, maximum, floor)
 
 
 def classify_command(step: str, kind: str, command: tuple[str, ...]) -> HanaStepPolicy:
@@ -103,7 +108,6 @@ def controller_for(transport: HanaControlTransport, *, read_only: bool = False) 
 def validate_assignment(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity
                         ) -> HanaControlTransport | HanaClaimRefused:
     """Check the configured destination, scope, source, and live local holder."""
-    from scripts.build_queue import placement
     from scripts.build_targets import target_config
     from scripts.lib import conf, process_start
     from scripts.mac_test import claim_state
@@ -120,7 +124,7 @@ def validate_assignment(assignment: placement.PlacementAssignment, holder: place
     if (destination.provider != 'ssh' or destination.host != transport.host or destination.slot != 1
             or not isinstance(destination.scope, claim_state.RepositoryScope)
             or destination.scope.slot != 1 or destination.scope.key != settings.repository_key
-            or not isinstance(assignment.source_key, placement.SourceKeyKnown)
+            or not isinstance(assignment.source_key, execution_identity.SourceKeyKnown)
             or not assignment.source_key.key or not assignment.episode or not assignment.attempt):
         return HanaClaimRefused('The assignment differs from the configured Hana scope')
     if (holder.host != store.host_name() or holder.pid <= 0
@@ -147,7 +151,7 @@ def claim_assigned(assignment: placement.PlacementAssignment, holder: placement.
     if controller.workload_path.resolve() != transport.settings.resolve():
         return HanaClaimRefused('The lifecycle controller differs from the assigned workload')
     destination = assignment.destination
-    execution = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+    execution = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
     reference = placement.ProviderClaimReference('ssh', destination.target, destination.scope,
         execution, assignment.episode, assignment.attempt)
     paths = claim_state.state_paths(destination.target)
@@ -159,7 +163,7 @@ def claim_assigned(assignment: placement.PlacementAssignment, holder: placement.
                     or previous['episode'] != assignment.episode or previous['attempt'] != assignment.attempt
                     or previous['pid'] != holder.pid or previous['proc_start'] != holder.start_time
                     or previous['submitting_session'] != claim_state.session_id(assignment.session)):
-                return HanaClaimRefused('Hana is busy')
+                return HanaClaimRefused(box.HANA_CLAIM_BUSY)
         if execution_command_settled(controller.directory, execution):
             return HanaClaimRefused('The Hana attempt already has a settled command path')
         if held:
@@ -167,13 +171,13 @@ def claim_assigned(assignment: placement.PlacementAssignment, holder: placement.
             status = controller.claim_status(execution)
             result = box.ClaimCommitted(status.claim) if isinstance(status, box.ClaimWaiting) else status
         else:
-            # Bind before requesting work so a dead holder cannot release an unresolved start.
-            controller.bind_execution(execution)
-            result = controller.request(execution)
+            result = controller.request(execution, assigned=True)
+        if isinstance(result, box.HanaResourcesHeld):
+            return HanaClaimResourcesHeld()
         if isinstance(result, box.ClaimRefused):
             return HanaClaimRefused(result.reason)
         snapshot = controller.inspect()
-        if not isinstance(snapshot, HanaLifecycleEvidence):
+        if isinstance(snapshot, (HanaUnprovisioned, HanaLifecycleUnavailable, box.HanaResourcesHeld)):
             return HanaClaimRetained(reference, 'The Hana lifecycle evidence is unavailable')
         generation = (HanaHostGeneration(snapshot.deployment.deployment, snapshot.boot.start_token, snapshot.boot.boot_id)
             if isinstance(snapshot.boot, box.VerifiedBoot) else HanaHostGeneration(snapshot.deployment.deployment, '', ''))
@@ -200,100 +204,198 @@ def claim_assigned(assignment: placement.PlacementAssignment, holder: placement.
         return HanaClaimAdopted(placement.ReservedHost(assignment, adopted), generation)
 
 
+def read_assigned_adoption(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity,
+                           transport: HanaControlTransport) -> placement.AdoptedProviderClaim | HanaClaimRefused:
+    """Read the exact target claim and lifecycle row without locks or provider calls."""
+    from scripts.aws_target import hana_box as box
+    from scripts.build_queue import placement
+    from scripts.mac_test import claim_state, mac_test
+
+    destination = assignment.destination
+    scope = destination.scope
+    reference = placement.assigned_claim_reference(assignment)
+    if destination.host != transport.host or not isinstance(scope, claim_state.RepositoryScope):
+        return HanaClaimRefused('adoption evidence is stale: the configured Hana destination differs')
+    try:
+        path = mac_test.claim_path(claim_state.state_paths(destination.target), scope)
+        record = claim_state.read_run(path)
+        if isinstance(record, claim_state.NoRun):
+            return HanaClaimRefused('adoption evidence is unavailable: the Hana claim record is missing')
+        controller = controller_for(transport, read_only=True)
+        snapshot = controller.read_saved_lifecycle()
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return HanaClaimRefused(f'adoption evidence is unavailable: {error}')
+    if isinstance(snapshot, HanaUnprovisioned):
+        return HanaClaimRefused('adoption evidence is unavailable: the Hana lifecycle row is missing')
+    if (record['claim_id'] != reference.claim_id or record['episode'] != reference.episode
+            or record['attempt'] != reference.attempt or record.get('repo_name') != scope.name
+            or record.get('repo_key') != scope.key or record.get('slot') != scope.slot
+            or record['pid'] != holder.pid or record['proc_start'] != holder.start_time
+            or record['submitting_session'] != claim_state.session_id(assignment.session)
+            or record.get('remote_host') != destination.host or record.get('cleanup_pending')):
+        return HanaClaimRefused('the exact claim is not adopted')
+    if (snapshot.state != box.Lifecycle.READY or not isinstance(snapshot.boot, box.VerifiedBoot)
+            or not any(claim.active and claim.execution == reference.claim_id for claim in snapshot.claims)
+            or not isinstance(snapshot.permit, box.DeliveredPermit)
+            or snapshot.permit.execution != reference.claim_id or snapshot.permit.expires <= controller.clock()):
+        return HanaClaimRefused('adoption evidence is stale: the Hana lifecycle has no active permit for this claim')
+    generation = generation_text(HanaHostGeneration(snapshot.deployment.deployment,
+        snapshot.boot.start_token, snapshot.boot.boot_id))
+    if record.get('instance_generation') != generation:
+        return HanaClaimRefused('adoption evidence is stale: the Hana claim belongs to a different boot')
+    return placement.AdoptedProviderClaim(reference, holder, assignment.session, destination.host, generation)
+
+
 def release_assigned(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity,
-                     controller: box.HanaController) -> bool:
+                     controller: box.HanaController) -> HanaClaimRelease:
     """Release the exact target claim after durable execution and lifecycle settlement."""
     from scripts.aws_target.hana_execution import execution_command_settled
-    from scripts.build_queue import placement
     from scripts.build_targets import target_config
     from scripts.mac_test import claim_state
 
     destination = assignment.destination
-    execution = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+    execution = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
     if not execution_command_settled(controller.directory, execution):
-        return False
+        return HanaClaimReleaseRefused('The Hana command settlement is unconfirmed')
     target = target_config.configured_ssh_target(destination.target)
     transport = read_execution_transport(target)
     if (not isinstance(transport, HanaControlTransport) or destination.host != transport.host
             or transport.settings.resolve() != controller.workload_path.resolve()):
-        return False
+        return HanaClaimReleaseRefused('The assigned Hana transport differs from the lifecycle controller')
     paths = claim_state.state_paths(destination.target)
     with claim_state.locked(paths.lock):
         held = claim_state.read_claims(paths)
-        matching = tuple(claim for claim in held if claim.scope == destination.scope
-            and claim.record['claim_id'] == execution and claim.record['episode'] == assignment.episode
-            and claim.record['attempt'] == assignment.attempt and claim.record['pid'] == holder.pid
-            and claim.record['proc_start'] == holder.start_time
-            and claim.record['submitting_session'] == claim_state.session_id(assignment.session))
+        matching = tuple(claim for claim in held if claim.record['claim_id'] == execution
+            and _matches_assigned_claim(claim, assignment, holder))
         if held and not matching and any(claim.record['claim_id'] == execution for claim in held):
-            return False
+            return HanaClaimReleaseRefused('The local Hana claim differs from the assignment or holder')
         return _release_claims(controller, execution, matching)
 
 
+def _matches_assigned_claim(claim: claim_state.HeldClaim, assignment: placement.PlacementAssignment,
+                           holder: placement.ClaimHolderIdentity) -> bool:
+    from scripts.mac_test import claim_state
+
+    record = claim.record
+    return (claim.scope == assignment.destination.scope and record['episode'] == assignment.episode
+            and record['attempt'] == assignment.attempt and record['pid'] == holder.pid
+            and record['proc_start'] == holder.start_time
+            and record['submitting_session'] == claim_state.session_id(assignment.session))
+
+
+def _holder_ended(pid: int, start_time: str) -> bool:
+    from scripts.lib import process_start
+
+    owner = process_start.process_start(pid)
+    return (isinstance(owner, (process_start.Gone, process_start.Zombie))
+            or isinstance(owner, process_start.Started) and owner.start != start_time)
+
+
+def recover_assigned_execution(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity,
+                               controller: box.HanaController) -> HanaSettlement:
+    """Settle a dead local holder's exact dispatch without contacting the guest."""
+    from functools import partial
+    from scripts.aws_target import hana_box as box
+    from scripts.aws_target.hana_execution import HanaSettlementPending, replay_execution_settlement
+    from scripts.build_queue import placement
+    from scripts.buildlog import store
+    from scripts.mac_test import claim_state
+
+    if holder.host != store.host_name() or not _holder_ended(holder.pid, holder.start_time):
+        return HanaSettlementPending('The Hana claim holder has not ended')
+    reference = placement.assigned_claim_reference(assignment)
+    paths = claim_state.state_paths(reference.target)
+    with claim_state.locked(paths.lock):
+        claims = tuple(claim for claim in claim_state.read_claims(paths) if claim.record['claim_id'] == reference.claim_id)
+        if claims:
+            claim = claims[0]
+            if (len(claims) != 1 or not _matches_assigned_claim(claim, assignment, holder)
+                    or claim.record.get('remote_host') != assignment.destination.host):
+                return HanaSettlementPending('The Hana claim differs from the assignment or holder')
+            generation: str | placement.NoProviderClaim = claim.record.get('instance_generation', '')
+            release: Callable[[], HanaClaimRelease] = partial(release_assigned, assignment, holder, controller)
+        else:
+            snapshot = controller.inspect_for_settlement()
+            if (not isinstance(snapshot, box.HanaLifecycleEvidence)
+                    or any(claim.execution == reference.claim_id for claim in snapshot.claims)
+                    or isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == reference.claim_id):
+                return HanaSettlementPending('The Hana lifecycle claim remains unresolved')
+            generation = placement.NoProviderClaim()
+            release = HanaClaimReleased
+    return replay_execution_settlement(controller.directory, assignment, retained_generation=generation,
+        release_claim=release)
+
+
 def _release_claims(controller: box.HanaController, execution: str, matching: tuple[claim_state.HeldClaim, ...],
-                    *, detached_only: bool = False) -> bool:
+                    *, detached_only: bool = False) -> HanaClaimRelease:
     from scripts.aws_target import hana_box as box
 
-    snapshot = controller.inspect()
-    if not isinstance(snapshot, HanaLifecycleEvidence):
-        return False
+    snapshot = controller.inspect_for_settlement()
+    if isinstance(snapshot, HanaUnprovisioned):
+        return HanaClaimReleaseRefused('No Hana deployment is available for release')
+    if isinstance(snapshot, HanaLifecycleUnavailable):
+        return HanaClaimReleaseRefused(f'The Hana lifecycle evidence is unavailable ({snapshot.reason})')
     current = any(claim.execution == execution for claim in snapshot.claims)
     pending = isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution
     if detached_only:
-        if current or pending or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING):
-            return False
+        if current:
+            return HanaClaimReleaseRefused('Hana still holds the lifecycle claim')
+        if pending or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING):
+            return box.lifecycle_release_block(snapshot.state, snapshot.operation)
     elif not matching and not current:
-        return not pending
+        return box.lifecycle_release_block(snapshot.state, snapshot.operation) if pending else HanaClaimReleased()
     elif snapshot.claims:
-        if len(snapshot.claims) != 1 or not current or not controller.release(execution):
-            return False
-    elif (snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING)
-            or isinstance(snapshot.operation, box.PendingOperation)):
-        return False
+        if len(snapshot.claims) != 1 or not current:
+            return HanaClaimReleaseRefused('The Hana lifecycle claim differs from the assignment')
+        released = controller.release(execution)
+        if isinstance(released, HanaClaimReleaseRefused):
+            return released
+    else:
+        blocked = box.lifecycle_release_block(snapshot.state, snapshot.operation)
+        if isinstance(blocked, HanaClaimReleaseRefused):
+            return blocked
     for claim in matching:
         claim.path.unlink(missing_ok=True)
-    return True
+    return HanaClaimReleased()
 
 
 def fixed_policy(transport: HanaControlTransport, repository: str, kind: str) -> HanaStepRefused | EnabledHanaRoute:
     """Apply configuration and repository capabilities without lifecycle reads."""
     from scripts.lib import conf
+    return configured_route(conf.read(transport.settings), repository, kind)
+
+
+def configured_route(configuration: conf.ConfigRead, repository: str, kind: str) -> HanaStepRefused | EnabledHanaRoute:
     from scripts.mac_test import eligibility
 
-    configuration = conf.read(transport.settings)
     settings = read_settings(configuration)
     if isinstance(settings, DisabledHanaRoute):
         return HanaStepRefused('off')
     identity = eligibility.repository_identity(Path(repository))
     if isinstance(identity, eligibility.UnknownRepository) or identity.key != settings.repository_key:
         return HanaStepRefused('repo')
-    if kind not in settings.kinds or not eligibility.linux_kind_permitted(configuration.values(), kind):
+    if kind not in settings.kinds:
         return HanaStepRefused('command')
     return settings
 
 
-def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest) -> placement.HostEvidence:
-    """Project existing lifecycle and execution records without provider mutations."""
+def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, *,
+                  transport: HanaControlTransport, workload: conf.ConfigRead) -> placement.HostEvidence:
+    """Read Hana evidence and release claims for ended local holders when safe."""
     from functools import partial
     import time
     from scripts.aws_target import hana_box as box, hana_spend, ledger
-    from scripts.aws_target.hana_execution import HanaSettled, read_claim_execution, settle_unpublished_claim
+    from scripts.aws_target.hana_execution import (
+        HanaSettled, claim_admission_refused, dispatch_claim_boot_matches, read_claim_execution, settle_unpublished_claim,
+    )
     from scripts.build_queue import placement
-    from scripts.build_targets import target_config
-    from scripts.lib import process_start
     from scripts.mac_test import claim_state, mac_test
     from scripts.build_hold.owning_session import NoOwningSession, OwningSession
     from scripts.buildlog import store
 
     now = time.time()
-    target = target_config.configured_ssh_target(key.destination.target)
-    if isinstance(key.settings, placement.ExplicitProviderSettings):
-        from dataclasses import replace
-        target = replace(target, settings=key.settings.path)
-    transport = read_execution_transport(target)
-    if not isinstance(transport, HanaControlTransport):
-        return placement.HostEvidenceUnavailable(key, now, 'The target does not use Hana control')
-    policy = fixed_policy(transport, request.constraints.repository,
+    target_name = key.destination.target
+    policy = configured_route(workload, request.constraints.repository,
         request.constraints.command_kind if isinstance(request.constraints.command_kind, str) else '')
     if isinstance(policy, HanaStepRefused):
         return placement.FreshHostEvidence(key, now, '', placement.FixedExclusion(policy.reason))
@@ -301,9 +403,15 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
     if isinstance(step, HanaStepRefused):
         return placement.FreshHostEvidence(key, now, '', placement.FixedExclusion('command'))
     controller = controller_for(transport, read_only=True)
-    paths = claim_state.state_paths(target.name)
+    paths = claim_state.state_paths(target_name)
     with claim_state.locked(paths.lock):
         snapshot = controller.inspect()
+        resources_held = False
+        if isinstance(snapshot, box.HanaResourcesHeld):
+            snapshot = controller.inspect_for_settlement()
+            if not isinstance(snapshot, box.HanaLifecycleEvidence):
+                return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('busy'))
+            resources_held = True
         if isinstance(snapshot, HanaUnprovisioned):
             return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('unprovisioned'))
         if isinstance(snapshot, HanaLifecycleUnavailable):
@@ -313,27 +421,41 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
             record = claim.record
             execution = record['claim_id']
             if ('remote_host' not in record or record['remote_host'] != transport.host
-                    or execution != placement.assigned_claim_id(record['episode'], record['attempt'])
+                    or execution != execution_identity.assigned_claim_id(record['episode'], record['attempt'])
                     or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING)
-                    or any(row.execution == execution for row in snapshot.claims)
                     or isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution):
                 held.append(claim)
                 continue
-            owner = process_start.process_start(record['pid'])
-            if isinstance(owner, (process_start.Gone, process_start.Zombie)) or (
-                    isinstance(owner, process_start.Started) and owner.start != record['proc_start']):
-                reference = placement.ProviderClaimReference('ssh', target.name, claim.scope,
+            if _holder_ended(record['pid'], record['proc_start']):
+                reference = placement.ProviderClaimReference('ssh', target_name, claim.scope,
                     execution, record['episode'], record['attempt'])
-                closed = settle_unpublished_claim(controller.directory, reference,
-                    release_claim=partial(_release_claims, controller, execution, (claim,), detached_only=True),
-                    reason='The Hana start owner exited')
-                if isinstance(closed, HanaSettled):
+                if not dispatch_claim_boot_matches(controller.directory, reference, record.get('instance_generation', '')):
+                    held.append(claim)
                     continue
+                attached = any(row.execution == execution for row in snapshot.claims)
+                release = partial(_release_claims, controller, execution, (claim,), detached_only=not attached)
+                if claim_admission_refused(controller.directory, reference):
+                    if not attached and isinstance(release(), HanaClaimReleased):
+                        continue
+                # The lifecycle controller owns a start until a journal proves that dispatch did not occur.
+                elif not attached or isinstance(read_claim_execution(controller.directory, reference),
+                                                execution_identity.ExecutionNotStarted):
+                    closed = settle_unpublished_claim(controller.directory, reference, release_claim=release,
+                        reason='The Hana start owner exited')
+                    if isinstance(closed, HanaSettled):
+                        if attached:
+                            refreshed = controller.inspect_for_settlement() if resources_held else controller.inspect()
+                            if not isinstance(refreshed, box.HanaLifecycleEvidence):
+                                return placement.HostEvidenceUnavailable(key, now, 'The Hana lifecycle evidence is unavailable')
+                            snapshot = refreshed
+                        continue
             held.append(claim)
+        if resources_held:
+            return placement.FreshHostEvidence(key, now, '', placement.TemporaryExclusion('busy'))
         block = mac_test.blocking_claim_block(paths, key.session)
     adopted: list[placement.AdoptedProviderClaim] = []
     cleanup: list[placement.RetainedCleanupClaim] = []
-    executions: list[tuple[placement.ProviderClaimReference, placement.ExecutionEvidence]] = []
+    executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
     generation = (generation_text(HanaHostGeneration(snapshot.deployment.deployment,
         snapshot.boot.start_token, snapshot.boot.boot_id)) if isinstance(snapshot.boot, box.VerifiedBoot) else '')
     holder: placement.ResourceHolder = placement.ResourceHolderUnknown()
@@ -341,10 +463,10 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
     own_claim = False
     for held_claim in held:
         record = held_claim.record
-        reference = placement.ProviderClaimReference('ssh', target.name, held_claim.scope,
+        reference = placement.ProviderClaimReference('ssh', target_name, held_claim.scope,
             record['claim_id'], record['episode'], record['attempt'])
         own_claim = own_claim or record['episode'] == request.episode
-        diagnostic = placement.BusyProviderDiagnostic(target.name, record['what'], record['since'])
+        diagnostic = placement.BusyProviderDiagnostic(target_name, record['what'], record['since'])
         session = OwningSession(record['submitting_session']) if record['submitting_session'] else NoOwningSession()
         if isinstance(session, OwningSession):
             holder = placement.ResourceHolderSession(session.session_id)
@@ -360,7 +482,9 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
     if any(not any(row.record['claim_id'] == claim.execution for row in held) for claim in snapshot.claims):
         return placement.HostEvidenceUnavailable(key, snapshot.observed_at, 'A lifecycle claim has no readable target claim')
     eligibility: placement.HostEligibility = placement.AllowedHost()
-    if not isinstance(block, mac_test.NoMacBlock):
+    if not controller.image_is_current(snapshot.deployment, workload=workload):
+        eligibility = placement.FixedExclusion(placement.HANA_IMAGE_STALE)
+    elif not isinstance(block, mac_test.NoMacBlock):
         eligibility = placement.TemporaryExclusion('blocked')
     elif (held or snapshot.claims) and not own_claim:
         eligibility = placement.TemporaryExclusion('busy')
@@ -374,8 +498,292 @@ def read_evidence(key: placement.HostEvidenceKey, request: wire.PlacementRequest
         eligibility = placement.TemporaryExclusion('starting')
     elif snapshot.state == box.Lifecycle.IDLE_STOPPED:
         preview = hana_spend.preview_placement_start(ledger.CostLedger(controller.directory),
-            controller.settings_path, transport.settings, controller.path)
+            controller.settings_path, workload, controller.path)
         if isinstance(preview, hana_spend.PermitRefused):
             eligibility = placement.TemporaryExclusion(preview.reason)
     return placement.FreshHostEvidence(key, snapshot.observed_at, generation, eligibility,
         tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
+
+
+GPU_SETUP_REQUIRED = 'Hana GPU setup is required. On natedev, run deploy.py up --workload merge-gates --approve-resources'
+GPU_SELECTION_REQUIRED = 'This target requires a configured Hana package and integration test'
+
+
+def gpu_setup(transport: HanaGpuNextestTransport, *, configuration: conf.ConfigRead | None = None
+              ) -> tuple[str, ...] | HanaStepRefused:
+    """Read the enabled route and the saved gate grants without calling AWS."""
+    from scripts.build_targets.target_config import ssh_target_state_directory
+    from scripts.mac_test import claim_state
+    from scripts.lib import conf
+
+    try:
+        settings = conf.read(transport.settings) if configuration is None else configuration
+        if settings.text('hana_gpu_route_enabled') != 'on':
+            return HanaStepRefused(GPU_SETUP_REQUIRED)
+        sizes = tuple(settings.words('hana_gpu_instance_types'))
+        record = claim_state.read_json_object(ssh_target_state_directory('aws') / 'gate-deployment.json')
+        granted = record.get('gpu_instance_types') if record else None
+        if sizes and isinstance(granted, list) and all(size in granted for size in sizes):
+            return sizes
+    except (OSError, ValueError):
+        pass
+    return HanaStepRefused(GPU_SETUP_REQUIRED)
+
+
+def gpu_step(transport: HanaGpuNextestTransport, repository: str, package: str, kind: str,
+             command: tuple[str, ...], *, configuration: conf.ConfigRead | None = None
+             ) -> placement.AllowedHost | placement.FixedExclusion:
+    """Allow the configured repository and exact nextest selection."""
+    from scripts.build_queue import placement
+    from scripts.lib import conf
+
+    settings = conf.read(transport.settings) if configuration is None else configuration
+    if repository != settings.text('hana_gpu_repository'):
+        return placement.FixedExclusion('This target requires the Hana repository')
+    selections = tuple(item.partition(':') for item in settings.words('hana_gpu_selections'))
+    targets = tuple(test for member, separator, test in selections if separator and member == package and test)
+    if kind != 'test' or not targets or (command and not any(
+            gpu_command_matches(command, package, test) for test in targets)):
+        return placement.FixedExclusion(GPU_SELECTION_REQUIRED)
+    setup = gpu_setup(transport, configuration=settings)
+    return placement.FixedExclusion(setup.reason) if isinstance(setup, HanaStepRefused) else placement.AllowedHost()
+
+
+def gpu_command_matches(command: tuple[str, ...], package: str, test: str) -> bool:
+    """Accept the verify.sh command with an optional explicit nextest profile."""
+    if command[:3] != ('cargo', 'nextest', 'run'):
+        return False
+    arguments = command[3:]
+    if arguments[:1] == ('--profile',) and len(arguments) >= 2 and re.fullmatch(r'[A-Za-z0-9_-]+', arguments[1]):
+        arguments = arguments[2:]
+    return arguments == ('--no-fail-fast', '--workspace', '--test', test, '-E', 'package(' + package + ')')
+
+
+def gpu_claim_pending(target: str, claim_id: str) -> bool:
+    """Keep ownership while the matching claim remains on disk."""
+    from scripts.mac_test import claim_state
+
+    return any(held.record['claim_id'] == claim_id for held in claim_state.read_claims(claim_state.state_paths(target)))
+
+
+def read_gpu_evidence(transport: HanaGpuNextestTransport, key: placement.HostEvidenceKey,
+                      request: HanaEvidenceRequest, *, configuration: conf.ConfigRead | None = None
+                      ) -> placement.FreshHostEvidence:
+    """Publish exact adopted claims and retain any unconfirmed GPU cleanup."""
+    import time
+    from scripts.aws_target import gpu_size_trial
+    from scripts.build_hold.owning_session import NoOwningSession, OwningSession
+    from scripts.build_queue import placement
+    from scripts.buildlog import store
+    from scripts.lib import process_start
+    from scripts.mac_test import claim_state, eligibility, mac_test
+
+    destination = key.destination
+    repo = eligibility.repository_identity(Path(request.constraints.repository))
+    policy = gpu_step(transport, repo.key if isinstance(repo, eligibility.KnownRepository) else '',
+                      key.package, key.command_kind if isinstance(key.command_kind, str) else '', key.command, configuration=configuration)
+    if not key.command:
+        policy = placement.FixedExclusion(GPU_SELECTION_REQUIRED)
+    if (not isinstance(request.constraints.selection, placement.PinnedHost)
+            or request.constraints.selection.target != destination.target):
+        policy = placement.FixedExclusion('This target requires --target hana-gpu')
+    generation = gpu_command_generation(key.command)
+    paths = claim_state.state_paths(destination.target)
+    adopted: list[placement.AdoptedProviderClaim] = []
+    cleanup: list[placement.RetainedCleanupClaim] = []
+    with claim_state.locked(paths.lock):
+        for held in claim_state.read_claims(paths):
+            record = held.record
+            running = process_start.process_start(record['pid'])
+            if (not isinstance(running, process_start.Unreadable)
+                    and running != process_start.Started(record['proc_start'])
+                    and (not record.get('cleanup_pending') or gpu_size_trial.assigned_gpu_cleanup_confirmed(record['claim_id']))):
+                held.path.unlink()
+                continue
+            reference = placement.ProviderClaimReference('ssh', destination.target, held.scope,
+                record['claim_id'], record['episode'], record['attempt'])
+            if record.get('cleanup_pending'):
+                cleanup.append(placement.RetainedCleanupClaim(reference, 'Hana GPU cleanup is pending'))
+            elif 'remote_host' in record:
+                sid = record['submitting_session']
+                adopted.append(placement.AdoptedProviderClaim(reference,
+                    placement.ClaimHolderIdentity(store.host_name(), record['pid'], record['proc_start']),
+                    OwningSession(sid) if sid else NoOwningSession(), record['remote_host'],
+                    record.get('instance_generation', '')))
+    if isinstance(policy, placement.AllowedHost):
+        if not isinstance(mac_test.blocking_claim_block(paths, request.constraints.session), mac_test.NoMacBlock):
+            policy = placement.TemporaryExclusion('blocked')
+        elif cleanup or any(claim.reference.episode != request.episode for claim in adopted):
+            policy = placement.TemporaryExclusion('busy')
+    return placement.FreshHostEvidence(key, time.time(), generation, policy, tuple(adopted), tuple(cleanup))
+
+
+def gpu_command_generation(command: tuple[str, ...]) -> str:
+    """Bind the adopted claim to the queued command."""
+    import hashlib
+    import json
+
+    return hashlib.sha256(json.dumps(command).encode()).hexdigest()
+
+
+def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, package: str,
+                       command: tuple[str, ...], result_file: Path) -> int:
+    """Run the exact queued step and publish its caller-facing result."""
+    from datetime import UTC, datetime
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+
+    from scripts.aws_target import gpu_size_trial
+    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+    from scripts.build_targets import target_config
+    from scripts.buildlog import store, treekey
+    from scripts.copies import copies
+    from scripts.lib import conf, process_start
+    from scripts.lib.atomic_file import write_text_atomic
+    from scripts.mac_test import claim_state, eligibility, mac_test
+    from scripts.production.gate_modules import GateRefused
+
+    started = time.monotonic()
+    destination = assignment.destination
+    identity = eligibility.repository_identity(repo)
+    scope = destination.scope
+    if (destination.target != 'hana-gpu' or destination.provider != 'ssh'
+            or destination.slot != 1 or not isinstance(scope, claim_state.RepositoryScope) or scope.slot != 1
+            or not isinstance(identity, eligibility.KnownRepository) or scope.key != identity.key or scope.name != identity.name
+            or not isinstance(assignment.source_key, execution_identity.SourceKeyKnown) or not command):
+        raise ValueError('The assignment does not identify the Hana GPU step')
+    target = target_config.configured_ssh_target(destination.target)
+    transport = read_execution_transport(target)
+    if not isinstance(transport, HanaGpuNextestTransport) or transport.host != destination.host:
+        raise ValueError('The assigned target does not use the Hana GPU transport')
+
+    reference = placement.assigned_claim_reference(assignment)
+    claim_id = reference.claim_id
+    paths = claim_state.state_paths(target.name)
+    path = mac_test.claim_path(paths, scope)
+    pid = os.getpid()
+    process = process_start.process_start(pid)
+    if not isinstance(process, process_start.Started):
+        raise ValueError('The Hana GPU claim holder is unavailable')
+    holder = placement.ClaimHolderIdentity(store.host_name(), pid, process.start)
+    record: claim_state.RemoteJobClaim = {
+        'claim_id': claim_id, 'episode': assignment.episode, 'attempt': assignment.attempt,
+        'submitting_session': claim_state.session_id(assignment.session), 'pid': holder.pid,
+        'proc_start': holder.start_time, 'what': 'Hana GPU nextest', 'worktree': str(repo),
+        'since': datetime.now(UTC).isoformat(), 'repo_name': scope.name, 'repo_key': scope.key,
+        'slot': 1, 'remote_host': transport.host, 'instance_generation': gpu_command_generation(command),
+    }
+
+    def check_step() -> tuple[str, ...]:
+        policy = gpu_step(transport, identity.key, package, 'test', command)
+        if isinstance(policy, placement.FixedExclusion):
+            raise ValueError(policy.reason)
+        setup = gpu_setup(transport)
+        if isinstance(setup, HanaStepRefused):
+            raise ValueError(setup.reason)
+        if not isinstance(mac_test.blocking_claim_block(paths, assignment.session), mac_test.NoMacBlock):
+            raise ValueError('The Hana GPU target is held')
+        return setup
+
+    def before_service() -> None:
+        with claim_state.locked(paths.lock):
+            _ = check_step()
+            current = claim_state.read_run(path)
+            if isinstance(current, claim_state.NoRun) or current != record:
+                raise ValueError('The assigned Hana GPU claim changed')
+
+    result: gpu_size_trial.HanaGpuNextestResult | HanaStepRefused
+    claimed = False
+    source_changed = False
+    try:
+        sizes = check_step()
+        if treekey.tree_key(str(repo)) != assignment.source_key.key:
+            source_changed = True
+            raise ValueError('The caller source changed before capture')
+        commit = copies.capture_source(repo)
+        if treekey.tree_key(str(repo)) != assignment.source_key.key:
+            source_changed = True
+            raise ValueError('The caller source changed during capture')
+        with claim_state.locked(paths.lock):
+            if claim_state.read_claims(paths):
+                raise ValueError('The Hana GPU slot is busy')
+            write_text_atomic(path, json.dumps(record) + '\n')
+            claimed = True
+        deadline = time.monotonic() + conf.read(transport.settings).number('api_timeout_s')
+        consume = wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder)
+        permission = admission_client.consume_permission(consume)
+        while (isinstance(permission, wire.DispatchStatus)
+                and isinstance(permission.permission, placement.PermissionAvailable)
+                and permission.reason in ('adoption evidence is unavailable or stale', 'the exact claim is not adopted',
+                    'claim holder is not a live coordinator descendant')
+                and time.monotonic() < deadline):
+            time.sleep(0.25)
+            permission = admission_client.consume_permission(consume)
+        if not isinstance(permission, wire.FirstAuthorization):
+            raise ValueError('The queue did not authorize the Hana GPU step')
+        result = gpu_size_trial.run_nextest(repo, commit, gpu_size_trial.HanaGpuNextestRequest(command[3:], sizes),
+            launch=gpu_size_trial.AssignedHanaGpuLaunch(claim_id, before_service))
+    except (OSError, ValueError, KeyError, wire.AdmissionUnavailable, subprocess.SubprocessError, copies.CopyError,
+            GateRefused) as error:
+        source_changed |= isinstance(error, copies.PreparationError) and str(error).startswith('SourceChanged:')
+        result = HanaStepRefused(str(error))
+    service_started = False
+    settled = not claimed
+    if claimed:
+        # Keep the assignment pending if the exact claim cannot be read or released.
+        service_started = True
+        try:
+            with claim_state.locked(paths.lock):
+                current = claim_state.read_run(path)
+                service_started = current != record
+                if current == record or (current == dict(record, cleanup_pending=True)
+                        and gpu_size_trial.assigned_gpu_cleanup_confirmed(claim_id)):
+                    path.unlink()
+                    settled = True
+        except (OSError, claim_state.StateReadError):
+            pass
+    dispatch = (placement.DispatchPathSettled() if settled else
+                placement.DispatchPathPending('The Hana GPU claim release remains pending'))
+    if isinstance(result, HanaStepRefused):
+        print('Hana GPU infrastructure failure: ' + result.reason, file=sys.stderr)
+        evidence: execution_identity.ExecutionEvidence
+        outcome: placement.AttemptOutcome
+        detail = ' '.join(result.reason.splitlines()) or 'The Hana GPU step was refused'
+        word, status = 'declined', gpu_size_trial.NEXTEST_INFRASTRUCTURE_EXIT
+        if service_started:
+            evidence = execution_identity.ExecutionEvidenceUnavailable(result.reason, time.time())
+            outcome = (placement.AttemptDeclined(result.reason) if settled
+                       else placement.AttemptOutcomeUnavailable(result.reason))
+            if not settled:
+                dispatch = placement.DispatchPathPending(result.reason)
+        else:
+            evidence = execution_identity.ExecutionNotStarted()
+            if source_changed:
+                outcome = placement.PrelaunchRefused(result.reason)
+            else:
+                outcome = execution_identity.HanaCommandAdmissionRefused(detail)
+                word, status = 'hana_command_admission_refused', 75
+        reason = 'source_changed' if source_changed else detail
+        write_text_atomic(result_file, f'outcome={word}\nreason={reason}\n')
+        report = wire.ExecutionReport(admission_client.request_id(), assignment, reference,
+            evidence, outcome, dispatch)
+    else:
+        print(result.stdout, end='', flush=True)
+        print(result.stderr, end='', file=sys.stderr, flush=True)
+        word = 'passed' if result.exit_code == 0 else 'failed'
+        write_text_atomic(result_file, f'outcome={word}\nseconds={time.monotonic() - started:.3f}\n')
+        report = wire.ExecutionReport(admission_client.request_id(), assignment, reference,
+            execution_identity.ExecutionEvidenceUnavailable('The GPU box has terminated', time.time()),
+            placement.AttemptCompleted(result.exit_code), dispatch)
+        status = result.exit_code
+    try:
+        response = admission_client.report_execution(report)
+        if response.assignment != assignment or (settled and isinstance(report.outcome, placement.AttemptCompleted)
+                and response.state != placement.ClosedAssignment('completed')):
+            raise wire.AdmissionUnavailable('The queue did not confirm the Hana GPU result')
+    except (OSError, wire.AdmissionUnavailable) as error:
+        print('Hana GPU queue report failed: ' + str(error), file=sys.stderr)
+    return status

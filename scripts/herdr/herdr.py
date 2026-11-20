@@ -52,11 +52,12 @@ from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never
 
 from scripts.herdr import pane_launch
 from scripts.agents import worker_lifecycle
-from scripts.lib import conf, models_registry, operation_deadline, session_folder
+from scripts.lib import conf, models_registry, operation_deadline, script_prompts, session_folder
 from scripts.lib.agent_scope import agents_slice, agent_scope_prefix
 from scripts.lib import legacy_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
+from scripts.lib.transcripts import claude_transcript_candidates
 from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
@@ -71,7 +72,6 @@ if TYPE_CHECKING:
 
 # herdr refuses a longer `agent start --timeout`.
 _AGENT_START_TIMEOUT_MAXIMUM_MS = 300_000
-PROMPT_SETTLE_SECONDS = 10
 PANE_POLL_SECONDS = 0.1
 START_RETRY_MAX_SECONDS = 1.0
 _PLATFORM = sys.platform
@@ -152,6 +152,14 @@ class _DarwinProcessGone(HerdrFailure):
     """An empty failed ps read was confirmed by the pid no longer existing."""
 
 
+class _CodexForegroundProcessGone(HerdrFailure):
+    """A process in the foreground report exited during the ancestry check."""
+
+    def __init__(self, owner_pid: int, reason: str) -> None:
+        super().__init__(reason)
+        self.owner_pid: int = owner_pid
+
+
 class SessionTaken(HerdrFailure):
     """A new session cannot own a server or systemd unit already in use."""
 
@@ -162,6 +170,27 @@ class SessionTaken(HerdrFailure):
 
 class AgentBlocked(HerdrFailure):
     """An agent requires user input; nothing is sent in response."""
+
+
+class HerdrCommandNotStarted(HerdrFailure):
+    """The transport command did not start."""
+
+
+@dataclass
+class TrackedPromptSubmission:
+    """Check readiness and record whether the prompt may have sent input."""
+
+    check: Callable[[], None]
+    may_have_submitted: bool = field(default=False, init=False)
+
+    def __call__(self) -> None:
+        self.check()
+
+
+class _WrongNativeTarget(HerdrFailure):
+    def __init__(self, reason: str, sessions: frozenset[str]) -> None:
+        super().__init__(reason, "wrong_target")
+        self.sessions: frozenset[str] = sessions
 
 
 class AgentExited(HerdrFailure):
@@ -297,19 +326,23 @@ class PromptRecipientUnavailable:
 class PromptSubmitted:
     at: datetime
     process: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("prompt recipient was not identified")
+    publication_error: str | None = None
+    state: ClassVar[Literal["confirmed"]] = "confirmed"
 
 
 @dataclass(frozen=True)
 class PromptNotSubmitted:
     reason: str
     screen: str | PromptScreenNotRead = PromptScreenNotRead()
-    # True only when the launcher never typed the prompt: the session then holds no work of it.
-    never_typed: bool = False
+    state: Literal["not_sent", "unknown"] = "unknown"
+    publication_error: str | None = None
 
 
 @dataclass(frozen=True)
 class AgentNotStarted(PromptNotSubmitted):
     """The start command failed, and no agent runs in the pane."""
+
+    state: Literal["not_sent", "unknown"] = "not_sent"
 
 
 @dataclass(frozen=True)
@@ -335,6 +368,9 @@ class OpeningPrompt:
     transcript: SessionTranscript | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
     before_prompt: Callable[[SessionTranscript], object] = _no_staff_publication
     cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
+    may_type: bool = True
+    other_transcripts: tuple[TranscriptCursor, ...] = ()
+    resend_once: bool = False
 
     def prepare_for_launch(self, since: datetime) -> OpeningPrompt:
         """Keep a supplied cursor or position a new cursor before the agent starts."""
@@ -344,10 +380,28 @@ class OpeningPrompt:
         cursor.skip_existing_turns()
         return replace(self, cursor=cursor)
 
+    def transcript_cursors(self, since: datetime) -> dict[str, TranscriptCursor]:
+        cursor = self.cursor
+        if not isinstance(cursor, TranscriptCursor) and isinstance(self.transcript, SessionTranscript):
+            cursor = TranscriptCursor(self.transcript, since)
+        readers = (cursor, *self.other_transcripts) if isinstance(cursor, TranscriptCursor) else self.other_transcripts
+        return {reader.transcript.session_id: reader for reader in readers}
+
+    def unconfirmed_state(self, typed: bool = False) -> Literal["not_sent", "unknown"]:
+        return "not_sent" if self.may_type and not typed else "unknown"
+
 
 @dataclass(frozen=True)
 class NoOpeningPrompt:
     """Leave the ready agent waiting for the user to type."""
+
+
+def _without_prompt_transport(opening: OpeningPrompt | NoOpeningPrompt, since: datetime,
+                              failure: PromptNotSubmitted) -> PromptSubmitOutcome:
+    if not isinstance(opening, OpeningPrompt):
+        return failure
+    receipt = _opening_receipt(script_prompt(opening.text), opening.transcript_cursors(since).values())
+    return receipt[1] if isinstance(receipt, tuple) else replace(failure, state=opening.unconfirmed_state())
 
 
 @dataclass(frozen=True)
@@ -386,46 +440,34 @@ class TranscriptCursor:
     turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
     readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
 
-    def bind_transcript(self, transcript: SessionTranscript) -> None:
-        """Read a changed native transcript from zero and retain the launch time filter."""
-        if transcript == self.transcript:
+    def _paths(self) -> Iterable[Path]:
+        try:
+            yield from claude_transcript_candidates(self.transcript.config_dir, self.transcript.session_id)
+        except FileNotFoundError:
             return
-        self.transcript = transcript
-        self.offsets.clear()
-        self.sizes.clear()
-        self.turns.clear()
-        self.current_paths = ()
-        self.readability = TranscriptReadable()
+        except (OSError, ValueError):
+            self.readability = TranscriptUnreadable()
 
     def skip_existing_turns(self) -> None:
         """Skip complete rows before launch without parsing historical JSON."""
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
-            return
-        try:
-            paths = tuple((self.transcript.config_dir / "projects").glob(f"*/{self.transcript.session_id}.jsonl"))
-            for path in paths:
+        for path in self._paths():
+            try:
                 with path.open("rb") as stream:
                     size = stream.seek(0, os.SEEK_END)
                     self.offsets[path] = complete_transcript_offset(stream)
                     self.sizes[path] = size
-        except OSError:
-            self.readability = TranscriptUnreadable()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                self.readability = TranscriptUnreadable()
 
     def read_turns(self) -> list[tuple[datetime, dict[str, object]]]:
         self.readability = TranscriptReadable()
-        self.current_paths = ()
-        # A session id is a file component, never a glob supplied by a caller.
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
-            return []
-        try:
-            paths = tuple((self.transcript.config_dir / "projects").glob(f"*/{self.transcript.session_id}.jsonl"))
-        except OSError:
-            self.readability = TranscriptUnreadable()
-            paths = ()
-        self.current_paths = paths
-        for path in paths:
+        paths: list[Path] = []
+        for path in self._paths():
             try:
                 with path.open("rb") as stream:
+                    paths.append(path)
                     offset = self.offsets.get(path, 0)
                     size = os.fstat(stream.fileno()).st_size
                     if size < self.sizes.get(path, 0):
@@ -453,9 +495,11 @@ class TranscriptCursor:
                                 self.turns.setdefault(path, []).append((at, row))
                         except (ValueError, TypeError, UnicodeError):
                             continue
+            except (FileNotFoundError, NotADirectoryError):
+                continue
             except OSError:
                 self.readability = TranscriptUnreadable()
-                continue
+        self.current_paths = tuple(paths)
         return [turn for turns in self.turns.values() for turn in turns]
 
     def submitted_prompt(self, text: str) -> PromptSubmitOutcome:
@@ -463,6 +507,10 @@ class TranscriptCursor:
             if row.get("type") == "user" and not row.get("isMeta", False) and _prompt_matches(text, _turn_text(row)):
                 return PromptSubmitted(at)
         return PromptNotSubmitted("no matching non-meta user turn after launch")
+
+    def allows_resend(self) -> bool:
+        """Allow a caller to authorize one send when the transcript has a known gap."""
+        return False
 
     def command_rejections(self, text: str) -> int:
         """How many times Claude answered this prompt's slash command with `Unknown command` since launch."""
@@ -472,6 +520,11 @@ class TranscriptCursor:
         rejected = re.compile(rf"Unknown command: {re.escape(command)}(?![\w:-])")
         return sum(1 for _, row in self.read_turns()
                    if row.get("type") == "system" and rejected.match(_turn_text(row)))
+
+
+def _add_transcript_cursors(readers: dict[str, TranscriptCursor], reference: TranscriptCursor, ids: Iterable[str]) -> None:
+    for identity in set(ids) - readers.keys():
+        readers[identity] = TranscriptCursor(SessionTranscript(reference.transcript.config_dir, identity), reference.since)
 
 
 def _slash_command(text: str) -> str:
@@ -512,20 +565,58 @@ def submitted_prompt(transcript: SessionTranscript, text: str, launched_at: date
     return TranscriptCursor(transcript, launched_at).submitted_prompt(text)
 
 
+def _opening_receipt(text: str, readers: Iterable[TranscriptCursor], *, session: str = "",
+                     recipient: PromptRecipientProcess | PromptRecipientUnavailable | None = None
+                     ) -> tuple[str, PromptSubmitted] | TranscriptReadable | TranscriptUnreadable:
+    found = unreadable = False
+    known_readers = (reader for reader in readers if reader.transcript.session_id)
+    for reader in known_readers:
+        native = reader.transcript.session_id
+        found = True
+        proof = reader.submitted_prompt(text)
+        if text.strip() and isinstance(proof, PromptSubmitted):
+            if recipient is None:
+                recipient = prompt_recipient_process(native)
+            elif native != session or (isinstance(recipient, PromptRecipientProcess)
+                                        and prompt_recipient_process(session) != recipient):
+                recipient = PromptRecipientUnavailable("prompt recipient changed during submission")
+            return native, replace(proof, process=recipient)
+        unreadable |= isinstance(reader.readability, TranscriptUnreadable)
+    return TranscriptReadable() if found and not unreadable else TranscriptUnreadable()
+
+
+def _prepare_prompt(pane: str, text: str) -> str:
+    text = script_prompt(text)
+    script_prompts.record(pane, text)
+    return text
+
+
 @dataclass(frozen=True)
 class ComposerInput:
     text: str
 
+    @staticmethod
+    def _pattern(text: str) -> str:
+        # A line break can split a word or replace a space.
+        return r"\s+".join(r"\n?".join(re.escape(char) for char in word) for word in text.split())
+
     def contains(self, text: str) -> bool:
-        # Physical wraps can split words, but spaces in the prompt must still
-        # match whitespace. This is the same match used for Enter-only retries.
-        pattern = r"\s+".join(r"\n?".join(re.escape(char) for char in word) for word in text.split())
+        pattern = self._pattern(text)
         return bool(pattern) and re.search(pattern, self.text) is not None
+
+    def matches(self, text: str) -> bool:
+        pattern = self._pattern(text)
+        return bool(pattern) and re.fullmatch(pattern, self.text.strip()) is not None
 
 
 @dataclass(frozen=True)
 class NoComposer:
     """The visible screen has no current input box."""
+
+
+class _OpeningComposer(Enum):
+    EMPTY = "empty"
+    DRAFT = "matching draft"
 
 
 _SGR = re.compile(r"\x1b\[([0-9;:]*)m")
@@ -609,11 +700,13 @@ def prompt_recipient_process(session_id: str) -> PromptRecipientProcess | Prompt
 
 
 def encode_prompt_outcome(outcome: PromptSubmitOutcome) -> str:
+    fields = {"publication_error": outcome.publication_error} if outcome.publication_error is not None else {}
     if isinstance(outcome, PromptNotSubmitted):
-        return json.dumps({"kind": "not submitted", "reason": outcome.reason,
+        return json.dumps({**fields, "kind": "not submitted", "reason": outcome.reason,
+                           **({"state": outcome.state} if outcome.state == "not_sent" else {}),
                            **({"screen": outcome.screen} if isinstance(outcome.screen, str) else {})})
     process = outcome.process
-    return json.dumps({"kind": "submitted", "at": outcome.at.isoformat(),
+    return json.dumps({**fields, "kind": "submitted", "at": outcome.at.isoformat(),
                        "process": {"pid": process.pid, "started_at": process.started_at}
                        if isinstance(process, PromptRecipientProcess) else {}})
 
@@ -623,6 +716,8 @@ def decode_prompt_outcome(text: str) -> PromptSubmitOutcome:
         value = cast(object, json.loads(text))
         if isinstance(value, dict):
             row = cast(dict[str, object], value)
+            error = row.get("publication_error")
+            publication_error = error if isinstance(error, str) else None
             if row.get("kind") == "submitted" and isinstance(row.get("at"), str):
                 at = datetime.fromisoformat(cast(str, row["at"]))
                 if at.tzinfo is not None:
@@ -631,12 +726,14 @@ def decode_prompt_outcome(text: str) -> PromptSubmitOutcome:
                         fields = cast(dict[str, object], process)
                         pid, started_at = fields.get("pid"), fields.get("started_at")
                         if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(started_at, str) and started_at:
-                            return PromptSubmitted(at, PromptRecipientProcess(pid, started_at))
-                    return PromptSubmitted(at)
+                            return PromptSubmitted(at, PromptRecipientProcess(pid, started_at), publication_error)
+                    return PromptSubmitted(at, publication_error=publication_error)
             if row.get("kind") == "not submitted" and isinstance(row.get("reason"), str):
                 screen = row.get("screen")
                 return PromptNotSubmitted(cast(str, row["reason"]),
-                                          screen if isinstance(screen, str) else PromptScreenNotRead())
+                                          screen if isinstance(screen, str) else PromptScreenNotRead(),
+                                          "not_sent" if row.get("state") == "not_sent"
+                                          else "unknown", publication_error)
     except (ValueError, TypeError):
         pass
     return PromptNotSubmitted("launcher supplied no valid submit proof")
@@ -714,6 +811,39 @@ class UnreadableCwd:
     detail: str
 
 
+class PaneShellAncestry(Enum):
+    DESCENDANT = "descendant"
+    OUTSIDE = "outside"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ProcessAncestry:
+    """Use parent PIDs and terminals from the scan that supplied the placement."""
+
+    parents: Mapping[int, int] = field(default_factory=dict[int, int])
+    terminals: Mapping[int, int | str] = field(default_factory=dict[int, int | str])
+
+    def is_detached_from_shell(self, pid: int, shell_pid: int) -> bool:
+        terminal = self.terminals.get(pid)
+        shell_terminal = self.terminals.get(shell_pid)
+        return (terminal is not None and shell_terminal is not None
+                and (terminal == 0 or terminal != shell_terminal)
+                and self.relative_to_shell(pid, shell_pid) is PaneShellAncestry.OUTSIDE)
+
+    def relative_to_shell(self, pid: int, shell_pid: int) -> PaneShellAncestry:
+        seen: set[int] = set()
+        while pid > 1 and pid not in seen:
+            if pid == shell_pid:
+                return PaneShellAncestry.DESCENDANT
+            seen.add(pid)
+            parent = self.parents.get(pid)
+            if parent is None:
+                return PaneShellAncestry.UNKNOWN
+            pid = parent
+        return PaneShellAncestry.OUTSIDE if pid in (0, 1) else PaneShellAncestry.UNKNOWN
+
+
 @dataclass(frozen=True)
 class HerdrProcess:
     pid: int
@@ -721,6 +851,8 @@ class HerdrProcess:
     marks: dict[str, str]
     command: str
     working_directory: str | UnreadableCwd
+    ancestry: ProcessAncestry = field(default_factory=ProcessAncestry, compare=False, repr=False)
+    runs_agent: bool = field(default=False, compare=False, repr=False)
 
     @property
     def cwd(self) -> str:
@@ -1035,16 +1167,42 @@ def unmarked_environment() -> dict[str, str]:
     return child_environment(dict(os.environ))
 
 
+class HerdrLaunchRefused(HerdrCommandNotStarted):
+    """The deadline passed before Herdr started the command."""
+
+
 PROGRAM_TIMEOUT_SECONDS = 10.0
 
 
 def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    prompt_transport = argv[3:5] == ["agent", "prompt"]
+    deadline = worker_lifecycle.effective_deadline(time.monotonic() + timeout)
     try:
-        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=operation_deadline.remaining(timeout),
-                              env=unmarked_environment() if environment is None else child_environment(environment))
-    except OSError as error:
-        raise HerdrFailure(f"{argv[0]}: {error}") from error
+        remaining = operation_deadline.remaining(timeout)
+    except TimeoutError as error:
+        raise HerdrLaunchRefused(f"{argv[0]}: {error}") from error
+    try:
+        env = unmarked_environment() if environment is None else child_environment(environment)
+        if not prompt_transport:
+            try:
+                return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=remaining, env=env)
+            except UnicodeDecodeError as error:
+                raise HerdrFailure("the Herdr reply cannot be decoded") from error
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    except Exception as error:
+        if prompt_transport or isinstance(error, OSError):
+            raise HerdrCommandNotStarted(f"{argv[0]}: {error}") from error
+        raise
+    with process:
+        try:
+            stdout, stderr = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
+        except BaseException as error:
+            process.kill()
+            if isinstance(error, UnicodeDecodeError):
+                raise HerdrFailure("the Herdr prompt reply cannot be decoded") from error
+            raise
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
 def require_success(result: subprocess.CompletedProcess[str], context: str) -> None:
@@ -1370,14 +1528,16 @@ class SubmitStarts:
 SUBMIT_UNPROVED = SubmitUnproved()
 
 
-@dataclass(frozen=True)
-class PaneSessionsStarting:
-    """The Codex pane starts without a current session identity."""
+class PaneSessionsStarting(Enum):
+    CODEX_IDENTITY = "Codex has no current session identity"
+    CLAUDE_ARGUMENTS = "a new Claude process has no readable arguments"
 
 
 @dataclass(frozen=True)
 class PaneSessionsChanging:
-    """The Claude process starts or exits, so the pane has no current session to read."""
+    """The pane or its agent changed during the scan."""
+
+    reason: str = "starting or exiting"
 
 
 @dataclass(frozen=True)
@@ -1387,7 +1547,14 @@ class PaneSessionsUnknown:
     reason: str
 
 
-PaneSessions = frozenset[str] | PaneSessionsStarting | PaneSessionsChanging | PaneSessionsUnknown
+@dataclass(frozen=True)
+class _PaneProcessNotFound:
+    """The process query did not find the listed pane."""
+
+    reason: str
+
+
+PaneSessions = frozenset[str] | PaneSessionsStarting | PaneSessionsChanging | PaneSessionsUnknown | _PaneProcessNotFound
 
 
 @dataclass
@@ -1427,6 +1594,14 @@ class PaneObservations:
     bulk_placement: HerdrProcessPlacements | None = None
     pid_placements: dict[int, ProcessPlacement] = field(default_factory=dict)
 
+    def clear(self) -> None:
+        """Discard the evidence that an action can change."""
+        self.replies.clear()
+        self.process_batches.clear()
+        self.linux_process_states.clear()
+        self.bulk_placement = None
+        self.pid_placements.clear()
+
     @property
     def process_places(self) -> HerdrProcessPlacements:
         if self.bulk_placement is None:
@@ -1435,6 +1610,31 @@ class PaneObservations:
 
 
 _pane_observations: ContextVar[PaneObservations | None] = ContextVar("pane_observations", default=None)
+
+
+_reported_target_retentions: ContextVar[set[tuple[HerdrPlace | NotInHerdr, str | AgentProcessIdentity, str]]] = (
+    ContextVar("reported_target_retentions"))
+
+
+@contextmanager
+def _target_check_retries() -> Generator[None]:
+    """Share retention notices until the target check stops retrying."""
+    if _reported_target_retentions.get(None) is not None:
+        yield
+        return
+    token = _reported_target_retentions.set(set())
+    try:
+        yield
+    finally:
+        _reported_target_retentions.reset(token)
+
+
+class _PaneProcessInfo(dict[str, object]):
+    """Process information with a reader for the same pane."""
+
+    def __init__(self, info: dict[str, object], read_again: Callable[[], dict[str, object]]) -> None:
+        super().__init__(info)
+        self.read_again: Callable[[], dict[str, object]] = read_again
 
 
 @contextmanager
@@ -1488,7 +1688,7 @@ class Herdr:
         """Run within the caller's monotonic deadline, retaining the usual 10 s cap."""
         deadline = worker_lifecycle.effective_deadline(deadline)
         if deadline <= time.monotonic():
-            raise HerdrFailure("deadline passed")
+            raise HerdrLaunchRefused("deadline passed")
         context = f"herdr {' '.join(arguments[:2])}"
         try:
             result = run_program(self.argv(*arguments), timeout=min(PROGRAM_TIMEOUT_SECONDS, max(0.0, deadline - time.monotonic())))
@@ -1501,6 +1701,7 @@ class Herdr:
         """Keep the pane label independent of its agent lifecycle."""
         _ = self.run("pane", "rename", pane, text)
 
+    @_target_check_retries()
     def run_in_pane(self, pane: str, command: list[str], *, terminal: str = "") -> None:
         """Run a command only when the selected pane contains its empty shell."""
         deadline = time.monotonic() + operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)
@@ -1526,15 +1727,34 @@ class Herdr:
         shared = observed is not None and arguments[:2] in (
             ("pane", "list"), ("tab", "list"), ("workspace", "list"),
             ("agent", "list"), ("pane", "process-info"))
-        if observed is not None and arguments[:2] == ("pane", "process-info"):
+        if (observed is not None and arguments[:2] == ("pane", "process-info")
+                and worker_lifecycle.effective_deadline(deadline) == math.inf):
             self._process_info_batch(observed)
         if shared and observed is not None and key in observed.replies:
-            return observed.replies[key]
-        output = self.run(*arguments) if deadline == math.inf else self.run(*arguments, deadline=deadline)
-        reply = json_object(decode_object(output, "herdr response").get("result"), "herdr result")
-        if shared and observed is not None:
-            observed.replies[key] = reply
+            reply = observed.replies[key]
+        else:
+            output = self.run(*arguments) if deadline == math.inf else self.run(*arguments, deadline=deadline)
+            reply = json_object(decode_object(output, "herdr response").get("result"), "herdr result")
+            if shared and observed is not None:
+                observed.replies[key] = reply
+        if arguments[:3] == ("pane", "process-info", "--pane") and len(arguments) == 4:
+            info = reply.get("process_info")
+            if isinstance(info, dict):
+                return {**reply, "process_info": self._pane_process_info(cast(dict[str, object], info),
+                                                                        arguments[3], deadline)}
         return reply
+
+    def _pane_process_info(self, info: dict[str, object], pane: str, deadline: float) -> _PaneProcessInfo:
+        def read_again() -> dict[str, object]:
+            arguments = ("pane", "process-info", "--pane", pane)
+            observed = _pane_observations.get()
+            if observed is not None:
+                _ = observed.replies.pop((self.session, arguments), None)
+                observed.linux_process_states.clear()
+            reply = self.result(*arguments, **({"deadline": deadline} if deadline != math.inf else {}))
+            return json_object(reply.get("process_info"), "fresh pane process info")
+
+        return _PaneProcessInfo(info, read_again)
 
     def _process_info_batch(self, observed: PaneObservations) -> None:
         """Read all pane processes in one report batch without CLI subprocesses."""
@@ -1567,6 +1787,12 @@ class Herdr:
 
     def pane_row(self, pane: str) -> PaneIdentity | NoPane:
         return next((row for row in self.panes() if row["pane_id"] == pane), NoPane(pane))
+
+    def pane_session_report(self, pane: str, *, deadline: float) -> ReportedAgentSession | NoReportedAgentSession:
+        rows = [row for row in self.listed("pane", deadline=deadline) if row.get("pane_id") == pane]
+        if len(rows) != 1:
+            raise HerdrFailure(f"{self.session}:{pane}: expected one pane report, found {len(rows)}")
+        return checked_pane_session(rows[0])
 
     def panes(self) -> list[PaneIdentity]:
         panes: list[PaneIdentity] = []
@@ -2019,25 +2245,48 @@ class Herdr:
                 self.save_layout()
             return True
 
+    def _closed_pane_ids(self, missing: set[str]) -> set[str]:
+        if not missing:
+            return set()
+        observed = _pane_observations.get()
+        if observed is not None:
+            _ = observed.replies.pop((self.session, ("pane", "list")), None)
+        try:
+            return missing - {json_text(row.get("pane_id"), "pane id") for row in self.listed("pane")}
+        except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+            return set()
+
     def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> PaneSessions:
         key = (self.session, str(pane.get("pane_id", "")), str(pane.get("terminal_id", "")))
         with run.lock:
             if key in run.sessions:
                 return run.sessions[key]
             try:
-                info = json_object(self.result("pane", "process-info", "--pane",
-                    json_text(pane.get("pane_id"), "pane id")).get("process_info"), "native pane processes")
+                arguments = ("pane", "process-info", "--pane", json_text(pane.get("pane_id"), "pane id"))
+                info = json_object(self.result(*arguments).get("process_info"), "native pane processes")
                 shell, foreground = _pane_process_ids(info, "native pane processes")
-                observed = _pane_sessions(info, pane)
-                sessions: PaneSessions = (frozenset({observed.session_id})
-                                          if isinstance(observed, CodexPaneSession) else observed)
+                try:
+                    observed = _pane_session(info, pane)
+                except _ClaudeArgvUnavailable as error:
+                    if not _claude_start_in_progress(error.pid, shell, foreground):
+                        raise
+                    # Read again on the next scan so an expired start reports an unknown.
+                    if (snapshot := _pane_observations.get()) is not None:
+                        _ = snapshot.replies.pop((self.session, arguments), None)
+                    return PaneSessionsStarting.CLAUDE_ARGUMENTS
+                sessions: PaneSessions = (frozenset() if isinstance(observed, NoForegroundAgent)
+                                          else frozenset({observed.session_id}))
                 if not sessions and foreground == shell:
                     run.shell_processes[key] = shell
             except CodexPaneStarting:
-                sessions = PaneSessionsStarting()
+                sessions = PaneSessionsStarting.CODEX_IDENTITY
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                sessions = (PaneSessionsChanging() if isinstance(error.__cause__, NativeRegistryChanging)
-                            else PaneSessionsUnknown(str(error)))
+                if isinstance(error, HerdrFailure) and error.code == "pane_not_found":
+                    sessions = _PaneProcessNotFound(str(error))
+                elif isinstance(error.__cause__, NativeRegistryChanging):
+                    sessions = PaneSessionsChanging()
+                else:
+                    sessions = PaneSessionsUnknown(str(error))
             run.sessions[key] = sessions
             return sessions
 
@@ -2049,14 +2298,18 @@ class Herdr:
         unknown: list[UnknownPane] = []
         launches: dict[str, pane_launch.PaneLaunch] | None = None
         run = cast(PaneEvidenceRun, _pane_evidence_run.get())
-        for pane in panes:
-            sessions = self._row_pane_sessions(pane, run)
+        observations = [(pane, self._row_pane_sessions(pane, run)) for pane in panes]
+        closed = self._closed_pane_ids({str(pane.get("pane_id", "")) for pane, sessions in observations
+                                       if isinstance(sessions, _PaneProcessNotFound)})
+        for pane, sessions in observations:
+            if isinstance(sessions, _PaneProcessNotFound):
+                sessions = (PaneSessionsChanging("pane closed during scan") if str(pane.get("pane_id", "")) in closed
+                            else PaneSessionsUnknown(sessions.reason))
             if isinstance(sessions, (PaneSessionsStarting, PaneSessionsChanging, PaneSessionsUnknown)):
-                reason = ("starting" if isinstance(sessions, PaneSessionsStarting)
-                          else "starting or exiting" if isinstance(sessions, PaneSessionsChanging) else sessions.reason)
+                reason = "starting" if isinstance(sessions, PaneSessionsStarting) else sessions.reason
                 unread = UnknownPane(str(pane.get("pane_id", "")), str(pane.get("tab_id", "")), reason)
                 unknown.append(unread)
-                if isinstance(sessions, PaneSessionsChanging):
+                if isinstance(sessions, PaneSessionsChanging) or sessions is PaneSessionsStarting.CLAUDE_ARGUMENTS:
                     continue
                 if isinstance(sessions, PaneSessionsUnknown):
                     if launches is None:
@@ -2469,13 +2722,14 @@ class Herdr:
             screen = ""
             if error.code == "agent_not_ready":
                 try:
-                    screen = self.run("pane", "read", pane, "--source", "visible")
+                    with operation_deadline.within(deadline):
+                        screen = self.run("pane", "read", pane, "--source", "visible")
                 except (HerdrFailure, OSError, subprocess.SubprocessError) as screen_error:
                     screen = f"visible screen is unavailable: {screen_error}"
             print(f"herdr {name}:{pane}: {error}; session retained", file=sys.stderr)
             if screen:
                 print(screen, file=sys.stderr)
-            return AgentNotStarted(str(error))
+            return _without_prompt_transport(opening, launched_at, AgentNotStarted(str(error)))
         if kind == "codex":
             try:
                 entry = self.codex_launch(pane, agent_arguments)
@@ -2485,57 +2739,73 @@ class Herdr:
             except (CodexPaneStarting, CodexSessionPending) as error:
                 if isinstance(error, CodexPaneStarting) or isinstance(opening, OpeningPrompt):
                     print(f"herdr {name}:{pane}: pane is starting; pane retained", file=sys.stderr)
-                return (PromptNotSubmitted("pane is starting; prompt retained", never_typed=True)
+                return (_without_prompt_transport(opening, launched_at, PromptNotSubmitted("pane is starting; prompt retained"))
                         if isinstance(opening, OpeningPrompt) else PromptSubmissionNotRequired())
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"anomaly: herdr {name}:{pane}: legacy launch publication is unavailable: {error}; launch continues", file=sys.stderr)
         if isinstance(opening, OpeningPrompt):
             if isinstance(opening.transcript, SessionTranscript):
-                transcript = opening.transcript
-                ready = self._started_target(name, pane, kind, deadline, checked=bool(transcript.session_id))
-                if isinstance(ready, PromptNotSubmitted):
-                    return ready
-                identity = ready
-                transcript = SessionTranscript(transcript.config_dir, identity)
-                if isinstance(opening.cursor, TranscriptCursor):
-                    opening.cursor.bind_transcript(transcript)
-                try:
-                    _ = opening.before_prompt(transcript)
-                except Exception as error:
-                    print(f"herdr {transcript.session_id}: staff publication failed: {error}", file=sys.stderr)
-                    return PromptNotSubmitted(f"staff publication failed: {error}")
-                opening = replace(opening, transcript=transcript)
+                assert isinstance(opening.cursor, TranscriptCursor)
+                with operation_deadline.within(deadline):
+                    return self._started_target(name, pane, kind, deadline, opening, opening.cursor)
             return self.submit_opening_prompt(pane, opening, launched_at,
                                               max(0, int((deadline - time.monotonic()) * 1000)))
         return PromptSubmissionNotRequired()
 
-    def _started_target(self, name: str, pane: str, kind: str, deadline: float, *,
-                        checked: bool) -> str | PromptNotSubmitted:
-        """Read the started agent's identity and prove its pane, retrying while the process starts.
+    @_target_check_retries()
+    def _started_target(self, name: str, pane: str, kind: str, deadline: float,
+                        opening: OpeningPrompt, cursor: TranscriptCursor) -> PromptSubmitOutcome:
+        """Retry the native identity and pane checks while the agent starts."""
+        text = script_prompt(opening.text)
+        requested = current = cursor.transcript.session_id
+        readers = opening.transcript_cursors(cursor.since)
+        gate_sessions: frozenset[str] = frozenset()
 
-        A starting agent can lack its registry record, process start time or argv. Reads retry
-        until the deadline; the pause doubles up to START_RETRY_MAX_SECONDS, which bounds the
-        evidence lines a lasting failure writes. Herdr runs restarts in threads, so stderr stays direct.
-        """
+        def publish(target: TranscriptCursor, proof: PromptSubmitted | None = None) -> PromptSubmitOutcome:
+            opening_now = replace(opening, transcript=target.transcript, cursor=target,
+                                  other_transcripts=tuple(reader for reader in readers.values() if reader is not target))
+            try:
+                _ = opening.before_prompt(target.transcript)
+            except Exception as error:
+                print(f"herdr {target.transcript.session_id}: staff publication failed: {error}", file=sys.stderr)
+                result = proof or _without_prompt_transport(opening_now, cursor.since,
+                    PromptNotSubmitted(f"staff publication failed: {error}"))
+                return replace(result, publication_error=str(error))
+            return proof or self.submit_opening_prompt(pane, opening_now, cursor.since,
+                                                       max(0, int((deadline - time.monotonic()) * 1000)))
+
         pause = PANE_POLL_SECONDS
         while True:
             try:
-                identity = self.native_session(pane, kind, max(0.1, deadline - time.monotonic()))
+                current = self.native_session(pane, kind, max(0.1, deadline - time.monotonic())) or current
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 unavailable = f"native session is unavailable: {error}"
-                failure = PromptNotSubmitted("native session is unavailable; pane retained")
+                reason = "native session is unavailable; pane retained"
             else:
-                if not checked or check_target(identity, action="keys", place=HerdrPlace(self.session, pane)):
-                    return identity
+                _add_transcript_cursors(readers, cursor, (current,))
                 unavailable = ""
-                failure = PromptNotSubmitted("prompt target is unknown; session retained")
+                reason = "prompt target is unknown; session retained"
+                try:
+                    ready = not requested or check_target(current, action="keys", place=HerdrPlace(self.session, pane))
+                except HerdrFailure as error:
+                    if isinstance(error, _WrongNativeTarget):
+                        _add_transcript_cursors(readers, cursor, gate_sessions := error.sessions)
+                    reason = str(error)
+                    break
+                if ready:
+                    return publish(readers[current])
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                if unavailable:
-                    print(f"herdr {name}:{pane}: {unavailable}; pane retained", file=sys.stderr)
-                return failure
-            time.sleep(operation_deadline.remaining(min(pause, remaining)))
+                break
+            time.sleep(min(pause, remaining))
             pause = min(pause * 2, START_RETRY_MAX_SECONDS)
+        result = _opening_receipt(text, readers.values())
+        if isinstance(result, tuple):
+            native, proof = result
+            return publish(readers[native if native in gate_sessions else current], proof)
+        if unavailable:
+            print(f"herdr {name}:{pane}: {unavailable}; pane retained", file=sys.stderr)
+        return PromptNotSubmitted(reason, state=opening.unconfirmed_state())
 
     def start_command(self, argv: list[str], kind: str, pane: str,
                       timeout: float) -> subprocess.CompletedProcess[str]:
@@ -2610,7 +2880,7 @@ class Herdr:
         payload = json_object(decode_object(result.stdout, "startup pane processes").get("result"), "startup pane result")
         info = json_object(payload.get("process_info"), "startup pane process info")
         shell, foreground = _pane_process_ids(info, "startup pane process info")
-        owner = foreground_pane_owner(info)
+        owner = foreground_pane_owner(self._pane_process_info(info, pane, deadline.at))
         if isinstance(owner, (ProvedCodexForeground, ProvedClaudeForeground)) and owner.kind == kind:
             identities: tuple[AgentProcessIdentity, ...] = ()
             try:
@@ -2647,12 +2917,13 @@ class Herdr:
     def native_pane_process(self, pane: str, kind: str, timeout: float, *,
                             pane_row: Mapping[str, object] | PaneNotRead = PANE_NOT_READ) -> NativeAgentProcess:
         """Read the identity and launch environment from one proved foreground process."""
+        deadline = time.monotonic() + timeout
         forget_pane_evidence(self.session, pane)
         result = run_program(self.argv("pane", "process-info", "--pane", pane), timeout=timeout)
         require_success(result, "native pane processes")
         payload = json_object(decode_object(result.stdout, "native pane processes").get("result"), "native pane result")
         info = json_object(payload.get("process_info"), "native pane process info")
-        owner = _require_foreground_kind(foreground_pane_owner(info), kind)
+        owner = _require_foreground_kind(foreground_pane_owner(self._pane_process_info(info, pane, deadline)), kind)
         if isinstance(owner, ProvedCodexForeground) and isinstance(pane_row, PaneNotRead):
             try:
                 row = self.pane_row(pane)
@@ -2715,7 +2986,8 @@ class Herdr:
         deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
         while time.monotonic() < deadline:
-            state = self.prompt_input_state(pane)
+            with operation_deadline.within(deadline):
+                state = self.prompt_input_state(pane)
             if isinstance(state.screen, str):
                 screen = state.screen
             if isinstance(state, PromptInputReady):
@@ -2729,198 +3001,182 @@ class Herdr:
         """Read the visible input region."""
         return _composer_input(self.run("pane", "read", pane, "--source", "visible", "--format", "ansi"))
 
-    def prompt_in_input(self, pane: str, text: str) -> bool:
-        """Read only the visible composer's last input region, never transcript scrollback."""
-        composer = self.composer(pane)
-        return isinstance(composer, ComposerInput) and composer.contains(text)
-
-    def prompt_input_empty(self, pane: str) -> bool:
-        composer = self.composer(pane)
-        return isinstance(composer, ComposerInput) and not composer.text.strip()
-
-    def _wait_for_submit(self, cursor: TranscriptCursor, text: str, deadline: float) -> PromptSubmitOutcome:
+    def _wait_for_submit(self, receipt: Callable[[], PromptSubmitted | TranscriptReadable | TranscriptUnreadable],
+                         deadline: float) -> PromptSubmitted | None:
         while True:
-            result = cursor.submitted_prompt(text)
+            result = receipt()
             if isinstance(result, PromptSubmitted):
                 return result
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return result
+                return None
             time.sleep(min(PANE_POLL_SECONDS, remaining))
 
+    @_target_check_retries()
     def submit_opening_prompt(self, pane: str, opening: OpeningPrompt, launched_at: datetime,
                               timeout_ms: int) -> PromptSubmitOutcome:
-        if timeout_ms <= 0 or not opening.text.strip():
-            return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
-        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt, opening.cursor)
-        deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
-        cursor = opening.cursor
-        if not isinstance(cursor, TranscriptCursor) and isinstance(opening.transcript, SessionTranscript):
-            cursor = TranscriptCursor(opening.transcript, launched_at)
+        text = script_prompt(opening.text)
+        readers = opening.transcript_cursors(launched_at)
+        cursor = next(iter(readers.values()), None)
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
-        typings, enters, rejections = 0, 0, 0
-        recipient: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("transcript identity not supplied")
-        current = opening.text
+        typed = False
+        draft_pending = not opening.may_type
+        recipient: PromptRecipientProcess | PromptRecipientUnavailable = _TARGET_RECIPIENT_UNKNOWN
+        terminal = ""
+        place = HerdrPlace(self.session, pane)
+        session = cursor.transcript.session_id if cursor is not None else ""
 
-        def failure(reason: str) -> PromptSubmitOutcome:
-            if typings and isinstance(cursor, TranscriptCursor):
-                proof = cursor.submitted_prompt(current)
-                if not isinstance(proof, PromptSubmitted) and current != opening.text:
-                    proof = cursor.submitted_prompt(opening.text)
-                if isinstance(proof, PromptSubmitted):
-                    if (isinstance(recipient, PromptRecipientProcess)
-                            and prompt_recipient_process(cursor.transcript.session_id) != recipient):
-                        reason = "prompt recipient changed during submission"
-                    else:
-                        return PromptSubmitted(proof.at, recipient)
-            detail = f"{reason}; prompt typed {typings} times" if typings else reason
+        def receipt() -> PromptSubmitted | TranscriptReadable | TranscriptUnreadable:
+            result = _opening_receipt(text, readers.values(), session=session, recipient=recipient)
+            return result[1] if isinstance(result, tuple) else result
+
+        elapsed = "opening prompt deadline elapsed"
+
+        def failure(reason: str = elapsed, *, check_readability: bool = False) -> PromptSubmitOutcome:
+            result = receipt()
+            if isinstance(result, PromptSubmitted):
+                return result
+            if isinstance(result, TranscriptUnreadable) and (check_readability or reason == elapsed):
+                reason = elapsed + ": transcript unreadable"
+            if typed and reason.startswith(elapsed):
+                reason += ": sent once, not confirmed"
+            if not opening.may_type:
+                reason += "; sent once, not confirmed"
+            if typed:
+                reason += "; prompt transport attempts: 1"
             visible = "\n".join(screen.splitlines()[-40:]) if isinstance(screen, str) else screen
-            return PromptNotSubmitted(detail, visible, never_typed=typings == 0)
+            outcome = PromptNotSubmitted(reason, visible, opening.unconfirmed_state(typed))
+            return outcome if opening.may_type else _resume_prompt_failure(outcome, pane)
 
-        def deadline_failure() -> PromptSubmitOutcome:
-            reason = "opening prompt deadline elapsed"
-            if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
-                reason += ": transcript unreadable"
-            return failure(reason)
-
-        try:
-            ready = self.wait_for_prompt_input(pane, timeout_ms)
-            screen = ready.screen
-            if isinstance(ready, PromptInputTimedOut):
-                if isinstance(cursor, TranscriptCursor):
-                    _ = cursor.read_turns()
-                if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
-                    return deadline_failure()
-                return failure("destination never became ready for input")
-            recipient = (prompt_recipient_process(opening.transcript.session_id)
-                         if isinstance(opening.transcript, SessionTranscript)
-                         else PromptRecipientUnavailable("transcript identity not supplied"))
-
-            def bound_outcome(outcome: PromptSubmitted) -> PromptSubmitOutcome:
-                if (isinstance(recipient, PromptRecipientProcess)
-                        and isinstance(opening.transcript, SessionTranscript)
-                        and prompt_recipient_process(opening.transcript.session_id) != recipient):
-                    return PromptNotSubmitted("prompt recipient changed during submission")
-                return PromptSubmitted(outcome.at, recipient)
-
-            # Readiness can take time: a matching turn may have arrived meanwhile.
-            if isinstance(cursor, TranscriptCursor):
-                existing = cursor.submitted_prompt(opening.text)
-                if isinstance(existing, PromptSubmitted):
-                    return bound_outcome(existing)
-                while isinstance(cursor.readability, TranscriptUnreadable):
-                    result = self._wait_for_submit(cursor, opening.text, min(deadline, time.monotonic() + 5))
+        def attempt(action: _OpeningComposer) -> PromptSubmitted | bool:
+            nonlocal terminal, recipient, typed, draft_pending
+            with operation_deadline.within(deadline):
+                record = (script_prompts.prepare_record(pane, text, deadline=deadline)
+                           if action is _OpeningComposer.EMPTY and text.lstrip().startswith("/") else None)
+                result = receipt()
+                if isinstance(result, PromptSubmitted):
+                    return result
+                if isinstance(result, TranscriptUnreadable) and not opening.resend_once:
+                    return False
+                composer = self.composer(pane)
+                if opening.resend_once and (isinstance(composer, NoComposer) or composer.text.strip()):
+                    raise HerdrFailure("check that the destination pane is idle and its input is empty", "wrong_target")
+                if isinstance(composer, NoComposer):
+                    return False
+                if not composer.text.strip():
+                    draft_pending = False
+                    if action is _OpeningComposer.DRAFT:
+                        return False
+                elif not composer.contains(text):
+                    raise HerdrFailure(f"would overwrite unsaved input in session {session}", "wrong_target")
+                elif action is _OpeningComposer.EMPTY or not composer.matches(text):
+                    return False
+                row = self.pane_row(pane)
+                if not isinstance(row, NoPane):
+                    terminal = terminal or row.get("terminal_id", "")
+                if isinstance(recipient, PromptRecipientUnavailable):
+                    recipient = prompt_recipient_process(session)
+                if not check_target(session, action=action, place=place, terminal=terminal,
+                                    recipient=recipient, pane_info=row, client=self):
+                    return False
+                if opening.resend_once:
+                    result = receipt()
                     if isinstance(result, PromptSubmitted):
-                        return bound_outcome(result)
-                    screen = _prompt_screen(self.run("pane", "read", pane, "--source", "visible"))
-                    if time.monotonic() >= deadline:
-                        return deadline_failure()
-                    if isinstance(cursor.readability, TranscriptReadable):
-                        ready = self.wait_for_prompt_input(pane,
-                            max(0, int((deadline - time.monotonic()) * 1000)))
-                        if isinstance(ready.screen, str):
-                            screen = ready.screen
-                        if isinstance(ready, PromptInputTimedOut):
-                            return deadline_failure()
-                        existing = cursor.submitted_prompt(opening.text)
-                        if isinstance(existing, PromptSubmitted):
-                            return bound_outcome(existing)
-            while time.monotonic() < deadline:
-                typings += 1
+                        return result
+                    if cursor is None or not cursor.allows_resend():
+                        raise HerdrFailure("the transcript does not permit a resend", "wrong_target")
+                if action is _OpeningComposer.DRAFT:
+                    self._send_keys(pane, "Enter")
+                    return True
+                if record is not None:
+                    record.publish()
+                typed = draft_pending = True
                 try:
-                    if not isinstance(cursor, TranscriptCursor):
-                        return failure("caller did not identify the transcript; submit is unproven")
-                    if not check_target(cursor.transcript.session_id, action="keys",
-                                        place=HerdrPlace(self.session, pane), text=current,
-                                        recipient=recipient if typings > 1 else _TARGET_RECIPIENT_UNKNOWN,
-                                        pane_info=self.pane_row(pane), client=self):
-                        return failure("prompt target is unknown; session retained")
-                    proof = cursor.submitted_prompt(current)
-                    if isinstance(proof, PromptSubmitted):
-                        return bound_outcome(proof)
-                    if isinstance(cursor.readability, TranscriptUnreadable):
-                        result = self._wait_for_submit(cursor, current, deadline)
-                        return bound_outcome(result) if isinstance(result, PromptSubmitted) else deadline_failure()
-                    self._prompt(pane, current)
+                    self._prompt(pane, text)
+                except HerdrCommandNotStarted:
+                    typed = False
+                    if record is not None:
+                        record.path.unlink(missing_ok=True)
+                    raise
                 except HerdrFailure as error:
                     if error.code != "agent_prompt_stalled":
-                        if isinstance(cursor, TranscriptCursor):
-                            proof = cursor.submitted_prompt(current)
-                            if isinstance(proof, PromptSubmitted):
-                                return bound_outcome(proof)
-                        return failure(str(error))
-                last_input = time.monotonic()
-                if not isinstance(cursor, TranscriptCursor):
-                    return failure("caller did not identify the transcript; submit is unproven")
-                while True:
-                    result = self._wait_for_submit(cursor, current, min(deadline, time.monotonic() + 5))
-                    if isinstance(result, PromptSubmitted):
-                        return bound_outcome(result)
-                    rejected = cursor.command_rejections(current) if current == opening.text else rejections
-                    if rejected > rejections:
-                        # Retry the command once while Claude loads its command list.
-                        rejections = rejected
-                        if rejections > 1:
-                            return failure(f"Claude answered Unknown command: {_slash_command(current)}")
-                        if (remaining := deadline - time.monotonic()) > 0:
-                            time.sleep(min(PROMPT_SETTLE_SECONDS, remaining))
-                        if time.monotonic() >= deadline:
-                            return deadline_failure()
-                        if not self.prompt_input_empty(pane):
-                            return failure("destination input contains other text")
-                        break
-                    raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
-                    screen = _prompt_screen(raw)
-                    composer = _composer_input(raw)
-                    if time.monotonic() >= deadline:
-                        return deadline_failure()
-                    if isinstance(cursor.readability, TranscriptUnreadable):
-                        continue
-                    if isinstance(composer, NoComposer):
-                        continue
-                    if composer.contains(current):
-                        if enters == 3:
-                            return failure("no user turn after three Enter retries")
-                        if not check_target(cursor.transcript.session_id, action="keys",
-                                            place=HerdrPlace(self.session, pane), text=current, recipient=recipient,
-                                            pane_info=self.pane_row(pane), client=self):
-                            return failure("prompt target is unknown; session retained")
-                        # A turn can land during the screen/process reads too.
-                        proof = cursor.submitted_prompt(current)
-                        if isinstance(proof, PromptSubmitted):
-                            return bound_outcome(proof)
-                        if isinstance(cursor.readability, TranscriptUnreadable):
-                            continue
-                        if time.monotonic() >= deadline:
-                            return deadline_failure()
-                        self._send_keys(pane, "Enter")
-                        enters += 1
-                        last_input = time.monotonic()
-                        continue
-                    if composer.text.strip():
-                        return failure("destination input contains other text")
-                    # Working can mean queued input, even with an empty composer.
-                    # Retype only when the recipient is idle after the settle time.
-                    observation = self.readiness(pane)
-                    if (not observation["agent_status"].idle
-                            or time.monotonic() - last_input < PROMPT_SETTLE_SECONDS):
-                        continue
-                    if typings == 3:
-                        return failure("no user turn after three typings")
-                    ready = self.wait_for_prompt_input(pane,
-                        max(0, int((deadline - time.monotonic()) * 1000)))
-                    if isinstance(ready.screen, str):
-                        screen = ready.screen
-                    if isinstance(ready, PromptInputTimedOut):
-                        if isinstance(cursor.readability, TranscriptUnreadable):
-                            return deadline_failure()
-                        return failure("destination never became ready for re-type")
-                    if not ready.idle:
-                        continue
+                        raise
+                finally:
+                    if typed and record is not None:
+                        record.trim()
+                return True
+
+        if timeout_ms <= 0 or not text.strip():
+            return failure("opening prompt deadline elapsed or text is empty")
+        try:
+            deadline = time.monotonic() + operation_deadline.remaining(timeout_ms / 1000)
+        except TimeoutError:
+            return failure()
+        try:
+            if opening.may_type:
+                ready = self.wait_for_prompt_input(pane, timeout_ms)
+                screen = ready.screen
+                if isinstance(ready, PromptInputTimedOut):
+                    return failure("destination never became ready for input", check_readability=True)
+                if opening.resend_once and not ready.idle:
+                    return failure("check that the destination pane is idle and its input is empty")
+            if cursor is None:
+                return failure("caller did not identify the transcript; submit is unproven")
+            with operation_deadline.within(deadline):
+                row = self.pane_row(pane)
+                if not isinstance(row, NoPane):
+                    terminal = row.get("terminal_id", "")
+                recipient = prompt_recipient_process(session)
+            pause = PANE_POLL_SECONDS
+            while opening.may_type and not typed:
+                if time.monotonic() >= deadline:
+                    return failure("prompt target is unknown; session retained", check_readability=True)
+                result = attempt(_OpeningComposer.EMPTY)
+                if isinstance(result, PromptSubmitted):
+                    return result
+                if result:
                     break
-            return deadline_failure()
-        except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
-            return failure(str(error))
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(pause, remaining))
+                    pause = min(pause * 2, START_RETRY_MAX_SECONDS)
+
+            if opening.resend_once:
+                return self._wait_for_submit(receipt, deadline) or failure()
+
+            enters = 0
+            while True:
+                if not opening.may_type and enters == 0 and not draft_pending:
+                    return failure("no matching draft in the retained pane")
+                result = self._wait_for_submit(receipt, min(deadline, time.monotonic() + 5))
+                if result is not None:
+                    return result
+                if cursor.command_rejections(text):
+                    return failure(f"Claude answered Unknown command: {_slash_command(text)}")
+                with operation_deadline.within(deadline):
+                    raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
+                screen = _prompt_screen(raw)
+                composer = _composer_input(raw)
+                if isinstance(composer, ComposerInput) and not composer.text.strip():
+                    draft_pending = False
+                if time.monotonic() >= deadline:
+                    return failure()
+                if isinstance(composer, NoComposer):
+                    continue
+                if composer.text.strip() and not composer.matches(text):
+                    return failure("destination input contains other text")
+                if not draft_pending:
+                    continue
+                if enters == 3:
+                    return failure("no user turn after three Enter retries")
+                result = attempt(_OpeningComposer.DRAFT)
+                if isinstance(result, PromptSubmitted):
+                    return result
+                enters += int(result)
+        except (OSError, subprocess.SubprocessError, HerdrFailure, UnicodeDecodeError) as error:
+            if cursor is not None and isinstance(error, _WrongNativeTarget):
+                _add_transcript_cursors(readers, cursor, error.sessions)
+            return failure() if typed and time.monotonic() >= deadline else failure(str(error))
 
     def prompt(self, pane: str, text: str, *, target: str,
                proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED,
@@ -2933,22 +3189,26 @@ class Herdr:
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
         _ = on_submission()
-        self._prompt(pane, text, proof=proof)
+        prepared = _prepare_prompt(pane, text)
+        transport_started = True
+        try:
+            self._prompt(pane, prepared, proof=proof)
+        except HerdrCommandNotStarted:
+            transport_started = False
+            raise
+        finally:
+            if isinstance(on_submission, TrackedPromptSubmission):
+                on_submission.may_have_submitted = transport_started
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
         """Send input to the selected pane terminal."""
         row = self.pane_row(pane)
         if isinstance(row, NoPane) or row.get("terminal_id") != terminal:
             raise HerdrFailure(f"{pane}: terminal changed before prompt")
-        self._prompt(pane, text)
+        self._prompt(pane, _prepare_prompt(pane, text))
 
     def _prompt(self, pane: str, text: str, *,
                 proof: SubmitUnproved | SubmitStarts = SUBMIT_UNPROVED) -> None:
-        from scripts.lib import script_prompts
-
-        text = script_prompt(text)
-        if text.lstrip().startswith("/"):
-            script_prompts.record(pane, text)
         arguments = ["agent", "prompt", pane, text]
         if isinstance(proof, SubmitStarts):
             arguments += ["--wait", "--until", "working", "--until", "blocked", "--timeout", str(proof.timeout_ms)]
@@ -3080,6 +3340,25 @@ def pane_session(row: Mapping[str, object]) -> str:
     return session if isinstance(session, str) else ""
 
 
+def checked_pane_session(row: Mapping[str, object]) -> ReportedAgentSession | NoReportedAgentSession:
+    """Read the pane report and reject malformed session metadata."""
+    report = row.get("agent_session")
+    if report is None:
+        session = row.get("session_id")
+    else:
+        fields = json_object(report, "herdr pane session report")
+        kind, session = fields.get("kind"), fields.get("value")
+        if kind == "pending" and session is None:
+            return NoReportedAgentSession()
+        if kind == "id" and isinstance(session, str) and session:
+            return ReportedAgentSession(session)
+        if "kind" in fields or "value" not in fields:
+            raise HerdrFailure("herdr pane session report is unreadable")
+    if session is None or session == "":
+        return NoReportedAgentSession()
+    return ReportedAgentSession(json_text(session, "herdr pane session report"))
+
+
 class CodexTerminalInputUnavailable(HerdrFailure):
     """A foreground child can hold the pane terminal."""
 
@@ -3118,11 +3397,17 @@ class ProvedCodexForeground:
 
 
 @dataclass(frozen=True)
+class ClaudeNativeIdentityUnread:
+    """The foreground proof did not need a read of the native identity."""
+
+
+@dataclass(frozen=True)
 class ProvedClaudeForeground:
     kind: ClassVar[Literal["claude"]] = "claude"
     pid: int
     arguments: list[str]
     cwd: object
+    native: NativeAgentProcess | ClaudeNativeIdentityUnread = field(default_factory=ClaudeNativeIdentityUnread)
 
 
 type ForegroundPaneAgent = ProvedCodexForeground | ProvedClaudeForeground
@@ -3132,6 +3417,13 @@ type ForegroundPaneAgent = ProvedCodexForeground | ProvedClaudeForeground
 class UnprovedForegroundOwner:
     kind: Literal["codex", "claude"]
     reason: str
+
+
+@dataclass(frozen=True)
+class ClaudeForegroundWithoutArgv(UnprovedForegroundOwner):
+    """One foreground Claude PID has no readable arguments."""
+
+    pid: int
 
 
 @dataclass(frozen=True)
@@ -3159,6 +3451,32 @@ class ObservedEmpty:
 class UnknownPaneOwner:
     place: HerdrPlace
     reason: str
+
+
+@dataclass(frozen=True)
+class ClaudePaneWithoutArgv(UnknownPaneOwner):
+    """The pane reports one foreground Claude PID without arguments."""
+
+    pid: int
+
+
+@dataclass(frozen=True)
+class NonAgentForegroundProcess:
+    pid: int
+    command: str
+
+
+@dataclass(frozen=True)
+class PaneWithNonAgentForeground(UnknownPaneOwner):
+    shell_pid: int
+    processes: tuple[NonAgentForegroundProcess, ...]
+
+
+@dataclass(frozen=True)
+class PaneShellNotProvedIdle(UnknownPaneOwner):
+    """The pane has a shell PID but no proof that the shell is idle."""
+
+    shell_pid: int
 
 
 type CheckedPane[Owner] = ProvedMatch[Owner] | ProvedOtherOwner | ObservedEmpty | UnknownPaneOwner
@@ -3189,6 +3507,7 @@ def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, ob
         program = _foreground_program(child)
         if not _foreground_arguments(child) and program == "codex":
             raise HerdrFailure("another foreground Codex process has no arguments")
+        current = 0
         try:
             current = _foreground_pid(child)
             child_pid = current
@@ -3203,6 +3522,11 @@ def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, ob
                 states[current] = state
                 current = state.parent
         except (HerdrFailure, OSError, ValueError, IndexError, AttributeError) as error:
+            if isinstance(error, (FileNotFoundError, ProcessLookupError)) and any(
+                    item.get("pid") == current for item in foreground):
+                programs = ", ".join(_foreground_program(item) for item in foreground)
+                raise _CodexForegroundProcessGone(
+                    pid, f"foreground process ancestry is unavailable. Foreground programs are {programs}") from error
             raise HerdrFailure("foreground process ancestry is unavailable") from error
         if child_pid == pid:
             raise HerdrFailure("foreground Codex PID appears twice")
@@ -3219,9 +3543,29 @@ def _codex_foreground(foreground: list[dict[str, object]], process: dict[str, ob
 def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
                           ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     """Prove the pane owner. Check for Codex terminal holders when input is pending."""
+    try:
+        return _prove_foreground_owner(info, for_input=for_input)
+    except _CodexForegroundProcessGone as error:
+        if isinstance(info, _PaneProcessInfo):
+            try:
+                fresh = info.read_again()
+                if _pane_process_ids(fresh, "fresh pane process info") == _pane_process_ids(info, "pane process info"):
+                    owner = _prove_foreground_owner(fresh, for_input=for_input)
+                    if isinstance(owner, ProvedCodexForeground) and owner.pid == error.owner_pid:
+                        return owner
+                    if isinstance(owner, UnprovedForegroundOwner) and owner.kind == "codex":
+                        return owner
+            except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                pass
+        return UnprovedForegroundOwner("codex", str(error))
+
+
+def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
+                            ) -> ForegroundPaneAgent | NoForegroundAgent | UnprovedForegroundOwner:
     foreground = _foreground_processes(info)
     claude: list[tuple[dict[str, object], list[str]]] = []
     codex: list[tuple[dict[str, object], list[str]]] = []
+    claude_without_argv: list[dict[str, object]] = []
     missing_argv: set[str] = set()
     for process in foreground:
         arguments = _foreground_arguments(process)
@@ -3230,7 +3574,10 @@ def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
         elif is_claude_process(arguments):
             claude.append((process, arguments))
         elif not arguments:
-            missing_argv.add(_foreground_program(process))
+            program = _foreground_program(process)
+            if program == "claude":
+                claude_without_argv.append(process)
+            missing_argv.add(program)
     if codex or missing_argv.intersection({"codex", "node", "nodejs"}):
         try:
             if not codex:
@@ -3239,6 +3586,8 @@ def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
                 raise HerdrFailure(f"expected one foreground codex process, found {len(codex)}")
             process, arguments = codex[0]
             owner = _codex_foreground(foreground, process, arguments, for_input=for_input)
+        except _CodexForegroundProcessGone:
+            raise
         except HerdrFailure as error:
             programs = ", ".join(_foreground_program(process) for process in foreground)
             return UnprovedForegroundOwner("codex", f"{error}. Foreground programs are {programs}")
@@ -3251,16 +3600,34 @@ def foreground_pane_owner(info: dict[str, object], *, for_input: bool = False
             except CodexTerminalInputUnavailable as error:
                 return replace(owner, terminal_input=error)
         return replace(owner, terminal_input=CodexTerminalInput.AVAILABLE)
-    if len(claude) == 1:
-        process, arguments = claude[0]
-        try:
-            return ProvedClaudeForeground(_foreground_pid(process), arguments, process.get("cwd"))
-        except HerdrFailure as error:
-            return UnprovedForegroundOwner("claude", str(error))
     if claude:
+        try:
+            candidates = [ProvedClaudeForeground(_foreground_pid(process), arguments, process.get("cwd"))
+                          for process, arguments in claude]
+            if len(candidates) == 1:
+                return candidates[0]
+            registered: list[ProvedClaudeForeground] = []
+            for candidate in candidates:
+                try:
+                    native = native_process(candidate.pid, "claude")
+                except NativeRegistryChanging:
+                    continue
+                registered.append(replace(candidate, native=native))
+            if len(registered) == 1:
+                return registered[0]
+        except (HerdrFailure, OSError, ValueError) as error:
+            return UnprovedForegroundOwner("claude", str(error))
         return UnprovedForegroundOwner("claude", f"expected one foreground claude process, found {len(claude)}")
-    if "claude" in missing_argv:
-        return UnprovedForegroundOwner("claude", "agent argv is unavailable")
+    if claude_without_argv:
+        reason = "agent argv is unavailable"
+        if len(claude_without_argv) == 1:
+            try:
+                pid = _foreground_pid(claude_without_argv[0])
+            except HerdrFailure:
+                return UnprovedForegroundOwner("claude", reason)
+            if sum(process.get("pid") == pid for process in foreground) == 1:
+                return ClaudeForegroundWithoutArgv("claude", reason, pid)
+        return UnprovedForegroundOwner("claude", reason)
     return NoForegroundAgent()
 
 
@@ -3268,17 +3635,24 @@ def pane_foreground(place: HerdrPlace, info: dict[str, object]) -> ForegroundPan
     """Read the foreground evidence before comparing it with a requested owner."""
     try:
         owner = foreground_pane_owner(info)
+        if isinstance(owner, ClaudeForegroundWithoutArgv):
+            return ClaudePaneWithoutArgv(place, owner.reason, owner.pid)
         if isinstance(owner, UnprovedForegroundOwner):
             return UnknownPaneOwner(place, owner.reason)
         if not isinstance(owner, NoForegroundAgent):
             return owner
         shell, group = _pane_process_ids(info, "empty pane")
         foreground = _foreground_processes(info)
-        if (group == shell and len(foreground) == 1 and _foreground_pid(foreground[0]) == shell
-                and _foreground_program(foreground[0]).lstrip("-") in
-                {"sh", "bash", "zsh", "dash", "fish", "ksh", "ash", "csh", "tcsh", "nu", "xonsh", "elvish"}):
+        shell_programs = {"sh", "bash", "zsh", "dash", "fish", "ksh", "ash", "csh", "tcsh", "nu", "xonsh", "elvish"}
+        processes = tuple(NonAgentForegroundProcess(_foreground_pid(process), _foreground_program(process))
+                          for process in foreground)
+        holders = tuple(process for process in processes
+                        if process.pid != shell or process.command.lstrip("-") not in shell_programs)
+        if group == shell and len(processes) == 1 and not holders:
             return ObservedEmpty(place, shell)
-        return UnknownPaneOwner(place, "no foreground agent")
+        if holders:
+            return PaneWithNonAgentForeground(place, "no foreground agent", shell, holders)
+        return PaneShellNotProvedIdle(place, "no foreground agent", shell)
     except HerdrFailure as error:
         return UnknownPaneOwner(place, str(error))
 
@@ -3318,6 +3692,8 @@ def read_foreground_pane_owner(owner: ForegroundPaneAgent, pane: Mapping[str, ob
     """Read the native identity of the proved pane owner."""
     if isinstance(owner, ProvedCodexForeground):
         return _read_codex_pane_process(owner.pid, pane)
+    if isinstance(owner.native, NativeAgentProcess):
+        return owner.native
     try:
         return native_process(owner.pid, owner.kind)
     except (OSError, ValueError) as error:
@@ -3352,28 +3728,145 @@ def _foreground_program(process: dict[str, object]) -> str:
 
 
 @dataclass(frozen=True)
+class ClaudePaneSession:
+    session_id: str
+    pid: int
+
+
+@dataclass(frozen=True)
 class CodexPaneSession:
     session_id: str
+    pid: int
     terminal_input: CodexTerminalInput | CodexTerminalInputUnavailable
 
 
-def _pane_sessions(info: dict[str, object], pane: Mapping[str, object], *,
-                   for_input: bool = False) -> CodexPaneSession | frozenset[str]:
+class _ClaudeArgvUnavailable(HerdrFailure):
+    """Herdr reports one foreground Claude process without arguments."""
+
+    def __init__(self, owner: ClaudeForegroundWithoutArgv) -> None:
+        super().__init__(owner.reason)
+        self.pid: int = owner.pid
+
+
+def _claude_start_in_progress(pid: int, shell: int, foreground: int) -> bool:
+    """Check whether the foreground Claude process is within its start period."""
+    if pid == shell or foreground == shell:
+        return False
+    try:
+        if _platform() == "darwin":
+            info = _darwin_process_bsd_info(pid)
+            if info.pbi_pgid != foreground or not info.pbi_start_tvsec:
+                return False
+            age = time.time() - (info.pbi_start_tvsec + info.pbi_start_tvusec / 1_000_000)
+        else:
+            fields = _linux_process_stat(pid)
+            started = int(fields[19])
+            if fields[0] in {"Z", "X", "x"} or int(fields[2]) != foreground or started <= 0:
+                return False
+            uptime = float((proc_root() / "uptime").read_text().split(maxsplit=1)[0])
+            age = uptime - started / os.sysconf("SC_CLK_TCK")
+        return 0 <= age < conf.read("shutdown").number("START_SECONDS")
+    except (HerdrFailure, OSError, ValueError, IndexError):
+        return False
+
+
+@dataclass(frozen=True)
+class _ClaudeParentIdentities:
+    claude: AgentProcessIdentity
+    parent: AgentProcessIdentity
+
+
+def _claude_parent_identities(leader: int, claude_pid: int) -> _ClaudeParentIdentities:
+    """Read the live identities of Claude and its parent in the foreground group."""
+    if _platform() == "darwin":
+        child = _darwin_process_bsd_info(claude_pid)
+        if child.pbi_ppid != leader or child.pbi_pgid != leader or child.pbi_status == _DARWIN_SZOMB:
+            raise HerdrFailure("Claude is outside the parent's foreground group")
+        parent = _darwin_process_bsd_info(leader)
+        if parent.pbi_pgid != leader or parent.pbi_status == _DARWIN_SZOMB:
+            raise HerdrFailure("Claude's parent does not lead the foreground group")
+        if any(info.pbi_start_tvsec <= 0 or not 0 <= info.pbi_start_tvusec < 1_000_000 for info in (child, parent)):
+            raise HerdrFailure("process start time is unavailable")
+        child_start = child.pbi_start_tvsec * 1_000_000 + child.pbi_start_tvusec
+        parent_start = parent.pbi_start_tvsec * 1_000_000 + parent.pbi_start_tvusec
+    else:
+        child_stat = _linux_process_stat(claude_pid)
+        if child_stat[0] in {"Z", "X", "x"} or int(child_stat[1]) != leader or int(child_stat[2]) != leader:
+            raise HerdrFailure("Claude is outside the parent's foreground group")
+        parent_stat = _linux_process_stat(leader)
+        if parent_stat[0] in {"Z", "X", "x"} or int(parent_stat[2]) != leader:
+            raise HerdrFailure("Claude's parent does not lead the foreground group")
+        child_start, parent_start = int(child_stat[19]), int(parent_stat[19])
+        if child_start <= 0 or parent_start <= 0:
+            raise HerdrFailure("process start time is unavailable")
+    return _ClaudeParentIdentities(AgentProcessIdentity(claude_pid, child_start), AgentProcessIdentity(leader, parent_start))
+
+
+@dataclass(frozen=True, repr=False)
+class _RelaunchParentCommand:
+    executable: Path
+    argv: tuple[str, ...]
+
+
+def _read_relaunch_parent_command(pid: int) -> _RelaunchParentCommand:
+    if _platform() == "darwin":
+        from scripts.whoami.account import kern_procargs2, procargs2_parts
+
+        command = procargs2_parts(kern_procargs2(pid), lambda _name: False)
+        return _RelaunchParentCommand(command.executable, command.arguments)
+    process = proc_root() / str(pid)
+    executable = (process / "exe").readlink()
+    raw = (process / "cmdline").read_bytes()
+    if not raw.endswith(b"\0"):
+        raise HerdrFailure("parent arguments are unavailable")
+    return _RelaunchParentCommand(executable, tuple(os.fsdecode(arg) for arg in raw[:-1].split(b"\0")))
+
+
+def _relaunch_leads_opening_group(leader: int, claude_pid: int) -> bool:
+    """Check the direct parent and its command across fresh process reads."""
+    try:
+        identities = _claude_parent_identities(leader, claude_pid)
+        command = _read_relaunch_parent_command(leader)
+        if len(command.argv) < 3 or command.argv[2] != "run":
+            return False
+        if re.fullmatch(r"python(?:3(?:\.\d+)?)?", command.executable.name, re.IGNORECASE) is None:
+            return False
+        script = Path(command.argv[1])
+        approved_script = Path(__file__).resolve().parents[1] / "lib/relaunch.py"
+        if not script.is_absolute() or script.resolve(strict=True) != approved_script.resolve(strict=True):
+            return False
+        if identities != _claude_parent_identities(leader, claude_pid):
+            return False
+        # An exec can change the command without changing the process start time.
+        return command == _read_relaunch_parent_command(leader)
+    except (HerdrFailure, OSError, ValueError, IndexError, RuntimeError):
+        return False
+
+
+def _pane_session(info: dict[str, object], pane: Mapping[str, object], *,
+                  for_input: bool = False, for_opening: bool = False) -> ClaudePaneSession | CodexPaneSession | NoForegroundAgent:
     owner = foreground_pane_owner(info, for_input=for_input)
+    if isinstance(owner, ClaudeForegroundWithoutArgv):
+        raise _ClaudeArgvUnavailable(owner)
     if isinstance(owner, UnprovedForegroundOwner):
         raise HerdrFailure(owner.reason)
     if isinstance(owner, NoForegroundAgent):
-        return frozenset()
+        return owner
+    if for_opening:
+        _, leader = _pane_process_ids(info, "opening process info")
+        if owner.pid != leader and not (isinstance(owner, ProvedClaudeForeground)
+                                       and _relaunch_leads_opening_group(leader, owner.pid)):
+            raise HerdrFailure("registered process does not lead the foreground group")
     if isinstance(owner, ProvedCodexForeground):
         try:
             session = read_foreground_pane_owner(owner, pane)
-            return CodexPaneSession(session.current_identity, owner.terminal_input)
+            return CodexPaneSession(session.current_identity, owner.pid, owner.terminal_input)
         except (HerdrFailure, ValueError) as error:
             if isinstance(error.__cause__, NativeRegistryChanging):
                 raise
             programs = ", ".join(_foreground_program(process) for process in _foreground_processes(info))
             raise HerdrFailure(f"{error}. Foreground programs are {programs}") from error
-    return frozenset({read_foreground_pane_owner(owner, pane).current_identity})
+    return ClaudePaneSession(read_foreground_pane_owner(owner, pane).current_identity, owner.pid)
 
 
 @dataclass(frozen=True)
@@ -3442,7 +3935,7 @@ _TARGET_PANE_UNKNOWN = NoPane("")
 _TARGET_RECIPIENT_UNKNOWN = PromptRecipientUnavailable("recipient was not recorded")
 
 
-def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal", "keys", "close"],
+def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal", "keys", "close"] | _OpeningComposer,
                  place: HerdrPlace | NotInHerdr = _TARGET_PLACE_UNKNOWN,
                  shell: PaneShell | PaneShellUnknown = _TARGET_SHELL_UNKNOWN,
                  terminal: str = "", text: str = "",
@@ -3453,40 +3946,47 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
 
     Unknown evidence preserves the resource without stopping independent actions.
     """
-    verb = {"signal": "signal", "keys": "send keys to", "close": "close"}[action]
+    opening = isinstance(action, _OpeningComposer)
+    keys = opening or action == "keys"
+    verb = "send keys to" if keys else action
     name = f"pid {target.pid}" if isinstance(target, AgentProcessIdentity) else target or "shell"
+
+    def retain(reason: str) -> bool:
+        reported = _reported_target_retentions.get(None)
+        key = (place, target, reason)
+        if reported is None or key not in reported:
+            label = f"{place.session}:{place.pane}" if opening and isinstance(place, HerdrPlace) else name
+            print(f"herdr {label}: {reason}", file=sys.stderr)
+            if reported is not None:
+                reported.add(key)
+        return False
+
     if isinstance(target, AgentProcessIdentity):
         if isinstance(shell, PaneShell) and target.pid == shell.pid:
             raise HerdrFailure(f"would {verb} the shell: agent identity matches the shell for session {name}", "wrong_target")
         if isinstance(target.start_ticks, ProcessGenerationUnavailable):
-            print(f"herdr {name}: process generation is unknown; process retained", file=sys.stderr)
-            return False
+            return retain("process generation is unknown; process retained")
         try:
             current = _startup_process_reader(PROGRAM_TIMEOUT_SECONDS).identity(target.pid)
         except (_StartupProcessGone, FileNotFoundError, ProcessLookupError):
             return False
         except (HerdrFailure, OSError, ValueError, IndexError, subprocess.SubprocessError) as error:
-            print(f"herdr {name}: process identity is unknown: {error}; process retained", file=sys.stderr)
-            return False
+            return retain(f"process identity is unknown: {error}; process retained")
         if isinstance(current.start_ticks, ProcessGenerationUnavailable):
-            print(f"herdr {name}: process generation is unknown; process retained", file=sys.stderr)
-            return False
+            return retain("process generation is unknown; process retained")
         if current != target:
             raise HerdrFailure(f"would {verb} a reused process that does not run session {name}", "wrong_target")
         return True
     if isinstance(place, NotInHerdr):
-        print(f"herdr {name}: pane is unknown; target retained", file=sys.stderr)
-        return False
+        return retain("pane is unknown; target retained")
     client = Herdr(place.session) if isinstance(client, NotInHerdr) else client
     try:
         row = client.pane_row(place.pane) if pane_info is _TARGET_PANE_UNKNOWN else pane_info
         if isinstance(row, NoPane):
-            print(f"herdr {name}: pane {place.pane} is absent", file=sys.stderr)
-            return False
+            return retain(f"pane {place.pane} is absent")
         actual_terminal = row.get("terminal_id", "")
         if not actual_terminal:
-            print(f"herdr {name}: terminal is unknown; target retained", file=sys.stderr)
-            return False
+            return retain("terminal is unknown; target retained")
         if terminal and actual_terminal != terminal:
             raise HerdrFailure(f"terminal identity changed; would {verb} another terminal instead of session {name}", "wrong_target")
         forget_pane_evidence(place.session, place.pane)
@@ -3496,48 +3996,50 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
         if foreground == shell_pid:
             descendants = _startup_processes(PaneShell(shell_pid), "claude", set())
             if isinstance(descendants, PaneRunning) and not descendants.commands:
-                print(f"herdr {name}: foreground process is unknown; pane retained", file=sys.stderr)
-                return False
+                return retain("foreground process is unknown; pane retained")
             if isinstance(descendants, (AgentProcessPresent, PaneRunning)):
                 commands = ", ".join(descendants.commands) if isinstance(descendants, PaneRunning) else "claude"
                 raise HerdrFailure(f"pane runs other work: {commands}; would {verb} other live work instead of session {name}", "wrong_target")
             if isinstance(descendants, PaneProcessesUnreadable):
-                print(f"herdr {name}: descendants are unknown; pane retained", file=sys.stderr)
-                return False
-            return action != "keys" or not target
+                return retain("descendants are unknown; pane retained")
+            return not keys or not target
         if not target:
             raise HerdrFailure(f"would {verb} a pane with other live work instead of the selected shell", "wrong_target")
-        observed = _pane_sessions(info, row, for_input=action == "keys")
-        sessions = {observed.session_id} if isinstance(observed, CodexPaneSession) else observed
-        if not sessions:
-            print(f"herdr {name}: native session is unknown; target retained", file=sys.stderr)
-            return False
-        if sessions != {target}:
-            raise HerdrFailure(f"would {verb} a process that does not run session {target}", "wrong_target")
-        if action == "keys":
+        observed = _pane_session(info, row, for_input=keys, for_opening=opening)
+        if isinstance(observed, NoForegroundAgent):
+            return retain("native session is unknown; target retained")
+        if observed.session_id != target:
+            raise _WrongNativeTarget(f"would {verb} a process that does not run session {target}",
+                                     frozenset({observed.session_id}))
+        if opening:
+            if isinstance(recipient, PromptRecipientUnavailable):
+                return retain("recipient is unknown; input retained")
+            if recipient.pid != observed.pid:
+                return retain("recorded recipient does not match the foreground agent; input retained")
+        if keys:
             if isinstance(recipient, PromptRecipientProcess):
                 current_recipient = prompt_recipient_process(target)
                 if isinstance(current_recipient, PromptRecipientUnavailable):
-                    print(f"herdr {name}: recipient is unknown; input retained", file=sys.stderr)
-                    return False
+                    return retain("recipient is unknown; input retained")
                 if current_recipient != recipient:
                     raise HerdrFailure(f"recipient changed; would {verb} another process in session {target}", "wrong_target")
             if isinstance(observed, CodexPaneSession) and isinstance(observed.terminal_input, CodexTerminalInputUnavailable):
                 raise observed.terminal_input
+            if opening:
+                readiness = client.readiness(place.pane)
+                return readiness["interactive_ready"] and readiness["agent_status"].idle
             composer = client.composer(place.pane)
             if isinstance(composer, ComposerInput) and composer.text.strip() and not composer.contains(text):
                 raise HerdrFailure(f"would overwrite unsaved input in session {target}", "wrong_target")
         return True
     except CodexPaneStarting:
-        print(f"herdr {name}: pane is starting; target retained", file=sys.stderr)
-        return False
+        return retain("pane is starting; target retained")
     except CodexTerminalInputUnavailable:
         raise
     except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         if isinstance(error, HerdrFailure) and error.code == "wrong_target":
             raise
-        print(f"herdr {name}: target evidence is unknown: {error}; target retained", file=sys.stderr)
-        return False
+        return retain(f"target evidence is unknown: {error}; target retained")
 
 
 def claude_trust(folder: Path, claude_json: Path) -> Trusted | Untrusted | UnreadableTrustFile:
@@ -4750,7 +5252,7 @@ def _foreground_arguments(process: dict[str, object]) -> list[str]:
     return [json_text(value, "foreground process argument") for value in cast(list[object], arguments)]
 
 
-def _is_agent_process(arguments: list[str], kind: str) -> bool:
+def _is_agent_process(arguments: Sequence[str], kind: str) -> bool:
     if not arguments:
         return False
     executable = Path(arguments[0]).name
@@ -4764,12 +5266,12 @@ def _is_agent_process(arguments: list[str], kind: str) -> bool:
     )
 
 
-def is_claude_process(arguments: list[str]) -> bool:
+def is_claude_process(arguments: Sequence[str]) -> bool:
     """The argv is a Claude Code process, native or through node."""
     return _is_agent_process(arguments, "claude")
 
 
-def is_codex_process(arguments: list[str]) -> bool:
+def is_codex_process(arguments: Sequence[str]) -> bool:
     """The argv is a Codex process, native or through node."""
     return _is_agent_process(arguments, "codex")
 
@@ -4799,6 +5301,7 @@ class _DarwinProcessBSDInfo(ctypes.Structure):
     pbi_status: int = 0
     pbi_pid: int = 0
     pbi_ppid: int = 0
+    pbi_pgid: int = 0
     e_tdev: int = 0
     pbi_start_tvsec: int = 0
     pbi_start_tvusec: int = 0
@@ -5316,10 +5819,28 @@ _live_pane_reader: ContextVar[Callable[[str], _LivePanePlaces]] = ContextVar(
     "herdr_live_pane_reader", default=_LivePanePlaces)
 
 
+@dataclass
+class _PanePlacementSnapshot:
+    """Cache pane placement for one report."""
+
+    parent: Callable[[str], _LivePanePlaces]
+    places: dict[str, _LivePanePlaces] = field(default_factory=dict)
+
+    def __call__(self, session: str) -> _LivePanePlaces:
+        if session not in self.places:
+            self.places[session] = self.parent(session)
+        return self.places[session]
+
+    def clear(self) -> None:
+        self.places.clear()
+        if isinstance(self.parent, _PanePlacementSnapshot):
+            self.parent.clear()
+
+
 @contextmanager
 def pane_snapshot() -> Generator[Callable[[str], list[PaneIdentity]]]:
     """Share live panes and retained shells; yield the pane reader for report display."""
-    reader = cache(_live_pane_reader.get())
+    reader = _PanePlacementSnapshot(_live_pane_reader.get())
     token = _live_pane_reader.set(reader)
     try:
         yield lambda session: [pane.copy() for pane in reader(session).panes.values()]
@@ -5401,7 +5922,7 @@ def herdr_places() -> HerdrProcessPlacements:
     try:
         if _platform() == "darwin":
             processes = {process.pid: process for process in _darwin_processes()}
-            sessions = _darwin_process_sessions(processes, _darwin_bound_sockets())
+            sessions = _darwin_process_sessions(processes, _darwin_bound_sockets(), failures=failures)
 
             def parent(pid: int) -> int:
                 return processes[pid].parent
@@ -5518,8 +6039,36 @@ def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[i
             owners.setdefault(scope, set()).add(sessions[pid])
 
 
+@dataclass
+class _LinuxProcessScan:
+    parents: dict[int, int] = field(default_factory=dict)
+    terminals: dict[int, int | str] = field(default_factory=dict)
+    starts: dict[int, str] = field(default_factory=dict)
+
+    def read_parent(self, pid: int) -> int:
+        fields = _linux_process_stat(pid)
+        parent = int(fields[1])
+        self.parents[pid] = parent
+        if len(fields) > 19 and fields[19].isdecimal():
+            self.starts[pid] = fields[19]
+        if len(fields) > 4 and re.fullmatch(r"-?[0-9]+", fields[4]):
+            self.terminals[pid] = int(fields[4])
+        return parent
+
+    def check_start(self, pid: int) -> None:
+        # Check again after the metadata reads: a reused PID or a new parent makes the evidence unknown.
+        try:
+            fields = _linux_process_stat(pid)
+            if pid in self.starts and fields[19] == self.starts[pid] and int(fields[1]) == self.parents.get(pid):
+                return
+        except (OSError, ValueError, IndexError):
+            pass
+        _ = self.parents.pop(pid, None)
+        _ = self.terminals.pop(pid, None)
+
+
 def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
-                      failures: list[str] | None = None) -> dict[int, str]:
+                      failures: list[str] | None = None, scan: _LinuxProcessScan | None = None) -> dict[int, str]:
     """Associate descendants and handoff survivors with socket-owned sessions."""
     if not servers:
         return {}
@@ -5538,9 +6087,10 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
             else:
                 shared_groups.setdefault((hierarchy, path), set()).add(session)
     children: dict[int, list[Path]] = {}
+    read_parent = linux_process_parent if scan is None else scan.read_parent
     for process in candidates:
         try:
-            parent = linux_process_parent(int(process.name))
+            parent = read_parent(int(process.name))
             children.setdefault(parent, []).append(process)
         except FileNotFoundError:
             continue
@@ -5641,6 +6191,7 @@ class _UserProcess:
     parent: int
     executable: str
     argument_state: UnparsedProcessArguments | ReadProcessArguments | UnreadableProcessArguments
+    terminal: int | str | None = None
 
     @cached_property
     def arguments(self) -> ReadProcessArguments | UnreadableProcessArguments:
@@ -5655,9 +6206,10 @@ class _UserProcess:
         return UnreadableProcessArguments(f"process {self.pid}: arguments are unreadable or changed")
 
 
-def _darwin_processes(*, complete: bool = False, timeout: float | _ProcessReadDeadline = PROGRAM_TIMEOUT_SECONDS) -> list[_UserProcess]:
+def _darwin_processes(*, complete: bool = False, with_terminal: bool = False,
+                      timeout: float | _ProcessReadDeadline = PROGRAM_TIMEOUT_SECONDS) -> list[_UserProcess]:
     result = run_program([os.environ.get("HERDR_PS", "ps"), "-U", str(os.getuid()),
-                          "-o", "pid=,ppid=,uid=,comm="],
+                          "-o", "pid=,ppid=,uid=,tdev=,comm=" if with_terminal else "pid=,ppid=,uid=,comm="],
                          timeout=timeout.remaining() if isinstance(timeout, _ProcessReadDeadline) else timeout)
     require_success(result, "user processes")
     # Both fields can contain spaces. Separate batched columns retain an unambiguous
@@ -5674,16 +6226,23 @@ def _darwin_processes(*, complete: bool = False, timeout: float | _ProcessReadDe
         elif complete and line.strip():
             raise HerdrFailure("user process arguments are incomplete")
     processes: list[_UserProcess] = []
+    last = 4 if with_terminal else 3
     for line in result.stdout.splitlines():
-        fields = line.split(maxsplit=3)
-        if len(fields) != 4 or not all(field.isdecimal() for field in fields[:3]):
+        fields = line.split(maxsplit=last)
+        if len(fields) != last + 1 or not all(field.isdecimal() for field in fields[:3]):
             if complete and line.strip():
                 raise HerdrFailure("user process descendants are incomplete")
             continue
         pid, parent, uid = map(int, fields[:3])
         if uid != os.getuid() or pid <= 0:
             continue
-        executable = fields[3].rstrip()
+        executable = fields[last].rstrip()
+        terminal: int | str | None = None
+        if with_terminal:
+            if fields[3] == "??":
+                terminal = 0
+            elif re.fullmatch(r"[0-9]+/[0-9]+", fields[3]):
+                terminal = fields[3]
         if pid not in commands:
             try:
                 current = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "command=", "-p", str(pid)],
@@ -5697,7 +6256,8 @@ def _darwin_processes(*, complete: bool = False, timeout: float | _ProcessReadDe
                 continue
             except HerdrFailure:
                 pass
-        processes.append(_UserProcess(pid, parent, executable, UnparsedProcessArguments(commands.get(pid, ""))))
+        processes.append(_UserProcess(pid, parent, executable, UnparsedProcessArguments(commands.get(pid, "")),
+                                      terminal))
     if complete and set(commands) != {process.pid for process in processes}:
         raise HerdrFailure("user process descendants changed or are incomplete")
     return processes
@@ -5761,12 +6321,11 @@ def _darwin_process_cwds(pids: Sequence[int]) -> dict[int, str | UnreadableCwd]:
     return working_directories
 
 
-def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_BoundUnixSocket]) -> dict[int, str]:
+def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_BoundUnixSocket], *,
+                             failures: list[str] | None = None) -> dict[int, str]:
     config = _session_socket("default").parent
     holders: dict[str, set[int]] = {}
     for listener in listeners:
-        if listener.pid not in by_pid:
-            continue
         if listener.path == config / "herdr.sock":
             session = "default"
         elif listener.path.name == "herdr.sock" and listener.path.parent.parent == config / "sessions":
@@ -5774,7 +6333,11 @@ def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_B
         else:
             continue
         holders.setdefault(session, set()).add(listener.pid)
-    servers = {next(iter(pids)): session for session, pids in holders.items() if len(pids) == 1}
+    if failures is not None:
+        failures.extend(f"cannot establish a socket owner for herdr session {session}"
+                        for session, pids in holders.items() if len(pids) > 1)
+    servers = {pid: session for session, pids in holders.items() if len(pids) == 1
+               for pid in pids if pid in by_pid}
     children: dict[int, list[int]] = {}
     for process in by_pid.values():
         children.setdefault(process.parent, []).append(process.pid)
@@ -5793,11 +6356,14 @@ def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_B
 
 def _darwin_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrProcess]:
     try:
-        by_pid = {process.pid: process for process in _darwin_processes()}
+        by_pid = {process.pid: process for process in _darwin_processes(with_terminal=True)}
         listeners = _darwin_bound_sockets()
     except (HerdrFailure, subprocess.TimeoutExpired):
         return []
     sessions = _darwin_process_sessions(by_pid, listeners)
+    ancestry = ProcessAncestry({pid: process.parent for pid, process in by_pid.items()},
+                              {pid: process.terminal for pid, process in by_pid.items()
+                               if process.terminal is not None})
     processes: list[HerdrProcess] = []
     working_directories = _darwin_process_cwds(sorted(sessions))
     for pid, session in sessions.items():
@@ -5813,7 +6379,8 @@ def _darwin_herdr_processes(*, inherited_marks_only: bool = False) -> list[Herdr
             marks = (_inherited_process_marks(environment) if inherited_marks_only
                      else _process_marks(pid, environment, list(arguments.argv), place))
             processes.append(HerdrProcess(pid, place, marks,
-                                          Path(by_pid[pid].executable).name, working_directories[pid]))
+                                          Path(by_pid[pid].executable).name, working_directories[pid], ancestry,
+                                          runs_agent=is_claude_process(arguments.argv) or is_codex_process(arguments.argv)))
         except (HerdrFailure, subprocess.TimeoutExpired):
             continue
     return processes
@@ -5879,7 +6446,9 @@ def _scan_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrPr
         candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
     except OSError:
         return processes
-    sessions = _process_sessions(candidates, _live_server_processes(candidates))
+    scan = _LinuxProcessScan()
+    sessions = _process_sessions(candidates, _live_server_processes(candidates), scan=scan)
+    ancestry = ProcessAncestry(scan.parents, scan.terminals)
     for pid, session in sessions.items():
         process = proc_root() / str(pid)
         try:
@@ -5901,7 +6470,9 @@ def _scan_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrPr
                 cwd = UnreadableCwd(str(error))
             marks = (_inherited_process_marks(environment) if inherited_marks_only
                      else _process_marks(pid, environment, arguments, place))
-            processes.append(HerdrProcess(pid, place, marks, Path(arguments[0]).name, cwd))
+            scan.check_start(pid)
+            processes.append(HerdrProcess(pid, place, marks, Path(arguments[0]).name, cwd, ancestry,
+                                          runs_agent=is_claude_process(arguments) or is_codex_process(arguments)))
         except (OSError, ValueError, RuntimeError):
             continue
     return processes
@@ -5968,12 +6539,23 @@ def process_action() -> Generator[None]:
         reader = reader.parent
     token = _process_reader.set(_read_current_processes)
     action = _process_action.set(True)
+    outer_observations = _pane_observations.get()
+    outer_panes = _live_pane_reader.get()
+    outer_evidence = _pane_evidence_run.get()
     observations = _pane_observations.set(None)
     panes = _live_pane_reader.set(_LivePanePlaces)
     evidence = _pane_evidence_run.set(_SCAN_AT_USE)
     try:
         yield
     finally:
+        if outer_observations is not None:
+            outer_observations.clear()
+        if isinstance(outer_panes, _PanePlacementSnapshot):
+            outer_panes.clear()
+        if isinstance(outer_evidence, PaneEvidenceRun):
+            with outer_evidence.lock:
+                outer_evidence.sessions.clear()
+                outer_evidence.shell_processes.clear()
         _pane_evidence_run.reset(evidence)
         _live_pane_reader.reset(panes)
         _pane_observations.reset(observations)
@@ -5988,9 +6570,7 @@ def herdr_processes(*, membership: StaffLabels | StaffLabelsRead = StaffLabelsRe
     if inherited_marks_only:
         return processes
     labels = RecordedLabels(membership)
-    return [HerdrProcess(row.pid, row.place, labels.resolve(row.pid, row.marks),
-                         row.command, row.working_directory)
-            for row in processes]
+    return [replace(row, marks=labels.resolve(row.pid, row.marks)) for row in processes]
 
 
 def _check_agent_arguments(kind: str, agent_arguments: list[str]) -> None:
@@ -6133,6 +6713,14 @@ def agent_alias_script(kind: str) -> str:
     return f"unalias {kind} 2>/dev/null; "
 
 
+def _resume_prompt_failure(outcome: PromptNotSubmitted, pane: str) -> PromptNotSubmitted:
+    if outcome.state == "not_sent":
+        advice = "The resume prompt was not sent. Check the retained pane and send the resume prompt by hand."
+    else:
+        advice = "Herdr could not confirm the resume prompt. Check the retained pane and send the prompt by hand if absent."
+    return replace(outcome, reason=f"{outcome.reason}; {advice} Pane: {pane}.")
+
+
 def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingPane, prepared: PreparedAgentEnvironment,
                           kind: str, agent_arguments: list[str], opening: OpeningPrompt | NoOpeningPrompt,
                           timeout_ms: int, *, agent: str, reported_unknown: str = "",
@@ -6140,6 +6728,7 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
                           codex: CodexConversations | CodexLaunchRead = CodexLaunchRead.CURRENT,
                           client: Herdr | LaunchClientSource = LaunchClientSource.NEW) -> AgentLaunched:
     """Launch the prepared environment. Use agent for staff lookup and agent_name for the server name."""
+    launched_at = datetime.now(timezone.utc)
     _check_agent_arguments(kind, agent_arguments)
     if kind == "claude":
         agent_arguments = models_registry.claude_arguments(agent_arguments, prepared.env)
@@ -6147,9 +6736,11 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             trust_claude_launch(prepared.directory, Path(prepared.env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"))
         except HerdrFailure as error:
             print(str(error), file=sys.stderr)
-            return AgentLaunched("", ClaudeTrustNotWritten(str(error)))
+            return AgentLaunched("", _without_prompt_transport(opening, launched_at, ClaudeTrustNotWritten(str(error))))
     session_id = next((agent_arguments[index + 1] for index, argument in enumerate(agent_arguments[:-1])
                        if argument in {"--resume", "--session-id", "resume"}), "")
+    resuming_with_prompt = isinstance(opening, OpeningPrompt) and (
+        "--resume" in agent_arguments or kind == "codex" and "resume" in agent_arguments)
     reuse_client = not isinstance(client, LaunchClientSource)
     client = Herdr(name) if isinstance(client, LaunchClientSource) else client
     member = ""
@@ -6218,23 +6809,22 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=server_name)
         finally:
             forget_pane_evidence(name, pane)
-    except AgentExited:
-        if isinstance(destination, NewTab):
-            close_agent(name, pane)
-        elif isinstance(destination, SplitPane):
-            _ = client.close_retained_pane(pane)
-        raise
     except (HerdrFailure, OSError, subprocess.SubprocessError) as error:
-        if isinstance(error, HerdrFailure) and error.code == "wrong_target":
+        if isinstance(error, HerdrFailure) and error.code == "wrong_target" and not resuming_with_prompt:
             raise
         print(f"herdr {name}:{pane}: start incomplete: {error}; pane retained", file=sys.stderr)
-        return AgentLaunched(pane, PromptNotSubmitted(str(error)))
-    if isinstance(outcome, AgentNotStarted) and not isinstance(destination, ExistingPane):
+        failure = AgentNotStarted(str(error)) if isinstance(error, AgentExited) else PromptNotSubmitted(str(error))
+        outcome = _without_prompt_transport(opening, launched_at, failure)
+    if (isinstance(outcome, AgentNotStarted) and outcome.state == "not_sent"
+            and not isinstance(destination, ExistingPane)):
         if isinstance(destination, NewTab):
             close_agent(name, pane)
         else:
             _ = client.close_retained_pane(pane)
         print(f"herdr {name}:{pane}: agent start failed: {outcome.reason}; pane closed", file=sys.stderr)
+    if (resuming_with_prompt and isinstance(outcome, PromptNotSubmitted)
+            and (isinstance(destination, ExistingPane) or not isinstance(outcome, AgentNotStarted))):
+        outcome = _resume_prompt_failure(outcome, pane)
     return AgentLaunched(pane, outcome)
 
 

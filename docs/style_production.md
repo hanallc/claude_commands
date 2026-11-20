@@ -243,9 +243,13 @@ One ticket per phase:
   Structure tickets opened before this change keep their crate cells until
   they merge.
 
-Run tier D first. Structure crates are taken in order of the other-family
-pending cells they block inside a unit's pilot scope, most first, so a crate
-blocking a pilot unit comes first. A repair phase always precedes a new ticket.
+Refill starts with tier D structure work. After a structure ticket, refill
+selects one ready build ticket for approved findings. If no build ticket is
+ready, refill continues with structure work. A build waits while any file it
+edits has pending or open structure work.
+Refill ranks structure crates by the number of pending cells they block in
+other families within the unit's pilot scope. A repair phase always precedes a
+new ticket.
 After an interruption, read assigned tickets with
 `style_ledger.py ticket open --repo <checkout> --unit <unit>`.
 Run `next-phase --session-dir <run folder>` to restore each ticket's phase and worker.
@@ -330,7 +334,8 @@ Refill only the unit worktree's own plan copy:
 ```
 
 Refill selects only from the unit's configured families.
-It takes tier D work first, then crates that block the most cells.
+Refill alternates tier D structure tickets with ready build tickets for approved findings.
+Structure work continues when no build is ready.
 Family rank orders the remaining work. A unit never borrows another owner's family.
 Selection checks rule versions, pilot scope, busy files, sync state and open-ticket footprints.
 When the owned families have no available work, refill reports their hold reasons and waits.
@@ -554,11 +559,12 @@ Exit 1 means the trees differ; run the five steps:
    Without a package, lint checks the workspace with mend, rustfmt, and Clippy.
    Clippy uses `--all-targets --all-features` and the workspace lint config.
    Nothing rewrites the tree: mend runs in report mode and rustfmt with `--check`.
-   `copies.standing` holds the checkout's `.claude-busy` lock through lint and
-   cleanup. Each checkout keeps its own real `target/`; a second busy checkout
-   uses its own cache. A missing or swept cache builds cold. The configured
-   gates root and pool limit come from `config/copies.conf` (see
-   `docs/as-built/gate-checkouts.md`). No `CARGO_TARGET_DIR` is set.
+   `copies.standing` holds a repository slot through lint and cleanup.
+   The machine shares the repository pool across owners.
+   Each `<repository>-slot<N>` checkout keeps its own `target/`.
+   A missing or swept cache builds cold. Lint leaves `CARGO_TARGET_DIR` unset.
+   `config/build_folders.conf` sets the slot root and the repository or machine default limit.
+   See [Standing gate checkouts](as-built/gate-checkouts.md).
    It records per-file diagnostics once per tool; disabled or incomplete checks
    grant no successful coverage. Exit 0 means clean, every tool recorded passing;
    continue the sync. Exit 1 means diagnostics recorded or a tool did not pass;
@@ -598,7 +604,7 @@ The parent merges each ticket checkpoint with the normal unit checkpoint command
 `merge_checkpoint.py --production <parent showrunner name> <unit> <phase> <hash> --started <time>`.
 Then run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`.
 Apply the `not built` and reservation recovery rules below.
-Send the owning director `From the showrunner of <parent showrunner name>: ticket <id> merged; refill.`
+Send the owning director `ticket <id> merged; refill.`
 This route needs no style hand-off.
 
 ### Style showrunner route
@@ -609,13 +615,14 @@ Use `merge_checkpoint.py --production <showrunner name> <unit> <phase> <hash> --
 The checkpoint does not filter code paths by responsibilities.
 The ticket gate and cargo-berth manage the ticket files and reservations.
 
-The publication coordinator confirms reservation release before another publication can move HEAD.
-It records the run folder and phase with the ticket checkpoint.
-If a retained record still needs release, repeat the coordinator command before publishing more work.
+The ledger saves the candidate, its parent and the full reservation before HEAD moves.
+The publication record prevents need, widen, yield and cancel changes for the ticket.
+Repeat the coordinator command to finish a pending publication.
+The coordinator records the checkpoint and confirms reservation release before it removes the publication record.
 `ticket merge` and `reconcile` also recover any retained reservation record.
 After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
 to recover any retained reservation and wake units waiting for sync. Send the owning director
-`From the showrunner of <style showrunner name>: ticket <id> merged; refill.`
+`ticket <id> merged; refill.`
 For each `has no applied check` line that merge prints, check the change in the
 code, and run the printed `held built` command when the change is there. A rerun
 of `ticket merge` on a merged ticket prints these lines again. A finding whose
@@ -630,9 +637,8 @@ merge after the release is confirmed releases nothing more.
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
 `style_sync.py send-handoff --repo <checkout> --production <style showrunner name> --checkpoint <style branch tip>`.
-It adds the hand-off, sends
-`From the showrunner of <style showrunner name>: hand-off <hash>` to the current parent's
-`showrunners.py address <parent>`, then records `handoff send`.
+It adds the hand-off and gets the current parent's address with `showrunners.py address <parent>`.
+It sends `hand-off <checkpoint>` to that address, then records `handoff send`.
 A send that send.py queued (`QUEUED:`, exit 1) is sent too: send.py delivers
 it later. The command prints `hand-off <hash7>: queued for <parent>`.
 Style work never waits for a sync to go home.
@@ -645,7 +651,7 @@ from its last merged hand-off. The subject is
 `Merge <style showrunner name> hand-off (<hash7>) into <branch point>`.
 After pushing, notifying sync and promoting, the attached receiver records the
 hand-off as merged in the style ledger with its merge commit, then sends
-`From the showrunner of <parent showrunner name>: hand-off <hash7> merged as <merge7>.`
+`hand-off <c7> merged as <m7>.`
 The acknowledgment is a notice; only after a `hand-off ledger:` line run
 `style_ledger.py handoff merged --repo <checkout> --checkpoint <hash> --merge-commit <merge>`;
 ancestry on the branch point is the evidence, so it also takes a pending row.
@@ -682,9 +688,9 @@ Run `reconcile` afterward: a root's unsent row stays pending until ancestry
 marks it merged.
 This also clears hand-offs a departing parent had not merged.
 
-On `From <unit>: ticket <id> closed with no code change; <n> held.`, merge
-nothing and send neither a hand-off nor a refill message: the unit refills
-itself; its `ticket merge` already woke units waiting for sync.
+When you receive `ticket <id> closed with no code change; <n> held.`, skip the merge.
+Omit the hand-off and refill messages.
+The unit refills itself, and its `ticket merge` already notified units that wait for sync.
 When `<n>` is positive, run `style_proposals.py file`.
 
 ## Yielding
@@ -693,28 +699,41 @@ Selection skips files reserved on the berth board, changed on live units'
 unmerged branches, or dirty in their worktrees. Acquire reservations when
 editing begins. Product work always wins a conflict.
 
-After a clean incoming merge mid-ticket, recheck the file's incoming diff before
-checkpointing and record the new fingerprint. On a conflict or berth overlap,
-drop every finding touching that file, including all its edits in other files;
-a multi-file rename is dropped as a whole. Release reservations no remaining
-finding touches, rerun the gate, and leave dropped cells stale for later work.
-Record each dropped file with `style_ledger.py ticket yield --repo <unit-worktree>
---id <ticket> --path <file>`; this clears the ticket's verdicts and unfiled held
-findings on it, leaving its cells for later work.
-Before a proposal yield or drop, record each reserved, unmerged or dirty file outside the ticket that the change needs.
-Use `style_ledger.py held need --repo <unit-worktree> --finding <finding-id> --path <file>`.
-The need belongs to the finding and lasts across drops and refills.
-The command accepts any finding in the ledger, with or without a build ticket.
-Refill waits while the needed file is busy.
-The ticket's gate accepts an edit to the recorded need path.
+After a clean incoming merge, check the incoming diff again before the checkpoint.
+Record the new fingerprint.
 
-A proposal ticket yields the file of a finding whose file, or a file its change
-edits, is blocked. Its findings at that file stay filed under their decision with
-no build ticket, and the ticket no longer lists them. The gate and `ticket merge`
-skip them, and a later proposal ticket takes them. The command prints
-`yielded <finding id>: it stays filed for a later ticket` for each. It refuses a
-file with no finding of the ticket, a file that holds every finding the ticket has
-left (drop the ticket), and a kept finding that can need a yielded one. A `path`
+For a proposal ticket with blocked changes, use this procedure.
+
+1. Record each reserved, unmerged or dirty file that a finding needs outside the ticket.
+   Use `style_ledger.py held need --repo <unit-worktree> --finding <finding-id> --path <file>`.
+2. Yield the blocked findings.
+   Use `style_ledger.py ticket yield --repo <unit-worktree> --id <ticket> --finding <finding-id>`.
+   Repeat `--finding` for each blocked finding.
+3. Release reservations that the remaining work does not need.
+4. Run the gate again.
+
+The ledger also yields findings that share an edit path with a yielded finding.
+This check continues until the remaining findings share no edit paths with the yielded findings.
+The ledger checks the ticket base and the current synced tip.
+It refuses the yield if it cannot read the synced tip.
+The command prints each yielded ID and its reason.
+The yielded findings stay filed for a later ticket.
+The ledger removes the rule pin when the ticket keeps no finding for that rule.
+A repeated yield changes nothing.
+Drop the ticket if the yield would release all its findings.
+Refill waits while a recorded need path is busy.
+The ledger stores a blocked need when another ticket holds its path.
+The ticket gate and checkpoint refuse while the ticket has a blocked need.
+Run `held need` again to acquire the path after the other ticket releases it.
+The ticket gate requires assignment and allows edits to acquired need paths.
+The gate records and refuses a rename it cannot prove.
+Use the reviewed merge route and `held built --commit <merge> --by <person>` for a rename without an applied check.
+
+Use `style_ledger.py ticket yield --repo <unit-worktree> --id <ticket> --path <file>` to yield work by file.
+This clears the ticket's verdicts and unfiled findings at that path.
+For a proposal ticket, it releases all findings at that path.
+The command refuses to release every remaining finding or to release work that a kept finding may need.
+A `path`
 attribute that mounts a file across crates refuses when either crate holds a
 finding of the ticket, and a `path` attribute that mounts a file not named
 `.rs` refuses anywhere. A `path` attribute on an inline module names the folder
@@ -729,6 +748,30 @@ the crate can re-export a renamed module, glob-import its parent, or hold an
 on the unit branch proves that the kept work builds without the yielded change.
 A structure ticket cannot yield.
 Style units obey build holds and memory admission like any unit.
+
+## Widening a proposal ticket
+
+The ticket footprint includes the file paths that approved findings state for a rename or split.
+Each file rename must pass the content check and the applied check.
+The ticket base tells the ledger which split destinations are new files.
+An existing split destination is an ordinary edit path.
+Assignment saves a reservation with the edit role for each path.
+Dispatch and assignment use the same paths.
+The gate verifies reference edits with the rename checks.
+The ledger checks additional paths for overlap before it saves them.
+It updates the reservation when a ticket checkpoints, widens, or yields.
+Refill uses saved reservations for other tickets.
+When legacy records are incomplete, the ledger reserves the affected crate and the known edit paths.
+Use a bare file name for a split destination in the finding's directory.
+Use a repository-relative path for a companion file in another directory.
+Use `style_plan.py widen --repo <unit-worktree> --ticket <ticket> --files <new-file> --reason <reason> --by <name>`
+to add a required path that the findings do not name.
+The command refuses a path that another queued, assigned, or checkpointed ticket holds or plans to create.
+Assignment leaves a ticket queued if another unit holds any path in its reservation.
+In a worker session, the command uses `UNIT_RUN_DIR` to update the active dispatch.
+Use `--session-dir <run>` to identify that run from another session.
+Repeat the same widen if the ledger saved the paths before the dispatch update.
+Read the updated `ticket-paths.txt` before you edit the new file.
 
 ## Big changes
 
@@ -1083,46 +1126,28 @@ refuses a finding whose decision is declined, because the next `file` waives it
 again: answer the decline again first. It strips `--by`. A refusal writes
 nothing for any id.
 
-A file rename is a `rename` finding whose `after` starts with `Rename <a> to <b>`,
-where `<a>` and `<b>` are sibling `.rs` files and the finding's path ends with `<a>`.
-Neither file name may be a Rust keyword, and the rest of `after` may not name a
-second `<x>.rs to <y>.rs` pair or a move, split or merge. Only these exact forms
-negate a move, so it is not a second change:
-- `does not`, `doesn't`, `cannot`, `never` or `without` right before it
-  (`does not move`, `without moving`);
-- a clause that is `nothing`, `none`, or `no`, at most three words and a noun that
-  names code (`definition`, `item`, `type`, `helper`, …) before it, with a place
-  word (`into`, `out`, `from`, `to`, …) or the sentence end (`.`, `;`, end of text) after it (`no existing
-  definition moves from those callers`);
-- a clause of `no` and at most three words before a move word that is a noun, with
-  a form of `be` after it (`no additional split is introduced`);
-- `no`, at most three words and a noun that names code right after it, then the
-  sentence end (`move no skipped definitions.`).
-
-`no longer`, `no more`, `no less`, `no fewer`, `no later`, `no sooner`, `no doubt`
-and `no matter` never negate.
-
-Every other form counts as a move, and a person decides: `Do not introduce a
-facade or move any definition`, `moves no item into a file`, `move no other helpers
-than LockError` and `move nothing apart from LockError` are refused. A clause starts after a mark
-(`. ; : , ( )`) or after `and`, `but` or `then`. A hyphenated word such as
-`finding-merging` is a name, not a merge.
-It is applied when only the new file is in the code, and not applied when only the
-old file is. It has no check when a folder of child modules (`lock/` or
-`mutation_lock/`) is there; the gate refuses changes in that folder, and a person
-moves it. The gate allows the old file to go and the new file to come, and it
-compares the new file with the old file at HEAD. The old file must be gone, and
-no file may be at the new path in HEAD. The new file may change only as the other
-Rust files below may: its own paths such as `crate::ledger::lock::LockError` take
-the new name, and its `use` and `mod` lines may take the order rustfmt gives them.
-A definition that comes into or goes out of the file, or any other change, is
-refused (`<new> (renamed from <old>: change is not only the rename)`). When
-another finding of the ticket has the old or the new path, the new file is free,
-as a finding's file is: it moves under that finding's approval, so an item rename
-declared there can change it. A new file that is byte-identical to the old one
-passes with no scan, also outside every crate root (`tests/helper.rs`). The text rules do not catch every move request
-(`only LockError goes into ledger/error.rs`): when the worker builds only the
-rename, the gate marks the finding built. In other
+A file rename finding uses kind `rename` and starts its `after` with `Rename <a> to <b>`.
+Use two sibling `.rs` paths in each pair.
+Write bare paths or enclose them in backticks.
+One source must match the end of the finding path.
+Rust keywords are invalid file stems.
+Join pairs with a comma, `and`, or `plus`.
+Use `Rename` or `Rename the companion file` after a period or semicolon.
+Use a separate `Update` clause for module declarations, imports, path attributes, and documentation references.
+The clause can also name a Rust file or qualified paths, as in `Update ledger/mod.rs and all super::lock paths`.
+The parser requires a complete instruction and refuses implied renames or directory moves.
+An item rename must name a valid source and target.
+Each path can occur in only one move across the ticket.
+The gate refuses the finding if it cannot verify any file rename.
+The applied check requires the new file and the removal of the old file.
+A folder of child modules at either name prevents the applied check.
+The new path must be absent at HEAD.
+The gate compares the new file with the old file at HEAD.
+A byte-identical file passes the content check, including a file outside a crate root such as `tests/helper.rs`.
+The gate also permits proven reference edits and changes to the order of `use` and `mod` lines.
+An approved item rename can change a declaration that the gate identifies in the old file.
+The content check refuses any other change to the renamed file.
+In other
 Rust files it allows only the `mod <old>;` line and the path
 segments that name the module: `super::lock`, `self::lock`, `crate::ledger::lock`,
 `ledger::lock` from the module that holds `ledger`, `alpha::ledger::lock` in a file

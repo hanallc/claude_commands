@@ -1,24 +1,23 @@
 # AWS builds: current design
 
-Status: current implementation, checked on 2026-11-12.
 AWS runs temporary Spot boxes for merge gates, paired gate trials, and the GPU size trial.
-Normal build jobs use `mac` and `natedev`.
-AWS has no permanent builder or build offload route.
+The configured build target order is `hana-aws,mac,natedev`.
+Eligible Hana check and clippy steps can run on the retained Hana Spot box.
+The former permanent `aws-build` target is absent.
 
 ## Per-run merge gates
 
 Each gate reserves queue capacity and spending before it requests a box.
 The gate uses its own box and terminates that box after completion or failure.
-The configured regions are `us-east-2`, `us-west-2`, `eu-north-1`, `eu-south-2`, `us-east-1`, `us-west-1`, and `eu-south-1`.
+`regions` in `cloud_gate.conf` lists all 19 configured gate regions.
 The home region, `us-east-2`, holds the shared artifact bucket and gate role.
 Regional stacks supply launch templates, public subnets, and expiry functions.
 The saved `gate-deployment.json` identifies deployed resources.
 The configured region list alone does not prove deployment or available quota.
 
 The gate reads current Spot prices before its first launch ranking.
-It places variants under a capacity cooldown last.
-It prefers larger vCPU counts within each group.
-Within one size, it prefers the lowest expected gate cost across regions and zones.
+It ranks alternatives by recent quota refusals, estimated live quota use, and recent zone refusals.
+Within each group, it prefers the lowest expected cost per gate across types, regions, and zones.
 Expected cost includes compute, regional transfer, and any configured regional delay cost.
 Missing live prices retain applicable cached prices.
 Capacity refusals select the next variant.
@@ -49,7 +48,7 @@ Each machine runs the archive twice with zero retries.
 The report compares statuses, wall times, and the largest single process's peak RSS.
 It excludes GPU memory.
 
-The service selects the first candidate region with an applied G and VT Spot quota of at least 32 vCPUs.
+The service selects the first candidate region whose applied G and VT Spot quota fits the largest configured trial type.
 It checks offerings and Spot prices for each configured type.
 It runs one box at a time and confirms termination before the next launch.
 Each box imports the prepared system and reboots before testing.
@@ -72,15 +71,12 @@ The ledger preserves uncertain launches until reconciliation confirms their stat
 Guest shutdown and regional expiry functions supply separate lifetime bounds.
 AWS failures can delay termination beyond those bounds.
 
-## Removed builder: 2026-11-04
+## Removed builder: 2026-11-10
 
-`builder-removal.json` records the removal on 2026-11-04.
+`builder-removal.json` records the removal. Commit `1b1fa1842` removed the target on 2026-11-10.
 The persistent `aws-build` instance, Tailscale device, and data volumes were removed.
 `routing.json` records `enabled: false`.
-The target registry contains `mac,natedev`.
-The builder configuration and offload route have been removed.
-Builder slots, warm mirrors, idle stop, and queue-based starts are historical features.
-Only historical cost, ownership, and teardown compatibility remain.
+The ledger and teardown retain historical records for the former builder.
 
 See the [runbook](builds-aws-runbook.md) for current commands.
 See the [as-built document](../as-built/builds-aws-target.md) for implementation details.

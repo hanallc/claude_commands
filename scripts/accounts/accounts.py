@@ -12,6 +12,7 @@ import asyncio
 import ctypes
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import math
@@ -27,14 +28,14 @@ import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections import Counter, OrderedDict
 from contextvars import Context, ContextVar
-from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Iterable, Mapping, Sequence
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from functools import cached_property
 from pathlib import Path
 from threading import Lock
-from typing import override, TYPE_CHECKING, BinaryIO, Literal, NotRequired, Protocol, TypedDict, TextIO, cast, overload
+from typing import override, TYPE_CHECKING, BinaryIO, Literal, NamedTuple, NotRequired, Protocol, TypedDict, TextIO, cast, overload
 from importlib import import_module
 from uuid import UUID
 
@@ -1742,9 +1743,9 @@ def _validate_role(role: str) -> None:
         raise AccountsError(f"accounts: {role} is not a role; only unit, showrunner, producer and workers are supported")
 
 
-def read_role_map() -> RoleMap:
+def read_role_map(*, fresh: bool = False) -> RoleMap:
     try:
-        return role_map.read_role_map()
+        return role_map.read_role_map(fresh=fresh)
     except role_map.RoleMapUnavailable as error:
         raise AccountsError(str(error)) from error
 
@@ -2437,28 +2438,50 @@ def producer_upkeep_members() -> tuple[staff.StaffRow, ...]:
     return tuple(row for row in members if not isinstance(row.exited, staff.Exited))
 
 
-@settings_report_scope()
-def group_move_members(group: ClaudeGroup) -> tuple[list[LiveGroupMember], tuple[staff.StaffRow, ...]]:
-    """Keep verified accounts and retain eligible members without account proof."""
-    from scripts.production import staff
-    from scripts.message import sessions
+@dataclass(frozen=True)
+class LiveStaffMoveMember:
+    row: staff.StaffRow
+    session: LiveGroupMember
 
-    live = live_group_members()[group]
+
+@dataclass(frozen=True)
+class GroupMoveMembers:
+    live: tuple[LiveStaffMoveMember, ...]
+    without_live_account: tuple[staff.StaffRow, ...]
+    claude_registry_unreadable: bool
+    running_sessions: frozenset[str]
+    busy: frozenset[staff.StaffId] = frozenset()
+
+
+@settings_report_scope()
+def group_move_members(group: ClaudeGroup) -> GroupMoveMembers:
+    """Use staff rows for membership and the registry for live accounts."""
+    from scripts.production import staff
+
     try:
         membership = staff.local_snapshot()
     except staff.StaffUnreadable:
-        return live, ()
-    running = {session["sessionId"] for session in sessions.running_sessions()}
-    running.update(member.session_id for member in live)
-    if group == "producers":
-        candidates = {row.id: row for row in eligible_producers(membership, "claude")}
-    else:
-        kind = "unit" if group == "units" else "showrunner"
-        candidates = {row.id: row for row in membership.find(kind=kind) if row.current_session in running}
-    live = [member for member in live if (owner := membership.by_current_session(member.session_id)) is None
-            or owner.kind != "producer" or owner.id in candidates]
-    verified = {member.session_id for member in live}
-    return live, tuple(row for row in candidates.values() if row.current_session not in verified)
+        membership = staff.StaffSnapshot(())
+    rows = (eligible_producers(membership, "claude") if group == "producers"
+            else membership.find(kind="unit" if group == "units" else "showrunner"))
+    candidates: dict[str, staff.StaffRow] = {row.current_session: row for row in rows}
+    # Read the row locks before the registry can observe a stopped member.
+    busy = frozenset(row.id for row in candidates.values()
+                     if not isinstance(staff.row_activity(row.id), staff.RowAvailable))
+    observed = _read_local_role_sessions(GroupAccounts(), include_workers=False)
+    live = tuple(LiveStaffMoveMember(owner, replace(member, name=owner.name)) for member in observed.members[group]
+                 if (owner := candidates.get(member.session_id)) is not None)
+    running = observed.running_claude_sessions.union(member.session_id for member in observed.members[group])
+    verified = {member.session.session_id for member in live}
+    unresolved: list[staff.StaffRow] = []
+    for identity, row in candidates.items():
+        if identity in verified:
+            continue
+        if identity in running or (group == "producers" and not observed.claude_registry_unreadable):
+            unresolved.append(row)
+        elif row.id in busy or not isinstance(staff.row_activity(row.id), staff.RowAvailable):
+            unresolved.append(row)
+    return GroupMoveMembers(live, tuple(unresolved), observed.claude_registry_unreadable, running, busy)
 
 
 def session_account_label(session: ListedSession | LiveGroupMember) -> str:
@@ -2516,6 +2539,17 @@ def group_label(groups: GroupAccounts, group: ClaudeGroup) -> str | GroupNotConf
     return note_file.canonical_label(label) if isinstance(label, str) else label
 
 
+def current_move_account(group: ClaudeGroup) -> str:
+    """Read the current group account before stopping a member."""
+    reading = role_map.read_role_map(fresh=True)
+    if not isinstance(reading.provenance, role_map.CurrentRoleMap):
+        raise AccountsError("the current group account is unavailable")
+    target = group_label(_group_accounts(reading.groups), group)
+    if not isinstance(target, str) or not _label_is(target, "claude"):
+        raise AccountsError(group_configuration_line(group))
+    return target
+
+
 def group_configuration_line(group: ClaudeGroup) -> str:
     return f"{group}: not configured — accounts.py move {group} <claudeN>"
 
@@ -2537,10 +2571,13 @@ def group_note_labels() -> dict[ClaudeGroup, str]:
     return labels
 
 
-def group_accounts() -> GroupAccounts:
+def group_accounts(*, fresh: bool = False) -> GroupAccounts:
     """Read only explicit group selections."""
+    return _group_accounts(read_role_map(fresh=fresh).groups)
+
+
+def _group_accounts(stored: StoredGroupSelections) -> GroupAccounts:
     result = GroupAccounts()
-    stored = _stored_groups()
     for group in CLAUDE_GROUPS:
         selection = cast(str | StoredGroupSelection | GroupNotConfigured, stored.get(group, GROUP_NOT_CONFIGURED))
         if isinstance(selection, GroupNotConfigured):
@@ -2882,7 +2919,7 @@ class SessionIdlePaneClosed:
     session_id: str
 
 
-SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused | SessionIdlePaneClosed
+SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | moves.MoveWaitingForRow | SessionMoveRefused | SessionIdlePaneClosed
 
 
 class WorkerResumePreview(Protocol):
@@ -2929,10 +2966,16 @@ class AccountPaneReader(Protocol):
 
 class SessionBatchMove(Protocol):
     def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause,
-                 source_accounts: Mapping[str, str]) -> list[stop_results.MoveResult]: ...
+                 source_accounts: Mapping[str, str], batch_id: str = "",
+                 intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
+                 moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
+                 staff_members: Collection[staff.StaffId] = ()) -> list[stop_results.MoveResult]: ...
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> tuple[SessionMoveOutcome, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause = "by hand", live: Sequence[ListedSession] | None = None, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS, batch_id: str = "",
+                  intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
+                  moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
+                  staff_members: tuple[staff.StaffRow, ...] = ()) -> tuple[SessionMoveOutcome, ...]:
     """Stop and resume each selected local owner through the shared move API."""
 
     account_config = read_account_settings(account_config)
@@ -2941,27 +2984,45 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, cause: moves.M
     else:
         inventory = import_module("scripts.agents.inventory")
 
-    checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
-    if isinstance(checked, MoveRefused):
-        return tuple(SessionMoveRefused(identity, checked.reason) for identity in ids)
+    if isinstance(intent, moves.ExplicitMoveTarget):
+        checked = check_move_target(target, datetime.now(timezone.utc), account_config=account_config)
+        if isinstance(checked, MoveRefused):
+            return tuple(SessionMoveRefused(identity, checked.reason) for identity in ids)
+        target = checked.destination.label
     live = inventory.listing() if live is None else live
     selected = list(dict.fromkeys(ids))
     refused: dict[str, SessionMoveRefused] = {}
     eligible: list[str] = []
+    sources: dict[str, str] = {}
+    conversations = {str(row.id): row.current_session for row in staff_members}
     for identity in selected:
-        matches = [item for item in live if item.session_id == identity]
+        conversation = conversations.get(identity, identity)
+        matches = [item for item in live if item.session_id == conversation]
         if len(matches) > 1:
             refused[identity] = SessionMoveRefused(identity, "session has several live processes")
         else:
             eligible.append(identity)
+            if matches:
+                sources[identity] = claude_config_label(matches[0].config_dir)
     outcomes: dict[str, SessionMoveOutcome] = dict(refused)
     batch = cast(SessionBatchMove, import_module("scripts.agents.stop_resume").move_sessions)
-    sources = {item.session_id: claude_config_label(item.config_dir) for item in live if item.session_id in eligible}
-    results = batch(eligible, checked.destination.label, why=why, cause=cause, source_accounts=sources)
+    if staff_members:
+        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources,
+                        batch_id=batch_id, intent=intent, staff_members=frozenset(row.id for row in staff_members))
+    elif isinstance(intent, moves.FollowGroupAccount):
+        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources,
+                        batch_id=batch_id, intent=intent)
+    elif batch_id:
+        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources, batch_id=batch_id)
+    else:
+        results = batch(eligible, target, why=why, cause=cause, source_accounts=sources)
     for identity, result in zip(eligible, results):
         if isinstance(result, stop_results.SessionNotFound):
-            account_anomaly(f"{identity}: no saved session was found")
-        elif isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending)):
+            if batch_id:
+                outcomes[identity] = SessionMoveRefused(identity, "no saved session was found")
+            else:
+                account_anomaly(f"{identity}: no saved session was found")
+        elif isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending, moves.MoveWaitingForRow)):
             outcomes[identity] = result
         else:
             outcomes[identity] = SessionMoveRefused(identity, result.reason)
@@ -2975,6 +3036,10 @@ def move_result_line(result: SessionMoveOutcome) -> str:
         return f"{result.session_id}: not moved: {result.reason}"
     if isinstance(result, stop_results.ResumePending):
         return f"{result.session_id}: stopped, resume pending on {result.account}: {next(iter(result.reason.splitlines()), 'unknown error')}"
+    if isinstance(result, moves.MoveInProgress):
+        return f"{result.session_id}: move to {result.account} already in progress"
+    if isinstance(result, moves.MoveWaitingForRow):
+        return f"{result.session_id}: move pending: {result.reason}"
     if isinstance(result, stop_results.MoveHandedOff):
         return f"{result.session_id}: moving now"
     return stop_results.claude_up_line(result)
@@ -3118,7 +3183,7 @@ def _move_worker_row(pane_moves: PaneMoves, row: staff.StaffRow, record: staff.S
             result = batch([str(row.current_session)], target, why=why, cause="by hand", source_accounts={})[0]
             if isinstance(result, stop_results.SessionNotFound):
                 return SessionMoveRefused(row.current_session, "no saved session was found")
-            if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending)):
+            if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending, moves.MoveWaitingForRow)):
                 return result
             return SessionMoveRefused(row.current_session, result.reason)
         run = pane_moves.run_for_worker(row, record)
@@ -3216,6 +3281,8 @@ def _move_target(target: str, *, repair: bool = True) -> NamedAccount | MoveRefu
         if isinstance(prepared, AccountRefused):
             return MoveRefused(prepared.reason.partition("\n")[0])
         destination = NamedAccount(target, claude_account_dir(target))
+        if destination.dir.is_symlink() or not destination.dir.is_dir():
+            return MoveRefused(f"accounts: {target} has no usable account directory")
     except AccountsError as error:
         return MoveRefused(str(error).partition("\n")[0])
     return destination
@@ -3290,17 +3357,18 @@ def move_preview_line(member: ListedSession | LiveGroupMember, target: str) -> s
 
 
 def _move_output(results: tuple[SessionMoveOutcome, ...],
-                 notices: tuple[str, ...]) -> tuple[str, str, int]:
+                 notices: tuple[str, ...], *, names: Mapping[str, str] | None = None) -> tuple[str, str, int]:
     stdout = "" if results else "".join(line + "\n" for line in notices)
     stderr = ""
     for result in results:
-        line = move_result_line(result) + ("; " + "; ".join(notices) if notices else "") + "\n"
-        if isinstance(result, (SessionMoveRefused, stop_results.ResumePending)):
+        display = replace(result, session_id=names.get(result.session_id, "unknown member")) if names is not None else result
+        line = move_result_line(display) + ("; " + "; ".join(notices) if notices else "") + "\n"
+        if isinstance(result, (SessionMoveRefused, stop_results.ResumePending, moves.MoveWaitingForRow)):
             stderr += line
         else:
             stdout += line
     return stdout, stderr, max((item.returncode if isinstance(item, SessionMoveRefused) else
-                               int(isinstance(item, stop_results.ResumePending)) for item in results), default=0)
+                               int(isinstance(item, (stop_results.ResumePending, moves.MoveWaitingForRow))) for item in results), default=0)
 
 
 @role_map.role_map_command
@@ -3315,33 +3383,43 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     checked = check_move_target(target, now, repair=not dry_run, account_config=account_config)
     if isinstance(checked, MoveRefused):
         return checked
-    members, stopped = group_move_members(group)
-    selected = [session for session in members if not session_on_account(session, target)]
-    ids = (*tuple(session.session_id for session in selected), *(row.current_session for row in stopped))
     reason = why or f"{group} moved by hand"
-    notices = (f"{group}: no live session moves",) if not ids else ()
+    transition = NoGroupTransition() if dry_run else group_transition(group)
+    if not dry_run and (isinstance(transition, NoGroupTransition) or group_label(group_accounts(), group) != target):
+        transition = set_group_account(group, target, why=reason)
+    members = group_move_members(group)
+    stopped = members.without_live_account
+    selected = [member for member in members.live if not session_on_account(member.session, target)
+                or (not dry_run and member.row.id in members.busy)]
+    rows = (*(member.row for member in selected), *stopped)
+    ids = tuple(row.current_session for row in rows)
+    if members.claude_registry_unreadable:
+        notices = (f"{group}: member list is incomplete because the Claude session registry is unreadable",)
+    else:
+        notices = (f"{group}: no live session moves",) if not ids else ()
     notices += tuple(f"{row.name}: saved account is unknown; resume on {target}"
                      for row in stopped if not isinstance(row.home, staff.SessionHome))
-    if group == "showrunners":
+    if group == "showrunners" and not members.claude_registry_unreadable:
         if TYPE_CHECKING:
             from scripts.agents import inventory
         else:
             inventory = import_module("scripts.agents.inventory")
-        live_ids = {member.session_id for member in members}
         notices += tuple(
             f"{runner.name}: no session runs under the id its update timer names; "
             + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner.name)}"
-            for runner in inventory.showrunner_registrations().entries if runner.session_id not in live_ids)
+            for runner in inventory.showrunner_registrations().entries if runner.session_id not in members.running_sessions)
     if dry_run:
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
-            *(move_preview_line(item, target) for item in selected),
+            *(move_preview_line(item.session, target) for item in selected),
             *(f"{row.name}: {row.current_session} · resume on {target} (from {claude_config_label(row.home.path)})"
               for row in stopped if isinstance(row.home, staff.SessionHome)), *notices))
-    _ = set_group_account(group, target, why=reason)
-    results = move_sessions(ids, target, why=reason, account_config=account_config) if ids else ()
-    stdout, stderr, code = _move_output(results, (*checked.notices, *notices))
+    assert isinstance(transition, GroupTransition)
+    results = move_sessions(tuple(row.id for row in rows), target, why=reason, account_config=account_config,
+                            batch_id=transition.move_id, intent=moves.FollowGroupAccount(group), staff_members=rows) if rows else ()
+    names = {result.session_id: row.name for result, row in zip(results, rows)}
+    stdout, stderr, code = _move_output(results, (*checked.notices, *notices), names=names)
     outcome = GroupMoveStartFailed if code else GroupMoveStarted
-    return outcome(ids, target, stdout, stderr, code)
+    return outcome(ids, target, stdout, stderr, code, outcomes=results)
 
 
 def session_on_account(session: ListedSession | LiveGroupMember, label: str) -> bool:
@@ -4330,10 +4408,57 @@ class SessionModelUnknown:
     """The session lacks a full model ID or a known effort."""
 
 
+SessionModel = ObservedSessionModel | SessionModelUnknown
+
+
+@dataclass
+class ModelSessionNames:
+    """Names in one count and the peer sessions that did not supply names."""
+
+    names: list[str] = field(default_factory=list)
+    unlisted_by_machine: Counter[str] = field(default_factory=Counter)
+
+    def extend(self, other: ModelSessionNames) -> None:
+        self.names.extend(other.names)
+        self.unlisted_by_machine.update(other.unlisted_by_machine)
+
+    def display_lines(self) -> tuple[str, ...]:
+        return (*sorted(self.names, key=lambda name: (name.casefold(), name)),
+                *(f"{count} more on {machine}" for machine, count in sorted(self.unlisted_by_machine.items())))
+
+
 class SessionModelCountDocument(TypedDict):
     model: str
     effort: str
     count: int
+    names: NotRequired[list[str]]
+
+
+@dataclass(frozen=True)
+class WeeklyQuota:
+    """A weekly percentage and its reset, when the provider supplies one."""
+
+    left: float
+    resets_at: datetime | StatusUnavailable
+
+
+def stored_weekly_quotas(now: datetime) -> dict[str, WeeklyQuota]:
+    """Read weekly quota for current sign-ins without counting sessions or refreshing usage."""
+    usage = usage_store.load()
+    if not usage:
+        return {}
+    account_config = read_account_settings(CURRENT_ACCOUNT_SETTINGS)
+    with role_map.stored_role_map():
+        claude = account_statuses()
+        try:
+            workers_home = _status_workers_account().home
+        except AccountsError:
+            workers_home = accounts_home() / ".codex"
+        codex = codex_statuses(workers_home)
+    return weekly_quotas(
+        _status_row(status, usage.get(usage_store.key(tool, status.login)), now, (), account_config=account_config)
+        for tool, statuses in (("Claude", claude), ("Codex", codex)) for status in statuses
+    )
 
 
 @dataclass(frozen=True)
@@ -4359,6 +4484,12 @@ class StatusRow:
     login_ends_at: agent_accounts.LoginEndKnown | agent_accounts.LoginEndUnknown = field(default_factory=agent_accounts.LoginEndUnknown)
     models_by_role: dict[str, Counter[ObservedSessionModel]] = field(default_factory=dict)
     inherited_roles: tuple[ClaudeGroup, ...] = ()
+    model_names_by_role: dict[str, dict[SessionModel, ModelSessionNames]] = field(default_factory=dict)
+
+
+def weekly_quotas(rows: Iterable[StatusRow]) -> dict[str, WeeklyQuota]:
+    return {row.label: WeeklyQuota(row.weekly_left_percent, row.resets_at)
+            for row in rows if isinstance(row.weekly_left_percent, (int, float))}
 
 
 @dataclass(frozen=True)
@@ -4847,14 +4978,22 @@ MODEL_COLUMNS: tuple[BoardColumn, ...] = (
 
 @dataclass(frozen=True)
 class ModelsBoard:
-    rows: list[BoardRow]
+    rows: list[ModelsBoardRow]
     orders: dict[str, list[AccountRowPlacement]]
+
+
+class ModelsBoardRow(BoardRow):
+    model_name: str
+    effort: str
+    session_names: dict[str, tuple[str, ...]]
 
 
 def models_board(reading: StatusReading, colors: dict[str, str]) -> ModelsBoard:
     """Group the accounts table's session counts by model, effort and role."""
-    grouped: dict[ObservedSessionModel | SessionModelUnknown, Counter[str]] = {}
+    grouped: dict[SessionModel, Counter[str]] = {}
+    grouped_names: dict[SessionModel, dict[str, ModelSessionNames]] = {}
     total: Counter[str] = Counter()
+    total_names: dict[str, ModelSessionNames] = {}
     unknown_roles: set[str] = set(MODEL_ROLES) if reading.claude_registry_unreadable else set()
     for row in reading.rows:
         for role, activity in zip(row.roles, row.role_counts):
@@ -4868,11 +5007,14 @@ def models_board(reading: StatusReading, colors: dict[str, str]) -> ModelsBoard:
                 grouped.setdefault(model, Counter())[role] += count
             if missing := activity.total - known.total():
                 grouped.setdefault(SessionModelUnknown(), Counter())[role] += missing
+            for model, names in row.model_names_by_role.get(role, {}).items():
+                grouped_names.setdefault(model, {}).setdefault(role, ModelSessionNames()).extend(names)
+                total_names.setdefault(role, ModelSessionNames()).extend(names)
 
-    def model_name(model: ObservedSessionModel | SessionModelUnknown) -> str:
+    def model_name(model: SessionModel) -> str:
         return model.model if isinstance(model, ObservedSessionModel) else "unknown"
 
-    def effort_order(model: ObservedSessionModel | SessionModelUnknown) -> int:
+    def effort_order(model: SessionModel) -> int:
         return MODEL_EFFORTS.index(model.effort) if isinstance(model, ObservedSessionModel) else len(MODEL_EFFORTS)
 
     def count_cells(counts: Counter[str]) -> dict[str, list[BoardSpan]]:
@@ -4880,29 +5022,42 @@ def models_board(reading: StatusReading, colors: dict[str, str]) -> ModelsBoard:
         values["total"] = counts.total()
         return {key: [_span(str(count), "default" if count else "inactive")] for key, count in values.items()}
 
+    def names_by_column(names: Mapping[str, ModelSessionNames], unreadable: set[str]) -> dict[str, tuple[str, ...]]:
+        combined = ModelSessionNames()
+        columns: dict[str, tuple[str, ...]] = {}
+        for role in MODEL_ROLES:
+            if role not in unreadable and role in names:
+                columns[role] = names[role].display_lines()
+                combined.extend(names[role])
+        if not unreadable and (lines := combined.display_lines()):
+            columns["total"] = lines
+        return columns
+
     models = sorted(grouped, key=lambda model: (model_name(model), effort_order(model)))
     hosts: frozenset[str] = conf.known_host_names() if models else frozenset()
-    rows: list[BoardRow] = []
+    rows: list[ModelsBoardRow] = []
     previous = ""
     for model in models:
         name = model_name(model)
+        effort = model.effort if isinstance(model, ObservedSessionModel) else "-"
         key = f"model.{name}"
         if isinstance(model, ObservedSessionModel) and not conf.host_suffix(key, hosts):
             label = _colored_span(name, key, colors, kind="bold")
             label["color_key"] = key
         else:
             label = _span(name, kind="bold")
-        rows.append(BoardRow(cells={
+        rows.append(ModelsBoardRow(cells={
             "model": [label] if name != previous else [],
-            "effort": [_span(model.effort if isinstance(model, ObservedSessionModel) else "-")],
+            "effort": [_span(effort)],
             **count_cells(grouped[model]),
-        }))
+        }, model_name=name, effort=effort, session_names=names_by_column(grouped_names.get(model, {}), set())))
         previous = name
     totals = count_cells(total)
     if unknown_roles:
         totals.update({key: [_span("unknown")] for key in MODEL_COUNT_COLUMNS
                        if key == "total" or key in unknown_roles})
-    rows.append(BoardRow(cells={"model": [_span("total", kind="bold")], "effort": [], **totals}))
+    rows.append(ModelsBoardRow(cells={"model": [_span("total", kind="bold")], "effort": [], **totals},
+                               model_name="total", effort="", session_names=names_by_column(total_names, unknown_roles)))
 
     orders: dict[str, list[AccountRowPlacement]] = {}
     for key in ("model", "effort", *MODEL_COUNT_COLUMNS):
@@ -5487,6 +5642,23 @@ def _test_signin_role_advice(problem: StatusProblem, test_accounts: set[CauseAcc
             and problem.cause.kind in ("note", "unreadable note", "unnoted", "wrong login"))
 
 
+def _status_workers_account() -> CodexWorkersAccount:
+    selected_workers = role_account("workers")
+    label = read_role_map().workers
+    if not label:
+        raise AccountsError("accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
+    selected = agent_accounts.codex_account_home(label)
+    if not isinstance(selected, agent_accounts.CodexHomeHoldingLogin):
+        kind: ProblemKind = "signed out" if selected.home.is_dir() else "access"
+        state = "not logged in" if selected.home.is_dir() else "not set up"
+        step = (f"CODEX_HOME={shlex.quote(str(selected.home))} codex login" if selected.home.is_dir()
+                else f"run accounts.py setup {label}")
+        diagnostic = f"accounts: workers is on {label}, which is {state} on this machine; {step}"
+        raise AccountsError(diagnostic, source=ObservedStateCause(diagnostic,
+            ProblemCauseKey(kind, CauseAccount(label), CauseFile(str(selected.home)))))
+    return selected_workers
+
+
 def _read_status(source: UsageSource, *, detail: bool, include_models: bool = False,
                  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
     """One table row per account folder, then one line for each thing wrong in a folder.
@@ -5501,19 +5673,7 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
             _observe_status_problem(problem)
     role_problems: list[AccountsError | str] = []
     try:
-        selected_workers = role_account("workers")
-        label = read_role_map().workers
-        if not label:
-            raise AccountsError("accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
-        selected = agent_accounts.codex_account_home(label)
-        if not isinstance(selected, agent_accounts.CodexHomeHoldingLogin):
-            kind: ProblemKind = "signed out" if selected.home.is_dir() else "access"
-            state = "not logged in" if selected.home.is_dir() else "not set up"
-            step = (f"CODEX_HOME={shlex.quote(str(selected.home))} codex login" if selected.home.is_dir()
-                    else f"run accounts.py setup {label}")
-            diagnostic = f"accounts: workers is on {label}, which is {state} on this machine; {step}"
-            raise AccountsError(diagnostic, source=ObservedStateCause(diagnostic,
-                ProblemCauseKey(kind, CauseAccount(label), CauseFile(str(selected.home)))))
+        selected_workers = _status_workers_account()
     except AccountsError as error:
         role_problems.append(error)
         _observe_status_problem(_role_problem(error, tuple(str(note_file.note_path(status.label)) for status in statuses)))
@@ -5825,7 +5985,9 @@ class LocalRoleSessions:
     session_lines: tuple[str, ...]
     continuation_lines: tuple[str, ...]
     claude_registry_unreadable: bool
+    running_claude_sessions: frozenset[str]
     models: dict[tuple[Path, str], ObservedSessionModel] = field(default_factory=dict)
+    model_session_names: dict[tuple[Path, str], str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -5838,10 +6000,10 @@ class SessionModelOptions:
 
 @dataclass(frozen=True)
 class NoRecordedModelTurn:
-    """The transcript has no recorded turn."""
+    """The scan found no recorded turn."""
 
 
-MODEL_TAIL_BYTES = 128 * 1024
+MODEL_TAIL_BLOCK_BYTES = 16 * 1024
 
 
 def _model_fields(value: object) -> dict[str, object]:
@@ -5856,18 +6018,74 @@ def _full_session_model(model: str) -> bool:
     return bool(re.fullmatch(r"(?:claude-[a-z][a-z0-9-]*-[0-9][a-z0-9-]*|gpt-[0-9][a-z0-9.-]*)", model))
 
 
-def _model_tail_lines(stream: BinaryIO, offset: int) -> Generator[bytes]:
-    """Read at most eight 16 KiB blocks from the end of the transcript."""
-    limit = max(0, offset - MODEL_TAIL_BYTES)
-    pending = b""
-    while offset > limit:
-        size = min(offset - limit, 16 * 1024)
+def _model_tail_lines(stream: BinaryIO, offset: int, start: int, *, row_boundary: int
+                      ) -> Generator[tuple[int, bytes]]:
+    """Read rows from the end. Keep fragments until their row starts."""
+    pending: list[bytes] = []
+    while offset > start:
+        floor = max(start, row_boundary) if offset > row_boundary else start
+        size = min(offset - floor, MODEL_TAIL_BLOCK_BYTES)
         offset -= size
         _ = stream.seek(offset)
-        pending, *lines = (stream.read(size) + pending).split(b"\n")
-        yield from reversed(lines)
-    if offset == 0 and pending:
-        yield pending
+        block = stream.read(size)
+        if len(block) != size:
+            raise OSError("transcript shrank during the model scan")
+        lines = block.split(b"\n")
+        end = offset + size
+        for line in reversed(lines[1:]):
+            row_start = end - len(line)
+            if pending:
+                line = b"".join((line, *reversed(pending)))
+                pending.clear()
+            yield row_start, line
+            end = row_start - 1
+        pending.append(lines[0])
+        if offset == row_boundary:
+            yield offset, b"".join(reversed(pending))
+            pending.clear()
+
+
+_MODEL_JSON_OBJECT = re.compile(r"\s*\{")
+_MODEL_JSON_FIELD = re.compile(r'\s*("(?:[^"\\]|\\.)*")\s*:\s*')
+_MODEL_JSON_COMMA = re.compile(r"\s*,")
+
+
+def _damaged_model_row(line: bytes, turn_type: str) -> bool:
+    """Read the top-level fields before the payload."""
+    row = line.decode("utf-8", errors="replace")
+    start = _MODEL_JSON_OBJECT.match(row)
+    if start is None:
+        return False
+    offset = start.end()
+    decode = json.JSONDecoder().raw_decode
+    try:
+        while (field := _MODEL_JSON_FIELD.match(row, offset)) is not None and field[1] != '"payload"':
+            value, end = cast(tuple[object, int], decode(row, field.end()))
+            if field[1] == '"type"':
+                return value == turn_type
+            comma = _MODEL_JSON_COMMA.match(row, end)
+            if comma is None:
+                break
+            offset = comma.end()
+    except (ValueError, RecursionError):
+        return False
+    return False
+
+
+def _model_row_options(line: bytes, turn_type: str, marker: bytes) -> SessionModelOptions | SessionModelUnknown | None:
+    if marker not in line:
+        return None
+    try:
+        record = _model_fields(cast(object, json.loads(line)))
+    except (ValueError, UnicodeError, RecursionError):
+        return SessionModelUnknown() if _damaged_model_row(line, turn_type) else None
+    if record.get("type") != turn_type:
+        return None
+    if turn_type == "turn_context":
+        payload = _model_fields(record.get("payload"))
+        return SessionModelOptions(_model_string(payload.get("model")), _model_string(payload.get("effort")))
+    model = _model_string(_model_fields(record.get("message")).get("model"))
+    return None if model == "<synthetic>" else SessionModelOptions(model, _model_string(record.get("effort")))
 
 
 def _model_turn_options(lines: Iterable[bytes], family: Literal["claude", "codex"]
@@ -5875,22 +6093,8 @@ def _model_turn_options(lines: Iterable[bytes], family: Literal["claude", "codex
     turn_type = "assistant" if family == "claude" else "turn_context"
     marker = f'"{turn_type}"'.encode()
     for line in lines:
-        if marker not in line:
-            continue
-        try:
-            record = _model_fields(cast(object, json.loads(line)))
-        except (ValueError, UnicodeError):
-            yield SessionModelUnknown()
-            continue
-        if record.get("type") != turn_type:
-            continue
-        if family == "codex":
-            payload = _model_fields(record.get("payload"))
-            yield SessionModelOptions(_model_string(payload.get("model")), _model_string(payload.get("effort")))
-        else:
-            model = _model_string(_model_fields(record.get("message")).get("model"))
-            if model != "<synthetic>":
-                yield SessionModelOptions(model, _model_string(record.get("effort")))
+        if (options := _model_row_options(line, turn_type, marker)) is not None:
+            yield options
 
 
 def _stream_model_turn(path: Path, family: Literal["claude", "codex"]
@@ -5932,17 +6136,260 @@ def _cached_compressed_model_turn(path: Path, family: Literal["claude", "codex"]
     return turn
 
 
-def _read_plain_model_turn(path: Path, family: Literal["claude", "codex"]
+def _model_digest(data: bytes) -> str:
+    return hashlib.blake2s(data, digest_size=16).hexdigest()
+
+
+@dataclass(frozen=True)
+class _LocatedModelTurn:
+    start: int
+    length: int
+    digest: str
+    options: SessionModelOptions | SessionModelUnknown
+
+    def matches(self, stream: BinaryIO) -> bool:
+        row = os.pread(stream.fileno(), self.length + 1, self.start)
+        return row.endswith(b"\n") and _model_digest(row[:-1]) == self.digest
+
+
+@dataclass(frozen=True)
+class _RowStartsBeforeScan:
+    """The unfinished row has no start in the scan range."""
+
+
+class _ModelFileStamp(NamedTuple):
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+    @classmethod
+    def read(cls, stream: BinaryIO) -> _ModelFileStamp:
+        state = os.fstat(stream.fileno())
+        return cls(state.st_dev, state.st_ino, state.st_size, state.st_mtime_ns, state.st_ctime_ns)
+
+
+_MODEL_EDGE_BYTES = 64
+_ModelCacheKey = tuple[Path, Literal["claude", "codex"], int]
+
+
+def _model_file_edge(stream: BinaryIO, size: int) -> str:
+    """Hash small samples at both ends of the saved prefix."""
+    width = min(size, _MODEL_EDGE_BYTES)
+    first = os.pread(stream.fileno(), width, 0)
+    last = os.pread(stream.fileno(), min(size - width, width), max(width, size - width))
+    return _model_digest(first + last)
+
+
+@dataclass(frozen=True)
+class _PlainModelScan:
+    source: _ModelFileStamp
+    edge: str
+    append_start: int | _RowStartsBeforeScan
+    turn: _LocatedModelTurn | NoRecordedModelTurn
+
+    def result(self, scan_bytes: int) -> SessionModelOptions | NoRecordedModelTurn | SessionModelUnknown:
+        if isinstance(self.turn, _LocatedModelTurn):
+            return self.turn.options
+        return SessionModelUnknown() if self.source.size > scan_bytes else self.turn
+
+    def document(self, key: _ModelCacheKey) -> dict[str, object]:
+        path, family, scan_bytes = key
+        turn = self.turn
+        return {
+            "path": str(path), "family": family, "scan_bytes": scan_bytes,
+            "source": self.source, "edge": self.edge,
+            "append_start": self.append_start if isinstance(self.append_start, int) else None,
+            "turn": (None if isinstance(turn, NoRecordedModelTurn) else {
+                "start": turn.start,
+                "length": turn.length,
+                "digest": turn.digest,
+                "options": (None if isinstance(turn.options, SessionModelUnknown)
+                            else [turn.options.model, turn.options.effort]),
+            }),
+        }
+
+    @classmethod
+    def from_document(cls, value: object) -> tuple[_ModelCacheKey, _PlainModelScan]:
+        row = _model_fields(value)
+        path, family, scan_bytes = row["path"], row["family"], row["scan_bytes"]
+        source, edge = row["source"], row["edge"]
+        if (not isinstance(path, str) or not path or (family != "claude" and family != "codex")
+                or not isinstance(scan_bytes, int) or not 128 * 1024 <= scan_bytes <= 32768 * 1024
+                or not isinstance(source, list) or len(cast(list[object], source)) != 5
+                or not all(type(item) is int for item in cast(list[object], source))
+                or not isinstance(edge, str) or not re.fullmatch(r"[0-9a-f]{32}", edge)):
+            raise ValueError("invalid model cache entry")
+        stamp = _ModelFileStamp(*cast(list[int], source))
+        floor = max(0, stamp.size - scan_bytes)
+        append_start = row["append_start"]
+        if append_start is None:
+            append_start = _RowStartsBeforeScan()
+        elif not isinstance(append_start, int) or not floor <= append_start <= stamp.size:
+            raise ValueError("invalid unfinished model row offset")
+        turn: _LocatedModelTurn | NoRecordedModelTurn = NoRecordedModelTurn()
+        if row["turn"] is not None:
+            saved = _model_fields(row["turn"])
+            start, length, digest = saved["start"], saved["length"], saved["digest"]
+            options = saved["options"]
+            if (not isinstance(start, int) or not floor <= start < stamp.size
+                    or not isinstance(length, int) or not 0 < length <= stamp.size - start
+                    or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{32}", digest)):
+                raise ValueError("invalid model row anchor")
+            observation: SessionModelOptions | SessionModelUnknown = SessionModelUnknown()
+            if isinstance(options, list) and len(cast(list[object], options)) == 2 and all(
+                    isinstance(item, str) for item in cast(list[object], options)):
+                observation = SessionModelOptions(*cast(list[str], options))
+            elif options is not None:
+                raise ValueError("invalid model row options")
+            turn = _LocatedModelTurn(start, length, digest, observation)
+        key = (Path(path), cast(Literal["claude", "codex"], family), scan_bytes)
+        return key, cls(stamp, edge, append_start, turn)
+
+
+_MODEL_CACHE_VERSION = 2
+_MODEL_CACHE_ENTRY_BYTES = 32768
+_MODEL_CACHE_START = f'{{"version":{_MODEL_CACHE_VERSION},"entries":['
+_MODEL_CACHE_END = "]}\n"
+
+
+@dataclass(frozen=True)
+class _ModelScanCacheEntry:
+    scan: _PlainModelScan
+    encoded: str
+
+
+class _PersistentModelScans:
+    """Load once per status scan and retain the largest transcripts."""
+
+    def __init__(self, limit: int) -> None:
+        root = os.environ.get("XDG_CACHE_HOME")
+        self.path: Path = (Path(root) if root else Path.home() / ".cache") / "claude/session-models.json"
+        self.limit: int = limit
+        self.observed: dict[_ModelCacheKey, _ModelScanCacheEntry] = {}
+
+    @property
+    def max_bytes(self) -> int:
+        return len(_MODEL_CACHE_START) + self.limit * (_MODEL_CACHE_ENTRY_BYTES + 1) + len(_MODEL_CACHE_END)
+
+    @cached_property
+    def previous(self) -> dict[_ModelCacheKey, _PlainModelScan]:
+        try:
+            with self.path.open("rb") as stream:
+                encoded = stream.read(self.max_bytes + 1)
+            if len(encoded) > self.max_bytes:
+                return {}
+            data = _model_fields(cast(object, json.loads(encoded)))
+            rows = data.get("entries")
+            if (data.get("version") != _MODEL_CACHE_VERSION or not isinstance(rows, list)
+                    or len(cast(list[object], rows)) > self.limit):
+                return {}
+            return dict(_PlainModelScan.from_document(row) for row in cast(list[object], rows))
+        except (OSError, ValueError, KeyError, RecursionError):
+            return {}
+
+    def get(self, key: _ModelCacheKey) -> _PlainModelScan | None:
+        entry = self.observed.get(key)
+        return self.previous.get(key) if entry is None else entry.scan
+
+    def remember(self, key: _ModelCacheKey, scan: _PlainModelScan) -> None:
+        encoded = json.dumps(scan.document(key), separators=(",", ":"))
+        if len(encoded) > _MODEL_CACHE_ENTRY_BYTES:
+            _ = self.observed.pop(key, None)
+            return
+        self.observed[key] = _ModelScanCacheEntry(scan, encoded)
+        if len(self.observed) > self.limit:
+            smallest = min(self.observed, key=lambda entry: self.observed[entry].scan.source.size)
+            del self.observed[smallest]
+
+    def save(self) -> None:
+        if not self.observed or {key: entry.scan for key, entry in self.observed.items()} == self.previous:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            entries = ",".join(entry.encoded for entry in self.observed.values())
+            atomic_file.write_text_atomic(self.path, _MODEL_CACHE_START + entries + _MODEL_CACHE_END,
+                                          new_file_mode=0o600)
+        except OSError:
+            pass
+
+
+_plain_model_turns: OrderedDict[_ModelCacheKey, _PlainModelScan] = OrderedDict()
+_plain_model_turns_lock = Lock()
+
+
+def _scan_plain_model_turn(path: Path, stream: BinaryIO, family: Literal["claude", "codex"], scan_bytes: int,
+                           previous: _PlainModelScan | None) -> _PlainModelScan | SessionModelUnknown:
+    source = _ModelFileStamp.read(stream)
+    if previous is not None and source == previous.source:
+        return previous
+
+    size = source.size
+    floor = max(0, size - scan_bytes)
+    start = floor
+    row_boundary = floor if floor == 0 or os.pread(stream.fileno(), 1, floor - 1) == b"\n" else -1
+    turn: _LocatedModelTurn | NoRecordedModelTurn = NoRecordedModelTurn()
+    if (previous is not None and floor <= previous.source.size < size
+            and (source.device, source.inode) == (previous.source.device, previous.source.inode)
+            and _model_file_edge(stream, previous.source.size) == previous.edge):
+        old_turn = previous.turn
+        if isinstance(previous.append_start, int) and previous.append_start >= floor:
+            if not isinstance(old_turn, _LocatedModelTurn) or old_turn.start < floor:
+                start = row_boundary = previous.append_start
+            elif old_turn.start < previous.append_start and old_turn.matches(stream):
+                start = row_boundary = previous.append_start
+                turn = old_turn
+        else:
+            # Start after the part of the unfinished row that the previous scan read.
+            start, row_boundary = previous.source.size, -1
+
+    append_start: int | _RowStartsBeforeScan = _RowStartsBeforeScan() if size else 0
+    turn_type = "assistant" if family == "claude" else "turn_context"
+    marker = f'"{turn_type}"'.encode()
+    for row_index, (row_start, line) in enumerate(_model_tail_lines(stream, size, start, row_boundary=row_boundary)):
+        if row_index == 0:
+            append_start = row_start
+        if (options := _model_row_options(line, turn_type, marker)) is not None:
+            located = _LocatedModelTurn(row_start, len(line), _model_digest(line), options)
+            if row_index == 0 and isinstance(options, SessionModelUnknown):
+                if isinstance(turn, NoRecordedModelTurn):
+                    turn = located
+                continue
+            turn = located
+            break
+    edge = _model_file_edge(stream, size)
+    current = path.stat()
+    if current.st_size < size or (current.st_dev, current.st_ino) != (source.device, source.inode):
+        return SessionModelUnknown()
+    return _PlainModelScan(source, edge, append_start, turn)
+
+
+def _read_plain_model_turn(path: Path, family: Literal["claude", "codex"], scan_bytes: int, cache_limit: int,
+                           persistent: _PersistentModelScans | None
                            ) -> SessionModelOptions | NoRecordedModelTurn | SessionModelUnknown:
-    """Read the newest turn from the tail of a plain transcript."""
+    """Read new rows and keep the latest turn that remains in the scan range."""
+    key = (path, family, scan_bytes)
+    if persistent is not None:
+        previous = persistent.get(key)
+    else:
+        with _plain_model_turns_lock:
+            previous = _plain_model_turns.get(key)
+
     with path.open("rb") as stream:
-        size = stream.seek(0, os.SEEK_END)
-        damaged_turn = False
-        for options in _model_turn_options(_model_tail_lines(stream, size), family):
-            if isinstance(options, SessionModelOptions):
-                return options
-            damaged_turn = True
-    return SessionModelUnknown() if damaged_turn or size > MODEL_TAIL_BYTES else NoRecordedModelTurn()
+        scanned = _scan_plain_model_turn(path, stream, family, scan_bytes, previous)
+    if isinstance(scanned, SessionModelUnknown):
+        return scanned
+    if persistent is not None:
+        persistent.remember(key, scanned)
+    else:
+        with _plain_model_turns_lock:
+            if _plain_model_turns.get(key) is previous:
+                _plain_model_turns[key] = scanned
+                _plain_model_turns.move_to_end(key)
+            while len(_plain_model_turns) > cache_limit:
+                _ = _plain_model_turns.popitem(last=False)
+    return scanned.result(scan_bytes)
 
 
 def _model_process_options(pid: int) -> SessionModelOptions:
@@ -5979,19 +6426,36 @@ def _model_process_options(pid: int) -> SessionModelOptions:
 class SessionModelReader:
     """Reuse catalog and transcript directory reads during one session scan."""
 
-    def __init__(self) -> None:
+    def __init__(self, persistent: _PersistentModelScans | None = None) -> None:
+        self._persistent: _PersistentModelScans | None = persistent
         self.codex_rollouts: dict[Path, dict[str, Path]] = {}
         self.claude_models: dict[Path, dict[str, str]] = {}
 
+    @classmethod
+    @contextmanager
+    def status_scan(cls, *, include_models: bool) -> Generator[SessionModelReader]:
+        if not include_models:
+            yield cls()
+            return
+        cache = _PersistentModelScans(read_account_settings().whole("session_model_cache_entries"))
+        yield cls(cache)
+        cache.save()
+
     @cached_property
-    def compressed_cache_limit(self) -> int:
+    def cache_limit(self) -> int:
+        if self._persistent is not None:
+            return self._persistent.limit
         return read_account_settings().whole("session_model_cache_entries")
+
+    @cached_property
+    def scan_bytes(self) -> int:
+        return read_account_settings().whole("session_model_scan_kib") * 1024
 
     def _turn(self, path: Path, family: Literal["claude", "codex"]
               ) -> SessionModelOptions | NoRecordedModelTurn | SessionModelUnknown:
         if path.suffix == ".zst":
-            return _cached_compressed_model_turn(path, family, self.compressed_cache_limit)
-        return _read_plain_model_turn(path, family)
+            return _cached_compressed_model_turn(path, family, self.cache_limit)
+        return _read_plain_model_turn(path, family, self.scan_bytes, self.cache_limit, self._persistent)
 
     @cached_property
     def registry(self) -> dict[str, dict[str, str]]:
@@ -6143,11 +6607,13 @@ def _read_local_role_sessions(groups: GroupAccounts, *, include_workers: bool = 
     from scripts.herdr import herdr
 
     # One pane and process read serves every member in this read.
-    with herdr.observation_snapshot():
-        return _observed_role_sessions(groups, include_workers=include_workers, include_models=include_models)
+    with herdr.observation_snapshot(), SessionModelReader.status_scan(include_models=include_models) as model_reader:
+        return _observed_role_sessions(groups, include_workers=include_workers, include_models=include_models,
+                                       model_reader=model_reader)
 
 
-def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, include_models: bool) -> LocalRoleSessions:
+def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, include_models: bool,
+                            model_reader: SessionModelReader) -> LocalRoleSessions:
     from scripts.message import sessions
     from scripts.herdr import pane_launch
     from scripts.production import session_staff, staff
@@ -6155,7 +6621,7 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
     inputs = {sessions.sessions_dir(), pane_launch.record_directory()}
     counts: dict[tuple[Path, str], dict[str, session_state.SessionState]] = {}
     models: dict[tuple[Path, str], ObservedSessionModel] = {}
-    model_reader = SessionModelReader()
+    names: dict[tuple[Path, str], str] = {}
     launches: dict[str, pane_launch.PaneLaunch] = {}
     try:
         membership = staff.local_snapshot()
@@ -6195,6 +6661,10 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
     def record_codex_model(directory: Path, identity: str, pid: int = 0) -> None:
         if include_models and isinstance(model := model_reader.codex(directory, identity, pid=pid), ObservedSessionModel):
             models[directory, identity] = model
+
+    def record_name(directory: Path, identity: str, name: str) -> None:
+        if include_models:
+            names[directory, identity] = " ".join(name.splitlines()).strip() or identity[:8]
 
     registry = sessions.read_registry(dependencies=inputs.add)
     live = {session["sessionId"]: session for session in sessions.running_sessions(registry=registry)}
@@ -6240,6 +6710,8 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
                     member_row if member_row is not None else session_state.UnrecordedStaff(),
                     session_state.LiveActivity(session.get("status", "")), detached=detached)
             counts.setdefault((directory, role), {})[identity] = state
+            named_staff = owner or member_row
+            record_name(directory, identity, (named_staff.name if named_staff else "") or session["name"])
             record_claude_model(directory, identity, session["pid"])
     # A member without a live session belongs to its selected role account.
     for member in (*staff.active(membership, "unit"), *staff.active(membership, "showrunner"),
@@ -6259,6 +6731,7 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
         directory = account_dir(selected)
         state = session_state.classify(member, session_state.NoLiveSession(), detached=detached)
         counts.setdefault((directory, stopped_group), {})[member.current_session] = state
+        record_name(directory, member.current_session, member.name)
         record_claude_model(directory, member.current_session)
         session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
@@ -6282,6 +6755,7 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
                     directory = evidence.backend.codex_home
                     counts.setdefault((directory, "workers"), {})[state.row.current_session] = session_state.classify(
                         state.row, session_state.LiveActivity(status), detached=detached)
+                    record_name(directory, state.row.current_session, state.row.name)
                     if include_models:
                         open_codex_workers[state.row.current_session] = directory
                     observed_workers.add(state.row.current_session)
@@ -6304,6 +6778,7 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
                 directory = setting.home if isinstance(setting, account.ProcessCodexHome) else accounts_home() / ".codex"
                 counts.setdefault((directory, "workers"), {})[member.current_session] = session_state.classify(
                     member, session_state.LiveActivity(process.activity), detached=detached)
+                record_name(directory, member.current_session, member.name)
                 record_codex_model(directory, member.current_session, process.pid)
         for member in codex_producers:
             activity: session_state.LiveActivity | session_state.NoLiveSession = session_state.NoLiveSession()
@@ -6321,9 +6796,10 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
                 directory = home
             counts.setdefault((directory, "producers"), {})[member.current_session] = session_state.classify(
                 member, activity, detached=detached)
+            record_name(directory, member.current_session, member.name)
             record_codex_model(directory, member.current_session, process.pid if process else 0)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
-                             tuple(session_lines), (), bool(registry.unreadable), models)
+                             tuple(session_lines), (), bool(registry.unreadable), frozenset(live), models, names)
 
 
 def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSessions) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
@@ -6334,14 +6810,25 @@ def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSession
         roles = tuple(dict.fromkeys((*row.roles, *(role for folder, role in observed.counts if folder == directory))))
         if any(role != "spare" for role in roles):
             roles = tuple(role for role in roles if role != "spare")
-        members: dict[str, session_state.SessionState] = {identity: state for role in roles
-                   for identity, state in observed.counts.get((directory, role), {}).items()}
+        members: dict[str, session_state.SessionState] = {}
+        models: dict[str, Counter[ObservedSessionModel]] = {}
+        model_names: dict[str, dict[SessionModel, ModelSessionNames]] = {}
+        for role in roles:
+            role_models: Counter[ObservedSessionModel] = Counter()
+            for identity, state in observed.counts.get((directory, role), {}).items():
+                members[identity] = state
+                key = (directory, identity)
+                model = observed.models.get(key, SessionModelUnknown())
+                if isinstance(model, ObservedSessionModel):
+                    role_models[model] += 1
+                if name := observed.model_session_names.get(key):
+                    model_names.setdefault(role, {}).setdefault(model, ModelSessionNames()).names.append(name)
+            models[role] = role_models
         counted.append(replace(row, roles=roles,
             sessions=tuple(AccountSessionDocument(session=identity, state=state) for identity, state in sorted(members.items())),
             selected_roles=tuple(role for role in row.roles if role != "spare"),
-            models_by_role={role: Counter(observed.models[directory, identity]
-                for identity in observed.counts.get((directory, role), {}) if (directory, identity) in observed.models)
-                for role in roles},
+            models_by_role=models,
+            model_names_by_role=model_names,
             role_counts=tuple(NoRoleCount() if role == "spare" else _role_session_counts(
                 tuple(observed.counts.get((directory, role), {}).values()), row.tool) for role in roles)))
     return tuple(counted), observed.inputs
@@ -6353,6 +6840,7 @@ class MachineSessionCounts(TypedDict):
     accounts: dict[str, dict[str, RoleSessionCountsDocument]]
     claude_registry_unreadable: NotRequired[Literal[True]]
     models: NotRequired[dict[str, dict[str, list[SessionModelCountDocument]]]]
+    unknown_model_names: NotRequired[dict[str, dict[str, list[str]]]]
 
 
 def _session_counts_cache() -> Path:
@@ -6366,10 +6854,13 @@ def _session_counts_machine() -> str:
 
 def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_state.SessionState]], *,
                              claude_registry_unreadable: bool = False,
-                             models: Mapping[tuple[Path, str], ObservedSessionModel] | None = None) -> MachineSessionCounts:
+                             models: Mapping[tuple[Path, str], ObservedSessionModel] | None = None,
+                             names: Mapping[tuple[Path, str], str] | None = None) -> MachineSessionCounts:
     """Publish the four session states for each account and role."""
-    mapped: dict[tuple[str, str], dict[str, session_state.SessionState]] = {}
-    mapped_models: dict[tuple[str, str], dict[str, ObservedSessionModel]] = {}
+    mapped: dict[tuple[str, str], dict[str, tuple[session_state.SessionState, SessionModel, str]]] = {}
+    unknown = SessionModelUnknown()
+    models = models or {}
+    names = names or {}
     for (directory, role), members in counts.items():
         label = directory.name.removeprefix(".")
         if re.fullmatch(r"codex(?:[1-9][0-9]*)?", label):
@@ -6377,30 +6868,60 @@ def _session_counts_document(counts: dict[tuple[Path, str], dict[str, session_st
         if not re.fullmatch(r"(?:claude|codex)[1-9][0-9]*", label) or (
                 claude_registry_unreadable and label.startswith("claude")):
             continue
-        mapped.setdefault((label, role), {}).update(members)
-        if models:
-            for identity in members:
-                if (model := models.get((directory, identity))) is not None:
-                    mapped_models.setdefault((label, role), {})[identity] = model
+        mapped.setdefault((label, role), {}).update({identity: (state, models.get((directory, identity), unknown),
+                                                names.get((directory, identity), "")) for identity, state in members.items()})
     values: dict[str, dict[str, RoleSessionCountsDocument]] = {}
+    model_counts: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
+    unknown_names: dict[str, dict[str, list[str]]] = {}
     for (label, role), members in mapped.items():
         tool = "codex" if label.startswith("codex") else "claude"
-        count = _role_session_counts(tuple(members.values()), tool)
+        count = _role_session_counts(tuple(state for state, _, _ in members.values()), tool)
         values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy, idle=count.idle,
             paused=count.paused, exited=count.exited, total=count.total)
+        known: dict[ObservedSessionModel, SessionModelCountDocument] = {}
+        missing: list[str] = []
+        for _, model, name in members.values():
+            if isinstance(model, ObservedSessionModel):
+                if model not in known:
+                    known[model] = SessionModelCountDocument(model=model.model, effort=model.effort, count=0)
+                entry = known[model]
+                entry["count"] += 1
+                if name:
+                    entry.setdefault("names", []).append(name)
+            elif name:
+                missing.append(name)
+        if known:
+            model_counts.setdefault(label, {})[role] = list(known.values())
+        if missing:
+            unknown_names.setdefault(label, {})[role] = missing
     document = MachineSessionCounts(machine=_session_counts_machine(),
         at=datetime.now(timezone.utc).isoformat(), accounts=values)
     if claude_registry_unreadable:
         document["claude_registry_unreadable"] = True
-    if mapped_models:
-        model_counts: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
-        for (label, role), members in mapped_models.items():
-            model_counts.setdefault(label, {})[role] = [
-                SessionModelCountDocument(model=model.model, effort=model.effort, count=count)
-                for model, count in Counter(members.values()).items()
-            ]
+    if model_counts:
         document["models"] = model_counts
+    if unknown_names:
+        document["unknown_model_names"] = unknown_names
     return document
+
+
+def _decode_model_names(value: object, count: int) -> list[str]:
+    """Ignore unusable names and retain the verified count."""
+    if not isinstance(value, list):
+        return []
+    items = cast(list[object], value)
+    if len(items) > count:
+        return []
+    names: list[str] = []
+    for item in items:
+        if not isinstance(item, str) or len(item.splitlines()) != 1 or not (name := item.strip()):
+            continue
+        try:
+            _ = name.encode("utf-8")
+        except UnicodeEncodeError:
+            continue
+        names.append(name)
+    return names
 
 
 def _decode_model_count(value: object, total: int) -> list[SessionModelCountDocument]:
@@ -6415,7 +6936,10 @@ def _decode_model_count(value: object, total: int) -> list[SessionModelCountDocu
                 or not isinstance(effort, str) or effort not in MODEL_EFFORTS
                 or not isinstance(count, int) or isinstance(count, bool) or not 0 < count <= total):
             return []
-        models.append(SessionModelCountDocument(model=model, effort=effort, count=count))
+        entry = SessionModelCountDocument(model=model, effort=effort, count=count)
+        if names := _decode_model_names(fields.get("names"), count):
+            entry["names"] = names
+        models.append(entry)
         total -= count
     return models
 
@@ -6454,14 +6978,23 @@ def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
     if claude_registry_unreadable:
         document["claude_registry_unreadable"] = True
     payload = _model_fields(fields.get("models"))
+    names_payload = _model_fields(fields.get("unknown_model_names"))
     models: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
+    unknown_names: dict[str, dict[str, list[str]]] = {}
     for label, roles in checked.items():
         model_roles = _model_fields(payload.get(label))
+        name_roles = _model_fields(names_payload.get(label))
         for role, count in roles.items():
-            if entries := _decode_model_count(model_roles.get(role), count["total"]):
+            entries = _decode_model_count(model_roles.get(role), count["total"])
+            if entries:
                 models.setdefault(label, {})[role] = entries
+            remainder = count["total"] - sum(entry["count"] for entry in entries)
+            if names := _decode_model_names(name_roles.get(role), remainder):
+                unknown_names.setdefault(label, {})[role] = names
     if models:
         document["models"] = models
+    if unknown_names:
+        document["unknown_model_names"] = unknown_names
     return document
 
 
@@ -6516,6 +7049,16 @@ class MachineRoleCounts:
         yield self.problems
 
 
+def _add_peer_model_names(groups: dict[SessionModel, ModelSessionNames], model: SessionModel, peer: str,
+                          count: int, names: Sequence[str]) -> None:
+    roster = ModelSessionNames([f"{name} ({peer})" for name in names])
+    if unlisted := count - len(names):
+        roster.unlisted_by_machine[peer] = unlisted
+    if model in groups:
+        roster.extend(groups[model])
+    groups[model] = roster
+
+
 def _machine_role_counts(
     rows: tuple[StatusRow, ...], now: datetime,
  *, claude_registry_unreadable: bool = False,
@@ -6524,6 +7067,7 @@ def _machine_role_counts(
     local, peer = _session_counts_machine(), remote.other_machine()
     peer_registry_unreadable = False
     peer_models: dict[str, dict[str, list[SessionModelCountDocument]]] = {}
+    peer_unknown_names: dict[str, dict[str, list[str]]] = {}
     try:
         document = _decode_session_counts(_session_counts_cache().read_text(), peer)
         stamp = _stored_time(document["at"])
@@ -6532,6 +7076,7 @@ def _machine_role_counts(
         peer_accounts = document["accounts"]
         peer_registry_unreadable = document.get("claude_registry_unreadable", False)
         peer_models = document.get("models", {})
+        peer_unknown_names = document.get("unknown_model_names", {})
         available = True
     except (OSError, ValueError):
         peer_accounts = {}
@@ -6561,12 +7106,20 @@ def _machine_role_counts(
                 paused=sum(count["paused"] for count in counts),
                 exited=sum(count["exited"] for count in counts)))
         models = {role: Counter(counts) for role, counts in row.models_by_role.items() if not local_unknown}
-        for role, entries in peer_models.get(row.label, {}).items():
-            known = models.setdefault(role, Counter())
+        model_names = {role: dict(groups) for role, groups in row.model_names_by_role.items() if not local_unknown}
+        for role, peer_count in peer_accounts.get(row.label, {}).items():
+            entries = peer_models.get(row.label, {}).get(role, [])
+            remainder = peer_count["total"]
             for entry in entries:
-                known[ObservedSessionModel(entry["model"], entry["effort"])] += entry["count"]
+                model = ObservedSessionModel(entry["model"], entry["effort"])
+                models.setdefault(role, Counter())[model] += entry["count"]
+                _add_peer_model_names(model_names.setdefault(role, {}), model, peer, entry["count"], entry.get("names", []))
+                remainder -= entry["count"]
+            if remainder:
+                names = peer_unknown_names.get(row.label, {}).get(role, [])
+                _add_peer_model_names(model_names.setdefault(role, {}), SessionModelUnknown(), peer, remainder, names)
         counted.append(replace(row, roles=roles, role_counts=tuple(combined),
-                               role_counts_by_machine=machines, models_by_role=models))
+                               role_counts_by_machine=machines, models_by_role=models, model_names_by_role=model_names))
     problems = (() if available else (f"{peer} unavailable: counts are {local} only",))
     unreadable = tuple(f"{machine}: Claude session registry unreadable. Claude session counts are unknown."
                        for machine, unread in ((local, claude_registry_unreadable), (peer, peer_registry_unreadable))
@@ -6795,6 +7348,7 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
         if options.action == "session-counts-read":
             observed = _local_session_counts(include_models=True)
             print(json.dumps(_session_counts_document(observed.counts, models=observed.models,
+                names=observed.model_session_names,
                 claude_registry_unreadable=observed.claude_registry_unreadable)))
             return 0
         if options.action == "session-counts-fetch":

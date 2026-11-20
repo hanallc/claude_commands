@@ -3,6 +3,10 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import io
+import json
+import tempfile
+from contextlib import redirect_stdout
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from dataclasses import replace
@@ -15,6 +19,7 @@ from scripts.build_queue.admission_records import PackageNotRecorded
 from scripts.build_targets import build_targets, targets, target_config
 from scripts.build_targets.target_config import ConfigError, ExcludedTarget, LocalTarget, SshTarget
 from scripts.mac_test import claim_state, eligibility, mac_test
+from scripts.lib import process_start as process_identity
 from scripts.message import unit_labels
 from scripts.build_queue.admission_records import NeedsMemory, WaitingStep
 
@@ -154,6 +159,53 @@ class MacRouteTests(unittest.TestCase):
             self.assertEqual(routes.holds("/fixture/cargo-liner-tile"), "busy with check cargo-handler")
             self.assertEqual(routes.holds("/fixture/organon"), "")
         self.assertEqual(scope.call_count, 2)
+
+    def test_a_kept_claim_does_not_hold_its_repository_while_another_runs(self) -> None:
+        first = claim_state.RepositoryScope("first")
+        second = claim_state.RepositoryScope("second")
+        live = claim(second, "live check")
+        kept_record: claim_state.RemoteJobClaim = {
+            "claim_id": "kept", "episode": "e", "attempt": "a", "submitting_session": "s",
+            "pid": 4243, "proc_start": "1", "what": "dead check", "worktree": "/fixture/first",
+            "since": SINCE.isoformat(), "remote_host": "fixture-mac"}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "first.json"
+            original = (json.dumps(kept_record, indent=3) + "\n").encode()
+            _ = path.write_bytes(original)
+            kept = mac_test.HeldClaim(first, path, kept_record)
+            job = targets.running_job(live)
+            routes = target_availability.MacRoutes(
+                (snapshot(MAC, targets.Running((job,)), claims=(live, kept)),), LABELS, UTC)
+            scopes = {"/fixture/first": first, "/fixture/second": second}
+            with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("1")), \
+                 mock.patch.object(mac_test, "target_claim_scope", side_effect=scope_of(scopes)):
+                self.assertEqual(routes.holds("/fixture/first"), "busy with dead check")
+            kept_record["proc_start"] = "old-start"
+            original = (json.dumps(kept_record, indent=3) + "\n").encode()
+            _ = path.write_bytes(original)
+            with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("1")), \
+                 mock.patch.object(mac_test, "target_claim_scope", side_effect=scope_of(scopes)):
+                self.assertEqual(routes.holds("/fixture/first"), "")
+                self.assertEqual(routes.holds("/fixture/second"), "busy with live check")
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_target_status_omits_kept_work_without_removing_the_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = claim_state.StatePaths(Path(directory))
+            record: claim_state.RemoteJobClaim = {
+                "claim_id": "kept", "episode": "e", "attempt": "a", "submitting_session": "s",
+                "pid": 4243, "proc_start": "old-start", "what": "dead check", "worktree": "/fixture",
+                "since": SINCE.isoformat(), "remote_host": "fixture-mac"}
+            original = (json.dumps(record, indent=3) + "\n").encode()
+            _ = paths.run.write_bytes(original)
+            output = io.StringIO()
+            with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("1")), \
+                 mock.patch.object(eligibility, "read_failed_probe", return_value=eligibility.NoFailedProbe()), \
+                 mock.patch.object(eligibility, "read_backoff", return_value=eligibility.NO_BACKOFF), \
+                 redirect_stdout(output):
+                self.assertEqual(mac_test.command_target_status(paths), 0)
+            self.assertEqual(output.getvalue(), "free\n")
+            self.assertEqual(paths.run.read_bytes(), original)
 
     def test_a_whole_mac_claim_or_an_unknown_repository_holds_with_every_live_claim(self) -> None:
         self.use_target_config()

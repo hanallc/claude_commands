@@ -42,6 +42,44 @@ class MoveRefused(ValueError):
     """A source cannot move without risking its data or another path."""
 
 
+class LiveSource(MoveRefused):
+    """A running session or another process uses the source."""
+
+
+class JournaledLiveSource(LiveSource):
+    """A live source has a saved copy journal."""
+
+
+class CopyWriteFailed(RuntimeError):
+    """A write can have changed the destination or the source."""
+
+
+@dataclass
+class CopyWriteState:
+    started: bool = False
+
+    def begin(self) -> None:
+        self.started = True
+
+
+@dataclass
+class MoveSummary:
+    moved_folders: int = 0
+    moved_bytes: int = 0
+    kept_live: int = 0
+    refused_other: int = 0
+    live_copy_pending: bool = False
+
+    def record_move(self, size: int) -> None:
+        self.moved_folders += 1
+        self.moved_bytes += size
+
+    def keep_live(self, source: Path, reason: LiveSource, *, journaled: bool) -> None:
+        kept(source, reason)
+        self.kept_live += 1
+        self.live_copy_pending |= journaled
+
+
 @dataclass(frozen=True)
 class MoveRoots:
     sessions: Path
@@ -123,11 +161,11 @@ class DestinationNames:
             row["sessionId"]: row for row in reversed(session_records.running_records(self.registry))
         }
 
-    def destination(self, session_id: str) -> SessionDestination:
+    def destination(self, session_id: str, root_fd: int) -> SessionDestination:
         if not session_folder.SESSION_ID.fullmatch(session_id):
             raise MoveRefused(f"invalid session id {session_id!r}")
         index_path = self.root / session_folder.INDEX
-        with open_directory(index_path, missing_ok=True) as index:
+        with destination_parent(root_fd, self.root, index_path / session_id, create=False) as index:
             if stat_at(index, session_id) is not None:
                 try:
                     name = os.readlink(session_id, dir_fd=index)
@@ -154,16 +192,18 @@ class DestinationNames:
         folder = session_folder.select_folder(self.root, base, session_id)
         return SessionDestination(folder, rule, session_id, owner)
 
-    def remember(self, name: SessionDestination, root_fd: int) -> None:
+    def remember(self, name: SessionDestination, root_fd: int, mount: int, writes: CopyWriteState) -> None:
         session_id = name.session_id
-        mount = mount_identity(root_fd)
-        with child_directory(root_fd, session_folder.INDEX, create=True, mount=mount) as index:
+        creates_index_entry = name.rule is not NamingRule.INDEX
+        with child_directory(root_fd, session_folder.INDEX, create=creates_index_entry,
+                             mount=mount, on_write=writes.begin) as index:
             if name.rule is NamingRule.INDEX or stat_at(index, session_id) is not None:
                 check_index_link(index, session_id, name.folder)
             if name.rule is NamingRule.INDEX:
                 return
             record = session_folder.FolderRecord(owner=name.owner, session_id=session_id)
-            with child_directory(root_fd, name.folder.name, create=True, mount=mount) as folder:
+            with child_directory(root_fd, name.folder.name, create=True, mount=mount, on_write=writes.begin) as folder:
+                writes.begin()
                 write_record_at(folder, session_folder.RECORD, record)
             try:
                 os.symlink(name.folder.name, session_id, dir_fd=index)
@@ -187,16 +227,14 @@ class ScratchpadLeaf:
     relative: Path
 
 
-def children(folder: Path) -> list[Path]:
-    try:
-        return sorted(folder.iterdir())
-    except FileNotFoundError:
-        return []
-
-
 def claude_tree(path: Path) -> bool:
-    return (CLAUDE_TREE.fullmatch(path.name) is not None and is_directory(path)
-            and path.lstat().st_uid == os.getuid())
+    if CLAUDE_TREE.fullmatch(path.name) is None:
+        return False
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
 
 
 @dataclass(frozen=True)
@@ -206,23 +244,49 @@ class UnrecognizedEntry:
     blocks_cutover: bool
 
 
-def scratchpad_leaves(roots: MoveRoots) -> Iterator[ScratchpadLeaf | UnrecognizedEntry]:
-    legacy = (entry for entry in children(roots.former_temp) if claude_tree(entry))
-    former = (entry for session in children(roots.former_sessions) if is_directory(session)
-              for entry in children(session) if claude_tree(entry))
-    for tree in (*former, *legacy):
-        for project in children(tree):
-            if not project.name.startswith("-"):
-                yield UnrecognizedEntry(project, "outside a Claude project", False)
-                continue
-            if not is_directory(project):
-                yield UnrecognizedEntry(project, "Claude project is not a directory", True)
-                continue
-            for leaf in children(project):
-                if session_folder.SESSION_ID.fullmatch(leaf.name) and is_directory(leaf):
-                    yield ScratchpadLeaf(leaf, Path(tree.name) / project.name / leaf.name)
-                else:
-                    yield UnrecognizedEntry(leaf, "not a Claude session directory", True)
+type SourceDiscovery = ScratchpadLeaf | UnrecognizedEntry
+
+
+def discover_children(folder: Path, visit: Callable[[Path], Iterator[SourceDiscovery]]) -> Iterator[SourceDiscovery]:
+    try:
+        entries = sorted(folder.iterdir())
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        yield UnrecognizedEntry(folder, str(error), True)
+        return
+    for entry in entries:
+        try:
+            yield from visit(entry)
+        except OSError as error:
+            yield UnrecognizedEntry(entry, str(error), True)
+
+
+def scratchpad_leaves(roots: MoveRoots) -> Iterator[SourceDiscovery]:
+    def visit_leaf(leaf: Path) -> Iterator[SourceDiscovery]:
+        if session_folder.SESSION_ID.fullmatch(leaf.name) and is_directory(leaf):
+            yield ScratchpadLeaf(leaf, Path(*leaf.parts[-3:]))
+        else:
+            yield UnrecognizedEntry(leaf, "not a Claude session directory", True)
+
+    def visit_project(project: Path) -> Iterator[SourceDiscovery]:
+        if not project.name.startswith("-"):
+            yield UnrecognizedEntry(project, "outside a Claude project", False)
+        elif not is_directory(project):
+            yield UnrecognizedEntry(project, "Claude project is not a directory", True)
+        else:
+            yield from discover_children(project, visit_leaf)
+
+    def visit_tree(tree: Path) -> Iterator[SourceDiscovery]:
+        if claude_tree(tree):
+            yield from discover_children(tree, visit_project)
+
+    def visit_former_session(session: Path) -> Iterator[SourceDiscovery]:
+        if is_directory(session):
+            yield from discover_children(session, visit_tree)
+
+    yield from discover_children(roots.former_sessions, visit_former_session)
+    yield from discover_children(roots.former_temp, visit_tree)
 
 
 @dataclass(frozen=True)
@@ -250,13 +314,19 @@ def require_mount(fd: int, mount: int, name: str) -> None:
 
 
 @contextmanager
-def child_directory(parent: int, name: str, *, create: bool = False, mount: int = -1) -> Generator[int]:
+def child_directory(parent: int, name: str, *, create: bool = False, mount: int = -1,
+                    on_write: Callable[[], None] = lambda: None) -> Generator[int]:
     if create:
         try:
             os.mkdir(name, mode=0o700, dir_fd=parent)
         except FileExistsError:
             pass
+        except OSError:
+            # The create operation can fail after it changes the folder.
+            on_write()
+            raise
         else:
+            on_write()
             os.fsync(parent)
     fd = os.open(name, DIRECTORY_OPEN, dir_fd=parent)
     try:
@@ -268,7 +338,7 @@ def child_directory(parent: int, name: str, *, create: bool = False, mount: int 
 
 
 @contextmanager
-def open_directory(path: Path, *, missing_ok: bool = False) -> Generator[int]:
+def open_directory(path: Path) -> Generator[int]:
     """Open every component without following a symlink."""
     if not path.is_absolute() or ".." in path.parts:
         raise MoveRefused(f"{path}: expected an absolute path within a configured root")
@@ -276,31 +346,32 @@ def open_directory(path: Path, *, missing_ok: bool = False) -> Generator[int]:
         root = os.open(path.anchor, DIRECTORY_OPEN)
         _ = stack.callback(os.close, root)
         fd = root
-        try:
-            for name in path.parts[1:]:
-                fd = stack.enter_context(child_directory(fd, name))
-        except FileNotFoundError:
-            if not missing_ok:
-                raise
-            fd = -1
+        for name in path.parts[1:]:
+            fd = stack.enter_context(child_directory(fd, name))
         yield fd
 
 
 @contextmanager
-def destination_parent(root_fd: int, root: Path, target: Path, *, create: bool) -> Generator[int]:
+def destination_parent(root_fd: int, root: Path, target: Path, *, create: bool,
+                       check_write: bool = False) -> Generator[int]:
     fd = root_fd
+    path = root
     mount = mount_identity(fd)
+    missing = False
     with ExitStack() as stack:
         try:
             for name in target.parent.relative_to(root).parts:
                 if name == "..":
                     raise MoveRefused(f"{target}: destination is outside the session root")
                 fd = stack.enter_context(child_directory(fd, name, create=create, mount=mount))
+                path /= name
         except FileNotFoundError:
             if create:
                 raise
-            fd = -1
-        yield fd
+            missing = True
+        if check_write:
+            require_writable_directory(fd, path)
+        yield -1 if missing else fd
 
 
 def stat_at(parent: int, name: str) -> os.stat_result | None:
@@ -319,8 +390,12 @@ def unlink_at(parent: int, name: str) -> None:
         pass
 
 
+def temporary_record_name(name: str) -> str:
+    return f".{name}.session-move"
+
+
 def write_record_at(parent: int, name: str, value: object) -> None:
-    temporary = f".{name}.session-move"
+    temporary = temporary_record_name(name)
     unlink_at(parent, temporary)
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
     with os.fdopen(fd, "w", encoding="utf-8") as output:
@@ -451,16 +526,35 @@ def tree_entries(fd: int, mount: int, relative: Path = TREE_ROOT) -> Iterator[tu
             yield path, fd, info, kind
 
 
-def tree_size(root: Path, mounts: Sequence[measure.Mount]) -> int:
+def check_source_mounts(root: Path, mounts: Sequence[measure.Mount]) -> None:
     for mount in mounts:
         if mount.point == root or mount.point.is_relative_to(root):
             raise MoveRefused(f"{mount.point}: entry is on another mount")
-    with open_directory(root) as fd:
-        return sum(info.st_size for _, _, info, kind in tree_entries(fd, mount_identity(fd))
-                   if kind is not HashedEntry.DIRECTORY)
 
 
 EntryIdentities = dict[Path, os.stat_result]
+
+
+@dataclass(frozen=True)
+class SourceRemoval:
+    """Check removal permissions while scanning the source."""
+
+    parent: int
+    path: Path
+
+
+class ReadManifestOnly(Enum):
+    NO_REMOVAL_CHECK = "read manifest only"
+
+
+def require_writable_directory(fd: int, path: Path) -> None:
+    if not os.access(".", os.W_OK | os.X_OK, dir_fd=fd, effective_ids=os.access in os.supports_effective_ids):
+        raise MoveRefused(f"{path}: directory needs write and search permission")
+
+
+def require_removable(parent: os.stat_result, entry: os.stat_result, path: Path) -> None:
+    if parent.st_mode & stat.S_ISVTX and os.geteuid() not in (0, parent.st_uid, entry.st_uid):
+        raise MoveRefused(f"{path}: sticky directory prevents removal")
 
 
 def preserved_metadata(parent: int, name: str, expected: os.stat_result) -> PreservedMetadata:
@@ -493,13 +587,23 @@ def read_entry(parent: int, path: Path, info: os.stat_result, kind: HashedEntry,
     return TreeEntry(kind, size, preserved_metadata(parent, name, info), sha256)
 
 
-def read_manifest(fd: int, identities: EntryIdentities | None = None) -> TreeManifest:
+def read_manifest(fd: int, identities: EntryIdentities | None = None, *,
+                  removal: SourceRemoval | ReadManifestOnly = ReadManifestOnly.NO_REMOVAL_CHECK) -> TreeManifest:
     mount = mount_identity(fd)
     root = os.fstat(fd)
+    checked_parents: dict[Path, os.stat_result] = {}
+    if isinstance(removal, SourceRemoval):
+        require_writable_directory(removal.parent, removal.path.parent)
+        require_removable(os.fstat(removal.parent), root, removal.path)
     manifest = {TREE_ROOT: read_entry(fd, TREE_ROOT, root, HashedEntry.DIRECTORY, mount)}
     if identities is not None:
         identities[TREE_ROOT] = root
     for path, parent, info, kind in tree_entries(fd, mount):
+        if isinstance(removal, SourceRemoval):
+            if path.parent not in checked_parents:
+                require_writable_directory(parent, removal.path / path.parent)
+                checked_parents[path.parent] = os.fstat(parent)
+            require_removable(checked_parents[path.parent], info, removal.path / path)
         if identities is not None:
             identities[path] = info
         manifest[path] = read_entry(parent, path, info, kind, mount)
@@ -642,7 +746,10 @@ def discard_stage(journal: int, stage: int) -> None:
     clear_journal(journal)
 
 
-def process_uses(sources: tuple[Path, ...], session_pids: frozenset[int]) -> tuple[tuple[Path, int, str], ...]:
+type SourceProcessUses = tuple[tuple[Path, int, str], ...]
+
+
+def process_uses(sources: tuple[Path, ...], session_pids: frozenset[int]) -> SourceProcessUses:
     if not sources:
         return ()
     prefixes = tuple(str(path) for path in sources)
@@ -656,10 +763,10 @@ def process_uses(sources: tuple[Path, ...], session_pids: frozenset[int]) -> tup
     return tuple((Path(path.removesuffix(tmp_sweep.DELETED_SUFFIX)), pid, how) for path, pid, how in uses.paths)
 
 
-def require_idle(source: Path, uses: tuple[tuple[Path, int, str], ...]) -> None:
+def require_idle(source: Path, uses: SourceProcessUses) -> None:
     for path, pid, how in uses:
         if path.is_relative_to(source):
-            raise MoveRefused(f"{source}: process {pid} {how} ({path})")
+            raise LiveSource(f"{source}: process {pid} {how} ({path})")
 
 
 @dataclass(frozen=True)
@@ -745,6 +852,11 @@ def directory_ancestors(path: Path, chain: dict[Path, FolderIdentity],
 @dataclass(frozen=True)
 class CopyInProgress:
     """The source is intact and the stage can contain a partial copy."""
+
+
+@dataclass(frozen=True)
+class CopyFromValidatedSource(CopyInProgress):
+    source_manifest: TreeManifest
 
 
 @dataclass(frozen=True)
@@ -876,14 +988,19 @@ def require_session_stopped(session_id: str, registry: session_records.RegistryR
         raise MoveRefused("cannot read all session records")
     state = session_records.session_liveness(session_id, registry)
     if isinstance(state, session_records.LiveSessionProcess):
-        raise MoveRefused(f"session {session_id} is live (process {state.pid})")
+        raise LiveSource(f"session {session_id} is live (process {state.pid})")
     if isinstance(state, session_records.SessionLivenessUnknown):
         raise MoveRefused(state.reason)
 
 
-def check_copy_idle(move: PlannedCopy, session_pids: frozenset[int]) -> None:
-    require_session_stopped(move.session_id, session_records.read_registry())
-    require_idle(move.source, process_uses((move.source,), session_pids))
+def check_source_idle(source: Path, registry: session_records.RegistryRead,
+                      read_uses: Callable[[], SourceProcessUses]) -> None:
+    require_session_stopped(source.name, registry)
+    require_idle(source, read_uses())
+
+
+def check_copy_idle(source: Path, session_pids: frozenset[int]) -> None:
+    check_source_idle(source, session_records.read_registry(), lambda: process_uses((source,), session_pids))
 
 
 @contextmanager
@@ -903,14 +1020,15 @@ def require_parent_path(path: Path, expected: int) -> None:
 
 def prepare_copy(job: MoveJournal, journal: int, source: int, session_pids: frozenset[int]) -> VerifiedCopy:
     move = job.move
-    check_copy_idle(move, session_pids)
+    check_copy_idle(move.source, session_pids)
     with (child_directory(source, move.source.name, mount=mount_identity(source)) as original,
           child_directory(journal, STAGED, create=True, mount=mount_identity(journal)) as staged):
         try:
             if not job.source.matches(os.fstat(original)):
                 raise MoveRefused("source changed before the copy")
             unlink_at(journal, PARTIAL_FILE)
-            expected = read_manifest(original)
+            expected = (job.state.source_manifest if isinstance(job.state, CopyFromValidatedSource)
+                        else read_manifest(original))
             existing = read_manifest(staged)
             copy_tree(original, staged, existing, expected, journal)
             attributes = SourceAttributeNames({
@@ -928,7 +1046,7 @@ def prepare_copy(job: MoveJournal, journal: int, source: int, session_pids: froz
 
 
 def resume_copy(job: MoveJournal, journal: int, roots: MoveRoots, root_fd: int,
-                session_pids: frozenset[int]) -> None:
+                session_pids: frozenset[int]) -> int:
     move = job.move
     with source_parent(roots, move) as source:
         old = stat_at(source, move.source.name)
@@ -962,7 +1080,7 @@ def resume_copy(job: MoveJournal, journal: int, roots: MoveRoots, root_fd: int,
                             replace(job, state=CopyInProgress()).save(journal)
                             discard_stage(journal, staged)
                             raise
-                check_copy_idle(move, session_pids)
+                check_copy_idle(move.source, session_pids)
                 require_parent_path(move.target.parent, target)
                 rename_exclusive(journal, STAGED, target, move.target.name)
             elif not verified.folder.matches(new) or stat_at(journal, STAGED) is not None:
@@ -972,12 +1090,13 @@ def resume_copy(job: MoveJournal, journal: int, roots: MoveRoots, root_fd: int,
                 os.fsync(journal)
 
             require_parent_path(move.target.parent, target)
-            finish_copy(job, verified, source, target, session_pids)
+            size = finish_copy(job, verified, source, target, session_pids)
         clear_journal(journal)
+        return size
 
 
 def finish_copy(job: MoveJournal, verified: VerifiedCopy, source: int, target: int,
-                session_pids: frozenset[int]) -> None:
+                session_pids: frozenset[int]) -> int:
     move = job.move
     require_parent_path(move.source.parent, source)
     remaining: TreeManifest = {}
@@ -986,11 +1105,11 @@ def finish_copy(job: MoveJournal, verified: VerifiedCopy, source: int, target: i
     source_present = stat_at(source, move.source.name) is not None
     source_mount = mount_identity(source)
     if source_present:
-        check_copy_idle(move, session_pids)
+        check_copy_idle(move.source, session_pids)
         with child_directory(source, move.source.name, mount=source_mount) as original:
             if not job.source.matches(os.fstat(original)):
                 raise MoveRefused("source changed before deletion")
-            remaining = read_manifest(original, source_identities)
+            remaining = read_manifest(original, source_identities, removal=SourceRemoval(source, move.source))
 
     with child_directory(target, move.target.name, mount=mount_identity(target)) as published:
         if not verified.folder.matches(os.fstat(published)):
@@ -1007,20 +1126,41 @@ def finish_copy(job: MoveJournal, verified: VerifiedCopy, source: int, target: i
                 raise MoveRefused("published copy changed before source deletion")
             proof = CopyDeletion(source_identities, destination_identities, expected, published)
             # Close the source scan before checking for open files.
-            check_copy_idle(move, session_pids)
+            check_copy_idle(move.source, session_pids)
             with child_directory(source, move.source.name, mount=source_mount) as original:
                 if not job.source.matches(os.fstat(original)):
                     raise MoveRefused("source changed before deletion")
                 remove_tree(source, move.source.name, original, source_mount, proof)
         else:
             os.fsync(source)
+        return sum(entry.size_bytes for entry in expected.values())
 
 
-def check_destination(root_fd: int, root: Path, target: Path, destinations: set[Path]) -> None:
-    with destination_parent(root_fd, root, target, create=False) as parent:
+def check_destination(root_fd: int, root: Path, move: PlannedCopy, name: SessionDestination,
+                      destinations: set[Path]) -> None:
+    target = move.target
+    with destination_parent(root_fd, root, target, create=False, check_write=True) as parent:
         if target in destinations or stat_at(parent, target.name) is not None:
             raise MoveRefused(f"destination conflict at {target}")
-    destinations.add(target)
+    with destination_parent(root_fd, root, root / JOURNAL / MOVE_RECORD, create=False, check_write=True) as journal:
+        check_record_writes(journal, root / JOURNAL, MOVE_RECORD)
+    if name.rule is not NamingRule.INDEX:
+        with destination_parent(root_fd, root, root / session_folder.INDEX / name.session_id,
+                                create=False, check_write=True):
+            pass
+        with destination_parent(root_fd, root, name.folder / session_folder.RECORD,
+                                create=False, check_write=True) as folder:
+            check_record_writes(folder, name.folder, session_folder.RECORD)
+
+
+def check_record_writes(parent: int, folder: Path, record: str) -> None:
+    for name in (record, temporary_record_name(record)):
+        info = stat_at(parent, name)
+        if info is not None:
+            path = folder / name
+            if stat.S_ISDIR(info.st_mode):
+                raise MoveRefused(f"{path}: a directory prevents the record write")
+            require_removable(os.fstat(parent), info, path)
 
 
 def show_copy(move: PlannedCopy, size: int) -> None:
@@ -1031,52 +1171,111 @@ def kept(source: Path, reason: object) -> None:
     print(f"session_move: kept {source}: {reason}", file=sys.stderr, flush=True)
 
 
-def start_copy(move: PlannedCopy, roots: MoveRoots, root_fd: int, session_pids: frozenset[int]) -> None:
-    with (child_directory(root_fd, JOURNAL, create=True, mount=mount_identity(root_fd)) as journal,
-          source_parent(roots, move) as source):
+@dataclass(frozen=True)
+class ValidatedCopy:
+    move: PlannedCopy
+    destination: SessionDestination
+    source_identity: FolderIdentity
+    source_manifest: TreeManifest
+
+    @property
+    def size_bytes(self) -> int:
+        return sum(entry.size_bytes for entry in self.source_manifest.values())
+
+
+def validate_copy(leaf: ScratchpadLeaf, roots: MoveRoots, root_fd: int, names: DestinationNames,
+                  destinations: set[Path], mounts: Sequence[measure.Mount], uses: SourceProcessUses) -> ValidatedCopy:
+    if leaf.source.is_relative_to(roots.sessions):
+        raise MoveRefused("source is inside the destination root")
+    check_source_idle(leaf.source, names.registry, lambda: uses)
+    name = names.destination(leaf.source.name, root_fd)
+    move = PlannedCopy(leaf.source, name.folder / leaf.relative, name.rule, name.session_id)
+    with source_parent(roots, move) as source:
         with child_directory(source, move.source.name, mount=mount_identity(source)) as original:
             identity = FolderIdentity.of(os.fstat(original))
-        job = MoveJournal(move, identity, CopyInProgress())
-        job.save(journal)
-        resume_copy(job, journal, roots, root_fd, session_pids)
+            check_source_mounts(move.source, mounts)
+            manifest = read_manifest(original, removal=SourceRemoval(source, move.source))
+    check_destination(root_fd, roots.sessions, move, name, destinations)
+    return ValidatedCopy(move, name, identity, manifest)
+
+
+def start_copy(validated: ValidatedCopy, names: DestinationNames,
+               roots: MoveRoots, root_fd: int, session_pids: frozenset[int]) -> int:
+    mount = mount_identity(root_fd)
+    move = validated.move
+    job = MoveJournal(move, validated.source_identity, CopyFromValidatedSource(validated.source_manifest))
+    writes = CopyWriteState()
+    try:
+        names.remember(validated.destination, root_fd, mount, writes)
+        check_copy_idle(move.source, session_pids)
+        with child_directory(root_fd, JOURNAL, create=True, mount=mount, on_write=writes.begin) as journal:
+            writes.begin()
+            job.save(journal)
+            try:
+                return resume_copy(job, journal, roots, root_fd, session_pids)
+            except LiveSource as error:
+                raise JournaledLiveSource(str(error)) from error
+    except LiveSource:
+        raise
+    except (MoveRefused, OSError) as error:
+        if writes.started:
+            raise CopyWriteFailed(str(error)) from error
+        raise
 
 
 def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, holds: tuple[OpenScratchHold, ...],
-                    mounts: Sequence[measure.Mount], *, dry_run: bool) -> int:
+                    mounts: Sequence[measure.Mount], summary: MoveSummary, *, dry_run: bool) -> None:
     session_pids = frozenset(row["pid"] for row in names.live.values())
     entries = tuple(scratchpad_leaves(roots))
     sources = {entry.source for entry in entries if isinstance(entry, ScratchpadLeaf)}
     blocked: set[Path] = set()
-    failed = False
 
     with destination_parent(root_fd, roots.sessions, roots.sessions / JOURNAL / MOVE_RECORD, create=False) as journal:
         pending = read_journal(journal, roots)
         if isinstance(pending, MoveJournal):
             sources.add(pending.move.source)
-        source_chains = {source: directory_chain(source) for source in sources} if holds else {}
-        source_ancestors = {source: directory_ancestors(source, chain, mounts)
-                            for source, chain in source_chains.items()}
+        source_identities: dict[Path, FolderIdentity] = {}
+        source_ancestors: dict[Path, set[FolderIdentity]] = {}
+        if holds:
+            for source in sorted(sources):
+                try:
+                    chain = directory_chain(source)
+                    source_ancestors[source] = directory_ancestors(source, chain, mounts)
+                except (MoveRefused, OSError) as error:
+                    kept(source, error)
+                    summary.refused_other += 1
+                    blocked.add(source)
+                else:
+                    if source in chain:
+                        source_identities[source] = chain[source]
         scratch_chain = directory_chain(roots.scratch) if holds else {}
+        reported_hold = False
         for hold in holds:
             chain = directory_chain(hold.path)
             ancestors = directory_ancestors(hold.path, chain, mounts)
             held_folder = chain.get(hold.path)
-            overlaps = {source for source, source_chain in source_chains.items()
-                        if source_chain.get(source) in ancestors or held_folder in source_ancestors[source]}
+            overlaps = {source for source, source_parents in source_ancestors.items()
+                        if source_identities.get(source) in ancestors or held_folder in source_parents}
             if overlaps or scratch_chain.get(roots.scratch) in ancestors:
                 kept(hold.path, f"open scratch hold, owner {hold.owner}")
                 blocked.update(overlaps)
-                failed = True
-        if failed:
+                summary.refused_other += 1
+                reported_hold = True
+        if reported_hold:
             print("session_move: an unreleased hold keeps its folder behind. Ask the owner to release it.",
                   file=sys.stderr, flush=True)
         if isinstance(pending, MoveJournal):
             if pending.move.source in blocked:
-                return 1
+                return
             print(f"resume copy {pending.move.source} -> {pending.move.target}", flush=True)
             if dry_run:
-                return 1
-            resume_copy(pending, journal, roots, root_fd, session_pids)
+                summary.refused_other += 1
+                return
+            try:
+                summary.record_move(resume_copy(pending, journal, roots, root_fd, session_pids))
+            except LiveSource as error:
+                summary.keep_live(pending.move.source, error, journaled=True)
+                return
             sources.discard(pending.move.source)
 
     eligible = sources - blocked
@@ -1084,34 +1283,30 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
     for entry in entries:
         if isinstance(entry, UnrecognizedEntry):
             kept(entry.path, entry.reason)
-            failed |= entry.blocks_cutover
+            summary.refused_other += int(entry.blocks_cutover)
 
     uses = process_uses(tuple(leaf.source for leaf in leaves), session_pids)
     destinations: set[Path] = set()
     for leaf in leaves:
         try:
-            if leaf.source.is_relative_to(roots.sessions):
-                raise MoveRefused("source is inside the destination root")
-            session_id = leaf.source.name
-            require_session_stopped(session_id, names.registry)
-            name = names.destination(session_id)
-            move = PlannedCopy(leaf.source, name.folder / leaf.relative, name.rule, session_id)
-            show_copy(move, tree_size(move.source, mounts))
-            check_destination(root_fd, roots.sessions, move.target, destinations)
-            require_idle(move.source, uses)
+            validated = validate_copy(leaf, roots, root_fd, names, destinations, mounts, uses)
+            size = validated.size_bytes
+            show_copy(validated.move, size)
             if not dry_run:
-                names.remember(name, root_fd)
-                start_copy(move, roots, root_fd, session_pids)
-        except (MoveRefused, OSError) as error:
-            kept(leaf.source, error)
-            failed = True
-            if not dry_run:
-                return 1
+                size = start_copy(validated, names, roots, root_fd, session_pids)
+            destinations.add(validated.move.target)
+            summary.record_move(size)
+        except (MoveRefused, OSError, CopyWriteFailed) as error:
+            if isinstance(error, LiveSource):
+                summary.keep_live(leaf.source, error, journaled=isinstance(error, JournaledLiveSource))
+            else:
+                kept(leaf.source, error)
+                summary.refused_other += 1
+            if isinstance(error, (JournaledLiveSource, CopyWriteFailed)):
+                return
 
-    return int(failed)
 
-
-def moves(roots: MoveRoots, *, dry_run: bool) -> int:
+def moves(roots: MoveRoots, summary: MoveSummary, *, dry_run: bool) -> None:
     if any(roots.sessions.is_relative_to(path) or path.is_relative_to(roots.sessions)
            for path in (roots.scratch, roots.former_sessions)):
         raise MoveRefused("the session root overlaps a source root")
@@ -1120,9 +1315,9 @@ def moves(roots: MoveRoots, *, dry_run: bool) -> int:
     with (open_directory(roots.sessions) as root,
           nullcontext() if dry_run else session_folder.root_lock(roots.sessions),
           nullcontext() if dry_run else scratch.locked_holds(scratch_settings=scratch_settings)):
-        return move_candidates(
+        move_candidates(
             roots, root, DestinationNames(roots.sessions), open_scratch_holds(holds_path),
-            measure.read_mounts(), dry_run=dry_run,
+            measure.read_mounts(), summary, dry_run=dry_run,
         )
 
 
@@ -1130,11 +1325,17 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--dry-run", action="store_true", help="Print the moves without changing any source or target.")
     arguments = parser.parse_args(argv)
+    dry_run = cast(bool, arguments.dry_run)
+    summary = MoveSummary()
     try:
-        return moves(MoveRoots.configured(), dry_run=cast(bool, arguments.dry_run))
+        moves(MoveRoots.configured(), summary, dry_run=dry_run)
     except (OSError, ValueError) as error:
         print(f"session_move: {error}", file=sys.stderr)
-        return 1
+        summary.refused_other += 1
+    action = "would move" if dry_run else "moved"
+    print(f"session_move: {action} {summary.moved_folders} folders ({summary.moved_bytes / 2**30:.2f} GiB), "
+          + f"kept {summary.kept_live} live, refused {summary.refused_other} other", flush=True)
+    return int(summary.refused_other > 0 or summary.live_copy_pending)
 
 
 if __name__ == "__main__":

@@ -36,13 +36,13 @@ from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as p
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.process_group import send_process_group
 from scripts.lib import cancellation
 from scripts.build_queue.admission_records import process_start_time
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.build_targets import target_config
 from scripts.production.gate_modules import GateRefused
-from scripts.production.merge_gate import SuiteMode
 
 
 NIXOS_LOCK = Path('/etc/nixos/flake.lock')
@@ -58,6 +58,7 @@ def host_nixpkgs_revision() -> str:
 
 
 TRIAL_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+PAIRED_TRIAL_JOB = StepJob('test-modules', modules=1)
 
 
 def main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
@@ -90,7 +91,7 @@ def checked_git(repo: Path, *arguments: str) -> str:
 
 
 def network_git(repo: Path, *arguments: str) -> str:
-    """Bound network Git calls and stop their process groups on cancellation."""
+    """Bound network Git calls and stop unreaped Git groups on failure."""
     command = ['git', '-C', str(repo), *arguments]
     timeout = cloud_gate.settings().number('git_network_timeout_s')
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -98,11 +99,13 @@ def network_git(repo: Path, *arguments: str) -> str:
         try:
             output, errors = process.communicate(timeout=timeout)
         except BaseException:
-            try:
-                send_process_group(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            _ = process.communicate()
+            if process.returncode is None:
+                with cancellation.defer_cleanup_signals():
+                    try:
+                        send_process_group(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _ = process.wait()
             raise
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
@@ -306,7 +309,7 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
         cloud_gate.settings().number('api_timeout_s')), ledger.CostLedger(directory), settings_path, folder / 'reservation.cgroup', clock=time.time)
     try:
         with redirect_stdout(sys.stderr), cloud_gate.cloud_reservation(
-                folder, worker.sidecar, SuiteMode.TARGETED_TEST, group=group) as slot:
+                folder, worker.sidecar, PAIRED_TRIAL_JOB, group=group) as slot:
             try:
                 connection.send('ready')
                 if connection.recv() != 'launch':

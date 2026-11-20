@@ -7,24 +7,28 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import fields
+from dataclasses import fields, replace
 import io
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
+from scripts.build_queue import execution_identity
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
-from scripts.mac_test import eligibility, offload, claim_state
-from scripts.build_queue import admission_client, admission_protocol as wire, placement
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.mac_test import eligibility, nextest_log, offload, claim_state
+from scripts.build_queue import admission_client, admission_protocol as wire, placement, queue_snapshot
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_hold.owning_session import NoOwningSession
 if TYPE_CHECKING:
     from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config
@@ -40,7 +44,10 @@ from scripts.lib import conf, session_folder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
-from scripts.mac_test.offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
+from scripts.mac_test.offload_test_commands import install_nextest_log_writer
+from scripts.mac_test.offload_test_support import (
+    OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
+)
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -285,6 +292,20 @@ class RunnerCompletionTests(unittest.TestCase):
                 }])
 
 
+    def test_split_utf8_tail_preserves_status_and_counts_raw_bytes(self) -> None:
+        wire = b"mac_test: tail fragment: \xa9\nmac_exit=42\nmac_cleanup=kept\n"
+        process = mock.Mock(stdout=io.BytesIO(wire), wait=mock.Mock(return_value=0))
+        controller = offload.ProcessController()
+        with mock.patch.object(subprocess, "Popen", return_value=process), redirect_stdout(io.StringIO()) as output:
+            result = controller.stream_mac_run(["ssh", "fixture", "run"])
+        self.assertEqual(result, offload.ReportedMacStatus(42, offload.CleanupKept()))
+        self.assertEqual(output.getvalue(), "mac_test: tail fragment: \ufffd\n")
+        self.assertEqual(controller.attempt_evidence.traffic.transfers, [{
+            "operation": "ssh_run", "sent_bytes": 3,
+            "received_bytes": len(wire), "complete": True,
+        }])
+
+
 class CompletedRunSyncTests(unittest.TestCase):
     def test_finished_runs_exchange_after_release_and_preserve_results(self) -> None:
         for target in ("linux", "mac"):
@@ -481,6 +502,33 @@ class OffloadSettingsTests(unittest.TestCase):
                 self.assertEqual(config.values["linux_only.hana"], "local-package")
                 self.assertEqual(config.mirror_busy_backoff_s, 37)
 
+    def test_explicit_mac_settings_cannot_bypass_the_nextest_summary_limit(self) -> None:
+        request = offload.OffloadRequest(self.root, "hana", "log-limit", offload.NO_RESULT_FILE, (),
+                                        owner="verify", holder_session="fixture-session")
+        for limit in ("", "# whole: 1..2048\n"):
+            with self.subTest(limit=limit):
+                settings = self.root / "summary-limit.conf"
+                _ = settings.write_text(self.settings.read_text().replace(
+                    f"# whole: 1..1024\n{nextest_log.SUMMARY_BYTES}=1024",
+                    f"{limit}{nextest_log.SUMMARY_BYTES}=2048"))
+                config = eligibility.read_config(settings)
+                with (mock.patch.object(subprocess, "run", RUN_SUBPROCESS),
+                      mock.patch.object(subprocess, "Popen", START_SUBPROCESS),
+                      self.assertRaisesRegex(conf.Unusable, nextest_log.SUMMARY_BYTES + "|Summary limit")):
+                    _ = offload.remote_test_command(config, request, HANA)
+
+    def test_explicit_mac_settings_use_host_only_nextest_limits(self) -> None:
+        host = socket.gethostname().partition(".")[0]
+        source = self.settings.read_text()
+        for key, value in ((nextest_log.TAIL_BYTES, 36), (nextest_log.SUMMARY_BYTES, 52)):
+            source = re.sub(rf"^{key}=\d+$", f"{key}.{host}={value}", source, flags=re.MULTILINE)
+        _ = self.settings.write_text(source)
+        config = eligibility.read_config(self.settings)
+        request = offload.OffloadRequest(self.root, "hana", "log-limit", offload.NO_RESULT_FILE, (),
+                                        owner="verify", holder_session="fixture-session")
+        with mock.patch.object(subprocess, "run", RUN_SUBPROCESS), mock.patch.object(subprocess, "Popen", START_SUBPROCESS):
+            self.assertIn(" run 36 52 ", offload.remote_test_command(config, request, HANA))
+
     def test_sender_normalizes_multiline_tool_versions_before_parity(self) -> None:
         versions = {"rustc": " rustc fixture \n", "nextest":
             " cargo-nextest 0.9.143  \n release: 0.9.143\n commit: abc\n date: today\n host: linux \n",
@@ -671,7 +719,7 @@ class OffloadSettingsTests(unittest.TestCase):
         assert start is not None
         local = fixture.request(owner=wire.Owner(os.getpid(), start))
         target = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("hana"))
-        constraints = placement.PlacementConstraints(placement.SourceKeyUnavailable("the fixture has no tree key"),
+        constraints = placement.PlacementConstraints(execution_identity.SourceKeyUnavailable("the fixture has no tree key"),
             ("cargo", "nextest", "run"), str(self.root), "hana", NoOwningSession(),
             (placement.PlacementCandidate(target),), placement.PinnedHost("mac"))
         request = wire.PlacementRequest(local.episode,
@@ -723,6 +771,58 @@ class OffloadSettingsTests(unittest.TestCase):
                                        return_value=eligibility.KnownRepository("cargo-liner")):
                     result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
                 self.assertEqual(result.reason if isinstance(result, offload.DeclinedMacRun) else result, reason)
+
+
+@final
+class MacPlacementWaitTests(unittest.TestCase):
+    def test_a_mac_copy_waits_for_the_mac_while_its_local_parent_holds_memory(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(4094003, "35916506")
+            run = wire.RunIdentity(owner.pid, owner.start_time)
+            parent = fixture.request(need=14912008192, owner=owner,
+                                     since=fixture.clock.now() - 3600, run=run)
+            grant, = fixture.server.handle_request(parent)
+            assert isinstance(grant, wire.Admitted)
+
+            child = fixture.fixture_owner(3682121, "36172697")
+            mac = placement.PlacementDestination("mac", "mac", "fixture-mac", claim_state.RepositoryScope("hana"))
+            constraints = placement.PlacementConstraints(execution_identity.SourceKeyKnown("fixture-tree"),
+                ("cargo", "nextest", "run"), str(fixture.root), "hana", NoOwningSession(),
+                (placement.PlacementCandidate(mac),), placement.PinnedHost("mac"))
+            request = wire.PlacementRequest("mac-copy", placement.SubmittingOwner(
+                fixture.server.host, child.pid, child.start_time), fixture.clock.now() - 3100,
+                parent.profile, constraints, identity=parent.identity, run=run,
+                purpose=placement.SpeculativeCopy(parent.episode, parent.since))
+            key = fixture.server.host_evidence_key(request, mac)
+            busy = placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.TemporaryExclusion("busy"))
+            fixture.server.publish_host_evidence(busy)
+
+            reply, = fixture.server.handle_request(request)
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertEqual(reply.wait, wire.PlacementResourceWait("mac", "busy"))
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [])
+            self.assertEqual([row["pid"] for row in snapshot.inputs.reservations], [owner.pid])
+            view, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual(view.reading.view.waiting, ())
+
+            fixture.allow_next_start()
+            younger = fixture.request(owner=fixture.fixture_owner(1855215, "36200000"))
+            self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Admitted)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+
+            fixture.server.publish_host_evidence(replace(busy, observed_at=fixture.clock.now(),
+                                                         eligibility=placement.AllowedHost()))
+            assigned, = fixture.server.handle_request(request)
+            assert isinstance(assigned, wire.Assignment)
+            self.assertEqual(assigned.assignment.destination, mac)
+            self.assertEqual(fixture.server.reservations[parent.episode].reservation_id, grant.reservation)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual(snapshot.inputs.ordered, [])
 
 
 @final
@@ -936,7 +1036,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                     self.assertEqual(ssh[0]["args"][-2], "alternate-mac")
                     self.assertEqual(ssh[1]["args"][-2], "alternate-mac")
                     self.assertIn("LINT_SWEEP_BUDGET_GIB=8", ssh[1]["args"][-1])
-                    remote_words = shlex.split(ssh[1]["args"][-1].rpartition("; echo mac_exit=$?")[0])
+                    remote_words, _ = split_mac_run_command(ssh[1]["args"][-1])
                     lint_index = remote_words.index("~/.claude/scripts/lint/lint")
                     self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
                     self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
@@ -966,7 +1066,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                                                   offload.ssh_options(config.connection))
                 self.assertEqual(prefix[-1], "alternate-mac")
                 self.assertIn("LINT_SWEEP_BUDGET_GIB=8", remote)
-                remote_words = shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+                remote_words, _ = split_mac_run_command(remote)
                 lint_index = remote_words.index("~/.claude/scripts/lint/lint")
                 self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
                 self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
@@ -1150,7 +1250,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 admission.server.publish_host_evidence(admission.server.host_probe(key))
         _ = admission.run_pass()
         with admission.loop_turn():
-            self.assertTrue(all(isinstance(admission.server.assignments[placement.attempt_key(
+            self.assertTrue(all(isinstance(admission.server.assignments[execution_identity.attempt_key(
                 saved.assignment.episode, saved.assignment.attempt)].state, placement.ClosedAssignment)
                 for saved in assigned), assigned)
 
@@ -1235,7 +1335,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                         remote = offload.remote_test_command(config, request, HANA)
                         claim = offload.claim_arguments(request, config)
                     self.assertEqual(claim[claim.index("--what") + 1], f"{verb} hana")
-                sent = shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+                sent, _ = split_mac_run_command(remote)
                 position = sent.index("~/.claude/scripts/lint/lint")
                 self.assertEqual(sent[position + 1:], [verb, *words])
                 if verb == "doc":
@@ -1425,7 +1525,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assert_wire("passed", "")
         remote = self.events_for("ssh")[-1]["args"][-1]
-        remote_words = shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+        remote_words, _ = split_mac_run_command(remote)
         lint_index = remote_words.index("~/.claude/scripts/lint/lint")
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
         self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
@@ -1452,6 +1552,7 @@ class OffloadCommandTests(OffloadCommandFixture):
             remote = offload.remote_test_command(config, request, eligibility.KnownRepository("hana"))
             mirror = self.root / offload.remote_mirror(eligibility.KnownRepository("hana"))
         mirror.mkdir(parents=True, exist_ok=True)
+        _ = install_nextest_log_writer(self.root)
         lint = self.root / ".claude/scripts/lint/lint"
         lint.parent.mkdir(parents=True, exist_ok=True)
         capture = self.root / "received-environment.json"
@@ -1549,10 +1650,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         run = events[2]["args"]
         self.assertEqual(run[: len(ssh_arguments)], ssh_arguments)
         remote = run[-1]
-        run_command, separator, status_command = remote.rpartition("; echo mac_exit=$?")
-        self.assertEqual(separator, "; echo mac_exit=$?")
-        self.assertIn("mac_cleanup=", status_command)
-        remote_words = shlex.split(run_command)
+        remote_words, cleanup = split_mac_run_command(remote)
+        self.assertIn("mac_cleanup=", cleanup)
         lint_index = remote_words.index("~/.claude/scripts/lint/lint")
         self.assertEqual(
             remote_words[lint_index :],
@@ -1638,10 +1737,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         result = self.command("-E", FILTER, filter_run=True)
         self.assertEqual(result.returncode, 0, result.stdout)
         remote = self.events_for("ssh")[-1]["args"][-1]
-        run_command, separator, status_command = remote.rpartition("; echo mac_exit=$?")
-        self.assertEqual(separator, "; echo mac_exit=$?")
-        self.assertIn("mac_cleanup=", status_command)
-        remote_words = shlex.split(run_command)
+        remote_words, cleanup = split_mac_run_command(remote)
+        self.assertIn("mac_cleanup=", cleanup)
         self.assertIn(f"({FILTER}) & not (test(slow) | test(gpu))", remote_words)
         self.assertNotIn(FILTER, remote_words)
 

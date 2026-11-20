@@ -20,6 +20,7 @@ from types import MappingProxyType
 from typing import Literal, cast, override
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_hold import build_hold, hold_enforcer, override_guard
 from scripts.build_queue import admission_service, admission_records, placement
@@ -118,7 +119,7 @@ class HoldEnforcerTests(unittest.TestCase):
         paths = claim_state.StatePaths(self.root / 'hana-claims')
         paths.directory.mkdir()
         record: claim_state.RemoteJobClaim = {
-            'claim_id': placement.assigned_claim_id('fixture-episode', 'fixture-attempt'),
+            'claim_id': execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'),
             'episode': 'fixture-episode', 'attempt': 'fixture-attempt',
             'submitting_session': 'other', 'pid': 701, 'proc_start': '11000', 'what': 'Hana check',
             'worktree': str(self.root), 'since': '2026-11-16T12:00:00+00:00', 'remote_host': 'fixture-hana',
@@ -157,9 +158,9 @@ class HoldEnforcerTests(unittest.TestCase):
         claim, = claim_state.read_claims(paths)
         assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
             placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
-            placement.SourceKeyKnown('fixture-source'),
+            execution_identity.SourceKeyKnown('fixture-source'),
             placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
         state.current_assignments[assignment.episode] = key
         for match in (True, False):
@@ -210,9 +211,9 @@ class HoldEnforcerTests(unittest.TestCase):
         claim, = claim_state.read_claims(paths)
         assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
             placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
-            placement.SourceKeyKnown('fixture-source'),
+            execution_identity.SourceKeyKnown('fixture-source'),
             placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
         state.current_assignments[assignment.episode] = key
         state.assignments[key] = admission_records.SavedPlacementAssignment(assignment)
@@ -221,7 +222,7 @@ class HoldEnforcerTests(unittest.TestCase):
             (self.holders / 'holder').unlink()
 
         for module, operation in ((target_config, 'read_execution_transport'),
-                (placement, 'attempt_key'), (placement, 'assigned_claim_id')):
+                (execution_identity, 'attempt_key'), (execution_identity, 'assigned_claim_id')):
             for error_type in (OSError, ValueError):
                 with self.subTest(operation=operation, error=error_type.__name__):
                     self.write_holder()
@@ -292,6 +293,17 @@ class HoldEnforcerTests(unittest.TestCase):
 
     def table(self) -> dict[int, build_hold.AuditProcess]:
         return hold_enforcer.read_processes(self.proc, self.uid, self.root / "cgroup")
+
+    def write_detached_run(self, path: Path, *, command_started: bool) -> None:
+        record: detached_runs.RunRecord = {
+            "run_id": path.stem, "status": "running", "session_dir": str(self.root),
+            "worker": "gate-owner", "staff_id": "", "label": "fixture gate",
+            "command": ["bash", "verify.sh", "check"], "log": str(path.with_suffix(".log")),
+            "started_at": 100.0, "pid": 100, "director_dir": "", "done_message_file": "",
+        }
+        if command_started:
+            record.update(command_group=10, command_started="11000")
+        _ = path.write_text(json.dumps(record))
 
     def decisions(self, enforcer_pid: int = 999) -> tuple[hold_enforcer.BuildDecision, ...]:
         return hold_enforcer.decide_builds(self.table(), build_hold.natedev_holds(self.holders).in_force,
@@ -749,8 +761,7 @@ class HoldEnforcerTests(unittest.TestCase):
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", str(record)))
                 # The command leads its own group; a record without one has not started its command.
-                command = {} if outcome == "no command group" else {"command_group": 10, "command_started": "11000"}
-                _ = record.write_text(json.dumps({"pid": 100, "status": "running", **command}))
+                self.write_detached_run(record, command_started=outcome != "no command group")
                 _ = self.process(10, "bash", parent=100, argv=("bash", "verify.sh", "check"), session="gate-owner")
                 table = self.table()
                 classified = hold_enforcer.classify_drain_runs(table, frozenset(), build_hold.LiveClaims(frozenset()))
@@ -768,9 +779,9 @@ class HoldEnforcerTests(unittest.TestCase):
                         raise OSError("private stop record is full")
                     record_build(build, holder, proc_root, action, stopped_run=stopped_run)
 
-                def save_reason(path: Path, text: str) -> None:
-                    write_text_atomic(path, text)
-                    if path == record and "stop_reason" in text and outcome == "identity change":
+                def stage_reason(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+                    write_text_atomic(path, text, new_file_mode=new_file_mode)
+                    if "stop_reason" in text and outcome == "identity change":
                         _ = self.process(10, "editor", start=12_000)
 
                 def signal_group(pid: int, signum: int) -> None:
@@ -783,7 +794,7 @@ class HoldEnforcerTests(unittest.TestCase):
                     self.assertIn("gate-owner", cycle["recipients"])
 
                 with mock.patch.object(hold_enforcer, "record_build", side_effect=save_stop), \
-                     mock.patch.object(detached_runs, "write_text_atomic", side_effect=save_reason):
+                     mock.patch.object(detached_runs, "write_text_atomic", side_effect=stage_reason):
                     if outcome.startswith("shared"):
                         before = record.read_bytes()
                         rows = self.rows()
@@ -821,6 +832,8 @@ class HoldEnforcerTests(unittest.TestCase):
                         self.assertIsInstance(result, expected)
                 if outcome == "stopped":
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    saved = cast(dict[str, object], json.loads(record.read_text()))
+                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                 else:
                     self.assertEqual(signals, [])
                     self.assertEqual([row for row in self.rows() if row["action"] == "stopped"], [])
@@ -891,15 +904,17 @@ class HoldEnforcerTests(unittest.TestCase):
         assert isinstance(run, hold_enforcer.WaitingRun)
         holder, = build_hold.natedev_holds(self.holders).in_force
         read_supervisor_args = hold_enforcer.supervisor_args
-        for argument, current, prefix in ((str(record), False, ("python3",)), (str(record), True, ("python3",)),
-                                           (record.name, True, ("python3",)),
-                                           (str(record), False, ("python3", "unrelated.py"))):
-            with self.subTest(record_argument=argument, supervisor_current=current, supervisor_prefix=prefix):
+        for argument, current, prefix, changes in ((str(record), False, ("python3",), False),
+                                                   (str(record), True, ("python3",), False),
+                                                   (record.name, True, ("python3",), False),
+                                                   (str(record), False, ("python3", "unrelated.py"), False),
+                                                   (str(record), True, ("python3",), True)):
+            with self.subTest(record_argument=argument, supervisor_current=current, supervisor_prefix=prefix,
+                              group_changes_after_check=changes):
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", argument))
                 table = self.table()
-                _ = record.write_text(json.dumps({"pid": 100, "status": "running",
-                                                  "command_group": 10, "command_started": "11000"}))
+                self.write_detached_run(record, command_started=True)
                 signals: list[tuple[int, int]] = []
                 inspected: list[int] = []
 
@@ -914,18 +929,24 @@ class HoldEnforcerTests(unittest.TestCase):
 
                 def signal_group(pid: int, signum: int) -> None:
                     saved = cast(dict[str, object], json.loads(record.read_text()))
-                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
+                    self.assertNotIn("stop_reason", saved)
                     signals.append((pid, signum))
 
-                result = hold_enforcer.stop_waiting_run(
-                    run, holder, table, self.proc, supervisor_args=supervisor_args,
-                    signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
-                    signal_group=signal_group,
-                )
+                with mock.patch.object(detached_runs, "command_group", wraps=detached_runs.command_group) as read_group:
+                    if changes:
+                        group = detached_runs.CommandGroup(10, "11000")
+                        read_group.side_effect = [group, group, detached_runs.CommandGroup(20, "12000")]
+                    result = hold_enforcer.stop_waiting_run(
+                        run, holder, table, self.proc, supervisor_args=supervisor_args,
+                        signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
+                        signal_group=signal_group,
+                    )
                 self.assertIn(100, inspected)
                 if current:
                     self.assertIsInstance(result, hold_enforcer.StoppedRun)
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    saved = cast(dict[str, object], json.loads(record.read_text()))
+                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                 else:
                     self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
                     self.assertEqual(signals, [])

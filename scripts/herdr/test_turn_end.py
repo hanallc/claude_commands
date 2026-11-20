@@ -5,6 +5,7 @@ from scripts.lib.checkout_test_support import python_tool_source
 
 import json
 import io
+import math
 import os
 import shutil
 import subprocess
@@ -31,7 +32,7 @@ from scripts.message import send
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff, test_worker, worker, worker_admission
-from scripts.production.staff_test_support import fixture_worker
+from scripts.production.staff_test_support import fixture_runtime_id, fixture_session, fixture_worker
 from scripts.whoami import agent_accounts, note_file, quota_alert
 
 
@@ -145,10 +146,15 @@ class TurnEndTests(unittest.TestCase):
                     runs = self.case.run_dir / "detached_runs"
                     runs.mkdir(exist_ok=True)
                     for run_id, owner, owner_id in (("own", name, str(row.id)), ("director", "director", "")):
-                        atomic_file.write_text_atomic(runs / f"{run_id}.json", json.dumps(
-                            {"run_id": run_id, "worker": owner, "staff_id": owner_id, "status": "finished",
-                             "started_at": datetime.now().timestamp()}))
-                        atomic_file.write_text_atomic(runs / f"{run_id}.log", "output")
+                        log = runs / f"{run_id}.log"
+                        record: detached_runs.RunRecord = {
+                            "run_id": run_id, "worker": owner, "staff_id": owner_id, "status": "finished",
+                            "started_at": datetime.now().timestamp(), "pid": 0, "command": ["true"],
+                            "label": "private verification", "log": str(log), "session_dir": str(self.case.run_dir),
+                            "director_dir": str(self.case.run_dir), "done_message_file": "",
+                        }
+                        atomic_file.write_text_atomic(log.with_suffix(".json"), json.dumps(record))
+                        atomic_file.write_text_atomic(log, "output")
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
                 self.assertIsInstance(active, progress_history.ActiveDispatch)
                 assert isinstance(active, progress_history.ActiveDispatch)
@@ -560,7 +566,9 @@ class TurnEndTests(unittest.TestCase):
                 elif reply_state == "done":
                     path, record = self.case.detached_record(row, "private-check")
                     record["delivery"] = f"sent: worker {row.name} at {pane}"
+                    record["delivered_at"] = datetime.now().timestamp()
                     atomic_file.write_text_atomic(path, json.dumps(record))
+                    self.case.agent.complete(pane)
                     self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.DONE)
                     anomaly = "run private-check finished, but its result is not in the transcript"
                     self.assertEqual(self.case.agent.notices[-1].count(anomaly), 1)
@@ -632,7 +640,7 @@ class TurnEndTests(unittest.TestCase):
                         for event in (turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED):
                             self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.WAITING_ON_RUNS)
                             self.assertEqual(len(self.case.agent.notices), notices + 2)
-                        self.case.agent.append(pane, "user", f"Detached run: {record['run_id']}\nRun finished: the final check")
+                    self.case.agent.append(pane, "user", f"Detached run: {record['run_id']}\nRun finished: the final check")
                     record.update(status="finished", delivery=f"sent: worker {row.name} at {pane}")
                     atomic_file.write_text_atomic(path, json.dumps(record))
                     if receipt == "awaiting reply":
@@ -640,7 +648,7 @@ class TurnEndTests(unittest.TestCase):
                             self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.WAITING_ON_REPLY)
                             self.assertEqual(len(self.case.agent.notices), notices + 3)
                             self.assertEqual(turn_path.read_text().strip(), reply)
-                        self.case.agent.complete(pane)
+                    self.case.agent.complete(pane)
                     if receipt == "launcher error":
                         self.assertEqual(self.case.finish(name, turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.DONE)
                         self.assertEqual(worker_panes.worker_pass(row, self.case.run_dir)["status"], "error")
@@ -977,6 +985,39 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(self.case.fixture.world.closed, [(pane, "terminal-" + pane)])
         self.assertEqual(len(self.case.fixture.world.launches), launches)
 
+    def test_selected_live_restart_recovers_before_removing_the_worker(self) -> None:
+        for stop_all in (False, True):
+            with self.subTest(unconfirmed_stop=stop_all):
+                name = "unconfirmed-worker" if stop_all else "live-worker"
+                self.case.agent.finish_after = 1
+                self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                pane = self.case.agent.submitted[-1][0]
+                row = self.case.agent.row(pane)
+                self.assertEqual(progress_history.cancel_worker_passes(self.case.run_dir, row.id), 1)
+                self.case.agent.complete(pane)
+                shutdown_record.save([str(row.id)])
+                launches = len(self.case.fixture.world.launches)
+                notices = len(self.case.agent.notices)
+                live = herdr.LiveConversation("codex", ())
+                with (patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()),
+                      patch.object(herdr, "read_conversation", return_value=live),
+                      patch.object(restart, "stop_row", return_value=False) as stop,
+                      patch.object(restart, "_after_unconfirmed_stop", return_value=live) as observe,
+                      redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                    self.case.agent.notice_failures = 1
+                    self.assertEqual(restart.restart(stop_all=stop_all, only=(str(row.id),)), 0)
+                    self.assertEqual(stop.call_count, int(stop_all))
+                    self.assertEqual(observe.call_count, int(stop_all))
+                    self.assertEqual(shutdown_record.read(), [str(row.id)])
+                    self.assertIn(pane, self.case.fixture.world.locations)
+                    self.assertEqual(len(self.case.agent.notices), notices)
+                    self.assertEqual(restart.restart(only=(str(row.id),)), 0)
+                self.assertEqual(shutdown_record.read(), [])
+                self.assertNotIn(pane, self.case.fixture.world.locations)
+                self.assertEqual(len(self.case.fixture.world.launches), launches)
+                self.assertEqual(len(self.case.agent.notices), notices + 1)
+                self.assertIn("late DONE", self.case.agent.notices[-1])
+
     def test_restart_recovers_completion_at_each_durable_boundary(self) -> None:
         for boundary in ("before the first record", "after the reply file", "after pane close"):
             with self.subTest(boundary=boundary):
@@ -1138,6 +1179,413 @@ class TurnEndTests(unittest.TestCase):
                     self.assertNotEqual(worker_panes.worker_pass(row, run)["instance_id"], instance)
                 else:
                     self.assertNotIn(pane, self.case.fixture.world.locations)
+
+    def test_detached_result_keeps_an_ended_pass_until_a_later_matching_done(self) -> None:
+        self.case.agent.finish_after = 1
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        run = self.case.run_dir
+        instance = str(worker_panes.worker_pass(row, run)["instance_id"])
+        self.assertEqual(progress_history.cancel_worker_passes(run, row.id), 1)
+        self.case.agent.complete(pane)
+        earlier_done = self.case.agent.replies[-1]
+        self.case.agent.append(pane, "assistant", "A later unrelated reply.")
+        self.assertEqual(self.case.receipt(), worker.DispatchComplete(earlier_done))
+        path, record = self.case.detached_record(row, "after-done")
+        record["delivery"] = f"sent: worker {row.name} at {pane}"
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.case.agent.append(pane, "user", "Detached run: after-done\nRun finished: private verification")
+        parent = self.case.fixture.parent.id
+        name = staff.WorkerName.parse(row.name)
+        submissions = self.case.agent.submitted.copy()
+        notices = list(self.case.agent.notices)
+        self.case.prompt = run / "next-assignment.md"
+        worker.save_reply(self.case.prompt, "Read the next assignment.")
+        shutdown_record.save([str(row.id)])
+        for reply in ("", "The run passed."):
+            with self.subTest(reply=reply), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                if reply:
+                    self.case.agent.append(pane, "assistant", reply)
+                receipt = self.case.receipt()
+                assert isinstance(receipt, worker.DispatchWaitingForRuns)
+                self.assertFalse(receipt.has_live_run)
+                assert isinstance(receipt.reply, worker.DispatchAwaitingReply)
+                self.assertEqual(receipt.reply.matching_done, worker.DispatchComplete(earlier_done))
+                event = turn_end.WorkerEvent(str(row.current_session), reply=reply) if reply else turn_end.WorkerEvent(
+                    str(row.current_session), turn_end.EventKind.RUN_FINISHED)
+                self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.WAITING_ON_REPLY)
+                self.assertIs(worker.restore(parent, only=frozenset({row.id})), worker.ExitCode.UNCERTAIN)
+                self.assertIs(self.case.dispatch(), worker.ExitCode.BUSY)
+                self.assertEqual(worker_panes.close(parent, name),
+                                 worker_panes.Kept("a detached run result awaits a matching DONE"))
+                with (patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()),
+                      patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("codex", ()))):
+                    self.assertEqual(restart.restart(only=(str(row.id),)), 0)
+                self.assertEqual(shutdown_record.read(), [str(row.id)])
+                self.assertEqual(worker_panes.worker_pass(row, run)["instance_id"], instance)
+                self.assertIn(pane, self.case.fixture.world.locations)
+                self.assertEqual(self.case.agent.submitted, submissions)
+                self.assertEqual(self.case.agent.notices, notices)
+        final = f"The run passed.\nDONE {instance}"
+        self.case.agent.append(pane, "assistant", final)
+        event = turn_end.WorkerEvent(str(row.current_session), reply=final)
+        self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.LATE_DONE)
+        self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.IGNORED)
+        self.assertEqual(len(self.case.agent.notices), len(notices) + 1)
+        late = self.case.reply.with_name(f"{self.case.reply.stem}_late_{instance}{self.case.reply.suffix}")
+        self.assertEqual(late.read_text(), final + "\n")
+        self.assertNotIn(pane, self.case.fixture.world.locations)
+        self.assertEqual(shutdown_record.read(), [])
+
+    def test_later_done_replaces_the_saved_reply_after_the_notice_was_sent(self) -> None:
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        with patch.object(self.case.fixture.world, "close_terminal_pane", return_value=False):
+            self.assertEqual(self.case.finish(), turn_end.TurnOutcome.DONE)
+        self.assertIn(pane, self.case.fixture.world.locations)
+        previous = self.case.reply.read_text()
+        instance = str(worker_panes.worker_pass(row, self.case.run_dir)["instance_id"])
+        path, record = self.case.detached_record(row, "after-notice")
+        record["delivery"] = f"sent: worker {row.name} at {pane}"
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.case.agent.append(pane, "user", "Detached run: after-notice\nRun finished: private verification")
+        self.assertEqual(self.case.finish(kind=turn_end.EventKind.RUN_FINISHED), turn_end.TurnOutcome.WAITING_ON_REPLY)
+        self.assertEqual(self.case.reply.read_text(), previous)
+        self.assertIn(pane, self.case.fixture.world.locations)
+        self.case.agent.append(pane, "assistant", f"The additional verification passed.\nDONE {instance}")
+        self.assertEqual(self.case.finish(), turn_end.TurnOutcome.DONE)
+        self.assertEqual(self.case.reply.read_text(), f"The additional verification passed.\nDONE {instance}\n")
+        self.assertNotIn(pane, self.case.fixture.world.locations)
+        self.assertEqual(sum(": done; reply " in message for message in self.case.agent.notices), 1)
+
+    def test_later_done_updates_an_action_error_without_repeating_its_notice(self) -> None:
+        status = self.case.run_dir / "fix.status"
+        original = self.case.agent.run_process
+
+        def fail_landed(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if len(command) > 2 and command[1].endswith("/findings.py") and command[2] == "landed":
+                return subprocess.CompletedProcess(command, 2, "", "ledger write failed")
+            return original(command, **options)
+
+        self.case.agent.run_process = fail_landed
+        self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse("fix"), "fix",
+            self.case.prompt, session_dir=self.case.run_dir, slot="fix", phase="8", kind="fix",
+            launcher_command=["fix"], reply=self.case.reply, fix_cause="Repair the failed gate",
+            completion_actions=progress_history.CompletionActions(status_file=str(status), resolve_fix=True)),
+            worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        with patch.object(self.case.fixture.world, "close_terminal_pane", return_value=False):
+            self.assertEqual(self.case.finish("fix"), turn_end.TurnOutcome.ERROR)
+        before = worker_panes.worker_pass(row, self.case.run_dir)
+        completion = progress_history.hook_completion(before)
+        assert isinstance(completion, progress_history.HookCompletion)
+        saved = self.case.reply.read_text()
+        self.case.agent.append(pane, "user", "Detached run: additional-check\nRun finished: additional check")
+        final = f"The additional check passed.\nDONE {before['instance_id']}"
+        self.case.agent.append(pane, "assistant", final)
+
+        self.assertEqual(self.case.finish("fix"), turn_end.TurnOutcome.ERROR)
+
+        self.assertNotEqual(saved, final + "\n")
+        self.assertEqual(self.case.reply.read_text(), final + "\n")
+        after = worker_panes.worker_pass(row, self.case.run_dir)
+        recovered = progress_history.hook_completion(after)
+        assert isinstance(recovered, progress_history.HookCompletion)
+        self.assertEqual((after["status"], after["hook_notice"]), ("error", before["hook_notice"]))
+        self.assertEqual((recovered.outcome, recovered.details), (completion.outcome, completion.details))
+        self.assertEqual(status.read_text(), "error\n")
+        self.assertEqual(sum(": error; reply " in message for message in self.case.agent.notices), 1)
+
+    def test_run_completion_replays_for_the_current_session_after_a_worker_moves(self) -> None:
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        path, record = self.case.detached_record(row, "session-change")
+        record.update(delivery="sent: holder received the result", completion_pending=True)
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        new_session = staff.native_id(fixture_runtime_id("run-result-after-session-change"))
+        backend = staff.backend(row)
+        assert isinstance(backend, (staff.CodexBackend, staff.ClaudeBackend))
+        fixture_session(new_session, backend)
+        old_transcript = worker_admission.transcript_source(row, backend).read_text()
+        lock = worker_panes.worker_lock
+
+        @contextmanager
+        def move_during_lock(parent: staff.StaffId, name: staff.WorkerName, *, blocking: bool
+                             ) -> Generator[worker_panes.WorkerLockHold | worker_panes.Kept]:
+            with lock(parent, name, blocking=blocking) as hold:
+                moved = staff.update_current_session(row.current_session, new_session)
+                source = worker_admission.transcript_source(moved, backend)
+                atomic_file.write_text_atomic(source, old_transcript)
+                yield hold
+
+        with patch.object(worker_panes, "worker_lock", side_effect=move_during_lock):
+            self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
+        pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertTrue(pending.get("completion_pending"))
+        self.assertFalse(self.case.reply.exists())
+
+        family = "codex" if isinstance(backend, staff.CodexBackend) else "claude"
+        self.case.fixture.world.activate(str(new_session), pane, family)
+        self.case.agent.complete(pane)
+        self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
+        self.assertEqual(self.case.reply.read_text(), self.case.agent.replies[-1] + "\n")
+        self.assertNotIn(pane, self.case.fixture.world.locations)
+        self.assertEqual(sum(": done; reply " in message for message in self.case.agent.notices), 1)
+
+    def test_a_detached_result_reaches_the_idle_worker_in_both_completion_orders(self) -> None:
+        source = Path(__file__).resolve().parents[2] / "config"
+        config = self.case.fixture.root / "conf"
+        for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
+            _ = shutil.copyfile(source / name, config / name)
+        cases = ((True, False, False), (False, False, False), (True, True, False), (True, True, True))
+        for finishes_during_turn, self_stop, transcript_unavailable in cases:
+            with self.subTest(finishes_during_turn=finishes_during_turn, self_stop=self_stop,
+                              transcript_unavailable=transcript_unavailable):
+                name = f"impl-result-{int(finishes_during_turn)}-{int(self_stop)}-{int(transcript_unavailable)}"
+                self.case.reply = self.case.run_dir / f"{name}.md"
+                self.case.agent.finish_after = 1
+                self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), "impl",
+                    self.case.prompt, session_dir=self.case.run_dir, slot=name, phase="8", kind="impl",
+                    launcher_command=["assign.sh"], reply=self.case.reply), worker.DispatchSubmission.SUBMITTED)
+                pane = self.case.agent.submitted[-1][0]
+                row = self.case.agent.row(pane)
+                path, record = self.case.detached_record(row, name)
+                record["status"] = "running"
+                if self_stop:
+                    record.update(stop_reason="The newer check replaces this run.",
+                                  stop_pass_requested=True, self_stop=True)
+                log = "The private check began." if self_stop else "The private check passed."
+                atomic_file.write_text_atomic(path, json.dumps(record))
+                atomic_file.write_text_atomic(Path(record["log"]), log + "\n")
+                submitted: list[str] = []
+                notices = len(self.case.agent.notices)
+                run = self.case.fixture.world.run
+
+                def submit(*arguments: str, deadline: float = math.inf) -> str:
+                    if arguments[:3] == ("agent", "prompt", pane):
+                        self.assertTrue(herdr.AgentStatus(
+                            self.case.fixture.world.locations[pane]["agent_status"]).idle)
+                        submitted.append(arguments[3])
+                        self.case.agent.append(pane, "user", arguments[3])
+                        self.case.fixture.world.locations[pane]["agent_status"] = "working"
+                        return "{}"
+                    return run(*arguments, deadline=deadline)
+
+                def deliver(result_path: Path) -> int:
+                    return detached_runs.main(["deliver", str(result_path)])
+
+                def finish_turn() -> turn_end.TurnOutcome:
+                    self.case.agent.without_done = True
+                    self.case.agent.complete(pane)
+                    self.case.agent.without_done = False
+                    if finishes_during_turn:
+                        self.case.fixture.world.locations[pane]["agent_status"] = "working"
+                    return self.case.finish(name)
+
+                def wait_for_idle(target: str, _timeout: int) -> herdr.ObservedAgentState:
+                    self.assertEqual(target, pane)
+                    self.assertEqual(submitted, [])
+                    self.case.fixture.world.locations[pane]["agent_status"] = "idle"
+                    return herdr.ObservedAgentState(herdr.AgentStatus.IDLE)
+
+                with (patch.object(self.case.fixture.world, "run", side_effect=submit),
+                      patch.object(self.case.fixture.world, "wait_turn_end", side_effect=wait_for_idle),
+                      patch.object(detached_runs, "_stopped_group_has_ended", return_value=True),
+                      patch.object(detached_runs, "_run", return_value=143 if self_stop else 0),
+                      patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver)):
+                    if not finishes_during_turn:
+                        with patch.object(detached_runs, "live_runs", return_value=[record]):
+                            self.assertEqual(finish_turn(), turn_end.TurnOutcome.WAITING_ON_RUNS)
+                    if transcript_unavailable:
+                        with patch.object(detached_runs, "_result_received", side_effect=OSError("fixture read failure")):
+                            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertEqual(saved.get("delivery"),
+                                         "deferred: worker transcript is unavailable: fixture read failure")
+                        self.assertNotIn("delivered_at", saved)
+                        self.assertEqual(len(self.case.agent.notices), notices)
+                        with patch.object(worker_panes, "observe", return_value=(worker_panes.ClosedWorker(row),)):
+                            self.assertEqual(self.case.finish(name, turn_end.EventKind.RUN_FINISHED),
+                                             turn_end.TurnOutcome.RETRY_EVIDENCE)
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertEqual(saved.get("delivery"), "deferred: worker pane is closed")
+                        self.assertNotIn("delivered_at", saved)
+                        self.assertEqual(len(self.case.agent.notices), notices)
+                    else:
+                        self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                    if finishes_during_turn:
+                        saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                        self.assertTrue(saved.get("completion_pending"))
+                        self.assertEqual(submitted, [])
+                        self.assertEqual(finish_turn(), turn_end.TurnOutcome.SUBMITTED)
+                    result, = submitted
+                    self.assertIn(f"Detached run: {name}", result)
+                    self.assertIn(log, result)
+                    if self_stop:
+                        self.assertIn("Result: STOPPED (exit 143)", result)
+                        self.assertIsInstance(progress_history.active_dispatch(row.id, self.case.run_dir),
+                                              progress_history.ActiveDispatch)
+                        self.assertIn(pane, self.case.fixture.world.locations)
+                        self.assertEqual(len(self.case.agent.notices), notices)
+                    saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                    self.assertEqual(saved.get("delivery"), f"sent: worker {name} at {pane}")
+                    self.assertTrue(saved.get("completion_pending"))
+                    self.case.agent.complete(pane)
+                    self.assertEqual(self.case.finish(name), turn_end.TurnOutcome.DONE)
+                    self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
+                    self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
+                self.assertEqual(self.case.reply.read_text(), self.case.agent.replies[-1] + "\n")
+                self.assertNotIn(pane, self.case.fixture.world.locations)
+                self.assertFalse(any("waiting on run reply" in text for text in self.case.agent.notices[notices:]))
+
+    def test_a_delivery_after_done_waits_when_the_transcript_has_no_result_yet(self) -> None:
+        for event in (turn_end.EventKind.TURN_END, turn_end.EventKind.RUN_FINISHED):
+            for stamped in (False, True):
+                with self.subTest(event=event, stamped=stamped):
+                    name = f"impl-{event.name.lower().replace('_', '-')}-{int(stamped)}"
+                    self.case.reply = self.case.run_dir / f"{name}-reply.md"
+                    self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
+                    pane = self.case.agent.submitted[-1][0]
+                    row = self.case.agent.row(pane)
+                    path, record = self.case.detached_record(row, name)
+                    record["delivery"] = f"sent: worker {row.name} at {pane}"
+                    if stamped:
+                        record["delivered_at"] = float(record["started_at"])
+                    atomic_file.write_text_atomic(path, json.dumps(record))
+                    receipt = self.case.receipt(name)
+                    self.assertIsInstance(receipt, worker.DispatchWaitingForRuns)
+                    assert isinstance(receipt, worker.DispatchWaitingForRuns)
+                    self.assertIsInstance(receipt.reply, worker.DispatchAwaitingReply)
+                    self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.WAITING_ON_REPLY)
+                    self.assertFalse(self.case.reply.exists())
+                    self.assertIsInstance(worker_panes.close(self.case.fixture.parent.id, staff.WorkerName.parse(name)),
+                                          worker_panes.Kept)
+                    self.case.agent.append(pane, "user", f"Detached run: {name}\nRun finished: private verification")
+                    self.case.agent.complete(pane)
+                    self.assertEqual(self.case.finish(name, event), turn_end.TurnOutcome.DONE)
+                    self.assertEqual(self.case.reply.read_text(), self.case.agent.replies[-1] + "\n")
+                    self.assertNotIn(pane, self.case.fixture.world.locations)
+
+    def test_supervisor_sends_the_notice_after_the_command_changes_completion_sources(self) -> None:
+        status = self.case.run_dir / "completion.status"
+        self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse("impl"), "impl",
+            self.case.prompt, session_dir=self.case.run_dir, slot="impl", phase="8", kind="impl",
+            launcher_command=["assign.sh"], reply=self.case.reply,
+            completion_actions=progress_history.CompletionActions(status_file=str(status))),
+            worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        path, record = self.case.detached_record(row, "changes-completion")
+        private_sources = self.case.fixture.root / "scripts"
+        module = private_sources / "direct/assign.py"
+        module.parent.mkdir(parents=True)
+        imported = self.case.fixture.root / "loaded-deferred-source"
+        deferred = module.with_name("detached_completion_fixture.py")
+        atomic_file.write_text_atomic(deferred, "from pathlib import Path\n"
+            + f"_ = Path({str(imported)!r}).write_text('original source')\n")
+        hook = '    """Run the saved completion actions after the hook proves DONE."""\n'
+        source = Path(str(assign.__file__)).read_text()
+        self.assertIn(hook, source)
+        atomic_file.write_text_atomic(module, source.replace(hook,
+            hook + "    from scripts.direct import detached_completion_fixture\n"
+                   + "    assert detached_completion_fixture.__file__\n", 1))
+        replacement = 'raise ImportError("the command replaced this dependency")\n'
+        record["command"] = [sys.executable, "-c", "from pathlib import Path; "
+            + f"Path({str(module)!r}).write_text({replacement!r}); "
+            + f"Path({str(deferred)!r}).write_text({replacement!r})"]
+        record["status"] = "running"
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        completion_sources = detached_runs.CompletionSources
+
+        def load_fixture_sources(_root: Path) -> detached_runs.CompletionSources:
+            return completion_sources(private_sources)
+
+        def deliver_fixture(record_path: Path) -> int:
+            self.assertEqual(record_path, path)
+            self.assertEqual(module.read_text(), replacement)
+            self.assertEqual(deferred.read_text(), replacement)
+            self.assertFalse(imported.exists())
+            self.case.agent.append(pane, "user", "Detached run: changes-completion\nRun finished: private verification")
+            self.case.agent.complete(pane)
+            return 0
+
+        package = sys.modules["scripts.direct"]
+        with (patch.dict(sys.modules), patch.object(package, "assign"),
+              patch.object(package, "detached_completion_fixture", create=True),
+              patch.object(detached_runs, "CompletionSources", side_effect=load_fixture_sources),
+              patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver_fixture)):
+            delattr(package, "assign")
+            delattr(package, "detached_completion_fixture")
+            _ = sys.modules.pop("scripts.direct.assign")
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        self.assertEqual(imported.read_text(), "original source")
+        self.assertEqual(status.read_text(), "done\n")
+        self.assertEqual(self.case.reply.read_text(), self.case.agent.replies[-1] + "\n")
+        self.assertEqual(sum(": done; reply " in message for message in self.case.agent.notices), 1)
+        self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
+        self.assertNotIn(pane, self.case.fixture.world.locations)
+
+    def test_reap_retries_completion_after_the_transcript_becomes_readable(self) -> None:
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        path, record = self.case.detached_record(row, "unreadable-transcript")
+        record["delivery"] = f"sent: worker {row.name} at {pane}"
+        self.case.agent.append(pane, "user", "Detached run: unreadable-transcript\nRun finished: private verification")
+        self.case.agent.complete(pane)
+        record.update(status="running", command=["true"])
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        with (patch.object(worker_admission, "transcript_source", side_effect=OSError("transcript is unreadable")),
+              patch.object(detached_runs, "deliver_in_fresh_process", return_value=0)):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), True)
+        self.assertFalse(self.case.reply.exists())
+        self.assertEqual(self.case.agent.notices, [])
+        self.assertIn(pane, self.case.fixture.world.locations)
+        self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
+        self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
+        self.assertEqual(self.case.reply.read_text(), self.case.agent.replies[-1] + "\n")
+        self.assertEqual(sum(": done; reply " in message for message in self.case.agent.notices), 1)
+        self.assertNotIn(pane, self.case.fixture.world.locations)
+        self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
+        self.assertEqual(len(self.case.agent.notices), 1)
+
+    def test_a_torn_final_reply_keeps_run_completion_pending_after_receipt_recovery(self) -> None:
+        config = self.case.fixture.root / "conf"
+        source = Path(__file__).resolve().parents[2] / "config"
+        for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
+            _ = shutil.copyfile(source / name, config / name)
+        self.case.agent.finish_after = 1
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        path, record = self.case.detached_record(row, "torn-final-reply")
+        record.update(delivery="unconfirmed: the worker transcript has no result receipt", completion_pending=True)
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.case.agent.append(pane, "user", "Detached run: torn-final-reply\nRun finished: private verification")
+        backend = staff.backend(row)
+        assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+        transcript = worker_admission.transcript_source(row, backend)
+        accepted = transcript.read_text()
+        atomic_file.write_text_atomic(transcript, accepted + '{"type":')
+        self.assertIs(turn_end.run_finished(row.id), detached_runs.CompletionReplay.RETRY)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved.get("delivery"), "already delivered: torn-final-reply")
+        self.assertIs(saved.get("completion_pending"), True)
+        self.assertFalse(self.case.reply.exists())
+        self.assertEqual(self.case.agent.notices, [])
+
+        atomic_file.write_text_atomic(transcript, accepted)
+        self.case.agent.complete(pane)
+        self.assertEqual(detached_runs.reap_orphans(str(self.case.run_dir)), [])
+        self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
+        self.assertEqual(self.case.reply.read_text(), self.case.agent.replies[-1] + "\n")
+        self.assertNotIn(pane, self.case.fixture.world.locations)
+        self.assertEqual(len(self.case.agent.notices), 1)
 
     def test_restore_reports_pending_close_and_retries_without_resending_done(self) -> None:
         self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
@@ -1539,7 +1987,7 @@ class TurnEndTests(unittest.TestCase):
             progress_history.complete_dispatch(self.case.run_dir, current.row.name, instance, status="error")
             progress_history.save_hook_completion(self.case.run_dir, instance,
                 progress_history.HookCompletion("error", str(missing), ("error reply write failed",)))
-            turn_end.run_finished(str(current.row.current_session))
+            self.assertIs(turn_end.run_finished(current.row.id), detached_runs.CompletionReplay.HANDLED)
             self.assertEqual(worker_panes.worker_pass(current.row, self.case.run_dir)["status"], "error")
             self.assertEqual(len(self.case.agent.notices), 2)
             self.assertIn("error reply write failed", self.case.agent.notices[-1])

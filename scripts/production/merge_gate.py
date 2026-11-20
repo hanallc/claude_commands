@@ -36,7 +36,7 @@ except FileNotFoundError:
 
 import argparse
 from collections import deque
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
@@ -76,7 +76,6 @@ from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
 from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
-from scripts.build_targets import build_targets  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
@@ -101,10 +100,9 @@ UNRECORDED_MODULE_RESERVATION_MIB = 640
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
 RERUN_LIMIT = 8
 RELEASE_LOCK_WAIT_S = 60
-# basedpyright resolves bpy (Blender's interpreter only) and PIL (a PEP 723 dependency) from this
-# type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
-# later dates report new diagnostics in bake_textures.py.
-TYPECHECK_REQUIREMENTS = ("pillow==13.0.0", "fake-bpy-module==20260822")
+# basedpyright resolves bpy with these Blender stubs.
+# Later versions report diagnostics in bake_textures.py.
+TYPECHECK_REQUIREMENTS = ("fake-bpy-module==20260822",)
 NIGHTLY_TYPE_DIRS = ("scripts",)
 NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
@@ -499,7 +497,10 @@ class BuildHoldWait:
         try:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
-            held = build_targets.caller_waits_on_hold(holds, directory)
+            # Load the hold check here to avoid the GPU routing import cycle.
+            caller_waits_on_hold = cast(Callable[[build_hold.NatedevHolds, Path], bool], getattr(
+                import_module("scripts.build_targets.build_targets"), "caller_waits_on_hold"))
+            held = caller_waits_on_hold(holds, directory)
         except (OSError, ValueError) as error:
             raise GateRefused(f"natedev hold state cannot be read: {error}") from error
         if held and not self.waiting:
@@ -749,7 +750,9 @@ class GateRecovery:
                 try:
                     if descriptor >= 0:
                         status = os.fstat(descriptor)
-                        if (status.st_dev, status.st_ino) == (token.device, token.inode):
+                        # The jobserver device reclaims tokens from a dead owner.
+                        if (stat.S_ISFIFO(status.st_mode)
+                                and (status.st_dev, status.st_ino) == (token.device, token.inode)):
                             _ = os.write(descriptor, bytes.fromhex(token.value))
                     _ = self.tokens.pop()
                     self.save()
@@ -1072,7 +1075,7 @@ def stop_at_time_limit(running: Sequence[RunningGateJob], failed: Sequence[GateJ
 
 
 def one_minute_load() -> float:
-    return float(Path("/proc/loadavg").read_text().split()[0])
+    return os.getloadavg()[0]
 
 
 def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
@@ -1448,7 +1451,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     runner = module_runner(repo)
     tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
-        raise GateRefused(f"the test runner requires writable tmpfs at {tmpfs}")
+        raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     # Remove the free test folders that a run ended by a signal left; a held folder costs one lock try.
     build_folders.sweep_temporary_build_folders(gate_test_parent(tmpfs), wait=False)
     hold = BuildHoldWait() if shared else None
@@ -2766,7 +2769,7 @@ def _sweep_nightly_slots() -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
-        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}")
+        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}", allow_abbrev=False)
         if arguments[0] == "nightly-assigned":
             _ = nightly_parser.add_argument("--unit", required=True)
             _ = nightly_parser.add_argument("--result", default="")
@@ -2779,7 +2782,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
             print(f"REFUSED: {error}", file=sys.stderr, flush=True)
             return 1
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")

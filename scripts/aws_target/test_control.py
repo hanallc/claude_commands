@@ -31,7 +31,7 @@ from scripts.review_links import console_theme, review_link
 def table_texts(tables: spot_table.SpotTables) -> tuple[str, ...]:
     """Every snapshot line, then every title, header and cell of the tables, for text checks."""
     every = (*tables.prices, *tables.quotas, *(table for costs in tables.runs
-             for table in (*costs.tables, *costs.prices, costs.refused, costs.launched)), tables.hours)
+             for table in (*costs.tables, costs.gate_prices, costs.refused, costs.launched)), tables.hours)
     return (*(text for _region, text in tables.snapshot_rows),
             *(text for table in every for text in (table.title, *table.headers, *(cell for row in table.rows for cell in row))))
 
@@ -135,6 +135,11 @@ gate_wait_usd_per_minute=0
 
     def snapshot(self) -> int:
         return aws_target.snapshot(self.settings, self.state, execute=self.execute, clock=self.clock, notify=self.notify)
+
+    def deploy_gate_zones(self) -> None:
+        _ = (self.state / 'gate-deployment.json').write_text(json.dumps({'regions': [
+            {'region': region, 'subnets': [{'id': 'subnet-' + region, 'zone': region + 'a'}]} for region in self.regions
+        ]}))
 
     def test_snapshot_writes_prices_and_quotas_with_one_atomic_write_and_limits_repeats(self) -> None:
         self.assertFalse((self.state / 'gate-deployment.json').exists())
@@ -340,6 +345,7 @@ gate_wait_usd_per_minute=0
 
     def test_table_ranks_cost_per_run_with_region_times_and_marks_other_region_times(self) -> None:
         self.assertEqual(self.snapshot(), 0)
+        self.deploy_gate_zones()
         fast, slow = self.standard
         home, other = self.regions
         events: list[dict[str, object]] = []
@@ -353,14 +359,15 @@ gate_wait_usd_per_minute=0
         merge_gates = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).runs[0]
         tables = {table.title: table for table in merge_gates.tables}
 
-        # The fixture lowest zone price is 0.25 USD/h, so 6 minutes cost 0.0250 and 12 minutes 0.0500.
+        # At 0.25 USD/h, 6 minutes cost 0.0250 USD and 12 minutes cost 0.0500 USD.
+        # The other region adds the configured transfer charge of 0.00015 USD before rounding.
         # One refused request came before one launch of the fast type at home; the other region has no requests.
         # No bill covers the runs yet; the other region has no runs of its own.
         self.assertEqual(tables[fast].rows, (
             (home, '0.2500', '6.0', '1', '0.0250', 'bill due', '1 bill due', '0'),
-            (other, '0.2500', '6.0', '1 elsewhere', '0.0250', 'no runs', 'no runs', '0')))
+            (other, '0.2500', '6.0', '1 elsewhere', '0.0252', 'no runs', 'no runs', '0')))
         self.assertEqual([row[:5] for row in tables[slow].rows], [(home, '0.2500', '12.0', '1', '0.0500'),
-                                                                 (other, '0.2500', '12.0', '1 elsewhere', '0.0500')])
+                                                                 (other, '0.2500', '12.0', '1 elsewhere', '0.0502')])
         for size in self.compare:
             self.assertEqual([row[2:] for row in tables[size].rows], [('—', '0', '—', 'no runs', 'no runs', '0')]
                              * len(self.regions))
@@ -401,6 +408,7 @@ gate_wait_usd_per_minute=0
 
     def test_each_scope_counts_only_its_run_kinds(self) -> None:
         self.assertEqual(self.snapshot(), 0)
+        self.deploy_gate_zones()
         size = self.standard[0]
         home = self.regions[0]
         events: list[dict[str, object]] = []
@@ -429,12 +437,10 @@ gate_wait_usd_per_minute=0
                 self.assertEqual(table.rows[0][2:5], (*run_time, usd))
                 self.assertEqual(f'{evidence.expected_usd(Decimal("0.25"), size, home, costs.scope.modes, Decimal(0), Decimal(0), unmeasured_extra_s=Decimal(0)):.4f}', usd)
                 self.assertEqual(costs.summary_of(costs.cheapest), f'Cheapest {costs.scope.noun}: {size} in {home}, {usd} USD (estimate)')
-                # The Cost per gate view shows the same estimate; a GPU type without runs has none.
-                standard, gpu = costs.prices
-                self.assertEqual((standard.title, standard.headers[1]), (f'Standard cost per {costs.scope.noun} (USD; estimate)', size))
+                # The Gate columns show the same estimate for Standard types.
+                standard = costs.gate_prices
+                self.assertEqual(standard.headers, ('region', *self.standard, *self.compare))
                 self.assertEqual((standard.rows[0][1], f'{standard.values[0][1]:.4f}'), (usd, usd))
-                self.assertEqual({cell for row in gpu.rows for cell in row[1:]}, {spot_table.NOT_SOLD})
-                self.assertEqual({value for row in gpu.values for value in row}, {None})
 
     def test_a_type_without_runs_borrows_the_times_of_its_vcpu_count(self) -> None:
         home = self.regions[0]
@@ -482,13 +488,15 @@ gate_wait_usd_per_minute=0
         prices = data['prices'][0]
         self.assertEqual([row[0] for row in prices['rows']], list(self.regions))
         self.assertEqual(prices['values'], [[None, *(0.25 for _ in prices['headers'][1:])] for _ in self.regions])
-        # The run tables leave out the Spot price and the estimate, which the Cost per gate view shows.
+        for table in (*data['prices'], *data['quotas']):
+            self.assertNotIn('title', table)
+        # The Spot and Gate columns in Prices and quotas show these values.
         run_headers = data['runs'][0]['tables'][0]['headers']
         self.assertNotIn(spot_table.SPOT_HEADER, run_headers)
         self.assertNotIn(spot_table.ESTIMATE_HEADER, run_headers)
         self.assertEqual(data['runs'][0]['tables'][0]['right'], list(range(1, len(run_headers))))
-        self.assertEqual([table['title'] for table in data['runs'][0]['prices']],
-                         ['Standard cost per merge gate (USD; estimate)', 'GPU cost per merge gate (USD; estimate)'])
+        for entry in data['runs']:
+            self.assertEqual([table['headers'] for table in entry['prices']], [['region', *self.standard, *self.compare]])
         self.assertEqual([table['not_sold'] for table in data['prices']], [[], []])
         self.assertEqual([table['region_axis'] for table in (*data['prices'], *data['quotas'])], ['rows'] * 4)
         self.assertEqual(data['regions'], sorted(self.regions, key=aws_page.region_filter_key))
@@ -539,18 +547,21 @@ gate_wait_usd_per_minute=0
         folder = self.root / 'page'
         cell = 'a</script><b>'
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        prices = (replace(tables.prices[0], title=cell), *tables.prices[1:])
+        standard, *other_prices = tables.prices
+        first, *other_rows = standard.rows
+        prices = (replace(standard, rows=((first[0], cell, *first[2:]), *other_rows)), *other_prices)
         with mock.patch.object(spot_table, 'spot_tables', return_value=replace(tables, prices=prices)):
             source = aws_page.publish(self.state, int(self.clock.now), folder).read_text()
         payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
-        self.assertEqual(cast(aws_page.PageData, json.loads(payload))['prices'][0]['title'], cell)
+        self.assertEqual(cast(aws_page.PageData, json.loads(payload))['prices'][0]['rows'][0][1], cell)
 
     def test_paid_cells_name_why_no_bill_counts_and_the_cheapest_is_a_placement_type(self) -> None:
         self.assertEqual(self.snapshot(), 0)
+        self.deploy_gate_zones()
         size, = self.compare
         home = self.regions[0]
         events: list[dict[str, object]] = []
-        # A short targeted run of a type that placement never picks: the cheapest estimate, but not a candidate.
+        # The ledger contains a short targeted run of a type outside the deployment.
         for attempt, kind, mode, box_s in (('a', self.standard[0], 'merge-gate', 360), ('b', size, 'targeted-test', 60)):
             row: dict[str, object] = {'attempt': attempt, 'instance_type': kind, 'mode': mode, 'region': home}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
@@ -609,7 +620,7 @@ gate_wait_usd_per_minute=0
             self.assertEqual(aws_target.main(), 1)
         read.assert_called_once_with(self.settings, self.state)
 
-    def test_scaler_policy_allows_snapshot_reads_in_all_regions(self) -> None:
+    def test_scaler_policy_allows_spot_reads_in_all_regions(self) -> None:
         document = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))
         resources = ledger.mapping(document['Resources'])
         policy = ledger.mapping(ledger.mapping(resources['GateGpuTrialScalerPolicy'])['Properties'])
@@ -618,9 +629,24 @@ gate_wait_usd_per_minute=0
         # Derive IAM actions from every API request in the snapshot path.
         actions = {arguments[5].replace('-', '') + ':' + ''.join(
             word.capitalize() for word in arguments[6].split('-')) for arguments in self.calls}
-        for action in actions:
-            self.assertTrue(any(action in cast(list[str], row['Action']) and row['Resource'] == '*'
-                                and row['Effect'] == 'Allow' and 'Condition' not in row for row in statements))
+        for action in sorted(actions | {'ec2:GetSpotPlacementScores'}):
+            with self.subTest(action=action):
+                self.assertTrue(any(action in cast(list[str], row['Action']) and row['Resource'] == '*'
+                                    and row['Effect'] == 'Allow' and 'Condition' not in row for row in statements))
+
+    def test_scaler_policy_reads_quota_request_history_for_only_the_spot_quotas(self) -> None:
+        document = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))
+        resources = ledger.mapping(document['Resources'])
+        policy = ledger.mapping(ledger.mapping(resources['GateGpuTrialScalerPolicy'])['Properties'])
+        statements = [row for row in ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement')
+                      if 'servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota' in cast(list[str], row['Action'])]
+        self.assertEqual(len(statements), 1)
+        statement, = statements
+        self.assertEqual((statement['Effect'], statement['Action']),
+                         ('Allow', ['servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota']))
+        codes = sorted({code for _regions, code, _desired, _label in deploy.quota_targets('us-east-2')})
+        self.assertEqual(statement['Resource'], [
+            {'Fn::Sub': 'arn:${AWS::Partition}:servicequotas:*:${AWS::AccountId}:ec2/' + code} for code in codes])
 
     def test_initial_failure_saves_each_error_and_the_table_names_its_time(self) -> None:
         self.failure = 'describe-spot-price-history'

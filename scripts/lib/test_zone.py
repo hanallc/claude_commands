@@ -7,6 +7,7 @@ import io
 import json
 import os
 import platform
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import live_settings, zone, user_zone
+from scripts.lib import live_settings, main_publish, zone, user_zone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("zone.py")
@@ -64,6 +65,13 @@ class ResolveTests(unittest.TestCase):
         with self.assertRaises(zone.Refusal) as refused:
             _ = zone.resolve("Seattle", self.NOW)
         self.assertIn("no zone is named 'Seattle'; give the IANA zone of the place", str(refused.exception))
+
+
+    def test_notice_tells_agents_to_let_the_tools_add_the_present_time(self) -> None:
+        text = zone.notice("America/Curacao", INITIAL_ZONE)
+        self.assertIn("Write no present time. Write only future times, such as an ETA. The tools add the present time.",
+                      text)
+        self.assertNotIn("Read the clock", text)
 
 
 class StoredZoneTests(unittest.TestCase):
@@ -155,8 +163,44 @@ class SetTests(unittest.TestCase):
         self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{self.checkout} main", pull[-1])
         (sent,) = self.log("broadcast.log")
         self.assertEqual(sent[:4], ["--from", "zone", "--all", sent[3]])
-        self.assertIn(f"now America/Curacao (AST, UTC-04:00); it was {INITIAL_ZONE}", sent[3])
+        self.assertRegex(
+            sent[3],
+            r"^The user's time zone is now America/Curacao \(AST, UTC-04:00\) as of [0-9]{2}:[0-9]{2} AST; "
+            + rf"it was {INITIAL_ZONE}\. ",
+        )
         self.assertFalse(self.queued().exists())
+
+    def test_a_superseded_mac_write_sends_no_zone_notice(self) -> None:
+        mac = self.root / "mac"
+        _ = self.git(self.root, "clone", "--quiet", str(self.checkout), str(mac))
+        mac_env = {**self.env, "HOME": str(mac), "CONF_DIR": str(mac / "config"),
+                   "XDG_STATE_HOME": str(mac / "state")}
+        receiver = str(SCRIPT.with_name("live_settings.py"))
+        saved = subprocess.run([sys.executable, receiver, "user_zone", "zone", "Europe/Paris"],
+                               env={**mac_env, "LIVE_SETTINGS_SAVE_ORDER": "2"}, capture_output=True,
+                               text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        ssh = main_publish.ssh
+
+        def send(command: str, *, ssh_program: str, time_limit: main_publish.CommandTimeLimit,
+                 host: str = "mac") -> subprocess.CompletedProcess[str] | str:
+            if "live_settings.py" not in command:
+                return ssh(command, ssh_program=ssh_program, time_limit=time_limit, host=host)
+            order, _, _, *arguments = shlex.split(command)
+            self.assertEqual(order, "LIVE_SETTINGS_SAVE_ORDER=1")
+            return subprocess.run([sys.executable, receiver, *arguments],
+                                  env={**mac_env, "LIVE_SETTINGS_SAVE_ORDER": order.split("=", 1)[1]},
+                                  capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(user_zone, "CONF", self.checkout / "config/user_zone.conf"), \
+                mock.patch.object(main_publish, "ssh", side_effect=send), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(zone.set_zone("Curacao"), 0)
+        self.assertIn("mac: a newer Save is already live", output.getvalue())
+        self.assertNotIn("mac: live now:", output.getvalue())
+        self.assertEqual(self.log("broadcast.log"), [])
+        self.assertFalse(self.queued().exists())
+        self.assertEqual((mac / "config/user_zone.conf").read_text(), CONF_TEXT.replace(INITIAL_ZONE, "Europe/Paris"))
 
     def test_an_offline_mac_is_queued_and_a_bare_zone_sends_it_later(self) -> None:
         _ = (self.fakes / "OFFLINE").write_text("", encoding="utf-8")
@@ -185,7 +229,8 @@ class SetTests(unittest.TestCase):
             self.assertEqual(shown.returncode, 0, shown.stderr)
             self.assertIn("mac: took the legacy change", shown.stdout)
             command = self.log("ssh.log")[-1][-1]
-            self.assertIn('cd "$HOME"/.claude && tip=$(git ls-remote', command)
+            self.assertIn('cd "$HOME"/.claude && { [ ! -f scripts/lib/waiting_rows.py ] || '
+                          + "scripts/lib/py scripts/lib/waiting_rows.py fast-forward HEAD; } && tip=$(git ls-remote", command)
             self.assertIn(f"natedev:{self.checkout} main", command)
             self.assertFalse(self.queued().exists())
 
@@ -306,6 +351,7 @@ class SetTests(unittest.TestCase):
             status = zone.set_zone("Curacao")
         self.assertEqual(status, 0)
         self.assertEqual(observed, {"fetch": [10, 10], "push": [10], "ssh": [10, 20]})
+        self.assertIn("LIVE_SETTINGS_SAVE_ORDER=1 ", self.log("ssh.log")[0][-1])
 
     def test_a_checkout_off_main_is_refused(self) -> None:
         _ = self.git(self.checkout, "switch", "-q", "-c", "work")

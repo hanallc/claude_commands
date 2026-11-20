@@ -10,13 +10,18 @@ from functools import cache, cached_property, lru_cache
 import os
 from pathlib import Path
 import re
+import select
+import shlex
 import subprocess
+from threading import Thread
 
 from scripts.lib import conf
 from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RAW_ID, RECORDED_STEP_NAMES, RECORDED_VERBS,
                                      SHORT_OWNER_STEPS, VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
                                      command_script, is_recorded_step, queue_identifier, script_file, verify_command)
 from scripts.build_queue import admission_wire as wire
+from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_CALL_VERBS,
+                                                GateJobNotRecorded, NotVerifyCall, VerifyCall, VerifyStep)
 from scripts.message.owner_role import OwnerRole
 
 
@@ -50,6 +55,10 @@ class QueueRowName(str):
     @classmethod
     def fixed(cls, kind: QueueKind) -> QueueRowName:
         return str.__new__(cls, kind.value)
+
+    @classmethod
+    def owner_only(cls, owner: str) -> QueueRowName:
+        return str.__new__(cls, public_queue_text(owner) or "—")
 
     @classmethod
     def repository(cls, repository: str, folder: str = "") -> QueueRowName | NoNamedStep:
@@ -139,12 +148,15 @@ class SlotCaller:
     work: str
 
     @cached_property
-    def step(self) -> QueueRowName | NoNamedStep:
-        """Read the command only when the slot must wait."""
+    def named_job(self) -> tuple[QueueRowName | NoNamedStep, StepJob | GateJobNotRecorded, VerifyStep]:
+        """Classify the command when the slot must wait."""
         if self.command:
-            return command_slot_name(self.command, RECORDED_STEP_NAMES)
-        return recorded_step(self.work, RECORDED_STEP_NAMES)
+            return command_slot_job(self.command, RECORDED_STEP_NAMES)
+        return recorded_step(self.work, RECORDED_STEP_NAMES), GATE_JOB_NOT_RECORDED, NotVerifyCall()
 
+    @property
+    def step(self) -> QueueRowName | NoNamedStep:
+        return self.named_job[0]
 
 SLOT_CALLER: ContextVar[SlotCaller | None] = ContextVar("slot_caller", default=None)
 
@@ -221,6 +233,18 @@ printf '%s' "$VERIFY_PACKAGE"
 """
 
 
+@cache
+def verify_value_options() -> frozenset[str]:
+    """Read the options that consume two words in the Verify parser."""
+    try:
+        parser = verify_package_parser()
+    except (OSError, AssertionError):
+        return frozenset()
+    cases = re.finditer(r"^[ \t]+(--[\w-]+(?:\|--[\w-]+)*)\)(.*?);;", parser, re.MULTILINE | re.DOTALL)
+    return frozenset(flag for case in cases if re.search(r"\bshift[ \t]+2\b", case.group(2))
+                     for flag in case.group(1).split("|"))
+
+
 @lru_cache(maxsize=128)
 def verify_package(step: str, arguments: tuple[str, ...]) -> str:
     """Pass literal arguments to the verify parser without starting a build."""
@@ -234,24 +258,35 @@ def verify_package(step: str, arguments: tuple[str, ...]) -> str:
 
 
 def command_slot_name(command: Sequence[str], names: StepNames) -> QueueRowName | NoNamedStep:
-    """Name the first verify step, or the first script in the command."""
+    """Name the first build job or script in the command."""
+    return command_slot_job(command, names)[0]
+
+
+def command_slot_job(command: Sequence[str], names: StepNames
+                     ) -> tuple[QueueRowName | NoNamedStep, StepJob | GateJobNotRecorded, VerifyStep]:
+    """Keep the gate job or Verify call with the step name."""
     script = ""
     try:
         for argv in command_programs(command):
+            job = command_job(argv)
             verify = verify_command(argv)
-            if isinstance(verify, VerifyCommand):
-                job = command_job(argv)
-                if isinstance(job, StepJob) and job.step in VERIFY_VERBS:
+            if isinstance(job, StepJob):
+                if not isinstance(verify, VerifyCommand):
+                    return QueueRowName.step(job.step, "", names), job, NotVerifyCall()
+                if job.step in VERIFY_VERBS:
                     arguments = verify.arguments
                     if arguments[:1] == ("--session-dir",):
                         arguments = arguments[2:]
                     package = verify_package(job.step, arguments[1:])
-                    return QueueRowName.step(job.step, package, names)
+                    # The slot waits for the whole call.
+                    facts = (VerifyCall(job.step, shlex.join(("verify", *arguments)), 1, 1)
+                             if job.step in VERIFY_CALL_VERBS else NotVerifyCall())
+                    return QueueRowName.step(job.step, package, names), GATE_JOB_NOT_RECORDED, facts
             if not script:
                 script = command_script(argv)
     except (ValueError, RecursionError):
         pass
-    return QueueRowName.script(script) if script else NoNamedStep.FOUND
+    return (QueueRowName.script(script) if script else NoNamedStep.FOUND), GATE_JOB_NOT_RECORDED, NotVerifyCall()
 
 
 class SlotWaitExpired(RuntimeError):
@@ -283,14 +318,16 @@ def read_pool(repository: str, machine: str, root: Path, locks: str) -> wire.Rep
 
 def wait_for_slot(repository: str, machine: str, root: Path, maximum: int, *, episode: str,
                   since: float, showrunner: str, unit: str, work: str, purpose: str,
-                  expires_at: float | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> None:
+                  expires_at: float | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                  owner_pid: int = 0) -> None:
     """Block on one queue connection; retain episode and since after a lost race."""
     from scripts.build_queue import admission_client as client, admission_records as records
     from scripts.build_queue import admission_protocol as wire
 
     seconds = conf.read_or_repository("build_folders").number("slots.wait_seconds")
     deadline = since + seconds if isinstance(expires_at, conf.UseConfiguredValue) else expires_at
-    start = records.process_start_time(os.getpid())
+    pid = owner_pid or os.getpid()
+    start = records.process_start_time(pid)
     if start is None:
         raise RuntimeError("the slot waiter has no process identity")
     caller = SLOT_CALLER.get()
@@ -298,14 +335,32 @@ def wait_for_slot(repository: str, machine: str, root: Path, maximum: int, *, ep
         session = os.environ.get("CLAUDE_CODE_SESSION_ID", "") or os.environ.get("CODEX_THREAD_ID", "")
         identity = wire.Identity(session, showrunner, work, "")
     else:
-        step = caller.step
+        step, job, verify = caller.named_job
         identity = wire.Identity(caller.staff_id, caller.showrunner,
-                                 step if isinstance(step, QueueRowName) else "", str(caller.source))
+                                 step if isinstance(step, QueueRowName) else "", str(caller.source), job=job, verify=verify)
     del unit, purpose
-    request = wire.RepositorySlotRequest(episode, wire.Owner(os.getpid(), start), since,
+    request = wire.RepositorySlotRequest(episode, wire.Owner(pid, start), since,
         repository, machine, str(root), maximum, deadline, identity)
+    if owner_pid:
+        watch_parent(owner_pid)
     reply = client.repository_slot(request)
     if isinstance(reply, wire.RepositorySlotExpired):
         raise SlotWaitExpired(reply.reason)
     if isinstance(reply, wire.Refused):
         raise RuntimeError(reply.reason)
+
+
+def watch_parent(pid: int) -> None:
+    """End a standalone waiter when its parent ends."""
+    if os.getppid() != pid:
+        raise SlotWaitExpired("slots: the step ended before its folder wait")
+    descriptor = os.pidfd_open(pid)
+    if os.getppid() != pid:
+        os.close(descriptor)
+        raise SlotWaitExpired("slots: the step ended before its folder wait")
+
+    def stop() -> None:
+        _ = select.select([descriptor], [], [])
+        os._exit(75)
+
+    Thread(target=stop, daemon=True, name="slot-wait-owner").start()

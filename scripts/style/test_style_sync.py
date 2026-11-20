@@ -434,7 +434,6 @@ class StyleSyncTests(unittest.TestCase):
         rule = "global:rust/names.md"
         _ = (self.root / "nate_style/rust/names.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\n---\n# Names\n")
         run = self.root / "run"
-        journal = style_ledger.publication_path(worktree, "publication.json")
 
         def assign(ticket: str, source: str) -> None:
             with style_ledger.open_ledger(worktree) as ledger:
@@ -445,12 +444,6 @@ class StyleSyncTests(unittest.TestCase):
                 blob = ledger.pinned_rule_texts(ticket)[0].blob
                 ledger.record(rule, source, head, blob, "clean", ticket=ticket, worker="test")
 
-        unlink = Path.unlink
-        def stop_before_journal_removal(path: Path, missing_ok: bool = False) -> None:
-            if path == journal:
-                raise RuntimeError("publication stopped after checkpoint record")
-            unlink(path, missing_ok=missing_ok)
-
         for case, interrupted in (("ordinary merge", False), ("stopped publication", True)):
             with self.subTest(case=case), mock.patch.object(
                     style_plan, "run_verification_step", return_value=subprocess.CompletedProcess([], 0)):
@@ -458,11 +451,12 @@ class StyleSyncTests(unittest.TestCase):
                     ledger.set_tip(self.tip, "main")
                 if interrupted:
                     assign("3001", "src/lib.rs")
-                    with mock.patch.object(Path, "unlink", stop_before_journal_removal):
+                    with mock.patch.object(style_ledger.Ledger, "finish_publication",
+                                           side_effect=RuntimeError("publication stopped after checkpoint record")):
                         with self.assertRaisesRegex(RuntimeError, "publication stopped after checkpoint record"):
                             _ = style_plan.publish_checkpoint(worktree, "3001", run, "1", "First checkpoint\n")
-                    self.assertTrue(journal.exists())
                     with style_ledger.open_ledger(worktree) as ledger:
+                        self.assertIsInstance(ledger.pending_publication("refs/heads/unit-names"), style_ledger.PendingPublication)
                         self.assertEqual(ledger.ticket_get("3001")["state"], "checkpointed")
                     self.assertEqual(style_sync.git(worktree, "status", "--porcelain"), "")
                 _ = (self.repo / "src/lib.rs").write_text(f"fn changed_{int(interrupted)}() {{}}\n")
@@ -480,9 +474,9 @@ class StyleSyncTests(unittest.TestCase):
                     self.assertEqual(connection.execute("SELECT style_branch FROM sync").fetchone(), ("refs/heads/main",))
                 if interrupted:
                     self.assertEqual(style_sync.git(worktree, "merge-base", "HEAD", tip), tip)
-                    self.assertFalse(journal.exists())
                     _ = self.git("merge", "--no-edit", "unit-names")
                     with style_ledger.open_ledger(worktree) as ledger:
+                        self.assertIsInstance(ledger.pending_publication("refs/heads/unit-names"), style_ledger.NoPendingPublication)
                         _ = ledger.ticket_merge("3001")
                     assign("3002", "src/later.rs")
                     checkpoint = style_plan.publish_checkpoint(worktree, "3002", run, "2", "Later checkpoint\n")
@@ -594,7 +588,7 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(self.merge_for_wake(), (0, "", ""))
         self.assertEqual(self.recorded_wakes(), [
             ["--to", "session:fake-" + unit, "--from", "sample-style", "--text",
-             "From the showrunner of sample-style: ticket 3001 merged; refill.", "--timeout", "10"]
+             "ticket 3001 merged; refill.", "--timeout", "10"]
             for unit in ("names", "types")
         ])
         self.assertEqual(self.remaining_waiters(), [])
@@ -668,8 +662,8 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual((second.unit, second.since), (first.unit, first.since))
         self.assertNotEqual(second.token, first.token)
         self.assertEqual([call[5] for call in self.recorded_wakes()], [
-            "From the showrunner of sample-style: ticket 3002 merged; refill.",
-            "From the showrunner of sample-style: ticket 3001 merged; refill.",
+            "ticket 3002 merged; refill.",
+            "ticket 3001 merged; refill.",
         ])
 
     def test_failed_wake_keeps_only_that_waiter_and_an_already_merged_ticket_retries_it(self) -> None:
@@ -719,7 +713,7 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual([notice[1] for notice in notices], ["session:fake-names", "session:fake-types"])
         self.assertEqual([notice[notice.index("--key") + 1] for notice in notices],
                          ["style-sync:names", "style-sync:types"])
-        self.assertTrue(all(f"From style_sync: branch point main moved to {self.tip[:7]}; sync." in notice
+        self.assertTrue(all(f"branch point main moved to {self.tip[:7]}; sync." in notice
                             for notice in notices))
         style_sync.notify(self.repo, "another", self.tip)
         self.assertEqual(self.handoff_notices(), notices)
@@ -734,7 +728,7 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(self.merge_for_wake(), (0, f"style_ledger: wake {style_unit_id('names')}: no live director\n", ""))
         self.assertEqual(self.recorded_wakes(), [[
             "--to", "session:fake-types", "--from", "sample-style", "--text",
-            "From the showrunner of sample-style: ticket 3001 merged; refill.", "--timeout", "10",
+            "ticket 3001 merged; refill.", "--timeout", "10",
         ]])
         self.assertEqual(self.remaining_waiters(), [style_unit_id("names")])
 
@@ -808,7 +802,7 @@ class StyleSyncTests(unittest.TestCase):
                 arguments = call["arguments"]
                 self.assertEqual(arguments, [
                     "--to", "session:fake-style", "--from", "style_sync", "--text",
-                    f"From style_sync: branch point main moved to {self.tip[:7]}; sync.",
+                    f"branch point main moved to {self.tip[:7]}; sync.",
                     "--key", "style-sync:sample-style", "--timeout", "10",
                 ])
                 self.assertLess(int(arguments[-1]), cast(int, calls.call_args_list[-1].kwargs["timeout"]))
@@ -1542,7 +1536,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         self.assertEqual(rows[checkpoint][1:3], ("sent", "parent"))
         notices = self.handoff_notices()
         self.assertEqual(len(notices), 1)
-        self.assertIn(f"From the showrunner of sample-style: hand-off {checkpoint}", notices[0])
+        self.assertIn(f"hand-off {checkpoint}", notices[0])
         self.assertIn("session:fake-parent", notices[0])
 
     def test_resume_replays_same_parent_without_touching_the_row(self) -> None:
@@ -1630,7 +1624,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         notices = self.handoff_notices()
         self.assertEqual(len(notices), 1)
         self.assertIn("session:fake-parent", notices[0])
-        self.assertIn(f"From the showrunner of sample-style: hand-off {checkpoint}", notices[0])
+        self.assertIn(f"hand-off {checkpoint}", notices[0])
 
     def test_send_handoff_as_root_sends_nothing_and_leaves_the_row_pending(self) -> None:
         checkpoint = self.handoff_checkpoint()
@@ -1724,7 +1718,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
                 ledger.handoff_add(first)
         self.assertEqual(self.resume_handoffs()[0], 0)
         texts = [notice[notice.index("--text") + 1] for notice in self.handoff_notices()]
-        self.assertEqual(texts, [f"From the showrunner of sample-style: hand-off {checkpoint}" for checkpoint in (first, second)])
+        self.assertEqual(texts, [f"hand-off {checkpoint}" for checkpoint in (first, second)])
         self.assertEqual({row[1:3] for row in self.handoff_rows()}, {("sent", "parent")})
 
 

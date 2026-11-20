@@ -4,8 +4,7 @@
 Changes that match origin/main can come from an interrupted update. Prove every
 candidate's content, mode, and index state before changing any file. Remove proved
 untracked files before restoring tracked paths to HEAD. Then finish the update
-with waiting_rows.move_to, which keeps the live configuration rows that main does
-not have yet. A blocked report names every path that fails the proof or collides
+under the journal lock. The move keeps live configuration rows. A blocked report names every path that fails the proof or collides
 with an incoming path.
 
 Each run appends a JSON line to SYNC_LOG. Each blocked run with --notify calls
@@ -109,35 +108,15 @@ def _matches_file(checkout: Path, name: str, entry: GitFileState) -> bool:
     return hashed.returncode == 0 and hashed.stdout.decode("ascii").strip() == entry.object_id
 
 
-def _has_untracked_update(checkout: Path, blocking_details: list[str]) -> bool:
-    untracked = _git(checkout, "ls-files", "--others", "-z")
-    if untracked.returncode:
-        blocking_details.append(_first_line(untracked))
-        return False
-    if not untracked.stdout:
-        return False
-    added = _git(checkout, "diff", "--name-only", "--no-renames", "--diff-filter=A", "-z",
-                 "HEAD", "origin/main", "--")
-    if added.returncode:
-        blocking_details.append(_first_line(added))
-        return False
-    added_paths = set(added.stdout.split("\0")) - {""}
-    untracked_paths = set(untracked.stdout.split("\0")) - {""}
-    collisions = sorted(name for name in untracked_paths
-                        if any(name.startswith(added_path + "/") or added_path.startswith(name + "/")
-                               for added_path in added_paths))
-    blocking_details.extend(collisions)
-    return bool(untracked_paths & added_paths) or bool(collisions)
-
-
-def _finish_interrupted_update(checkout: Path, blocking_details: list[str], waiting: set[str]) -> bool:
+def _finish_interrupted_update(checkout: Path, move: waiting_rows.CheckoutMove,
+                               blocking_details: list[str], waiting: set[str]) -> bool:
     """Restore candidates only after every changed working file matches origin/main.
 
     Files in `waiting` hold waiting rows; the move keeps them.
     """
     queries = [
-        _git(checkout, "ls-tree", "-r", "-z", "HEAD"),
-        _git(checkout, "ls-tree", "-r", "-z", "origin/main"),
+        _git(checkout, "ls-tree", "-r", "-z", move.head),
+        _git(checkout, "ls-tree", "-r", "-z", move.tip),
         _git(checkout, "-c", "core.filemode=true", "diff", "--name-only", "--no-renames", "-z", "HEAD", "--"),
         _git(checkout, "diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD", "--"),
         _git(checkout, "ls-files", "--others", "-z"),
@@ -153,32 +132,27 @@ def _finish_interrupted_update(checkout: Path, blocking_details: list[str], wait
         for record in result.stdout.split("\0"):
             if record:
                 metadata, name = record.split("\t", 1)
-                mode, kind, object_id = metadata.split()
-                if kind not in ("blob", "commit"):
-                    blocking_details.append(f"git reported an unsupported object type for {name}: {kind}")
-                    return False
+                mode, _, object_id = metadata.split()
                 files[name] = GitFileState(mode, object_id)
         trees.append(files)
     head_files, target_files = trees
     index_files: dict[str, GitFileState] = {}
-    unmerged: set[str] = set()
     for record in queries[5].stdout.split("\0"):
         if record:
             metadata, name = record.split("\t", 1)
-            mode, object_id, stage = metadata.split()
-            if stage != "0":
-                unmerged.add(name)
-            else:
-                index_files[name] = GitFileState(mode, object_id)
-    tracked = (set(queries[2].stdout.split("\0") + queries[3].stdout.split("\0")) - {""} - waiting) | unmerged
-    untracked = {name for name in queries[4].stdout.split("\0")
-                 if name in target_files and name not in head_files}
+            mode, object_id, _ = metadata.split()
+            index_files[name] = GitFileState(mode, object_id)
+    tracked = set(queries[2].stdout.split("\0") + queries[3].stdout.split("\0")) - {""} - waiting
+    added = target_files.keys() - head_files.keys()
+    untracked = set(queries[4].stdout.split("\0")) - waiting - {""}
+    blocking_details.extend(sorted(name for name in untracked if any(
+        name.startswith(path + "/") or path.startswith(name + "/") for path in added)))
     restore: list[str] = []
     remove: list[str] = []
-    for name in sorted(tracked | untracked):
+    for name in sorted(tracked | (untracked & added)):
         try:
-            if name in unmerged or (name in tracked and index_files.get(name, ABSENT_FILE) not in (
-                    head_files.get(name, ABSENT_FILE), target_files.get(name, ABSENT_FILE))):
+            if name in tracked and index_files.get(name, ABSENT_FILE) not in (
+                    head_files.get(name, ABSENT_FILE), target_files.get(name, ABSENT_FILE)):
                 blocking_details.append(name)
                 continue
             if _matches_file(checkout, name, head_files.get(name, ABSENT_FILE)):
@@ -203,7 +177,7 @@ def _finish_interrupted_update(checkout: Path, blocking_details: list[str], wait
     except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
         blocking_details.append(str(error) or type(error).__name__)
         return False
-    return True
+    return bool(restore or remove)
 
 
 def sync(checkout: Path) -> Outcome:
@@ -217,45 +191,38 @@ def sync(checkout: Path) -> Outcome:
     busy = [name for name in IN_PROGRESS if (git_dir / name).exists()]
     if busy:
         return Outcome("in-progress", f"{checkout} has a git operation in progress ({busy[0]})")
-    fetched = _git(checkout, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main",
-                   timeout=FETCH_TIMEOUT_SECONDS)
-    if fetched.returncode:
-        try:
-            warm = subprocess.run(["github-warm-status"], capture_output=True, check=False, timeout=5).returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            warm = False
-        advice = ("GitHub credentials are warm. GitHub refused the fetch. This is likely a GitHub incident; "
-                  + "the job retries" if warm else f"run github-warmup at a terminal on {socket.gethostname()}")
-        return Outcome("fetch-failed", f"git fetch origin main failed in {checkout}: {_first_line(fetched)}; {advice}")
-    head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
-    target = _git(checkout, "rev-parse", "origin/main").stdout.strip()
-    if head == target:
-        return Outcome(CURRENT, head[:8])
-    if _git(checkout, "merge-base", "--is-ancestor", "HEAD", "origin/main").returncode:
-        return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")
-    status = _git(checkout, "status", "--porcelain", "--untracked-files=no", "--",
-                  ".", f":(exclude,glob){waiting_rows.WAITING_GLOB}")
-    interrupted = False
-    blocking_details: list[str] = []
     try:
-        waiting = set(waiting_rows.waiting_files(checkout))
-    except OSError as error:
-        waiting = set[str]()
-        blocking_details.append(str(error))
-    if status.returncode:
-        blocking_details.append(_first_line(status))
-    elif not blocking_details and (_has_untracked_update(checkout, blocking_details) or status.stdout.strip()):
-        interrupted = _finish_interrupted_update(checkout, blocking_details, waiting)
+        waiting_rows.restore_live(checkout)
+        fetched = _git(checkout, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main",
+                       timeout=FETCH_TIMEOUT_SECONDS)
+        if fetched.returncode:
+            try:
+                warm = subprocess.run(["github-warm-status"], capture_output=True, check=False, timeout=5).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                warm = False
+            advice = ("GitHub credentials are warm. GitHub refused the fetch. This is likely a GitHub incident; "
+                      + "the job retries" if warm else f"run github-warmup at a terminal on {socket.gethostname()}")
+            return Outcome("fetch-failed", f"git fetch origin main failed in {checkout}: {_first_line(fetched)}; {advice}")
+        with waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
+            move = waiting_rows.move_target(checkout, "origin/main", pending, fast_forward=True)
+            return _advance(checkout, move, pending)
+    except waiting_rows.Diverged:
+        return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")
+    except (OSError, UnicodeError, ValueError) as error:
+        return Outcome("ff-failed", f"the move to origin/main failed in {checkout}: {' '.join(str(error).split())}")
+
+
+def _advance(checkout: Path, move: waiting_rows.CheckoutMove, pending: waiting_rows.LockedJournal) -> Outcome:
+    if move.head == move.tip:
+        return Outcome(CURRENT, move.head[:8])
+    blocking_details: list[str] = []
+    waiting = set(waiting_rows.waiting_files(checkout)) | waiting_rows.pending_files(checkout, pending).keys()
+    interrupted = _finish_interrupted_update(checkout, move, blocking_details, waiting)
     if blocking_details:
         return Outcome("dirty", f"{checkout} has local changes that block the update ({', '.join(blocking_details)})")
-    try:
-        waiting_rows.move_to(checkout, target)
-    except (OSError, UnicodeError) as error:
-        return Outcome("ff-failed", f"the move to origin/main failed in {checkout}: {' '.join(str(error).split())}")
-    detail = f"{head[:8]}..{target[:8]}"
-    if interrupted:
-        detail += "; finished an interrupted update"
-    return Outcome(ADVANCED, detail)
+    waiting_rows.apply_move(checkout, waiting_rows.check_move(checkout, move, pending), pending)
+    suffix = "; finished an interrupted update" if interrupted else ""
+    return Outcome(ADVANCED, f"{move.head[:8]}..{move.tip[:8]}{suffix}")
 
 
 def state_dir() -> Path:

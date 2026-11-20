@@ -3,34 +3,39 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 import unittest
 
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
 
 
 class VerifyLintLocalWritesTests(VerifyStepRoutesFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixture.environment["PYTHONPYCACHEPREFIX"] = str(self.fixture.root.parent / "bytecode")
+        _ = self.fixture.environment.pop("PYTHONDONTWRITEBYTECODE", None)
+
     def hold_before_repair(self, tool: str) -> Path:
         self.fixture.environment["TEST_REQUIRE_CLIPPY_FIX"] = "1" if tool == "clippy" else "0"
         self.fixture.environment["TEST_REQUIRE_MEND_FIX"] = "1" if tool == "mend" else "0"
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink(missing_ok=True)
-        shell = self.fixture.root / "hold-before-repair.sh"
-        _ = shell.write_text('''
-hold_before_repair() {
-    if [[ "$TEST_REQUIRE_MEND_FIX" != 1 && "$BASH_COMMAND" != *'invoke_clippy_fix --workspace '* ]]; then
-        return 0
-    fi
-    case "$BASH_COMMAND" in
-        'invoke_mend --workspace --fix '*|'invoke_clippy_fix --workspace '*\
-            |'lint_rewrite invoke_mend --workspace --fix '*|'lint_rewrite invoke_clippy_fix --workspace '*)
-            printf held > "$BUILD_HOLD_DIR/other"
-            ;;
-    esac
-}
-set -o functrace
-trap hold_before_repair DEBUG
-''')
-        self.fixture.environment["BASH_ENV"] = str(shell)
+        script = self.fixture.verify_script
+        invoke = script.parent.parent / "lint/invoke.sh"
+        function = "invoke_mend() {" if tool == "mend" else "invoke_clippy_fix() {"
+        self.assertIn(function, invoke.read_text())
+        commands = (("if lint_rewrite invoke_mend --workspace --fix ", "invoke_mend --workspace --fix ")
+                    if tool == "mend" else ("lint_rewrite invoke_clippy_fix --workspace ",))
+        hold = 'printf held > "$BUILD_HOLD_DIR/other"'
+        original = script.read_text()
+        updated = original
+        for command in commands:
+            line, = (line for line in original.splitlines() if line.lstrip().startswith(command))
+            indentation = line[:len(line) - len(line.lstrip())]
+            replacement = f"{indentation}{hold}\n{line}"
+            if replacement not in updated:
+                updated = updated.replace(line, replacement, 1)
+        _ = script.write_text(updated)
         cargo = self.fixture.bin_directory / "cargo"
         source = cargo.read_text().replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
 repair = Path(os.environ["PACKAGE_ROOT"]) / "local-repair"

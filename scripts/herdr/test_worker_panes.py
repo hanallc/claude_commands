@@ -21,7 +21,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
 from typing import Literal, cast, final, override
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 from weakref import finalize
 
 from scripts.production import fake_unit_host, staff, worker_admission
@@ -39,7 +39,7 @@ from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.direct import progress_history
-from scripts.agents import detached_run_process, worker_lifecycle
+from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 
@@ -71,9 +71,12 @@ def live_detached_run(run: Path, row: staff.StaffRow) -> Generator[None]:
     path = run / "detached_runs" / (row.name + ".json")
     with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
                           stdin=subprocess.PIPE, text=True) as supervisor:
-        write_text_atomic(path, json.dumps({"worker": row.name, "staff_id": row.id,
-                                           "run_id": row.name, "log": str(path.with_suffix(".log")),
-                                           "status": "running", "pid": supervisor.pid}))
+        record: detached_runs.RunRecord = {
+            "worker": row.name, "staff_id": row.id, "run_id": row.name, "log": str(path.with_suffix(".log")),
+            "status": "running", "pid": supervisor.pid, "command": ["true"], "label": "private verification",
+            "started_at": time.time(), "session_dir": str(run), "director_dir": str(run), "done_message_file": "",
+        }
+        write_text_atomic(path, json.dumps(record))
         try:
             yield
         finally:
@@ -936,8 +939,8 @@ class WorkerPaneTests(StaffTestCase):
         if not state.exists():
             run.mkdir(exist_ok=True)
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
-                "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
-                          "status": "active"}, "pass": {}, "events": [],
+                "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
+                                 "status": "active"}], "pass": {}, "events": [],
                 "history_file": str(run / "history.jsonl"),
                 "main_agent": {"session_id": self.parent.current_session, "family": "claude",
                                "model": "fixture", "effort": "high"}}))
@@ -1000,7 +1003,9 @@ class WorkerPaneTests(StaffTestCase):
                 _ = progress_history.begin_dispatch(run, slot="impl", phase=phase, role="impl",
                     worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
                 before = self.staff_state()
-                if operation in {"finish-phase", "finish-run"}:
+                if operation == "finish-phase":
+                    self.record_command(operation, "--phase-id", phase, "--status", "completed", at=3)
+                elif operation == "finish-run":
                     self.record_command(operation, "--status", "completed", at=3)
                 else:
                     self.record_command("finish-pass", "--status", "interrupted", "--orphaned-launcher", at=3)
@@ -2115,6 +2120,16 @@ class WorkerPaneTests(StaffTestCase):
             self.assertIsInstance(worker_panes.can_close(opened), worker_panes.Kept)
             self.assertIsInstance(self.start(role="review"), worker_panes.StartRefused)
 
+            path = run / unit_runs.STATE_FILE
+            state = cast(dict[str, object], json.loads(path.read_text()))
+            passes = cast(dict[str, dict[str, object]], state["pass"])
+            passes["newer-slot"] = {"worker_id": opened.row.id, "instance_id": "newer-pass",
+                                    "started_at": 1, "status": "completed"}
+            write_text_atomic(path, json.dumps(state))
+            self.reply_to_dispatch(opened.row, "newer-pass")
+            self.assertIsInstance(worker_panes.can_close(opened), worker_panes.CloseAllowed)
+            self.assertIsInstance(self.start(role="review"), worker_panes.OpenWorker)
+
     def test_failed_unpublished_close_reports_one_anomaly(self) -> None:
         for failure in (False, OSError("TEST close failed\nsecond line")):
             with self.subTest(failure=failure):
@@ -2582,8 +2597,13 @@ class WorkerPaneTests(StaffTestCase):
                     destination_run = self.worker_run("a-destination", "unit", self.parent.current_session, director_run=True)
                     self.assertNotEqual(worker_panes.worker_run(row), destination_run)
                 record = source_run / "detached_runs/private-run.json"
-                write_text_atomic(record, json.dumps({"worker": row.name, "staff_id": row.id,
-                    "status": "running" if detached else "finished", "pid": 998901}))
+                saved: detached_runs.RunRecord = {
+                    "worker": row.name, "staff_id": row.id, "run_id": record.stem, "log": str(record.with_suffix(".log")),
+                    "status": "running" if detached else "finished", "pid": 998901, "command": ["true"],
+                    "label": "private verification", "started_at": time.time(), "session_dir": str(source_run),
+                    "director_dir": str(source_run), "done_message_file": "",
+                }
+                write_text_atomic(record, json.dumps(saved))
                 before = self.staff_state(), self.world.foreground.copy(), len(self.world.launches), self.world.stops.copy()
 
                 def release(source: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend | staff.BackendUnavailable) -> SourceReleased:
@@ -3819,14 +3839,21 @@ class WorkerPaneTests(StaffTestCase):
         read = self.world.result
         record = staff.snapshot()
         body = "Detached run: fixture-run\nRun finished: fixture checks"
+        fifo = self.root / "grandchild-stdin"
+        os.mkfifo(fifo)
         for exiting in (False, True):
             with self.subTest(exiting=exiting):
                 # The intermediate process is outside the reported foreground group.
                 fake_unit_host.process(os.environ, child, pid, ["sh"], {})
                 fake_unit_host.process(os.environ, grandchild, child, [] if exiting else ["python3"], {})
+                child_process = self.world.process_root / str(grandchild)
                 if exiting:
-                    stat = self.world.process_root / str(grandchild) / "stat"
+                    stat = child_process / "stat"
                     write_text_atomic(stat, stat.read_text().replace("(fixture) S", "(fixture) Z"))
+                else:
+                    stdin = child_process / "fd" / "0"
+                    stdin.parent.mkdir()
+                    stdin.symlink_to(fifo)
 
                 def result(*args: str, deadline: float = math.inf) -> dict[str, object]:
                     reply = read(*args, deadline=deadline)
@@ -3840,7 +3867,7 @@ class WorkerPaneTests(StaffTestCase):
                     return reply
 
                 with (patch.object(self.world, "result", side_effect=result),
-                      patch.object(self.world, "prompt") as prompt,
+                      patch.object(self.world, "prompt", wraps=self.world.prompt) as prompt,
                       patch.object(send, "delivery_timeout", return_value=1.0),
                       patch.object(send, "_send", return_value=send.Result("sent", "fixture holder")) as holder,
                       redirect_stderr(io.StringIO()) as errors):
@@ -3851,7 +3878,8 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertIsInstance(states[absent.id], worker_panes.ClosedWorker)
                 self.assertNotIn("absence is unproved", errors.getvalue())
                 self.assertIsInstance(delivery, send.PaneTextDelivered)
-                prompt.assert_called_once_with(pane, body, target=row.current_session, proof=herdr.SubmitStarts(1000))
+                prompt.assert_called_once_with(pane, body, target=row.current_session, proof=herdr.SubmitStarts(1000),
+                                               on_submission=ANY)
                 holder.assert_not_called()
 
     def test_codex_without_arguments_never_gives_its_pane_to_a_registered_claude_child(self) -> None:
@@ -3913,7 +3941,8 @@ class WorkerPaneTests(StaffTestCase):
         terminal = str(location["terminal_id"])
         codex_process: dict[str, object] = {"pid": pid, "name": "codex"}
         child_process = {"pid": child, "name": "claude", "argv": claude_arguments}
-        reply = {"process_info": {"foreground_processes": [child_process, codex_process]}}
+        reply = {"process_info": {"shell_pid": pid - 1, "foreground_process_group_id": pid,
+                                  "foreground_processes": [child_process, codex_process]}}
         with (patch.object(self.world, "result", return_value=reply),
               patch.object(self.world, "pane_row", return_value=location)):
             for has_argv in (True, False):

@@ -216,9 +216,13 @@ def firefox_probe_results(page: bytes) -> list[list[str]]:
 
 
 class AccountsPageTests(unittest.TestCase):
+    review_root: Path = Path()
+
     @override
     def setUp(self) -> None:
-        configuration = Path(self.enterContext(tempfile.TemporaryDirectory())) / "config"
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        configuration = scratch / "config"
+        self.review_root = scratch / "review"
         _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", configuration)
         _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
         _ = write_config_fixture(configuration / "console.conf", PAGE_STATUS_SETTINGS)
@@ -227,7 +231,122 @@ class AccountsPageTests(unittest.TestCase):
             "account.claude1=#af875f\naccount.claude2=#b294bb\naccount.codex2=#123456\nrole.unit-director=#d7af00\n"
             + "model.claude-opus-5-5=#e08a5c\n",
             encoding="utf-8")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "CONF_DIR": str(configuration), "REVIEW_LINKS_ROOT": str(self.review_root),
+        })))
+
+    def test_page_reads_quota_clear_state_from_the_fixture_root(self) -> None:
+        reading = accounts.StatusReading((replace(status_row("claude1"), weekly_left_percent=4),),
+                                         (), (), timezone.utc, AT)
+        with (patch.object(accounts, "read_status", return_value=reading),
+              patch.object(accounts_page, "cleared_quotas", return_value={}) as cleared):
+            _ = accounts_page.page()
+        cleared.assert_called_once_with(accounts_page.quota_state(self.review_root))
+
+    def test_quota_clear_survives_reset_time_drift_until_the_next_week(self) -> None:
+        reset = AT + timedelta(days=1, microseconds=299911)
+        path = accounts_page.quota_state(self.review_root)
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps({"claude1": {"level": "urgent", "reset": reset.isoformat()}}), encoding="utf-8")
+        cases = ((reset - timedelta(microseconds=526917), 4, False),
+                 (reset + timedelta(seconds=3599), 4, False),
+                 (reset + timedelta(hours=1), 4, True),
+                 (reset + timedelta(days=7), 100, False),
+                 (reset + timedelta(days=7), 4, True))
+        for observed_reset, left, shows_icon in cases:
+            with self.subTest(reset=observed_reset, left=left):
+                row = replace(status_row("claude1"), resets_at=observed_reset, weekly_left_percent=left)
+                reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+                with patch.object(accounts, "read_status", return_value=reading):
+                    content = accounts_page.page().decode()
+                self.assertEqual('data-quota-account="claude1"' in content, shows_icon)
+
+    def test_page_keeps_account_values_when_quota_settings_or_state_are_invalid(self) -> None:
+        reading = accounts.StatusReading((replace(status_row("claude1"), weekly_left_percent=4),),
+                                         (), (), timezone.utc, AT)
+        path = accounts_page.quota_state(self.review_root)
+        path.parent.mkdir(parents=True)
+        threshold_error = "accounts_quota_warning_percent must be greater than accounts_quota_urgent_percent."
+        cases = ((10, 5, "{", f"Invalid quota clear state in {path}."),
+                 (5, 5, "{}", threshold_error),
+                 (5, 10, "{}", threshold_error))
+        with patch.object(accounts, "read_status", return_value=reading):
+            for warning, urgent, state, error in cases:
+                with self.subTest(warning=warning, urgent=urgent, state=state):
+                    _ = path.write_text(state, encoding="utf-8")
+                    _ = write_config_fixture(conf.path("review_links"),
+                        f"accounts_quota_warning_percent={warning}\naccounts_quota_urgent_percent={urgent}\n")
+                    content = accounts_page.page().decode()
+                    self.assertIn(">4%</span>", content)
+                    self.assertEqual(content.count(f"<li>{html.escape(error)}</li>"), 1)
+                    self.assertNotIn('data-quota-account="claude1"', content)
+
+    def test_weekly_quota_icons_follow_the_config_and_skip_missing_readings(self) -> None:
+        cases = ((11, ""), (10, "Warning: 10% left"), (6, "Warning: 6% left"),
+                 (5, "Urgent: 5% left"), (0, "Urgent: 0% left"), (accounts.StatusUnavailable(), ""))
+        quota_rows = tuple(replace(status_row(label), tool="codex" if label.startswith("codex") else "claude",
+                                   weekly_left_percent=left)
+                           for label, (left, _) in zip(("claude1", "claude2", "codex1", "claude3", "codex2", "claude4"),
+                                                         cases, strict=True))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        reading = accounts.StatusReading(quota_rows, (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading), patch.dict(
+                os.environ, {"REVIEW_LINKS_ROOT": str(root)}):
+            content = accounts_page.page().decode()
+            for row, (_, name) in zip(quota_rows, cases, strict=True):
+                with self.subTest(account=row.label):
+                    button = re.search(rf'<button[^>]*data-quota-account="{row.label}"[^>]*>', content)
+                    if name:
+                        assert button is not None
+                        self.assertIn(f'aria-label="{name}"', button[0])
+                    else:
+                        self.assertIsNone(button)
+            _ = write_config_fixture(conf.path("review_links"),
+                                     "accounts_quota_warning_percent=12\naccounts_quota_urgent_percent=6\n")
+            changed = accounts_page.page().decode()
+            self.assertIn('aria-label="Warning: 11% left"', changed)
+            self.assertIn('aria-label="Urgent: 6% left"', changed)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_quota_panel_closes_and_clear_preserves_the_percentage_color(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        reading = accounts.StatusReading((replace(status_row("claude1"), weekly_left_percent=4),),
+                                         (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading), patch.dict(
+                os.environ, {"REVIEW_LINKS_ROOT": str(root)}):
+            source = accounts_page.page().decode()
+        setup = """<script>
+const realFetch=window.fetch.bind(window);let clearForm;
+window.fetch=(url,options)=>options?.method==='POST'
+ ? (clearForm=new URLSearchParams(options.body),Promise.resolve({ok:true,json:async()=>({state:'saved'})}))
+ : realFetch(url,options);
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ try{
+  const button=document.querySelector('[data-quota-account=claude1]');
+  const panel=document.getElementById('quota-panel'),clear=panel.querySelector('button');
+  const percent=button.nextElementSibling,color=getComputedStyle(percent).color;
+  button.click();
+  check(!panel.hidden && document.activeElement===clear,'the panel opens and focuses Clear');
+  check(panel.textContent.includes('claude1 has 4% left') && panel.textContent.includes('Urgent'),
+   'the panel names the account, percentage and level');
+  clear.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  check(panel.hidden && document.activeElement===button,'Escape closes the panel and restores focus');
+  button.click();document.body.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
+  check(panel.hidden,'an outside click closes the panel');
+  button.click();clear.click();await paint();
+  check(panel.hidden && !button.isConnected,'Clear closes the panel and removes the button');
+  check(clearForm.get('quota_account')==='claude1' && clearForm.get('quota_level')==='urgent',
+   'Clear posts the account and level');
+  check(percent.textContent==='4%' && getComputedStyle(percent).color===color,'the percentage keeps its color');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        page = source.replace("</head>", setup + "</head>").replace("</body>", probe + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     def test_board_draws_the_table_and_problems_without_the_upcoming_list(self) -> None:
         config = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='accounts-board-config-')))
@@ -458,6 +577,81 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         page = rendered.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_model_counts_show_session_names_on_hover_and_focus(self) -> None:
+        model = accounts.ObservedSessionModel("claude-opus-5-5", "low")
+        high = accounts.ObservedSessionModel(model.model, "high")
+        earlier = accounts.ObservedSessionModel("claude-fable-5-1", "low")
+        names = ['alpha & "beta"', "hana-unit (mac)", "zeta"]
+        fixture = replace(status_row("claude1"), roles=("units", "workers"),
+                          role_counts=(accounts.RoleSessionCounts(4, 0, 0, 0), accounts.UnknownRoleCounts()),
+                          models_by_role={"units": Counter({model: 3, high: 1})},
+                          model_names_by_role={"units": {model: accounts.ModelSessionNames(names[::-1]),
+                                                         high: accounts.ModelSessionNames(["high-unit"])}})
+        reading = accounts.StatusReading((fixture,), (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            page = accounts_page.page().decode()
+        refreshed = replace(fixture,
+                            role_counts=(accounts.RoleSessionCounts(6, 0, 0, 0), accounts.UnknownRoleCounts()),
+                            models_by_role={"units": Counter({earlier: 1, model: 3, high: 2})},
+                            model_names_by_role={"units": {**fixture.model_names_by_role["units"],
+                                earlier: accounts.ModelSessionNames(["fable-unit"]),
+                                high: accounts.ModelSessionNames(["high-unit", "new-unit"])}})
+        with patch.object(accounts, "read_status", return_value=replace(reading, rows=(refreshed,))):
+            fresh = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
+        setup = MENU_SETUP.replace("FRESH_PAGE", json.dumps(fresh).replace("</", "<\\/"))
+        probe = r"""<script>
+(async()=>{
+const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
+const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+try{
+ frameElement.style.width='800px';frameElement.style.height='520px';await flush();
+ const table=document.querySelector('table[aria-label="Models"]');
+ const [model,high,total]=table.tBodies[0].rows;
+ const count=model.cells[7], tooltip=document.querySelector('.model-tooltip');
+ const names=['alpha & "beta"','hana-unit (mac)','zeta'];
+ count.scrollIntoView({block:'center'});
+ check(count.textContent==='3','the cell contains only the count');
+ check(count.tabIndex===0 && !count.hasAttribute('title'),'the tooltip cell supports focus');
+ check(names.every(name=>count.getAttribute('aria-label')?.includes(name)),'the accessible name includes every session');
+ check(model.cells[3].tabIndex<0 && !model.cells[3].dataset.modelSessions,'zero has no tooltip');
+ check(total.cells[7].tabIndex<0 && !total.cells[7].dataset.modelSessions,'unknown has no tooltip');
+ count.dispatchEvent(new PointerEvent('pointerover',{bubbles:true}));
+ check(!tooltip.hidden && tooltip.textContent===names.join('\n'),'hover shows one line per name in order');
+ count.dispatchEvent(new PointerEvent('pointerout',{bubbles:true}));
+ check(tooltip.hidden,'leaving the count hides its tooltip');
+ count.focus({preventScroll:true});
+ check(document.activeElement===count,'keyboard focus reaches the count');
+ // The screenshot frame sets the active element without sending a focus event.
+ count.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
+ check(!tooltip.hidden && tooltip.textContent===names.join('\n'),'focus shows the same tooltip');
+ const tip=tooltip.getBoundingClientRect(), bounds=table.getBoundingClientRect();
+ check(tip.left>=Math.max(0,bounds.left) && tip.right<=Math.min(innerWidth,bounds.right)+1 &&
+   tip.top>=Math.max(0,bounds.top) && tip.bottom<=Math.min(innerHeight,bounds.bottom)+1,
+   'the tooltip stays inside the visible table');
+ document.documentElement.dataset.theme='light';
+ check(getComputedStyle(tooltip).backgroundColor==='rgb(25, 35, 57)','the light tooltip uses the console color');
+ document.documentElement.dataset.theme='dark';
+ check(getComputedStyle(tooltip).backgroundColor==='rgb(228, 234, 244)','the dark tooltip uses the console color');
+ const other=high.cells[5];
+ count.dispatchEvent(new PointerEvent('pointerover',{bubbles:true}));
+ other.focus({preventScroll:true});
+ other.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
+ check(document.activeElement===other && !tooltip.hidden && tooltip.textContent==='high-unit',
+   'focus on a second cell takes priority over the earlier hover');
+ document.dispatchEvent(new Event('visibilitychange'));await flush();
+ const rows=document.querySelector('table[aria-label="Models"]').tBodies[0].rows;
+ const restored=rows[2].cells[5];
+ check(!other.isConnected && restored.textContent==='2' && document.activeElement===restored &&
+   !tooltip.hidden && tooltip.textContent==='high-unit\nnew-unit',
+   'refresh restores focus and the tooltip for the same model, effort and column');
+}catch(error){failures.push(String(error));}
+realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        page = page.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
         self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
@@ -1016,6 +1210,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                     self.assertIn("<div data-accounts>", page)
                     self.assertIn(console_theme.CSS, page)
                     self.assertIn(page_frame.STYLE, page)
+                    self.assertEqual(page.count(page_frame.BUTTON_STATES), 1)
                     self.assertIn('<h1 class="page-title">Accounts</h1>', page)
                     self.assertIn("'console-shown'", page)
                     self.assertIn(f'data-refresh-seconds="{float(seconds)}"', page)

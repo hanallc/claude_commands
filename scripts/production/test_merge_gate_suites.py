@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import cast, final
 from collections.abc import Generator
 from unittest import mock
-from scripts.production import affected_modules, checkpoint_gate, merge_gate
+from scripts.production import affected_modules, checkpoint_gate, merge_gate, targeted_test
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import process_group
 from scripts.test_times import gate_record
@@ -302,6 +302,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         output = io.StringIO()
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(os, "cpu_count", return_value=2),
+              mock.patch.object(os, "getloadavg", side_effect=[(1.25, 4.0, 5.0), (2.5, 6.0, 7.0)]),
               mock.patch.object(merge_gate, "typecheck_python", return_value=Path(sys.executable)),
               contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
             for name in ("BuildHoldWait", "gate_reservation", "queue_place", "shared_cpu_pool",
@@ -313,6 +314,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertTrue(run.passed, output.getvalue())
         self.assertEqual(len(run.jobs), 3)
         self.assertIn("at most 2 modules at once", output.getvalue())
+        self.assertIn("One-minute load: start=1.25 max=2.50 end=2.50", output.getvalue())
         active: set[int] = set()
         peak = 0
         for event in self.module_events():
@@ -360,6 +362,19 @@ class MergeGateSuitesTests(GateSuitesFixture):
         with contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
             _ = merge_gate.main(["--repo", str(self.checkout), "--module", "hooks/test_first.py"])
         self.assertIn("--module needs --tests-only", errors.getvalue())
+
+    def test_gate_commands_refuse_abbreviated_options(self) -> None:
+        for main, arguments, short in (
+            (merge_gate.main, ["--tests-on", "--full"], "--tests-on"),
+            (targeted_test.main, ["--ful"], "--ful"),
+        ):
+            with (self.subTest(command=main.__module__),
+                  mock.patch.object(merge_gate, "run_tests_only") as run,
+                  contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as refusal):
+                _ = main(arguments)
+            self.assertEqual(refusal.exception.code, 2)
+            self.assertIn(f"unrecognized arguments: {short}", errors.getvalue())
+            run.assert_not_called()
 
     @gate_suites("hooks")
     def test_whole_machine_stops_a_module_at_its_time_limit(self) -> None:

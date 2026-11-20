@@ -89,6 +89,27 @@ class UnroutedChange:
 ChangeOwner = StaffRoutedChange | ShowrunnerOwnChange | UnroutedChange
 
 
+def _route_producer(record: staff.StaffSnapshot, identity: staff.StaffId) -> ChangeOwner:
+    producer = record.by_id(identity)
+    if producer is None:
+        return UnroutedChange(f"No staff record for {identity}")
+    if producer.kind == "showrunner":
+        return ShowrunnerOwnChange(producer.id, producer.name)
+    if producer.kind != "unit":
+        return UnroutedChange(f"Producer {identity} is not a staff unit or showrunner")
+    parent = producer
+    seen: set[staff.StaffId] = set()
+    while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo) and parent.id not in seen:
+        seen.add(parent.id)
+        ancestor = record.by_id(parent.parent.id)
+        if ancestor is None:
+            break
+        parent = ancestor
+    if parent.kind != "showrunner":
+        return UnroutedChange(f"No staff showrunner for {producer.name}")
+    return StaffRoutedChange(producer.id, parent.id, parent.name)
+
+
 @dataclass(frozen=True)
 class UnavailableProduction:
     review_list: Path
@@ -256,24 +277,10 @@ class StaffRouting:
             if runner is not None and runner.kind == "showrunner":
                 return ShowrunnerOwnChange(runner.id, runner.name)
             return ShowrunnerOwnChange(MissingShowrunner(list_owner), list_owner)
-        producer = self.record.by_id(staff.StaffId(identity))
-        if producer is None:
-            return self.unrouted(review_list, row, f"No staff record for {identity}", identity)
-        if producer.kind == "showrunner":
-            return ShowrunnerOwnChange(producer.id, producer.name)
-        if producer.kind != "unit":
-            return self.unrouted(review_list, row, f"Producer {identity} is not a staff unit or showrunner", identity)
-        parent = producer
-        seen: set[staff.StaffId] = set()
-        while parent.kind != "showrunner" and isinstance(parent.parent, staff.ReportsTo) and parent.id not in seen:
-            seen.add(parent.id)
-            ancestor = self.record.by_id(parent.parent.id)
-            if ancestor is None:
-                break
-            parent = ancestor
-        if parent.kind != "showrunner":
-            return self.unrouted(review_list, row, f"No staff showrunner for {producer.name}", identity)
-        return StaffRoutedChange(producer.id, parent.id, parent.name)
+        owner = _route_producer(self.record, staff.StaffId(identity))
+        if isinstance(owner, UnroutedChange):
+            return self.unrouted(review_list, row, owner.note, identity)
+        return owner
 
     def owner_and_production(self, review_list: Path, row: dict[str, str]) -> ChangeAssignment:
         """Read the producer and its showrunner's current production document."""
@@ -300,9 +307,18 @@ class StaffRouting:
             root = self._review_root
             if not waits_for_user(review_list, row, root):
                 return UnroutedChange(note + "; no message goes out")
-            member = self.record.by_id(staff.StaffId(producer))
+            identity = staff.StaffId(producer)
+
+            def still_unrouted() -> bool:
+                try:
+                    fresh = staff.authority_snapshot()
+                except staff.StaffUnreadable:
+                    return True
+                return isinstance(_route_producer(fresh, identity), UnroutedChange)
+
+            member = self.record.by_id(identity)
             names = (member.name if member is not None else producer,)
-            unrouted_alert.notify(root, list_owner, row, note, names)
+            unrouted_alert.notify(root, list_owner, row, note, names, still_unrouted=still_unrouted)
         return UnroutedChange(note + "; no message goes out")
 
 
@@ -321,8 +337,13 @@ def review_root(*, sources: list[Path] | None = None) -> Path:
         "change_review", "review_links_directory", sources=sources)).expanduser()
 
 
-def delivery_slots(path: Path, *, sources: list[Path] | None = None) -> delivery_state.DeliverySlots:
-    """Read one delivery record. A collector requires valid JSON and complete reads."""
+def delivery_slots(path: Path, *, sources: list[Path] | None = None,
+                   strict: bool = False) -> delivery_state.DeliverySlots:
+    """Reject read and parse errors in strict mode and during collection.
+
+    Strict reads also require an attempt ID for a pending verdict.
+    """
+    require_read = strict or sources is not None
     if sources is not None:
         sources.append(path)
     try:
@@ -330,11 +351,12 @@ def delivery_slots(path: Path, *, sources: list[Path] | None = None) -> delivery
     except FileNotFoundError:
         return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
     except OSError:
-        if sources is not None:
+        if require_read:
             raise
         return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
-    return (delivery_state.decode_value(cast(object, json.loads(text))) if sources is not None
-            else delivery_state.decode(text))
+    if require_read:
+        return delivery_state.decode_value(cast(object, json.loads(text)), require_verdict_attempt=strict)
+    return delivery_state.decode(text)
 
 
 def waits_for_user(review_list: Path, row: dict[str, str], root: Path, *,

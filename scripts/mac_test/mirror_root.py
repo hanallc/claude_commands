@@ -22,7 +22,11 @@ class MacMirrorRoot:
     @classmethod
     def read(cls, settings: conf.ConfigRead) -> MacMirrorRoot:
         """Read and validate the configured remote path once."""
-        value = settings.text("mirror_root")
+        return cls.parse(settings.text("mirror_root"))
+
+    @classmethod
+    def parse(cls, value: str) -> MacMirrorRoot:
+        """Validate a mirror root below the Mac home folder."""
         if not value.startswith("~/"):
             raise conf.Unusable("mac_test.conf: mirror_root must start with ~/")
         return cls(value[2:])

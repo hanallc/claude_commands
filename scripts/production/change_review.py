@@ -42,7 +42,7 @@ from typing import TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
-from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
+from scripts.lib import build_folders, conf, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -446,6 +446,18 @@ def read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else BODY
 
 
+def review_list_source(path: Path) -> Path:
+    """Resolve a review list path and reject existing paths that are not files."""
+    source = path.resolve()
+    try:
+        mode = source.stat().st_mode
+    except FileNotFoundError:
+        return source
+    if not stat.S_ISREG(mode):
+        raise ChangeReviewError(f"{source}: the review list must be a regular file")
+    return source
+
+
 def list_file(showrunner: str, *, sources: list[Path] | None = None) -> Path:
     """The list of the top-level showrunner called `showrunner`."""
     folder = lists_directory() if sources is None else lists_directory(sources=sources)
@@ -772,6 +784,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                   else str(producer) if isinstance(producer, str) else row_production(owner, record)
                   for change, owner, producer in zip(changes, row_owners, row_producers)]
     unregistered: set[str] = set()
+    pending_rows: list[str] = []
 
     def write(lines: list[str]) -> list[str]:
         existing = _changes("".join(lines)) if any(isinstance(change, PublicationChange) for change in changes) else []
@@ -821,6 +834,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                                      IMAGE: row_images[index]})
                 for offset, index in enumerate(selected)]
         _insert(lines, end, rows)
+        pending_rows.extend(rows)
         unregistered.update(change.unit_name for index in selected
                             if isinstance(change := changes[index], PublicationChange)
                             and isinstance(change.producer, UnknownProducer) and change.unit_name)
@@ -835,7 +849,14 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
             return f"add {named}"
         return f"{'row' if len(ids) == 1 else 'rows'} {named} from {merged}"
 
-    rows = _edit(path, production, day, write, what)
+    def publish(path: Path, text: str) -> None:
+        try:
+            write_text_atomic(path, text)
+        except AtomicDurabilityUnconfirmed as error:
+            visible = [WrittenReviewRow(path, row) for row in pending_rows]
+            raise ReviewListDurabilityUnconfirmed(path, visible, error) from error
+
+    rows = _edit(path, production, day, write, what, publish=publish)
     for name in sorted(unregistered):
         print(f"change review: no staff row for unit {name}; Producer stays empty")
     return rows
@@ -1515,18 +1536,24 @@ _held_review_locks: ContextVar[frozenset[Path]] = ContextVar("held_review_locks"
 
 
 @contextmanager
-def _list_lock(path: Path) -> Generator[None]:
+def _list_lock(path: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
     folder = path.parent.resolve()
     held = _held_review_locks.get()
     if folder in held:
-        yield
+        yield file_lock.LockResult.ACQUIRED
         return
     descriptor = os.open(folder, os.O_RDONLY)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            if wait:
+                raise
+            yield file_lock.LockResult.BUSY
+            return
         token = _held_review_locks.set(held | {folder})
         try:
-            yield
+            yield file_lock.LockResult.ACQUIRED
         finally:
             _held_review_locks.reset(token)
     finally:
@@ -1534,16 +1561,19 @@ def _list_lock(path: Path) -> Generator[None]:
 
 
 @contextmanager
-def review_delivery_lock(root: Path) -> Generator[None]:
+def review_delivery_lock(root: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
     lock = root.resolve() / ".review-link-delivery.lock"
     held = _held_review_locks.get()
     if lock in held:
-        yield
+        yield file_lock.LockResult.ACQUIRED
         return
-    with file_lock.exclusive(lock):
+    with file_lock.exclusive(lock, wait=wait) as result:
+        if result is file_lock.LockResult.BUSY:
+            yield result
+            return
         token = _held_review_locks.set(held | {lock})
         try:
-            yield
+            yield result
         finally:
             _held_review_locks.reset(token)
 
@@ -1553,6 +1583,17 @@ def checked_review_write(path: Path, root: Path, check: Callable[[], Result]) ->
     """Check a Review card while holding its list and delivery locks."""
     with review_delivery_lock(root), _list_lock(path):
         yield check()
+
+
+@contextmanager
+def try_review_write(path: Path, root: Path) -> Generator[file_lock.LockResult]:
+    """Try the Review delivery lock, then the change list lock."""
+    with review_delivery_lock(root, wait=False) as result:
+        if result is file_lock.LockResult.BUSY:
+            yield result
+            return
+        with _list_lock(path, wait=False) as result:
+            yield result
 
 
 @contextmanager
@@ -1711,6 +1752,32 @@ def row_merge(cells: dict[str, str]) -> RecordedMerge | MergeNotRecorded:
     return RecordedMerge(text) if text else MergeNotRecorded()
 
 
+def _move_to_reviewed(path: Path, lines: list[str], cells: dict[str, str], verdict: str, day: date) -> None:
+    """Write a closed row with its merge, history and recorded production."""
+    identity = staff.initial_snapshot()
+    member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
+    if member is not None:
+        parent = identity.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
+        cells[PRODUCTION] = _cell(parent.name if parent is not None else member.name)
+    if not any(line.strip() == REVIEWED for line in lines):
+        reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
+        _insert(lines, len(lines), reviewed_rows)
+    _add_column(path, lines, REVIEWED, "Merged")
+    for column in ("Review log", IMAGE):
+        if cells.get(column):
+            _add_column(path, lines, REVIEWED, column)
+    if member is not None:
+        _add_column(path, lines, REVIEWED, PRODUCTION)
+    if PRODUCER in cells:
+        _add_column(path, lines, REVIEWED, PRODUCER)
+    if cells.get(KIND):
+        for column in (KIND, CHECK, PRODUCTION):
+            _add_column(path, lines, REVIEWED, column)
+    reviewed, top, _ = _table(path, lines, REVIEWED)
+    _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells,
+                                               "Verdict": _cell(verdict), "Date": day.isoformat()})])
+
+
 def _verdict_write(
     path: Path, row: str, verdict: str, day: date, *, superseded: str = '',
 ) -> RowWrite[VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict]:
@@ -1735,32 +1802,9 @@ def _verdict_write(
         if image:
             removed_image = image
             cells[IMAGE] = ""
-        identity = staff.initial_snapshot()
-        member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
-        if member is not None:
-            parent = identity.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
-            cells[PRODUCTION] = _cell(parent.name if parent is not None else member.name)
-        if not any(line.strip() == REVIEWED for line in lines):
-            reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
-            _insert(lines, len(lines), reviewed_rows)
-        _add_column(path, lines, REVIEWED, "Merged")
         if superseded:
             append_row_review_log(cells, superseded, "nate", datetime.now().astimezone(user_zone()))
-        if cells.get("Review log"):
-            _add_column(path, lines, REVIEWED, "Review log")
-        if member is not None:
-            _add_column(path, lines, REVIEWED, PRODUCTION)
-        if PRODUCER in cells:
-            _add_column(path, lines, REVIEWED, PRODUCER)
-        # Page rows retain their description and proof in the same record after
-        # answering. Older lists keep their existing Reviewed table shape.
-        if cells.get(KIND):
-            for column in (KIND, CHECK, PRODUCTION):
-                _add_column(path, lines, REVIEWED, column)
-        reviewed, top, _ = _table(path, lines, REVIEWED)
-        _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells, "#": row,
-                                                   "Verdict": _cell(verdict), "Date": day.isoformat(),
-                                                   "Merged": cells.get("Merged", "")})])
+        _move_to_reviewed(path, lines, cells, verdict, day)
         return VerdictRecorded(row_merge(cells))
 
     def after() -> None:
@@ -1785,6 +1829,64 @@ def record_verdict(
     except Exception as error:
         report_warning(f"{path} {row}: the verdict is saved. Image cleanup failed: {error}")
     return result
+
+
+def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: Path) -> bool:
+    """Close a row as withdrawn and keep its earlier verdict in the log."""
+    prefix = "Withdrawn: "
+    event = review_events.ReviewLog(stamp, "nate", prefix + _words("reason", words))
+    verdict = "withdrawn"
+
+    def write(lines: list[str]) -> bool:
+        for section in (SECTION, REVIEWED):
+            if not any(line.strip() == section for line in lines):
+                continue
+            columns, first, end = _table(path, lines, section)
+            index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
+            if index is None:
+                continue
+            cells = dict(zip(columns, _cells(lines[index])))
+            events = review_events.decode(_plain(cells.get("Review log", "")))
+            previous = _plain(cells.get("Verdict", ""))
+            if previous == verdict:
+                for earlier in reversed(events):
+                    if earlier.who == event.who and earlier.words.startswith(prefix):
+                        if earlier.words == event.words:
+                            return False
+                        raise ChangeReviewError(f"{row} is already withdrawn")
+            try:
+                slots = change_routing.delivery_slots(delivery, strict=True)
+            except (OSError, ValueError) as error:
+                raise ChangeReviewError(f"{row}: cannot read its verdict delivery record: {error}") from error
+            if isinstance(slots.verdict, delivery_state.DeliveryIntent):
+                raise ChangeReviewError(f"{row} has a pending verdict message. Withdraw it after delivery.")
+            if previous:
+                previous_date = _plain(cells.get("Date", ""))
+                try:
+                    previous_time = datetime.fromisoformat(previous_date)
+                    if previous_time.tzinfo is None:
+                        previous_time = previous_time.replace(tzinfo=stamp.tzinfo)
+                except ValueError:
+                    previous_time = stamp
+                    previous = f"Previous verdict ({previous_date or 'date unavailable'}) — {previous}"
+                events = (*events, review_events.ReviewLog(previous_time, event.who, previous))
+            cells["Review log"] = _cell(review_events.encode((*events, event)))
+            if section == SECTION:
+                del lines[index]
+                _move_to_reviewed(path, lines, cells, verdict, stamp.date())
+            else:
+                _add_column(path, lines, REVIEWED, "Review log")
+                reviewed, _, _ = _table(path, lines, REVIEWED)
+                cells.update({"Verdict": verdict, "Date": stamp.date().isoformat()})
+                lines[index] = _row(path, reviewed, cells) + "\n"
+            return True
+        raise RowNotListed(f"{row} is not on the change review list")
+
+    root = change_routing.review_root()
+    root.mkdir(parents=True, exist_ok=True)
+    delivery = change_routing.delivery_path(root, path, row)
+    with review_delivery_lock(root):
+        return _edit(path, production, stamp.date(), write, lambda _: f"withdraw {row}")
 
 
 def review_rows(path: Path) -> list[dict[str, str]]:
@@ -1923,7 +2025,7 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
         result = scratch.end(f"row:{_owner(path)}-{row}")
         return ([f"removed {folder}" for folder in result]
                 + [f"kept {folder.path}: {folder.reason}" for folder in result.kept])
-    except (scratch.ScratchError, OSError) as error:
+    except (conf.Unusable, scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
 
 
@@ -1982,6 +2084,7 @@ class PendingVerdictCleanup:
     feature_review: str = ''
     superseded_wait: str = ''
     wait_log: WaitSupersessionDestination | NoSavedWaitLogDestination = NO_SAVED_WAIT_LOG_DESTINATION
+    require_git_commit: bool = True
 
     @classmethod
     def for_row(cls, root: Path, path: Path, row: str) -> PendingVerdictCleanup:
@@ -1989,16 +2092,23 @@ class PendingVerdictCleanup:
         return cls(path, row, root / name.replace('.review-link-delivery-', VERDICT_CLEANUP_PREFIX, 1))
 
     @classmethod
-    def load(cls, intent: Path, lists: Path) -> PendingVerdictCleanup:
-        """Read the exact list, row and verdict for restart cleanup."""
-        fields = cast(dict[str, object], json.loads(intent.read_text(encoding='utf-8')))
+    def load(cls, intent: Path, expected_directory: Path | None = None) -> PendingVerdictCleanup:
+        """Read the exact list, row and verdict from a private cleanup record."""
+        with os.fdopen(os.open(intent, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), encoding='utf-8') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise ChangeReviewError(f"{intent}: scratch cleanup record must be private")
+            fields = cast(dict[str, object], json.load(source))
         path = Path(cast(str, fields['list']))
         row = _row_id('row', cast(str, fields['row']))
+        if path != review_list_source(path) or (expected_directory is not None and path.parent != expected_directory):
+            raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
         cleanup = replace(cls.for_row(intent.parent, path, row),
                           verdict=_words('verdict', cast(str, fields['verdict'])),
                           feature_review=cast(str, fields.get('feature_review', '')),
-                          superseded_wait=cast(str, fields.get('superseded_wait', '')))
-        if path.parent != lists or path.is_symlink() or not path.match(PREFIX+'*.md') or cleanup.intent != intent:
+                          superseded_wait=cast(str, fields.get('superseded_wait', '')),
+                          require_git_commit=fields.get('require_git_commit') is not False)
+        if cleanup.intent != intent:
             raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
         if 'wait_log' in fields:
             cleanup = replace(cleanup, wait_log=WaitSupersessionDestination.from_fields(
@@ -2027,12 +2137,15 @@ class PendingVerdictCleanup:
     def confirm_durability(self) -> None:
         """Confirm the visible verdict before recovery performs its closeout."""
         self.sync()
-        _commit([self.path], f'{_owner(self.path)} verdict {self.row}', report_warning=self.commit_failed)
+        _commit([self.path], f'{_owner(self.path)} verdict {self.row}',
+                report_warning=self.commit_failed if self.require_git_commit else _print_warning)
 
     def save(self) -> None:
         fields: dict[str, object] = {
             'list':str(self.path.resolve()), 'row':self.row, 'verdict':self.verdict,
             'feature_review':self.feature_review, 'superseded_wait':self.superseded_wait}
+        if not self.require_git_commit:
+            fields['require_git_commit'] = False
         if isinstance(self.wait_log, WaitSupersessionDestination):
             fields['wait_log'] = self.wait_log.fields()
         write_text_atomic(self.intent, json.dumps(fields)+'\n', new_file_mode=0o600)
@@ -2072,7 +2185,7 @@ class VerdictRefused:
 def _require_verdict_exchange(slots: delivery_state.DeliverySlots, verdict: str, validation_id: str) -> None:
     """Apply the same exchange checks to a single verdict and a batch verdict."""
     try:
-        if isinstance(slots.question, delivery_state.OpenQuestion):
+        if isinstance(slots.question, delivery_state.OpenQuestion) and not slots.validation_requested:
             _ = delivery_state.question_exchange_for_reply(slots.question, '', verdict)
         if validation_id or slots.validation_requested:
             delivery_state.require_exchange_id(
@@ -2118,11 +2231,12 @@ def clear_change_later(path: Path, row: str) -> Generator[None, None, None]:
             raise
 
 
-def _cleared_validation(delivery: Path) -> str:
+def _cleared_validation(delivery: Path, slots: delivery_state.DeliverySlots) -> str:
     fields = cast(dict[str, object], json.loads(delivery.read_text()))
     # A null slot prevents older fields from restoring the completed validation.
     fields["validation"] = None
-    _ = fields.pop("handed_at", None)
+    if isinstance(slots.question, delivery_state.OpenQuestion):
+        fields["question"] = None
     return json.dumps(fields)+"\n"
 
 
@@ -2150,7 +2264,7 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
         except ChangeReviewError as error:
             return VerdictRefused([], str(error))
         if slots.validation_requested and not lands(verdict) and any(item["#"] == local_row for item in pending(path)):
-            cleared = _cleared_validation(delivery)
+            cleared = _cleared_validation(delivery, slots)
             event = _validation_fault_event(production, verdict)
             _edit(path, production, event.time.date(), lambda lines: _append_review_log(path, lines, local_row, event),
                   lambda _: f"review {local_row}", report_warning=warnings.append)
@@ -2171,7 +2285,8 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
             result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
         else:
             result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append,
-                                    publish=publish, superseded=superseded, commit_warning=cleanup.commit_failed)
+                                    publish=publish, superseded=superseded,
+                                    commit_warning=cleanup.commit_failed if cleanup.require_git_commit else warnings.append)
     return _verdict_output(path, local_row, shown, verdict, result, warnings, cleanup=cleanup)
 
 
@@ -2338,10 +2453,38 @@ def _foreign_merges(repo: Path, refs: Mapping[Path, str], production: Path,
     return frozenset(foreign)
 
 
+@dataclass(frozen=True)
+class WrittenReviewRow:
+    list_path: Path
+    markdown: str
+
+
+class ReviewListWriteFailed(ChangeReviewError):
+    """A list write failed after zero or more rows were saved."""
+
+    def __init__(self, list_path: Path, rows: list[WrittenReviewRow], error: Exception) -> None:
+        super().__init__(str(error))
+        self.list_path: Path = list_path
+        self.written_rows: tuple[WrittenReviewRow, ...] = tuple(rows)
+
+
+class ReviewListDurabilityUnconfirmed(ReviewListWriteFailed):
+    """The new rows are visible after the write, but the directory sync failed."""
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
                known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[str]:
+    """Return the Markdown for the rows written to the review lists."""
+    return [row.markdown for row in list_ready_rows(repo, production, merge_branch, review_list=review_list,
+                                                   record=record, selection=selection, known_producer=known_producer)]
+
+
+def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
+                    review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
+                    selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
+                    known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[WrittenReviewRow]:
     """Add live changes on origin/main, or release one completed step of one merge."""
     repo = repo.expanduser().resolve()
     try:
@@ -2376,7 +2519,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     outside = _reviewed_merge_refs_by_doc(repo, lambda: outside_docs, record=record)
     outside_refs = set(outside.values())
     foreign = _foreign_merges(repo, outside, production, merge_branch, record)
-    rows: list[str] = []
+    rows: list[WrittenReviewRow] = []
     matched_step = False
     recorded = checkpoint_producers(record)
     for entry in merges:
@@ -2461,9 +2604,15 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
                 selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
                             and change.item.readiness.step == selection.step]
             stamp = now()
-            rows.extend(append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
-                                    on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                    merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem))
+            try:
+                written = append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
+                                      on_hold=note if isinstance(selection, ReadinessScan) else None,
+                                      merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem)
+            except ReviewListDurabilityUnconfirmed as error:
+                raise ReviewListDurabilityUnconfirmed(path, [*rows, *error.written_rows], error) from error
+            except (ChangeReviewError, OSError, UnicodeError) as error:
+                raise ReviewListWriteFailed(path, rows, error) from error
+            rows.extend(WrittenReviewRow(path, row) for row in written)
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows
@@ -2502,6 +2651,7 @@ class CommandLine(argparse.Namespace):
     see: str = ""
     row: str = ""
     verdict: str = ""
+    reason: str = ""
     validation: str = ""
     kind: str = ""
     production: str = ""
@@ -2700,7 +2850,7 @@ def _batch_item(value: object, index: int, day: date, review_root: Path,
             if slots.validation_requested and not lands(verdict):
                 _, first, end = _table(path, lines, SECTION)
                 if any(line.startswith(f"| {target.row} |") for line in lines[first:end]):
-                    cleared_validations[target] = _cleared_validation(delivery)
+                    cleared_validations[target] = _cleared_validation(delivery, slots)
                     _append_review_log(path, lines, target.row, _validation_fault_event(doc, verdict))
                     return lambda: _validation_fault_output(shown)
             result = change_verdict.write(lines)
@@ -2796,6 +2946,7 @@ ACTION_OPTIONS: dict[str, tuple[str, ...]] = {
     "mark-important": ("list", "production", "row"),
     "set-kind": ("list", "production", "row", "kind"),
     "verdict": ("list", "production", "row", "verdict", "validation"),
+    "withdraw": ("list", "production", "row", "reason"),
     "list-path": ("production",),
     "showrunner": ("production",),
     "backfill-production": ("list", "write"),
@@ -2880,6 +3031,13 @@ def _run(options: CommandLine) -> int:
                 print(line)
             if isinstance(result, VerdictRefused):
                 return 1
+        case "withdraw":
+            target = _row_option(options)
+            shown = row_display_id(target.path, target.row)
+            written = withdraw_row(target.path, target.row, options.reason, now(), production_doc(options.production))
+            print(f"{shown} withdrawn" if written else f"{shown} already withdrawn")
+            for line in end_row_scratch(target.path, target.row):
+                print(line)
         case "list-path":
             print(production_list(options.production))
         case "showrunner":
@@ -2917,12 +3075,12 @@ def _run(options: CommandLine) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict",
+    _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict", "withdraw",
                                                    "mark-important", "set-kind", "list-path", "showrunner",
                                                    "backfill-production", "image", "batch"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "step", "change", "check", "see",
-                 "row", "verdict", "validation", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
+                 "row", "verdict", "reason", "validation", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")

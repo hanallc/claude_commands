@@ -157,7 +157,6 @@ class RosterTests(unittest.TestCase):
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({
             "threshold_percent": 2,
-            "repeat_minutes": 30,
             "stall_minutes": 5,
             "faults_to": "runner",
             "always": [],
@@ -536,7 +535,7 @@ class RosterTests(unittest.TestCase):
             peer.assert_called_once()
             deliver.assert_called_once()
             message = cast(send.Message, deliver.call_args.args[0])
-            self.assertEqual((message.to, message.text), (f"session:{owner.current_session}", "fixture text"))
+            self.assertEqual((message.to, message.text), (f"staff:{owner.id}", "fixture text"))
             with self.assertRaises(SystemExit) as refused:
                 _ = send.send(send.parse(["--to", "bad", "--from", "fixture-reviewer", "--text", "fixture text"]))
             self.assertEqual(refused.exception.code, 2)
@@ -667,7 +666,7 @@ class RosterTests(unittest.TestCase):
         for target in targets:
             registry = mock.Mock(wraps=sessions.read_registry)
             with self.subTest(target=target):
-                previous = f"staff:{owner.id}" if target == owner.name else target
+                previous = f"staff:{owner.id}" if target == owner.name else f"session:{identity}"
                 _ = (state / "keys.json").write_text(json.dumps({"notice": {"last": {previous: started.isoformat()}}}))
                 options = send.parse(["--here", "--to", target, "--from", "fixture", "--text", "Notice",
                                       "--key", "notice", "--repeat-minutes", "30"])
@@ -1151,7 +1150,9 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(recipient.reach, roster.Messageable(f"session:{native}"))
                 route = send.resolve_recipient(f"session:{native}", send.LocalOnly(), observed,
                                                membership=membership)
-                self.assertEqual(route, send.PaneWorkerRecipient(child))
+                self.assertEqual(route, send.ClaudeRecipient(f"session:{native}"))
+                self.assertEqual(send.resolve_recipient(child.name, send.LocalOnly(), observed,
+                                                        membership=membership), send.PaneWorkerRecipient(child))
                 self.assertTrue(broadcast.selects(broadcast.Workers(), recipient))
                 self.assertTrue(broadcast.selects(broadcast.WorkersOfUnit(
                     "session:17e44ec4-3e24-5ae1-b10d-5cf30de9455b", unit.name, recipient.machine), recipient))
@@ -1256,6 +1257,14 @@ class RosterTests(unittest.TestCase):
             found = send.matching_recipients("peer-only", send.LocalThenPeer(), result, membership=membership)
         self.assertIsInstance(found, send.LocalRosterIncomplete)
         peer.assert_not_called()
+
+    def test_roster_reports_every_unreadable_session_record(self) -> None:
+        unreadable = [self.sessions / filename for filename in ("first.json", "second.json")]
+        for path in unreadable:
+            _ = path.write_text("{")
+        result = roster.roster(os.environ, roster.ThisMachine())
+        for path in unreadable:
+            self.assertIn(f"Claude session records: cannot read {path}", result.problems)
 
     def test_a_run_with_an_unreadable_owner_is_a_problem_for_that_run_only(self) -> None:
         run = self.runs / "lost-owner-run"
@@ -1504,7 +1513,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "")
         self.assertEqual(deliver.call_count, 1)
         forwarded = cast(send.Message, deliver.call_args.args[0])
-        self.assertEqual(forwarded.to, 'session:peer-session')
+        self.assertEqual(forwarded.to, 'staff:peer-session')
         self.assertEqual(forwarded.text, 'owner update')
 
     def test_durable_warnings_survive_snapshots_and_do_not_change_roster_exit_status(self) -> None:

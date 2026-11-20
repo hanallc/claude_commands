@@ -746,6 +746,12 @@ class ClaudeUnknown(NamedTuple):
     reason: str
 
 
+class PaneHeldByNonAgents(ClaudeUnknown):
+    """Non-agent processes block the pane. The pane has no other local ownership blocks."""
+
+    __slots__: tuple[str, ...] = ()
+
+
 Claude = LiveClaude | ClaudeNotRunning | ClaudeUnknown
 
 
@@ -787,6 +793,20 @@ class ShellNotObserved:
 
 
 @dataclass(frozen=True)
+class ProvedProcessGeneration:
+    pid: int
+    started: str
+
+
+@dataclass(frozen=True)
+class NoProvedProcessGeneration:
+    """The observation carries no checked process start."""
+
+
+type OwnerGeneration = ProvedProcessGeneration | NoProvedProcessGeneration
+
+
+@dataclass(frozen=True)
 class LabeledSession:
     unit: str
     claude: Claude
@@ -794,6 +814,7 @@ class LabeledSession:
     process: ObservedProcess | ProcessUnobserved = ProcessUnobserved()
     identity: LiveSession | StoredReference | NoSession | UnprovedPaneIdentity = NO_SESSION
     empty: herdr.ObservedEmpty | ShellNotObserved = ShellNotObserved()
+    generation: OwnerGeneration = field(default=NoProvedProcessGeneration(), compare=False, repr=False)
 
 
 def place_text(place: Place) -> str:
@@ -834,6 +855,11 @@ type UnitPaneObservation = LabeledSession | UnreadablePaneList
 @dataclass(frozen=True)
 class ProvedLiveUnit:
     owner: LabeledSession | LiveClaude
+    standalone_generation: OwnerGeneration = field(default=NoProvedProcessGeneration(), compare=False, repr=False)
+
+    @property
+    def generation(self) -> OwnerGeneration:
+        return self.owner.generation if isinstance(self.owner, LabeledSession) else self.standalone_generation
 
 
 @dataclass(frozen=True)
@@ -853,6 +879,11 @@ class UnknownUnit:
     reason: str
 
 
+@dataclass(frozen=True)
+class NonAgentPaneHolders(UnknownUnit):
+    """Resume can wait for the pane holders to exit."""
+
+
 type UnitOwner = ProvedLiveUnit | ProvedAbsentUnit | UnknownUnit
 
 
@@ -868,6 +899,8 @@ def checked_unit_owner(pane: LabeledSession | None, failures: tuple[str, ...] = 
             return UnknownUnit("the registry identity differs from the pane evidence")
         if isinstance(pane.identity, LiveSession) and isinstance(pane.process, ProvedCodexPaneProcess):
             return ProvedLiveUnit(pane)
+        if isinstance(pane.claude, PaneHeldByNonAgents):
+            return NonAgentPaneHolders(pane.claude.reason)
         if isinstance(pane.claude, ClaudeUnknown):
             return UnknownUnit(pane.claude.reason)
         if not isinstance(pane.empty, ShellNotObserved):
