@@ -25,6 +25,16 @@ NOTES_DIRECTORY = ".showrunner-notes"
 GUARD_READY_FILE = "guard-ready.json"
 
 
+def production_backup_root() -> Path:
+    """Return the folder that contains the production backup repositories."""
+    return Path.home() / ".local" / "state" / "production-backups"
+
+
+def production_backup_checkout(owner: staff.StaffId) -> Path:
+    """Return the local Git backup for this production."""
+    return production_backup_root() / owner / "backup"
+
+
 class Refusal(Exception):
     """An invalid request that must leave the production unchanged."""
 
@@ -73,6 +83,11 @@ class ProductionDocument:
     log: Path
     zone: ZoneInfo
     merge_checkout: Path | LegacyProduction = field(default_factory=LegacyProduction, kw_only=True)
+
+    @property
+    def repository_checkout(self) -> Path:
+        """Return the checkout for published repository reads."""
+        return self.merge_checkout if isinstance(self.merge_checkout, Path) else self.checkout
 
     def for_owner(self, owner: staff.StaffRow) -> Production:
         return Production(self.doc, self.name, self.merge_branch, self.checkout, self.log, self.zone, owner,
@@ -461,7 +476,15 @@ def read_guard_ready() -> GuardReady | None:
             return None
         claude = tuple(_claude_guard(entry) for entry in _rows(fields["claude"]))
         codex = tuple(_codex_guard(entry) for entry in _rows(fields["codex"]))
+        events = {"PreToolUse", "PostToolUse"}
         if not claude or not codex:
+            return None
+        if any({entry.event for entry in claude if entry.settings == path} != events
+               for path in {entry.settings for entry in claude}):
+            return None
+        if any({(entry.event, entry.tool) for entry in codex if entry.codex_home == home}
+               != {(event, tool) for event in events for tool in ("Bash", "apply_patch")}
+               for home in {entry.codex_home for entry in codex}):
             return None
         code = Path(__file__).resolve().parents[2]
         ancestor = subprocess.run(

@@ -236,6 +236,14 @@ Its subject is `Merge <unit> phase <N> as-built (<short>) into <branch>`.
 `Promote: none` and an absent field both mean `NoPromotion`.
 Each local Promote checkout must exist before the command pushes.
 
+For an enrolled production, use the exact staff document for live policy.
+The showrunner starts in the main checkout from `Repository`.
+The serving merge unit publishes from the integration worktree on `Merge branch`.
+Run the enrolled production's merge checks in item 143 test copies.
+Resolve the live LOG relative to the main checkout.
+Removal tools protect both checkouts and their branches.
+Sync refuses incoming paths that overlap the live document, LOG, or notes.
+
 - **Origin ancestry:** The checkpoint must occur on an origin branch. The command fetches and checks the unit's Branch first. If necessary, it fetches all origin heads. Machine-readable fetch output identifies current origin refs. Stale tracking refs cannot certify a checkpoint. Neither ancestry checks nor worktree cleanup prune shared refs. This also applies when the checkout normally fetches one branch. The ancestry line names the containing branch. Without a containing branch, the result stays `commit is not on origin`. Scope, conflict checks, and merging use the submitted checkpoint hash. The overlap report checks other units' branches and dirty worktrees. It excludes the submitting unit. Push preparation, publication, batch preparation, and promotion fetch explicit refspecs before they read full origin ref names.
 - **Inputs:** The showrunner staff row supplies the production name and document path. Unit staff rows supply the worktrees. `.unit.toml` supplies each plan. The document supplies `Merge branch`, `Showrunner checkout`, `Log`, and `Merge tests`. It also supplies `Known flakes` and `Known flaky tests`. Flakes name packages. Flaky tests use the form `` `<path::test>`, `<path::test>` ``. `Push` selects `validate_and_push` by default, or `git`. `Promote` accepts `<checkout>[, mac <path>]`. Its type is `NoPromotion | PromoteTo(checkouts, MacCheckout | NoMac)`.
 
