@@ -3085,9 +3085,11 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - The audit stays off. Re-arm needs the fix on main and nate's word.
 
 ### Phase 181 — The five worst removal sites refuse a path outside their own form (item 152)  · status: done
-**Source:** bob, item 152, 2026-11-19 21:03 EST; the five most severe sites of the 178 removal survey. Base main f5eb6c184. Merges tonight, after 177.
+**Source:** bob, item 152, 2026-11-19 21:03 EST; the five most severe sites of the 178 removal survey. Row `1f4c4a055` on main `f5eb6c184`.
 
-#### Work Order
-1. Merge gate recovery (`merge_gate.py`), the Mac lint-copy return (`fix_return.py`, `verify.sh`), Hana shot shutdown (`hana_shot.py`), scratch task end (`scratch.py`) and selection capture (`selection_capture.py`) each remove only a path of their own written form.
-2. None of them removes after a failed check.
-3. Fixture-home tests for each.
+- Merge gate recovery, the Mac lint-copy return, Hana shot shutdown, scratch task end and selection capture each remove only a path of their own written form. None removes after a failed check.
+- Each site keeps a folder from an earlier run and prints `kept for a manual removal list: <path> (<tool>, <reason>)`. `scratch.end` returns `list[KeptFolder]`; a remote check returns `RemoteKeptFolder`.
+- The gate recovery entry stays until the folder and its lease files are gone. Kept Hana records move to `launches/retained/` and never select a process to signal.
+- A failed publication in `copies.py` removes only the folder that the same process made.
+- Fixtures clear inherited `GIT_*`, `RIPGREP_CONFIG_PATH`, `STAFF_CONFIG`, `BASH_ENV`, `CARGO_TARGET_DIR` and `COPIES_*`, and use a private home, config and session root.
+- Row tests: 54 modules, both layouts, 108 of 108 green. Reviews: blind review, 7 closure reviews, 8 repairs.
