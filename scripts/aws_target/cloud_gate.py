@@ -52,6 +52,17 @@ class LocalFallback:
     reason: str
 
 
+class LaunchLogLockFallback(LocalFallback):
+    """The worker saved a launch log lock failure in its outcome."""
+
+
+@final
+class LaunchLogLockWaitExpired(TimeoutError):
+    """The launch log entry is missing because the append lock wait expired."""
+
+    code = 'launch_log_lock_timeout'
+
+
 @dataclass
 class CloudAttempt:
     directory: Path
@@ -139,10 +150,14 @@ def _saved_gate_job(record: dict[str, object]) -> StepJob | GateJobNotRecorded:
         return GATE_JOB_NOT_RECORDED
 
 
-def append_launch(directory: Path, row: dict[str, object], *, gate_job: StepJob | GateJobNotRecorded) -> None:
+def append_launch(directory: Path, row: dict[str, object], *, gate_job: StepJob | GateJobNotRecorded,
+                  lock_timeout_s: store.AppendLockWait = 'blocking') -> None:
     """Append one launch event with the queue's job record."""
-    with store.locked_append(directory / 'cloud-gate-launches.jsonl') as handle:
-        store.append_locked(handle, {**row, 'gate_job': snapshot_codec.snapshot_value(gate_job)})
+    try:
+        with store.locked_append(directory / 'cloud-gate-launches.jsonl', lock_timeout_s=lock_timeout_s) as handle:
+            store.append_locked(handle, {**row, 'gate_job': snapshot_codec.snapshot_value(gate_job)})
+    except store.AppendLockWaitExpired as error:
+        raise LaunchLogLockWaitExpired(f'{error}. The launch log entry is missing.') from error
 
 
 def capacity_error(reason: str) -> bool:
@@ -564,9 +579,11 @@ class GateWorker:
         _ = cleanup_attempts(attempts, self)
 
     def record_launch(self, request: dict[str, object], size: str, zone: str,
-                      result: Literal['launched', 'refused', 'finished'], reason: str = '', *, gate_s: float = 0) -> None:
+                      result: Literal['launched', 'refused', 'finished'], reason: str = '', *,
+                      gate_s: float = 0, lock_timeout_s: store.AppendLockWait = 'blocking',
+                      event_at: float | Literal['current_time'] = 'current_time') -> None:
         error_code = launch_error_code(reason)
-        now = self.clock()
+        now = self.clock() if event_at == 'current_time' else event_at
         row: dict[str, object] = {'time': now, 'attempt': request['attempt'], 'instance_type': size,
             'vcpus': self.size_vcpus, 'result': result, 'mode': request['mode'], 'region': self.box_region}
         if result != 'finished' and self.price_read_evidence:
@@ -575,7 +592,7 @@ class GateWorker:
             row['gate_s'] = gate_s
         else:
             row.update({'availability_zone': zone, 'error_code': error_code, 'reason': reason})
-        append_launch(self.book.directory, row, gate_job=_saved_gate_job(request))
+        append_launch(self.book.directory, row, gate_job=_saved_gate_job(request), lock_timeout_s=lock_timeout_s)
         if result == 'refused':
             if error_code in run_cost.QUOTA_REFUSALS:
                 pool = ledger.SpotQuotaPool(self.box_region, ledger.spot_quota_class(size))
@@ -795,6 +812,7 @@ class GateWorker:
                     return instance
                 raise AwsUnavailable('The expired launch remains unconfirmed')
             launch_json = json.dumps(arguments)
+            log_lock_timeout_s = settings().number('launch_log_lock_timeout_s')
             try:
                 for retry in range(settings().whole('launch_reply_tries')):
                     try:
@@ -802,7 +820,7 @@ class GateWorker:
                             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
                                 'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
                         reply = api.call('run-instances', '--cli-input-json', launch_json)
-                        self.record_launch(request, size, zone, 'launched')
+                        accepted_at = self.clock()
                         break
                     except AwsUnavailable as error:
                         self.record_launch(request, size, zone, 'refused', str(error))
@@ -843,9 +861,23 @@ class GateWorker:
             if len(instances) != 1:
                 raise AwsUnavailable('The launch reply has no unique instance')
             instance = ledger.text(instances[0], 'InstanceId')
-            save(path, {**launch, 'instance': instance})
-            self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
+            attempt = ledger.text(request, 'attempt')
             self.box_zone = zone
+            try:
+                try:
+                    save(path, {**launch, 'instance': instance})
+                finally:
+                    self.book.record_gate_launch_identity(attempt, ledger.GateRunning(instance), instance_type=size)
+                self.record_launch(request, size, zone, 'launched', lock_timeout_s=log_lock_timeout_s,
+                                   event_at=accepted_at)
+                self.book.refresh_gate_prices()
+            except (OSError, ValueError, KeyError, TypeError):
+                try:
+                    self.terminate(attempt, instance)
+                except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
+                    print(f'Cloud gate could not confirm termination after a failed launch step: {error}',
+                          file=sys.stderr, flush=True)
+                raise
             return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
         return LocalFallback('Spot capacity is unavailable in every configured region')
@@ -1007,6 +1039,8 @@ class GateWorker:
                     self.terminate(attempt, instance, result_seen_at=result_seen_at)
                     interruption_confirmed = bool(interruption_code)
             return {'status': 'complete', 'instance': instance, 'result_file': RESULT_FILE}
+        except LaunchLogLockWaitExpired as error:
+            return {'status': 'fallback', 'reason': str(error), 'error_code': error.code}
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
             # Saved arguments mean AWS may have accepted the launch; a saved variant alone does not.
@@ -1216,7 +1250,9 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         outcome = LocalFallback(str(error))
     if isinstance(outcome, LocalFallback):
         if attempt.interruptions:
-            outcome = LocalFallback(f'Spot interruption on {attempt.interruptions} attempts; ' + outcome.reason)
+            outcome = replace(outcome, reason=f'Spot interruption on {attempt.interruptions} attempts; ' + outcome.reason)
+        if isinstance(outcome, LaunchLogLockFallback):
+            return outcome
         try:
             append_launch(attempt.directory, {'time': time.time(), 'attempt': attempt.identifier,
                 'instance_type': '', 'vcpus': 0, 'result': 'fallback', 'mode': attempt.mode.value, 'region': '',
@@ -1413,6 +1449,8 @@ def run_service(repo: Path, folder: Path, request: dict[str, object], command: S
     if not (folder / 'outcome.json').exists():
         return LocalFallback('The scaler service has no final result')
     outcome = read(folder / 'outcome.json')
+    if outcome.get('error_code') == LaunchLogLockWaitExpired.code:
+        return LaunchLogLockFallback(ledger.text(outcome, 'reason'))
     if outcome.get('status') != 'complete':
         return LocalFallback(ledger.text(outcome, 'reason'))
     try:

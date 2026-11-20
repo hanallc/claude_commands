@@ -2355,27 +2355,45 @@ class CostLedger:
             state.gate_quota_refusals.append(GateQuotaRefusal(pool, state.live_gate_vcpus(now).get(pool, 0), int(now)))
             self._save(state)
 
-    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
+    @staticmethod
+    def _apply_gate_outcome(state: LedgerEvidence, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated,
+                            instance_type: str, now: int) -> bool:
         """Preserve confirmed termination against every later outcome."""
-        with self._locked() as state:
-            if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
-                return
-            now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at
-            cooldown = inf
-            if state.gate_quota_refusals:
-                try:
-                    cooldown = conf.read_or_repository('cloud_gate').whole('capacity_cooldown_seconds')
-                except conf.Unusable:
-                    # Save the outcome and clear marks by count even if the cooldown is unavailable.
-                    pass
-            if isinstance(outcome, GateRunning):
-                # Clear expired marks before this launch increases the count.
-                state.clear_ended_quota_refusals(now, cooldown)
-            state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type)
-                                       if row.attempt == attempt else row for row in state.gate_reservations]
+        if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
+            return False
+        cooldown = inf
+        if state.gate_quota_refusals:
+            try:
+                cooldown = conf.read_or_repository('cloud_gate').whole('capacity_cooldown_seconds')
+            except conf.Unusable:
+                # Use the live count if the cooldown is unavailable.
+                pass
+        if isinstance(outcome, GateRunning):
+            # Clear expired marks before this launch increases the count.
             state.clear_ended_quota_refusals(now, cooldown)
-            self._price_gates(state, self.read_bills(), now)
-            self._save(state)
+        state.gate_reservations = [replace(row, state=outcome, instance_type=instance_type or row.instance_type)
+                                   if row.attempt == attempt else row for row in state.gate_reservations]
+        state.clear_ended_quota_refusals(now, cooldown)
+        return True
+
+    def record_gate_launch_identity(self, attempt: str, outcome: GateRunning, *, instance_type: str) -> None:
+        """Save the running instance before the launch log append."""
+        with self._locked() as state:
+            if self._apply_gate_outcome(state, attempt, outcome, instance_type, int(time.time())):
+                self._save(state)
+
+    def refresh_gate_prices(self) -> None:
+        """Save prices from the current launch log and bills."""
+        with self.transaction() as state:
+            self._price_gates(state, self.read_bills(), int(time.time()))
+
+    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
+        """Save the outcome with current prices."""
+        with self._locked() as state:
+            now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at
+            if self._apply_gate_outcome(state, attempt, outcome, instance_type, now):
+                self._price_gates(state, self.read_bills(), now)
+                self._save(state)
 
     def observe(self, observation: InstanceObservation, *, confirms_transition: bool = False) -> None:
         if observation.state == "unknown":

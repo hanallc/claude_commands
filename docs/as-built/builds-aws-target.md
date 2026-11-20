@@ -851,6 +851,16 @@ It records copies before it waits for image readiness.
 The deployment record stores ordered regional launch resources and keeps artifact resources at the top level.
 The reader migrates an old single-region record once.
 Launch state, launch logs, and reservations retain the box region.
+Before the launch request, the worker saves the request and its token in `launch.json`.
+The worker captures the launch time when AWS accepts the request.
+The worker tries to save the instance ID in `launch.json` and the cost ledger.
+If either identity write fails, the worker requests termination after it has tried both writes.
+After both writes succeed, the worker takes the launch log lock and repairs any partial row at the end.
+The worker appends the launch with the saved time, then updates prices from the launch log and bills.
+The `launch_log_lock_timeout_s` setting limits this lock wait to five seconds by default.
+If the wait expires, the worker requests termination for the saved instance.
+The worker reports `launch_log_lock_timeout` and states that the launch log entry is missing.
+The controller returns that reason without another append to the busy launch log.
 Recovery replays saved launch arguments in the saved region before it uses the current variants.
 Status, termination, and expired-launch searches use that region.
 Reconciliation searches every configured region for an expired reservation without a recorded region.
