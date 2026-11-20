@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 
 from scripts.build_queue import admission_records as records, head_stall
-from scripts.build_queue.queue_fixture import fixture_reservation
+from scripts.build_queue.queue_fixture import fixture_reservation, write_process
 from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
 from scripts.buildlog import cli, mac_idle, sample
 from scripts.lint.memory_test_support import admission_policy_fixture, config_environment
@@ -115,8 +115,8 @@ class FindStallTests(unittest.TestCase):
                 (10, f"BUILDLOG_STEP_SCOPE={second_scope}\0".encode(), "VmRSS: 1024 kB\n"),
                 (11, f"BUILDLOG_STEP_SCOPE={second_scope}\0".encode(), "VmRSS: 1024 kB\n"),
             ):
+                write_process(proc, pid)
                 process = proc / str(pid)
-                process.mkdir(parents=True)
                 _ = (process / "environ").write_bytes(scope)
                 _ = (process / "status").write_text(status)
             (proc / "9").mkdir()
@@ -125,6 +125,10 @@ class FindStallTests(unittest.TestCase):
             _ = self.enterContext(mock.patch.object(head_stall, "PROC", proc))
             _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(builds)})))
             one_unreadable = ("sccache: 1 compiler not readable; uses can be low",)
+            scan_incomplete = ("sccache: compiler scan incomplete; uses can be low",)
+            incomplete = records.RunningStep("", "sccache.service", "compile", "builds.slice", 0,
+                records.CompilerServiceMemory(GIB, pid=7, anonymous_source=COMPILER_SCOPE,
+                    compiler_evidence=records.CompilerEvidenceIncomplete("compiler job PID was reused")), pid=7)
             for name, second_holder, service, amounts, header in (
                 ("both jobs", second, (compiler_service(first_job, second_job, source=COMPILER_SCOPE),),
                  ("10.2 GiB", "12.3 GiB"), ()),
@@ -147,8 +151,10 @@ class FindStallTests(unittest.TestCase):
                 ("the process-tree holder can rule out a job assigned to another holder", second_tree,
                  (compiler_service(first_job, source=COMPILER_SCOPE),),
                  ("10.2 GiB", "0.3 GiB"), ()),
+                ("reused PID with the same source members and no verified jobs", second, (incomplete,),
+                 ("0.2 GiB", "0.3 GiB"), scan_incomplete),
                 ("missing service", second, (),
-                 ("0.2 GiB", "0.3 GiB"), ("sccache: compiler scan incomplete; uses can be low",)),
+                 ("0.2 GiB", "0.3 GiB"), scan_incomplete),
             ):
                 with self.subTest(name=name):
                     queue = snapshot([waiter(NOW - 3600)], (first, second_holder, *service))

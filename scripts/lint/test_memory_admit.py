@@ -5362,37 +5362,53 @@ class ProgressKeepAsideTests(unittest.TestCase):
             self.assertIsInstance(reading.compiler_evidence, admission_records.CompilerEvidenceIncomplete)
 
     def test_compiler_service_excludes_a_pid_reused_after_the_membership_read(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            scope = root / "builds.slice" / "sccache.service"
-            proc = root / "proc"
-            pid = 11
-            write_scope(scope, members=(pid,), current=GIB, anonymous=GIB)
-            write_process(proc, pid, GIB, start="10")
-            self.executable(proc, pid, "rustc")
-            process = proc / str(pid)
-            _ = (process / "comm").write_text("rustc\n")
-            _ = (process / "environ").write_bytes(b"BUILDLOG_STEP_SCOPE=/fixture/build.scope\0")
-            read_text = Path.read_text
-            replaced = False
+        for name, same_members in (("reused PID leaves the service", False),
+                                   ("same members with a changed executable and reused PIDs", True)):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                scope = root / "builds.slice" / "sccache.service"
+                proc = root / "proc"
+                pid, other_job, daemon = 11, 12, 13
+                members = (pid, other_job, daemon) if same_members else (pid,)
+                total = len(members) * GIB
+                write_scope(scope, members=members, current=total, anonymous=total)
+                for member in members:
+                    program = "sccache" if member == daemon else "rustc"
+                    write_process(proc, member, GIB, start="10")
+                    self.executable(proc, member, program)
+                    process = proc / str(member)
+                    self.assertGreater((process / "comm").write_text(program + "\n"), 0)
+                    environment = b"HOME=/fixture\0" if member == daemon else b"BUILDLOG_STEP_SCOPE=/fixture/build.scope\0"
+                    self.assertGreater((process / "environ").write_bytes(environment), 0)
+                trigger = scope / ("memory.current" if same_members else "cgroup.procs")
+                read_text = Path.read_text
+                replaced = False
 
-            def reuse_after_membership(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
-                nonlocal replaced
-                content = read_text(path, encoding=encoding, errors=errors)
-                if path == scope / "cgroup.procs" and not replaced:
-                    replaced = True
-                    _ = path.write_text("")
-                    write_process(proc, pid, 2 * GIB, start="11")
-                return content
+                def reuse_after_membership(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                    nonlocal replaced
+                    content = read_text(path, encoding=encoding, errors=errors)
+                    if path == trigger and not replaced:
+                        replaced = True
+                        if same_members:
+                            self.executable(proc, pid, "other")
+                            write_process(proc, other_job, 2 * GIB, start="11")
+                            write_process(proc, daemon, GIB, start="11")
+                        else:
+                            self.assertEqual(path.write_text(""), 0)
+                            write_process(proc, pid, 2 * GIB, start="11")
+                    return content
 
-            with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(scope.parent)}), patch.object(
-                    Path, "read_text", reuse_after_membership):
-                (reading,) = gate.sccache_memory(proc)
-            assert isinstance(reading, admission_records.CompilerServiceMemory)
-            self.assertTrue(replaced)
-            self.assertIsInstance(reading.compiler_evidence, admission_records.CompilerEvidenceIncomplete)
-            self.assertEqual(reading.jobs, ())
-            self.assertEqual(reading.bytes, GIB)
+                with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(scope.parent)}), patch.object(
+                        Path, "read_text", reuse_after_membership):
+                    (reading,) = gate.sccache_memory(proc)
+                assert isinstance(reading, admission_records.CompilerServiceMemory)
+                self.assertTrue(replaced)
+                self.assertIsInstance(reading.compiler_evidence, admission_records.CompilerEvidenceIncomplete)
+                self.assertEqual(reading.jobs, ())
+                self.assertEqual(reading.bytes, total)
+                if same_members:
+                    self.assertEqual(reading.anonymous_source, admission_records.ScopeSource(scope, frozenset(members)))
+                    self.assertEqual(reading.pid, admission_records.PidNotRecorded())
 
     def test_shared_process_use_is_counted_once_before_distinct_step_profiles_are_grouped(self) -> None:
         rows = (self.reservation("build", identity="z-parent"), self.reservation("clippy", identity="a-child"))

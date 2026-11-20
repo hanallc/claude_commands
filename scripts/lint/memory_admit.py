@@ -1614,11 +1614,14 @@ def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
     """Charge each verified compiler job once inside the compiler service."""
     directory = builds_slice_cgroup() / "sccache.service"
 
-    def read(members: MemberSnapshot) -> tuple[MeasuredMemory, dict[int, str | OSError]]:
-        return slice_working_set(directory), read_process_samples(members.jobs, proc)
+    def read(members: MemberSnapshot) -> tuple[MeasuredMemory, dict[int, str | OSError], dict[int, str]]:
+        reading = slice_working_set(directory)
+        samples = read_process_samples(members.jobs, proc)
+        programs = member_programs(members.identities.keys() - members.jobs.keys(), proc, skip_unreadable=True)
+        return reading, samples, programs
 
     try:
-        (reading, samples), evidence = read_with_members(lambda: compiler_members(proc), read, proc)
+        (reading, samples, programs), evidence = read_with_members(lambda: compiler_members(proc), read, proc)
     except (OSError, ValueError) as error:
         if isinstance(error, FileNotFoundError) and not directory.exists():
             return []
@@ -1633,8 +1636,12 @@ def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
     stable_pids = evidence.stable_pids()
     scopes: dict[Path, dict[int, str | OSError]] = {}
     for pid, scope in before.jobs.items():
-        if pid in stable_pids and after.jobs.get(pid) == scope:
-            scopes.setdefault(scope, {})[pid] = samples[pid]
+        identity = before.identities[pid]
+        if (not isinstance(identity, MemberIdentity) or isinstance(identity.executable, ExecutableUnreadable)
+                or identity != after.identities.get(pid) or after.jobs.get(pid) != scope):
+            compilers = records.CompilerEvidenceIncomplete(f"{scope}: compiler job {pid} identity or scope unverified")
+            continue
+        scopes.setdefault(scope, {})[pid] = samples[pid]
     for scope, processes in sorted(scopes.items()):
         measured = measured_processes(processes, stable_pids, proc, compilers=compilers)
         measured_source = measured.anonymous_source
@@ -1645,10 +1652,9 @@ def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
         jobs.append(CompilerJob(scope, use))
         if isinstance(use, RunUseUnavailable):
             compilers = records.CompilerEvidenceIncomplete(use.reason)
-    daemon_candidates = (before.identities.keys() & after.identities.keys()) - before.jobs.keys() - after.jobs.keys()
-    programs = member_programs(daemon_candidates, proc, skip_unreadable=True)
+    daemon_candidates = stable_pids - before.jobs.keys() - after.jobs.keys()
     servers = [pid for pid in daemon_candidates if programs.get(pid) == "sccache" or (
-        pid in stable_pids and isinstance(identity := before.identities[pid], MemberIdentity) and identity.sccache_daemon())]
+        isinstance(identity := before.identities[pid], MemberIdentity) and identity.sccache_daemon())]
     source = before.job_scope_source if before.job_scope_source == after.job_scope_source else records.NoSource()
     if isinstance(reading.anonymous, RunUseUnavailable):
         compilers = records.CompilerEvidenceIncomplete(reading.anonymous.reason)

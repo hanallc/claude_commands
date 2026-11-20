@@ -148,7 +148,8 @@ def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
             continue
         source = memory.anonymous_source
         if isinstance(source, records.ScopeSource):
-            if all(isinstance(job.use, records.AnonymousRunUse) for job in memory.jobs):
+            if (not isinstance(memory.compiler_evidence, records.CompilerEvidenceIncomplete)
+                    and all(isinstance(job.use, records.AnonymousRunUse) for job in memory.jobs)):
                 return CompleteCompilerScan()
             members = source.members
         else:
@@ -185,10 +186,12 @@ def find_stall(snapshot: QueueSnapshot, last_memory_admission: float, now: float
     quiet = now - quiet_since
     if waited < limit or quiet < limit:
         return NoStall()
+    compiler_uses = gate.compiler_job_uses(inputs.running)
     holders = tuple(Holder(step.step, step.folder, step.pid, step.promise,
                            attributed.use.bytes if isinstance(attributed.use, records.AnonymousRunUse) else attributed.use,
                            max(0.0, now - step.started_at) if step.started_at > 0 else HolderAdmissionUnavailable())
-                    for _, step, attributed in gate.attributed_step_uses(inputs) if step.promise > 0)
+                    for _, step, attributed in gate.attributed_step_uses(inputs, compiler_uses=compiler_uses)
+                    if step.promise > 0)
     return HeadStall(last_memory_start, head.get("step", "step"), head.get("folder", ""),
                      head["pid"], head["need"], waited, quiet, holders, _compiler_scan(inputs.running))
 
