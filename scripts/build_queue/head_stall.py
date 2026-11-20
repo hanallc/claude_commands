@@ -210,7 +210,11 @@ def builds_text(stall: HeadStall) -> str:
 
 def _alert_text(stall: HeadStall, now: float) -> str:
     instant = datetime.fromtimestamp(now, UTC)
-    holds = build_hold.natedev_holds(build_hold.holder_directory())
+    directory = build_hold.holder_directory()
+    try:
+        holds = build_hold.natedev_holds(directory)
+    except OSError:
+        return builds_text(stall)
     for holder in holds.in_force:
         if not build_hold.release_overdue(holder.release, instant):
             release_time = build_hold.release_eta_text(holder.release)

@@ -6,7 +6,7 @@ import os
 from collections.abc import Callable
 from contextlib import redirect_stderr
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 import subprocess
@@ -16,6 +16,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.build_hold import build_hold
 from scripts.build_queue import admission_records as records, head_stall
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
@@ -313,6 +314,26 @@ class WatchTests(unittest.TestCase):
                 self.assertEqual([text for _, text in self.sent], [expected, expected])
                 _ = self.observe(queue, now + 60)
                 self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+
+    def test_a_hold_read_error_sends_the_normal_alert(self) -> None:
+        with mock.patch.object(build_hold, "natedev_holds", side_effect=PermissionError("cannot list holders")):
+            stall = self.observe(STALLED, NOW)
+        assert isinstance(stall, head_stall.HeadStall)
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+        self.assertEqual([text for _, text in self.sent], [head_stall.builds_text(stall)] * 2)
+
+    def test_a_hold_that_starts_during_a_reported_stall_sends_no_second_alert(self) -> None:
+        self.assertIsInstance(self.observe(STALLED, NOW), head_stall.HeadStall)
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+
+        _ = (self.holders / "natemerge").write_text(json.dumps({
+            "holder": "natemerge", "for": "landing merge test",
+            "since": datetime.fromtimestamp(NOW + 1, UTC).isoformat(),
+            "release_eta": datetime.fromtimestamp(NOW + 3600, UTC).isoformat(),
+        }))
+
+        self.assertIsInstance(self.observe(STALLED, NOW + 60), head_stall.HeadStall)
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
 
     def test_only_the_failed_recipient_retries(self) -> None:
         self.mock_send_outcomes((0, "SENT"), (3, "FAILED"), (0, "SENT"))
