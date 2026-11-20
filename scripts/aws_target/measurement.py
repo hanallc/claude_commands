@@ -37,7 +37,9 @@ class MeasurementInputs:
     settings: SpendingSettings | MeasurementUnavailable
 
 
-def read_inputs(configuration: Path | conf.ConfigRead, directory: Path) -> MeasurementInputs:
+def read_inputs(configuration: Path | conf.ConfigRead | ledger.SpendEvidenceAt, directory: Path) -> MeasurementInputs:
+    if isinstance(configuration, ledger.SpendEvidenceAt):
+        return MeasurementInputs(configuration.state, configuration.settings)
     book = ledger.CostLedger(directory)
     try:
         state = book.read_snapshot()
@@ -59,7 +61,8 @@ def record_go_live(directory: Path, now: int) -> None:
         _ = create_text_atomic(path, json.dumps({'at': now}) + '\n')
 
 
-def read_status_measurement(configuration: Path | conf.ConfigRead, directory: Path, now: int, *,
+def read_status_measurement(configuration: Path | conf.ConfigRead | ledger.SpendEvidenceAt,
+                            directory: Path, now: int, *,
                             inputs: MeasurementInputs | None = None) -> AwsStatusMeasurement | MeasurementUnavailable:
     try:
         source = read_inputs(configuration, directory) if inputs is None else inputs
@@ -79,7 +82,8 @@ def read_status_measurement(configuration: Path | conf.ConfigRead, directory: Pa
         return MeasurementUnavailable(str(error))
 
 
-def read_measurement(configuration: Path | conf.ConfigRead, directory: Path, now: int, *,
+def read_measurement(configuration: Path | conf.ConfigRead | ledger.SpendEvidenceAt,
+                     directory: Path, now: int, *,
                      inputs: MeasurementInputs | None = None) -> AwsMeasurement | MeasurementUnavailable:
     status = read_status_measurement(configuration, directory, now, inputs=inputs)
     if isinstance(status, MeasurementUnavailable):
@@ -87,7 +91,8 @@ def read_measurement(configuration: Path | conf.ConfigRead, directory: Path, now
     try:
         go_live_row = mac_test.read_json_object(directory / 'go-live.json')
         go_live = ledger.instant(go_live_row, 'at') if go_live_row is not None else MeasurementUnavailable('go-live time is not recorded')
-        readings = ledger.CostLedger(directory).validated_bills(now)
+        readings = (configuration.validated_bills if isinstance(configuration, ledger.SpendEvidenceAt)
+                    else ledger.CostLedger(directory).validated_bills(now))
         return AwsMeasurement(status.permission, status.costs, status.events,
                               status.monthly_limit_usd, readings, go_live)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:

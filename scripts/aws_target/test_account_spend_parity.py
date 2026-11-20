@@ -12,7 +12,7 @@ import sys
 from typing import override
 from unittest import mock
 
-from scripts.aws_target import aws_page, aws_target, config, ledger, spend
+from scripts.aws_target import aws_page, aws_target, config, ledger, measurement, remote, spend
 from scripts.aws_target.aws_cli import AwsCli
 from scripts.aws_target.ledger_test_support import SpendReferenceFixture, instant
 
@@ -750,15 +750,22 @@ class AccountSpendParityTests(SpendReferenceFixture):
         self.record('65 later', page_day=utc_day(JAN1), cap_day=utc_day(JAN1))
 
         self.scene('66')
+        other = self.root / 'report-settings.conf'
+        _ = other.write_bytes(self.settings.read_bytes())
         self.replace('fallback_usd_per_hour', '2')
         self.run_builder(self.now - HOUR, self.now)
-        other = self.root / 'report-settings.conf'
-        _ = other.write_text(self.original_settings)
         self.record('66')
         report = spend.read_spend(other, self.book.directory, self.now, utc_day(self.now))
         assert isinstance(report, spend.Spend)
         day, = (row for row in report.days if row.day == utc_day(self.now))
         self.assertEqual(day.usd, Decimal(1))
+        evidence = ledger.capture_spend_evidence(self.book.directory, self.now)
+        assert isinstance(evidence, ledger.SpendEvidenceAt)
+        account = ledger.utc_account_spend(evidence)
+        assert isinstance(account, ledger.UtcAccountSpend)
+        today = account.days[-1]
+        assert isinstance(today, ledger.UtcDaySpend)
+        self.assertEqual(today.usd, Decimal(2))
 
         jan15 = JAN1 + 14 * DAY
         self.scene('67', now=jan15 + DAY + 12 * HOUR)
@@ -898,6 +905,162 @@ print(floor.day, floor.usd, decision.reason)
             self.assertEqual(watch.settlement, expected)
         reading, = self.book.read_snapshot().reconciliations
         self.assertEqual(reading.established_days, (ledger.EstablishedDayCost('2026-01-01', Decimal(7)),))
+
+    def captured_utc_spend(self) -> ledger.UtcAccountSpend:
+        evidence = ledger.capture_spend_evidence(self.book.directory, self.now, settings_path=self.settings)
+        self.assertIsInstance(evidence, ledger.SpendEvidenceAt, evidence)
+        assert isinstance(evidence, ledger.SpendEvidenceAt)
+        account = ledger.utc_account_spend(evidence)
+        self.assertIsInstance(account, ledger.UtcAccountSpend, account)
+        assert isinstance(account, ledger.UtcAccountSpend)
+        return account
+
+    def saved_utc_bill(self, start: int, usd: str, *usage: ledger.UsageTypeCost,
+                       read_at: int, settled: bool = True, provisional: bool = False,
+                       earlier: tuple[tuple[int, str], ...] = ()) -> None:
+        self.write_bill(start, usd, *usage, at=read_at, settled=settled, provisional=provisional, earlier=earlier)
+        self.book.reconcile(ledger.CostReconciliation(read_at, start, start + DAY, Decimal(usd), 'Cost Explorer'))
+
+    def test_utc_capture_defers_an_active_and_an_interrupted_refresh(self) -> None:
+        self.scene('capture-refresh')
+        self.saved_utc_bill(JAN1, '2', spot_bill('2', '2'), read_at=JAN2 + HOUR)
+        previous = self.captured_utc_spend()
+        self.assertEqual(previous.months[0].usd, Decimal(2))
+        with self.book.transaction():
+            self.write_bill(JAN1, '5', spot_bill('5', '5'), at=JAN2 + 2 * HOUR)
+            self.assertEqual(ledger.capture_spend_evidence(self.book.directory, self.now, settings_path=self.settings),
+                             ledger.SpendEvidenceUnavailable('cost-ledger.lock is locked'))
+        self.assertEqual(ledger.capture_spend_evidence(self.book.directory, self.now, settings_path=self.settings),
+                         ledger.SpendEvidenceUnavailable('2026-01-01 has an incomplete Cost Explorer publication'))
+        self.book.reconcile(ledger.CostReconciliation(JAN2 + 2 * HOUR, JAN1, JAN2, Decimal(5), 'Cost Explorer'))
+        updated = self.captured_utc_spend()
+        self.assertEqual(updated.months[0].usd, Decimal(5))
+
+    def test_utc_capture_detects_launch_and_journal_changes(self) -> None:
+        self.scene('capture-sources')
+        log = self.book.launch_history_path
+        row = {'result': 'launched', 'attempt': 'fixture', 'time': self.now,
+               'instance_type': 'm7a.8xlarge', 'region': 'us-east-1'}
+        launch = json.dumps(row)
+        future = json.dumps({**row, 'time': self.now + 1})
+        _ = log.write_text(launch + '\n' + future + '\n' + '{"unfinished":')
+        evidence = ledger.capture_spend_evidence(self.book.directory, self.now, settings_path=self.settings)
+        assert isinstance(evidence, ledger.SpendEvidenceAt)
+        self.assertEqual(len(evidence.launches), 1)
+        with ledger.verify_spend_revision(self.book.directory, evidence) as revision:
+            self.assertIsInstance(revision, ledger.SpendRevisionVerified)
+            self.assertEqual(ledger.capture_spend_evidence(self.book.directory, self.now, settings_path=self.settings),
+                             ledger.SpendEvidenceUnavailable('cost-ledger.lock is locked'))
+        refusal = json.dumps({'result': 'refused', 'time': self.now})
+        _ = log.write_text(launch + '\n' + refusal + '\n')
+        with ledger.verify_spend_revision(self.book.directory, evidence) as revision:
+            self.assertEqual(revision, ledger.SpendEvidenceUnavailable('spend sources changed before publication'))
+        journal = self.book.directory / 'hana' / 'provider'
+        journal.mkdir(parents=True)
+        _ = (journal / 'first.json').write_text('{"action":"observe"}')
+        read = remote.read_record
+
+        def append_record(path: Path) -> dict[str, object]:
+            _ = (journal / 'second.json').write_text('{"action":"observe"}')
+            return read(path)
+
+        with mock.patch.object(remote, 'read_record', side_effect=append_record):
+            self.assertEqual(ledger.capture_spend_evidence(self.book.directory, self.now, settings_path=self.settings),
+                             ledger.SpendEvidenceUnavailable('spend sources changed during capture'))
+
+    def test_utc_capture_verifies_the_gate_pricing_recovery_source(self) -> None:
+        self.scene('gate-settings-recovery')
+        gate_path = self.root / 'cloud_gate.conf'
+        _ = gate_path.write_text('enabled=on\n')
+        recovery_path = self.root / 'repository-cloud_gate.conf'
+        _ = recovery_path.write_text('# whole: 1..\nroot_gib=42\n')
+        with mock.patch.object(ledger, '_REPOSITORY_GATE_SPEND_SETTINGS', recovery_path):
+            evidence = ledger.capture_spend_evidence(self.book.directory, self.now, settings_path=self.settings)
+            self.assertIsInstance(evidence, ledger.SpendEvidenceAt, evidence)
+            assert isinstance(evidence, ledger.SpendEvidenceAt)
+            self.assertEqual(evidence.gate_root_gib, 42)
+            _ = recovery_path.write_text('# whole: 1..\nroot_gib=43\n')
+            with ledger.verify_spend_revision(self.book.directory, evidence) as verified:
+                self.assertEqual(verified, ledger.SpendEvidenceUnavailable('spend sources changed before publication'))
+
+    def test_utc_capture_keeps_an_empty_report_read_only(self) -> None:
+        directory = self.root / 'empty-ledger'
+        evidence = ledger.capture_spend_evidence(directory, NOON, settings_path=self.settings)
+        assert isinstance(evidence, ledger.SpendEvidenceAt)
+        result = ledger.utc_account_spend(evidence)
+        assert isinstance(result, ledger.UtcAccountSpend)
+        self.assertEqual(result.days, (ledger.UtcDayWithoutEvidence(date(2026, 1, 2),
+                                                                  'No priced evidence supports the estimate'),))
+        self.assertEqual(result.months, ())
+        with ledger.verify_spend_revision(directory, evidence) as revision:
+            self.assertEqual(revision, ledger.SpendEvidenceUnavailable('page publication requires the existing cost ledger lock'))
+        self.assertFalse(directory.exists())
+
+    def test_utc_spend_uses_the_watch_and_the_unsettled_maximum(self) -> None:
+        for key, amount, settled, earlier, expected, source in (
+            ('local higher', '2', False, (), '3', ledger.EstimatedUtcDaySpend),
+            ('AWS higher', '4', False, (), '4', ledger.UnsettledAwsFloor),
+            ('provisional settled', '2', True, (), '2', ledger.SettledWatchAmount),
+            ('settled changed', '2', False, ((JAN2, '4'), (JAN2 + HOUR, '4')), '3', ledger.EstimatedUtcDaySpend),
+        ):
+            with self.subTest(key=key):
+                self.scene(key)
+                self.run_builder(JAN2 - 3 * HOUR, JAN2)
+                self.saved_utc_bill(JAN1, amount, spot_bill(amount, '2'), read_at=JAN2 + 2 * HOUR,
+                                    settled=settled, provisional=settled, earlier=earlier)
+                evidence = ledger.capture_spend_evidence(self.book.directory, self.now, settings_path=self.settings)
+                assert isinstance(evidence, ledger.SpendEvidenceAt)
+                report = ledger.utc_account_spend(evidence)
+                assert isinstance(report, ledger.UtcAccountSpend)
+                day = report.days[0]
+                assert isinstance(day, ledger.UtcDaySpend)
+                self.assertEqual(day.usd, Decimal(expected))
+                self.assertIsInstance(day.source, source)
+                self.assertEqual(day.estimate.usd if isinstance(day.estimate, ledger.EstimatedUtcDaySpend) else None,
+                                 Decimal(3))
+                if key == 'provisional settled':
+                    assert isinstance(day.source, ledger.SettledWatchAmount)
+                    self.assertTrue(day.source.bill.provisional)
+                if key == 'settled changed':
+                    self.assertEqual(report.settlement_notes[0].settlement,
+                                     ledger.SettledChargeChanged(Decimal(4), Decimal(2)))
+                self.assertIs(measurement.read_inputs(evidence, self.book.directory).state, evidence.state)
+                self.assertEqual(self.book.read_snapshot(), evidence.state)
+
+    def test_utc_spend_uses_only_earlier_scoped_rates(self) -> None:
+        self.scene('UTC-rate-scope', now=JAN3 + DAY + HOUR)
+        self.run_builder(JAN2 + HOUR, JAN2 + 2 * HOUR)
+        self.run_builder(JAN3 + DAY, self.now)
+        self.saved_utc_bill(JAN1, '2', spot_bill('2', '1', region_prefix='USE2'), read_at=JAN2 + HOUR)
+        self.saved_utc_bill(JAN3, '5', spot_bill('5', '2.5'), read_at=self.now)
+        report = self.captured_utc_spend()
+        self.assertEqual(tuple((row.day.day, row.usd) for row in report.days if isinstance(row, ledger.UtcDaySpend)),
+                         ((1, Decimal(2)), (2, Decimal(1)), (3, Decimal(5)), (4, Decimal(2))))
+
+    def test_utc_spend_combines_only_uncovered_resource_carry(self) -> None:
+        self.scene('UTC-resource-scope')
+        ebs = storage_bill('2')
+        s3 = ledger.UsageTypeCost('USE1-TimedStorage-ByteHrs', Decimal(2))
+        self.saved_utc_bill(JAN1, '4', ebs, s3, read_at=JAN2 + HOUR)
+        self.book.record_inventory(ledger.ResourceInventory(
+            JAN2 + 6 * HOUR, (ledger.PricedResource(ebs.usage_type, Decimal(186)),), 'fixture scoped volume', True))
+        report = self.captured_utc_spend()
+        today = report.days[-1]
+        assert isinstance(today, ledger.UtcDaySpend)
+        self.assertEqual(today.usd, Decimal(3))
+        self.assertEqual(report.months[0].usd, Decimal(7))
+        self.assertEqual(tuple(interval.usd for interval in today.intervals),
+                         (Decimal('1.5'), Decimal('.5'), Decimal(1)))
+
+    def test_utc_spend_keeps_the_minimum_once_and_ignores_rejected_bills(self) -> None:
+        self.scene('UTC-minimum', now=JAN2 + HOUR)
+        self.run_builder(JAN2 - 15, JAN2 + 15)
+        self.write_bill(JAN1, '8', spot_bill('8', '1'), name='wrong.json')
+        self.book.reconcile(ledger.CostReconciliation(self.now, JAN1, JAN2, Decimal(8), 'Cost Explorer'))
+        report = self.captured_utc_spend()
+        self.assertEqual(tuple(row.usd for row in report.days if isinstance(row, ledger.UtcDaySpend)),
+                         (Decimal(1) / 120, Decimal(1) / 120))
+        self.assertEqual(report.settlement_notes, ())
 
     def test_account_limit_operators_at_full_precision(self) -> None:
         self.scene('N13', start=JAN2)
