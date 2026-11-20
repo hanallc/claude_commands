@@ -3249,6 +3249,24 @@ class LaunchDestinationTests(StaffTestCase):
         _ = self.enterContext(patch.object(herdr, "_PLATFORM", "linux"))
         _ = self.enterContext(patch.object(herdr, "_startup_processes", return_value=herdr.PaneAtShell()))
 
+    def test_failed_split_start_reports_the_exit_and_close_result_once(self) -> None:
+        pane = "launched-pane"
+        failure = herdr.AgentExited("agents", pane)
+        for closed in (True, False):
+            with (self.subTest(closed=closed),
+                  patch.object(herdr.Herdr, "result", return_value={"pane": {"pane_id": pane}}),
+                  patch.object(herdr.Herdr, "label_pane"),
+                  patch.object(herdr.Herdr, "run_in_pane"),
+                  patch.object(herdr.Herdr, "start_command", side_effect=failure),
+                  patch.object(herdr.Herdr, "close_retained_pane", return_value=closed) as close,
+                  redirect_stderr(io.StringIO()) as errors):
+                launched = herdr.launch_prepared_agent("agents", herdr.SplitPane("parent", "right", 0.5, "worker"),
+                    herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(), 1000, agent="worker")
+            close.assert_called_once_with(pane)
+            self.assertEqual(launched, herdr.AgentLaunched(pane, herdr.AgentNotStarted(str(failure))))
+            state = "pane closed" if closed else "pane close unconfirmed"
+            self.assertEqual(errors.getvalue().splitlines(), [f"herdr agents:{pane}: agent start failed: {failure}; {state}"])
+
     def test_declined_resume_explains_manual_prompt_recovery(self) -> None:
         prepared = herdr.PreparedAgentEnvironment(self.root, {})
         client = cast(herdr.Herdr, Mock())
@@ -6340,6 +6358,27 @@ class HerdrTests(unittest.TestCase):
         self.assertFalse(process.killed)
         self.assertLessEqual(len(calls), 1 + int(clock.elapsed * 2))
         self.assertTrue(all(later[0] - earlier[0] >= 0.5 for earlier, later in zip(calls, calls[1:])))
+
+    def test_start_does_not_treat_an_agent_report_without_a_pid_as_an_exit(self) -> None:
+        clock = StartupClock()
+        process = WaitingAgentCLI(clock, 1, lambda: None)
+        shell = herdr.PaneShell(10)
+        client = self.herdr
+
+        def processes(*_arguments: object) -> herdr.PaneProcessesUnreadable | herdr.PaneAtShell:
+            return herdr.PaneProcessesUnreadable() if clock.elapsed < 0.6 else herdr.PaneAtShell()
+
+        with (patch.object(herdr, "time", SimpleNamespace(monotonic=lambda: clock.elapsed)),
+              patch.object(subprocess, "Popen", return_value=process),
+              patch.object(herdr, "_startup_processes", side_effect=processes),
+              patch.object(client, "startup_processes", side_effect=[
+                  herdr.PaneStartupObservation(shell, herdr.PaneAtShell()),
+                  herdr.PaneStartupObservation(shell, herdr.AgentProcessPresent(()))]) as observe):
+            result = client.start_command(["fake-herdr", "agent", "start"], "codex", "pane-1", 2)
+
+        self.assertEqual(observe.call_count, 2)
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(process.killed)
 
 
     def test_start_collects_cli_completion_after_a_slow_observation_crosses_deadline(self) -> None:

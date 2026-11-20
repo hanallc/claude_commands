@@ -393,6 +393,7 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
             result = worker.ExitCode.UNCERTAIN
     if result is worker.DispatchSubmission.SUBMITTED:
         progress_history.confirm_assignment_submission(run, instance, delivery.completion_id)
+        print(diagnostics.getvalue(), end="", file=sys.stderr)
         return TurnOutcome.SUBMITTED
     outcome = TurnOutcome.BUSY if result == worker.ExitCode.BUSY else TurnOutcome.UNCERTAIN
     details = diagnostics.getvalue().strip() or f"Stage 2 submission returned {result}"

@@ -2045,6 +2045,25 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.prompts(), [])
         self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
 
+    def test_failed_first_start_skips_publication_and_cleanup_of_the_closed_split(self) -> None:
+        from scripts.production import worker
+
+        pane = "w1:p1"
+        reason = str(herdr.AgentExited(self.world.session, pane))
+        self.world.outcome = herdr.AgentNotStarted(reason)
+        self.world.disappear_after_launch = True
+        with (patch.object(self.world, "pane_row", wraps=self.world.pane_row) as pane_row,
+              patch.object(worker_admission, "publish", side_effect=AssertionError("worker did not start")),
+              redirect_stderr(io.StringIO()) as errors):
+            result = self.start("reviewer", "review")
+            self.assertEqual(worker.startup_result(staff.WorkerName.parse("reviewer"), result), worker.ExitCode.UNCERTAIN)
+
+        self.assertEqual(result, worker_panes.UncertainWorker(self.parent, reason))
+        self.assertFalse(any(call.args == (pane,) for call in pane_row.call_args_list))
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(self.prompts(), [])
+        self.assertEqual(staff.snapshot().find(kind="worker", parent=self.parent.id), [])
+
     def test_refused_new_worker_closes_only_the_pane_it_started(self) -> None:
         with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("TEST admission refused")):
             result = self.start("TEST-refused")

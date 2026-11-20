@@ -2765,16 +2765,14 @@ class Herdr:
                     continue
                 break
         except HerdrFailure as error:
-            screen = ""
             if error.code == "agent_not_ready":
                 try:
                     with operation_deadline.within(deadline):
                         screen = self.run("pane", "read", pane, "--source", "visible")
                 except (HerdrFailure, OSError, subprocess.SubprocessError) as screen_error:
                     screen = f"visible screen is unavailable: {screen_error}"
-            print(f"herdr {name}:{pane}: {error}; session retained", file=sys.stderr)
-            if screen:
-                print(screen, file=sys.stderr)
+                if screen:
+                    print(screen, file=sys.stderr)
             return _without_prompt_transport(opening, launched_at, AgentNotStarted(str(error)))
         if kind == "codex":
             try:
@@ -2908,7 +2906,7 @@ class Herdr:
                     if isinstance(activity, AgentProcessPresent):
                         for identity in activity.identities:
                             _track_startup_identity(tracked, identity)
-                    agent_seen = agent_seen or isinstance(activity, AgentProcessPresent)
+                        agent_seen = agent_seen or bool(activity.identities)
                     if agent_seen and not tracked and isinstance(activity, PaneAtShell):
                         if process.poll() is not None:
                             stdout, stderr = process.communicate()
@@ -6921,16 +6919,22 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
     except (HerdrFailure, OSError, subprocess.SubprocessError) as error:
         if isinstance(error, HerdrFailure) and error.code == "wrong_target" and not resuming_with_prompt:
             raise
-        print(f"herdr {name}:{pane}: start incomplete: {error}; pane retained", file=sys.stderr)
-        failure = AgentNotStarted(str(error)) if isinstance(error, AgentExited) else PromptNotSubmitted(str(error))
-        outcome = _without_prompt_transport(opening, launched_at, failure)
-    if (isinstance(outcome, AgentNotStarted) and outcome.state == "not_sent"
-            and not isinstance(destination, ExistingPane)):
-        if isinstance(destination, NewTab):
-            close_agent(name, pane)
+        if isinstance(error, AgentExited):
+            failure = AgentNotStarted(str(error))
         else:
-            _ = client.close_retained_pane(pane)
-        print(f"herdr {name}:{pane}: agent start failed: {outcome.reason}; pane closed", file=sys.stderr)
+            print(f"herdr {name}:{pane}: start incomplete: {error}; pane retained", file=sys.stderr)
+            failure = PromptNotSubmitted(str(error))
+        outcome = _without_prompt_transport(opening, launched_at, failure)
+    if isinstance(outcome, AgentNotStarted):
+        pane_status = "pane retained"
+        if outcome.state == "not_sent" and not isinstance(destination, ExistingPane):
+            if isinstance(destination, NewTab):
+                close_agent(name, pane)
+                pane_status = "pane closed"
+            else:
+                pane_status = "pane closed" if client.close_retained_pane(pane) else "pane close unconfirmed"
+        reason = " ".join(outcome.reason.splitlines())
+        print(f"herdr {name}:{pane}: agent start failed: {reason}; {pane_status}", file=sys.stderr)
     if (resuming_with_prompt and isinstance(outcome, PromptNotSubmitted)
             and (isinstance(destination, ExistingPane) or not isinstance(outcome, AgentNotStarted))):
         outcome = _resume_prompt_failure(outcome, pane)

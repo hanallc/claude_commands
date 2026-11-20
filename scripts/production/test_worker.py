@@ -1617,7 +1617,8 @@ class WorkerCommandTests(unittest.TestCase):
                         self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
                         result = worker.main(commands[0][2:])
                 if failure:
-                    self.assertEqual(errors.getvalue().splitlines(), [f"{name}: compaction failed: {failure}"])
+                    self.assertEqual(errors.getvalue().splitlines(),
+                                     [f"{name}: compaction failed: herdr agent compact: compact_failed: {failure}"])
                 self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
                 self.assertEqual(len(self.agent.submitted), before + 1)
                 reopened = self.agent.submitted[-1][0]

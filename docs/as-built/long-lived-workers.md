@@ -156,6 +156,9 @@ All other foreground processes must descend from that Codex process.
 A Claude child cannot claim the Codex pane.
 If a foreground Codex process has no arguments, the pane owner stays unproved.
 If the identity remains unknown, the pane notice lists the foreground program names.
+An agent report without a process identity cannot prove the agent exited during startup.
+Herdr reports a failed split start and its pane closure result on one line.
+The worker skips publication and cleanup after Herdr reports a failed split start.
 After its first turn, the launcher clears the cached pane list before it checks the published worker.
 This refresh includes the pane session report and the process evidence within an observation snapshot.
 An incomplete final scan names the state, the scan reason, and membership in the parent's tabs.

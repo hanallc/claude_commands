@@ -2092,5 +2092,42 @@ class TurnEndTests(unittest.TestCase):
             self.assertIsNone(staff.by_id(row.id))
 
 
+class StageTwoCompactionTests(unittest.TestCase):
+    def test_failed_compaction_reports_one_line_and_submits_one_prompt(self) -> None:
+        case = test_worker.WorkerCommandTests("runTest")
+        self.addCleanup(case.doCleanups)
+        case.setUp()
+        name = "review"
+        run = case.run_dir
+        ready = run / "review.ready"
+        result = worker.dispatch(case.fixture.parent.id, staff.WorkerName.parse(name), "review", case.prompt,
+            session_dir=run, slot=name, phase="8", kind="review", launcher_command=[name],
+            early_ready=ready, reply=case.reply)
+        self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+        pane = case.agent.submitted[-1][0]
+        row = case.agent.row(pane)
+        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, run))
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.CodexBackend)
+        source = worker_admission.transcript_source(row, backend)
+        with source.open("a", encoding="utf-8") as stream:
+            _ = stream.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 43001, "cached_input_tokens": 0, "output_tokens": 0}}}}) + "\n")
+        case.agent.compact_error = "compact unavailable"
+        atomic_file.write_text_atomic(ready, "ready\n")
+        before = len(case.agent.submitted)
+
+        with redirect_stderr(io.StringIO()) as errors:
+            outcome = case.finish(name, turn_end.EventKind.STAGE_READY)
+
+        self.assertIs(outcome, turn_end.TurnOutcome.SUBMITTED)
+        self.assertEqual(errors.getvalue().splitlines(),
+                         [f"{name}: compaction failed: herdr agent compact: compact_failed: compact unavailable"])
+        self.assertEqual(len(case.agent.submitted), before + 1)
+        target, prompt = case.agent.submitted[-1]
+        self.assertEqual(target, pane)
+        self.assertIn(f"DONE {worker_panes.stage_two_completion_id(delivery.completion_id)}", prompt)
+
+
 if __name__ == "__main__":
     _ = unittest.main()

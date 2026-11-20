@@ -177,6 +177,10 @@ class DestinationAfterSourceRelease:
     """Select the switch destination after the source pane closes."""
 
 
+class _SplitAgentNotStarted(Exception):
+    """Herdr has reported a failed start in the new split."""
+
+
 class StartRefusal(Enum):
     UNKNOWN_ROLE = "unknown role"
     ROLE_UNAVAILABLE = "dispatch role unavailable"
@@ -1509,6 +1513,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             launch_destination = _parent_split(_text(parents[0], "pane_id"), launch_destination.ratio,
                                                launch_destination.label)
             launched = launch_at(launch_destination)
+        if isinstance(launched.outcome, herdr.AgentNotStarted) and isinstance(launch_destination, herdr.SplitPane):
+            raise _SplitAgentNotStarted(launched.outcome.reason)
         launches.append(launched)
         launch_destinations[launched.pane] = launch_destination
         pane = client.pane_row(launched.pane)
@@ -1598,6 +1604,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         launched = launches[-1]
         if launched.pane in first_turn_launches:
             pane_launch.write(pane_launch.record_directory() / f"{client.session}.json", first_turn_launches[launched.pane])
+    except _SplitAgentNotStarted as error:
+        return UncertainWorker(row or owner, str(error))
     except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         if not launches:
             return _uncertain(row or owner, f"agent launch is incomplete; pane retained: {error}")
