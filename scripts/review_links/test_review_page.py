@@ -2068,8 +2068,10 @@ requestAnimationFrame(focusRow);
         page = self.fixture.temporary / 'chip-contrast.html'
         _ = page.write_text(review.replace('<div data-review ', list_chip + '<div data-review ', 1))
         with self.firefox_commands(page) as command:
-            for theme in ('dark', 'light'):
-                for selector in ('#review-show-open', '#filter-show-open'):
+            for selector in ('#review-show-open', '#filter-show-open', '#review-show-validating'):
+                if selector == '#review-show-validating':
+                    _ = command('WebDriver:Navigate', url=page.as_uri()+'?show=Validating')
+                for theme in ('dark', 'light'):
                     position = cast(dict[str, list[int]], command('WebDriver:ExecuteScript',
                         args=[theme, selector], script=r"""
 const [theme, selector] = arguments;
@@ -2078,10 +2080,11 @@ const {x, y, width, height} = document.querySelector(selector).getBoundingClient
 return [Math.floor(x + width / 2), Math.floor(y + height / 2)];
 """))
                     x, y = position['value']
-                    for state in ('hover', 'active'):
+                    for state in ('rest', 'hover', 'active'):
                         with self.subTest(theme=theme, selector=selector, state=state):
+                            target_x, target_y = (2, 2) if state == 'rest' else (x, y)
                             actions: list[dict[str, int | str]] = [
-                                {'type': 'pointerMove', 'origin': 'viewport', 'x': x, 'y': y, 'duration': 0}]
+                                {'type': 'pointerMove', 'origin': 'viewport', 'x': target_x, 'y': target_y, 'duration': 0}]
                             if state == 'active':
                                 actions.append({'type': 'pointerDown', 'button': 0})
                             _ = command('WebDriver:PerformActions', actions=[{
@@ -2090,10 +2093,16 @@ return [Math.floor(x + width / 2), Math.floor(y + height / 2)];
                                 args=[selector, state], script=r"""
 const [selector, state] = arguments;
 const chip = document.querySelector(selector);
-if (!chip.matches('[aria-pressed=true]:' + state)) throw new Error('The chip state is missing.');
-const {color, backgroundColor, boxShadow} = getComputedStyle(chip);
+const stateSelector = state === 'rest' ? ':not(:hover):not(:active)' : ':' + state;
+if (!chip.matches('[aria-pressed=true]' + stateSelector)) throw new Error('The chip state is missing.');
+if (selector === '#review-show-validating' &&
+    (!chip.hasAttribute('data-empty-count') || chip.querySelector('b').textContent !== '0')) {
+ throw new Error('Validating must have a zero count.');
+}
+const {color, backgroundColor, boxShadow, opacity} = getComputedStyle(chip);
+if (opacity !== '1') throw new Error('The selected chip must have full opacity.');
 const tint = boxShadow.match(/(?:rgba?|color)\([^)]*\)/g)?.at(-1);
-if (!tint) throw new Error('The chip tint is missing.');
+if (state !== 'rest' && !tint) throw new Error('The chip tint is missing.');
 const canvas = document.createElement('canvas').getContext('2d');
 function luminance(...layers) {
  canvas.clearRect(0, 0, 1, 1);
@@ -2107,7 +2116,7 @@ function luminance(...layers) {
  });
  return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
 }
-const ink = luminance(color), fill = luminance(backgroundColor, tint);
+const ink = luminance(color), fill = tint ? luminance(backgroundColor, tint) : luminance(backgroundColor);
 return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 """))
                             ratio = result['value']
