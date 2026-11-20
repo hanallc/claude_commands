@@ -1194,34 +1194,39 @@ def verify_call() -> records.VerifyStep:
     return records.NotVerifyCall()
 
 
-def _local_origin_key(directory: str, key: str) -> str:
-    """Resolve a local origin from its checkout root."""
-    from scripts.buildlog import repository
+def landing_repository_key(step: str, source: records.Repository, argv: list[str], cwd: str) -> wire.LandingRepository:
+    """Resolve the test repository without changing its history key."""
+    from scripts.build_queue import admission_records as records, landing_test_gate
+    from scripts.buildlog import repository, step_context, store
     from scripts.lib import git_files
 
+    if step not in landing_test_gate.TEST_STEPS:
+        return wire.LandingRepositoryNotRecorded()
+    directory = step_context.git_directory(argv, cwd)
+    key = source.key if isinstance(source, records.RepositoryIdentity) else repository.repository_key(directory)
     seen: set[Path] = set()
     while Path(key).is_absolute():
         try:
             checkout = git_files.locate(Path(directory))
             common = checkout.common_dir
-            source = Path(repository.source_git_dir(str(common)))
-            root = checkout.toplevel if source == common else source.parent
+            origin = Path(repository.source_git_dir(str(common)))
+            root = checkout.toplevel if origin == common else origin.parent
             if root in seen:
-                break
+                return wire.LandingRepositoryNotRecorded()
             seen.add(root)
             key = repository.repository_key(str(root))
-            directory = key
+            directory = key if Path(key).is_dir() else key + ".git"
         except (OSError, ValueError):
-            break
-    return key
+            return wire.LandingRepositoryNotRecorded()
+    return wire.LandingRepositoryNotRecorded() if key == store.UNKNOWN_IDENTITY else wire.LandingRepositoryKey(key)
 
 
 def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sidecar: str,
                  episode: str, profile: records.InferFromArgv | wire.Profile | InferProfileAtUse = INFER_PROFILE_AT_USE,
                  *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
                  ) -> wire.AdmitRequest:
-    from scripts.build_queue import landing_test_gate, step_estimator, admission_records as records
-    from scripts.buildlog import record, repository, store
+    from scripts.build_queue import step_estimator, admission_records as records
+    from scripts.buildlog import store
 
     if isinstance(run, wire.NoRun):
         run = parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
@@ -1232,21 +1237,13 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
                                   store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],
                                   build_history_generation=lambda: build_history_generation(config))
     request_profile = estimate.profile
-    if request_profile.step in landing_test_gate.TEST_STEPS:
-        source = request_profile.repository
-        key = source.key if isinstance(source, records.RepositoryIdentity) else store.UNKNOWN_IDENTITY
-        if isinstance(request_profile, records.ProgramProfile) and isinstance(source, records.UnknownRepository):
-            key = repository.repository_key(cwd)
-        if Path(key).is_absolute():
-            key = _local_origin_key(record.git_directory(argv, cwd), key)
-        if key != store.UNKNOWN_IDENTITY and (isinstance(source, records.UnknownRepository) or key != source.key):
-            request_profile = replace(request_profile, repository=records.RepositoryIdentity(key, key.rsplit("/", 1)[-1]))
     width_value = records.test_threads(argv)
     width_value = width_value or (int(os.environ["NEXTEST_TEST_THREADS"]) if os.environ.get("NEXTEST_TEST_THREADS", "").isdecimal() else None)
     width_value_typed: records.TestWidth = (records.RequestedTestWidth(width_value) if width_value else
         records.UnspecifiedTestWidth() if request_profile.step == "nextest" else records.NoTestWidth())
     call = os.environ.get("BUILDLOG_CALL_ID", "")
-    identity = replace(step_identity(request_profile.step, request_profile.worktree), verify=verify_call())
+    identity = replace(step_identity(request_profile.step, request_profile.worktree), verify=verify_call(),
+        landing_repository=landing_repository_key(request_profile.step, request_profile.repository, argv, cwd))
     if isinstance(request_profile, records.ProgramProfile):
         identity = replace(identity, folder=request_profile.worktree)
     return wire.AdmitRequest(episode, owner, tuple(argv), cwd, since, sidecar,

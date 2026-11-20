@@ -2248,8 +2248,8 @@ class AdmissionServer:
             return False
         if isinstance(protected, landing_test_gate.RunningLandingTests) and request.identity.landing_test in protected.references:
             return False
-        repository = request.profile.repository
-        return isinstance(repository, records.RepositoryIdentity) and repository.key == landing_test_gate.REPOSITORY_KEY
+        repository = request.identity.landing_repository
+        return isinstance(repository, wire.LandingRepositoryKey) and repository.key == landing_test_gate.REPOSITORY_KEY
 
     def _landing_waits(self, protected: landing_test_gate.LandingTests) -> frozenset[str]:
         if isinstance(protected, landing_test_gate.NoProtectedLandingTests):
@@ -3440,7 +3440,7 @@ done
         if not identity.step:
             session = request.constraints.session
             identity = wire.Identity(session.session_id if isinstance(session, OwningSession) else "",
-                "", request.profile.step, request.profile.worktree)
+                "", request.profile.step, request.profile.worktree, landing_repository=identity.landing_repository)
         owner = wire.Owner(request.owner.pid, request.owner.start_time)
         local = request.local
         if isinstance(local, wire.LocalAdmissionUnavailable):
@@ -4429,7 +4429,8 @@ done
             build_history_generation=lambda: records.BuildHistoryGeneration(self.build_history_generation),
             location=step_estimator.RepositoryLocation(request.repository, request.worktree))
         label = config.ci_label.format(runner=request.runner, job=request.job)
-        identity = wire.Identity("", label, estimate.profile.step, request.worktree, request.runner)
+        identity = wire.Identity("", label, estimate.profile.step, request.worktree, request.runner,
+                                 landing_repository=request.landing_repository)
         return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
             request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,
             isinstance(estimate.cache, records.FreshTest), route=request.route, code_version=request.code_version)

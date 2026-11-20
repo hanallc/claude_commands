@@ -117,6 +117,7 @@ class SnapshotCodecTests(unittest.TestCase):
 
     def test_older_services_read_direct_requests_with_a_local_reason(self) -> None:
         reason = "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"
+        landing = wire.LandingRepositoryKey("https://github.com/natepiano/claude_commands")
         for revision in (CI_CLIENT, "1be2f8932"):
             with self.subTest(revision=revision), AdmissionFixture() as fixture, \
                     pinned_snapshot_reader(revision) as (parse, schema, pinned):
@@ -124,7 +125,10 @@ class SnapshotCodecTests(unittest.TestCase):
                 encode_request = cast(Callable[[object], str], getattr(pinned, "encode_request"))
                 for base in (fixture.request(), fixture.service_request()):
                     with self.subTest(request=type(base).__name__):
-                        request = replace(base, route=target_config.LocalRequired(reason))
+                        request = (replace(base, identity=replace(base.identity, landing_repository=landing),
+                                           route=target_config.LocalRequired(reason))
+                                   if isinstance(base, wire.AdmitRequest) else
+                                   replace(base, landing_repository=landing, route=target_config.LocalRequired(reason)))
                         encoded = wire.encode_request(request)
                         self.assertEqual(wire.parse_request(encoded), request)
                         decoded = parse_request(encoded)
@@ -133,6 +137,9 @@ class SnapshotCodecTests(unittest.TestCase):
                         restored = wire.parse_request(encode_request(decoded))
                         assert isinstance(restored, (wire.AdmitRequest, wire.ServiceEstimateRequest))
                         self.assertEqual(restored.route, records.DIRECT_CARGO)
+                        landing_repository = (restored.identity.landing_repository if isinstance(restored, wire.AdmitRequest)
+                                              else restored.landing_repository)
+                        self.assertEqual(landing_repository, wire.LandingRepositoryNotRecorded())
                 running = records.RunningStep("session", "fixture", "build", "/fixture", 0,
                     records.MeasuredMemory(1024), pid=42, route=target_config.LocalRequired(reason))
                 snapshot = replace(wait_reply(records.NeedsMemory()).snapshot, running=(running,))

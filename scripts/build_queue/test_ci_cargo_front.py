@@ -19,7 +19,9 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import ci_cargo_front
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
+from scripts.build_queue.test_landing_admission import WAIT_TEXT, local_test_clone, queue_land
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import land_queue, land_runs
 
 
 DENIED_HOME_CLIENT = """
@@ -206,8 +208,9 @@ class CargoLifetimeTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
-    def start_front(self, fixture: AdmissionFixture, *arguments: str) -> subprocess.Popen[str]:
-        cargo = fixture.root / "fake-cargo"
+    def start_front(self, fixture: AdmissionFixture, *arguments: str, cwd: Path | None = None,
+                    cargo_name: str = "fake-cargo") -> subprocess.Popen[str]:
+        cargo = fixture.root / cargo_name
         _ = cargo.write_text(FAKE_CARGO)
         cargo.chmod(0o755)
         environment = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
@@ -216,7 +219,7 @@ class CargoLifetimeTests(unittest.TestCase):
             "RUNNER_NAME": "hana-runner-a", "GITHUB_JOB": "compile"}
         child = subprocess.Popen([sys.executable, "-c", DENIED_HOME_FRONT,
             "--cargo", str(cargo), "--", *arguments], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env=environment, cwd=fixture.root)
+            text=True, env=environment, cwd=cwd or fixture.root)
         self.addCleanup(self.stop_front, child)
         return child
 
@@ -305,6 +308,35 @@ class CargoLifetimeTests(unittest.TestCase):
                 with fixture.loop_turn():
                     self.assertFalse(fixture.server.reservations)
                     self.assertFalse(fixture.server.waiters)
+
+    def test_a_local_clone_of_claude_commands_waits_for_the_landing_test(self) -> None:
+        with AdmissionFixture() as fixture:
+            clone = local_test_clone(fixture.root)
+            queue_land()
+            with fixture.serving():
+                child = self.start_front(fixture, "test", cwd=clone, cargo_name="cargo")
+                try:
+                    output, errors = cast(TextIO, child.stdout), cast(TextIO, child.stderr)
+                    readable, _, _ = select.select([output, errors], [], [], TEST_HANG_GUARD_SECS)
+                    self.assertEqual(readable, [errors], "Cargo started before the landing test ended")
+                    self.assertIn(WAIT_TEXT, errors.readline())
+                    with fixture.loop_turn():
+                        self.assertFalse(fixture.server.reservations)
+                        waiter, = fixture.server.waiters.values()
+                        self.assertEqual(waiter.request.owner.pid, child.pid)
+                        self.assertIsInstance(waiter.last_reply, wire.Wait)
+                        assert isinstance(waiter.last_reply, wire.Wait)
+                        self.assertEqual(waiter.last_reply.reason, records.WaitsForLandingTest())
+                    self.assertEqual(land_queue.take_next(os.getpid()), "builds first")
+                    land_runs.close_claim(os.getpid())
+                    with fixture.loop_turn():
+                        _ = fixture.run_pass()
+                    data = self.started(child)
+                    os.kill(int(str(data["pid"])), signal.SIGUSR1)
+                    started, diagnostics = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(child.returncode, 0, started + diagnostics)
+                finally:
+                    self.stop_front(child)
 
     def test_cancelled_cargo_releases_and_records_a_failed_peak(self) -> None:
         with AdmissionFixture() as fixture, fixture.serving():

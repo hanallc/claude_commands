@@ -135,6 +135,20 @@ class RunPlace:
 
 
 @dataclass(frozen=True)
+class LandingRepositoryKey:
+    """The client resolved this repository key for landing protection."""
+    key: str
+
+
+@dataclass(frozen=True)
+class LandingRepositoryNotRecorded:
+    """The request has no repository key for landing protection."""
+
+
+LandingRepository = LandingRepositoryKey | LandingRepositoryNotRecorded
+
+
+@dataclass(frozen=True)
 class Identity:
     """The caller identity holds its session, step, folder, and unit."""
     session_id: str
@@ -145,6 +159,7 @@ class Identity:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     landing_test: LandingTestReference | NoLandingTestReference = field(default=NoLandingTestReference(), kw_only=True)
+    landing_repository: LandingRepository = field(default=LandingRepositoryNotRecorded(), kw_only=True)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -234,6 +249,7 @@ class ServiceEstimateRequest(CallerCode):
     job: str
     test_width: records.TestWidth = field(default_factory=_no_test_width)
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+    landing_repository: LandingRepository = field(default=LandingRepositoryNotRecorded(), kw_only=True)
 
 
 @dataclass(frozen=True)

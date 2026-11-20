@@ -75,6 +75,8 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         del record["verify"]
     if writing and record.get("landing_test") == {"kind": "NoLandingTestReference"}:
         del record["landing_test"]
+    if writing and record.get("landing_repository") == {"kind": "LandingRepositoryNotRecorded"}:
+        del record["landing_repository"]
     if schema.__module__ == "scripts.build_queue.admission_records":
         if writing and schema.__name__ == "QueueInputs":
             # Pinned clients require this inactive field in the wire record.

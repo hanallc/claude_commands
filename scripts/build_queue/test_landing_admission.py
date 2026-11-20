@@ -6,12 +6,13 @@ from contextlib import nullcontext, redirect_stderr
 from dataclasses import replace
 import io
 import os
+from pathlib import Path
 import subprocess
 import unittest
 from unittest.mock import patch
 
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records as records
-from scripts.build_queue import first_step, memory_feed, placement, queue_place, queue_view
+from scripts.build_queue import first_step, memory_feed, placement, queue_place, queue_view, step_estimator
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, only_admitted
 from scripts.build_queue.test_placement import (PlacementFixture, adopt_assignment, assignment_for, consume_permission,
     placement_request, publish_candidate)
@@ -23,6 +24,7 @@ from scripts.production import land_queue, land_runs
 
 
 REPOSITORY = records.RepositoryIdentity("https://github.com/natepiano/claude_commands", "claude_commands")
+LANDING_REPOSITORY = wire.LandingRepositoryKey(REPOSITORY.key)
 COMMIT = "a" * 40
 WAIT_TEXT = "waits for the merge test"
 
@@ -30,6 +32,18 @@ WAIT_TEXT = "waits for the merge test"
 def queue_land() -> None:
     _ = land_queue.take_next(os.getpid())
     land_queue.add("builds first", batch="", commits=[COMMIT], first=False, before=None)
+
+
+def local_test_clone(root: Path, source_name: str = "source", upstream: str = REPOSITORY.key) -> Path:
+    source = root / source_name
+    clone = root / "clone"
+    git("init", "-q", str(source))
+    git("-C", str(source), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "--allow-empty", "-qm", "Source")
+    git("-C", str(source), "remote", "add", "origin", upstream)
+    git("clone", "-q", "--no-local", str(source), str(clone))
+    git("-C", str(clone), "remote", "set-url", "origin", f"../{source_name}")
+    return clone
 
 
 class LandingAdmissionTests(unittest.TestCase):
@@ -71,7 +85,7 @@ class LandingAdmissionTests(unittest.TestCase):
         for cloud in (False, True):
             with self.subTest(cloud=cloud), AdmissionFixture(skip_idle_spacing=True) as fixture:
                 request = fixture.request(step="test", need=GIB)
-                request = replace(request, profile=replace(request.profile, repository=REPOSITORY),
+                request = replace(request, identity=replace(request.identity, landing_repository=LANDING_REPOSITORY),
                                   place=wire.CloudPlace("aws") if cloud else wire.LocalPlace())
                 decide = gate.admission_pass
                 queued = False
@@ -92,14 +106,7 @@ class LandingAdmissionTests(unittest.TestCase):
 
     def test_a_relative_local_clone_waits_and_its_repository_is_resolved_once(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:
-            source = fixture.root / "source"
-            clone = fixture.root / "clone"
-            git("init", "-q", str(source))
-            git("-C", str(source), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-                "commit", "--allow-empty", "-qm", "Source")
-            git("-C", str(source), "remote", "add", "origin", REPOSITORY.key)
-            git("clone", "-q", "--no-local", str(source), str(clone))
-            git("-C", str(clone), "remote", "set-url", "origin", "../source")
+            clone = local_test_clone(fixture.root)
             self.assertFalse((clone / ".git/objects/info/alternates").exists())
             workdir = clone / "nested"
             workdir.mkdir()
@@ -116,14 +123,45 @@ class LandingAdmissionTests(unittest.TestCase):
                 _ = fixture.run_pass()
                 self.assertEqual(lookup.call_count, resolved)
 
+    def test_a_relative_origin_can_name_a_checkout_with_a_dot_git_suffix(self) -> None:
+        with AdmissionFixture(skip_idle_spacing=True) as fixture:
+            clone = local_test_clone(fixture.root, "source.git")
+            self.assertFalse((fixture.root / "source").exists())
+            queue_land()
+            owner = fixture.request(step="test", need=GIB)
+            request = client.step_request(["cargo", "test"], str(clone), owner.owner,
+                                          owner.since, "", owner.episode)
+            wait, = fixture.connect(request).replies()
+            self.assertIsInstance(wait, wire.Wait)
+            assert isinstance(wait, wire.Wait)
+            self.assertEqual(wait.reason, records.WaitsForLandingTest())
+
+    def test_a_local_clone_keeps_its_history_key_for_an_unrelated_test(self) -> None:
+        with AdmissionFixture(skip_idle_spacing=True) as fixture:
+            clone = local_test_clone(fixture.root, upstream="https://github.com/fixture/other")
+            queue_land()
+            argv = ["cargo", "nextest", "run"]
+            source, _ = step_estimator.git_identity(argv, str(clone))
+            assert isinstance(source, records.RepositoryIdentity)
+            self.assertEqual(source.key, str(fixture.root / "source"))
+            owner = fixture.request(step="nextest", need=GIB)
+            request = client.step_request(argv, str(clone), owner.owner, owner.since, "", owner.episode)
+            self.assertEqual(request.profile.repository, source)
+            grant = only_admitted(fixture.connect(request).replies())
+            self.assertEqual(fixture.server.waiters, {})
+            fixture.release(grant)
+
     def test_service_protection_never_starts_git(self) -> None:
         with AdmissionFixture(skip_idle_spacing=True) as fixture:
             git("init", "-q", str(fixture.root))
             git("-C", str(fixture.root), "remote", "add", "origin", REPOSITORY.key)
             queue_land()
             known = fixture.request(step="test", need=GIB)
-            known = replace(known, cwd=str(fixture.root), profile=replace(known.profile, repository=REPOSITORY))
-            unknown = replace(fixture.request(step="test", need=GIB), cwd=str(fixture.root))
+            known = replace(known, cwd=str(fixture.root),
+                            identity=replace(known.identity, landing_repository=LANDING_REPOSITORY))
+            unknown = fixture.request(step="test", need=GIB)
+            unknown = replace(unknown, cwd=str(fixture.root), profile=replace(unknown.profile, repository=REPOSITORY))
+            self.assertNotIn("landing_repository", wire.encode_request(unknown))
 
             with patch("scripts.build_queue.admission_service.subprocess.Popen",
                        side_effect=AssertionError("service started a subprocess while deciding landing protection")):
@@ -138,7 +176,7 @@ class LandingAdmissionTests(unittest.TestCase):
             requests: list[wire.AdmitRequest] = []
             for index, step in enumerate(("merge-gate", "targeted-test", "test", "t")):
                 request = fixture.request(need=GIB, step=step, since=fixture.clock.now() - 40 + index)
-                requests.append(replace(request, profile=replace(request.profile, repository=REPOSITORY)))
+                requests.append(replace(request, identity=replace(request.identity, landing_repository=LANDING_REPOSITORY)))
             peers = [fixture.connect(request) for request in reversed(requests)]
             for peer in peers:
                 reply = peer.replies()[-1]
@@ -165,7 +203,8 @@ class LandingAdmissionTests(unittest.TestCase):
                           patch.object(repository, "repository_key", return_value=REPOSITORY.key)):
                         landing = client.step_request(["merge-gate"], request.cwd, request.owner, request.since,
                                                       "", request.episode, profile)
-                    self.assertEqual(landing.profile.repository, REPOSITORY)
+                    self.assertEqual(landing.profile, profile)
+                    self.assertEqual(landing.identity.landing_repository, LANDING_REPOSITORY)
                     self.assertEqual(landing.identity.landing_test, land_runs.test_reference())
                     grant = only_admitted(fixture.connect(landing).replies())
                     self.assertEqual(list(fixture.caller_reservations()), [landing.episode])
@@ -182,7 +221,8 @@ class LandingAdmissionTests(unittest.TestCase):
         with AdmissionFixture() as fixture, patch.object(land_runs, "process_start", return_value=Started("10")):
             queue_land()
             request = fixture.request(step="merge-gate")
-            request = replace(request, profile=replace(request.profile, repository=REPOSITORY), place=wire.CloudPlace("aws"))
+            request = replace(request, identity=replace(request.identity, landing_repository=LANDING_REPOSITORY),
+                              place=wire.CloudPlace("aws"))
             wait, = fixture.connect(request).replies()
             assert isinstance(wait, wire.Wait)
             self.assertEqual(wait.reason, records.WaitsForLandingTest())
@@ -198,7 +238,8 @@ class LandingAdmissionTests(unittest.TestCase):
             _ = land_queue.take_next(123)
             with land_runs.landing([COMMIT]):
                 landing = fixture.request(step="merge-gate")
-                identity = replace(landing.identity, landing_test=land_runs.test_reference())
+                identity = replace(landing.identity, landing_test=land_runs.test_reference(),
+                                   landing_repository=LANDING_REPOSITORY)
                 landing = replace(landing, identity=identity, profile=request.profile, place=request.place)
                 _ = only_admitted(fixture.connect(landing).replies())
                 self.assertEqual(list(fixture.caller_reservations()), [landing.episode])
@@ -206,7 +247,7 @@ class LandingAdmissionTests(unittest.TestCase):
     def test_routed_tests_wait_before_assignment_and_before_start_permission(self) -> None:
         with PlacementFixture() as fixture:
             earlier = placement_request(fixture)
-            earlier = replace(earlier, profile=replace(earlier.profile, repository=REPOSITORY))
+            earlier = replace(earlier, identity=replace(earlier.identity, landing_repository=LANDING_REPOSITORY))
             _ = publish_candidate(fixture, earlier)
             assignment = assignment_for(fixture, earlier)
             claim = adopt_assignment(fixture, earlier, assignment)
@@ -216,7 +257,7 @@ class LandingAdmissionTests(unittest.TestCase):
             self.assertEqual(reply.state, placement.ClosedAssignment(WAIT_TEXT))
             self.assertIsInstance(reply.permission, placement.PermissionAvailable)
             later = placement_request(fixture)
-            later = replace(later, profile=replace(later.profile, repository=REPOSITORY))
+            later = replace(later, identity=replace(later.identity, landing_repository=LANDING_REPOSITORY))
             _ = publish_candidate(fixture, later)
             fixture.clock.advance(1)
             waiting, = fixture.connect(later).replies()

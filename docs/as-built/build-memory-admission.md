@@ -36,9 +36,10 @@ A land that started before this change does not hold tests.
 Admission holds `claude_commands` requests for `merge-gate`, `targeted-test`, `test`, `t`, and `nextest` during protection.
 A `LandingTestReference` in the request permits tests for its live land.
 The copy wrapper registers the landing before its first admission and passes the reference to its child.
-The client sends the repository key and resolves relative local origins from the clone root.
-The service compares repository keys.
-Requests without a key are outside this rule.
+Both admission clients resolve relative local origins from the clone root.
+They send a landing repository key in a separate request field and keep the history key.
+The service uses the landing repository key for this rule.
+Requests without this field do not wait for a landing test.
 Each pass reads protection and checks file revisions before local and cloud grants.
 The service also checks protection before it consumes permission to start a routed assignment.
 A held test keeps its queue time and shows `waits for the merge test`.

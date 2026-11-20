@@ -129,7 +129,9 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     if start is None:
         raise RuntimeError("cargo admission owner has no process identity")
     argv = [command, *arguments]
-    repository, worktree = step_estimator.git_identity(argv, os.getcwd())
+    cwd = os.getcwd()
+    repository, worktree = step_estimator.git_identity(argv, cwd)
+    landing_repository = client.landing_repository_key(parse.cargo_subcommand(arguments), repository, argv, cwd)
     width = records.test_threads(argv)
     test_width: records.TestWidth = records.RequestedTestWidth(width) if width else records.UnspecifiedTestWidth()
     prefix = f"build-admission-ci-{os.getuid()}-"
@@ -143,10 +145,10 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
         sidecar = directory / "cargo.cgroup"
         _ = sidecar.write_text("")
         sidecar.chmod(0o644)
-        request = wire.ServiceEstimateRequest(client.request_id(), wire.Owner(pid, start), tuple(argv), os.getcwd(),
+        request = wire.ServiceEstimateRequest(client.request_id(), wire.Owner(pid, start), tuple(argv), cwd,
             client.CLOCK.now(), str(sidecar), repository, worktree,
             os.environ.get("RUNNER_NAME", ""), os.environ.get("GITHUB_JOB", ""), test_width,
-            route=records.direct_cargo_route())
+            route=records.direct_cargo_route(), landing_repository=landing_repository)
         with ExitStack() as reservation:
             try:
                 held = reservation.enter_context(queue_place.held_reservation(request))

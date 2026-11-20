@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.build_queue import admission_wire as wire
-from scripts.production import land_queue, land_runs
+from scripts.production import land_runs
 
 
 REPOSITORY_KEY = "https://github.com/natepiano/claude_commands"
@@ -35,6 +35,9 @@ type TestRequest = wire.AdmitRequest | wire.LaunchRequest | wire.PlacementReques
 
 def read() -> LandingTests:
     """Read the line before claims and registrations to cover the handoff."""
+    # Load the queue CLI only when the service checks for a landing.
+    from scripts.production import land_queue
+
     try:
         queued = land_queue.read_items()
     except (OSError, ValueError):
@@ -64,6 +67,8 @@ class PassProtection:
         self.protected: LandingTests = NoProtectedLandingTests()
 
     def read(self) -> LandingTests:
+        from scripts.production import land_queue
+
         revision = tuple(_file_revision(path) for path in (land_queue.line_path(), *land_runs.protection_paths()))
         if revision != self.revision:
             self.revision = revision
