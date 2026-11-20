@@ -718,7 +718,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         last_valid = CLOCK.monotonic()
                         connection.settimeout(configuration.silence_seconds)
                         with suppress(BrokenPipeError, ConnectionResetError):
-                            connection.sendall(wire.encode_request(request).encode())
+                            declined = replace(request, route_check_answer=wire.RouteCheckDeclined())
+                            connection.sendall(wire.encode_request(declined).encode())
                         continue
                     if not isinstance(reply, wire.Wait):
                         raise CheckerFailure("invalid admission answer")

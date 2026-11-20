@@ -961,7 +961,8 @@ class ClientTests(unittest.TestCase):
             result = client.admit(request, lambda _reply: None, lambda: request, _attempt=hold)
             self.assertEqual(result, GRANTED)
             first, refresh, second = transport.requests
-            self.assertEqual(first, refresh)
+            assert isinstance(first, wire.AdmitRequest)
+            self.assertEqual(replace(first, route_check_answer=wire.RouteCheckDeclined()), refresh)
             assert isinstance(second, wire.AdmitRequest)
             self.assertNotEqual(second.episode, request.episode)
             self.assertEqual(second.since, request.since)

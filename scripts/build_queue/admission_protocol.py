@@ -45,6 +45,8 @@ from scripts.build_queue.admission_wire import (
     Identity as Identity,
     CallerCode as CallerCode,
     AdmitRequest as AdmitRequest,
+    NoRouteCheckAnswer as NoRouteCheckAnswer,
+    RouteCheckDeclined as RouteCheckDeclined,
     ServiceEstimateRequest as ServiceEstimateRequest,
     RepositorySlotRequest as RepositorySlotRequest,
     RepositorySlotWaiting as RepositorySlotWaiting,

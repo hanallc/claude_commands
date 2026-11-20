@@ -480,7 +480,8 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
     def test_every_request_round_trips_with_profiles_width_and_call_states(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
-            requests: list[wire.Request] = [request, fixture.launch(),
+            declined = replace(request, route_check_answer=wire.RouteCheckDeclined())
+            requests: list[wire.Request] = [request, declined, fixture.launch(),
                 replace(request, profile=records.ProgramProfile("merge-gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
                 replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",
                     records.HistoryPeakSizing(18 * GIB, records.FirstProgramPeak(18 * GIB), NOW))),

@@ -907,11 +907,13 @@ class LandingWaitTests(unittest.TestCase):
 
     def test_a_wait_receives_a_route_notice_and_keeps_its_place(self) -> None:
         cases = (("landing", "none", 2.5), ("memory", "none", 2.5),
-                 ("memory", "periodic", 60.0), ("memory", "in_flight", 60.0))
+                 ("memory", "periodic", 60.0), ("memory", "in_flight", 60.0),
+                 ("memory", "unchanged", 2.5))
         for reason, refresh, interval in cases:
             with self.subTest(reason=reason, refresh=refresh), AdmissionFixture() as fixture:
                 self.configure_wait(fixture, retry_seconds=interval)
-                if refresh != "none":
+                refresh_at_expiry = refresh in ("periodic", "in_flight")
+                if refresh_at_expiry:
                     _ = write_config_fixture(fixture.root / "build_admission.conf", "estimate_refresh_seconds=30\n")
                 if reason == "landing":
                     _ = only_admitted(fixture.server.handle_request(self.gate_request(fixture, self.INTEGRATE)))
@@ -930,7 +932,7 @@ class LandingWaitTests(unittest.TestCase):
                     self.assertIsInstance(first.snapshot.decision.room.basis, records.DoesNotFit)
                 places = fixture.server.places.copy()
                 retry_at = fixture.clock.monotonic() + interval
-                if refresh != "none":
+                if refresh_at_expiry:
                     fixture.clock.advance(30)
                     _ = fixture.run_pass()
                     expired, = peer.replies()
@@ -952,9 +954,11 @@ class LandingWaitTests(unittest.TestCase):
 
                 fixture.clock.advance(0.5)
                 _ = fixture.run_pass()
-                if refresh == "in_flight":
+                refresh_while_open = refresh in ("in_flight", "unchanged")
+                if refresh_while_open:
                     fixture.free(60 * GIB)
-                    request = self.refresh_gate_estimate(fixture, request)
+                    if refresh == "in_flight":
+                        request = self.refresh_gate_estimate(fixture, request)
                     peer.socket.sendall(wire.encode_request(request).encode())
                 self.assertEqual(peer.replies(), [wire.RouteAgain()])
                 waiter = fixture.server.waiters[request.episode]
@@ -963,16 +967,18 @@ class LandingWaitTests(unittest.TestCase):
                 self.assertNotIn(request.episode, fixture.server.reservations)
                 self.assertIn(request.owner.pid, fixture.queue_pids())
 
-                if refresh == "in_flight":
+                if refresh_while_open:
                     self.assertEqual(waiter.request.profile.estimated_at, request.profile.estimated_at)
-                    peer.socket.sendall(wire.encode_request(request).encode())
+                declined = replace(request, route_check_answer=wire.RouteCheckDeclined())
+                peer.socket.sendall(wire.encode_request(declined).encode())
+                if refresh_while_open:
                     _ = only_admitted(peer.replies())
                     self.assertEqual(fixture.server.reservations[request.episode].queue_waiter["since"], request.since)
                     continue
-                peer.socket.sendall(wire.encode_request(request).encode())
                 resumed, = peer.replies()
                 self.assertIsInstance(resumed, wire.Wait)
                 self.assertEqual(fixture.server.waiters[request.episode].cloud_route_check, service.NoCloudRouteCheck())
+                self.assertEqual(fixture.server.waiters[request.episode].row["since"], request.since)
                 self.assertEqual(fixture.server.places, places)
 
     def test_an_open_route_check_lets_a_later_waiter_start_at_the_deadline(self) -> None:
@@ -1011,7 +1017,8 @@ class LandingWaitTests(unittest.TestCase):
             self.assertIn(later.episode, fixture.server.reservations)
             self.assertIn(last.episode, fixture.server.waiters)
 
-            peer.socket.sendall(wire.encode_request(request).encode())
+            declined = replace(request, route_check_answer=wire.RouteCheckDeclined())
+            peer.socket.sendall(wire.encode_request(declined).encode())
             resumed, = peer.replies()
             self.assertIsInstance(resumed, wire.Wait)
             self.assertEqual(fixture.server.waiters[request.episode].cloud_route_check, service.NoCloudRouteCheck())
@@ -1066,7 +1073,8 @@ class LandingWaitTests(unittest.TestCase):
             self.assertEqual(fixture.server.waiters[request.episode].cloud_route_check, check)
             self.assertNotIn(request.episode, fixture.server.reservations)
 
-            peer.socket.sendall(wire.encode_request(request).encode())
+            declined = replace(request, route_check_answer=wire.RouteCheckDeclined())
+            peer.socket.sendall(wire.encode_request(declined).encode())
             resumed, = peer.replies()
             self.assertIsInstance(resumed, wire.Wait)
             self.assertEqual(fixture.server.waiters[request.episode].route_retry_at,

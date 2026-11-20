@@ -4764,8 +4764,8 @@ done
             if (previous is not None and isinstance(connection, Connection)
                     and previous.connection is connection and _refreshes(previous.request, request)):
                 waiting.route_retry_at = previous.route_retry_at
-                # The gate repeats the same request when its route check ends without a grant.
-                if request != previous.request:
+                if not (isinstance(request, wire.AdmitRequest)
+                        and isinstance(request.route_check_answer, wire.RouteCheckDeclined)):
                     waiting.cloud_route_check = previous.cloud_route_check
             self.waiters[key] = waiting
             self._save_place(self.waiters[key])

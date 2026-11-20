@@ -153,6 +153,16 @@ NO_RUN = NoRun()
 
 
 @dataclass(frozen=True)
+class NoRouteCheckAnswer:
+    """The request carries no answer to a route check."""
+
+
+@dataclass(frozen=True)
+class RouteCheckDeclined:
+    """The gate finished its route check and wants to wait again."""
+
+
+@dataclass(frozen=True)
 class AdmitRequest(CallerCode):
     """The request holds the command, caller, run, and memory profile for admission."""
     episode: str
@@ -170,6 +180,7 @@ class AdmitRequest(CallerCode):
     run: RunIdentity | NoRun = NO_RUN
     place: LocalPlace | CloudPlace = LocalPlace()
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+    route_check_answer: NoRouteCheckAnswer | RouteCheckDeclined = field(default=NoRouteCheckAnswer(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -714,6 +725,8 @@ def _write_wire_record(value: object) -> object:
     if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
             and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
         del record["route"]
+    if record.get("kind") == "AdmitRequest" and record.get("route_check_answer") == {"kind": "NoRouteCheckAnswer"}:
+        del record["route_check_answer"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:
