@@ -448,10 +448,10 @@ def _print_placement_status(episode: str, attempt: str) -> int:
     return 0 if current else 1
 
 
-def request_placement(request: wire.PlacementRequest
+def request_placement(request: wire.PlacementRequest, *, report_refusal: bool = True
                       ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
     """Request a durable destination without selecting a fallback in the caller."""
-    reply = _call(request, lambda _wait: None)
+    reply = _call(request, lambda _wait: None, report_refusal=report_refusal)
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Refused):
@@ -470,12 +470,14 @@ def acquire_placement(request: wire.PlacementRequest
         return LeftQueue()
 
 
-def report_prerequisite(request: wire.PrerequisiteReport) -> wire.Ok:
-    reply = _call(request, lambda _wait: None)
+def report_prerequisite(request: wire.PrerequisiteReport, *, report_refusal: bool = True) -> wire.Ok:
+    reply = _call(request, lambda _wait: None, report_refusal=report_refusal)
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Ok):
         return reply
+    if not report_refusal and isinstance(reply, wire.Refused):
+        raise wire.AdmissionUnavailable(reply.reason)
     raise wire.AdmissionUnavailable("invalid prerequisite answer")
 
 
@@ -781,15 +783,22 @@ def nested_reservation_reason() -> str:
     return ""
 
 
+class AdmissionRefusalHandler(Protocol):
+    def __call__(self, reason: str, *, checker: bool = False) -> wire.Refused: ...
+
+
 def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
-          *, attempt: Callable[[], None] = _no_attempt_hook,
+          *, attempt: Callable[[], None] = _no_attempt_hook, report_refusal: bool = True,
           configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
           ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
+    def refuse(reason: str, *, checker: bool = False) -> wire.Refused:
+        return _refused(reason, checker=checker) if report_refusal else wire.Refused(reason)
+
     if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.PlacementRequest)):
         reason = nested_reservation_reason()
         if reason:
-            return _refused(reason)
+            return refuse(reason)
     acquisition = _is_placement_control(request) or isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest,
         wire.BuildHistoryRequest, wire.PlacementRequest, wire.PrerequisiteReport, wire.RepositorySlotRequest))
     retry = _ACQUISITION_RETRY.get() if acquisition else None
@@ -803,28 +812,28 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
         retry = AcquisitionRetry(deadline, launch_without_wait=launch and limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     try:
+        from scripts.build_queue import admission_records as records
         if isinstance(configuration, ReadConfigurationAtUse):
-            from scripts.build_queue import admission_records as records
-            try:
-                resolved = records.read_memory_config(report=False)
-            except conf.Unusable as error:
-                return _refused(str(error), checker=True)
+            resolved = records.read_memory_config(report=False)
         else:
             resolved = configuration
         request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
-        if not isinstance(resolved, (wire.AcquisitionTiming, wire.CleanupTiming)):
-            from scripts.build_queue import admission_records as records
-            records.warn_configuration_diagnostics(resolved.diagnostics)
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.ServiceEstimateRequest)):
             assert not isinstance(resolved, wire.CleanupTiming)
-            return _run_admission(request, on_wait, refresh, attempt, retry, resolved)
-        return _control_reply(request, retry, resolved)
+            reply = _run_admission(request, on_wait, refresh, attempt, retry, resolved, refuse)
+        else:
+            reply = _control_reply(request, retry, resolved, refuse)
+        if not isinstance(reply, wire.Refused) and isinstance(resolved, records.MemoryConfig):
+            records.warn_configuration_diagnostics(resolved.diagnostics)
+        return reply
     except _QueueLeft:
         return LeftQueue()
     except _QueueUnreachable as error:
         if not owns_retry:
             raise
-        return _refused(str(error))
+        return refuse(str(error))
+    except conf.Unusable as error:
+        return refuse(str(error), checker=True)
     finally:
         _ACQUISITION_RETRY.reset(token)
 
@@ -859,7 +868,8 @@ def _transport_failure(error: OSError, retry: AcquisitionRetry,
 
 
 def _control_reply(request: wire.Request, retry: AcquisitionRetry,
-                   configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming) -> CallReply:
+                   configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming,
+                   refuse: AdmissionRefusalHandler) -> CallReply:
     from scripts.build_queue import admission_records as records
 
     placement_control = _waits_for_live_service(request)
@@ -883,7 +893,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
             raise _unreachable(configuration)
         if slot_waiting is not None:
             return wire.RepositorySlotExpired(slot_waiting.expired_text)
-        return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+        return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
 
     last_valid = last_notice = CLOCK.monotonic()
     restarted = False
@@ -922,6 +932,8 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                             return deadline_reply(expired)
                         if generation_query:
                             raise
+                        if retry.launch_without_wait:
+                            return deadline_reply()
                         _silence_notice(last_valid)
                         last_notice = CLOCK.monotonic()
                         continue
@@ -931,7 +943,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                     retry.unreachable_deadline = (CLOCK.monotonic() + configuration.unreachable_limit_seconds
                         if isinstance(configuration, wire.AcquisitionTiming) else float("inf"))
                     if isinstance(reply, wire.Refused):
-                        return reply if generation_query or placement_control else _refused(reply.reason)
+                        return reply if generation_query or placement_control else refuse(reply.reason)
                     if slot_waiting is not None:
                         if isinstance(reply, (wire.RepositorySlotReady, wire.RepositorySlotExpired)):
                             return reply
@@ -968,7 +980,7 @@ def _control_reply(request: wire.Request, retry: AcquisitionRetry,
                     raise CheckerFailure("invalid admission answer")
         except CheckerFailure as error:
             reason = str(error) or "checker returned an error"
-            return wire.Refused(reason) if generation_query else _refused(reason, checker=True)
+            return wire.Refused(reason) if generation_query else refuse(reason, checker=True)
         except OSError as error:
             if placement_control and isinstance(error, (FileNotFoundError, ConnectionRefusedError)):
                 reason = "no socket" if isinstance(error, FileNotFoundError) else "connect refused"
@@ -1027,9 +1039,10 @@ type AdmissionResult = AdmissionReply | LeftQueue | RetryAfterRelease
 def _run_admission(request: AdmissionRequest, on_wait: Callable[[wire.Wait], None],
                    refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None,
                    attempt: Callable[[], None], retry: AcquisitionRetry,
-                   configuration: records.MemoryConfig | wire.AcquisitionTiming) -> AdmissionReply | LeftQueue:
+                   configuration: records.MemoryConfig | wire.AcquisitionTiming,
+                   refuse: AdmissionRefusalHandler) -> AdmissionReply | LeftQueue:
     while True:
-        result = _acquire(request, on_wait, refresh, attempt, retry, configuration)
+        result = _acquire(request, on_wait, refresh, attempt, retry, configuration, refuse)
         if not isinstance(result, RetryAfterRelease):
             return result
         request = result.request
@@ -1038,7 +1051,8 @@ def _run_admission(request: AdmissionRequest, on_wait: Callable[[wire.Wait], Non
 def _acquire(request: AdmissionRequest, on_wait: Callable[[wire.Wait], None],
              refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None,
              attempt: Callable[[], None], retry: AcquisitionRetry,
-             configuration: records.MemoryConfig | wire.AcquisitionTiming) -> AdmissionResult:
+             configuration: records.MemoryConfig | wire.AcquisitionTiming,
+             refuse: AdmissionRefusalHandler) -> AdmissionResult:
     retry_request: wire.AdmitRequest | None = None
     cause: AdmissionCompletion = None
     checker = CheckerRetry()
@@ -1083,15 +1097,15 @@ def _acquire(request: AdmissionRequest, on_wait: Callable[[wire.Wait], None],
     if isinstance(cause, LeftQueue):
         return cause
     if isinstance(answer, wire.Refused):
-        return _refused(answer.reason, checker=True)
+        return refuse(answer.reason, checker=True)
     if cause is AcquisitionDeadline.LAUNCH:
-        return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+        return refuse(LAUNCH_WAIT_LIMIT_REASON, checker=True)
     if cause is AcquisitionDeadline.UNREACHABLE:
         raise _unreachable(configuration)
     if isinstance(cause, _QueueUnreachable):
         raise cause
     assert isinstance(cause, CheckerFailure)
-    return _refused(str(cause) or "checker returned an error", checker=True)
+    return refuse(str(cause) or "checker returned an error", checker=True)
 
 
 def _wait_for_admission_reply(sockets: AcquisitionSockets, initial_request: AdmissionRequest,
@@ -1896,6 +1910,7 @@ class ClientArguments(argparse.Namespace):
     local_only: bool = False
     local_reason: str = ""
     mac_only: bool = False
+    pinned_refusals: bool = False
     once: bool = False
     reason: str = ""
     status: int = 0
@@ -1915,6 +1930,11 @@ def constrained_step_route(route: target_config.StepRoute,
     return target_config.LocalRequired("; ".join(reasons))
 
 
+def _print_placement_refusal(reason: str) -> int:
+    print("refused\t" + " ".join(reason.splitlines()))
+    return 2
+
+
 def _place_step(args: ClientArguments, output: WaitOutput) -> int:
     output.local_reason = args.local_reason or output.local_reason
     if args.command == "cancel-placement":
@@ -1931,6 +1951,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
     queued_episode_state = args.assignment_file.with_name(args.assignment_file.name + ".queued")
     already_queued = False
     keep_wait = False
+    pinned_refusal_reported = False
     try:
         if args.command == "place-step" and placement_wait_state.exists():
             try:
@@ -2020,14 +2041,17 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         if args.request_file is not None:
             write_text_atomic(args.request_file, wire.encode_request(request), new_file_mode=0o600)
             return 0
+        report_refusal = not args.pinned_refusals
         if already_queued:
-            _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite))
+            _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite),
+                                    report_refusal=report_refusal)
         while True:
-            answer = request_placement(request)
+            answer = request_placement(request, report_refusal=report_refusal)
             output.placement_notices(answer, placement_events=args.wait_events)
             if isinstance(answer, wire.PlacementWait) and isinstance(answer.wait, wire.Wait):
-                _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite))
-                answer = request_placement(request)
+                _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite),
+                                        report_refusal=report_refusal)
+                answer = request_placement(request, report_refusal=report_refusal)
                 output.placement_notices(answer, placement_events=args.wait_events)
             if not isinstance(answer, wire.PlacementWait):
                 break
@@ -2068,8 +2092,11 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 return 78
             CLOCK.sleep(records.read_memory_config().waiting_pass_seconds)
         if isinstance(answer, wire.DispatchStatus):
+            reason = answer.state.reason if isinstance(answer.state, placement.ClosedAssignment) else answer.reason
+            if args.pinned_refusals:
+                pinned_refusal_reported = True
+                return _print_placement_refusal(reason)
             if args.mac_only:
-                reason = answer.state.reason if isinstance(answer.state, placement.ClosedAssignment) else answer.reason
                 print("refused\t" + reason)
             else:
                 print(wire.encode_reply(answer), end="")
@@ -2091,8 +2118,13 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 output.on_event("done")
                 output.held = False
             if args.command == "place-step":
-                placement_wait_state.unlink(missing_ok=True)
-                queued_episode_state.unlink(missing_ok=True)
+                try:
+                    placement_wait_state.unlink(missing_ok=True)
+                    queued_episode_state.unlink(missing_ok=True)
+                except OSError as error:
+                    if not pinned_refusal_reported:
+                        raise
+                    print(str(error), file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2120,6 +2152,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = placement_parser.add_argument("--mac-only", action="store_true")
     _ = placement_parser.add_argument("--once", action="store_true")
     _ = placement_parser.add_argument("--wait-events", action="store_true")
+    _ = placement_parser.add_argument("--pinned-refusals", action="store_true")
     _ = placement_parser.add_argument("argv", nargs=argparse.REMAINDER)
     cancel_parser = subcommands.add_parser("cancel-placement")
     _ = cancel_parser.add_argument("--episode", required=True)
@@ -2152,6 +2185,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in ("check-nested", "place-step"):
         reason = nested_reservation_reason()
         if reason:
+            if args.pinned_refusals:
+                return _print_placement_refusal(reason)
             print(reason, file=sys.stderr)
             return 2
         if args.command == "check-nested":
@@ -2210,15 +2245,18 @@ def main(argv: list[str] | None = None) -> int:
             _ = args.shell_state.write_text("BUILDLOG_MEM_OUTCOME=LeftQueue\nBUILDLOG_MEM_WAIT_S="
                 + str(output.elapsed_seconds()) + "\n")
         return 75
-    except _QueueUnreachable as error:
-        _ = _refused(str(error))
-        return 2
-    except wire.AdmissionUnavailable as error:
-        suffix = "; step refused" if args.command == "place-step" else ""
-        print(f"admission service unavailable: {error.reason}{suffix}", file=sys.stderr)
-        return 2
-    except (CheckerFailure, ValueError, OSError) as error:
-        _ = _refused(str(error) or "checker returned an error")
+    except (_QueueUnreachable, wire.AdmissionUnavailable, ValueError, OSError) as error:
+        if isinstance(error, wire.AdmissionUnavailable):
+            reason = f"admission service unavailable: {error.reason}"
+            if args.command == "place-step" and not args.pinned_refusals:
+                reason += "; step refused"
+        elif isinstance(error, _QueueUnreachable):
+            reason = str(error)
+        else:
+            reason = str(error) or "checker returned an error"
+        if args.pinned_refusals:
+            return _print_placement_refusal(reason)
+        print(reason, file=sys.stderr)
         return 2
     finally:
         if output.held and args.command not in ("place-step", "cancel-placement"):

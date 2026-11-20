@@ -25,6 +25,7 @@ from typing import Literal, TypedDict, NamedTuple, NotRequired, cast
 from scripts.accounts import accounts
 from scripts.build_hold import override_guard
 from scripts.herdr import herdr_types
+from scripts.agents import set_model
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
 from scripts.direct import progress_history
@@ -80,6 +81,7 @@ from scripts.whoami.account import (
 
 
 class CommandLine(argparse.Namespace):
+    role: str = ""
     command: str = ""
     session: str = ""
     account: str | None = None
@@ -238,7 +240,7 @@ def wait_for_workers(record: staff.StaffSnapshot) -> None:
         time.sleep(1)
 
 
-USAGE = """usage: agents COMMAND
+USAGE = f"""usage: agents COMMAND
   agents help
   agents status [ACCOUNT] [--json] [--here]
   agents pause NAME [--finish-step] --why TEXT
@@ -255,6 +257,7 @@ USAGE = """usage: agents COMMAND
   agents remove-stray NAME SESSION
   agents transfer NAME [--model MODEL --effort EFFORT]
   agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
+  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
 """
 
 
@@ -656,6 +659,12 @@ def main(argv: list[str] | None = None) -> int:
     if not arguments or arguments in (["help"], ["--help"], ["-h"]):
         print(USAGE, end="")
         return 0
+    if arguments[0] == set_model.LOCAL_COMMAND:
+        try:
+            return set_model.on_remote(arguments[1:])
+        except (OSError, ValueError, conf.Unusable) as error:
+            print(error)
+            return 2
     if arguments == ["_unit-local"]:
         return unit_local_command()
     parser = argparse.ArgumentParser(prog="agents", usage=USAGE.removeprefix("usage: ").rstrip())
@@ -679,6 +688,10 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
     _ = command.add_argument("--job", default="")
+    command = commands.add_parser(set_model.COMMAND)
+    _ = command.add_argument("role", metavar="ROLE")
+    _ = command.add_argument("model", metavar="MODEL")
+    _ = command.add_argument("effort", metavar="EFFORT", nargs="?", default="")
     for verb in ("pause", "exit", "resume"):
         command = commands.add_parser(verb)
         selection = command.add_mutually_exclusive_group(required=True)
@@ -730,6 +743,11 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--who", required=True)
     _ = command.add_argument("--session", dest="account", required=True)
     options = parser.parse_args(arguments, namespace=CommandLine())
+    if options.command == set_model.COMMAND:
+        try:
+            return set_model.run(options.role, options.model, options.effort)
+        except (OSError, ValueError, conf.Unusable, staff.StaffRefused) as error:
+            return set_model.report_error(error)
     try:
         if options.command == "resume" and options.resend_opening_prompt:
             if options.production or options.retired:

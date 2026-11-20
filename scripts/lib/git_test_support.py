@@ -1,6 +1,7 @@
 """Configure disposable Git fixtures and commit changes with one synthetic identity."""
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -14,6 +15,13 @@ def write_fixture_git_config(directory: Path) -> Path:
     path = directory / "git-config"
     _ = path.write_text("[maintenance]\n\tauto = false\n", encoding="utf-8")
     return path
+
+
+def fixture_git_environment(directory: Path) -> dict[str, str]:
+    """Give fixture commands a private Git configuration and repository lookup."""
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    return {**environment, "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(directory)),
+            "GIT_CONFIG_NOSYSTEM": "1"}
 
 
 def commit_repository(repository: Path, message: str, *paths: str, allow_empty: bool = False,

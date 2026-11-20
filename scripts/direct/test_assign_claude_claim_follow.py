@@ -2,40 +2,65 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import signal
-from typing import cast
+from typing import ClassVar, cast
+from unittest.mock import patch
 
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
-from scripts.direct import worker_state
+from scripts.direct import assign_claude, worker_state
 from scripts.lib import process_start
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.test_assign_claude import GROUP_STOP_READY, stop_assignment
 
 
 class AssignClaudeLauncherFollowTests(AssignClaudeLauncherFixture):
+    direct_cli_calls: ClassVar[bool] = True
+
     def test_new_launch_and_delivery_retry_preserve_a_live_claim(self) -> None:
         session = self.start_phase("held-publication")
         _ = self.claude_worker(session)
         claim = session / "impl_claim_fixture-impl.json"
-        worker_state.publish_worker_claim(claim, "fixture-impl")
-        original = claim.read_bytes()
-        before = self.open_passes(session)
-        entry = self.assign_script.with_suffix(".py")
-        source = entry.read_text()
-        for kind in ("new", "retry"):
-            with self.subTest(kind=kind):
-                if kind == "retry":
-                    _ = entry.write_text(source.replace("code = assign_claude.run(",
-                        "assign_claude._switch = lambda launch, name: assign_claude.ClaudeDeliveryRetry()\n"
-                        + "code = assign_claude.run(", 1))
-                    result = self.worker_launch(session, to="fixture-impl")
-                else:
-                    result = self.worker_launch(session, slot="fixture-impl")
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("claimed by launcher", result.stderr)
-                self.assertEqual(claim.read_bytes(), original)
-                self.assertEqual(self.open_passes(session), before)
-                self.assertEqual(self.launch_records(session, "pass_started"), [])
-                self.assertFalse((self.root / "delivered_message.txt").exists())
+        context = multiprocessing.get_context("fork")
+        ready = context.Event()
+        release = context.Event()
+
+        def publish() -> None:
+            worker_state.publish_worker_claim(claim, "fixture-impl")
+            ready.set()
+            _ = release.wait(TEST_HANG_GUARD_SECS)
+
+        publisher = context.Process(target=publish)
+        publisher.start()
+        try:
+            self.assertTrue(ready.wait(TEST_HANG_GUARD_SECS))
+            pid = publisher.pid
+            assert pid is not None
+            self.assertNotEqual(pid, os.getpid())
+            self.assertEqual(worker_state.read_worker_claim(claim), worker_state.HeldWorkerClaim(pid))
+            original = claim.read_bytes()
+            before = self.open_passes(session)
+            for kind in ("new", "retry"):
+                with self.subTest(kind=kind):
+                    if kind == "retry":
+                        with patch.object(assign_claude, "_switch", return_value=assign_claude.ClaudeDeliveryRetry()):
+                            result = self.worker_launch(session, to="fixture-impl")
+                    else:
+                        result = self.worker_launch(session, slot="fixture-impl")
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("claimed by launcher", result.stderr)
+                    self.assertEqual(claim.read_bytes(), original)
+                    self.assertEqual(self.open_passes(session), before)
+                    self.assertEqual(self.launch_records(session, "pass_started"), [])
+                    self.assertFalse((self.root / "delivered_message.txt").exists())
+        finally:
+            release.set()
+            publisher.join(timeout=TEST_HANG_GUARD_SECS)
+            if publisher.is_alive():
+                publisher.kill()
+                publisher.join()
+            publisher.close()
 
     def test_group_stop_leaves_a_free_claim_and_the_next_follow_proceeds(self) -> None:
         session = self.start_phase("killed-follow")

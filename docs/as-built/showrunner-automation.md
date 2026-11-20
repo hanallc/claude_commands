@@ -136,6 +136,7 @@ A `#` starts a comment only at the line start or after whitespace.
 The first key wins, and `key.<host>` overrides `key`.
 The comment immediately above a key defines its whole-number range, numeric range, or allowed words.
 An invalid setting warns on stderr and uses the newest usable committed value under that revision's limits.
+Recovery prefers a value that also passes the current setting's limit.
 No usable value raises `conf.Unusable` with the source, key, and reason.
 `ConfigRead.origin` returns live, recovered, or unavailable evidence without printing a warning.
 The [accounts configuration section](accounts.md#runtime-configuration-and-constraints) defines repository defaults and explicit-folder behavior.
@@ -224,7 +225,10 @@ The queue survives a unit rename because its key is the fixed staff id.
 - `--trailer <line>` (repeatable), `--regime after|trial`, `--holds K`, and `--merge-defects D`.
 - `--excluded "<why>"`, `--cancel-prior`, `--bump`, and `--scratch <dir>`.
 
-`produce.md` `<MergeCheckpoint/>` runs the command in the background after the showrunner's judgments.
+`produce.md` `<MergeCheckpoint/>` sends the command to a merge unit when one serves the production.
+Otherwise, the showrunner starts single and batch merges with `detached_runs.py start --session-dir "<STATE_DIR>"`.
+The showrunner also uses this start command for child handoffs.
+The run continues across an account move. Stop the run with `detached_runs.py stop --reason "<why>" <record>`.
 `--as-built` merges a unit's closing documentation commit without tests or a review-ledger row.
 It requires an earlier code checkpoint merge for that phase.
 It accepts only `.md` paths and requires a change to or deletion of the unit's plan.
@@ -996,6 +1000,19 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
     No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
     A busy session does not prove that the director works on a phase.
+    The board shows census shell commands when the conversation, machine, PID, and process start match the checked director.
+    It compares the start from the owner proof in the format from `scripts/lib/process_start.py`.
+    A matching empty shell list confirms no shell work when the checked director reports no shell activity.
+    When the checked director reports shell activity, an empty list leaves shell work unverified.
+    If no row matches the checked director, a census row for the conversation leaves shell work unverified.
+    This includes empty shell lists and older rows with no process identity.
+    A shell name that contains only whitespace appears as `Unnamed background command`.
+    A missing machine field gives `CensusMachineUnreported` on a legacy row.
+    A reported process identity requires a PID, a process start, and a nonempty machine name.
+    An unreadable census leaves shell work unverified for a checked live owner, including a paused unit.
+    If the census cannot reach the local machine, the board cannot verify shell work for its units.
+    A remote machine timeout leaves the local census evidence usable.
+    Unverified shell work prevents an idle result.
     With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
     The director's busy status does not change this result.
     Its only current row is `Now | Nothing to do | The plan is complete and the queue is empty` for a complete readable plan.

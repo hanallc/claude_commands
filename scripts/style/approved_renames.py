@@ -1,10 +1,8 @@
 """Read an approved rename finding and decide whether its change is in a file.
 
-Certainty comes from name presence: a file cannot declare, in any form, a name that is in none of its identifiers.
-The check is AppliedInCode only when no identifier is the old name and the scan finds the new name declared under the
-parent, and RenameNotApplied only when no identifier is the new name and the scan finds the old name declared under the
-parent. Every other case, both names present included, is NoAppliedCheck, so the scan never decides between two names.
-A file whose macros or attributes can make names that are not its identifiers is NoAppliedCheck too.
+Check both names under the parent of an item rename.
+Use the target enum body to check a variant when another scope uses the old name.
+Return NoAppliedCheck when the scan cannot prove where the file declares a name.
 
 Local binding proofs compare original and edited token streams. They locate each declaration, exclude shadowed
 scopes, and account for each changed use, including struct shorthand and format captures.
@@ -20,7 +18,7 @@ import re
 import posixpath
 import hashlib
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from enum import Enum
 from dataclasses import dataclass
 from functools import cache
@@ -100,10 +98,43 @@ PARENT_KEYWORDS = frozenset({"enum", "struct", "union", "trait", "mod"})
 NAME_MACROS = frozenset({"include", "concat_idents", "paste"})
 # A relative Rust file path: folders of name characters, then a file whose stem can be a module name.
 RUST_FILE = r"(?:[A-Za-z0-9_-]+/)*[A-Za-z_][A-Za-z0-9_]*\.rs"
+RUST_FILE_SIDE = re.compile(rf"(?P<quote>`?){RUST_FILE}(?P=quote)")
 # A file rename finding's after: each path ends at a space, a mark, the end of a sentence or the end of the text.
 FILE_RENAME = re.compile(rf"Rename ({RUST_FILE}) to ({RUST_FILE})(?=$|[\s;,:)]|\.(?:\s|$))")
 # A rename of a Rust file at any place in an after, as in `After the moves, rename <a> to <b>.`
 ANY_FILE_RENAME = re.compile(rf"(?<![\w/.-])rename ({RUST_FILE}) to {RUST_FILE}", re.IGNORECASE)
+RENAME_FILE_PAIR = (
+    rf"(?P<old_quote>`?)(?P<old>{RUST_FILE})(?P=old_quote)\s+to\s+"
+    + rf"(?P<new_quote>`?)(?P<new>{RUST_FILE})(?P=new_quote)(?=$|[\s;,:)]|\.(?:\s|$))"
+)
+RENAME_VERB = r"rename\s+(?:(?:the\s+)?(?:companion\s+)?file\s+)?"
+SENTENCE_SEPARATOR = r"\s*[.;]\s+"
+PAIR_SEPARATOR = r"(?:\s*,\s*(?:(?:and|plus)\s+)?|\s+(?:and|plus)\s+)"
+FIRST_FILE_RENAME = re.compile(RENAME_VERB + RENAME_FILE_PAIR, re.IGNORECASE)
+NEXT_FILE_RENAME = re.compile(
+    rf"(?:{SENTENCE_SEPARATOR}{RENAME_VERB}|{PAIR_SEPARATOR}(?:{RENAME_VERB})?){RENAME_FILE_PAIR}", re.IGNORECASE,
+)
+REFERENCE_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+RUST_ITEM_TARGET = re.compile(rf"(?:::)?(?:{REFERENCE_NAME}::)*(?:r#)?{REFERENCE_NAME}")
+FILE_INSTRUCTION_VERB = re.compile(r"(?:rename|move|relocate)\s+", re.IGNORECASE)
+REFERENCE_TARGET = (
+    rf"(?:the\s+|all\s+)?(?:"
+    + r"module declarations?|mod(?: lines?)?|pub use(?: lines?)?|imports?|path attributes?|documentation references?|"
+    + rf"`{RUST_FILE}`|{RUST_FILE}|(?:{REFERENCE_NAME}::)+{REFERENCE_NAME}\s+paths?)(?=$|[\s;,]|\.(?:\s|$))"
+)
+REFERENCE_UPDATE = re.compile(
+    rf"(?:{SENTENCE_SEPARATOR}|{PAIR_SEPARATOR})update\s+{REFERENCE_TARGET}"
+    + rf"(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+){REFERENCE_TARGET})*",
+    re.IGNORECASE,
+)
+RENAME_DESCRIPTION = re.compile(r"\s+\(the type it holds\)", re.IGNORECASE)
+END_OF_RENAME = re.compile(r"\s*\.?")
+MOVE_DESTINATION = re.compile(
+    rf"(?:^|[.;]\s+)(?:(?:Create|Add) (?:a new file |the file |file )?"
+    + rf"|(?:Move|Split|Extract|Place) (?:[^\n.;]|\.(?!\s|$))+? (?:into|to|in) (?:a new file |the file |file )?)"
+    + rf"`?({RUST_FILE})`?(?=$|[\s;,:)]|\.(?:\s|$))",
+    re.IGNORECASE,
+)
 # Words after a file rename that name a second file pair: another change.
 SECOND_FILE_PAIR = re.compile(rf"{RUST_FILE}\s+to\s+{RUST_FILE}", re.IGNORECASE)
 # A move, split or merge of code; a word joined to another with a hyphen, as in `finding-merging`, is a name.
@@ -180,6 +211,30 @@ class NoFileRename:
     Its after does not start with `Rename <a> to <b>`, its path does not end with <a>, the two files are not sibling
     module files with different names that are not Rust keywords, or the rest of its after names another change.
     """
+
+
+@dataclass(frozen=True)
+class UnparsedFileRenames:
+    """The parser cannot establish the kind or scope of the rename."""
+
+
+@dataclass(frozen=True)
+class ItemRename:
+    """A pair that changes one Rust item or binding name."""
+
+    pair: ApprovedRename | BindingRename
+
+
+@dataclass(frozen=True)
+class FileRenamePlan:
+    """One or more moves from a complete file rename instruction."""
+
+    first: FileRename
+    companions: tuple[FileRename, ...] = ()
+
+    @property
+    def moves(self) -> tuple[FileRename, ...]:
+        return (self.first, *self.companions)
 
 
 @dataclass(frozen=True)
@@ -1619,6 +1674,12 @@ class Declarations:
 
 
 @dataclass(frozen=True)
+class ScopedDeclarations:
+    sites: frozenset[int]
+    data_members: frozenset[int]
+
+
+@dataclass(frozen=True)
 class UncertainScan:
     """The scan does not read with certainty where the file declares the name under its parent.
 
@@ -1667,6 +1728,89 @@ def file_rename(kind: str, path: str, after: str) -> FileRename | NoFileRename:
             or len(stems) == 1 or stems & ROOT_STEMS or stems & style_footprint.RUST_KEYWORDS):
         return NoFileRename()
     return FileRename(path, path.removesuffix(match[1]) + match[2])
+
+
+def classify_rename(path: str, before: str, after: str) -> FileRenamePlan | ItemRename | UnparsedFileRenames:
+    """Classify complete file instructions and establish both sides of an item rename."""
+    instruction = after.strip()
+    first = FIRST_FILE_RENAME.match(instruction)
+    if not first:
+        if (FILE_INSTRUCTION_VERB.match(instruction) or RUST_FILE_SIDE.fullmatch(instruction)
+                or RUST_FILE_SIDE.fullmatch(before.strip())):
+            return UnparsedFileRenames()
+        if RUST_ITEM_TARGET.fullmatch(instruction) and not RUST_ITEM_TARGET.fullmatch(before.strip()):
+            return UnparsedFileRenames()
+        qualified = approved_rename("rename", before, after)
+        if isinstance(qualified, ApprovedRename):
+            return ItemRename(qualified)
+        binding = refactor_rename("rename", before, after, 0, "")
+        if isinstance(binding, BindingRename) and (
+            RUST_ITEM_TARGET.fullmatch(instruction)
+            or re.search(r"[():={}\[\].]", before)
+        ):
+            return ItemRename(binding)
+        return UnparsedFileRenames()
+    pairs = [(first["old"], first["new"])]
+    end = first.end()
+    if description := RENAME_DESCRIPTION.match(instruction, end):
+        end = description.end()
+    while not END_OF_RENAME.fullmatch(instruction, end):
+        if pair := NEXT_FILE_RENAME.match(instruction, end):
+            pairs.append((pair["old"], pair["new"]))
+            end = pair.end()
+        elif update := REFERENCE_UPDATE.match(instruction, end):
+            end = update.end()
+        else:
+            return UnparsedFileRenames()
+    anchor = next((old for old, _ in pairs if path == old or path.endswith("/" + old)), "")
+    if not anchor:
+        return UnparsedFileRenames()
+    prefix = path.removesuffix(anchor)
+    folder = PurePosixPath(path).parent
+    moves: list[FileRename] = []
+    for source, destination in pairs:
+        if source == anchor and PurePosixPath(source).parent == PurePosixPath(destination).parent:
+            old, new = path, prefix + destination
+        else:
+            old = source if "/" in source else str(folder / source)
+            new = destination if "/" in destination else str(PurePosixPath(old).with_name(destination))
+        if source == anchor and old != path:
+            return UnparsedFileRenames()
+        old_path, new_path = PurePosixPath(old), PurePosixPath(new)
+        stems = {old_path.stem, new_path.stem}
+        if old_path.parent != new_path.parent or len(stems) != 2 or stems & (ROOT_STEMS | style_footprint.RUST_KEYWORDS):
+            return UnparsedFileRenames()
+        moves.append(FileRename(old, new))
+    return FileRenamePlan(moves[0], tuple(moves[1:]))
+
+
+def reused_file_rename_paths(moves: Iterable[FileRename]) -> frozenset[str]:
+    """Return paths that occur in more than one move."""
+    seen: set[str] = set()
+    reused: set[str] = set()
+    for move in moves:
+        for path in (move.old, move.new):
+            if path in seen:
+                reused.add(path)
+            seen.add(path)
+    return frozenset(reused)
+
+
+def stated_file_renames(kind: str, path: str, after: str, *, before: str = "") -> tuple[FileRename, ...]:
+    """Return the file moves that the finding permits."""
+    if kind != "rename":
+        return ()
+    parsed = classify_rename(path, before, after)
+    return parsed.moves if isinstance(parsed, FileRenamePlan) and not reused_file_rename_paths(parsed.moves) else ()
+
+
+def stated_split_destinations(kind: str, path: str, after: str) -> tuple[str, ...]:
+    """Return Rust file paths that a restructure names as move destinations."""
+    if kind != "restructure":
+        return ()
+    folder = PurePosixPath(path).parent
+    names = (match[1] for match in MOVE_DESTINATION.finditer(after))
+    return tuple(dict.fromkeys(name if "/" in name else str(folder / name) for name in names))
 
 
 def edits_module_owners(kind: str, path: str, after: str) -> bool:
@@ -1797,6 +1941,13 @@ def std_derives_only(attributes: tuple[str, ...]) -> bool:
 
 def declaration_sites(words: tuple[str, ...], path: str, rename: ApprovedRename, name: str) -> Declarations | UncertainScan:
     """Where the file at path declares name directly under the rename's parent."""
+    scope = _declaration_scope(words, path, rename)
+    if isinstance(scope, UncertainScan):
+        return scope
+    return Declarations(frozenset(index for index in scope.sites if words[index] == name))
+
+
+def _declaration_scope(words: tuple[str, ...], path: str, rename: ApprovedRename) -> ScopedDeclarations | UncertainScan:
     parent = rename.parent
     starts = style_footprint.item_starts(words)
     modules = inline_modules(words, starts)
@@ -1810,13 +1961,17 @@ def declaration_sites(words: tuple[str, ...], path: str, rename: ApprovedRename,
         return UncertainScan()
     home = enclosing(modules, declared[0]) if declared else ()
     home_path = tuple(module.name for module in home)
-    if (declared or top_level) and rename.qualifier and home_path[-len(rename.qualifier):] != rename.qualifier:
+    qualifier = rename.qualifier[1:] if rename.qualifier[:1] == ("",) else rename.qualifier
+    if (declared or top_level) and qualifier and home_path[-len(qualifier):] != qualifier:
         return UncertainScan()
     impls = impl_blocks(words, rename, any(words[index] == "trait" for index in declared), starts, modules, home)
     if isinstance(impls, UncertainScan):
         return UncertainScan()
-    sites = {index for body in style_footprint.enum_bodies(words) if body.name == parent
-             for index in body.variants if words[index] == name}
+    enum_starts = {body_start(words, index) for index in declared if words[index] == "enum"}
+    enums = tuple(body for body in style_footprint.enum_bodies(words) if body.start in enum_starts)
+    sites = {index for body in enums for index in body.variants}
+    data_members = {index for body in enums if body.safe_attributes and not body.attributed_variants
+                    for index in body.variants}
     bodies = [(block.start, block.end) for block in impls]
     if top_level:
         bodies.append((-1, len(words)))
@@ -1825,44 +1980,67 @@ def declaration_sites(words: tuple[str, ...], path: str, rename: ApprovedRename,
         if start == len(words):
             continue
         if words[index] in {"struct", "union"}:
-            sites.update(site for site in field_sites(words, start, style_footprint.closing(words, start))
-                         if words[site] == name)
+            fields = field_sites(words, start, style_footprint.closing(words, start))
+            sites.update(fields)
+            data_members.update(fields)
         elif words[index] in {"mod", "trait"}:
             bodies.append((start, style_footprint.closing(words, start)))
     for start, end in bodies:
         cursor = start + 1
         while cursor < end:
-            if words[cursor] in ITEM_KEYWORDS and cursor in starts and cursor + 1 < end and words[cursor + 1] == name:
+            if words[cursor] in ITEM_KEYWORDS and cursor in starts and cursor + 1 < end:
                 sites.add(cursor + 1)
             if words[cursor] in {"{", "(", "["}:
                 cursor = style_footprint.closing(words, cursor)
             cursor += 1
-    return Declarations(frozenset(sites))
+    return ScopedDeclarations(frozenset(sites), frozenset(data_members))
+
+
+def file_move_applied(move: FileRename, read: FileReader) -> AppliedInCode | RenameNotApplied | NoAppliedCheck:
+    """Check the source, destination and child module folders of a file rename."""
+    old, new = read(move.old), read(move.new)
+    if (isinstance(old, bytes) == isinstance(new, bytes)
+            or not all(isinstance(read(folder), MissingFile) for folder in move.module_folders)):
+        return NoAppliedCheck("rename")
+    return AppliedInCode() if isinstance(new, bytes) else RenameNotApplied(move.old)
 
 
 def applied_check(kind: str, before: str, after: str, path: str, read: FileReader) -> AppliedCheck:
     """Whether a finding's change is in the code that read reads."""
-    moved = file_rename(kind, path, after)
-    if isinstance(moved, FileRename):
-        old, new = read(moved.old), read(moved.new)
-        if (isinstance(old, bytes) == isinstance(new, bytes)
-                or not all(isinstance(read(folder), MissingFile) for folder in moved.module_folders)):
-            return NoAppliedCheck(kind)
-        return AppliedInCode() if isinstance(new, bytes) else RenameNotApplied(moved.old)
-    rename = approved_rename(kind, before, after)
+    if kind != "rename":
+        return NoAppliedCheck(kind)
+    intent = classify_rename(path, before, after)
+    if isinstance(intent, UnparsedFileRenames):
+        return RenameNotApplied(path)
+    if isinstance(intent, FileRenamePlan):
+        if reused_file_rename_paths(intent.moves):
+            return RenameNotApplied(path)
+        if not intent.companions:
+            return file_move_applied(intent.first, read)
+        for move in intent.moves:
+            if not isinstance(file_move_applied(move, read), AppliedInCode):
+                return RenameNotApplied(move.old)
+        return AppliedInCode()
+    rename = intent.pair
     source = read(path)
     # A file that is not there declares neither name.
-    if isinstance(rename, NoQualifiedRename) or not isinstance(source, bytes):
+    if isinstance(rename, BindingRename) or not isinstance(source, bytes):
         return NoAppliedCheck(kind)
     source_tokens = style_footprint.tokens(source.decode(errors="replace"))
     names = {token.value.removeprefix("r#") for token in source_tokens if token.kind == "identifier"}
     words = tuple(token.value for token in source_tokens)
-    if ((rename.old in names) == (rename.new in names) or names & NAME_MACROS
-            or any(pair == ("[", "<") for pair in zip(words, words[1:]))):
+    if names & NAME_MACROS or any(pair == ("[", "<") for pair in zip(words, words[1:])):
         return NoAppliedCheck(kind)
-    # The file cannot declare a name that is in none of its identifiers, so the name it holds settles the check.
-    held = rename.old if rename.old in names else rename.new
-    found = declaration_sites(words, path, rename, held)
-    if isinstance(found, UncertainScan) or not found.sites:
+    if not names.intersection((rename.old, rename.new)):
         return NoAppliedCheck(kind)
-    return RenameNotApplied(path) if held == rename.old else AppliedInCode()
+    scope = _declaration_scope(words, path, rename)
+    if isinstance(scope, UncertainScan):
+        return NoAppliedCheck(kind)
+    if any(words[index] == rename.old for index in scope.sites):
+        return RenameNotApplied(path)
+    new = frozenset(index for index in scope.sites if words[index] == rename.new)
+    data_rename = (bool(new & scope.data_members) and "macro_rules" not in names
+                   and all(words[index].removeprefix("r#") != rename.old for index in scope.data_members))
+    if new and (rename.old not in names or data_rename):
+        return AppliedInCode()
+    return NoAppliedCheck(kind)

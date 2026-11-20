@@ -1,11 +1,12 @@
 """One fake stop-and-resume boundary for account move callers."""
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from scripts.accounts import moves
 from scripts.agents import stop_resume
+from scripts.production import staff
 
 
 _NO_SOURCES: Mapping[str, str] = MappingProxyType({})
@@ -28,8 +29,11 @@ class FakeSessionMoves:
     sources: list[dict[str, str]] = field(default_factory=list)
 
     def __call__(self, sessions: list[str], target: str, *, why: str, cause: moves.MoveCause = "by hand",
-                 source_accounts: Mapping[str, str] = _NO_SOURCES) -> list[stop_resume.MoveResult]:
-        del cause
+                 source_accounts: Mapping[str, str] = _NO_SOURCES, batch_id: str = "",
+                 intent: moves.FollowGroupAccount | moves.ExplicitMoveTarget =
+                 moves.ExplicitMoveTarget.REQUESTED_ACCOUNT,
+                 staff_members: Collection[staff.StaffId] = ()) -> list[stop_resume.MoveResult]:
+        del cause, batch_id, intent, staff_members
         self.sources.append(dict(source_accounts))
         self.batches.append(list(sessions))
         return [self.move(session, target, why=why) for session in sessions]

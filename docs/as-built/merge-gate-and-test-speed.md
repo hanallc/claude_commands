@@ -98,6 +98,9 @@ The history counts an older file of cloud gate runs under a box name as `aws` to
 Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
 The AWS state folder retains `cloud-gate-launches.jsonl`.
 Each launch call records its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+Launch, refusal, fallback, and finish rows record the queue's tagged job record in `gate_job`.
+The field contains `{"kind":"GateJobNotRecorded"}` when the job is unknown.
+Older rows can omit the field.
 A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
 Local fallback prints `Cloud gate uses natedev: <reason>`.
 These lines contain no account, instance, or subnet identifier.
@@ -164,9 +167,9 @@ The gate bucket blocks public access, requires HTTPS, encrypts objects, and remo
 | `expiry_memory_mib` | `128` | Size the expiry function. |
 | `shared_usd_per_month` | `1` | Price shared gate resources before creation. |
 | `credential_file` | `~/.config/aws-build/credentials` | Select the service's private scaler file. |
-| `packages` | See the configured list below. | Prepare the common trial and production tools. |
+| `packages` | List in `config/cloud_gate.conf`. | Prepare tools for cloud gates and paired trials. |
 
-The package list contains `git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq gcc pkg-config tmux taplo zsh bash gh sqlite chromium util-linux awscli2`.
+The list includes bubblewrap for tests that need a sandbox.
 The existing `aws_target.conf` supplies the profile, region, placement, accounting settings, and shared limits.
 
 Fake AWS tests cover launch order, lost replies, restart recovery, expiry, termination, result validation, fallback, and concurrent cap reservations.
@@ -212,7 +215,7 @@ The regression tests observe complete operations and child processes.
 | Test | Observation |
 |---|---|
 | `test_resolve_reuses_the_stored_role_and_live_model_identity` | Worker reuse reads the registry zero times with both operation snapshots cleared. |
-| `test_inherited_editor_writes_without_catalog_sync` | An inherited editor publishes its row with exactly two registry reads. |
+| `test_inherited_editor_writes_without_catalog_sync` | An inherited editor saves its row with one registry read under the lock. |
 | `test_sync_codex_catalog.sh` | Lock contention produces no registry reads; an acquired lock permits reads before an invalid cache fails. |
 | `test_failed_catalog_sync_warns_and_returns_the_current_configuration` | Both fresh factories warn after sync failure and return the current path and text. |
 
@@ -715,7 +718,18 @@ A batch can contain one item.
 
 1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
    Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
-2. Resume each item that the merge branch already contains through the single command's route, in file order.
+2. Fetch the merge branch and the unit branches from origin.
+   Fetch all origin heads only if an item still needs a commit or a fresh tracking ref.
+   Resolve every item to a commit before writing the record or starting a merge.
+   Refuse the batch and name the item if it cannot resolve to a commit.
+   Record each item's argument line and resolved commit in Git's internal directory, in batch order.
+   Normalize shell quoting and keep the argument order.
+   Resume checkpoint merges only when the arguments and commits match the record and an unpushed checkpoint belongs to the batch.
+   Identify checkpoint merges by their subjects and second parents.
+   If the record is missing or differs, reset the merge branch to its pushed tip.
+   Then start a fresh batch. Remove the record after the push or when the batch ends without unpushed merges.
+   If record removal fails, report a warning and continue.
+   Resume each item that the merge branch already contains through the single command's route, in file order.
 3. Retain the starting tip and whether a merge is unfinished.
 4. Check each remaining item and make its own merge commit.
 5. Test all code paths changed from the published merge branch tip through HEAD once.
