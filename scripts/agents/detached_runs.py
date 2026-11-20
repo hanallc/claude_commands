@@ -51,6 +51,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
+from scripts.usage import rollouts
 
 if TYPE_CHECKING:
     from scripts.accounts.session_state import RunEvidence
@@ -560,6 +561,7 @@ def _retired_worker_result(record: RunRecord) -> bool:
 
 SUPERSEDED_ORPHAN_DELIVERY = "nothing delivered: the supervisor is gone and a newer run of the same command answers"
 OTHER_PASS_DELIVERY = "nothing delivered: the result belongs to a different pane pass"
+COVERED_BY_DONE = "finished: the pass DONE covers the result"
 
 
 @dataclass
@@ -645,6 +647,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
                         and _number(other.get("started_at"), 0.0) > record["started_at"]
                         for _, other in records)
             delivery = ""
+            finished_at = record.setdefault("finished_at", datetime.now(timezone.utc).isoformat(timespec="microseconds"))
             if not _cancels_pass(record):
                 try:
                     delivery = (SUPERSEDED_ORPHAN_DELIVERY if newer and not record.get("self_stop")
@@ -653,6 +656,7 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
                     print(f"detached_runs: {record['run_id']}: {error}", file=sys.stderr)
                     continue
             record = _read_record(path)
+            _ = record.setdefault("finished_at", finished_at)
             if delivery:
                 record["delivery"] = delivery
             elif newer:
@@ -660,7 +664,6 @@ def _reap_orphans_locked(runs: Path, worker: str = "") -> OrphanReapResult:
             record.update({
                 "status": "finished", "ended": "supervisor gone",
                 "completion_pending": True,
-                "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             })
             record = _write_record(path, record)
             result.queue_completion(path, record)
@@ -698,6 +701,8 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
         if _cancels_pass(record) and not record.get("delivery"):
             delivery = _complete_stopped_run(path, record)
             if _worker_result_pending(delivery):
+                return CompletionReplay.RETRY
+            if _stop_fallback_delivered(record, delivery) and _complete_worker_dispatch(record) == CompletionReplay.RETRY:
                 return CompletionReplay.RETRY
         elif _retired_worker_result(record):
             _ = deliver(record, command_result(record))
@@ -766,6 +771,18 @@ def _clear_completion_pending(path: Path) -> None:
                 and record.get("completion_pending") is True):
             record["completion_pending"] = False
             write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+
+
+def acknowledge_worker_completion(run: Path, row: staff.StaffRow, instance: str, started_at: float) -> None:
+    """Clear settled result flags after the worker pass completes."""
+    runs = run / DETACHED_RUNS_DIR
+    for record in _registered_runs(runs, row.id):
+        delivery = record.get("delivery", "")
+        if (record["staff_id"] == row.id and record["status"] == "finished"
+                and record.get("completion_pending") is True and delivery and not _worker_result_pending(delivery)
+                and (record.get("pane_dispatch_id") == instance
+                     or "pane_dispatch_id" not in record and record["started_at"] >= started_at)):
+            _clear_completion_pending(runs / f"{record['run_id']}.json")
 
 
 def _complete_worker_dispatch(record: RunRecord) -> CompletionReplay:
@@ -902,6 +919,46 @@ class WorkerResultDeferred(Enum):
     PENDING = "a finished run result still needs delivery"
 
 
+class RunFinishTimeUnknown(Enum):
+    UNRECORDED = "the run has no recorded finish time"
+
+
+@dataclass(frozen=True)
+class RunFinishedBefore:
+    exclusive_bound: float
+
+
+class WorkerResultCovered(Enum):
+    BY_DONE = "the pass DONE covers the run result"
+
+
+class ResultDoneCoverage(StrEnum):
+    COVERED = "DONE covers the result"
+    NEEDS_DELIVERY = "DONE does not cover the result"
+
+
+@dataclass(frozen=True)
+class ResultTranscriptUnknown:
+    reason: str
+
+
+def run_finish_time(record: RunRecord) -> float | RunFinishedBefore | RunFinishTimeUnknown:
+    """Read the finish time without assuming precision in old records."""
+    value = record.get("finished_at", "")
+    at = rollouts.parse_timestamp(value)
+    if at is None:
+        return RunFinishTimeUnknown.UNRECORDED
+    # Old records truncate to seconds.
+    return at.timestamp() if value[19:20] == "." else RunFinishedBefore(at.timestamp() + 1)
+
+
+@dataclass(frozen=True)
+class FinishedWorkerResult:
+    finished_at: float | RunFinishedBefore | RunFinishTimeUnknown
+    delivered_at: float | DeliveryTimeUnknown | WorkerResultDeferred | WorkerResultCovered
+    requires_done_after_finish: bool = False
+
+
 DEFERRED_WORKER_RESULT = "deferred: "
 FAILED_WORKER_SUBMISSION = "submission failed: "
 UNCONFIRMED_WORKER_RESULT = "unconfirmed: "
@@ -909,6 +966,11 @@ UNCONFIRMED_WORKER_RESULT = "unconfirmed: "
 
 def _worker_result_pending(delivery: str) -> bool:
     return delivery.startswith((DEFERRED_WORKER_RESULT, FAILED_WORKER_SUBMISSION, UNCONFIRMED_WORKER_RESULT))
+
+
+def _stop_fallback_delivered(record: RunRecord, delivery: str) -> bool:
+    return (_cancels_pass(record) and record.get("pane_dispatch_id") != ""
+            and delivery.startswith(("sent: ", "queued: ", "skipped: ", "already delivered: ")))
 
 
 def result_is_from_another_pass(record: Mapping[str, object], instance: object) -> bool:
@@ -920,9 +982,9 @@ def result_is_from_another_pass(record: Mapping[str, object], instance: object) 
 
 def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dispatch_id: str = "",
                    include_legacy_pass: bool = False,
-                   ) -> tuple[dict[str, float | DeliveryTimeUnknown | WorkerResultDeferred], set[str]]:
+                   ) -> tuple[dict[str, FinishedWorkerResult], set[str]]:
     """Find finished results and identify results from other passes."""
-    results: dict[str, float | DeliveryTimeUnknown | WorkerResultDeferred] = {}
+    results: dict[str, FinishedWorkerResult] = {}
     other_passes: set[str] = set()
     for record in _registered_runs(runs, worker.id):
         if record.get("staff_id") != worker.id:
@@ -934,10 +996,17 @@ def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dis
             continue
         if pane_dispatch_id and not include_legacy_pass and record.get("pane_dispatch_id") != pane_dispatch_id:
             continue
-        if _worker_result_pending(record.get("delivery", "")):
-            results[record["run_id"]] = WorkerResultDeferred.PENDING
-        elif record.get("delivery", "").startswith((f"sent: worker {record['worker']} at ", f"sent: worker {worker.name} at ", "already delivered: ")):
-            results[record["run_id"]] = record.get("delivered_at", DeliveryTimeUnknown.UNRECORDED)
+        delivery = record.get("delivery", "")
+        stop_fallback = _stop_fallback_delivered(record, delivery)
+        if delivery == COVERED_BY_DONE:
+            results[record["run_id"]] = FinishedWorkerResult(run_finish_time(record), WorkerResultCovered.BY_DONE)
+        elif not delivery or _worker_result_pending(delivery):
+            results[record["run_id"]] = FinishedWorkerResult(run_finish_time(record), WorkerResultDeferred.PENDING)
+        elif stop_fallback or delivery.startswith((
+                f"sent: worker {record['worker']} at ", f"sent: worker {worker.name} at ", "already delivered: ")):
+            results[record["run_id"]] = FinishedWorkerResult(
+                run_finish_time(record), record.get("delivered_at", DeliveryTimeUnknown.UNRECORDED),
+                requires_done_after_finish=stop_fallback)
     return results, other_passes
 
 
@@ -1337,13 +1406,14 @@ def deliver(record: RunRecord, result: CommandResult, *,
     done_file = record["done_message_file"]
     if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS) and not record.get("stop_reason"):
         return _save_delivery(path, f"nothing delivered: {_exit_words(result)} with a done message")
-    if done_file and exit_code == 0 and not record.get("stop_reason"):
-        try:
-            text = Path(done_file).read_text(encoding="utf-8")
-        except OSError as exc:
-            text = f"Run finished: {record['label']}\nResult: PASS (exit 0)\n(done message {done_file} unreadable: {exc})"
-    else:
-        text = result_text(record, result)
+
+    def message() -> str:
+        if done_file and exit_code == 0 and not record.get("stop_reason"):
+            try:
+                return Path(done_file).read_text(encoding="utf-8")
+            except OSError as error:
+                return f"Run finished: {record['label']}\nResult: PASS (exit 0)\n(done message {done_file} unreadable: {error})"
+        return result_text(record, result)
     membership = staff.local_snapshot()
     member = _run_owner(record, membership)
     if isinstance(member, RunOwnerUnavailable) and (
@@ -1356,7 +1426,7 @@ def deliver(record: RunRecord, result: CommandResult, *,
 
     def send_to_director(director: staff.StaffRow) -> str:
         sent = send.send(send.parse(["--to", str(director.id), "--from", "detached-runs",
-                                     "--timeout", str(send_budget.seconds()), "--text", marker + "\n" + text]))
+                                     "--timeout", str(send_budget.seconds()), "--text", marker + "\n" + message()]))
         if sent.outcome in ("failed", "refused"):
             raise RunDeliveryFailed(f"{sent.outcome}: {sent.detail}")
         return _save_delivery(path, f"{sent.outcome}: {sent.detail}")
@@ -1387,19 +1457,31 @@ def deliver(record: RunRecord, result: CommandResult, *,
         unconfirmed = saved.startswith(UNCONFIRMED_WORKER_RESULT)
 
         def check_pass() -> None:
-            linked = record.get("pane_dispatch_id")
-            if isinstance(linked, str) and linked:
-                from scripts.direct import recorder_state
-                from scripts.herdr import worker_panes
+            if record.get("pane_dispatch_id") == "":
+                return
+            from scripts.direct import recorder_state
+            from scripts.herdr import worker_panes
 
-                try:
-                    run = worker_panes.worker_run(worker, record=membership)
-                    instance = worker_panes.worker_pass(worker, run, record=membership).get("instance_id")
-                except (OSError, ValueError, recorder_state.OldRecorderState) as error:
-                    raise _WorkerPassDeliveryBlocked(
-                        DEFERRED_WORKER_RESULT + f"worker pass is unavailable: {error}") from error
+            try:
+                run = worker_panes.worker_run(worker, record=membership)
+                passed = worker_panes.worker_pass(worker, run, record=membership)
+                instance = passed.get("instance_id")
                 if result_is_from_another_pass(record, instance):
                     raise _WorkerPassDeliveryBlocked(OTHER_PASS_DELIVERY)
+                if run != Path(record["session_dir"]):
+                    return
+                read_coverage = cast(Callable[[staff.StaffRow, dict[str, object], RunRecord],
+                    ResultDoneCoverage | ResultTranscriptUnknown],
+                    import_module("scripts.production.worker").result_done_coverage)
+                coverage = read_coverage(worker, passed, record)
+            except (OSError, ValueError, recorder_state.OldRecorderState) as error:
+                raise _WorkerPassDeliveryBlocked(
+                    DEFERRED_WORKER_RESULT + f"worker pass is unavailable: {error}") from error
+            if not isinstance(coverage, str):
+                raise _WorkerPassDeliveryBlocked(
+                    DEFERRED_WORKER_RESULT + f"worker transcript is unavailable: {coverage.reason}")
+            if coverage == ResultDoneCoverage.COVERED:
+                raise _WorkerPassDeliveryBlocked(COVERED_BY_DONE)
 
         def before_input() -> None:
             check_pass()
@@ -1411,11 +1493,11 @@ def deliver(record: RunRecord, result: CommandResult, *,
             check_pass()
             if unconfirmed:
                 return saved
-            delivery = send.deliver_worker_text(worker, membership, marker + "\n" + text,
+            delivery = send.deliver_worker_text(worker, membership, marker + "\n" + message(),
                 sender="detached-runs", timeout=send_budget.seconds(), reason=reason, receipt=receipt)
         except _WorkerPassDeliveryBlocked as blocked:
             status = str(blocked)
-            if unconfirmed and status != OTHER_PASS_DELIVERY:
+            if unconfirmed and status not in (OTHER_PASS_DELIVERY, COVERED_BY_DONE):
                 return saved
             return _save_delivery(path, status)
         if isinstance(delivery, send.WorkerResultNotSubmitted):
@@ -1479,7 +1561,8 @@ def command_deliver(args: argparse.Namespace) -> int:
             return 1
     if _cancels_pass(record):
         if record["status"] != "finished":
-            record.update(status="finished", finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            record["status"] = "finished"
+            _ = record.setdefault("finished_at", datetime.now(timezone.utc).isoformat(timespec="microseconds"))
         return 0 if _finish_record(record_path, record) == CompletionReplay.HANDLED else 1
     try:
         _ = deliver(record, command_result(record))
@@ -1650,10 +1733,15 @@ def command_supervise(args: argparse.Namespace) -> int:
         # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
         # unless the result is already held.
         record["exit_code"] = exit_code
+        if not record.get("stop_pass_requested"):
+            record["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         record = _write_record(record_path, record)
         # Other members of the command group can remain after its leader exits.
         while record.get("stop_pass_requested") and not _stopped_group_has_ended(record):
             time.sleep(0.25)
+        if "finished_at" not in record:
+            record["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            record = _write_record(record_path, record)
         delivery_exit = deliver_in_fresh_process(record_path)
         record = _read_record(record_path)
         if _cancels_pass(record):
@@ -1663,14 +1751,11 @@ def command_supervise(args: argparse.Namespace) -> int:
             if record["status"] == "running":
                 if not _stopped_group_has_ended(record):
                     return 1
-                record.update(status="finished", finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+                record["status"] = "finished"
             return 0 if _finish_record(record_path, record) == CompletionReplay.HANDLED else 1
         if delivery_exit != 0:
             return 1
-        record.update({
-            "status": "finished", "exit_code": exit_code,
-            "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        })
+        record.update(status="finished", exit_code=exit_code)
         _ = _finish_record(record_path, record)
     return 0
 
