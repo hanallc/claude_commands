@@ -14,10 +14,11 @@ from collections.abc import Callable, Collection, Generator, Iterable, Iterator,
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 from itertools import chain
 from pathlib import Path
 from threading import Lock
-from typing import NamedTuple, cast
+from typing import NamedTuple, NewType, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
@@ -58,12 +59,31 @@ def _folder_registry(owner: str, kind: str) -> Path:
     return state_root() / "review-folders" / (owner or ".unowned") / (kind + ".json")
 
 
-def _registered_folders(path: Path) -> tuple[Path, ...]:
+_RegisteredFolderPath = NewType("_RegisteredFolderPath", Path)
+
+
+def _registered_folders(path: Path, *, on_invalid_entry: Callable[[Path, Exception], None] | None = None
+                        ) -> tuple[_RegisteredFolderPath, ...]:
     try:
-        folders = cast(list[str], json.loads(path.read_text(encoding="utf-8")))
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except FileNotFoundError:
         return ()
-    return tuple(Path(folder) for folder in folders)
+    except (ValueError, RecursionError) as error:
+        raise ValueError(f"Cannot read the folder registry {path}: {error}") from error
+    if not isinstance(value, list):
+        raise ValueError(f"Expected a list of folder paths in {path}.")
+    folders: list[_RegisteredFolderPath] = []
+    for index, entry in enumerate(cast(list[object], value), start=1):
+        if isinstance(entry, str) and entry and "\x00" not in entry:
+            folder = Path(entry)
+            if folder.is_absolute():
+                folders.append(_RegisteredFolderPath(folder))
+                continue
+        error = ValueError(f"Folder path {index} in {path} must be absolute and contain no NUL.")
+        if on_invalid_entry is None:
+            raise error
+        on_invalid_entry(path, error)
+    return tuple(folders)
 
 
 def review_folders(owner: staff.StaffId, kind: str) -> tuple[Path, ...]:
@@ -288,55 +308,79 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
 
 
 def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path] = (),
-                  *, document: Path | None = None, strict: bool = False,
+                  *, document: Path | None = None, current_source: Path | None = None, strict: bool = False,
                   include_history: bool = True, require_document: bool = True,
-                  require_existing_document: bool = False, sources: list[Path] | None = None) -> tuple[Path, ...]:
-    """Return current and former store roots. Use stored_paths to include their archives."""
+                  require_existing_document: bool = False, sources: list[Path] | None = None,
+                  on_source_error: Callable[[Path, Exception], None] | None = None) -> tuple[Path, ...]:
+    """Return current and former store roots. Use stored_paths to include their archives.
+
+    Use current_source to name the source of the supplied roots.
+    If given, on_source_error reports each source failure and keeps the other roots.
+    """
+    def source_failed(path: Path, error: Exception, *, required: bool) -> None:
+        if on_source_error is not None:
+            on_source_error(path, error)
+        elif required:
+            raise error
+
+    resolved: dict[Path, None] = {}
+
+    def add_resolved_folder(folder: Path, source: Path) -> None:
+        try:
+            if "\x00" in str(folder):
+                raise ValueError("A folder path cannot contain NUL.")
+            resolved[folder.resolve()] = None
+        except (OSError, ValueError, RuntimeError) as error:
+            source_failed(source, error, required=strict)
+
     configured_roots = tuple(current)
-    roots = list(configured_roots)
+    for folder in configured_roots:
+        add_resolved_folder(folder, current_source if current_source is not None else folder)
+
+    registry = _folder_registry(owner, kind)
     if sources is not None:
-        sources.append(_folder_registry(owner, kind))
+        sources.append(registry)
     try:
-        roots.extend(review_folders(owner, kind))
-    except (OSError, ValueError):
-        if strict:
-            raise
+        registered = _registered_folders(registry, on_invalid_entry=partial(source_failed, required=strict))
+    except (OSError, ValueError) as error:
+        source_failed(registry, error, required=strict)
+    else:
+        for folder in registered:
+            add_resolved_folder(folder, registry)
     if kind is RecordKind.QUESTION and owner:
-        roots.append(default_question_folder(owner))
+        folder = default_question_folder(owner)
+        add_resolved_folder(folder, folder)
     if kind is RecordKind.INVESTIGATION and owner:
-        roots.append(state_root() / owner / "investigations")
+        folder = state_root() / owner / "investigations"
+        add_resolved_folder(folder, folder)
     if document is not None and kind is not RecordKind.INVESTIGATION:
         require_existing = strict and require_existing_document
+        document_required = strict and require_document
         try:
             read_document = require_existing or document.parent.is_dir()
-        except OSError:
-            if strict and require_document:
-                raise
+        except OSError as error:
+            source_failed(document, error, required=document_required)
             read_document = False
         if read_document:
             if not configured_roots or kind is RecordKind.PROPOSAL or not require_document:
                 try:
-                    if (configured := issues_folder(document)) is not None:
-                        roots.append(configured)
-                except FileNotFoundError:
+                    configured = issues_folder(document)
+                except FileNotFoundError as error:
                     if require_existing:
-                        raise
-                except OSError:
-                    if strict and require_document:
-                        raise
+                        source_failed(document, error, required=True)
+                except (OSError, ValueError, RuntimeError) as error:
+                    source_failed(document, error, required=document_required or isinstance(error, RuntimeError))
+                else:
+                    if configured is not None:
+                        add_resolved_folder(configured, document)
             if include_history:
+                historical: list[Path] = []
                 try:
-                    roots.extend(historical_issue_folders(document, sources=sources))
-                except (OSError, UnicodeError):
-                    if strict and require_document:
-                        raise
-    resolved: dict[Path, None] = {}
-    for path in roots:
-        try:
-            resolved[path.resolve()] = None
-        except (OSError, RuntimeError):
-            if strict:
-                raise
+                    historical.extend(historical_issue_folders(document, sources=sources))
+                except (OSError, ValueError, RuntimeError) as error:
+                    source_failed(document, error, required=document_required or isinstance(error, RuntimeError))
+                for folder in historical:
+                    add_resolved_folder(folder, document)
     return tuple(resolved)
 
 

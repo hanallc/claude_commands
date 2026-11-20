@@ -38,6 +38,7 @@ from scripts.nightly_review import candidates
 from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
+from scripts.production.record_store import state_root
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_page
@@ -859,13 +860,25 @@ window.fetch=(url,options)=>{
             +f'proposed_by: {producer.id}\nproposal_id: P1\ndate_created: 2026-11-01\n---\n'
             +'# Reduce the build time\n')
 
-        snapshot = review_page.build_snapshot(self.root)
-        proposals = [item for item in snapshot.records.values() if item.type == review_items.ReviewType.PROPOSAL]
-        self.assertEqual(review_items.count_items(proposals, datetime.now(snapshot.zone)), 1)
-        self.assertIn('proposal/'+str(path), {entry['key'] for entry in snapshot.entries})
-        self.assertEqual(proposals[0].owner, producer.id)
-        self.assertIn(doc, snapshot.source_stamps)
-        self.assertEqual(snapshot.notices, ())
+        registry = state_root() / 'review-folders' / producer.id / 'proposal.json'
+        for registry_state in ('missing', 'unreadable', 'null', 'embedded NUL'):
+            with self.subTest(registry=registry_state):
+                if registry_state == 'unreadable':
+                    registry.mkdir(parents=True)
+                elif registry_state == 'null':
+                    registry.rmdir()
+                    _ = registry.write_text('null')
+                elif registry_state == 'embedded NUL':
+                    _ = registry.write_text(json.dumps([str(folder) + '\x00']))
+                snapshot = review_page.build_snapshot(self.root)
+                proposals = [item for item in snapshot.records.values() if item.type == review_items.ReviewType.PROPOSAL]
+                self.assertEqual(review_items.count_items(proposals, datetime.now(snapshot.zone)), 1)
+                self.assertIn('proposal/'+str(path), {entry['key'] for entry in snapshot.entries})
+                self.assertEqual(proposals[0].owner, producer.id)
+                self.assertIn(doc, snapshot.source_stamps)
+                self.assertIn(registry, snapshot.source_stamps)
+                expected = () if registry_state == 'missing' else (f'Could not load {registry}.',)
+                self.assertEqual(snapshot.notices, expected)
 
     def test_snapshot_ignores_producer_documents_and_reports_missing_production(self) -> None:
         directory = self.fixture.temporary / 'brain'
@@ -881,6 +894,36 @@ window.fetch=(url,options)=>{
         for path in (directory, missing_producer):
             self.assertNotIn(f'Could not load {path}.', snapshot.notices)
             self.assertNotIn(path, snapshot.source_stamps)
+
+        invalid = self.fixture.temporary / 'invalid-producer.md'
+        with self.subTest(source='unknown account in Proposals'):
+            _ = invalid.write_text(f'# Producer\n- **Proposals:** ~review-test-{uuid4().hex}/proposals\n')
+            _ = fixture_member('producer', name='invalid', doc=staff.LiveDoc(local_machine(), invalid))
+            fresh = review_page.build_snapshot(self.root)
+            self.assertEqual(fresh.records.keys(), snapshot.records.keys())
+            self.assertIn(invalid, fresh.source_stamps)
+            self.assertIn(f'Could not load {invalid}.', fresh.notices)
+
+        with self.subTest(source='invalid Proposals value in a showrunner document'):
+            doc = self.fixture.temporary / 'invalid-showrunner.md'
+            runner = fixture_member('showrunner', name='invalid-runner', doc=staff.LiveDoc(local_machine(), doc))
+            folder = self.fixture.temporary / 'registered-proposals'
+            folder.mkdir()
+            path = folder / 'P1.md'
+            _ = path.write_text('---\nstatus: open\ntags: [proposal]\nstage: backlog\n'
+                +f'proposed_by: {runner.id}\nproposal_id: P1\ndate_created: 2026-11-01\n---\n'
+                +'# Reduce the build time\n')
+            registry = state_root() / 'review-folders' / runner.id / 'proposal.json'
+            registry.parent.mkdir(parents=True)
+            _ = registry.write_text(json.dumps([str(folder)]))
+
+            for value in (f'~review-test-{uuid4().hex}/proposals', str(folder) + '\x00'):
+                with self.subTest(proposals=value):
+                    _ = doc.write_text(f'# Showrunner\n- **Proposals:** {value}\n')
+                    fresh = review_page.build_snapshot(self.root)
+                    self.assertEqual(fresh.records['proposal/'+str(path.resolve())].owner, runner.id)
+                    self.assertCountEqual(fresh.notices, (*snapshot.notices,
+                        f'Could not load {invalid}.', f'Could not load {doc}.'))
 
     def test_change_projection_isolates_an_unreadable_production_path(self) -> None:
         doc = self.fixture.temporary / 'unreadable.md'

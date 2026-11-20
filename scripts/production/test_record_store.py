@@ -113,6 +113,27 @@ class NumberedRecordsTests(unittest.TestCase):
                 [registered, root / owner / "questions"],
             )
 
+    def test_registry_skips_an_empty_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": directory}):
+            owner = staff.StaffId("producer")
+            registry = Path(directory) / "review-folders" / owner / "proposal.json"
+            registry.parent.mkdir(parents=True)
+            notices: list[Path] = []
+
+            def skipped(source: Path, error: Exception) -> None:
+                self.assertIsInstance(error, ValueError)
+                notices.append(source)
+
+            registered = Path(directory).resolve() / "proposals"
+            for valid in ((), (registered,)):
+                with self.subTest(valid=valid):
+                    notices.clear()
+                    _ = registry.write_text(json.dumps(["", *map(str, valid)]))
+                    folders = record_store.known_folders(record_store.RecordKind.PROPOSAL, owner,
+                                                          strict=True, on_source_error=skipped)
+                    self.assertEqual(folders, valid)
+                    self.assertEqual(notices, [registry])
+
     def test_unicode_separators_stay_inside_a_header_field(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": directory}):
             store = record_store.NumberedRecords(staff.StaffId("fixture"), "records", "R", "record", ValueError)
