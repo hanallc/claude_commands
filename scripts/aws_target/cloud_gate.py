@@ -122,6 +122,58 @@ class GateRankingInput:
     eligible: run_cost.GateVariantEligibility
 
 
+@dataclass(frozen=True)
+class GateChoiceRanking:
+    reference: GateRankedChoice | run_cost.NoPricedGateVariant
+    choices: tuple[GateRankedChoice, ...]
+
+
+def rank_gate_choices(rows: Sequence[GateRankedChoice], types: tuple[str, ...], ratio: Decimal) -> GateChoiceRanking:
+    """Rank measured choices by the cost limit and capacity order."""
+    def type_rank(row: GateRankedChoice) -> int:
+        size = row.variant.instance_type
+        return types.index(size) if size in types else len(types)
+
+    priced = {row.variant: row.estimate for row in rows if isinstance(row.estimate, run_cost.GatePlacementEstimate)}
+    baseline = min((row for row in rows if row.variant in priced),
+                   key=lambda row: (priced[row.variant].aws_spend_usd, type_rank(row)), default=None)
+    if baseline is None:
+        return GateChoiceRanking(run_cost.NoPricedGateVariant(), tuple(sorted(rows, key=lambda row: row.capacity)))
+
+    reference = baseline.variant
+    estimate = priced[reference]
+
+    def decide(row: GateRankedChoice) -> GateRankedChoice:
+        row_estimate = row.estimate
+        if not isinstance(row_estimate, run_cost.GatePlacementEstimate):
+            return row
+        cost = row_estimate.aws_spend_usd
+        cheapest = estimate.aws_spend_usd
+        multiple = (cost / cheapest if cheapest else Decimal(1) if not cost else NoComparableSpendRatio())
+        row = replace(row, cost_ratio=multiple)
+        seconds = row_estimate.same_type_seconds
+        reference_seconds = estimate.same_type_seconds
+        if ratio == 1 or not isinstance(seconds, Decimal) or not isinstance(reference_seconds, Decimal):
+            return row
+        saved = reference_seconds - seconds
+        if saved <= 0:
+            return row
+        if cost > ratio * cheapest:
+            return replace(row, decision=FasterAboveRatio(reference, multiple))
+        if isinstance(multiple, Decimal):
+            return replace(row, decision=FasterWithinRatio(reference, saved, multiple))
+        return row
+
+    def order(row: GateRankedChoice) -> tuple[GateCapacity, bool, bool, Decimal, int]:
+        if isinstance(row.estimate, run_cost.GatePlacementEstimate):
+            if isinstance(row.decision, FasterWithinRatio):
+                return row.capacity, False, False, row.estimate.aws_spend_usd, type_rank(row)
+            return row.capacity, True, False, row.estimate.order_cost_usd, type_rank(row)
+        return row.capacity, True, True, Decimal(0), type_rank(row)
+
+    return GateChoiceRanking(replace(baseline, cost_ratio=Decimal(1)), tuple(sorted(map(decide, rows), key=order)))
+
+
 def gate_rate_candidates(variants: Sequence[GateLaunchVariant]) -> tuple[ledger.GateRateCandidate, ...]:
     return tuple(dict.fromkeys(ledger.GateRateCandidate(row.instance_type, row.region) for row in variants))
 
@@ -711,9 +763,6 @@ class GateWorker:
     def rank_choices(self, ranking: GateRankingInput, mode: str, live_prices: Sequence[ledger.RegionalSpotPrice],
                      values: conf.ConfigRead) -> list[GateRankedChoice]:
         """Return the ordered choices and the evidence for each decision."""
-        types = values.words('instance_types')
-        def type_rank(variant: GateLaunchVariant) -> int:
-            return types.index(variant.instance_type) if variant.instance_type in types else len(types)
         now = self.clock()
         max_age = conf.read(self.settings_path).whole('price_max_age_seconds')
         cooldown = values.whole('capacity_cooldown_seconds')
@@ -750,55 +799,15 @@ class GateWorker:
         pricing = run_cost.GateRunPricing.from_config(values, history.evidence, self.api.region, modes) if prices else None
         estimates = {variant: pricing.placement_estimate(price, variant.instance_type, variant.region)
                      for variant, price in prices.items()} if pricing is not None else {}
-        reference = min(estimates, key=lambda row: (estimates[row].aws_spend_usd, type_rank(row))) if estimates else None
         rows: list[GateRankedChoice] = []
         for variant in eligibility.variants:
             samples, _ = history.evidence.box_seconds(variant.instance_type, variant.region, modes)
-            estimate = estimates.get(variant)
-            multiple: Decimal | NoComparableSpendRatio = NoComparableSpendRatio()
-            if estimate is not None and reference is not None:
-                cheapest = estimates[reference].aws_spend_usd
-                if cheapest:
-                    multiple = estimate.aws_spend_usd / cheapest
-                elif not estimate.aws_spend_usd:
-                    multiple = Decimal(1)
             median = statistics.median(samples) if samples else run_cost.NoBoxTimeMeasurement()
             rows.append(GateRankedChoice(variant, len(samples), median,
-                estimate if estimate is not None else run_cost.NoPricedGateVariant(), multiple, capacity(variant), DefaultOrder()))
-
-        if reference is None:
-            return sorted(rows, key=lambda row: row.capacity)
-
-        def order(row: GateRankedChoice) -> tuple[GateCapacity, bool, Decimal, int]:
-            priced = isinstance(row.estimate, run_cost.GatePlacementEstimate)
-            cost = row.estimate.order_cost_usd if isinstance(row.estimate, run_cost.GatePlacementEstimate) else Decimal(0)
-            return row.capacity, not priced, cost, type_rank(row.variant)
-
-        ratio = values.value('faster_box_max_cost_ratio', conf.decimal)
-        if ratio == 1:
-            return sorted(rows, key=order)
-
-        baseline = estimates[reference]
-        for index, row in enumerate(rows):
-            if (not isinstance(row.estimate, run_cost.GatePlacementEstimate)
-                    or isinstance(row.estimate.same_type_seconds, run_cost.NoBoxTimeMeasurement)
-                    or isinstance(baseline.same_type_seconds, run_cost.NoBoxTimeMeasurement)):
-                continue
-            saving = baseline.same_type_seconds - row.estimate.same_type_seconds
-            if saving <= 0:
-                continue
-            if row.estimate.aws_spend_usd > ratio * baseline.aws_spend_usd:
-                rows[index] = replace(row, decision=FasterAboveRatio(reference, row.cost_ratio))
-            elif isinstance(row.cost_ratio, Decimal):
-                rows[index] = replace(row, decision=FasterWithinRatio(reference, saving, row.cost_ratio))
-
-        def faster_order(row: GateRankedChoice) -> tuple[GateCapacity, bool, bool, Decimal, int]:
-            cap_order, unpriced, cost, configured = order(row)
-            if isinstance(row.decision, FasterWithinRatio) and isinstance(row.estimate, run_cost.GatePlacementEstimate):
-                return cap_order, False, unpriced, row.estimate.aws_spend_usd, configured
-            return cap_order, True, unpriced, cost, configured
-
-        return sorted(rows, key=faster_order)
+                estimates.get(variant, run_cost.NoPricedGateVariant()), NoComparableSpendRatio(),
+                capacity(variant), DefaultOrder()))
+        ratio = values.value('faster_box_max_cost_ratio', conf.decimal) if estimates else Decimal(1)
+        return list(rank_gate_choices(rows, values.words('instance_types'), ratio).choices)
 
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object], *,
                configuration: conf.ConfigRead | None = None, ranking: GateRankingInput | None = None) -> str | LocalFallback:

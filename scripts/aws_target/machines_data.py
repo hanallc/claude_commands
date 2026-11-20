@@ -1,0 +1,390 @@
+"""Read local evidence for the AWS Machines page without calling AWS."""
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, time, timedelta
+from decimal import Decimal
+import heapq
+from pathlib import Path
+import re
+from statistics import median
+from typing import Literal, cast
+
+from scripts.aws_target import cloud_gate, ledger, price_days, run_cost
+from scripts.aws_target.aws_target import read_snapshot, snapshot_failures
+from scripts.lib import conf
+
+
+_WEEKS_PER_YEAR = 52
+_MONTHS_PER_YEAR = 12
+_HOURS_IN_SECONDS = 3600
+_DAYS_PER_WEEK = 7
+_RULE_OFF = Decimal(1)
+_WORKLOADS = (('merge-gate', 'Merge checks'), ('targeted-test', 'Named tests'), ('test-affected', 'Affected tests'))
+_SAVED_PRICE_AUTH_FAILURE = re.compile(
+    r'\b(?:AuthFailure|ExpiredToken(?:Exception)?|InvalidClientTokenId|UnrecognizedClientException)\b'
+    + r'|unable to locate credentials', re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class MachinesConfiguration:
+    page: conf.ConfigRead
+    gate: conf.ConfigRead
+    account: conf.ConfigRead
+
+
+@dataclass(frozen=True)
+class SavedSpotPriceRead:
+    read_at: int
+    aws_closed: bool
+
+
+@dataclass(frozen=True)
+class NoSavedSpotPriceRead:
+    """The snapshot has no successful quote with a read time."""
+
+
+@dataclass(frozen=True)
+class NoHoursSaved:
+    """The projection has no time saving to divide the cost by."""
+
+
+@dataclass(frozen=True)
+class MachineChoice:
+    machine: ledger.GateRateCandidate
+    vcpus: int
+    checks: int
+    median_seconds: Decimal | run_cost.NoBoxTimeMeasurement
+    usd_per_hour: Decimal | run_cost.NoPricedGateVariant
+    usd_per_check: Decimal | run_cost.NoPricedGateVariant
+    capacity_refusals: int
+    launched: int
+    small_sample: bool
+    quota_vcpus: Decimal
+    quota_assumed: bool
+    quota_fit_share: Decimal
+    spot_granted_share: Decimal
+    free_share: Decimal
+
+
+@dataclass(frozen=True)
+class MachineRunShare:
+    machine: ledger.GateRateCandidate
+    share: Decimal
+
+
+@dataclass(frozen=True)
+class MachineLimit:
+    ratio: Decimal
+    ceiling_extra_usd_per_month: Decimal
+
+
+@dataclass(frozen=True)
+class MachineStep:
+    first_ratio: Decimal
+    last_ratio: Decimal
+    added: tuple[ledger.GateRateCandidate, ...]
+    shares: tuple[MachineRunShare, ...]
+    extra_usd_per_month: Decimal
+    hours_saved_per_month: Decimal
+    usd_per_hour_saved: Decimal | NoHoursSaved
+    limits: tuple[MachineLimit, ...]
+
+
+@dataclass(frozen=True)
+class MeasuredWorkload:
+    name: str
+    mode: str
+    choices: tuple[MachineChoice, ...]
+    reference: ledger.GateRateCandidate
+    checks: int
+    checks_per_month: Decimal
+    reference_usd_per_month: Decimal
+    concurrent_starts: tuple[tuple[int, int], ...]
+    live_ratio: Decimal
+    steps: tuple[MachineStep, ...]
+    assumptions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WorkloadWithoutComparison:
+    name: str
+    mode: str
+    sentence: str
+
+
+@dataclass(frozen=True)
+class MachinesPageData:
+    window_start: datetime
+    window_end: datetime
+    ratio_max: Decimal
+    ratio_step: Decimal
+    price_read: SavedSpotPriceRead | NoSavedSpotPriceRead
+    workloads: tuple[MeasuredWorkload | WorkloadWithoutComparison, ...]
+
+
+@dataclass(frozen=True)
+class _GateInterval:
+    machine: ledger.GateRateCandidate
+    start: int
+    end: int
+    finished_at: datetime
+
+
+@dataclass(frozen=True)
+class _SavedPrices:
+    read: SavedSpotPriceRead | NoSavedSpotPriceRead
+    hourly: dict[ledger.GateRateCandidate, Decimal]
+    quotas: dict[str, ledger.SpotQuota]
+
+
+def _workload(row: dict[str, object]) -> str:
+    mode = row.get('mode')
+    if mode == 'gate':
+        return 'merge-gate'
+    if mode == 'targeted-test':
+        job = row.get('gate_job')
+        if isinstance(job, dict):
+            step = cast(dict[str, object], job).get('step')
+            if step == 'test-affected':
+                return 'test-affected'
+            if step in ('test-all', 'test-nightly'):
+                return ''
+    return mode if isinstance(mode, str) else ''
+
+
+def _saved_prices(directory: Path, now: int, days: int) -> _SavedPrices:
+    latest: dict[tuple[ledger.GateRateCandidate, str], ledger.RegionalSpotPrice] = {}
+    for row in sorted(ledger.read_spot_prices(directory), key=lambda price: price.read_at):
+        if row.read_at <= now:
+            latest[ledger.GateRateCandidate(row.instance_type, row.region), row.zone] = row
+    read_at = max((row.read_at for row in latest.values()), default=-1)
+    read: SavedSpotPriceRead | NoSavedSpotPriceRead = NoSavedSpotPriceRead()
+    hourly: dict[ledger.GateRateCandidate, Decimal] = {}
+    if read_at >= 0:
+        region_reads: dict[str, int] = {}
+        for (machine, _zone), row in latest.items():
+            region_reads[row.region] = max(region_reads.get(row.region, row.read_at), row.read_at)
+            hourly[machine] = min(hourly.get(machine, row.usd_per_hour), row.usd_per_hour)
+        failed = {failure.region for failure in snapshot_failures(read_snapshot(directory))
+                  if failure.read == 'price' and region_reads.get(failure.region, now) < failure.at <= now
+                  and _SAVED_PRICE_AUTH_FAILURE.search(failure.error + ' ' + failure.reason)}
+        read = SavedSpotPriceRead(read_at, region_reads.keys() <= failed)
+        last_day = datetime.fromtimestamp(read_at, UTC).date()
+        first_day = last_day - timedelta(days=days - 1)
+        means: dict[ledger.GateRateCandidate, list[Decimal]] = defaultdict(list)
+        for entry in price_days.read_days(directory).values():
+            if first_day.isoformat() <= entry.day <= last_day.isoformat():
+                means[ledger.GateRateCandidate(entry.instance_type, entry.region)].append(entry.mean_usd_per_hour)
+        hourly.update({machine: median(prices) for machine, prices in means.items()})
+    quotas = {row.region: row for row in ledger.read_spot_quotas(directory) if row.read_at <= now}
+    return _SavedPrices(read, hourly, quotas)
+
+
+def _intervals(rows: Sequence[dict[str, object]], reservations: dict[str, ledger.GateReservation], home: str,
+               start: datetime, end: datetime) -> tuple[_GateInterval, ...]:
+    intervals: dict[str, _GateInterval] = {}
+    for row in rows:
+        if row.get('result') != 'finished':
+            continue
+        finished_at = datetime.fromtimestamp(float(str(row['time'])), UTC)
+        if not start <= finished_at < end:
+            continue
+        attempt = str(row.get('attempt', ''))
+        reservation = reservations.get(attempt)
+        if reservation is None or not isinstance(reservation.state, ledger.GateTerminated):
+            continue
+        size = reservation.instance_type or str(row.get('instance_type') or '')
+        if ledger.gate_vcpus(size) and reservation.state.at > reservation.at:
+            region = reservation.region or str(row.get('region') or home)
+            _ = intervals.setdefault(attempt, _GateInterval(ledger.GateRateCandidate(size, region), reservation.at,
+                                                            reservation.state.at, finished_at))
+    return tuple(intervals.values())
+
+
+def _concurrent_starts(intervals: Sequence[_GateInterval]) -> tuple[tuple[int, int], ...]:
+    ends: list[int] = []
+    counts: Counter[int] = Counter()
+    for interval in sorted(intervals, key=lambda row: (row.start, row.end)):
+        while ends and ends[0] <= interval.start:
+            _ = heapq.heappop(ends)
+        heapq.heappush(ends, interval.end)
+        counts[len(ends)] += 1
+    return tuple(sorted(counts.items()))
+
+
+def _requests(rows: Sequence[dict[str, object]], home: str, start: datetime,
+              end: datetime) -> tuple[Counter[ledger.GateRateCandidate], Counter[ledger.GateRateCandidate]]:
+    launched: Counter[ledger.GateRateCandidate] = Counter()
+    refused: Counter[ledger.GateRateCandidate] = Counter()
+    low, high = start.timestamp(), end.timestamp()
+    for row in rows:
+        if not low <= float(str(row['time'])) < high:
+            continue
+        size = str(row.get('instance_type') or '')
+        if not ledger.gate_vcpus(size):
+            continue
+        machine = ledger.GateRateCandidate(size, str(row.get('region') or home))
+        if row.get('result') == 'launched':
+            launched[machine] += 1
+        elif row.get('result') == 'refused' and row.get('error_code') in run_cost.ZONE_REFUSALS:
+            refused[machine] += 1
+    return launched, refused
+
+
+def _steps(rows: Sequence[cloud_gate.GateRankedChoice], types: tuple[str, ...], ratios: Sequence[Decimal],
+           reference: cloud_gate.GateRankedChoice, choices: dict[ledger.GateRateCandidate, MachineChoice],
+           monthly_checks: Decimal) -> tuple[MachineStep, ...]:
+    assert isinstance(reference.estimate, run_cost.GatePlacementEstimate)
+    base = reference.estimate.aws_spend_usd
+    reference_machine = ledger.GateRateCandidate(reference.variant.instance_type, reference.variant.region)
+    allowed_before: set[ledger.GateRateCandidate] = set()
+    steps: list[MachineStep] = []
+    for ratio in ratios:
+        allowed: set[ledger.GateRateCandidate] = set()
+        shares: list[MachineRunShare] = []
+        extra = saved = Decimal(0)
+        left = Decimal(1)
+        for row in cloud_gate.rank_gate_choices(rows, types, ratio).choices:
+            if not isinstance(row.decision, cloud_gate.FasterWithinRatio):
+                continue
+            assert isinstance(row.estimate, run_cost.GatePlacementEstimate)
+            machine = ledger.GateRateCandidate(row.variant.instance_type, row.variant.region)
+            allowed.add(machine)
+            share = left * choices[machine].free_share
+            shares.append(MachineRunShare(machine, share))
+            left -= share
+            extra += share * (row.estimate.aws_spend_usd - base)
+            saved += share * row.decision.saved_seconds
+        limit = MachineLimit(ratio, (ratio - _RULE_OFF) * base * monthly_checks)
+        if steps and allowed == allowed_before:
+            previous = steps[-1]
+            steps[-1] = MachineStep(previous.first_ratio, ratio, previous.added, previous.shares,
+                previous.extra_usd_per_month, previous.hours_saved_per_month, previous.usd_per_hour_saved,
+                (*previous.limits, limit))
+            continue
+        added = tuple(row.machine for row in shares if row.machine not in allowed_before)
+        shares.append(MachineRunShare(reference_machine, left))
+        monthly_extra = extra * monthly_checks
+        monthly_saved = saved * monthly_checks / _HOURS_IN_SECONDS
+        steps.append(MachineStep(ratio, ratio, added, tuple(shares), monthly_extra, monthly_saved,
+            monthly_extra / monthly_saved if monthly_saved else NoHoursSaved(), (limit,)))
+        allowed_before = allowed
+    return tuple(steps)
+
+
+def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], intervals: Sequence[_GateInterval],
+                      prices: _SavedPrices, start: datetime, end: datetime, configuration: MachinesConfiguration,
+                      ratios: Sequence[Decimal]) -> MeasuredWorkload | WorkloadWithoutComparison:
+    checks = len(intervals)
+    sizes = len({ledger.gate_vcpus(row.machine.instance_type) for row in intervals})
+    if not checks or (mode != 'merge-gate' and sizes < 2):
+        check_word = 'check' if checks == 1 else 'checks'
+        size_word = 'size' if sizes == 1 else 'sizes'
+        return WorkloadWithoutComparison(name, mode, f'The records hold {checks} completed {check_word} '
+                                                    + f'on {sizes} machine {size_word} in this period.')
+    home = configuration.account.text('region')
+    gate = configuration.gate
+    types = gate.words('instance_types')
+    run_mode = 'targeted-test' if mode == 'test-affected' else mode
+    concurrency = _concurrent_starts(intervals)
+    quota_assumption = Decimal(gate.whole('spot_quota_request_vcpus'))
+    small_sample_checks = configuration.page.whole('machines_small_sample_checks')
+    samples: dict[ledger.GateRateCandidate, list[Decimal]] = defaultdict(list)
+    runs: list[run_cost.FinishedGateRun] = []
+    for interval in intervals:
+        size, region = interval.machine.instance_type, interval.machine.region
+        seconds = Decimal(interval.end - interval.start)
+        samples[interval.machine].append(seconds)
+        runs.append(run_cost.FinishedGateRun(size, region, run_mode, interval.finished_at.date().isoformat(),
+                                            Decimal(0), seconds))
+    evidence = run_cost.evidence_from_runs(runs, rows, start, end, home)
+    pricing = run_cost.GateRunPricing.from_config(gate, evidence, home, (mode,))
+    launched, refused = _requests(rows, home, start, end)
+    max_seconds = gate.whole('max_gate_minutes') * 60
+    choices: dict[ledger.GateRateCandidate, MachineChoice] = {}
+    ranked_rows: list[cloud_gate.GateRankedChoice] = []
+    assumptions = [
+        'A month has 52 weeks divided by 12.',
+        'The measured check rate, overlap, and share of Spot refusals repeat.',
+        'This workload has the quota for itself. Other workloads can reduce its available quota.',
+        'Each successful launch and each capacity refusal counts as one Spot request.',
+        'Prices use the median of saved daily means, or the lowest saved zone price when daily means are absent.',
+        'The projection uses measured choices within the gate time limit and includes configured transfer cost.',
+    ]
+    for machine in sorted(samples.keys() | launched.keys() | refused.keys(),
+                          key=lambda item: (item.instance_type, item.region)):
+        size, region = machine.instance_type, machine.region
+        cpus = ledger.gate_vcpus(size)
+        quota = prices.quotas.get(region)
+        recorded_quota = quota.limit(ledger.spot_quota_class(size)) if quota is not None else ledger.NoSpotQuota()
+        assumed = not isinstance(recorded_quota, Decimal)
+        quota_vcpus = recorded_quota if isinstance(recorded_quota, Decimal) else quota_assumption
+        if assumed:
+            assumption = f'The records have no quota for {region}. The estimate uses {quota_vcpus} vCPUs.'
+            if assumption not in assumptions:
+                assumptions.append(assumption)
+        fits = Decimal(sum(count for occupancy, count in concurrency if occupancy <= quota_vcpus // cpus)) / checks
+        requests = launched[machine] + refused[machine]
+        granted = Decimal(launched[machine]) / requests if requests else Decimal(0)
+        if not requests:
+            assumptions.append(f'The records have no Spot requests for {size} in {region}. The estimate uses 0% availability.')
+        hourly = prices.hourly.get(machine, run_cost.NoPricedGateVariant())
+        times = samples.get(machine, [])
+        typical = median(times) if times else run_cost.NoBoxTimeMeasurement()
+        estimate = (pricing.placement_estimate(hourly, size, region)
+                    if isinstance(hourly, Decimal) and times else run_cost.NoPricedGateVariant())
+        cost = estimate.aws_spend_usd if isinstance(estimate, run_cost.GatePlacementEstimate) else estimate
+        choices[machine] = MachineChoice(machine, cpus, len(times), typical, hourly, cost,
+            refused[machine], launched[machine], len(times) < small_sample_checks, quota_vcpus, assumed,
+            fits, granted, fits * granted)
+        if size in types and isinstance(typical, Decimal) and typical <= max_seconds:
+            ranked_rows.append(cloud_gate.GateRankedChoice(run_cost.GateLaunchVariant(region, size, '', ''),
+                len(times), typical, estimate, cloud_gate.NoComparableSpendRatio(),
+                cloud_gate.GateCapacity(False, False, False), cloud_gate.DefaultOrder()))
+    ranking = cloud_gate.rank_gate_choices(ranked_rows, types, _RULE_OFF)
+    reference = ranking.reference
+    if not isinstance(reference, cloud_gate.GateRankedChoice):
+        return WorkloadWithoutComparison(name, mode,
+            f'The records hold {checks} completed checks, with no saved price for an eligible measured choice.')
+    assert isinstance(reference.estimate, run_cost.GatePlacementEstimate)
+    monthly_checks = Decimal(checks * _DAYS_PER_WEEK * _WEEKS_PER_YEAR) / (_MONTHS_PER_YEAR * (end - start).days)
+    return MeasuredWorkload(name, mode, tuple(choices.values()),
+        ledger.GateRateCandidate(reference.variant.instance_type, reference.variant.region), checks,
+        monthly_checks, reference.estimate.aws_spend_usd * monthly_checks, concurrency,
+        gate.value('faster_box_max_cost_ratio', conf.decimal),
+        _steps(ranked_rows, types, ratios, reference, choices, monthly_checks), tuple(assumptions))
+
+
+def read_machines_data(directory: Path, now: int,
+                       configuration: MachinesConfiguration | Literal['live_settings'] = 'live_settings') -> MachinesPageData:
+    """Read the last complete UTC days and project every slider value."""
+    if configuration == 'live_settings':
+        configuration = MachinesConfiguration(conf.read_or_repository('aws_page'), cloud_gate.settings(),
+                                               conf.read_or_repository('aws_target'))
+    page = configuration.page
+    days = page.whole('machines_window_days')
+    ratio_max = page.value('machines_ratio_max', conf.decimal)
+    ratio_step = page.value('machines_ratio_step', conf.decimal)
+    intervals, remainder = divmod(ratio_max - _RULE_OFF, ratio_step)
+    if remainder:
+        raise conf.Unusable('machines_ratio_max must lie on a slider step from 1.00')
+    ratios = tuple(_RULE_OFF + step * ratio_step for step in range(int(intervals) + 1))
+    end = datetime.combine(datetime.fromtimestamp(now, UTC).date(), time.min, UTC)
+    start = end - timedelta(days=days)
+    prices = _saved_prices(directory, now, days)
+    try:
+        reservations = {row.attempt: row for row in ledger.CostLedger(directory).read_snapshot().gate_reservations}
+    except ledger.LedgerUnavailable:
+        return MachinesPageData(start, end, ratio_max, ratio_step, prices.read, tuple(
+            WorkloadWithoutComparison(name, mode, 'The cost ledger is unavailable.') for mode, name in _WORKLOADS))
+    launches = ledger.recent_gate_launches(directory, start.timestamp())
+    home = configuration.account.text('region')
+    workloads: list[MeasuredWorkload | WorkloadWithoutComparison] = []
+    for mode, name in _WORKLOADS:
+        rows = tuple(row for row in launches if _workload(row) == mode)
+        workloads.append(_project_workload(name, mode, rows, _intervals(rows, reservations, home, start, end),
+                                           prices, start, end, configuration, ratios))
+    return MachinesPageData(start, end, ratio_max, ratio_step, prices.read, tuple(workloads))

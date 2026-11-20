@@ -667,15 +667,16 @@ def read_gate_run_history(book: ledger.CostLedger, start: datetime, end: datetim
     """Read all launch rows to match runs that finish in the window."""
     rows = book.launches()
     runs = runs_from_rows(rows, start, end, home).runs
-    return GateRunHistory(runs, _run_evidence(runs, rows, start, end, home))
+    return GateRunHistory(runs, evidence_from_runs(runs, rows, start, end, home))
 
 
 def run_evidence(rows: Sequence[dict[str, object]], start: datetime, end: datetime, home: str) -> RunEvidence:
-    return _run_evidence(runs_from_rows(rows, start, end, home).runs, rows, start, end, home)
+    return evidence_from_runs(runs_from_rows(rows, start, end, home).runs, rows, start, end, home)
 
 
-def _run_evidence(runs: Sequence[FinishedGateRun], rows: Sequence[dict[str, object]],
-                  start: datetime, end: datetime, home: str) -> RunEvidence:
+def evidence_from_runs(runs: Sequence[FinishedGateRun], rows: Sequence[dict[str, object]],
+                       start: datetime, end: datetime, home: str) -> RunEvidence:
+    """Combine measured run times with launch and refusal evidence."""
     by_region: dict[tuple[str, str, str], list[Decimal]] = defaultdict(list)
     by_type: dict[tuple[str, str], list[Decimal]] = defaultdict(list)
     by_mode: dict[str, list[Decimal]] = defaultdict(list)
