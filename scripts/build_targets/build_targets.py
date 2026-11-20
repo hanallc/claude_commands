@@ -761,6 +761,11 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     return EligibleTarget(target)
 
 
+@dataclass(frozen=True)
+class TargetWithFailedProbe(EligibleTarget):
+    """The target meets policy, but its last reachability probe failed."""
+
+
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
                            kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED, new_step: bool = False,
                            configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
@@ -830,12 +835,13 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     paths = mac_test.state_paths(target.name)
     answer = mac_test.free_now(paths, target.settings, repo_root, session=session,
                                  configuration=configuration)
-    if new_step and not isinstance(selection, Pinned) and answer == "bad":
-        start_probe_recovery(target, repo_root, package, kind)
-    if answer not in ("free", "bad"):
-        return ExcludedTarget(target, answer)
     if answer == "bad":
-        return EligibleTarget(target)
+        failed_probe = isinstance(eligibility.read_failed_probe(target.name), eligibility.FailedProbe)
+        if new_step and not isinstance(selection, Pinned):
+            start_probe_recovery(target, repo_root, package, kind)
+        return TargetWithFailedProbe(target) if failed_probe else EligibleTarget(target)
+    if answer != "free":
+        return ExcludedTarget(target, answer)
     from scripts.mac_test import offload
 
     probe_settings = eligibility.SshProbeSettings(config) if isinstance(config, conf.ConfigRead) else config

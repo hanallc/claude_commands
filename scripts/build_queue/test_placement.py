@@ -2211,8 +2211,16 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                   mock.patch.object(build_targets, "start_probe_recovery") as start):
                 evidence = self.read_target(fixture, request)
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
-                self.assertEqual(evidence.eligibility, ALLOWED_HOST)
+                self.assertEqual(evidence.eligibility, placement.TemporaryExclusion("failed probe"))
                 start.assert_called_once()
+                fixture.server.publish_host_evidence(evidence)
+                reply, = fixture.server.handle_request(request)
+                assert isinstance(reply, wire.PlacementWait), reply
+                self.assertEqual(reply.eligibility, (placement.CandidateEligibility(destination, evidence.eligibility),))
+
+                pinned = replace(request, episode=f"{request.episode}-pinned",
+                    constraints=replace(request.constraints, selection=placement.PinnedHost(destination.target)))
+                self.assertEqual(assignment_for(fixture, pinned).destination, destination)
 
             _ = settings.write_text(good)
             args = build_targets.CliArguments()
