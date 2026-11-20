@@ -1702,14 +1702,19 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             self.assertNotIn(unavailable, fixture.server.host_readers)
 
     def test_hana_retry_survives_bad_registered_transport(self) -> None:
-        with PlacementFixture() as fixture, fixture.loop_turn():
-            registered, request, destination = self.target_settings_fixture(fixture)
-            _ = registered.write_text("execution_transport=broken\n")
+        with PlacementFixture(fixture_defaults_only=True) as fixture, fixture.loop_turn():
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=fixture\nkind.fixture=ssh\nplatform.fixture=linux\nsettings.fixture=target.conf\n"
+                + "enabled.hana-aws=on\n")
+            _ = (fixture.root / "target.conf").write_text("execution_transport=broken\n")
             settings = fixture.root / "explicit.conf"
-            _ = write_config_fixture(settings, template="hana_aws")
-            _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.hana-aws=on\n")
+            _ = settings.write_text("execution_transport=hana-control\nhost=fixture\n"
+                + "# whole: 1..\nstep_memory_gib=24\n# whole: 1..\naws_timeout_s=10\n")
+            request = placement_request(fixture)
+            destination = replace(request.constraints.candidates[0].destination,
+                                  provider="ssh", target="fixture", host="fixture")
             candidate = placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings))
-            request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+            request = replace(request, constraints=replace(request.constraints, command_kind="check", candidates=(candidate,)))
             before = fixture.server.host_evidence_key(request, destination)
             _ = (fixture.root / "aws_target.conf").write_text("changed=1\n")
             self.assertNotEqual(fixture.server.host_evidence_key(request, destination), before)
@@ -2322,29 +2327,63 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             assert isinstance(completed, wire.DispatchStatus)
             self.assertEqual(completed.state, placement.ClosedAssignment("completed"))
 
-    def test_adapter_authorization_cannot_become_a_coordinator_launch(self) -> None:
+    def test_adapter_authorization_keeps_its_source_before_and_after_claim(self) -> None:
+        for claimed in (False, True):
+            with self.subTest(claimed=claimed), PlacementFixture(fixture_defaults_only=True) as fixture:
+                request = placement_request(fixture)
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                claim = adopt_assignment(fixture, request, assignment)
+                consume = consume_permission("adapter-authorization", assignment, claim)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                if claimed:
+                    self.assertEqual(fixture.server.handle_request(consume), [wire.FirstAuthorization(assignment, claim)])
+                saved = fixture.server.assignments[key]
+
+                upgrade = replace(request, constraints=replace(request.constraints, command_kind="run"))
+                reply, = fixture.server.handle_request(upgrade)
+                self.assertIsInstance(reply, wire.PlacementWait)
+                self.assertEqual(fixture.server.assignments[key].permission, saved.permission)
+                self.assertEqual(fixture.server.placement_requests[request.episode].constraints, request.constraints)
+
+                reply, = fixture.server.handle_request(request)
+                if claimed:
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                else:
+                    self.assertEqual(reply, wire.Assignment(assignment))
+                    self.assertEqual(fixture.server.handle_request(consume), [wire.FirstAuthorization(assignment, claim)])
+
+                fixture.restart()
+                reply, = fixture.server.handle_request(upgrade)
+                self.assertIsInstance(reply, wire.PlacementWait)
+                self.assertEqual(fixture.server.handle_request(wire.CancelPlacement(
+                    "coordinator-cancel", request.episode, request.owner, "fixture cancel")), [wire.Ok()])
+                status, = fixture.server.handle_request(consume)
+                assert isinstance(status, wire.DispatchStatus)
+                self.assertEqual(status.state, placement.CurrentAssignment())
+                self.assertEqual(status.reason, "launch permission was already consumed")
+
+    def test_an_adapter_cannot_consume_a_coordinator_assignment_before_the_reply(self) -> None:
         with PlacementFixture(fixture_defaults_only=True) as fixture:
             request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints,
+                command_kind="run", selection=placement.PinnedHost("mac")))
             _ = publish_candidate(fixture, request)
-            assignment = assignment_for(fixture, request)
-            claim = adopt_assignment(fixture, request, assignment)
-            consume = consume_permission("adapter-authorization", assignment, claim)
-            self.assertEqual(fixture.connect(consume).replies(), [wire.FirstAuthorization(assignment, claim)])
+            # Leave the assignment current before the coordinator receives permission to launch.
+            with mock.patch.object(fixture.server, "_placement_reply",
+                                   return_value=wire.PlacementWait(request.episode, request.since, 1, ())):
+                _ = fixture.server.handle_request(request)
+            key = fixture.server.current_assignments[request.episode]
+            saved = fixture.server.assignments[key]
+            self.assertIsInstance(saved.permission, placement.PermissionAvailable)
+            claim = adopt_assignment(fixture, request, saved.assignment)
 
-            upgrade = replace(request, constraints=replace(request.constraints, command_kind="run"))
-            for retry in (request, upgrade):
-                reply, = fixture.connect(retry).replies()
-                self.assertIsInstance(reply, wire.PlacementWait)
-
-            fixture.restart()
-            reply, = fixture.connect(upgrade).replies()
-            self.assertIsInstance(reply, wire.PlacementWait)
-            self.assertEqual(fixture.connect(wire.CancelPlacement(
-                "coordinator-cancel", request.episode, request.owner, "fixture cancel")).replies(), [wire.Ok()])
-            status, = fixture.connect(consume).replies()
+            consume = consume_permission("adapter-authorization", saved.assignment, claim)
+            status, = fixture.server.handle_request(consume)
             assert isinstance(status, wire.DispatchStatus)
-            self.assertEqual(status.state, placement.CurrentAssignment())
-            self.assertEqual(status.reason, "launch permission was already consumed")
+            self.assertEqual(status.reason, "the Mac assignment does not authorize an adapter claim")
+            self.assertEqual(fixture.server.assignments[key].permission, saved.permission)
+            self.assertEqual(fixture.server.handle_request(request), [wire.Assignment(saved.assignment)])
 
     def test_coordinator_retries_a_lost_mac_assignment_with_either_switch_value(self) -> None:
         for switch in ("on", "off"):
