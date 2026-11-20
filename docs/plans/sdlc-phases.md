@@ -1446,7 +1446,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** `send.py` picks the SendMessage call by the proxy forward's tool ID. The SENT line notes the other calls. A refusal, a missing result, a timeout or a socket error after the write stay not SENT. On main 1a3e942f1 (hash 75e6bfa6b).
 
-### Phase 86 — A merge run survives an account move, and a changed batch after a stopped run is refused  · status: todo
+### Phase 86 — A merge run survives an account move, and a changed batch after a stopped run is refused  · status: done
 **Depends on:** none (branch from main 815070e57)
 
 #### Work Order
@@ -1474,7 +1474,9 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
-### Phase 87 — A busy staff row names the command and PID that hold it  · status: todo
+**Result:** the showrunner fallback starts `merge_checkpoint.py` through `detached_runs.py start`, in its own process session, so an account move no longer stops it. A `--batch` run that differs from a stopped batch with unpushed merges is refused, and the refusal names the reset step. A rerun of the same batch still resumes. On main 10fd385ee (merged as 5aff530c8, hash 6214af197).
+
+### Phase 87 — A busy staff row names the command and PID that hold it  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1495,6 +1497,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. The new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** `slot_operation` writes the holder's PID and command into the lock file. A busy row error names the holder: `<name>: another operation holds this row (pid <pid>: <command>)`. On main 10fd385ee (merged as 6b648d50b, hash c2edd1f3e).
 
 ### Phase 88 — Merges run no type check; the nightly type check sends each red to its author  · status: todo
 **Depends on:** none
