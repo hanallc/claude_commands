@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import override, cast, final
 from unittest.mock import patch
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.accounts import role_map
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.signal_test_support import install_signal_pid_guard
@@ -272,7 +273,7 @@ def setUpModule() -> None:
     private_staff = Path(home.name) / "staff.json"
     _ = private_staff.write_text(json.dumps({"schema": 2, "rows": []}))
     unittest.addModuleCleanup(set_environment("STAFF_FILE", str(private_staff)))
-    unittest.addModuleCleanup(set_environment("STAFF_CONFIG", str(Path(__file__).resolve().parents[2] / "config/staff.conf")))
+    unittest.addModuleCleanup(set_environment("STAFF_CONFIG", str(TEST_CONFIG_DIRECTORY / "staff.conf")))
     unittest.addModuleCleanup(set_environment("XDG_STATE_HOME", str(Path(home.name) / "state")))
     # Account-change notices resolve the user zone through discovery, whose paths
     # were cached at import before HOME changed. Isolate both it and child processes.

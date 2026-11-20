@@ -13,6 +13,7 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.production import affected_modules as affected
 from scripts.test_times.gate_record_test_support import gate_run
 
@@ -34,7 +35,7 @@ class AffectedModulesTests(unittest.TestCase):
         self.write(".git/test-config/merge_gate.conf", "# text:\nlanding_branches=main builds natedev sdlc\n"
                    + "# text:\nscan_roots=\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.repo / ".git/test-config")})))
-        self.write(".git/test-config/buildlog.conf", (Path(__file__).resolve().parents[2] / "config/buildlog.conf").read_text())
+        self.write(".git/test-config/buildlog.conf", (TEST_CONFIG_DIRECTORY / "buildlog.conf").read_text())
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.repo / ".git/buildlog")})))
         self.write(".gitignore", "__pycache__/\n")
         # Ten unrelated modules distinguish direct selection from a full selection.

@@ -13,6 +13,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.lib import conf
+from scripts.lint.memory_test_support import config_environment, copy_config_fixture
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit
 from scripts.style import refill_measure, selection_capture, style_config, style_ledger, style_reader
 from scripts.style.style_plan_test_support import StylePlanFixture, install_unconfigured_board
@@ -32,9 +33,7 @@ class SelectionCaptureTests(StylePlanFixture):
         _ = reader.write_text("#!/bin/sh\nprintf 'cargo-style 2.3.4 protocol 7\\n'\n")
         reader.chmod(0o755)
         configuration = self.root / "capture-config"
-        configuration.mkdir()
-        for path in conf.directory().glob("*.conf"):
-            _ = shutil.copy2(path, configuration / path.name)
+        _ = config_environment(configuration)
         _ = (configuration / "style_reader.conf").write_text(
             "# one of: python, rust\nreader=python\n# whole: 1..\nprotocol=7\n"
             + "# text:\nminimum_version=2.3.4\n")
@@ -167,12 +166,9 @@ class SelectionCaptureTests(StylePlanFixture):
 
         with self.subTest(input="staff configuration also in CONF_DIR"):
             config = self.root / "shared-config"
-            config.mkdir()
-            for path in conf.directory().glob("*.conf"):
-                _ = shutil.copy2(path, config / path.name)
+            _ = copy_config_fixture(conf.directory(), config)
             staff_config = config / "staff.conf"
-            original_config = (Path(__file__).resolve().parents[2] / "config/staff.conf").read_text()
-            _ = staff_config.write_text(original_config)
+            original_config = staff_config.read_text()
             with patch.dict(os.environ, {"CONF_DIR": str(config), "STAFF_CONFIG": str(staff_config)}):
                 captured = self.root / "staff-capture"
                 _ = selection_capture.capture(self.repo, self.database, "names", captured)

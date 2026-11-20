@@ -1,6 +1,7 @@
 """The style units table reads ticket work, dated builds and approved work left."""
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.agents import remote
 
 import json
@@ -55,7 +56,7 @@ class StyleUnitsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "table-conf"
-        _ = cast(object, shutil.copytree(Path(__file__).resolve().parents[2] / "config", config))
+        _ = cast(object, shutil.copytree(TEST_CONFIG_DIRECTORY, config))
         _ = write_config_fixture(config / "production.conf", "units_table_columns=170\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)})))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))

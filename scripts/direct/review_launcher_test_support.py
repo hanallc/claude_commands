@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.agents import remote
 
 from scripts.lib import test_hang_guard
@@ -177,7 +178,7 @@ class ReviewLauncherFixture(LauncherFixture):
                          self.root / "scripts/production/fast_track.py")
         config = self.root / "config"
         config.mkdir(exist_ok=True)
-        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
+        _ = shutil.copy2(TEST_CONFIG_DIRECTORY / "fast_track.conf", config / "fast_track.conf")
         for name in ("review.sh", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         configure_launcher_fixture(direct_dir / "review.sh")
@@ -193,7 +194,7 @@ class ReviewLauncherFixture(LauncherFixture):
             _ = shutil.copy2(DIRECT_DIR.parent / "message" / name, message / name)
         review_config = self.root / "config/review"
         review_config.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/review/style.md", review_config / "style.md")
+        _ = shutil.copy2(TEST_CONFIG_DIRECTORY / "review/style.md", review_config / "style.md")
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)

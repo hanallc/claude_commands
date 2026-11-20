@@ -28,6 +28,12 @@ if TYPE_CHECKING:
     from decimal import Decimal
 
 
+TEST_CONFIG_PATH = Path("scripts/lib/test_config")
+TEST_CONFIG_DIRECTORY = Path(__file__).parents[2] / TEST_CONFIG_PATH
+_VALUE_LIMIT_PREFIXES = ("# whole:", "# range:", "# one of:")
+_SCHEMA_LIMIT_PREFIXES = (*_VALUE_LIMIT_PREFIXES, "# text:")
+
+
 _warning_sink: ContextVar[Callable[[str, bool], None] | None] = ContextVar("configuration_warning_sink", default=None)
 
 
@@ -180,7 +186,7 @@ class ConfigRead:
                     raise
                 return default, None
             bad = setting.value
-            if allow_blank and not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
+            if allow_blank and not setting.value and not setting.limit.startswith(_VALUE_LIMIT_PREFIXES):
                 return convert(""), setting.value
             return _converted(setting, convert), setting.value
 
@@ -209,7 +215,7 @@ class ConfigRead:
         current_limit = ""
         if isinstance(self.settings, dict):
             current = self.settings.get(self.effective_key(key))
-            if current is not None and current.limit.startswith(("# whole:", "# range:", "# one of:")):
+            if current is not None and current.limit.startswith(_VALUE_LIMIT_PREFIXES):
                 current_limit = current.limit
         fallback: RecoveredValue[Result] | None = None
         for committed in _committed_files(self.source):
@@ -281,7 +287,7 @@ class ConfigRead:
                 setting = _setting(settings, key)
             except _MissingKey:
                 continue
-            if not setting.value and not setting.limit.startswith(("# whole:", "# range:", "# one of:")):
+            if not setting.value and not setting.limit.startswith(_VALUE_LIMIT_PREFIXES):
                 result[key] = setting.value
                 continue
             try:
@@ -369,22 +375,34 @@ def path(file: str | Path) -> Path:
     return directory() / f"{file}.conf"
 
 
+def _repository_config_directory() -> Path:
+    return Path(__file__).resolve().parents[2] / "config"
+
+
 def _repository_path(stem: str) -> Path:
     """Return the repository configuration file for a validated stem."""
     conf_reads.record(stem)
-    return Path(__file__).resolve().parents[2] / "config" / f"{stem}.conf"
+    return _repository_config_directory() / f"{stem}.conf"
+
+
+def _section_settings(source: str, *, separator: str = "=") -> Iterator[tuple[str, str, Setting]]:
+    section = ""
+    previous = ""
+    for index, raw in enumerate(source.splitlines()):
+        line = re.split(r"(?:^|\s)#", raw, maxsplit=1)[0].strip()
+        if line.startswith("["):
+            section = line.removeprefix("[").removesuffix("]").strip()
+        elif line:
+            key, found, value = line.partition(separator)
+            if found:
+                yield section, key.strip(), Setting(value.strip(), previous, index)
+        previous = raw.strip()
 
 
 def _parse(source: str) -> dict[str, Setting]:
     settings: dict[str, Setting] = {}
-    previous = ""
-    for index, raw in enumerate(source.splitlines()):
-        line = re.split(r"(?:^|\s)#", raw, maxsplit=1)[0].strip()
-        if line and not line.startswith("["):
-            key, separator, value = line.partition("=")
-            if separator:
-                _ = settings.setdefault(key.strip(), Setting(value.strip(), previous, index))
-        previous = raw.strip()
+    for _, key, setting in _section_settings(source):
+        _ = settings.setdefault(key, setting)
     return settings
 
 
@@ -583,14 +601,67 @@ def check(file: str | Path, key: str, value: str) -> None:
         raise Unusable(f"{source}: {key}={value!r}: {error}") from error
 
 
+def check_test_defaults(shipped: Path, defaults: Path) -> None:
+    """Validate shipped limits and compare the test keys and limits."""
+    def label(section: str, key: str) -> str:
+        return f"[{section}] {key}" if section else key
+
+    def limits(file: Path, display: str, *, shipped_values: bool) -> dict[tuple[str, str], str]:
+        # Context deferral uses one window setting and lists of phrase patterns.
+        phrases: set[str] = {"action", "marker", "state", "later", "exclude"} if file.name == "context_deferral.conf" else set()
+        separator = ":" if phrases else "="
+        result: dict[tuple[str, str], str] = {}
+        source = file.read_text(encoding="utf-8")
+        for section, key, setting in _section_settings(source, separator=separator):
+            entry = (section, key)
+            if entry in result and (section or key not in phrases):
+                errors.append(f"{display}: Duplicate key {key} in section {section or 'top level'}.")
+            limit = setting.limit if setting.limit.startswith(_SCHEMA_LIMIT_PREFIXES) else ""
+            _ = result.setdefault(entry, limit)
+            if shipped_values and limit:
+                try:
+                    _limits(limit, setting.value)
+                except (ValueError, ArithmeticError) as error:
+                    errors.append(f"{display}: {label(section, key)}={setting.value!r}: {error} ({limit}).")
+        return result
+
+    shipped_files = {file.name: file for file in shipped.glob("*.conf")}
+    default_files = {file.name: file for file in defaults.glob("*.conf")}
+    errors: list[str] = []
+    for name in sorted(shipped_files.keys() | default_files.keys()):
+        source = f"config/{name}"
+        copy = str(TEST_CONFIG_PATH / name)
+        source_limits = limits(shipped_files[name], source, shipped_values=True) if name in shipped_files else {}
+        copy_limits = limits(default_files[name], copy, shipped_values=False) if name in default_files else {}
+        if name not in default_files:
+            errors.append(f"{source}: Add the missing test config {copy}.")
+            continue
+        if name not in shipped_files:
+            errors.append(f"{copy}: {source} does not exist. Remove the test config.")
+            continue
+        for entry in sorted(source_limits.keys() | copy_limits.keys()):
+            entry_label = label(*entry)
+            if entry not in copy_limits:
+                errors.append(f"{source}: {entry_label} is missing from {copy}. Add the test default and its limit.")
+            elif entry not in source_limits:
+                errors.append(f"{copy}: {entry_label} is missing from {source}. Remove the test default.")
+            elif source_limits[entry] != copy_limits[entry]:
+                errors.append(f"{copy}: The limit for {entry_label} differs from {source}. Copy the limit line.")
+    if errors:
+        raise Unusable("\n".join(errors))
+
+
 def main(arguments: list[str] | None = None) -> int:
     args = sys.argv[1:] if arguments is None else arguments
-    if len(args) != 3 or args[0] != "get":
-        print("usage: conf.py get FILE KEY", file=sys.stderr)
-        return 2
     try:
-        print(read(args[1]).text(args[2]))
-    except Unusable as error:
+        if args == ["check-test-defaults"]:
+            check_test_defaults(_repository_config_directory(), TEST_CONFIG_DIRECTORY)
+        elif len(args) == 3 and args[0] == "get":
+            print(read(args[1]).text(args[2]))
+        else:
+            print("usage: conf.py get FILE KEY | conf.py check-test-defaults", file=sys.stderr)
+            return 2
+    except (Unusable, OSError, UnicodeError) as error:
         print(str(error), file=sys.stderr)
         return 2
     return 0

@@ -16,6 +16,7 @@ from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.production import staff
 from scripts.production.production_doc import read_production
 from scripts.production.update_registration import scheduled_prompt
@@ -181,7 +182,7 @@ class NotifierTests(unittest.TestCase):
         })
         if not process_boundary_for_case(self) and "SHOWN_ZONE" not in environment:
             config = environment.get("USER_ZONE_CONF") or str(
-                Path(user_zone.__file__).resolve().parents[2] / "config/user_zone.conf")
+                TEST_CONFIG_DIRECTORY / "user_zone.conf")
             if not Path(config).is_absolute():
                 config = str(Path.cwd() / config)
             try:

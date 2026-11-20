@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import unittest
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib import conf
 from scripts.production import claude_table_layout, display_cells
 
@@ -25,7 +26,7 @@ class WrappedTableTests(unittest.TestCase):
                     for column, original in enumerate(originals, 1):
                         restored = " ".join(row[column] for row in selected if row[column])
                         self.assertEqual(restored.replace(" ", ""), original.replace(" ", ""))
-                settings = conf.read_or_repository("production")
+                settings = conf.read(TEST_CONFIG_DIRECTORY / "production.conf")
                 width = settings.whole("units_table_floor_columns") - claude_table_layout.REPLY_INDENT
                 fitted = claude_table_layout.fit(titles, rows, width)
                 self.assertTrue(fitted.keeps_table(titles, rows, width, settings.whole("units_table_cell_lines")))

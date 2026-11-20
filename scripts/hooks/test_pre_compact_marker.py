@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast, override
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -29,7 +30,7 @@ class PreCompactMarkerTests(unittest.TestCase):
         self.folder = self.root / ".local/state/compaction"
         self.config = self.root / "config"
         self.config.mkdir()
-        source = HOOK.resolve().parents[2] / "config/compaction_marker.conf"
+        source = TEST_CONFIG_DIRECTORY / "compaction_marker.conf"
         _ = (self.config / source.name).write_text(source.read_text())
 
     def run_hook(self, family: str, payload: str) -> subprocess.CompletedProcess[str]:

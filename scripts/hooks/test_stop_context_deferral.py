@@ -12,10 +12,11 @@ import unittest
 from pathlib import Path
 from typing import override
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("stop-context-deferral.py")
-CONFIG = HOOK.parents[2] / "config" / "context_deferral.conf"
+CONFIG = TEST_CONFIG_DIRECTORY / "context_deferral.conf"
 REASON = "Compaction runs by itself mid-work; do the work now."
 TRUE_HITS = (
     "My context is full; I will finish the work later.",

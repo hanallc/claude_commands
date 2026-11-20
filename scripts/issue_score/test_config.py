@@ -14,11 +14,9 @@ from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import conf
-from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY, UseConfiguredValue
 from scripts.issue_score import apply_labels, blind, client, decide, evaluate, questions, records, score_issues, vault
 
-
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
 FIXTURE_VALUES = {
     "workers": "8", "model": "jev-1.14.0", "input_usd_per_million": "0.042",
@@ -66,9 +64,9 @@ def patch_thresholds(**policies: questions.ThresholdOutcome) -> Generator[None]:
 
 
 class ConfigurationTests(ConfiguredTestCase):
-    def test_each_shipped_key_reads_without_recovery_and_has_a_valid_limit(self) -> None:
-        scoring_config = conf.read(CONFIG_DIR / "issue_score.conf")
-        path = CONFIG_DIR / "issue_score.conf"
+    def test_each_fixed_key_reads_without_recovery_and_has_a_valid_limit(self) -> None:
+        scoring_config = conf.read(TEST_CONFIG_DIRECTORY / "issue_score.conf")
+        path = TEST_CONFIG_DIRECTORY / "issue_score.conf"
         lines = path.read_text(encoding="utf-8").splitlines()
         settings = conf.read(path).values()
         self.assertTrue(settings)
@@ -138,7 +136,7 @@ class ConfigurationTests(ConfiguredTestCase):
                 questions.MinimumGap(.51) if field == "area" else questions.Supported(.51),
             )
             readers[f"error_target.{field}"] = (lambda field=field: questions.error_targets()[field], "0.2", .2)
-        self.assertEqual(set(readers), set(conf.read(CONFIG_DIR / "issue_score.conf").values()))
+        self.assertEqual(set(readers), set(conf.read(TEST_CONFIG_DIRECTORY / "issue_score.conf").values()))
         for key, (read, replacement, expected) in readers.items():
             with self.subTest(key=key):
                 initial = "private-initial" if isinstance(expected, (str, Path)) else "1"

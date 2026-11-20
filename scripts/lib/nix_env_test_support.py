@@ -10,6 +10,7 @@ from typing import cast, override
 import unittest
 from unittest.mock import patch
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.buildlog.store import host_name
 from scripts.lib.build_slots_test_support import write_private_slot_roots
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
@@ -50,7 +51,7 @@ class NixFixture(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         configuration = self.root / "settings"
-        _ = copy_config_fixture(ROOT / "config", configuration)
+        _ = copy_config_fixture(TEST_CONFIG_DIRECTORY, configuration)
         write_private_slot_roots(configuration / "build_folders.conf", self.root, host_name())
         _ = write_config_fixture(configuration / "nix_env.conf",
                                  "trusted_home_folders=rust worktrees\ntrusted_home_prefix=.claude\n")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_queue.admission_test_support import (
@@ -1171,7 +1172,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         scripts = claude / "scripts"
         scripts.mkdir(parents=True)
         _ = copy_helpers(self.home, *VERIFY_HELPERS)
-        _ = shutil.copytree(VERIFY.parent.parent.parent / "config", claude / "config")
+        _ = shutil.copytree(TEST_CONFIG_DIRECTORY, claude / "config")
         log = scripts / "buildlog"
         # Keep the recorder's import interface while the command records fixture observations.
         record_source = (VERIFY.parent.parent / "buildlog/record.py").read_text()

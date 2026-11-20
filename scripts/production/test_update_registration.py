@@ -1,6 +1,7 @@
 """Registration behavior against a private seeded fixture."""
 
 from __future__ import annotations
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lint.memory_test_support import config_environment, copy_config_fixture
 
 import json
@@ -46,7 +47,7 @@ class ProducerQuestionTests(RegistrationFixture):
         listing = self.root / "reviews/change-review - example.md"
         _ = self.doc.write_text(self.doc.read_text() + f"- **Change review:** `{listing}`\n")
         config = self.root / "config"
-        _ = copy_config_fixture(Path(__file__).parents[2] / 'config', config)
+        _ = copy_config_fixture(TEST_CONFIG_DIRECTORY, config)
         settings = config / "review_links.conf"
         _ = write_config_fixture(settings, "delivery_pause_seconds=0\ndelivery_tries=3\n")
         self.env.update({"CLAUDE_CODE_SESSION_ID": self.producer.current_session, "CODEX_THREAD_ID": "",

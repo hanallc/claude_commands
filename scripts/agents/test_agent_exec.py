@@ -1,6 +1,7 @@
 """Shell launchers select the caller's Claude account or the mapped Codex workers home."""
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib.helper_tree_test_support import copy_helpers
 
 from scripts.lib.test_models_registry import RegistryReadProbe, write_registry
@@ -169,8 +170,8 @@ class ClaudeLauncherTests(unittest.TestCase):
         notes.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
             "AGENT_NOTES_DIR": str(notes), "STAFF_FILE": str(self.home / "staff.json"),
-            "STAFF_CONFIG": str(SCRIPTS.parent / "config/staff.conf"),
-            "CONF_DIR": str(SCRIPTS.parent / "config"),
+            "STAFF_CONFIG": str(TEST_CONFIG_DIRECTORY / "staff.conf"),
+            "CONF_DIR": str(TEST_CONFIG_DIRECTORY),
             **source_environment(self.home / "sources")}, clear=True)))
         _ = copy_helpers(self.home)
         _ = (self.home / ".claude.json").write_text("{}")

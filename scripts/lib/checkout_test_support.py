@@ -9,6 +9,7 @@ import shutil
 import shlex
 import sys
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY, TEST_CONFIG_PATH
 from scripts.lib.python_startup.sitecustomize import STARTUP_FILES, TEST_RUNNER_FILES, inherited_paths
 
 
@@ -19,8 +20,7 @@ SOURCE = Path(__file__).resolve().parents[2]
 def runtime_files() -> tuple[Path, ...]:
     """List runtime files without compiled files or unrelated test modules."""
     helpers = {"test_hang_guard.py", "test_models_registry.py", "test_support.py", "test_phase.py"}
-    return tuple(path.relative_to(SOURCE) for folder in ("scripts", "config")
-                 for path in sorted((SOURCE / folder).rglob("*"))
+    return tuple(path.relative_to(SOURCE) for path in sorted((SOURCE / "scripts").rglob("*"))
                  if path.is_file() and "__pycache__" not in path.parts
                  and (path.suffix != ".py" or not path.name.startswith("test_") or path.name in helpers))
 
@@ -39,12 +39,30 @@ def copy_with_bytecode(source: Path, destination: Path) -> None:
 def copy_runtime(checkout: Path, *, configuration: bool = True) -> None:
     """Copy missing runtime files and keep the fixture's existing tools."""
     for relative in runtime_files():
-        if not configuration and relative.parts[0] == "config":
+        if relative.is_relative_to(TEST_CONFIG_PATH):
             continue
         destination = checkout / relative
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
             copy_with_bytecode(SOURCE / relative, destination)
+    copy_test_configuration(checkout, configuration=configuration)
+
+
+def copy_test_configuration(checkout: Path, *, configuration: bool = True) -> None:
+    """Seed private config paths with fixed defaults."""
+    def seed(source: Path, destination: Path) -> None:
+        if destination.is_symlink():
+            destination.unlink()
+        if source.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+            for child in sorted(source.iterdir()):
+                seed(child, destination / child.name)
+        elif not destination.exists():
+            _ = shutil.copy2(source, destination)
+
+    seed(TEST_CONFIG_DIRECTORY, checkout / TEST_CONFIG_PATH)
+    if configuration:
+        seed(TEST_CONFIG_DIRECTORY, checkout / "config")
 
 
 def copy_startup(checkout: Path) -> None:
@@ -60,11 +78,14 @@ def copy_startup(checkout: Path) -> None:
 def copy_test_runner(checkout: Path) -> None:
     """Install the test runner and its dependencies in a temporary checkout."""
     for relative in TEST_RUNNER_FILES:
+        if relative.startswith("config/"):
+            continue
         destination = checkout / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.is_symlink():
             destination.unlink()
         copy_with_bytecode(SOURCE / relative, destination)
+    copy_test_configuration(checkout)
 
 
 def python_tool_source(source: str) -> str:

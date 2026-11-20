@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from scripts.build_hold.override_guard import require_checkout
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY as TEST_CONFIG_DIRECTORY
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import AdmissionPolicy, MemoryConfig
@@ -33,7 +34,9 @@ def admission_policy_fixture() -> AdmissionPolicy:
 
 
 def _template(name: str) -> Path:
-    return Path(__file__).resolve().parents[2] / "config" / name
+    if name in ("", ".", "..") or Path(name).name != name or "\0" in name:
+        raise ValueError(f"Expected a file name for the test config template: {name!r}")
+    return TEST_CONFIG_DIRECTORY / name
 
 
 # Test clocks move only when a test moves them, so a test configuration has no pass gap unless the test sets one.
@@ -41,7 +44,7 @@ TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Merge committed defaults, test defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
+    """Apply fixed defaults, existing settings, then explicit overrides. Keep each explicit limit."""
     source = _template(f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
     existing = path.read_text() if path.exists() else ""
@@ -132,18 +135,16 @@ def commit_config_fixture(path: Path) -> None:
 
 def config_environment(root: Path) -> dict[str, str]:
     """Give subprocess fixtures their own complete configuration folder."""
-    folder = root
-    names = {source.name for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf")}
-    names.add(ADMISSION_CONFIG_FIXTURE.name)
-    for name in sorted(names):
-        destination = folder / name
-        if not destination.exists():
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if name in TEST_CONFIG_DEFAULTS:
-                _ = write_config_fixture(destination)
-            else:
-                _ = destination.write_bytes(_template(name).read_bytes())
-    return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
+    root.mkdir(parents=True, exist_ok=True)
+    for source in sorted(TEST_CONFIG_DIRECTORY.glob("*.conf")):
+        destination = root / source.name
+        if destination.exists():
+            continue
+        if source.name in TEST_CONFIG_DEFAULTS:
+            _ = write_config_fixture(destination)
+        else:
+            _ = destination.write_bytes(source.read_bytes())
+    return {"CONF_DIR": str(root), "BUILD_TARGETS_CONFIG": str(root / "build_targets.conf")}
 
 
 def gate_isolation_environment(root: Path) -> dict[str, str]:

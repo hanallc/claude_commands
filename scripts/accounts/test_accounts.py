@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import sys
@@ -139,7 +140,7 @@ class AccountsConfigurationTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "accounts.conf"
-            _ = config.write_bytes((root / "config/accounts.conf").read_bytes())
+            _ = config.write_bytes((TEST_CONFIG_DIRECTORY / "accounts.conf").read_bytes())
             with patch.dict(os.environ, {"CONF_DIR": temporary}):
                 account_config = conf.read("accounts")
                 configured = account_config.values()
@@ -161,6 +162,7 @@ class AccountsConfigurationTests(unittest.TestCase):
                         elif kind == "number":
                             self.assertEqual(account_config.number(key), float(configured[key]))
                         else:
+                            self.assertTrue(configured[key].strip(), key)
                             self.assertEqual(account_config.text(key), configured[key])
 
     def test_accounts_reader_scan_exposes_a_wrong_usage_age_method(self) -> None:
@@ -8257,7 +8259,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         config = self.root / "conf"
         config.mkdir()
         _ = (config / "accounts.conf").write_text(
-            (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_text())
+            (TEST_CONFIG_DIRECTORY / "accounts.conf").read_text())
         _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
                                                + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
                                                + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
@@ -8738,7 +8740,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         row = self.worker("w74", live=False)
         self.dispatch(row)
         atomic_file.write_text_atomic(self.root / "conf/shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+            (TEST_CONFIG_DIRECTORY / "shutdown.conf").read_text())
         pane_record.write(self.world.session, pane_record.launch("w1:p1", str(row.current_session), str(self.root),
             {"CLAUDE_CONFIG_DIR": str(self.root / ".claude1")}, ["claude", "-n", row.name]))
         result_path = self.run_dir / f"detached_runs/{row.name}.json"
@@ -10303,7 +10305,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "statusline.conf"
             _ = (config.parent / "accounts.conf").write_bytes(
-                (Path(__file__).resolve().parents[2] / "config/accounts.conf").read_bytes())
+                (TEST_CONFIG_DIRECTORY / "accounts.conf").read_bytes())
             for setting, css, escape in (
                 ("brown", "#af875f", "\x1b[38;5;137m"),
                 ("magenta", "#800080", "\x1b[35m"),

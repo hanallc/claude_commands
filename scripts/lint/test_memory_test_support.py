@@ -7,25 +7,42 @@ import tempfile
 import unittest
 from unittest import mock
 
+from scripts.lint import memory_test_support
 from scripts.lint.memory_test_support import ConfigFixtureRefused, commit_config_fixture, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class ConfigFixtureTests(unittest.TestCase):
-    def test_partial_config_keeps_values_and_receives_committed_defaults_and_limits(self) -> None:
+    def test_partial_config_keeps_values_and_receives_fixed_defaults_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "direct.conf"
             _ = path.write_text("MAX_FIX_ATTEMPTS=17\nfixture_only=kept\n")
             _ = write_config_fixture(path, "MAX_REOPENS=19\n")
             text = path.read_text()
-        committed = Path(__file__).resolve().parents[2] / "config" / "direct.conf"
-        expected = dict(line.split("=", 1) for line in committed.read_text().splitlines()
+        defaults = memory_test_support.TEST_CONFIG_DIRECTORY / "direct.conf"
+        expected = dict(line.split("=", 1) for line in defaults.read_text().splitlines()
                         if "=" in line and not line.startswith("#"))
         expected.update(MAX_FIX_ATTEMPTS="17", MAX_REOPENS="19", fixture_only="kept")
         actual = dict(line.split("=", 1) for line in text.splitlines()
                       if "=" in line and not line.startswith("#"))
         self.assertEqual(actual, expected)
         self.assertIn("# whole: 1..\nMAX_FIX_ATTEMPTS=17\n", text)
+
+    def test_both_fixture_writers_use_the_fixed_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            defaults = root / "defaults"
+            defaults.mkdir()
+            source = defaults / "direct.conf"
+            _ = source.write_text("# whole: 1..\nMAX_FIX_ATTEMPTS=27\n", encoding="utf-8")
+            with mock.patch.object(memory_test_support, "TEST_CONFIG_DIRECTORY", defaults):
+                folder = root / "fixture"
+                _ = memory_test_support.config_environment(folder)
+                partial = folder / "partial.conf"
+                _ = write_config_fixture(partial, "MAX_REOPENS=19\n", template="direct")
+            self.assertCountEqual(folder.glob("*.conf"), [folder / "direct.conf", partial])
+            self.assertEqual((folder / source.name).read_bytes(), source.read_bytes())
+            self.assertEqual(partial.read_text(), "# whole: 1..\nMAX_FIX_ATTEMPTS=27\nMAX_REOPENS=19\n")
 
     def test_successive_overrides_keep_prior_values_and_allow_an_explicit_empty_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -47,6 +64,19 @@ class ConfigFixtureTests(unittest.TestCase):
         self.assertIn("host=private-host\n", text)
         self.assertIn("offload=on\n", text)
         self.assertIn("leftover_timeout_s=", text)
+
+    def test_named_template_refuses_paths_outside_the_defaults_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            defaults = root / "defaults"
+            defaults.mkdir()
+            fixture = root / "fixture.conf"
+            with mock.patch.object(memory_test_support, "TEST_CONFIG_DIRECTORY", defaults):
+                for template in (str(root / "private"), "../private"):
+                    with self.subTest(template=template):
+                        with self.assertRaisesRegex(ValueError, "Expected a file name for the test config template"):
+                            _ = write_config_fixture(fixture, template=template)
+                        self.assertFalse(fixture.exists())
 
     def test_existing_and_explicit_limits_follow_their_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

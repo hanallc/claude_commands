@@ -22,6 +22,7 @@ from typing import TypedDict, cast, override
 from unittest import mock
 
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import build_hold
 from scripts.build_hold import owning_session as session_owner
@@ -439,7 +440,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
     def setUp(self) -> None:
         super().setUp()
         self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(SCRIPT.parent.parent.parent / "config"),
+            "CONF_DIR": str(TEST_CONFIG_DIRECTORY),
         }))
 
     def test_remote_commands_refuse_without_state_changes(self) -> None:

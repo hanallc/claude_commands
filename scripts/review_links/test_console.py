@@ -16,6 +16,7 @@ import unittest
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.disks import disks_page
@@ -53,7 +54,7 @@ class ConsoleTests(unittest.TestCase):
         self.configuration = self.root / "config"
         self.configuration.mkdir()
         for stem in ("console", "review_links", "change_review"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
+            _ = shutil.copyfile(TEST_CONFIG_DIRECTORY / f"{stem}.conf",
                                 self.configuration / f"{stem}.conf")
         _ = write_config_fixture(self.configuration / "console.conf",
             "page.accounts.label=Accounts\npage.accounts.title=Accounts\npage.accounts.icon=users\n"
@@ -143,15 +144,23 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('.workspace{flex:1;width:100%}', source)
         self.assertIn("mobileToggle.setAttribute('aria-expanded', String(!value))", source)
 
-    def test_repository_config_names_staff_for_every_console_page(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+    def test_fixed_config_names_staff_for_every_console_page(self) -> None:
+        path = TEST_CONFIG_DIRECTORY / "console.conf"
         settings = conf.read(path).values()
         pages = {key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")}
         self.assertEqual(pages | {"rebuilds"}, page_frame.OWNER_PAGES)
-        for page in page_frame.OWNER_PAGES:
-            with self.subTest(page=page):
-                self.assertRegex(settings[f"page.{page}.owner"], r"^[a-f0-9-]{36}$")
-        self.assertEqual(settings["owner.default"], settings["page.review.owner"])
+        self.assertEqual(console.owner_config_problems(settings), ())
+
+    def test_console_owner_problems_name_invalid_missing_and_distinct_ids(self) -> None:
+        settings = conf.read("console").values()
+        settings["page.aws.owner"] = "-" * 36
+        settings["owner.default"] = "12345678-1234-1234-1234-123456789012"
+        del settings["page.list.owner"]
+        self.assertEqual(console.owner_config_problems(settings), (
+            "page.aws.owner: Expected a staff UUID.",
+            "page.list.owner: Expected a staff UUID.",
+            "owner.default: Use the same staff ID as page.review.owner.",
+        ))
 
     def test_builds_url_resolves_from_its_public_function(self) -> None:
         folder = self.root / "snapshots/builds"
@@ -305,7 +314,7 @@ class ForYouNotifierTests(unittest.TestCase):
 
 def assert_notifier_browser(case: unittest.TestCase, width: int) -> None:
     'Exercise the real shell with controlled reads, timers, and clipboard writes.'
-    settings = Path(__file__).resolve().parents[2] / "config"
+    settings = TEST_CONFIG_DIRECTORY
     pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage("/page")),
              console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage("/console/review.html")),
              console.ConsolePage("accounts", "Accounts", "users", "Accounts", console.AvailablePage("/accounts")))

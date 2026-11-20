@@ -16,6 +16,7 @@ from threading import Event
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.maintenance import agent_notes_job as job
 from scripts.maintenance import vault_commit
 from scripts.maintenance.settings import Part, Schedule, settings
@@ -33,7 +34,7 @@ class JobTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.config = self.root / "job.toml"
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = self.config.write_text((job.ROOT / "config/agent_notes.toml").read_text())
+        _ = self.config.write_text((TEST_CONFIG_DIRECTORY / "agent_notes.toml").read_text())
         self.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root), "AGENT_NOTES_JOB_CONFIG": str(self.config)}))
 

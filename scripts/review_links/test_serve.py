@@ -1,6 +1,7 @@
 """HTTP behavior on localhost and retention in disposable snapshot folders."""
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.lib.checkout_test_support import python_tool_source
@@ -2803,7 +2804,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             (question, 'answer'), (investigation_key, 'read'), (question, 'later')))
 
         _, efficiency = case.decisions()
-        config = Path(__file__).resolve().parents[2]/'config/nightly_review.conf'
+        config = TEST_CONFIG_DIRECTORY / "nightly_review.conf"
         _ = shutil.copyfile(config, case.fixture.temporary/'config/nightly_review.conf')
         self.assert_stale_review_actions(case, ((efficiency, 'approve'), (efficiency, 'decline')))
 
@@ -5012,7 +5013,7 @@ class ServerStartupTests(unittest.TestCase):
         tailscale.chmod(0o755)
         other_store = temporary / "other-store"
         configuration = temporary / "config"
-        _ = shutil.copytree(checkout / "config", configuration)
+        _ = shutil.copytree(TEST_CONFIG_DIRECTORY, configuration)
         _ = write_config_fixture(configuration / "console.conf", f"page.list.owner={keeper}\n")
         rebuild_cache = temporary / "rebuild-cache"
         _ = (configuration / "statusline.conf").write_text(f"rebuild.cache={rebuild_cache}\n")

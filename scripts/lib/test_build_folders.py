@@ -20,6 +20,7 @@ from typing import Never, cast, override
 from unittest import mock
 from contextlib import contextmanager, nullcontext
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1745,12 +1746,12 @@ assert not loaded, loaded
         environment = config_environment(config.parent)
         self.assertEqual(environment, {"CONF_DIR": str(config.parent),
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
-        sources = Path(__file__).resolve().parents[2] / "config"
+        sources = TEST_CONFIG_DIRECTORY
         for source in sources.glob("*.conf"):
             private = config.parent / source.name
             if source.name == "build_admission.conf":
-                shipped = conf.read(source).values()
-                self.assertEqual(conf.read(private).values(), shipped | {"min_pass_gap_seconds": "0"})
+                defaults = conf.read(source).values()
+                self.assertEqual(conf.read(private).values(), defaults | {"min_pass_gap_seconds": "0"})
             else:
                 self.assertEqual(private.read_bytes(), source.read_bytes())
         _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
@@ -1802,7 +1803,7 @@ assert not loaded, loaded
         self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "private.{owner}.")
 
     def test_folder_rules_keep_the_live_config_reader_without_a_private_override(self) -> None:
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config" / "build_folders.conf")
+        settings = conf.read(TEST_CONFIG_DIRECTORY / "build_folders.conf")
         with mock.patch.dict(os.environ):
             _ = os.environ.pop("CONF_DIR", None)
             with mock.patch.object(conf, "read", return_value=settings) as read:

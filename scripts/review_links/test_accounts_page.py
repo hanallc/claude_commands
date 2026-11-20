@@ -1,5 +1,6 @@
 """The console Accounts page draws the accounts board table."""
 from __future__ import annotations
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 from collections import Counter
@@ -223,7 +224,7 @@ class AccountsPageTests(unittest.TestCase):
         scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
         configuration = scratch / "config"
         self.review_root = scratch / "review"
-        _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", configuration)
+        _ = copy_config_fixture(TEST_CONFIG_DIRECTORY, configuration)
         _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
         _ = write_config_fixture(configuration / "console.conf", PAGE_STATUS_SETTINGS)
         _ = write_config_fixture(configuration / "review_links.conf", "page_refresh_seconds=15\naccounts_page_seconds=30\n")

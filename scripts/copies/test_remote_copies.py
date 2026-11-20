@@ -735,7 +735,7 @@ exec(compile(program, '<remote-probe>', 'exec'))
         self.assertEqual(floor_claims.read_mirror_record(self.mirror / floor_claims.MIRROR_RECORD)["kind"], "remote-mirror")
 
     def test_allow_list_keeps_only_original_copy_makers(self) -> None:
-        settings = conf.read(Path(__file__).resolve().parents[2] / "config/copies.conf").values()
+        settings = conf.read(conf.TEST_CONFIG_DIRECTORY / "copies.conf").values()
         entries = {key.removeprefix("allow.") for key in settings if key.startswith("allow.")}
         self.assertEqual(entries, {"copies/copies.py", "production/add_unit.py", "agents/shutdown.py",
             "style/add_style.py", "worktree/make_worktree.sh", "worktree/worktrees.py",

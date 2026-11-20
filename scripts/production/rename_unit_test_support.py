@@ -1,6 +1,7 @@
 """Use private staff records and Git repositories for unit rename tests."""
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.agents import remote
 
 import json
@@ -386,7 +387,7 @@ class FolderRenameFixture(StaffTestCase):
             worktree=staff.PresentWorktree(remote.local_machine(), self.source))
         _ = staff.update_current_session(row.current_session,
             staff.native_id(fixture_runtime_id("folder-current-after-clear")))
-        _ = self.configuration.write_text((Path(__file__).resolve().parents[2] / "config/production.conf").read_text())
+        _ = self.configuration.write_text((TEST_CONFIG_DIRECTORY / "production.conf").read_text())
         self.transcript("claude")
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:

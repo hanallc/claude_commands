@@ -1,6 +1,7 @@
 """Restart staff rows without a session journal."""
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.agents import remote
@@ -617,7 +618,7 @@ class RecordedResumeTests(RestartTestCase):
     def setUp(self) -> None:
         super().setUp()
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
+        for source in TEST_CONFIG_DIRECTORY.glob("*.conf"):
             _ = write_config_fixture(configuration / source.name)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
 
@@ -754,7 +755,7 @@ class MixedRestartTests(ShutdownTestCase):
             "MODELS_CONFIG_FILE": str(root / "conf/models.conf"), "MODELS_CONFIG_PUBLISH": "0",
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
+        for source in TEST_CONFIG_DIRECTORY.glob("*.conf"):
             _ = write_config_fixture(root / 'conf' / source.name)
         write_text_atomic(root / "conf/models.conf",
             Path(__file__).resolve().parents[1].joinpath("lib/test_models_registry.conf").read_text())
@@ -1209,7 +1210,7 @@ class RestartTests(RestartTestCase):
     def setUp(self) -> None:
         super().setUp()
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
+        for source in TEST_CONFIG_DIRECTORY.glob("*.conf"):
             _ = write_config_fixture(configuration / source.name)
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
@@ -3955,7 +3956,7 @@ class RetainedSplitRestartTests(RestartTestCase):
         self.addCleanup(fixture.doCleanups)
         root = fixture.root
         config = root / "conf"
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
+        for source in TEST_CONFIG_DIRECTORY.glob("*.conf"):
             _ = write_config_fixture(config / source.name)
         write_text_atomic(config / "models.conf", registry_text())
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),

@@ -602,8 +602,8 @@ class NixConfigTests(NixFixture):
                                  nix_env.Refused(f"nix_env: {self.work}: direnv timed out after {timeout} s"))
                 self.assertEqual(run.call_args.kwargs["timeout"], timeout)
 
-    def test_shipped_config_supplies_the_settings_used_by_nix_and_heal(self) -> None:
-        path = ROOT / "config/nix_env.conf"
+    def test_fixed_config_supplies_the_settings_used_by_nix_and_heal(self) -> None:
+        path = conf.TEST_CONFIG_DIRECTORY / "nix_env.conf"
         settings = conf.read(path)
         values = settings.values()
         for key in ("trusted_home_folders", "trusted_home_prefix", "heal_state_directory", "session_directory_glob"):

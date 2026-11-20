@@ -1,4 +1,5 @@
 from __future__ import annotations
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.agents.test_support import write_machine_config
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -254,7 +255,7 @@ class PaneRestoreTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(accounts, "role_account", side_effect=role_account))
         configuration = self.root / "configuration"
         configuration.mkdir()
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
+        for source in TEST_CONFIG_DIRECTORY.glob("*.conf"):
             _ = write_config_fixture(configuration / source.name)
         write_machine_config(configuration)
         _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
@@ -676,7 +677,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         parent, unit, worker = self.tree()
         unit = staff.set_worktree(unit.id, staff.PresentWorktree(machine, self.root), expected=unit.worktree)
         configuration = self.root / "configuration"
-        for config_source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
+        for config_source in TEST_CONFIG_DIRECTORY.glob("*.conf"):
             _ = write_config_fixture(configuration / config_source.name)
         (self.root / "run").mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -946,7 +947,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         _ = self.enterContext(mock.patch.object(accounts, "role_account", side_effect=role_account))
         configuration = self.root / "configuration"
         configuration.mkdir()
-        for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
+        for source in TEST_CONFIG_DIRECTORY.glob("*.conf"):
             _ = write_config_fixture(configuration / source.name)
         registry = write_registry(configuration / "models.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {

@@ -1,6 +1,7 @@
 """Exercise native hook payloads against private staff and transcripts."""
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib.checkout_test_support import python_tool_source
 
 import json
@@ -237,7 +238,7 @@ class TurnEndTests(unittest.TestCase):
         for shared_sessions in (False, True):
             with self.subTest(shared_sessions=shared_sessions):
                 _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": "codex"}})
-                _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                _ = shutil.copyfile(TEST_CONFIG_DIRECTORY / "accounts.conf",
                                     self.case.fixture.root / "conf/accounts.conf")
                 self.case.agent.finish_after = 1
                 self.assertIs(self.case.dispatch("impl-shared" if shared_sessions else "impl"), worker.DispatchSubmission.SUBMITTED)
@@ -1337,7 +1338,7 @@ class TurnEndTests(unittest.TestCase):
         self.assertEqual(sum(": done; reply " in message for message in self.case.agent.notices), 1)
 
     def test_a_detached_result_reaches_the_idle_worker_in_both_completion_orders(self) -> None:
-        source = Path(__file__).resolve().parents[2] / "config"
+        source = TEST_CONFIG_DIRECTORY
         config = self.case.fixture.root / "conf"
         for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
             _ = shutil.copyfile(source / name, config / name)
@@ -1556,7 +1557,7 @@ class TurnEndTests(unittest.TestCase):
 
     def test_a_torn_final_reply_keeps_run_completion_pending_after_receipt_recovery(self) -> None:
         config = self.case.fixture.root / "conf"
-        source = Path(__file__).resolve().parents[2] / "config"
+        source = TEST_CONFIG_DIRECTORY
         for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
             _ = shutil.copyfile(source / name, config / name)
         self.case.agent.finish_after = 1

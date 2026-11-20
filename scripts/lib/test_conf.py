@@ -769,8 +769,95 @@ conf_reads.record('disabled')
         self.assertEqual(live.value, Decimal("7.25"))
 
 
+class TestDefaultsChecks(unittest.TestCase):
+    shipped: Path = Path()
+    defaults: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.shipped = root / "config"
+        self.defaults = root / "scripts/lib/test_config"
+        self.shipped.mkdir()
+        self.defaults.mkdir(parents=True)
+
+    def test_check_accepts_different_values_and_prose(self) -> None:
+        _ = (self.shipped / "example.conf").write_text("# Live value.\nmode=slow\n# whole: 0..9\ncount=4\n")
+        _ = (self.defaults / "example.conf").write_text("# Test value.\nmode=fast\n# whole: 0..9\ncount=1\n")
+        conf.check_test_defaults(self.shipped, self.defaults)
+
+    def test_check_rejects_a_shipped_value_outside_its_limit(self) -> None:
+        _ = (self.shipped / "example.conf").write_text("[pool]\n# whole: 0..9\ncount=10\n")
+        _ = (self.defaults / "example.conf").write_text("[pool]\n# whole: 0..9\ncount=1\n")
+        with self.assertRaises(conf.Unusable) as failure:
+            conf.check_test_defaults(self.shipped, self.defaults)
+        self.assertEqual(str(failure.exception),
+                         "config/example.conf: [pool] count='10': outside range 0..9 (# whole: 0..9).")
+
+    def test_check_names_duplicate_keys_in_both_copies(self) -> None:
+        source = "[pool]\n# whole: 0..9\ncount=4\ncount=4\n[other]\ncount=3\n"
+        _ = (self.shipped / "example.conf").write_text(source)
+        _ = (self.defaults / "example.conf").write_text(source)
+        with self.assertRaises(conf.Unusable) as failure:
+            conf.check_test_defaults(self.shipped, self.defaults)
+        self.assertEqual(str(failure.exception).splitlines(), [
+            "config/example.conf: Duplicate key count in section pool.",
+            "scripts/lib/test_config/example.conf: Duplicate key count in section pool.",
+        ])
+
+    def test_context_deferral_allows_phrase_lists_and_requires_one_window(self) -> None:
+        source = "window: 200\naction: act\nmarker: first\nmarker: second\n"
+        shipped = self.shipped / "context_deferral.conf"
+        defaults = self.defaults / shipped.name
+        _ = shipped.write_text(source)
+        _ = defaults.write_text(source)
+        conf.check_test_defaults(self.shipped, self.defaults)
+        _ = defaults.write_text(source + "window: 100\n")
+        with self.assertRaises(conf.Unusable) as failure:
+            conf.check_test_defaults(self.shipped, self.defaults)
+        self.assertEqual(str(failure.exception),
+                         "scripts/lib/test_config/context_deferral.conf: Duplicate key window in section top level.")
+
+    def test_check_compares_keys_and_limits_within_each_section(self) -> None:
+        _ = (self.shipped / "example.conf").write_text(
+            "[first]\n# whole: 0..9\ncount=4\n[second]\n# whole: 0..9\ncount=3\n[third]\ncount=2\n"
+        )
+        _ = (self.defaults / "example.conf").write_text(
+            "[first]\n# whole: 0..9\ncount=1\n[second]\n# whole: 0..8\ncount=1\n[fourth]\ncount=1\n"
+        )
+        with self.assertRaises(conf.Unusable) as failure:
+            conf.check_test_defaults(self.shipped, self.defaults)
+        self.assertCountEqual(str(failure.exception).splitlines(), [
+            "config/example.conf: [third] count is missing from scripts/lib/test_config/example.conf. "
+            + "Add the test default and its limit.",
+            "scripts/lib/test_config/example.conf: [fourth] count is missing from config/example.conf. "
+            + "Remove the test default.",
+            "scripts/lib/test_config/example.conf: The limit for [second] count differs from config/example.conf. "
+            + "Copy the limit line.",
+        ])
+
+    def test_check_names_missing_and_extra_test_files(self) -> None:
+        _ = (self.shipped / "missing.conf").write_text("mode=slow\n")
+        _ = (self.defaults / "extra.conf").write_text("mode=fast\n")
+        with self.assertRaises(conf.Unusable) as failure:
+            conf.check_test_defaults(self.shipped, self.defaults)
+        self.assertCountEqual(str(failure.exception).splitlines(), [
+            "config/missing.conf: Add the missing test config scripts/lib/test_config/missing.conf.",
+            "scripts/lib/test_config/extra.conf: config/extra.conf does not exist. Remove the test config.",
+        ])
+
+    def test_check_compares_colon_keys_in_context_deferral(self) -> None:
+        name = "context_deferral.conf"
+        _ = (self.shipped / name).write_text("window: 200\naction: example\n")
+        _ = (self.defaults / name).write_text("window: 100\n")
+        with self.assertRaises(conf.Unusable) as failure:
+            conf.check_test_defaults(self.shipped, self.defaults)
+        self.assertEqual(str(failure.exception), "config/context_deferral.conf: action is missing from "
+                         + "scripts/lib/test_config/context_deferral.conf. Add the test default and its limit.")
+
+
 class HanaConfigurationTests(unittest.TestCase):
-    source: Path = Path(__file__).resolve().parents[2] / "config/hana_aws.conf"
+    source: Path = conf.TEST_CONFIG_DIRECTORY / "hana_aws.conf"
 
     def test_render_configuration_has_no_host_suffixes(self) -> None:
         settings = conf.settings(self.source.read_text())

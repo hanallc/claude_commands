@@ -14,12 +14,13 @@ from typing import ClassVar, cast, override
 import unittest
 from unittest.mock import patch
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.production.cli_fixture import invoke_cli, process_boundary_for_case
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
 # Only the fsync test calls a function directly; never initialize it from live config.
-with patch.dict(os.environ, {"CONF_DIR": str(Path(Path(__file__).resolve().parents[2] / "config/direct.conf").parent)}):
+with patch.dict(os.environ, {"CONF_DIR": str(TEST_CONFIG_DIRECTORY)}):
     from scripts.direct import findings as findings
 
 SCRIPT = Path(__file__).with_name("findings.py")

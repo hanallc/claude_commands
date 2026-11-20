@@ -1,6 +1,7 @@
 """Check feed configuration and publication with private queue readings."""
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.build_queue import admission_records, admission_service, placement
 from scripts.build_queue import snapshot_codec as codec
@@ -2667,7 +2668,7 @@ process.stdout.write(JSON.stringify({
                       job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
                       ) -> memory_feed.MemoryPage:
         """Render the same gate mode on both machines and in both tables."""
-        config = Path(__file__).resolve().parents[2] / "config" / "build_steps.conf"
+        config = TEST_CONFIG_DIRECTORY / "build_steps.conf"
         _ = shutil.copyfile(config, self.root / "build_steps.conf")
         base = with_wait_reason(reservation_reading(), admission_records.StartSpacingWait(110))
         running = replace(base.view.running[0], step=step, pid=running_pid, job=job)

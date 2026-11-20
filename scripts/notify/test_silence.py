@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib.checkout_test_support import python_tool_source
 
 import io
@@ -75,7 +76,7 @@ class SilenceTests(unittest.TestCase):
     def test_nightly_result_without_herdr_keeps_only_the_newest_result_until_silence_ends(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         checkout = Path(__file__).resolve().parents[2]
-        _ = shutil.copytree(checkout / "config", root / "config")
+        _ = shutil.copytree(TEST_CONFIG_DIRECTORY, root / "config")
         keys = root / "keys"
         _ = keys.write_text("PUSHOVER_USER=fixture\nPUSHOVER_TOKEN=fixture\n")
         posted = root / "posted.jsonl"

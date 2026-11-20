@@ -698,8 +698,8 @@ class VaultPullTests(unittest.TestCase):
         self.assertEqual(len(self.questions()), 10)
 
     def test_vault_retry_delay_limit_stays_below_one_minute(self) -> None:
-        production = Path(__file__).resolve().parents[2] / "config/build_targets.conf"
-        for settings in (production, self.folder / "config/build_targets.conf"):
+        defaults = conf.TEST_CONFIG_DIRECTORY / "build_targets.conf"
+        for settings in (defaults, self.folder / "config/build_targets.conf"):
             with self.subTest(settings=settings):
                 conf.check(settings, "vault.lock_retries", "10")
                 conf.check(settings, "vault.lock_retry_delay_s", "5")

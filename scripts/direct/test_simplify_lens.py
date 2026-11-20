@@ -12,6 +12,7 @@ import unittest
 from typing import ClassVar, cast, override
 from unittest.mock import patch
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib.helper_tree_test_support import copy_helpers
 
 from scripts.direct import simplify_daily
@@ -91,12 +92,12 @@ class DailySimplifyTests(NixFixture):
         with patch.dict(os.environ, self.env):
             write_claude_account("claude1", "unit@example.invalid", 100,
                                  datetime.now(timezone.utc) + timedelta(days=30))
-        registry = write_registry(self.root / "models.conf", base_text=(ROOT / "config/models.conf").read_text())
+        registry = write_registry(self.root / "models.conf", base_text=(TEST_CONFIG_DIRECTORY / "models.conf").read_text())
         self.env.update({"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
                          "CODEX_CATALOG_SYNC_STATE_FILE": str(registry)})
         self.env.update(private_slot_config(self.root, repository="origin").environment)
         settings = Path(self.env["CONF_DIR"])
-        _ = shutil.copytree(ROOT / "config/review", settings / "review", dirs_exist_ok=True)
+        _ = shutil.copytree(TEST_CONFIG_DIRECTORY / "review", settings / "review", dirs_exist_ok=True)
         _ = write_config_fixture(settings / "direct.conf", "SIMPLIFY_LENS=on\nSIMPLIFY_FIRST_RUN_BEFORE=2026-11-05T22:50:00-05:00\n")
         startup = self.root / "startup"
         startup.mkdir()

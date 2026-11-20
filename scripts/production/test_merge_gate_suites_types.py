@@ -1,6 +1,7 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 import unittest
@@ -390,7 +391,7 @@ class NightlyPushTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "config"
-        _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", config)
+        _ = copy_config_fixture(TEST_CONFIG_DIRECTORY, config)
         _ = write_config_fixture(config / "merge_gate.conf",
             "nightly_result_push=on\nnightly_result_modules=8\nnightly_assign_minutes=30\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {

@@ -6,6 +6,7 @@ import os
 from contextlib import ExitStack
 from types import TracebackType
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib import build_folders, conf
 from scripts.lint.memory_test_support import config_environment
 from pathlib import Path
@@ -20,7 +21,7 @@ _swept: set[Path] = set()
 
 def socket_parent() -> Path:
     """Return the parent; the first call in a process removes the free folders killed runs left."""
-    parent = Path(conf.read_or_repository("build_folders").text("roots.system")) / PARENT
+    parent = Path(conf.read(TEST_CONFIG_DIRECTORY / "build_folders.conf").text("roots.system")) / PARENT
     parent.mkdir(mode=0o700, exist_ok=True)
     if parent not in _swept:
         _swept.add(parent)

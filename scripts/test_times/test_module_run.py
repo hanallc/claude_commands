@@ -375,6 +375,44 @@ finally:
     os.close(descriptor)""", []),
             ("read outside", "(OUTSIDE / 'outside.txt').read_text()", []),
             ("read config", "(ROOT / 'config/limits.conf').read_text()", []),
+            ("alias to config", "(OUTSIDE / 'limits-alias').read_text()", []),
+            ("list config", "os.listdir(ROOT / 'config')", ["config"]),
+            ("read review rules", "(ROOT / 'config/review/rules.md').read_text()", []),
+            ("read TOML", "(ROOT / 'config/example.toml').read_text()", []),
+            ("open relative to descriptor config", """descriptor = os.open(ROOT, os.O_RDONLY)
+os.chdir(OUTSIDE)
+try:
+    os.close(os.open('config/limits.conf', os.O_RDONLY, dir_fd=descriptor))
+finally:
+    os.close(descriptor)
+    os.chdir(ROOT)""", []),
+            ("open relative to current directory config", """os.chdir(ROOT / 'listed')
+try:
+    current = getattr(os, 'AT_FDCWD', -2 if sys.platform == 'darwin' else -100)
+    os.close(os.open('../config/limits.conf', os.O_RDONLY, dir_fd=current))
+finally:
+    os.chdir(ROOT)""", []),
+            ("echo config", "subprocess.check_output(['echo', 'config/limits.conf'], cwd=ROOT)", []),
+            ("git show config", "subprocess.check_output(['git', 'show', 'HEAD:config/limits.conf'], cwd=ROOT / 'listed')", []),
+            ("git show staged config", "subprocess.check_output(['git', 'show', ':0:config/limits.conf'], cwd=ROOT)", []),
+            ("git show relative config", "subprocess.check_output(['git', '-C', 'config', 'show', 'HEAD:./limits.conf'],"
+             + " cwd=ROOT)", []),
+            ("git show review", "subprocess.check_output(['git', 'show', 'HEAD:config/review/rules.md'], cwd=ROOT)", []),
+            ("git cat-file config", "subprocess.check_output(['git', 'cat-file', '-p', 'HEAD:config/limits.conf'], cwd=ROOT)", []),
+            ("git ls-files config", "subprocess.check_output(['git', 'ls-files', '--', 'config'], cwd=ROOT)", ["config/"]),
+            ("git ls-files from config", "subprocess.check_output(['git', '-C', 'config', 'ls-files', '--', '../docs'],"
+             + " cwd=ROOT)", ["docs/"]),
+            ("git ls-tree config", "subprocess.check_output(['git', 'ls-tree', '--full-tree', 'HEAD', 'config'],"
+             + " cwd=ROOT / 'listed')", []),
+            ("git ls-tree object config", "subprocess.check_output(['git', 'ls-tree', 'HEAD:config'], cwd=ROOT)", []),
+            ("git grep config", "subprocess.check_output(['git', 'grep', '-e', 'fixture', '--', 'config'], cwd=ROOT)", []),
+            ("git archive config", "subprocess.check_output(['git', 'archive', 'HEAD', 'config'], cwd=ROOT)", []),
+            ("git explicit config", "subprocess.check_output(['git', '--git-dir', ROOT / '.git', "
+             + "'cat-file', '-p', 'HEAD:config/limits.conf'], cwd=OUTSIDE)", []),
+            ("git nested config", "subprocess.check_output(['git', 'show', ':config/limits.conf'], cwd=ROOT / 'nested')", []),
+            ("git root path config", "subprocess.check_output(['git', 'ls-files', '--', ':/config'], cwd=ROOT / 'listed')", ["/"]),
+            ("read fixed defaults", "(ROOT / 'scripts/lib/test_config/limits.conf').read_text()", []),
+            ("caught config read", "with self.assertRaises(RuntimeError): (ROOT / 'config/limits.conf').read_text()", []),
             ("read cache", "(ROOT / '__pycache__/saved.bin').read_bytes()", []),
             ("write modes", """for mode in ('a', 'w', 'r+'):
     with open(ROOT / 'listed/item.txt', mode) as target: target.write('fixture')""", []),
@@ -400,7 +438,7 @@ try:
 finally:
     os.close(descriptor)""", ["listed"]),
             ("outside removal", """path = OUTSIDE / 'removal-probe'
-path.mkdir()
+(path / 'config').mkdir(parents=True)
 shutil.rmtree(path)""", []),
             ("git prefixes", "subprocess.check_output(['git', 'ls-files', '-z', '--', 'scripts/', 'commands/', 'docs/'], cwd=ROOT)",
              ["commands/", "docs/", "scripts/"]),
@@ -414,6 +452,9 @@ shutil.rmtree(path)""", []),
             ("outside", "os.listdir(OUTSIDE)", []),
             ("child", "subprocess.run([sys.executable, '-c', \"import os; os.listdir('listed')\"], cwd=ROOT, check=True)", []),
         )
+        blocked = {"read config", "alias to config", "caught config read", "open relative to descriptor config",
+                   "open relative to current directory config", "git show config", "git show staged config",
+                   "git show relative config", "git cat-file config", "git explicit config"}
         with tempfile.TemporaryDirectory() as directory:
             outside = Path(directory)
             root = outside / "checkout"
@@ -428,14 +469,26 @@ shutil.rmtree(path)""", []),
                 target.mkdir()
                 _ = (target / "item.txt").write_text("fixture\n")
             _ = (root / "config/limits.conf").write_text("value=fixture\n")
+            (outside / "limits-alias").symlink_to(root / "config/limits.conf")
+            _ = (root / "config/example.toml").write_text('value = "fixture"\n')
+            _ = (root / "config/review/rules.md").write_text("Review the fixture.\n")
+            defaults = library / "test_config"
+            defaults.mkdir(exist_ok=True)
+            _ = (defaults / "limits.conf").write_text("value=fixed\n")
             (root / "__pycache__").mkdir()
             _ = (root / "__pycache__/saved.bin").write_bytes(b"fixture")
             _ = (outside / "outside.txt").write_text("fixture\n")
             environment = {**os.environ, "HOME": str(outside / "home"), "PYTHONPATH": str(library / "python_startup"),
                            "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
-            for arguments in (("init", "--quiet"), ("add", "listed", "commands", "docs")):
-                _ = subprocess.run(["git", *arguments], cwd=root, env=environment, check=True,
-                                   capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+            inner = root / "nested"
+            (inner / "config").mkdir(parents=True)
+            _ = (inner / "config/limits.conf").write_text("value=private\n")
+            for checkout, folders in ((root, ("listed", "commands", "docs", "config")), (inner, ("config",))):
+                for arguments in (("init", "--quiet"), ("add", *folders),
+                                  ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                                   "commit", "-qm", "fixture")):
+                    _ = subprocess.run(["git", *arguments], cwd=checkout, env=environment, check=True,
+                                       capture_output=True, timeout=TEST_HANG_GUARD_SECS)
             for name, action, expected in cases:
                 with self.subTest(case=name):
                     output = outside / "times.json"
@@ -448,9 +501,26 @@ shutil.rmtree(path)""", []),
                     result = subprocess.run([sys.executable, "-c", entry, str(runner), str(root / "tests"), "test_listing.py"],
                                             cwd=root, env={**environment, "TEST_TIMES_OUT": str(output)},
                                             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                    if name in blocked:
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn("use fixed test configs instead of reading config", result.stderr)
+                        self.assertNotIn("config/limits.conf", read_times(output).get("content_reads", []))
+                        if name == "read config":
+                            untimed = {key: value for key, value in environment.items() if key != "TEST_TIMES_OUT"}
+                            result = subprocess.run(
+                                [sys.executable, "-c", entry, str(runner), str(root / "tests"), "test_listing.py"],
+                                cwd=root, env=untimed, capture_output=True, text=True, check=False,
+                                timeout=TEST_HANG_GUARD_SECS,
+                            )
+                            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                            self.assertIn("use fixed test configs instead of reading config/limits.conf", result.stderr)
+                        continue
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(read_times(output).get("folder_scans"), expected)
-                    self.assertEqual(read_times(output).get("content_reads"), ["listed/item.txt"] if name == "read file" else [])
+                    contents = {"read file": ["listed/item.txt"],
+                                "read fixed defaults": ["scripts/lib/test_config/limits.conf"],
+                                "read review rules": ["config/review/rules.md"], "read TOML": ["config/example.toml"]}
+                    self.assertEqual(read_times(output).get("content_reads"), contents.get(name, []))
 
     def sender_fixture(self, mode: str) -> FixtureRun:
         with tempfile.TemporaryDirectory() as directory:

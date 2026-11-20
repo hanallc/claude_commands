@@ -26,6 +26,7 @@ import sys
 
 GIT: str = shutil.which("git") or "git"
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import fake_unit_host, showrunners, staff
@@ -87,7 +88,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.fixture = fixtures.RefusalWatchTests()
         self.fixture.setUp()
         write_text_atomic(Path(os.environ["CONF_DIR"]) / "shutdown.conf",
-            (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
+            (TEST_CONFIG_DIRECTORY / "shutdown.conf").read_text())
         self.addCleanup(self.fixture.doCleanups)
         self.home = self.fixture.home
         _ = self.enterContext(isolated_staff_file(self.home / "staff.json", {}))

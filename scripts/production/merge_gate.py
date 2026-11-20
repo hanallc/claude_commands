@@ -2858,6 +2858,21 @@ def run_gate_suites(repo: Path,
                     mode: SuiteMode = SuiteMode.MERGE_GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
     """Use the scaler service and retain the permitted local fallback."""
+    test_defaults = repo / conf.TEST_CONFIG_PATH
+    try:
+        if test_defaults.is_dir():
+            shipped = repo / "config"
+            conf.check_test_defaults(shipped, test_defaults)
+            console_file = shipped / "console.conf"
+            if console_file.exists():
+                from scripts.review_links.console import owner_config_problems
+
+                settings = conf.settings(console_file.read_text(encoding="utf-8"))
+                problems = owner_config_problems({key: setting.value for key, setting in settings.items()})
+                if problems:
+                    raise GateRefused("\n".join(f"config/console.conf: {problem}" for problem in problems))
+    except (conf.Unusable, OSError, UnicodeError) as error:
+        raise GateRefused(str(error)) from error
     cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
     selected: AllModules | TreeSelection = ALL_MODULES
     if mode is SuiteMode.TARGETED_TEST and not full:

@@ -31,6 +31,7 @@ from typing import Literal, TextIO, TypedDict, cast, override
 from unittest import mock
 from uuid import NAMESPACE_URL, uuid5
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
@@ -420,9 +421,9 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
         _ = environment.setdefault(key, str(path.parent / folder))
     # A row removal edits the restart record; a fixture never edits the live one.
     _ = environment.setdefault("SHUTDOWN_STATE_DIR", os.environ.get("SHUTDOWN_STATE_DIR", str(path.parent / "shutdown")))
-    environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
+    environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(TEST_CONFIG_DIRECTORY / "staff.conf"))
     with ExitStack() as contexts:
-        if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
+        if Path(environment["STAFF_CONFIG"]) == TEST_CONFIG_DIRECTORY / "staff.conf":
             configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
             _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
             environment["STAFF_CONFIG"] = str(configuration)
@@ -844,7 +845,7 @@ class StaffTestCase(unittest.TestCase):
             "STAFF_TEST_OWNER_SOURCE": str(self.root / "natedev-sources"),
             "STAFF_TEST_LOCK_NOTICE": "",
             "PYTHONDONTWRITEBYTECODE": "1",
-            "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
+            "STAFF_CONFIG": str(TEST_CONFIG_DIRECTORY / "staff.conf"),
         })))
         _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))

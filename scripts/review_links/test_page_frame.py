@@ -114,7 +114,7 @@ class PageStatusTests(unittest.TestCase):
                 assert_component_states(self, page_frame.title(page.title(), page))
 
     def test_only_the_configured_status_pages_have_age_limits(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        path = conf.TEST_CONFIG_DIRECTORY / "console.conf"
         limits = set(re.findall(r"(?m)^[ \t]*(status\.[^\s=]+\.age_limit_seconds)[ \t]*=",
                                 path.read_text(encoding="utf-8")))
         self.assertEqual(limits, {f"status.{name}.age_limit_seconds" for name, *_ in STATUS_PAGES})

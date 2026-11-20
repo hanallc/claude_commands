@@ -1,5 +1,6 @@
 """Tests for the Codex wind-down: which processes count, whose they are, and the two messages."""
 from __future__ import annotations
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 from scripts.agents import remote
@@ -640,7 +641,7 @@ class MessageTests(unittest.TestCase):
             "CONF_DIR": str(self.root / "config"),
         }
         configuration = self.root / "config"
-        _ = copy_config_fixture(SCRIPT.parents[2] / "config", configuration)
+        _ = copy_config_fixture(TEST_CONFIG_DIRECTORY, configuration)
         _ = write_config_fixture(configuration / "accounts.conf", "codex_credit_accounts=none\n")
         self.environment.update(fake_unit_host.environment(self.root))
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership

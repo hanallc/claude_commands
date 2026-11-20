@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import main, mock
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import send
 from scripts.production import staff
@@ -35,7 +36,7 @@ class CodexQueueDrainTests(StaffTestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root / "state"), "CODEX_THREAD_ID": "inherited-thread",
             "CLAUDE_CODE_SESSION_ID": "", "HERDR_BIN": "/nonexistent/herdr",
-            "CONF_DIR": str(HOOK.parents[2] / "config"),
+            "CONF_DIR": str(TEST_CONFIG_DIRECTORY),
         })))
         _ = self.enterContext(mock.patch.object(send, "STATE", self.root / "state/message"))
         member = staff.StaffRow(staff.StaffId(THREAD), "producer", "Agent", staff.StaffRoot(),

@@ -1,6 +1,7 @@
 """Check fixed producer routing and shared fixtures for the count readers."""
 from __future__ import annotations
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.production.change_review_test_support import pictured_changes
 
 from scripts.agents import remote
@@ -554,7 +555,7 @@ class StaffRoutingTests(unittest.TestCase):
             config_env = config_environment(config)
             _ = write_config_fixture(config / "scratch.conf",
                                      f"visible_root={root / 'repro'}\nholds_file={root / 'holds.json'}")
-            settings = Path(__file__).resolve().parents[2] / "config/change_review.conf"
+            settings = TEST_CONFIG_DIRECTORY / "change_review.conf"
             _ = (config / "change_review.conf").write_text(settings.read_text())
             _ = write_config_fixture(config / "review_links.conf", "delivery_pause_seconds=0\n")
             environment = {**config_env, "STAFF_FILE": str(root / "staff.json"), "CHANGE_REVIEW_DIR": str(root),
@@ -622,8 +623,8 @@ class MergeWriterRoutingTests(ProducerFixture):
 
 
 class ChangeReviewConfigTests(unittest.TestCase):
-    def test_shipped_config_has_a_review_links_directory(self) -> None:
-        path = Path(__file__).resolve().parents[2] / "config/change_review.conf"
+    def test_fixed_config_has_a_review_links_directory(self) -> None:
+        path = TEST_CONFIG_DIRECTORY / "change_review.conf"
         self.assertIsInstance(conf.read(path).origin("review_links_directory", str), conf.UsableLiveValue)
 
     def test_delivery_root_reads_the_folder_setting_at_use(self) -> None:

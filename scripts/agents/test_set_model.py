@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import ClassVar, cast, override
 from unittest.mock import patch
 
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.agents import remote, set_model, shutdown, worker_lifecycle
 from scripts.herdr import herdr
 from scripts.lib import models_registry
@@ -190,9 +191,9 @@ class SetModelTests(unittest.TestCase):
         (self.root / "last_success").touch()
         config = self.root / "config"
         config.mkdir()
-        source = Path(__file__).resolve().parents[2] / "config"
-        (config / "machines.conf").symlink_to(source / "machines.conf")
-        (config / "script_prompts.conf").symlink_to(source / "script_prompts.conf")
+        source = TEST_CONFIG_DIRECTORY
+        _ = (config / "machines.conf").write_bytes((source / "machines.conf").read_bytes())
+        _ = (config / "script_prompts.conf").write_bytes((source / "script_prompts.conf").read_bytes())
         _ = (config / "set_model.conf").write_text(
             "default_effort=high\n"
             + "# range: 0..10\nscreen_wait_seconds=0\n"

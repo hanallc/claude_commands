@@ -1,5 +1,6 @@
 """Render AWS costs, wait estimates, and peer exchange evidence."""
 from __future__ import annotations
+from scripts.lib.conf import TEST_CONFIG_DIRECTORY
 from scripts.lint.memory_test_support import write_config_fixture
 
 from contextlib import closing
@@ -115,8 +116,8 @@ class AwsReportTests(MeasurementFixture):
     def test_report_renders_one_aws_section_without_target_registration(self) -> None:
         registry = self.root / "build_targets.conf"
         fixture = registry.read_text()
-        shipped = (Path(__file__).resolve().parents[2] / 'config/build_targets.conf').read_text()
-        for source, configuration in (('fixture', fixture), ('shipped', shipped)):
+        defaults = (TEST_CONFIG_DIRECTORY / 'build_targets.conf').read_text()
+        for source, configuration in (('fixture', fixture), ('defaults', defaults)):
             with self.subTest(configuration=source):
                 _ = registry.write_text(configuration)
                 original = self.render()
