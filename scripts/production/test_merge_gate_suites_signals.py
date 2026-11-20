@@ -202,8 +202,10 @@ sys.stdin.read(1)
                     recovery.tokens.append(recovery.token(pool.descriptor, b"Q", "returning", pool_size=size))
                     recovery.save()
                     original = recovery.path.read_text()
-                    with self.assertRaisesRegex(merge_gate.GateRecoveryUnresolved, reason):
-                        _ = merge_gate.recover_fifo_slots(pool.descriptor)
+                    problem = merge_gate.recover_fifo_slots(pool.descriptor)
+                    assert problem is not None
+                    self.assertEqual(problem.path, recovery.path)
+                    self.assertIn(reason, problem.reason)
                     self.assertEqual(recovery.path.read_text(), original)
                     self.assertEqual(self.jobserver_tokens(), b"QR")
 
@@ -287,7 +289,7 @@ sys.stdin.read(1)
             def expire_slice(readers: list[int], writers: list[int], errors: list[int],
                              timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
                 nonlocal waits
-                if pool.blocking in readers:
+                if pool.blocking in readers and not waits:
                     waits += 1
                     self.assertEqual(waits, 1)
                     assert timeout is not None
@@ -303,6 +305,7 @@ sys.stdin.read(1)
             returning.tokens.append(returning.token(pool.descriptor, b"Q", "returning", pool_size=1))
             acquiring = merge_gate.GateRecovery(directory / "acquiring.json", str(self.checkout), os.getpid(), "old")
             acquiring.tokens.append(acquiring.token(pool.descriptor, b"", "acquiring", pool_size=1))
+            pool.deadline = time.monotonic() + stop_seconds
             with mock.patch.object(select, "select", side_effect=expire_slice):
                 slot = pool.acquire()
             self.assertEqual(slot.token, b"Q")
@@ -365,6 +368,41 @@ sys.stdin.read(1)
             self.assertEqual(dead.path.read_text(), original)
         self.assertEqual(self.jobserver_tokens(), b"")
 
+    def test_cpu_wait_names_a_record_that_becomes_unreadable(self) -> None:
+        self.configure_gate("program_stop_seconds=0.25")
+        self.create_jobserver(self.root / "unreadable-jobserver", b"Q")
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                merge_gate.gate_recovery(self.checkout) as live, merge_gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, merge_gate.SharedCPUPool)
+            holder = merge_gate.GateRecovery(live.path.with_name("holder.json"), str(self.checkout),
+                                             live.pid, live.start)
+            holder.tokens.append(holder.token(pool.descriptor, os.read(pool.descriptor, 1), "held"))
+            holder.save()
+            ready = select.select
+            corrupt = b"{"
+            waits = 0
+
+            def damage_record(readers: list[int], writers: list[int], errors: list[int],
+                              timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
+                nonlocal waits
+                if pool.blocking in readers:
+                    waits += 1
+                    self.assertEqual(waits, 1)
+                    self.assertEqual(merge_gate.read_gate_recovery(holder.path), holder)
+                    _ = holder.path.write_bytes(corrupt)
+                return ready(readers, writers, errors, timeout)
+
+            stop_seconds = admission_records.read_memory_config().program_stop_seconds
+            pool.deadline = time.monotonic() + stop_seconds
+            with mock.patch.object(select, "select", side_effect=damage_record), \
+                    self.assertRaises(merge_gate.GateRecoveryUnresolved) as failure:
+                _ = pool.acquire()
+            self.assertEqual(waits, 1)
+            self.assertIn(f"Record: {holder.path}", str(failure.exception))
+            self.assertIn("cannot parse gate record", str(failure.exception))
+            self.assertEqual(holder.path.read_bytes(), corrupt)
+            self.assertEqual(self.jobserver_tokens(), b"")
+
     def test_fifo_recount_preserves_live_slots_and_available_bytes(self) -> None:
         self.supply_jobserver(b"ABC")
         with mock.patch.dict(os.environ, self.environment, clear=True), \
@@ -426,16 +464,20 @@ sys.stdin.read(1)
                         self.assertFalse(valid.path.exists())
                         self.assertEqual(self.jobserver_tokens(), b"Q")
 
-    def test_cpu_wait_retries_while_a_live_gate_holds_the_slot(self) -> None:
+    def test_cpu_wait_outlasts_the_stop_budget_while_a_live_gate_holds_the_slot(self) -> None:
+        self.configure_gate("program_stop_seconds=0.25")
         self.supply_jobserver(b"Q")
         with mock.patch.dict(os.environ, self.environment, clear=True), \
-                merge_gate.gate_recovery(self.checkout), merge_gate.shared_cpu_pool() as pool:
+                merge_gate.gate_recovery(self.checkout) as live, merge_gate.shared_cpu_pool() as pool:
             assert isinstance(pool, merge_gate.SharedCPUPool)
             holder = pool.try_acquire()
             assert isinstance(holder, merge_gate.SharedCPUSlot)
+            unreadable = live.path.with_name("unreadable.json")
+            self.write(unreadable, "{")
             ready = select.select
             waits = 0
             stop_seconds = admission_records.read_memory_config().program_stop_seconds
+            began = time.monotonic()
 
             def advance_wait(readers: list[int], writers: list[int], errors: list[int],
                              timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
@@ -445,16 +487,17 @@ sys.stdin.read(1)
                     assert timeout is not None
                     self.assertGreater(timeout, 0)
                     self.assertLessEqual(timeout, stop_seconds)
-                    if waits < 3:
-                        return [], [], []
-                    self.assertEqual(waits, 3)
-                    holder.release()
+                    self.assertLessEqual(waits, 2)
+                    if waits == 2:
+                        self.assertGreaterEqual(time.monotonic() - began, stop_seconds)
+                        holder.release()
                 return ready(readers, writers, errors, timeout)
 
             with mock.patch.object(select, "select", side_effect=advance_wait):
                 slot = pool.acquire()
             self.assertEqual(slot.token, b"Q")
-            self.assertEqual(waits, 3)
+            self.assertEqual(waits, 2)
+            self.assertEqual(unreadable.read_text(), "{")
         self.assertEqual(self.jobserver_tokens(), b"Q")
 
     def test_start_barrier_expires_while_the_parent_holds_the_writer(self) -> None:
