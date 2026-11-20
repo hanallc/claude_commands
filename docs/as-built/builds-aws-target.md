@@ -855,8 +855,11 @@ The gate box gets `packages` from `config/cloud_gate.conf` at the deployment hos
 The list includes bubblewrap.
 Before `guest.py` starts, the boot script runs `bwrap --ro-bind / / true` as `gate-trial`.
 Success writes `stage=bwrap ready` to the boot log.
-Failure writes `stage=bwrap unavailable` and sends the reason through the boot error link.
+Failure reports that bwrap or unprivileged user namespaces do not work for `gate-trial`.
+The boot log and the boot error record include this reason.
 A failed check prevents the gate box from running tests.
+The production EXIT handler attempts to send any boot error before it requests poweroff.
+The handler keeps the boot session exit status.
 Cloud gates and paired trials use this boot script.
 GPU size trials use their own boot script and prepared system.
 The live `gate_box.GUEST` program contains the bootstrap code.

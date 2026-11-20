@@ -196,7 +196,7 @@ subprocess.run = fail_log_put
         self.assertNotIn('#basedpyright', script)
         self.assertIn('#chromium', script)
         self.assertIn('github:NixOS/nixpkgs/fixture-revision#bubblewrap', script)
-        self.assertIn('bwrap or unprivileged user namespaces are not available for gate-trial', script)
+        self.assertIn('stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial', script)
         self.assertLessEqual(len(script.encode()), 16384)
         result = subprocess.run(['sh', '-n'], input=script, text=True, capture_output=True,
                                 timeout=TEST_HANG_GUARD_SECS, check=False)
@@ -311,7 +311,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
             'nix': 'Tool preparation failed (exit 7)',
             'tools shell': 'Tool preparation failed (exit 7)',
             'tools ready': 'The box failed at stage tools ready (exit 7)',
-            'bwrap unavailable': 'bwrap or unprivileged user namespaces are not available for gate-trial (exit 1)',
+            'bwrap unavailable': 'stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial (exit 1)',
             'result upload': 'The box failed at stage result upload (exit 1)',
             'paired request download': 'The box failed at stage tools ready (exit 7)',
         }
@@ -460,7 +460,10 @@ elif name == 'git' and 'rev-parse' in args:
 elif name == 'loginctl':
     fail('boot')
     fail('boot error record')
-elif name in ('systemd-run', 'mount', 'chown', 'ln', 'cp', 'shutdown', 'git'):
+elif name == 'shutdown':
+    assert args == ['-h', 'now'], args
+    event('shutdown -h now')
+elif name in ('systemd-run', 'mount', 'chown', 'ln', 'cp', 'git'):
     pass
 else:
     print('fixture-version')
@@ -539,6 +542,11 @@ else:
                     detail = ledger.text(results[-1], field)
                     self.assertIn(f'{stage} failed (curl exit 7, HTTP 403)', detail)
                     self.assertNotIn('CalledProcessError', detail)
+                trace = (root / 'trace').read_text().splitlines()
+                if failure in ('bwrap unavailable', 'result upload'):
+                    self.assertEqual(reply.returncode, 1, log + reply.stderr)
+                    self.assertIn('shutdown -h now', trace)
+                    self.assertLess(trace.index('upload result'), trace.index('shutdown -h now'))
                 if failure in boot_errors:
                     self.assertEqual(results[-1]['error'], boot_errors[failure], log)
                     if failure == 'boot error record':
@@ -553,8 +561,8 @@ else:
                     if failure == 'paired request download':
                         self.assertIn('GET request failed (curl exit 7, HTTP 403)', log)
                     if failure == 'bwrap unavailable':
-                        self.assertEqual(reply.returncode, 1)
-                        self.assertIn('stage=bwrap unavailable', ledger.text(uploads[-2], 'body'))
+                        self.assertIn('stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial',
+                                      ledger.text(uploads[-2], 'body'))
                         self.assertNotIn('stage=tools checked', log)
                         self.assertNotIn('stage=tests start', log)
                 else:
@@ -573,7 +581,8 @@ else:
                     self.assertEqual([line.split(' stage=', 1)[1] for line in lines], stages)
                     for line in lines:
                         self.assertRegex(line, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ stage=')
-                    trace = (root / 'trace').read_text().splitlines()
+                    self.assertIn('shutdown -h now', trace)
+                    self.assertLess(trace.index('upload result'), trace.index('shutdown -h now'))
                     self.assertIn('fetch ' + links['commit'], trace)
                     record = ledger.mapping(results[-1]['record'])
                     self.assertEqual(record['head'], 'e' * 40)
