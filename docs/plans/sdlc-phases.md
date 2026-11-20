@@ -1713,6 +1713,24 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Order:** writes and reviews now; tests run in the next test slot after the phase 91 and 93 gates.
 
+### Phase 98 — stall-watch does not bump a unit that waits on a live build hold  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** sdlc, 14:30 EST Nov 20 (evidence from the hana showrunner): during the fps build hold 14:15–15:05, stall-watch bumped widget at 14:23 and 14:30, and demo and organon. Each status said it waits for the hold release. Name: stallhold.
+**Spec:**
+1. stall-watch reads the live build hold from the same source `/build:status` uses. A unit whose status waits on that hold counts as holding until the hold ends.
+2. No new config key unless a tunable is needed. A new key needs no go.
+3. The bump text says that stall-watch takes no reply. (demo's reply failed with "no staff row or live session for stall-watch".)
+**Files:** `scripts/production/stall_watch.py`, `scripts/production/test_stall_watch.py`, the build hold reader it imports, `config/` only for a needed tunable.
+**Tests:** one table row in the existing stall-watch status test: a unit whose status waits on a live build hold gets no bump; after the hold ends it gets one. A break wakes units for nothing during each hold.
+**Acceptance gate:** the stall-watch targeted test passes; basedpyright 0/0 on changed files.
+
+**Workers:** 1 writer.
+
+**Order:** after phase 97; writes and reviews now; tests run in the next test slot.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
