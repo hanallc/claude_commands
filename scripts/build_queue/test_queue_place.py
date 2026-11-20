@@ -394,7 +394,7 @@ class QueuePlaceFixture(ExitStack):
     def start_blocked(self, place: queue.QueuePlace) -> subprocess.Popen[bytes]:
         child = place.popen([sys.executable, "-c", BLOCKING_CHILD], stdout=subprocess.PIPE)
         assert child.stdout is not None
-        if not select.select([child.stdout], [], [], 3)[0] or child.stdout.readline() != b"ready\n":
+        if not select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0] or child.stdout.readline() != b"ready\n":
             raise AssertionError("short program never became ready")
         return child
 
@@ -1155,7 +1155,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         os._exit(status)
                 os.close(write_fd)
                 try:
-                    self.assertTrue(select.select([read_fd], [], [], 5)[0], "holder never admitted")
+                    self.assertTrue(select.select([read_fd], [], [], TEST_HANG_GUARD_SECS)[0],
+                                    "holder never admitted")
                     self.assertEqual(os.read(read_fd, 5), b"ready")
                     _, row = fixture.reservation()
                     os.kill(holder, number)
