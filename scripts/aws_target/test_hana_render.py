@@ -115,8 +115,7 @@ class HanaRenderTests(unittest.TestCase):
             for path in (targets, folders):
                 _ = shutil.copyfile(path, checkout / 'config' / path.name)
             copies = checkout / 'config/copies.conf'
-            copies_config = ('root=/tmp/copies\nroot.aws-hana=/tmp/guest-copies\n'
-                + 'remote_registry=/tmp/default-mirrors\nremote_registry.fixture-guest=/tmp/mirrors\n')
+            copies_config = 'remote_registry=/tmp/default-mirrors\nremote_registry.fixture-guest=/tmp/mirrors\n'
             _ = copies.write_text(copies_config)
             configuration_path = image_inputs / 'config/hana_aws.conf'
             _ = configuration_path.write_text(
@@ -246,7 +245,7 @@ class HanaRenderTests(unittest.TestCase):
                 self.assertEqual(cast(dict[str, object], json.loads(receiver_json))['command_timeout_s'], 27)
             _ = targets.write_text(target_values)
             _ = (image_inputs / 'config/copies.conf').write_text(
-                copies_config.replace('copies\n', 'other-copies\n'))
+                copies_config.replace('/tmp/default-mirrors', '/tmp/other-mirrors'))
             self.assertEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
             self.assertEqual(cast(dict[str, object], json.loads((output / 'safety.json').read_text()))['guest_digest'],
                 digest.value)
