@@ -97,6 +97,12 @@ class StopFields(TypedDict, total=False):
     self_stop: Literal[True]
 
 
+class DetachedRunKind(StrEnum):
+    DETECT = "detect"
+    PYTHON_TESTS = "python-tests"
+    OTHER = "other"
+
+
 class RunRecord(StopFields):
     run_id: str
     status: Literal["running", "finished"]
@@ -105,6 +111,8 @@ class RunRecord(StopFields):
     staff_id: str
     label: str
     command: list[str]
+    # Older records have no kind.
+    kind: NotRequired[Literal["detect", "python-tests", "other"]]
     log: str
     started_at: float
     pid: int
@@ -1125,6 +1133,7 @@ def command_start(args: argparse.Namespace) -> int:
         name = seat_name(session_dir, name)
     session_dir = str(Path(session_dir).resolve())
     label = str(getattr(args, "label", "") or "") or " ".join(command)
+    kind = cast(DetachedRunKind, args.kind)
     done_file = str(getattr(args, "done_message_file", "") or "")
     director_dir = str(getattr(args, "director_dir", "") or "") or session_dir
     runs = _runs_dir(session_dir).resolve()
@@ -1163,6 +1172,7 @@ def command_start(args: argparse.Namespace) -> int:
             record: RunRecord = {
                 "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
                 "staff_id": identity, "label": label, "command": command,
+                "kind": kind.value,
                 "log": str(log_path), "started_at": time.time(), "pid": 0,
                 "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
             }
@@ -1485,14 +1495,17 @@ def deliver_in_fresh_process(record_path: Path) -> int:
         return 1
 
 
-def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
+def scope_prefix(marker: Path, environment: dict[str, str], *,
+                 kind: DetachedRunKind = DetachedRunKind.DETECT) -> list[str]:
     """Start the command in builds-detached.slice when a scope is available."""
     runtime = environment.get("XDG_RUNTIME_DIR", "")
     if (environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
             or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
         return []
+    run_id = marker.stem.partition("@")[0]
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
-            "--slice=builds-detached.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
+            "--slice=builds-detached.slice", f"--unit=detached-{kind}-{run_id}.scope",
+            "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
 
 
 def _run(command: list[str], environment: dict[str, str], log: Path) -> int:
@@ -1612,7 +1625,11 @@ def command_supervise(args: argparse.Namespace) -> int:
     })
     log = Path(record["log"])
     marker = log.with_suffix(".scope")
-    prefix = scope_prefix(marker, environment)
+    try:
+        kind = DetachedRunKind(record.get("kind", DetachedRunKind.DETECT))
+    except ValueError:
+        kind = DetachedRunKind.DETECT
+    prefix = scope_prefix(marker, environment, kind=kind)
     with _completion_sources(Path(__file__).resolve().parents[1]):
         exit_code = _run(prefix + record["command"], environment, log)
         with record_lock(record_path):
@@ -1736,6 +1753,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--to", default="")
     _ = start.add_argument("--director-dir", default="", help="the run folder whose director hears results")
     _ = start.add_argument("--label", default="")
+    _ = start.add_argument("--kind", type=DetachedRunKind, choices=list(DetachedRunKind), default=DetachedRunKind.DETECT)
     _ = start.add_argument("--done-message-file", default="")
     _ = start.add_argument("command", nargs=argparse.REMAINDER)
     start.set_defaults(handler=command_start)
