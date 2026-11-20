@@ -1772,7 +1772,12 @@ def remote_record_path(mirror: RemoteMirror) -> Path:
 
 
 def remote_lease_path(mirror: RemoteMirror) -> Path:
-    return remote_registry() / (remote_key(mirror.host, mirror.path) + ".lease")
+    return remote_mirror_lock_path(floor_claims.MirrorIdentity(mirror.host, mirror.path))
+
+
+def remote_mirror_lock_path(identity: floor_claims.MirrorIdentity) -> Path:
+    """Locate the coordinator's lease for the exact host and mirror path."""
+    return remote_registry() / (remote_key(identity.host, identity.path) + ".lease")
 
 
 def _list_holder_name(mirror: RemoteMirror, pid: int, staff_names: ListStaffNames) -> MirrorHolderName:
@@ -1966,6 +1971,25 @@ def mirror_probe_setup(path: str) -> str:
     shell_mark = mark if Path(relative).is_absolute() else '"$HOME"/' + mark
     return ("test -f " + shell_mark + ' || "$HOME"/.claude/scripts/lib/py -c ' + shlex.quote(program) + " " +
             shlex.quote(path) + " || exit 1")
+
+
+def mirror_lease_probe(path: str) -> str:
+    """Report a held lease without creating any mirror files."""
+    program = "\n".join((
+        "import fcntl, sys",
+        "from scripts.mac_test import floor_claims",
+        "tree = floor_claims.mirror_local_path(sys.argv[1])",
+        "for lease in (floor_claims.mirror_parent_lock_path(tree), floor_claims.mirror_lock_path(tree)):",
+        "    try:",
+        "        with lease.open('rb') as handle:",
+        "            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)",
+        "    except FileNotFoundError:",
+        "        continue",
+        "    except BlockingIOError:",
+        "        print('mirror_lease=held')",
+        "        break",
+    ))
+    return '"$HOME"/.claude/scripts/lib/py -c ' + shlex.join([program, path])
 
 
 def mark_mirror(tree: Path, owner: str, repo: str, session: str, **extra: object) -> None:

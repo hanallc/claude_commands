@@ -2175,13 +2175,8 @@ def free_now(
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
-    Read from local records alone, and cheap enough for LINT_QUEUE_LEAVE_HOOK,
-    which runs it on every held memory poll: no SSH, no gh and no lock. CI is
-    not read, since a claim does not consult it; the claim itself still decides
-    under its lock. Another repository's claim leaves the answer free. A copy
-    claim gives way to a new test, so it holds the scope only for another copy
-    (`copy`). A kept claim leaves the answer free: its holder is gone, and the
-    next claim takes it over and cleans its leftovers.
+    Read local claims and mirror leases without SSH or taking a lock.
+    A new test can stop a speculative copy. A kept claim permits cleanup by the next claimant.
     """
     from scripts.mac_test import eligibility
     from scripts.buildlog import repository
@@ -2225,6 +2220,16 @@ def free_now(
     ) for candidate in scopes)
     if held:
         return "busy"
+    if repository_name is not None and target_config.uses_legacy_mac_layout(paths.platform):
+        from scripts.copies import copies
+
+        known = eligibility.KnownRepository(repository_name)
+        try:
+            holder = eligibility.mac_mirror_holder(capacity_settings.text("host"), known)
+        except copies.CopyError:
+            return "state"
+        if holder is not None and (copy or not eligibility.mirror_copy_yields(claims, known, holder)):
+            return "busy"
     if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe):
         return "bad"
     if repository_name is not None and eligibility.linux_version_decline_path(paths.target, repository_name).exists():

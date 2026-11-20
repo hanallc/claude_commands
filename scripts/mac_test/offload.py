@@ -63,7 +63,6 @@ from scripts.direct import result_environment
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.buildlog import treekey
-from scripts.mac_test.mirror_root import MacMirrorRoot
 from scripts.buildlog import store
 from scripts.buildlog import transfer_bytes
 from scripts.build_targets import target_config
@@ -820,7 +819,7 @@ class MirrorUseBusy:
 
 @dataclass(frozen=True)
 class UnresolvedSlotStartup:
-    """The Linux slot refused startup because earlier ownership remains unresolved."""
+    """The provider cannot start while an earlier run holds its mirror or slot."""
 
 
 RemoteRunStatus = (ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
@@ -1384,14 +1383,9 @@ def linux_mirror_root() -> Path:
     return Path('.local/state/build-target/mirror')
 
 
-def mac_mirror_root() -> MacMirrorRoot:
-    """Read the remote mirror root without expanding the local home folder."""
-    return conf.read("mac_test").value("mirror_root", MacMirrorRoot.parse)
-
-
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     if target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
-        return f"{mac_mirror_root().relative}/{repository.legacy_mirror_name}"
+        return eligibility.mac_mirror_path(repository.legacy_mirror_name)
     if slot < 1:
         raise ValueError("slot must be positive")
     name = build_folders.repository_key_for(repository.policy_name, repository.key or repository.name)
@@ -1740,6 +1734,10 @@ def probe_mac(
     else:
         script = probe_script(repository, target, slot)
         timeout_s = config.probe_timeout_s
+        if isinstance(config, eligibility.SshProbeSettings):
+            from scripts.copies import copies
+
+            script = copies.mirror_lease_probe(remote_mirror(repository, target, slot)) + " || exit 1\n" + script
     identity = controller.claim_identity
     if isinstance(identity, claim_state.ClaimIdentity):
         path = pending_start_path(target, identity)
@@ -1753,9 +1751,24 @@ def probe_mac(
         [*ssh_prefix(config), script],
         CommandTimeLimit(timeout_s),
     )
-    if (linux and isinstance(result, CommandOutput)
-            and result.stdout.strip() == "linux_startup=unresolved"):
-        return UnresolvedSlotStartup()
+    if isinstance(result, CommandOutput):
+        if linux and result.stdout.strip() == "linux_startup=unresolved":
+            return UnresolvedSlotStartup()
+        if (isinstance(config, eligibility.SshProbeSettings) and result.status == 0
+                and "mirror_lease=held" in result.stdout.splitlines()):
+            from scripts.copies import copies
+
+            yields = False
+            try:
+                holder = eligibility.mac_mirror_holder(config.host, repository)
+                paths = claim_state.state_paths(target)
+                yields = holder is not None and eligibility.mirror_copy_yields(
+                    claim_state.read_claims(paths), repository, holder)
+            except (OSError, ValueError, copies.CopyError):
+                pass
+            if not yields:
+                record_reachable(target)
+                return UnresolvedSlotStartup()
     if isinstance(result, CommandTimedOut):
         reason = f"SSH probe timed out after {timeout_s:g} s"
     elif isinstance(result, CommandCouldNotStart):
@@ -2287,7 +2300,7 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
         from scripts.mac_test import linux_runner
         return linux_runner.mirror_selector_script(remote_mirror(scope, target, slot),
                                                    require_boot_identity=False)
-    root = mac_mirror_root().relative
+    root = eligibility.mac_mirror_root().relative
     mirror = f"[{root[0]}]" + root[1:].replace(".", "[.]")
     if isinstance(scope, KnownRepository):
         mirror += "/" + extended_regex_literal(scope.legacy_mirror_name)
@@ -3192,6 +3205,8 @@ def run_offload(
             result = leased_offload(controller, config, request, repository, started, linux, leases)
             if isinstance(result, DeclinedMacRun) and result.reason == "copy" and mirror_busy_refusal(result.detail):
                 write_mirror_busy(config, repository.name, request.target)
+                if not linux:
+                    return BusyMacDecline(UnreadableMacHolder(), result.seconds)
             return result
     except copies.CopyError as error:
         return DeclinedMacRun("copy", elapsed_seconds(started), str(error))

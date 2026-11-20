@@ -14,6 +14,7 @@ import socket
 import os
 import runpy
 import select
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -33,9 +34,11 @@ from zoneinfo import ZoneInfo
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 
+from scripts.copies import copies
+from scripts.build_targets import build_targets, target_config
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
-from scripts.mac_test import mac_test
+from scripts.mac_test import floor_claims, mac_test, offload
 from scripts.lib import conf
 from scripts.lib import test_hang_guard
 
@@ -372,6 +375,8 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.write_executable(send_stub, SEND_STUB)
         self.write_executable(sessions_stub, SESSIONS_STUB)
         self.write_config()
+        copies_config = self.root / "copies.conf"
+        _ = write_config_fixture(copies_config, f"remote_registry={self.root / 'remote-mirrors'}\n")
         self.sync_gh()
         self.environment = {
             **{
@@ -384,6 +389,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
+            "COPIES_CONFIG": str(copies_config),
             "MAC_TEST_SEND": str(send_stub),
             "MAC_TEST_SESSIONS": str(sessions_stub),
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
@@ -1324,7 +1330,7 @@ finally:
     def test_free_now_answers_for_the_named_repository(self) -> None:
         hana, liner = self.repository("hana"), self.repository("cargo-liner")
         (hana / "crates").mkdir()
-        self.write_config(offload="on")
+        self.write_config(offload="on", host="fixture-mac", mirror_root="~/fixture-mirrors")
         path = self.state_directory / "mirror-busy-hana.until"
         path.parent.mkdir(parents=True, exist_ok=True)
         for value, answer in ((str(time.time() + 120), "busy"), (str(time.time() - 1), "free"),
@@ -1335,6 +1341,37 @@ finally:
                                     1 if answer == "busy" else 0, answer + "\n")
                 self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
         path.unlink()
+        if sys.platform == "linux":
+            mirror = copies.RemoteMirror("verify", copies.SelectedRepository("hana"), "fixture-mac",
+                                         "fixture-mirrors/hana", "holder")
+            with mock.patch.dict(os.environ, self.environment):
+                with self.subTest(mirror="held"), copies.remote_lease(mirror):
+                    self.assertEqual(self.claim_names(), [])
+                    self.assert_command(self.command("free-now", "--repo-root", str(hana)), 1, "busy\n")
+                    self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
+                with self.subTest(mirror="released"):
+                    self.assertTrue(copies.remote_lease_path(mirror).is_file())
+                    self.assert_command(self.command("free-now", "--repo-root", str(hana)), 0, "free\n")
+        remote_mirror = self.root / "mac-home" / "fixture-mirrors" / "hana"
+        remote_mirror.parent.mkdir(parents=True)
+        lease = floor_claims.mirror_lock_path(remote_mirror)
+        program = shlex.split(copies.mirror_lease_probe(str(remote_mirror)))[1:]
+        target = target_config.SshTarget("mac", "macos", self.config_path)
+        with mock.patch.dict(os.environ, self.environment):
+            configuration = conf.read(self.config_path)
+            for held in (True, False):
+                with self.subTest(mac_lease=held), lease.open("ab") as lock:
+                    if held:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    reading = subprocess.run([sys.executable, *program],
+                        env={**self.environment, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+                        capture_output=True, text=True, check=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                    probe = offload.CommandOutput(0, reading.stdout + "free_gib=120\nhost=fixture-mac\nrc=0\n", "")
+                    with mock.patch.object(offload.ProcessController, "capture", return_value=probe):
+                        answer = build_targets.mac_target_eligibility(target, hana, "hana", "test",
+                            target_config.ANY_ELIGIBLE_TARGET, configuration=configuration)
+                    self.assertEqual(answer, target_config.ExcludedTarget(target, "busy") if held
+                                     else target_config.EligibleTarget(target))
         self.assertEqual(self.logged_arguments("ssh"), [])
         owner = self.start_child()
         self.assert_command(self.claim_in(owner.pid, "hana tests", hana), 0, "claimed\n")

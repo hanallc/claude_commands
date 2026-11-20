@@ -41,6 +41,7 @@ else:
     from scripts.buildlog import record as buildlog_record
     from scripts.buildlog import store as buildlog_store
 from scripts.lib import conf, session_folder
+from scripts.lib import process_start
 from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
@@ -1258,7 +1259,8 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.fixture["rsync_status"] = 23
         self.sync_fixture()
         stub = self.bin_directory / "command-stub"
-        source = stub.read_text().replace('    exit "$rsync_status"',
+        original = stub.read_text()
+        source = original.replace('    exit "$rsync_status"',
             "    printf '%s\\n' 'rsync: destination denied' 'rsync error: code 23' >&2\n"
             + '    exit "$rsync_status"')
         _ = stub.write_text(source)
@@ -1280,7 +1282,61 @@ class OffloadCommandTests(OffloadCommandFixture):
         _ = stub.write_text(source.replace("rsync: destination denied", "copies: /mirror/hana: busy; held by session reader"))
         result = self.command(runner_options=("--target", "mac"))
         self.assertEqual(result.returncode, 75, result.stdout)
-        self.assertTrue((self.state_directory / "mirror-busy-hana.until").exists())
+        backoff = self.state_directory / "mirror-busy-hana.until"
+        self.assertTrue(backoff.exists())
+
+        with self.subTest(selection="Mac only"):
+            backoff.unlink()
+            admission = caller_admission(self, self.root, self.environment)
+            pid = os.getpid()
+            start = process_start.process_start(pid)
+            assert isinstance(start, process_start.Started)
+            owner = wire.Owner(pid, start.start)
+            admission.proc.register(owner)
+            local = admission.request(owner=owner, episode="mac-only-mirror")
+            mac = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("hana"))
+            constraints = placement.PlacementConstraints(execution_identity.SourceKeyUnavailable("fixture"),
+                ("cargo", "nextest", "run"), str(self.repository), "hana", NoOwningSession(),
+                (placement.PlacementCandidate(mac),), placement.MacOnlyHost(), command_kind="test")
+            request = wire.PlacementRequest(local.episode, placement.SubmittingOwner(admission.server.host, pid, owner.start_time),
+                local.since, local.profile, constraints, identity=local.identity, route=target_config.MAC_ONLY)
+
+            def place(evidence: placement.HostEligibility) -> wire.Reply:
+                with admission.loop_turn():
+                    key = admission.server.host_evidence_key(request, mac)
+                    admission.server.publish_host_evidence(placement.FreshHostEvidence(
+                        key, admission.clock.now(), "", evidence))
+                    reply, = admission.server.handle_request(request)
+                    return reply
+
+            first = place(placement.AllowedHost())
+            assert isinstance(first, wire.Assignment)
+            assignment_file = self.root / "mac-only-mirror.assignment"
+            _ = assignment_file.write_text(wire.encode_reply(first))
+            options = ("--target", "mac", "--assignment-file", str(assignment_file))
+            failed = self.command(runner_options=options)
+            self.assertEqual(failed.returncode, 75, failed.stdout)
+            self.assert_wire("declined", "busy")
+            self.assertFalse(self.claim_file.exists())
+            self.assertTrue(backoff.exists())
+
+            waiting = place(placement.TemporaryExclusion("busy"))
+            assert isinstance(waiting, wire.PlacementWait)
+            self.assertEqual((waiting.episode, waiting.since), (request.episode, request.since))
+
+            _ = stub.write_text(original)
+            self.fixture["rsync_status"] = 0
+            self.sync_fixture()
+            backoff.unlink()
+            replacement = place(placement.AllowedHost())
+            assert isinstance(replacement, wire.Assignment)
+            self.assertEqual((replacement.assignment.episode, replacement.assignment.since),
+                             (first.assignment.episode, first.assignment.since))
+            self.assertNotEqual(replacement.assignment.attempt, first.assignment.attempt)
+            _ = assignment_file.write_text(wire.encode_reply(replacement))
+            finished = self.command(runner_options=options)
+            self.assertEqual(finished.returncode, 0, finished.stdout)
+            self.assert_wire("passed", "")
 
     def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
         controller = offload.ProcessController()

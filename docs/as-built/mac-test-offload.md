@@ -60,12 +60,13 @@ It grants no new execution permission.
 Release compares the exact claim identity.
 A PID alone cannot release another attempt.
 
-- `free-now --settings FILE [--repo-root DIR]` reads local records without a lock or remote command.
+- `free-now --settings FILE [--repo-root DIR]` reads local records and the coordinator's mirror leases.
+  It takes no lock and runs no remote command.
   It answers `off`, `backoff`, `blocked`, `state`, `busy`, `bad` or `free`, in that order.
   It exits 0 only for `free`.
   A live claim blocks only its repository.
   A kept claim, whose holder process is gone, does not answer `busy`: the next claim takes it over and cleans its leftovers.
-  A live mirror refusal time also answers `busy` for that repository.
+  A held mirror lease or an active mirror retry delay answers `busy` for that repository.
   A failed target probe blocks every repository.
   A version decline blocks only its repository.
   `verify.sh` passes its repository root with `--repo-root`.
@@ -711,11 +712,18 @@ Unknown remote memory remains unknown and creates no local memory charge.
 One `mirror_busy_backoff_s` key in `mac_test.conf` serves both Mac and AWS targets.
 Each target stores `mirror-busy-<repository>.until` beside its unreachable backoff record.
 A mirror busy refusal during copy writes this time.
+On the Mac, this refusal also returns `busy` to the caller.
+A Mac-only step uses the same queue episode to wait and try again.
+Movable steps can use natedev during the retry delay.
 No available slot lease also writes this time.
 A `mirror-use` busy refusal after copy becomes `BusyMacDecline`, without a lost run.
 A successful copy removes the repository's refusal time.
 `free-now` reads this local record without SSH or a lock.
 A live time answers `busy` only for its target and repository.
+The coordinator holds the mirror lease through remote cleanup and claim release.
+A placement probe also checks the leases on the Mac before it assigns a run.
+A live speculative copy can still give way to a new step.
+A released lease file supplies no evidence of a holder.
 The claim and mirror lease still make the final decision under their locks.
 Read access alone does not make a mirror busy.
 A working directory, a mapped file, or a file open for writing still makes it busy.
