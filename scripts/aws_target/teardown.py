@@ -14,10 +14,11 @@ from typing import cast, final
 
 from scripts.aws_target import admin_secrets, box, ledger, remote
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock
-from scripts.aws_target.config import deployment_record
+from scripts.aws_target.config import deployment_record, gate_deployment
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 from scripts.mac_test import mac_test
+from scripts.aws_target.gate_box import GATE_IMAGE_OWNER_TAG
 
 
 DRY_RUN = '''down would disable AWS routing and aws-target.service.
@@ -424,7 +425,6 @@ class TargetRemoval:
 
 def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = False) -> bool:
     """Remove regional stacks before deleting their copied images."""
-    from scripts.aws_target.config import gate_deployment
     manifest_path = directory / 'gate-deployment.json'
     manifest = gate_deployment(manifest_path, api.region) if manifest_path.exists() else {}
     stack_path = directory / 'regional-stacks.json'
@@ -496,7 +496,6 @@ def remove_gate_images(api: AwsCli, directory: Path, clock: Callable[[], float])
     folder = directory / 'gate-image'
     if not folder.exists():
         return False
-    from scripts.aws_target.gate_box import GATE_IMAGE_OWNER_TAG
     _ = box.cleanup_images(api, {}, GATE_IMAGE_OWNER_TAG)
     book = ledger.CostLedger(directory)
     inventories = book.read_snapshot().inventories

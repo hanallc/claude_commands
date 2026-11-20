@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.build_targets import target_config
+from scripts.lib.atomic_file import write_text_atomic
 
 
 def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tuple[str, ...]:
@@ -25,7 +26,6 @@ def gate_regions(home: str, configuration: conf.ConfigRead | None = None) -> tup
 
 def gate_deployment(path: Path, home: str) -> dict[str, object]:
     """Migrate the single-region record once and read the regional form."""
-    from scripts.lib.atomic_file import write_text_atomic
     value = cast(dict[str, object], json.loads(path.read_text()))
     if 'regions' not in value:
         regional = {key: value.pop(key) for key in ('image', 'subnets', 'template', 'version', 'security_group') if key in value}

@@ -24,6 +24,9 @@ from types import SimpleNamespace
 from typing import cast, override
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
+import multiprocessing
+import shlex
+import sqlite3
 
 from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presign
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
@@ -226,7 +229,6 @@ class CloudGateTests(CostFixture):
         self.fake.result = self.result()
 
     def test_time_limit_returns_red_with_traceback_and_ends_the_box(self) -> None:
-        import sqlite3
         _ = index.update()
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
@@ -325,7 +327,6 @@ class CloudGateTests(CostFixture):
                 self.assertEqual(ledger.mapping(row['record'])['vcpus'], 32)
 
     def test_finished_result_wins_when_polling_crosses_the_time_limit(self) -> None:
-        import sqlite3
         _ = index.update()
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
@@ -2151,7 +2152,6 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual((row['result'], row['gate_job']), ('finished', {'kind': 'GateJobNotRecorded'}))
 
     def test_paired_cancellation_after_recorded_launch_cleans_before_slot_release(self) -> None:
-        import multiprocessing
         for confirmed in (True, False):
             with self.subTest(confirmed=confirmed):
                 attempt = 'launch-cancel-' + str(confirmed)
@@ -2432,8 +2432,6 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             read_settings(self.settings).box_minimum_seconds) + Decimal('0.02'))
 
     def test_paired_coordinator_launches_modules_concurrently_and_keeps_json_order(self) -> None:
-        import multiprocessing
-        from contextlib import contextmanager, redirect_stdout
         barrier = multiprocessing.get_context('fork').Barrier(2)
         cohort = self.root / 'cohort'
         cohort.mkdir()
@@ -3481,7 +3479,6 @@ class CloudRouteTests(CostFixture):
             command = cloud_gate.service_command(module, options, 'fixture', paired=paired)
             cleanup = [argument for argument in command if argument.startswith('--property=ExecStopPost=')]
             self.assertEqual(len(cleanup), 1)
-            import shlex
             arguments = shlex.split(cleanup[0].split('=', 2)[2])
             expected = ['--paired-cleanup', str(folder)] if paired else ['--cleanup' if value == '--worker' else value for value in options]
             self.assertEqual(arguments, [sys.executable, '-m', module, *expected])

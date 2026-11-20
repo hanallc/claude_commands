@@ -25,6 +25,7 @@ from scripts.aws_target import config as aws_config, console_help, ledger, quota
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
+from scripts.build_targets.target_config import ssh_target_state_directory
 
 PAGE_NAME = 'aws_prices.html'
 # The user's order for the region filter, 2026-11-15: the groups in this order, then each group A to Z.
@@ -581,8 +582,6 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
 
 def publish_configured() -> int:
     """Publish the page from the AWS target state folder; the hourly job calls this."""
-    from scripts.build_targets.target_config import ssh_target_state_directory
-
     _ = publish(ssh_target_state_directory('aws'), int(time.time()), output_folder(), settings_path=conf.path('aws_target'))
     return 0
 

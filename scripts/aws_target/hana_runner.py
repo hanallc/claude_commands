@@ -14,7 +14,7 @@ import sys
 from typing import cast
 
 from scripts.aws_target import hana_protocol, hana_source as source
-from scripts.aws_target.hana_result import HanaCommandResult, PeakUnavailable
+from scripts.aws_target.hana_result import HanaCommandResult, PeakUnavailable, integer_field, object_fields
 from scripts.lib import build_slots, conf
 from scripts.mac_test import linux_runner
 
@@ -121,8 +121,6 @@ class RunnerArguments(argparse.Namespace):
 
 
 def main() -> int:
-    from scripts.aws_target.hana_result import object_fields, integer_field
-
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument('--bundle-fd', required=True, type=int)
     _ = parser.add_argument('--bundle-offset', required=True, type=int)

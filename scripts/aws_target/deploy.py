@@ -34,7 +34,11 @@ from uuid import uuid4
 
 
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
-from scripts.aws_target import admin_secrets, aws_test_identity, box, gate_probe, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote, retained, spot_end, teardown
+from scripts.aws_target import (
+    admin_secrets, aws_test_identity, aws_trial, box, cloud_gate, gate_probe, gpu_size_trial,
+    hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger,
+    plan_identity, plan_run, quota_requests, remote, retained, spot_end, teardown,
+)
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
@@ -2655,7 +2659,6 @@ class Deployment:
         """Print regional Spot prices without resource identities."""
         settings = read_deployment_settings(self.settings_path)
         api = self._api(settings)
-        from scripts.aws_target import cloud_gate
         values = cloud_gate.settings()
         configured_types = values.words('instance_types')
         largest = largest_gate_vcpus(configured_types)
@@ -2697,7 +2700,6 @@ class Deployment:
 
     def quota_status(self) -> bool:
         """Read regional Spot quotas with the plan identity."""
-        from scripts.aws_target import gpu_size_trial
         plan = plan_run.PlanRun(plan_identity.plan_credentials, self.execute, self.pause)
         _ = plan.credential
         settings = read_deployment_settings(self.settings_path)
@@ -2764,7 +2766,6 @@ class Deployment:
 
     def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:
         """Check terminal approval and start the scaler service."""
-        from scripts.aws_target import cloud_gate, gpu_size_trial
         self._authorize(approve_resources)
         limits = gpu_size_trial.settings()
         timeout = (limits.lifetime_minutes * 60 * (len(limits.spot_max_usd_per_hour) + 2)
@@ -2782,8 +2783,6 @@ class Deployment:
             self._gate_plan_locked(self.mode)
 
     def _gate_plan_locked(self, plan: plan_run.PlanRun) -> None:
-        from scripts.aws_target import cloud_gate, gpu_size_trial
-
         settings = read_deployment_settings(self.settings_path)
         values = cloud_gate.settings()
         regions = gate_regions(settings.region, values)
@@ -2956,7 +2955,6 @@ class Deployment:
 
     def gate_up(self, *, approve_resources: bool = False) -> bool:
         """Add the gate resources and preserve every Rust parameter."""
-        from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
         self._authorize(approve_resources)
         with self._require_account_stack('up --workload merge-gates'):
             gate_probe.invalidate_record(self.directory)
@@ -3044,7 +3042,6 @@ class Deployment:
     def _probe_gate_gpu(self, settings: DeploymentSettings, values: conf.ConfigRead, manifest: dict[str, object],
                         caps: dict[str, Decimal], *, admin_api: AwsCli, scaler_arn: str,
                         partition: str, account_id: str) -> bool:
-        from scripts.aws_target import gpu_size_trial
 
         api = self._gate_scaler_api(settings, values.number('api_timeout_s'))
         regions = ledger.rows(manifest, 'regions')
@@ -3424,7 +3421,6 @@ def run_setup_plan(args: DeploymentArguments) -> int:
 
 def main() -> int:
     if sys.argv[1:2] == ['aws-trial']:
-        from scripts.aws_target import aws_trial
         os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
         settings_path = conf.path('aws_target')
         with step('aws-trial', 'running the trial', settings_path):

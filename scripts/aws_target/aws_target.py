@@ -23,11 +23,15 @@ import time
 from time import monotonic
 from typing import cast, final
 
-from scripts.aws_target import hana_spend, ledger, measurement, price_days, quota_requests, run_cost
+from scripts.aws_target import (
+    admin_secrets, hana_spend, ledger, measurement, open_gates, plan_identity, plan_run, price_days, quota_requests, run_cost,
+)
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
+from scripts.aws_target.hana_box import HanaController, read_settings as lifecycle_settings
+from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
 from scripts.message import send_budget, send_result
@@ -263,8 +267,6 @@ def scaler_snapshot_api(configuration: conf.ConfigRead, credential_file: Path, e
 def placement_snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = execute_command,
                        clock: Callable[[], float] = time.time) -> None:
     """Collect placement scores once per UTC hour, independent of prices."""
-    from scripts.aws_target import admin_secrets
-
     try:
         credential_file = admin_secrets.credentials_file()
         if not credential_file.is_file():
@@ -366,8 +368,6 @@ def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[
 def read_snapshot_quota_requests(regions: tuple[str, ...], timeout: float,
                                  execute: AwsExecutor) -> tuple[quota_requests.RegionalQuotaRequests, ...]:
     """Collect independent quota request readings with the plan identity."""
-    from scripts.aws_target import plan_identity, plan_run
-
     if not regions:
         return ()
     deadline = monotonic() + timeout
@@ -419,9 +419,6 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
     """Replace successful regional reads and preserve failed regional reads.
 
     force reads before the refresh interval ends and does not move the interval; deploy.py up uses it."""
-    # Import here because administrator deployment also uses the shared read functions.
-    from scripts.aws_target import admin_secrets
-
     configuration = conf.read(settings_path)
     values = conf.read_or_repository('cloud_gate')
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
@@ -603,8 +600,6 @@ class AccountRefresh:
 def controller_tick(settings_path: Path, directory: Path, workload_path: Path, *,
                     lifecycle: Callable[[], object] | None = None, refresh: Callable[[], object] | None = None) -> int:
     """Recover lifecycle state before an independent account refresh attempt."""
-    from scripts.aws_target.hana_box import HanaController
-    from scripts.aws_target.hana_provider import AwsHanaProvider
     status = 0
     controller = HanaController(directory, settings_path, workload_path,
         AwsHanaProvider.from_settings(settings_path, directory, workload_path))
@@ -623,7 +618,6 @@ def serve(settings_path: Path, directory: Path, workload_path: Path, *,
           run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
           pause: Callable[[float], None] = time.sleep, keep_running: Callable[[], bool] = lambda: True) -> int:
     """Bound each tick in a child process and release all tick locks between attempts."""
-    from scripts.aws_target.hana_box import read_settings as lifecycle_settings
     while keep_running():
         settings = lifecycle_settings(conf.read(workload_path))
         try:
@@ -660,8 +654,7 @@ def main() -> int:
     _ = parser.add_argument('--hana-settings', type=Path)
     args = parser.parse_args(namespace=RefreshArguments())
     if args.command == 'open-gates':
-        from scripts.aws_target.open_gates import report
-        return report(args.directory, int(time.time()))
+        return open_gates.report(args.directory, int(time.time()))
     if args.command == 'snapshot':
         return hourly(args.settings, args.directory)
     if args.command == 'serve':

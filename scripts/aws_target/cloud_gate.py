@@ -25,6 +25,7 @@ import tempfile
 import time
 from typing import BinaryIO, Literal, cast, final
 from uuid import uuid4
+from urllib.parse import urlsplit
 
 from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_presign
 from scripts.aws_target.aws_cli import aws_error_code
@@ -45,6 +46,7 @@ from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production import merge_gate as gate
 from scripts.test_times import gate_record
+from scripts.buildlog import record as buildlog_record
 
 
 @dataclass(frozen=True)
@@ -1118,11 +1120,10 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at,
                 cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
             store.append_locked(handle, record)
-    from scripts.buildlog.record import keep_result
     imported: dict[str, object] = {'id': record_id}
     try:
         # The result leaves the checkout: a gate copy is a reused slot.
-        imported['result'] = keep_result(json.dumps(row).encode(), store.CLOUD_GATE_PLACE, at, record_id)
+        imported['result'] = buildlog_record.keep_result(json.dumps(row).encode(), store.CLOUD_GATE_PLACE, at, record_id)
     except OSError as error:
         gate_record.report_not_written(error)
     save(folder / 'imported.json', imported)
@@ -1162,7 +1163,6 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
         modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     origin_main = gate.checked_git(repo, 'rev-parse', 'refs/remotes/origin/main')
     origin = gate.checked_git(repo, 'remote', 'get-url', 'origin')
-    from urllib.parse import urlsplit
     if urlsplit(origin).password or urlsplit(origin).query or ('://' in origin and urlsplit(origin).username):
         raise GateRefused('The origin URL must contain no credential')
     folder.mkdir(parents=True, exist_ok=True)

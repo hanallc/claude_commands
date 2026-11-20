@@ -26,7 +26,7 @@ from typing import ClassVar, Literal, cast, override
 from unittest import mock
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gate_probe, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gate_probe, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote, teardown
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
@@ -4078,7 +4078,6 @@ sys.exit(7)
                 aws_config.read_deployment_settings(self.settings), 'us-west-2')
 
     def test_regional_image_cleanup_recovers_after_deregistration_record_failure(self) -> None:
-        from scripts.aws_target import teardown
         path = self.state / 'regional-images.json'
         _ = path.write_text(json.dumps({'copy': {'region': 'us-west-2', 'image': 'ami-west'}}))
         deleted = False
@@ -4112,7 +4111,6 @@ sys.exit(7)
         self.assertFalse(teardown.remove_regional_gates(api, self.state))
 
     def test_down_removes_regional_stack_and_copied_image_before_snapshot(self) -> None:
-        from scripts.aws_target import teardown
         text_setting(self.root / 'cloud_gate.conf', 'regions', 'us-east-2 us-west-2')
         cloud_gate_record = {'deployment_id': 'fixture', 'regions': [{'region': 'us-east-2'},
             {'region': 'us-west-2', 'stack': 'fixture-gates-us-west-2'}]}
