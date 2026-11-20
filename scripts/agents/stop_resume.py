@@ -1185,10 +1185,25 @@ def resume_arguments(entry: pane_launch.NativePaneLaunch) -> list[str]:
     if isinstance(names, LaunchNamesNotRead):
         names = LaunchNames.read()
     row = names.tab_record.by_member_reference(pane_launch.reference_id(entry))
+    current = names.resume(entry)
     if row is not None and row.kind == "producer":
         restart = cast(RowStarter, cast(object, import_module("scripts.agents.restart")))
-        return restart.producer_resume(row, names.resume(entry))[2]
-    return pane_record.resume_arguments(names.resume(entry))
+        return restart.producer_resume(row, current)[2]
+    if (row is not None and row.kind == "worker" and isinstance(row.role, staff.KnownWorkerRole)
+            and pane_launch.saved_kind(current) == "claude"):
+        role = row.role.value
+
+        def claude_role_fallback() -> pane_record.ClaudeResumeSettings:
+            from scripts.herdr import worker_panes
+
+            try:
+                settings = worker_panes.launch_policy(role, "claude").settings
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return pane_record.NO_CLAUDE_RESUME_SETTINGS
+            return pane_record.ClaudeResumeSettings(settings.model, settings.effort)
+
+        return pane_record.resume_arguments(current, claude_role_fallback=claude_role_fallback)
+    return pane_record.resume_arguments(current)
 
 
 def _pane_environment(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch) -> tuple[list[str], dict[str, str]]:

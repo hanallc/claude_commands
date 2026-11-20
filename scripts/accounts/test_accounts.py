@@ -8208,6 +8208,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
     """Move native workers with isolated staff, accounts, processes, and panes."""
 
     def __init__(self, methodName: str = "runTest") -> None:
+        from scripts.agents import restart
         from scripts.herdr.test_worker_panes import PaneWorld
 
         super().__init__(methodName)
@@ -8218,6 +8219,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.owner_id = staff.StaffId("")
         self.stop = MagicMock()
         self.target_check = MagicMock()
+        self.saved_session_launch = restart.session_launch
 
     @property
     def owner(self) -> staff.StaffRow:
@@ -8437,21 +8439,60 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertEqual(moves.read_moves(), [])
 
     def test_move_elapsed_time_includes_stopping_the_worker(self) -> None:
-        row = self.worker()
-        self.dispatch(row)
-        with patch.object(time, "monotonic", return_value=100.0) as clock:
-            def stop(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
-                stopped = self.stop_worker(row, client, deadline=deadline)
-                clock.return_value = 102.5
-                return stopped
+        from scripts.agents import restart
+        from scripts.herdr import pane_launch
+        from scripts.production import worker_admission
 
-            self.stop.side_effect = stop
-            result = self.move("claude2")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        outcome = result.outcomes[0]
-        assert isinstance(outcome, stop_results.ClaudeUp)
-        self.assertEqual(outcome.elapsed_seconds, 2.5)
-        self.assertIn("Claude is up on claude2 in w1:p1 (2.5 s)", result.stdout)
+        for name, pane, saved_model, role_effort, turn_model, turn_effort, expected_effort in (
+            ("implementer", "w1:p1", "", "", "", "", ""),
+            ("reviewer", "w1:p2", "", "high", "opus", "xhigh", "xhigh"),
+            ("tester", "w1:p3", "", "high", "opus", "", "high"),
+            ("saved-opus", "w1:p4", "opus", "high", "claude-opus-5-5", "", "high"),
+            ("empty-saved-model", "w1:p5", "", "medium", "opus", "", "medium"),
+        ):
+            with self.subTest(worker=name):
+                row = self.worker(name)
+                self.dispatch(row)
+                source = worker_admission.transcript_source(row, staff.ClaudeBackend())
+                final_turn: dict[str, object] = {}
+                if turn_model:
+                    records = pane_launch.record_directory() / f"{self.world.session}.json"
+                    entry = pane_launch.read_strict(records)[pane]
+                    entry["model"] = saved_model
+                    pane_launch.write(records, entry)
+                    _ = write_registry(self.root / "conf/models.conf", {
+                        "assignments": {"direct": "claude"}, "direct.claude": {"impl": f"sonnet:{role_effort}"},
+                    })
+                    final_turn = {"type": "assistant", "message": {"model": turn_model}}
+                    if turn_effort:
+                        final_turn["effort"] = turn_effort
+                    with source.open("a") as stream:
+                        _ = stream.write(json.dumps({
+                            "type": "assistant", "message": {"model": "sonnet"}, "effort": "high",
+                        }) + "\n")
+                launch = self.saved_session_launch if final_turn else restart.session_launch
+                with (patch.object(time, "monotonic", return_value=100.0) as clock,
+                      patch.object(restart, "session_launch", launch)):
+                    def stop(worker: staff.StaffRow, client: herdr.Herdr, *, deadline: float) -> bool:
+                        stopped = self.stop_worker(worker, client, deadline=deadline)
+                        if final_turn:
+                            with source.open("a") as stream:
+                                _ = stream.write(json.dumps(final_turn) + "\n")
+                        clock.return_value = 102.5
+                        return stopped
+
+                    self.stop.side_effect = stop
+                    result = self.move("claude2")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                outcome = next(item for item in result.outcomes if item.session_id == row.id)
+                assert isinstance(outcome, stop_results.ClaudeUp)
+                self.assertEqual(outcome.elapsed_seconds, 2.5)
+                self.assertIn(f"Claude is up on claude2 in {pane} (2.5 s)", result.stdout)
+                if final_turn:
+                    arguments = self.world.requests[-1][1]
+                    self.assertEqual(arguments[:2], ["--resume", row.current_session])
+                    self.assertEqual(arguments[arguments.index("--model") + 1], turn_model)
+                    self.assertEqual(arguments[arguments.index("--effort") + 1], expected_effort)
 
     def test_codex_move_reads_the_process_account_and_resumes_the_same_thread(self) -> None:
         row = self.worker(family="codex")
@@ -8470,14 +8511,40 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.assertTrue(accounts.session_on_account(member, "codex2"))
 
     def test_stopped_worker_resumes_in_the_same_pane(self) -> None:
-        row = self.worker(live=False)
-        self.dispatch(row)
-        result = self.move("claude2")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.stop.assert_not_called()
-        self.assertEqual(self.world.launches, [herdr.ExistingPane("w1:p1", "terminal-w1:p1")])
+        from scripts.agents import pane_record, restart
+        from scripts.herdr import pane_launch
+        from scripts.production import worker_admission
 
-        self.assertEqual(self.world.closed, [])
+        for index, (model, effort) in enumerate((("", ""), ("opus", "xhigh")), start=1):
+            with self.subTest(model=model):
+                row = self.worker("implementer" if index == 1 else "reviewer", live=False)
+                self.dispatch(row)
+                launch = restart.session_launch
+                if model:
+                    pane = f"w1:p{index}"
+                    records = pane_launch.record_directory() / f"{self.world.session}.json"
+                    pane_launch.retire_launch(records, pane, pane_launch.read_strict(records)[pane])
+                    self.assertIsNone(pane_record.launch_for_session(str(row.current_session)))
+                    source = worker_admission.transcript_source(row, staff.ClaudeBackend())
+                    transcript = self.root / "home/.claude1/projects/project" / f"{row.current_session}.jsonl"
+                    transcript.parent.mkdir(parents=True, exist_ok=True)
+                    _ = source.rename(transcript)
+                    with transcript.open("a") as stream:
+                        _ = stream.write(json.dumps({
+                            "type": "assistant", "message": {"model": model}, "effort": effort}) + "\n")
+                    launch = self.saved_session_launch
+                with patch.object(restart, "session_launch", launch):
+                    result = self.move("claude2")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.stop.assert_not_called()
+                self.assertEqual(self.world.launches, [
+                    herdr.ExistingPane(f"w1:p{pane}", f"terminal-w1:p{pane}") for pane in range(1, index + 1)])
+                if model:
+                    arguments = self.world.requests[-1][1]
+                    self.assertEqual(arguments[:2], ["--resume", row.current_session])
+                    self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
+                    self.assertEqual(arguments[arguments.index("--effort") + 1], "xhigh")
+                self.assertEqual(self.world.closed, [])
 
     def test_stopped_idle_worker_move_closes_the_pane_and_keeps_the_conversation(self) -> None:
         row = self.worker(live=False)

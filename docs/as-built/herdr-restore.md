@@ -63,7 +63,13 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   A saved pane without a staff row uses its saved identity, account, and folder.
   Both routes send no opening prompt.
   They preserve the saved Remote Control setting and `disableAgentView`.
-  Producers use the current `[producers]` model and effort; other sessions preserve the saved model.
+  Producers use the current `[producers]` model and effort.
+  Other Claude resumes use the model and effort from the latest real assistant turn.
+  A saved-pane resume or worker account move uses the saved model when there is no usable turn.
+  A worker account move uses the role model if the saved model is empty.
+  A same-role worker restore uses the role model when there is no usable turn.
+  Worker account moves and same-role restores use the role effort when the turn has no effort.
+  Without a launch record, `restart.session_launch` supplies the model and effort that the turn records.
   The launch-name reader supplies the current display name.
 - A replacement closes its source only after resume publication proves the new conversation.
   A source pane that gains another conversation or program stays open and prints an anomaly.

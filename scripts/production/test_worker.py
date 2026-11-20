@@ -4301,16 +4301,31 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertNotIn(opened.pane, self.fixture.world.foreground)
 
     def test_restore_uses_the_known_row_role_without_history(self) -> None:
-        opened = self.opened()
-        _ = staff.set_worker_role(opened.row.id, staff.KnownWorkerRole("impl"))
-        _ = self.fixture.world.stop(opened.row, self.fixture.world)
-        active = progress_history.ActiveDispatch("saved-pass", ("assign.sh",))
-        with (patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()),
-              patch.object(progress_history, "active_dispatch", return_value=active),
-              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK)):
-            code, _output, errors = self.command("restore")
-        self.assertEqual(code, 0, errors)
-        self.assertEqual(len(self.fixture.world.launches), 2)
+        for family, name in (("codex", "impl"), ("claude", "claude-impl")):
+            with self.subTest(family=family):
+                _ = write_registry(self.fixture.root / "conf/models.conf", {
+                    "assignments": {"direct": family}, "direct.claude": {"impl": "sonnet:high"},
+                })
+                opened = self.opened(name)
+                _ = staff.set_worker_role(opened.row.id, staff.KnownWorkerRole("impl"))
+                if family == "claude":
+                    source = worker_admission.transcript_source(opened.row, staff.ClaudeBackend())
+                    atomic_file.write_text_atomic(source, json.dumps({"type": "assistant", "effort": "xhigh",
+                        "message": {"model": "claude-opus-5-5", "content": [{"type": "text", "text": "Ready."}]}}) + "\n")
+                _ = self.fixture.world.stop(opened.row, self.fixture.world)
+                active = progress_history.ActiveDispatch("saved-pass", ("assign.sh",))
+                launches = len(self.fixture.world.launches)
+                with (patch.object(progress_history, "last_dispatch", return_value=progress_history.NoDispatchRecorded()),
+                      patch.object(progress_history, "active_dispatch", return_value=active),
+                      patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK)):
+                    code, _output, errors = self.command("restore")
+                self.assertEqual(code, 0, errors)
+                self.assertEqual(len(self.fixture.world.launches), launches + 1)
+                if family == "claude":
+                    _, arguments, _ = self.fixture.world.requests[-1]
+                    self.assertEqual(arguments[:2], ["--resume", opened.row.current_session])
+                    self.assertEqual(arguments[arguments.index("--model") + 1], "claude-opus-5-5")
+                    self.assertEqual(arguments[arguments.index("--effort") + 1], "xhigh")
 
     def test_restore_reports_the_unavailable_role_and_continues_other_workers(self) -> None:
         missing = self.opened("impl")
