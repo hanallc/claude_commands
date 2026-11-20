@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from scripts.build_queue import execution_identity
 from scripts.aws_target.hana_guest import WorkPermit
 from scripts.aws_target.hana_placement import HanaClaimRelease, HanaClaimReleaseRefused
-from scripts.aws_target import hana_protocol, hana_result, hana_source
+from scripts.aws_target import hana_protocol, hana_result
 from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
 from scripts.build_queue import placement
 
@@ -273,7 +273,8 @@ class NoMissingBasis:
     """The observation has no valid request for complete captured source."""
 
 
-def missing_basis(observation: hana_protocol.HanaCommandObservation, request: hana_protocol.HanaExecutionRequest) -> hana_source.MissingBasis | NoMissingBasis:
+def missing_basis(observation: hana_protocol.HanaCommandObservation,
+                  request: hana_protocol.HanaExecutionRequest) -> hana_protocol.MissingBasis | NoMissingBasis:
     """Decode the guest diagnostic without accepting a different repository or basis."""
     evidence = observation.evidence
     if (not isinstance(evidence, execution_identity.ExecutionEvidenceUnavailable)
@@ -287,7 +288,7 @@ def missing_basis(observation: hana_protocol.HanaCommandObservation, request: ha
         values = cast(list[object], commits)
         if not all(isinstance(value, str) and value in request.manifest.basis_commits for value in values):
             return NoMissingBasis()
-        return hana_source.MissingBasis(request.manifest.repository, tuple(cast(list[str], values)))
+        return hana_protocol.MissingBasis(request.manifest.repository, tuple(cast(list[str], values)))
     except (ValueError, KeyError, TypeError):
         return NoMissingBasis()
 
