@@ -62,6 +62,38 @@ FIREFOX_MIN_SHARED_WIDTH = 500
 CHROME = shutil.which("google-chrome")
 LIST_BROWSER = CHROME or shutil.which("firefox")
 
+WATCH_ACTIONS = """<script>
+function waitForChange(element,ready,options){
+ if(ready()) return Promise.resolve();
+ return new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(ready()){observer.disconnect();resolve();}
+  });
+  observer.observe(element,options);
+ });
+}
+let submittedForm;
+document.addEventListener('submit',event=>{submittedForm=event.target;},true);
+function waitForSave(form){
+ return waitForChange(form,()=>!form.hasAttribute('data-sending'),
+  {attributes:true,attributeFilter:['data-sending']});
+}
+function waitForRefresh(){
+ const list=document.querySelector('[data-list]');
+ return waitForChange(list.parentElement,()=>!list.isConnected,{childList:true});
+}
+function respondToSave(form,respond){
+ const saved=waitForSave(form);
+ respond();
+ return saved;
+}
+async function finishAnimations(animations){
+ const finished=Promise.allSettled(animations.map(animation=>animation.finished));
+ for(const animation of animations) animation.finish();
+ await finished;
+}
+</script>"""
+
 
 def _private_firefox_command(profile: Path, width: int, height: int, *, dark: bool) -> tuple[list[str], dict[str, str]]:
     profile.mkdir()
@@ -431,54 +463,66 @@ class ListPageTests(unittest.TestCase):
 
     @classmethod
     @contextmanager
-    def probe_server(cls, handler: type[BaseHTTPRequestHandler]) -> Generator[ThreadingHTTPServer]:
+    def probe_server(cls, prefix: str, handler: type[BaseHTTPRequestHandler]) -> Generator[ThreadingHTTPServer]:
         server = cls._http_server
         if server is None:
-            server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+            with ExitStack() as startup:
+                server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+                _ = startup.callback(server.server_close)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                _ = startup.callback(thread.join, TEST_HANG_GUARD_SECS)
+                _ = startup.callback(server.shutdown)
+                cls.addClassCleanup(startup.pop_all().close)
             cls._http_server = server
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            cls.addClassCleanup(server.server_close)
-            cls.addClassCleanup(thread.join, TEST_HANG_GUARD_SECS)
-            cls.addClassCleanup(server.shutdown)
-        with patch.object(server, "RequestHandlerClass", handler):
+
+        def parse_request(request: BaseHTTPRequestHandler) -> bool:
+            if not handler.parse_request(request):
+                return False
+            if not request.path.startswith(prefix + "/"):
+                request.send_error(404)
+                return False
+            request.path = request.path[len(prefix):]
+            return True
+
+        case_handler = type("CaseHandler", (handler,), {"parse_request": parse_request})
+        with patch.object(server, "RequestHandlerClass", case_handler):
             yield server
 
-    def browser_view(self, destination: str, path: Path | None, width: int, height: int,
-                     complete: threading.Event | None = None, *, dark: bool = False
-                     ) -> subprocess.CompletedProcess[str]:
-        if CHROME:
+    @contextmanager
+    def browser_page(self, destination: str, width: int, height: int, *, dark: bool = False,
+                     firefox_only: bool = False, ready: str = "load") -> Generator[_Chrome | _Firefox]:
+        if CHROME and not firefox_only:
             browser = self.chrome()
-            ready = "load" if complete is None else "DOMContentLoaded"
             with browser.page(destination, window_size=(width, height), ready=ready, dark=dark):
-                if complete is not None and not complete.wait(45):
-                    raise TimeoutError("Chrome did not report the page result")
-                if path is not None:
-                    browser.screenshot(path)
-            return subprocess.CompletedProcess(destination, 0, "", "")
-        if width < FIREFOX_MIN_SHARED_WIDTH:
+                yield browser
+        else:
+            firefox = self.firefox()
+            with firefox.page(destination, width, height, dark=dark):
+                yield firefox
+
+    def browser_results(self, destination: str, width: int, height: int, complete: threading.Event,
+                        *, dark: bool = False, firefox_only: bool = False) -> None:
+        if (firefox_only or not CHROME) and width < FIREFOX_MIN_SHARED_WIDTH:
             with tempfile.TemporaryDirectory(dir=self.root, prefix="firefox-view-") as temporary:
                 root = Path(temporary)
                 command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
-                assert complete is not None and path is None
-                process = subprocess.Popen([*command, destination], stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.DEVNULL, env=environment, start_new_session=True)
-                try:
-                    if not complete.wait(45):
-                        raise TimeoutError("Firefox did not report the page result")
-                finally:
-                    _stop_browser(process)
-                return subprocess.CompletedProcess(destination, 0, "", "")
-        try:
-            browser = self.firefox()
-            with browser.page(destination, width, height, dark=dark):
-                if complete is not None and not complete.wait(45):
-                    raise TimeoutError("Firefox did not report the page result")
-                if path is not None:
-                    browser.screenshot(path)
-        except (OSError, RuntimeError) as error:
-            raise RuntimeError(f"Firefox could not show {destination}") from error
-        return subprocess.CompletedProcess(destination, 0, "", "")
+                # Firefox uses the exact viewport size in screenshot mode.
+                browser = subprocess.run([*command, "--screenshot", str(root / "page.png"), destination],
+                                         capture_output=True, text=True, timeout=45, env=environment)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertTrue(complete.is_set(), f"Firefox did not report a result for {destination}")
+            return
+        with self.browser_page(destination, width, height, dark=dark, firefox_only=firefox_only, ready="DOMContentLoaded"):
+            if not complete.wait(45):
+                raise TimeoutError(f"The probe did not report a result for {destination}")
+
+    def browser_screenshot(self, destination: str, width: int, height: int, path: Path,
+                           complete: threading.Event, *, dark: bool = False) -> None:
+        with self.browser_page(destination, width, height, dark=dark, ready="DOMContentLoaded") as browser:
+            if not complete.wait(45):
+                raise TimeoutError(f"The probe did not report a result for {destination}")
+            browser.screenshot(path)
 
     def test_review_links_use_the_card_body_for_every_state(self) -> None:
         source = review_items.ProposalLedgerSource(self.root / "proposals.md")
@@ -1182,7 +1226,8 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                     @override
                     def html_response(self, status: int, content: bytes) -> None:
                         if self.path == list_page.PAGE_PATH + "?direct=1":
-                            content = content.replace(b'</body>', probe.encode() + b'</body>')
+                            hold = b'<img hidden src="/complete">' if not CHROME else b""
+                            content = content.replace(b'</body>', hold + probe.encode() + b'</body>')
                         super().html_response(status, content)
 
                     @override
@@ -1235,10 +1280,9 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                         url = f"http://127.0.0.1:{server.server_port}" + route
                         if size == "screenshot":
                             assert proof is not None
-                            result = self.browser_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
+                            self.browser_screenshot(url + "&shot=1", width, height, Path(proof), complete, dark=True)
                         else:
-                            result = self.browser_view(url, None, width, height, complete, dark=True)
-                        self.assertEqual(result.returncode, 0, result.stderr)
+                            self.browser_results(url, width, height, complete, dark=True)
                     finally:
                         complete.set()
                         server.shutdown()
@@ -1280,7 +1324,7 @@ addEventListener('message',event=>{
  [...links].find(link=>link.textContent==='#'+event.data.clickListLink).click();
 });
 </script></body>''')
-        page = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH))
+        page = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage("CASE_PATH" + list_page.PAGE_PATH))
         shell = console.render((page,), console.UnavailablePage()).decode()
         probe = r'''<script>
 const params=new URLSearchParams(location.search),number=params.get('number'),scenario=params.get('case');
@@ -1445,64 +1489,66 @@ frame.addEventListener('load',async()=>{
    }
   }
  }catch(error){failures.push(String(error));}
- await fetch('/list-jump-result',{method:'POST',body:JSON.stringify(failures)});
+ await fetch('CASE_PATH/list-jump-result',{method:'POST',body:JSON.stringify(failures)});
 },{once:true});
-</script><img hidden src="/list-jump-ready">'''
+</script><img hidden src="CASE_PATH/list-jump-ready">'''
         shell = shell.replace('</body>', probe + '</body>')
-        results: list[list[str]] = []
-        complete = threading.Event()
+        proof = os.environ.get("LIST_JUMP_PROOF")
+        cases = [(30, "open"), (29, "closed"), (31, "producer"), (99, "missing"), (29, "repeat"),
+                 (2, "history"), (2, "banner"), (30, "pending-words"), (30, "unavailable-producer"),
+                 (30, "unread-words")]
+        if proof:
+            cases.append((29, "proof"))
+        for number, case in cases:
+            with self.subTest(link=case):
+                prefix = "/" + uuid4().hex
+                results: list[list[str]] = []
+                complete = threading.Event()
 
-        class Probe(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                path = urlsplit(self.path).path
-                if path == '/list-jump-ready':
-                    _ = complete.wait(35)
-                body = listing if path == list_page.PAGE_PATH else shell.encode() if path == "/console/" else b'{}'
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/html; charset=utf-8' if body != b'{}' else 'application/json')
-                self.end_headers()
-                try:
-                    _ = self.wfile.write(body)
-                except BrokenPipeError:
-                    pass
+                class Probe(BaseHTTPRequestHandler):
+                    result_rows: ClassVar[list[list[str]]] = results
+                    result_event: ClassVar[threading.Event] = complete
+                    console_page: ClassVar[bytes] = shell.replace("CASE_PATH", prefix).encode()
 
-            def do_POST(self) -> None:
-                if self.path == '/list-jump-result':
-                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                    complete.set()
-                self.send_response(204)
-                self.end_headers()
+                    def do_GET(self) -> None:
+                        path = urlsplit(self.path).path
+                        if path == '/list-jump-ready':
+                            _ = self.result_event.wait(35)
+                        body = listing if path == list_page.PAGE_PATH else self.console_page if path == "/console/" else b'{}'
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html; charset=utf-8' if body != b'{}' else 'application/json')
+                        self.end_headers()
+                        with suppress(BrokenPipeError):
+                            _ = self.wfile.write(body)
 
-            @override
-            def log_message(self, format: str, *args: object) -> None:
-                pass
+                    def do_POST(self) -> None:
+                        if self.path == '/list-jump-result':
+                            self.result_rows.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                            self.result_event.set()
+                        self.send_response(204)
+                        self.end_headers()
 
-        with self.probe_server(Probe) as server:
-            try:
-                proof = os.environ.get("LIST_JUMP_PROOF")
-                cases = [(30, "open"), (29, "closed"), (31, "producer"), (99, "missing"), (29, "repeat"),
-                         (2, "history"), (2, "banner"), (30, "pending-words"), (30, "unavailable-producer"),
-                         (30, "unread-words")]
-                if proof:
-                    cases.append((29, "proof"))
-                for number, case in cases:
-                    with self.subTest(link=case):
-                        complete.clear()
-                        results.clear()
-                        filters = {"sort": "#", "item": f"{MORTY.id}/{source.id}"}
-                        if case in ("open", "closed", "producer", "missing"):
-                            filters.update(owner=OWNER.id, producer=MORTY.id, q="linked item")
-                        if case == "unread-words":
-                            filters.update(unread="1", q="item")
-                        place = list_page.PAGE_PATH + "?show=working#" + urlencode(filters)
-                        url = "/console/" + console.place_query("list", place)
+                    @override
+                    def log_message(self, format: str, *args: object) -> None:
+                        pass
+
+                filters = {"sort": "#", "item": f"{MORTY.id}/{source.id}"}
+                if case in ("open", "closed", "producer", "missing"):
+                    filters.update(owner=OWNER.id, producer=MORTY.id, q="linked item")
+                if case == "unread-words":
+                    filters.update(unread="1", q="item")
+                place = prefix + list_page.PAGE_PATH + "?show=working#" + urlencode(filters)
+                url = prefix + "/console/" + console.place_query("list", place)
+                with self.probe_server(prefix, Probe) as server:
+                    try:
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
-                        screenshot = Path(proof) if case == "proof" and proof else None
-                        result = self.browser_view(destination, screenshot, 1440, 1100, complete, dark=True)
-                        self.assertEqual(result.returncode, 0, result.stderr)
+                        if case == "proof" and proof:
+                            self.browser_screenshot(destination, 1440, 1100, Path(proof), complete, dark=True)
+                        else:
+                            self.browser_results(destination, 1440, 1100, complete, dark=True)
                         self.assertEqual(results, [[]])
-            finally:
-                complete.set()
+                    finally:
+                        complete.set()
 
     def test_staff_owner_and_producer_names_have_role_colors_but_nate_stays_plain(self) -> None:
         _ = self.add("Staff names")
@@ -3019,14 +3065,15 @@ const requests=[];let finishPost;
 window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
  requests.push(new URLSearchParams(options.body));
- return new Promise(resolve=>finishPost=result=>resolve({ok:result.ok!==false,status:result.ok===false ? 400 : 200,
-  json:async()=>({unread:'false',...result})}));
+ const form=submittedForm;
+ return new Promise(resolve=>finishPost=result=>respondToSave(form,()=>resolve({
+  ok:result.ok!==false,status:result.ok===false ? 400 : 200,json:async()=>({unread:'false',...result})
+ })));
 };
 </script>'''
         probe = '''<script>
 (async()=>{
  const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
- const flush=()=>new Promise(resolve=>requestAnimationFrame(resolve));
  const row=number=>document.querySelector('[data-number="'+number+'"]');
  const visible=()=>[...document.querySelectorAll('[data-list-item]')].filter(item=>!item.hidden).map(item=>item.dataset.number).sort().join(',');
  const choose=(show,query)=>new Promise(done=>{
@@ -3047,13 +3094,13 @@ window.fetch=async(_path,options={})=>{
    !removed.querySelector('[value="read"]'),'Remove clears the unread controls before the response');
   check([...row('106').querySelectorAll('button')].every(button=>button.disabled),'Remove disables the row buttons');
   submit('106','remove');check(requests.length===1,'a second Remove press sends nothing');
-  finishPost({item_state:'Closed',parked:'false'});await flush();await flush();
+  await finishPost({item_state:'Closed',parked:'false'});
   check(row('106').hidden,'Remove stays outside Working after success');
   await choose('all','106');check(visible()==='','Remove keeps the item out of All');
   check(row('106').querySelector('.list-state').textContent==='Closed','Remove updates the state text');
   await choose('working','105');row('105').querySelector('.list-toggle').click();
   const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
-  finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
+  await finishPost({ok:false,reason:'The fixture refuses this close.'});
   check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
   check(row('105').dataset.unread==='true' && row('105').querySelector('.list-dot') &&
    refused.querySelector('[value="read"]'),'a refused Remove restores the unread controls');
@@ -3067,7 +3114,7 @@ window.fetch=async(_path,options={})=>{
   check(document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}).length,
    'Park animates the row when it leaves Working');
   submit('105','park');check(requests.length===3,'a second Park press sends nothing');
-  finishPost({item_state:'Working',parked:'true'});await flush();await flush();
+  await finishPost({item_state:'Working',parked:'true'});
   check(row('105').hidden,'Park stays outside Working after success');
   await choose('parked','105');check(visible()==='105','Park updates the Parked view');
   check(parked.querySelector('[data-send-status]').textContent==='Parked','Park shows its result');
@@ -3075,12 +3122,12 @@ window.fetch=async(_path,options={})=>{
   const form=row('58').querySelector('form');
   check(row('58').dataset.unread==='false' && !form.querySelector('[value="read"]'),'the unread sync case starts read');
   form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
-  submit('58','tell');finishPost({item_state:'Waiting for nate',parked:'false',unread:'true'});await flush();await flush();
+  submit('58','tell');await finishPost({item_state:'Waiting for nate',parked:'false',unread:'true'});
   check(row('58').dataset.unread==='true' && row('58').querySelector('.list-dot'),'an unread response restores the dot');
   check(Boolean(form.querySelector('[value="read"]')),'an unread response restores Mark read');
   if(form.querySelector('[value="read"]')){
    document.getElementById('list-unread').click();
-   submit('58','read');finishPost({item_state:'Waiting for nate',parked:'false',unread:'false'});await flush();await flush();
+   submit('58','read');await finishPost({item_state:'Waiting for nate',parked:'false',unread:'false'});
    check(!row('58').querySelector('.list-dot') && !form.querySelector('[value="read"]'),'the restored Mark read button works');
    check(row('58').hidden && document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}).length,
     'Mark read animates the row when it leaves Unread');
@@ -3111,8 +3158,7 @@ window.fetch=async(_path,options={})=>{
  check(sheet.hidden && requests.length===1,'Save closes the shared sheet and submits once');
  check(requests[0]?.get('action')==='park' && requests[0].get('until')==='2026-12-04T00:30:00.000Z',
   'Save sends the selected instant');
- finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 19:30 EST'});
- await flush();
+ await finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 19:30 EST'});
  check(row.querySelector('[data-parked-note]').textContent===summary.replace('Parks until','Parked until'),
   'The row shows the same time as the picker');
  check(form.querySelector('[data-parked-detail]').textContent==='Parked until Dec 3 19:30 EST',
@@ -3132,8 +3178,7 @@ window.fetch=async(_path,options={})=>{
  preset.click();
  check(menu.hidden && requests.length===1,'One click closes the menu and posts once');
  check(requests[0]?.get('action')==='park' && requests[0].get('until')==='delivered','The POST uses the delivery value');
- finishPost({item_state:'Working',parked:'true',parked_until:'delivered'});
- await flush();
+ await finishPost({item_state:'Working',parked:'true',parked_until:'delivered'});
  check(!row.hidden && row.nextElementSibling?.dataset.number==='2',
   'All keeps the server order until a refresh.');
  check(document.querySelector('#filter-show-all b').textContent==='2' &&
@@ -3147,8 +3192,7 @@ window.fetch=async(_path,options={})=>{
  check(form.querySelector('[data-parked-detail]').textContent==='Parked until delivered','The panel shows the condition');
  check(row.querySelector('[data-parked-note]').textContent==='Parked until delivered','The state cell has the condition');
  submit('unpark');
- finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
- await flush();
+ await finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
  check(row.hidden,'Unpark removes the item from Parked');
  show('working');
  check(!row.hidden,'Unpark returns the item to Working');
@@ -3203,7 +3247,7 @@ window.fetch=async(_path,options={})=>{
  save.click();
  const first=requests[0];
  check(first?.get('until')==='2026-12-04T00:30:00.000Z','The first save sends the chosen instant');
- losePost();await flush();
+ await losePost();
  await finishRowMotion();
  now=Date.parse('2026-12-05T13:00:00Z');
  toggle.click();
@@ -3211,34 +3255,37 @@ window.fetch=async(_path,options={})=>{
  save.click();
  check(requests.length===2 && requests[1].get('request')===first.get('request') &&
   requests[1].get('until')===first.get('until'),'Save retries the same ID and instant');
- if(requests.length===2){finishPost({parked:'false',parked_until:''});await flush();}
+ if(requests.length===2){await finishPost({parked:'false',parked_until:''});}
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_refusal_from_enter_restores_focus(self) -> None:
+        for number in (1, 2):
+            _ = self.add(f"Park item {number} with Enter", number=number)
         self.browser_action_sequence(r"""
  Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
- const toggle=form.querySelector('[data-later-toggle]');
- toggle.click();
- const time=form.querySelector('[data-later-time]');
  show('working');
- time.focus();
- const blurred=new Promise(resolve=>time.addEventListener('blur',resolve,{once:true}));
- time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
- check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Working');
- if(document.activeElement===time) await blurred;
- finishPost({reason:'The fixture refuses Park'});
- await flush();
- const animations=document.getAnimations();
- const finished=Promise.allSettled(animations.map(animation=>animation.finished));
- for(const animation of animations) animation.finish();
- await finished;
- await flush();
- check(!row.hidden && !toggle.disabled && document.activeElement===toggle,
-  'The restored row returns focus to Park until. '+JSON.stringify({
-   hidden:row.hidden,disabled:toggle.disabled,focus:document.activeElement?.outerHTML.slice(0,200),
-  }));
-""")
+ for(const [number,afterBlur] of [[1,false],[2,true]]){
+  const item=document.querySelector('[data-number="'+number+'"]');
+  if(item.querySelector('[data-detail]').hidden) item.querySelector('.list-toggle').click();
+  const toggle=item.querySelector('[data-later-toggle]'),time=item.querySelector('[data-later-time]');
+  toggle.click();
+  time.focus();
+  let lostFocus=false;
+  const blurred=new Promise(resolve=>time.addEventListener('blur',()=>{
+   lostFocus=true;resolve();
+  },{once:true}));
+  time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+  check(requests.length===number && item.hidden,'Enter submits Park and hides the row from Working');
+  if(afterBlur) await blurred;
+  check(lostFocus===afterBlur,'The refusal follows the requested order for row '+number);
+  await finishPost({reason:'The fixture refuses Park'});
+  await blurred;
+  await finishRowMotion();
+  check(!item.hidden && !toggle.disabled && document.activeElement===toggle,
+   'The restored row returns focus to Park until for row '+number);
+ }
+""", add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_expired_park_retry_keeps_the_calendar_in_the_tab_order(self) -> None:
@@ -3251,9 +3298,8 @@ window.fetch=async(_path,options={})=>{
  toggle.click();
  save.click();
  const first=requests[0];
- losePost();await flush();
- for(const animation of document.getAnimations()) animation.finish();
- await flush();
+ await losePost();
+ await finishAnimations(document.getAnimations());
  now=Date.parse('2026-12-15T13:00:00Z');
  toggle.click();
  const entry=grid.querySelector('button:not(:disabled)[tabindex="0"]');
@@ -3270,7 +3316,7 @@ window.fetch=async(_path,options={})=>{
   save.click();
   check(requests[1]?.get('request')!==first.get('request') && requests[1]?.get('until')?.startsWith('2027-01-03'),
    'The new date sends a new request');
-  if(requests.length===2){finishPost({parked:'true'});await flush();}
+  if(requests.length===2){await finishPost({parked:'true'});}
  }
 """)
 
@@ -3284,13 +3330,11 @@ window.fetch=async(_path,options={})=>{
  time.focus();
  time.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
  check(requests.length===1 && row.hidden,'Enter submits Park and hides the row from Working');
- finishPost({reason:'The fixture refuses Park'});
- await flush();
+ await finishPost({reason:'The fixture refuses Park'});
  const search=document.getElementById('list-search');
  search.focus();
  check(document.activeElement===search,'Search receives focus while the row returns');
- for(const animation of document.getAnimations()) animation.finish();
- await flush();
+ await finishAnimations(document.getAnimations());
  check(!row.hidden && document.activeElement===search,'A refused Park keeps focus on Search');
 """)
 
@@ -3305,10 +3349,11 @@ const requests=[];let finishPost,losePost;
 window.fetch=async(_path,options={})=>{
  if(options.method!=='POST') throw new Error('Fixture refresh refused');
  requests.push(new URLSearchParams(options.body));
+ const form=submittedForm;
  return new Promise((resolve,reject)=>{
-  losePost=()=>reject(new Error('Fixture lost response'));
-  finishPost=result=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
-   json:async()=>({unread:'true',...result})});
+  losePost=()=>respondToSave(form,()=>reject(new Error('Fixture lost response')));
+  finishPost=result=>respondToSave(form,()=>resolve({ok:!result.reason,status:result.reason ? 400 : 200,
+   json:async()=>({unread:'true',...result})}));
  });
 };
 </script>'''
@@ -3320,22 +3365,21 @@ window.fetch=async(_path,options={})=>{
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
   return requests.at(-1).get('request');
  };
- const flush=()=>new Promise(resolve=>requestAnimationFrame(resolve));
  const labels=()=>[...row.querySelectorAll('[data-label="State"] small')].map(note=>note.textContent);
  try{
   check(labels().join() === 'Parked until Nov 18 13:00 EST','The row starts with one saved time label');
   form.elements.until.value='2026-12-03';
-  const park=submit('park');losePost();await flush();
+  const park=submit('park');await losePost();
   check(submit('park')===park,'an exact Park retry keeps its request ID');
-  losePost();await flush();
+  await losePost();
   check(submit('remove')!==park,'Remove gets a different ID after a lost Park response');
-  finishPost({reason:'Fixture refuses Remove'});await flush();
+  await finishPost({reason:'Fixture refuses Remove'});
   const returning=document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}) ?? [];
   for(const animation of returning) animation.finish();
   await Promise.allSettled(returning.map(animation=>animation.finished));
   form.elements.until.value='2026-12-04';
   check(submit('park')!==park,'a different Park date gets a different ID');
-  finishPost({item_state:'Working',parked:'true',parked_until:'Dec 5 00:00 EST'});await flush();
+  await finishPost({item_state:'Working',parked:'true',parked_until:'Dec 5 00:00 EST'});
   check(labels().length===1,'a successful Park keeps one date label');
   check(labels().join()==='Parked until Dec 5 00:00 EST','the label uses the saved date from the response');
  }catch(error){failures.push(String(error));}
@@ -3382,11 +3426,11 @@ window.fetch=async(_path,options={})=>{
  check(!row.querySelector('[data-list-check]'),'The parked row omits the future check.');
  unpark.focus();
  const first=submit('unpark');
- losePost();await flush();
+ await losePost();
  check(!row.hidden && !unpark.hidden,'a lost response leaves Unpark available');
  check(document.activeElement===unpark,'a lost response returns focus to Unpark');
  check(submit('unpark').id===first.id,'an exact Unpark retry keeps its request ID');
- finishPost(SAVED_UNPARK);await flush();
+ await finishPost(SAVED_UNPARK);
  check(row.hidden && document.activeElement===document.querySelector('#filter-show-parked'),'focus moves to Parked');
  const status=document.querySelector('[data-hidden-action-status][role="status"]');
  check(!status.hidden && status.getClientRects().length>0 && status.textContent==='Item #1 unparked.',
@@ -3401,14 +3445,14 @@ window.fetch=async(_path,options={})=>{
  form.elements.until.value='2026-12-03';
  submit('park');
  check(!nextCheck.getClientRects().length,'The row hides the check while Park is pending.');
- finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST',check_html:''});await flush();
+ await finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST',check_html:''});
  show('parked');
  check(!row.querySelector('[data-list-check]'),'The Park response removes the check before a refresh.');
  document.querySelector('[data-sort="3"]').click();
  unpark.focus();
  submit('unpark');
  show('all');
- finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});await flush();
+ await finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
  check(!row.hidden && !row.querySelector('[data-detail]').hidden,'Unpark in All keeps the row open');
  check(document.querySelector('[data-list-item]')===row,'Unpark preserves the item order by title');
  check(document.activeElement===row.querySelector('.list-toggle'),'focus moves to the item number');
@@ -3453,9 +3497,10 @@ window.fetch=async(_path,options={})=>{
  const numbers=()=>[...document.querySelectorAll('[data-number="2"],[data-number="3"]')]
   .map(item=>item.dataset.number).join(',');
  const refresh=async markup=>{
+  const replaced=waitForRefresh();
   refreshMarkup=markup;
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-  await flush();
+  await replaced;
  };
  const input=current().querySelector('textarea');
  input.value='Keep the words for this item.';
@@ -3478,8 +3523,9 @@ window.fetch=async(_path,options={})=>{
  submit(parks ? 'park-until-delivered' : 'unpark',prior.querySelector('form'));
  if(parks) editOther();
  else prior.querySelector('.list-log-scroll').focus();
- finishPost(fixture.response);
- await flush();
+ const replaced=waitForRefresh();
+ await finishPost(fixture.response);
+ await replaced;
  check(methods.join()==='POST,GET','The save makes one List GET while the item waits.');
  const refreshed=current(),freshDraft=other().querySelector('textarea');
  check(refreshed!==prior && beforeOrder===(parks ? '3,2' : '2,3') &&
@@ -3509,8 +3555,7 @@ window.fetch=async(_path,options={})=>{
  show('parked');
  form.elements.until.value='2026-12-03';
  submit('unpark');
- finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'expired'});
- await flush();
+ await finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'expired'});
  const status=document.querySelector('[data-hidden-action-status]');
  check(row.hidden && !status.hidden && status.textContent==='Item #1: Parking time already expired.',
        'Parked reports that the parking time already expired.');
@@ -3530,11 +3575,10 @@ window.fetch=async(_path,options={})=>{
  form.elements.until.value='2026-12-03';
  unpark.focus();
  const first=submit('unpark');
- losePost();await flush();
+ await losePost();
  check(submit('unpark').id===first.id,'The retry sends the original request ID.');
- finishPost({item_state:'Working',parked:'true',parked_until:'Dec 4 00:00 EST',
+ await finishPost({item_state:'Working',parked:'true',parked_until:'Dec 4 00:00 EST',
   unpark_outcome:'cleared_newer_parking_active'});
- await flush();
  const message=form.querySelector('[data-send-status]').textContent;
  check(message==='The original Unpark cleared parking. A newer parking time is active',
        'The replay reports the original result and the newer parking time.');
@@ -3553,8 +3597,7 @@ window.fetch=async(_path,options={})=>{
  show('parked');
  form.elements.until.value='2026-12-03';
  submit('unpark');
- finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'no_active_parking'});
- await flush();
+ await finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'no_active_parking'});
  const status=document.querySelector('[data-hidden-action-status]');
  check(row.hidden && !status.hidden && status.textContent==='Item #1: No active parking time to clear.',
        'The result shows that there was no active parking time.');
@@ -3575,10 +3618,10 @@ window.fetch=async(_path,options={})=>{
  submit('unpark',second.querySelector('form'));
  const result={item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'};
  const status=document.querySelector('[data-hidden-action-status]');
- finishFirst(result);await flush();
+ await finishFirst(result);
  check(row.hidden && !second.hidden && !status.hidden && status.textContent==='Item #1 unparked.',
        'The first request shows its result while the second request runs.');
- finishPost(result);await flush();
+ await finishPost(result);
  check(second.hidden && !status.hidden && status.textContent==='Item #1 unparked. Item #2 unparked.',
        'Both results stay visible after both rows leave Parked.');
  show('all');
@@ -3611,8 +3654,7 @@ window.fetch=async(_path,options={})=>{
  unpark.focus({preventScroll:true});
  check(filter.getBoundingClientRect().bottom<0,'The focused row is below the viewport with the filters.');
  submit('unpark');
- finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
- await flush();
+ await finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
  const withinViewport=element=>{
   const {top,bottom}=element.getBoundingClientRect();
   return !element.hidden && top>=0 && bottom<=innerHeight;
@@ -3648,11 +3690,11 @@ window.fetch=async(_path,options={})=>{
  await finishRowMotion();
  submit('remove');
  check(unpark.hidden,'Remove hides Unpark immediately.');
- finishPost({reason:'Fixture refuses Remove'});await flush();
+ await finishPost({reason:'Fixture refuses Remove'});
  check(!unpark.hidden,'A refusal restores Unpark.');
  await finishRowMotion();
  submit('remove');
- finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
+ await finishPost({item_state:'Closed',parked:'true',unread:'false'});
  check(unpark.hidden && row.dataset.parked==='true','A confirmed Remove leaves Unpark hidden.');
  const sortValues=JSON.parse(row.dataset.sortValues);
  check(sortValues[3]==='active parked item' && sortValues[4]==='closed',
@@ -3698,43 +3740,43 @@ observer.observe(original.parentNode,{childList:true});
     def test_browser_retries_a_lost_tell_after_a_refused_park(self) -> None:
         self.browser_action_sequence('''
  form.elements.words.value='Tell morty once.';
- const tell=submit('tell');losePost();await flush();
+ const tell=submit('tell');await losePost();
  form.elements.until.value='2026-12-03';
  const park=submit('park');
  check(park.id!==tell.id,'Park uses its own request ID');
- finishPost({reason:'Fixture refuses Park'});await flush();
+ await finishPost({reason:'Fixture refuses Park'});
  await finishRowMotion();
  check(submit('park').id!==park.id,'a refused Park leaves no unconfirmed request');
- finishPost({reason:'Fixture refuses Park again'});await flush();
+ await finishPost({reason:'Fixture refuses Park again'});
  await finishRowMotion();
  form.elements.until.value='';
  const retry=submit('tell');
  check(retry.id===tell.id && retry.token===tell.token,'Tell retains its signed ID across refusals');
- finishPost({item_state:'Working',parked:'false'});await flush();
+ await finishPost({item_state:'Working',parked:'false'});
  form.elements.words.value='Tell morty once.';
  check(submit('tell').id!==tell.id,'a confirmed Tell leaves no unconfirmed request');
- finishPost({item_state:'Working',parked:'false'});await flush();
+ await finishPost({item_state:'Working',parked:'false'});
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_retries_two_lost_park_dates_after_a_confirmed_remove(self) -> None:
         self.browser_action_sequence('''
  form.elements.until.value='2026-12-03';
- const first=submit('park');losePost();await flush();
+ const first=submit('park');await losePost();
  await finishRowMotion();
  form.elements.until.value='2026-12-04';
- const second=submit('park');losePost();await flush();
+ const second=submit('park');await losePost();
  await finishRowMotion();
  check(first.id!==second.id,'each Park date gets its own request ID');
  const remove=submit('remove');
  check(remove.id!==second.id,'Remove uses its own request ID');
- finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
+ await finishPost({item_state:'Closed',parked:'true',unread:'false'});
  await finishRowMotion();
  for(const [date,original] of [['2026-12-03',first],['2026-12-04',second]]){
   form.elements.until.value=date;
   const retry=submit('park');
   check(retry.id===original.id && retry.token===original.token,'Park retains the signed ID for '+date);
-  finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
+  await finishPost({item_state:'Closed',parked:'true',unread:'false'});
  }
 ''')
 
@@ -3746,7 +3788,7 @@ observer.observe(original.parentNode,{childList:true});
  check(row.hidden,'the row leaves All during Remove');
  check(document.querySelector('[data-record-motion]'),'Remove starts its exit animation');
  await finishRowMotion();
- losePost();await flush();
+ await losePost();
  await finishRowMotion();
  check(!row.hidden && row.dataset.unread==='true' && row.querySelector('.list-dot'),
   'a lost Remove restores the row and unread mark');
@@ -3760,7 +3802,7 @@ observer.observe(original.parentNode,{childList:true});
   'opening the details shows the inline notice only');
  row.querySelector('.list-toggle').click();
  check(!hiddenStatus.hidden,'closing the details restores the notice above the table');
- submit('remove');finishPost({reason:'Fixture refuses Remove'});await flush();
+ submit('remove');await finishPost({reason:'Fixture refuses Remove'});
  check(row.dataset.state==='Working' && row.dataset.unread==='true' && row.querySelector('.list-dot'),
   'a refused Remove retry restores the last saved unread state');
 ''')
@@ -3772,7 +3814,7 @@ observer.observe(original.parentNode,{childList:true});
  show('all');
  submit('remove');
  await finishRowMotion();
- losePost();await flush();
+ await losePost();
  await finishRowMotion();
  const above=document.querySelector('[data-hidden-action-status]');
  const inline=form.querySelector('[data-send-status]');
@@ -3795,7 +3837,7 @@ observer.observe(original.parentNode,{childList:true});
  for(const item of [row,second]){
   if(item.querySelector('[data-detail]').hidden) item.querySelector('.list-toggle').click();
   submit('remove',item.querySelector('form'));
-  losePost();await flush();
+  await losePost();
   item.querySelector('.list-row').click();
  }
  const status=document.querySelector('[data-hidden-action-status]');
@@ -3819,7 +3861,8 @@ observer.observe(original.parentNode,{childList:true});
         with patch.object(list_page, "counts_strip", return_value=""):
             page = list_page.render(self.root / "reviews")
         def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            return self.browser_view(arguments[-1], None, 1366, 768)
+            with self.browser_page(arguments[-1], 1366, 768):
+                return subprocess.CompletedProcess(arguments, 0, "", "")
 
         with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
             self.assertEqual(save_notice_failures(page, 'remove'), [[]])
@@ -3830,12 +3873,12 @@ observer.observe(original.parentNode,{childList:true});
  form.elements.words.value='Which check passed?';
  form.elements.words.dispatchEvent(new Event('input'));
  const attempt=submit('question');
- finishPost({status:503,reason:'Fixture delivery status unavailable'});await flush();
+ await finishPost({status:503,reason:'Fixture delivery status unavailable'});
  check(form.querySelector('[data-send-status]').textContent===
   'Save not confirmed: Fixture delivery status unavailable','a service error leaves the save unconfirmed');
  const retry=submit('question');
  check(retry.id===attempt.id && retry.token===attempt.token,'the retry uses the original signature');
- finishPost({item_state:'Working',parked:'false'});await flush();
+ await finishPost({item_state:'Working',parked:'false'});
  check(form.elements.words.value==='','the confirmed reply clears the question');
 ''')
 
@@ -3848,12 +3891,12 @@ observer.observe(original.parentNode,{childList:true});
  check(ask?.disabled,'spaces keep Ask question disabled');
  words.value='What changed?';words.dispatchEvent(new Event('input'));
  check(!ask?.disabled,'words enable Ask question');
- const question=submit('question');losePost();await flush();
- const feedback=submit('tell');losePost();await flush();
+ const question=submit('question');await losePost();
+ const feedback=submit('tell');await losePost();
  check(question.id!==feedback.id,'Ask and Tell use different request IDs');
  const retry=submit('question');
  check(retry.id===question.id && retry.token===question.token,'an exact Ask retry keeps its signature');
- finishPost({item_state:'Working',parked:'false'});await flush();
+ await finishPost({item_state:'Working',parked:'false'});
  check(words.value==='' && ask.disabled,'a saved question clears the box');
 ''')
 
@@ -4363,7 +4406,7 @@ observer.observe(original.parentNode,{childList:true});
  form.elements.words.value='Which check passed?';
  submit('question');
  check(!row.hidden,'The row stays in All until the save succeeds');
- finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
+ await finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});
  check(!row.hidden,'The saved row stays in All.');
  check(row.querySelector('[data-open-question-note]').getClientRects().length &&
   row.querySelector('.list-state').textContent==='Waiting for nate','The note appears below the saved state.');
@@ -4398,9 +4441,8 @@ observer.observe(original.parentNode,{childList:true});
  show('parked');
  const chip=document.querySelector('[data-filter-row="show"] [data-filter-value="parked"]');
  submit('unpark');
- finishPost({parked:'true',parked_until:'Nov 26 00:00 EST',waiting_for_answer:'true',
+ await finishPost({parked:'true',parked_until:'Nov 26 00:00 EST',waiting_for_answer:'true',
   open_question:'true',unpark_outcome:'cleared_newer_parking_active'});
- await flush();
  check(!row.hidden && chip.dataset.filterCount==='1','The newer parking keeps the waiting item in Parked.');
  check(row.querySelector('[data-waiting-note]') && row.dataset.waitingForAnswer==='true',
   'The parked row shows that the producer will answer.');
@@ -4417,8 +4459,7 @@ observer.observe(original.parentNode,{childList:true});
  check(!row.hidden && chip.dataset.filterCount==='1','Parked includes the item before the question.');
  unpark.focus();
  submit('unpark');
- finishPost({parked:'false',parked_until:'',waiting_for_answer:'true',open_question:'true',unpark_outcome:'cleared'});
- await flush();
+ await finishPost({parked:'false',parked_until:'',waiting_for_answer:'true',open_question:'true',unpark_outcome:'cleared'});
  check(row.hidden && chip.dataset.filterCount==='0','The waiting item leaves Parked and its count.');
  check(document.activeElement===chip,'The Parked filter receives focus.');
  check(!status.hidden && status.textContent==='Item #1 unparked.',
@@ -4439,12 +4480,12 @@ observer.observe(original.parentNode,{childList:true});
  show('working');
  const remove=submit('remove');
  check(row.hidden,'Remove immediately hides the row in Working');
- losePost();await flush();
+ await losePost();
  check(!row.hidden && row.dataset.state==='Working','the lost response restores the Working row');
  await finishRowMotion();
  check(submit('remove').id===remove.id,'the exact Remove retry uses the same ID');
  show('blocked');
- finishPost({reason:'Fixture refuses Remove'});await flush();
+ await finishPost({reason:'Fixture refuses Remove'});
  const hiddenStatus=document.querySelector('[data-hidden-action-status]');
  check(row.hidden && hiddenStatus.getClientRects().length>0 &&
   hiddenStatus.textContent==='Item 1: Not saved: Fixture refuses Remove',
@@ -4461,23 +4502,29 @@ observer.observe(original.parentNode,{childList:true});
     def test_browser_reads_the_saved_item_after_a_lost_park_or_remove_response(self) -> None:
         self.browser_action_sequence('''
  show('working');
- let finishReadback,readKey;
- readback=key=>{readKey=key;return new Promise(resolve=>{finishReadback=resolve;});};
+ const loseAndRead=async()=>{
+  let readStarted;
+  const started=new Promise(resolve=>{readStarted=resolve;});
+  readback=key=>new Promise(resolve=>readStarted({key,reply:resolve}));
+  const saved=losePost();
+  return {...await started,saved};
+ };
  form.elements.until.value='2026-12-03';
  const park=submit('park');
- losePost();await flush();
- check(row.hidden && readKey===row.dataset.key,'Park waits for the current item before restoring the row.');
- finishReadback({item_state:'Working',unread:'true',parked:'true',parked_until:'Dec 3 00:00 EST',park_request_saved:true});
- await flush();
+ const parkRead=await loseAndRead();
+ check(row.hidden && parkRead.key===row.dataset.key,'Park waits for the current item before restoring the row.');
+ parkRead.reply({item_state:'Working',unread:'true',parked:'true',parked_until:'Dec 3 00:00 EST',park_request_saved:true});
+ await parkRead.saved;
  check(row.hidden,'The saved Park stays out of Working.');
  show('parked');
  check(!row.hidden && row.querySelector('[data-parked-note]').textContent==='Parked until Dec 3 00:00 EST',
   'Parked shows the saved parking time.');
  check(submit('park').id===park.id,'The exact Park retry uses the original request ID.');
- finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST'});await flush();
- submit('remove');losePost();await flush();
- finishReadback({item_state:'Closed',unread:'false',parked:'true',parked_until:'Dec 3 00:00 EST'});
- await flush();
+ await finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST'});
+ submit('remove');
+ const removeRead=await loseAndRead();
+ removeRead.reply({item_state:'Closed',unread:'false',parked:'true',parked_until:'Dec 3 00:00 EST'});
+ await removeRead.saved;
  show('all');
  check(row.hidden && row.dataset.state==='Closed','The saved Remove stays closed after readback.');
 ''', reduced_motion=True)
@@ -4494,7 +4541,9 @@ observer.observe(original.parentNode,{childList:true});
  };
  const park=submit(PARK_ACTION);
  check(row.hidden,'The pending park hides the row from Working.');
- losePost();await flush();
+ const replaced=waitForRefresh();
+ await losePost();
+ await replaced;
  check(readRequest===park.id,'The item read uses the original request ID.');
  const refreshed=document.querySelector('[data-number="1"]');
  check(refreshed!==row && !refreshed.hidden && refreshed.dataset.parked==='false',
@@ -4523,13 +4572,13 @@ observer.observe(original.parentNode,{childList:true});
  form.elements.until.value='2026-12-03';
  const park=submit(action);
  check(!isLinked(),'Park releases the link at submission.');
- losePost();await flush();
+ await losePost();
  check(isLinked()===!saved,'Only a missing receipt restores the link.');
  if(!saved){
   check(row.querySelector('[data-parked-note]').textContent==='Parked until '+previous,
    'The restored row shows the previous saved parking time.');
   check(submit(action).id===park.id,'The restored row keeps the exact Park request ID.');
-  finishPost({reason:'Fixture refuses Park'});await flush();
+  await finishPost({reason:'Fixture refuses Park'});
  }
 '''.replace('PARK_RECEIPT', json.dumps(saved)).replace('PARK_ACTION', json.dumps(action)),
                                                  reduced_motion=True, add_item=False)
@@ -4547,10 +4596,10 @@ observer.observe(original.parentNode,{childList:true});
  check(original>0 && first()==='1','the newest unread item sorts first');
  submit('remove');
  check(updateKey()===0 && first()==='2','a pending Remove sorts as read');
- finishPost({reason:'Fixture refuses Remove'});await flush();
+ await finishPost({reason:'Fixture refuses Remove'});
  check(updateKey()===original && first()==='1','a refusal restores the exact Update sort key');
  submit('remove');
- finishPost({item_state:'Closed',parked:'false',unread:'false'});await flush();
+ await finishPost({item_state:'Closed',parked:'false',unread:'false'});
  check(updateKey()===0 && first()==='2','a confirmed Remove sorts as read without a refresh');
 """, reduced_motion=True)
 
@@ -4571,11 +4620,11 @@ observer.observe(original.parentNode,{childList:true});
  if(!exit) throw new Error('Remove must animate the exit.');
  exit.pause();exit.currentTime=exit.effect.getTiming().duration/2;
  check(row.hidden && updateKey()===0 && first()==='2','Remove clears the Update key during the exit');
- finishPost({reason:'Fixture refuses Remove'});await flush();
+ await finishPost({reason:'Fixture refuses Remove'});
  const restore=animation();
  check(!row.hidden && restore && restore!==exit,'the refusal reverses the exit animation');
  check(updateKey()===original && first()==='1','the restored Update key puts the row first');
- restore?.finish();await flush();
+ if(restore) await finishAnimations([restore]);
  check(!animation() && first()==='1','the correct order remains after the animation');
 """)
 
@@ -4586,7 +4635,7 @@ observer.observe(original.parentNode,{childList:true});
  const updateKey=()=>JSON.parse(row.dataset.sortValues)[7];
  check(updateKey()>0 && row.querySelector('.list-dot'),'the item starts unread');
  submit('remove');
- finishPost({item_state:'Closed',unread:'false'});await flush();
+ await finishPost({item_state:'Closed',unread:'false'});
  check(row.dataset.state==='Closed' && row.dataset.unread==='false','the Closed item is read');
  check(updateKey()===0,'the Closed item has a zero Update key');
  check(!row.querySelector('.list-dot') && !form.querySelector('[value="read"]'),
@@ -4632,11 +4681,11 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_action_sequence("""
  const original=JSON.parse(row.dataset.sortValues)[7];
  submit('remove');await finishRowMotion();
- losePost();await flush();await finishRowMotion();
+ await losePost();await finishRowMotion();
  check(!row.hidden && row.dataset.unread==='true','a lost Remove restores the unread update.');
  form.elements.until.value='2026-12-03';
  submit('park');
- finishPost({reason:'Fixture refuses Park'});await flush();
+ await finishPost({reason:'Fixture refuses Park'});
  show('all');onlyUnread();
  check(!row.hidden && row.dataset.state==='Working','the refusal returns the Working row to Unread');
  check(row.querySelector('.list-dot') && form.querySelector('[value="read"]'),
@@ -4666,9 +4715,9 @@ observer.observe(original.parentNode,{childList:true});
  const opacity=Number(getComputedStyle(exit.effect.target).opacity);
  check(opacity>0 && opacity<1,'the row fades before it disappears');
  check(top(next)<start && top(next)>first,'the next row moves up during the fade');
- exit.finish();await flush();
+ await finishAnimations([exit]);
  check(!motion() && Math.abs(top(next)-first)<2,'the next row ends in the removed row position');
- finishPost({reason:'Fixture refuses Remove'});await flush();
+ await finishPost({reason:'Fixture refuses Remove'});
  const restored=motion()?.getAnimations({subtree:true})[0];
  check(!row.hidden && restored,'the refusal restores the row with an animation');
  if(!restored) throw new Error('No restore animation');
@@ -4676,11 +4725,11 @@ observer.observe(original.parentNode,{childList:true});
  check(top(next)<start && top(next)>first,'the next row moves down during restore');
  form.requestSubmit(form.querySelector('[value="remove"]'));
  check(!row.hidden && requests.length===1,'A second Remove during the fade sends no POST.');
- restored.finish();await flush();
+ await finishAnimations([restored]);
  submit('remove');
  await finishRowMotion();
  check(!motion() && Math.abs(top(next)-first)<2,'Remove works after the fade ends.');
- finishPost({item_state:'Closed',unread:'false'});await flush();
+ await finishPost({item_state:'Closed',unread:'false'});
  show('all');
  check(row.hidden && !motion(),'a filter change keeps the Closed item hidden');
 """)
@@ -4698,7 +4747,7 @@ observer.observe(original.parentNode,{childList:true});
  check(row.hidden,'Remove hides the item before the response');
  check(Boolean(document.querySelector('[data-record-motion]'))===!reduced,
   'only the full motion setting animates the exit');
- finishPost({reason:'Fixture refuses Remove'});await flush();
+ await finishPost({reason:'Fixture refuses Remove'});
  check(!row.hidden,'the refusal restores the row');
  check(Boolean(document.querySelector('[data-record-motion]'))===!reduced,
   'only the full motion setting animates the restoration');
@@ -4713,7 +4762,7 @@ observer.observe(original.parentNode,{childList:true});
  const motion=()=>document.querySelector('[data-record-motion]')?.getAnimations({subtree:true})[0];
  const read=submit('read'),firstExit=motion();
  check(row.hidden && firstExit,'Mark read starts the fade before the response');
- losePost();await flush();
+ await losePost();
  const restored=motion();
  check(!row.hidden && restored && restored!==firstExit,'a lost Mark read response slides the row back');
  check(form.querySelector('[data-send-status]').textContent==='Save not confirmed: Fixture lost response',
@@ -4721,14 +4770,14 @@ observer.observe(original.parentNode,{childList:true});
  await finishRowMotion();
  check(!form.querySelector('[value="read"]').disabled,'the restored item can retry Mark read');
  check(submit('read').id===read.id,'the exact Mark read retry uses the same ID');
- finishPost({unread:'true'});await flush();
+ await finishPost({unread:'true'});
  check(!row.hidden && row.dataset.unread==='true','a newer unread update returns the row to Unread');
  await finishRowMotion();
  form.elements.words.value='Send the update.';
  form.elements.words.dispatchEvent(new Event('input'));
  submit('tell');
  check(row.hidden && motion(),'Tell morty starts the fade before the response in Unread');
- finishPost({unread:'false'});await flush();
+ await finishPost({unread:'false'});
  check(row.hidden,'Tell morty keeps the row outside Unread after confirmation');
 """, add_item=False)
 
@@ -4759,11 +4808,9 @@ observer.observe(original.parentNode,{childList:true});
    action+' starts the fade in the same table before the response.');
   if(section) check(!section.hidden,'The linked section stays visible during its fade.');
   const parked=action==='park' || row.dataset.parked==='true';
-  finishPost({unread:action==='read' ? 'false' : 'true',parked:String(parked),
+  await finishPost({unread:action==='read' ? 'false' : 'true',parked:String(parked),
    parked_until:parked ? 'Dec 3 00:00 EST' : ''});
-  await flush();
-  for(const animation of document.getAnimations()) animation.finish();
-  await flush();
+  await finishAnimations(document.getAnimations());
   check(row.hidden===(action==='read') && linked.hidden,
    action+' uses the saved unread state to show or hide the row in the main table.');
   check(!history.state.recordTable.linkedItem,'The action releases the link.');
@@ -4793,7 +4840,7 @@ observer.observe(original.parentNode,{childList:true});
  form.elements.words.dispatchEvent(new Event('input'));
  submit('question');
  check(row.hidden,'Ask question starts the fade before the response in Unread');
- finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
+ await finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});
  check(row.hidden && row.dataset.unread==='false','the saved question keeps the row outside Unread');
  onlyUnread(false);show('working');
  check(row.hidden && row.dataset.unread==='false' && !row.querySelector('.list-dot') && !form.querySelector('[value="read"]'),
@@ -4820,7 +4867,7 @@ observer.observe(original.parentNode,{childList:true});
  form.querySelector('[value="question"]').focus();
  submit('question');
  if(destination==='user selection') all.focus();
- finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
+ await finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});
  const expected=destination==='same row' ? row.querySelector('.list-toggle') :
   destination==='next row' ? next : destination==='empty view' ? search : all;
  check(document.activeElement===expected,'The browser keeps focus at '+destination);
@@ -4994,12 +5041,12 @@ window.fetch=async(_url,options)=>{
  check(row.hidden,'The row leaves Unread during the request');
  ask.blur();
  check(document.activeElement===document.body,'The browser has no focused control while Ask is disabled');
- losePost();await flush();
+ await losePost();
  check(!row.hidden && !ask.disabled && document.activeElement===ask,'The restored Ask button has focus');
  submit('question');
  const search=document.getElementById('list-search');
  search.focus();
- finishPost({reason:'The POST was refused'});await flush();
+ await finishPost({reason:'The POST was refused'});
  check(document.activeElement===search,'A failed request preserves the focus the user chose');
 """, reduced_motion=True)
 
@@ -5015,14 +5062,14 @@ window.fetch=async(_url,options)=>{
  ask.focus();
  submit('question');
  ask.blur();
- losePost();await flush();
+ await losePost();
  const spacer=document.querySelector('[data-record-motion]');
  const animation=spacer?.getAnimations({subtree:true})[0];
  check(animation && getComputedStyle(row).display==='none','The row is still hidden by the animation');
  if(!animation) throw new Error('The restored row must animate.');
  const search=document.getElementById('list-search');
  if(USER_SELECTS_SEARCH) search.focus();
- animation.finish();await flush();
+ await finishAnimations([animation]);
  check(!row.hidden && !ask.disabled,'The row and Ask button are available');
  check(document.activeElement===(USER_SELECTS_SEARCH ? search : ask),'Focus returns only if the user did not move it');
 """.replace('USER_SELECTS_SEARCH', json.dumps(user_selects_search)), add_item=False)
@@ -5047,7 +5094,9 @@ window.fetch=async(_url,options)=>{
  ask.focus();
  submit('question');
  ask.blur();
- finishPost({unread:'false',waiting_for_answer:'false'});await flush();
+ const replaced=waitForRefresh();
+ await finishPost({unread:'false',waiting_for_answer:'false'});
+ await replaced;
  const refreshed=document.querySelector('[data-number="1"]');
  check(refreshed!==row && !refreshed.hidden,'The refresh keeps the row visible');
  check(document.activeElement===refreshed.querySelector('.list-toggle'),'The row toggle keeps focus through refresh');
@@ -5069,7 +5118,9 @@ window.fetch=async(_url,options)=>{
  ask.focus();
  submit('question');
  ask.blur();
- finishPost({unread:'false',waiting_for_answer:'false'});await flush();
+ const replaced=waitForRefresh();
+ await finishPost({unread:'false',waiting_for_answer:'false'});
+ await replaced;
  const refreshed=document.querySelector('[data-number="1"]');
  check(refreshed!==row && refreshed.hidden,'The item leaves Unread and the List refreshes');
  check(document.activeElement===document.querySelector('[data-number="2"] .list-toggle'),
@@ -5091,7 +5142,9 @@ window.fetch=async(_url,options)=>{
  other.querySelector('.list-toggle').click();
  remove.focus();
  check(document.activeElement===remove,'The user selects Remove on the other item during the request');
- finishPost({unread:'false',waiting_for_answer:'false'});await flush();
+ const replaced=waitForRefresh();
+ await finishPost({unread:'false',waiting_for_answer:'false'});
+ await replaced;
  const refreshed=document.querySelector('[data-number="2"]');
  check(refreshed!==other && !refreshed.hidden,'The List refreshes the other item');
  check(document.activeElement===refreshed.querySelector('button[value="remove"]'),
@@ -5108,7 +5161,9 @@ window.fetch=async(_url,options)=>{
  form.querySelector('[value="question"]').focus();
  submit('question');
  sort.focus();
- finishPost({unread:'false',waiting_for_answer:'false'});await flush();
+ const replaced=waitForRefresh();
+ await finishPost({unread:'false',waiting_for_answer:'false'});
+ await replaced;
  const renewed=document.querySelector('[data-sort="3"]');
  check(renewed!==sort,'The List replaces the sort button during refresh');
  check(document.activeElement===renewed,'The selected column sort keeps focus');
@@ -5132,12 +5187,12 @@ window.fetch=async(_url,options)=>{
  const failFirst=finishPost;
  second.querySelector('.list-toggle').click();
  ask(second.querySelector('form'));
- failFirst({reason:'The save failed'});await flush();
+ await failFirst({reason:'The save failed'});
  const returning=row.nextElementSibling.getAnimations({subtree:true})[0];
  check(!row.hidden && !row.querySelector('.list-toggle').getClientRects().length,
   'The first row returns but its animation still hides its toggle');
  returning.pause();
- finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
+ await finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});
  check(document.activeElement===document.getElementById('list-search'),
   'Search receives focus because neither row has an available toggle');
  returning.finish();
@@ -5156,7 +5211,7 @@ window.fetch=async(_url,options)=>{
  submit('question');
  nav.focus();
  check(!document.hasFocus() && parent.document.activeElement===nav,'The user focuses the console during the request');
- finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
+ await finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});
  check(!row.hidden,'The saved question stays in All.');
  check(parent.document.activeElement===nav,'The response preserves the console focus');
 """, add_item=False, reduced_motion=True, in_frame=True)
@@ -5426,6 +5481,8 @@ window.fetch=async(_url,options)=>{
                                   viewport_height: int | None = None, reload_markup: str = "",
                                   reload_console: bool = False, console_fragment: str = "",
                                   viewport_width: int | None = None) -> None:
+        if not CHROME and viewport_width is not None and viewport_width < FIREFOX_MIN_SHARED_WIDTH:
+            probe = '<img hidden src="/complete">' + probe
         page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         reloaded = reload_markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         loaded = threading.Event()
@@ -5460,6 +5517,9 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src
                     self.html_response(200, console_shell)
                 elif self.path == "/":
                     self.html_response(200, host_page)
+                elif self.path == "/complete":
+                    _ = complete.wait(TEST_HANG_GUARD_SECS)
+                    self.json_response(200, {})
                 else:
                     self.send_error(404)
                 return None
@@ -5487,9 +5547,8 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src
             try:
                 window_height = max(900, (viewport_height or 0) + 32)
                 destination = frame_url if console_fragment or viewport_width is not None else "/"
-                browser = self.browser_view(f"http://127.0.0.1:{server.server_port}{destination}",
-                                           None, viewport_width or 1280, window_height, complete)
-                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.browser_results(f"http://127.0.0.1:{server.server_port}{destination}",
+                                     viewport_width or 1280, window_height, complete)
                 self.assertEqual(results, [[]])
             finally:
                 complete.set()
@@ -5683,9 +5742,7 @@ const change=async path=>{
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                browser = self.browser_view(f'http://127.0.0.1:{server.server_port}/proof',
-                                            None, 1440, 900, complete)
-                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.browser_results(f'http://127.0.0.1:{server.server_port}/proof', 1440, 900, complete)
                 self.assertEqual(results, [[]])
             finally:
                 complete.set()
@@ -5715,10 +5772,12 @@ window.fetch=async(path,options={})=>{
   return {ok:true,text:async()=>refreshMarkup};
  }
  requests.push(new URLSearchParams(options.body));
+ const form=submittedForm;
  return new Promise((resolve,reject)=>{
-  losePost=()=>reject(new Error('Fixture lost response'));
-  finishPost=result=>resolve({ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
-   json:async()=>({unread:'true',...result})});
+  losePost=()=>respondToSave(form,()=>reject(new Error('Fixture lost response')));
+  finishPost=result=>respondToSave(form,()=>resolve({
+   ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),json:async()=>({unread:'true',...result})
+  }));
  });
 };
 </script>'''
@@ -5739,12 +5798,8 @@ window.fetch=async(path,options={})=>{
   addEventListener('hashchange',resolve,{once:true});
   location.hash=new URLSearchParams(params);
  });
- const flush=()=>new Promise(resolve=>requestAnimationFrame(resolve));
- const finishRowMotion=async()=>{
-  const motions=document.querySelectorAll('[data-record-motion]');
-  for(const motion of motions) for(const animation of motion.getAnimations({subtree:true})) animation.finish();
-  await flush();
- };
+ const finishRowMotion=()=>finishAnimations(
+  [...document.querySelectorAll('[data-record-motion]')].flatMap(motion=>motion.getAnimations({subtree:true})));
  for(const item of document.querySelectorAll('[data-list-item]')) itemSnapshots.set(item.dataset.key,{
   item_state:item.dataset.state,parked:item.dataset.parked,unread:item.dataset.unread,
   unread_sort:JSON.parse(item.dataset.sortValues)[7],open_question:item.dataset.openQuestion,
@@ -5767,7 +5822,7 @@ window.fetch=async(path,options={})=>{
                         reduced_motion: bool = False,
                         window_size: tuple[int, int] | None = None, in_frame: bool = False) -> None:
         page = self.root / 'actions.html'
-        _ = page.write_text(markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
+        _ = page.write_text(markup.replace('<head>', '<head>' + WATCH_ACTIONS + setup, 1).replace('</body>', probe + '</body>'))
         if in_frame:
             page = self.root / 'actions-console.html'
             _ = page.write_text('<!doctype html><button id="console-nav">Console navigation</button>'
@@ -5988,7 +6043,7 @@ window.fetch=async(_path,options={})=>{
  const before=row.dataset.unread==='true' && row.querySelector('.list-dot') && form.querySelector('[value="read"]') && !row.hidden;
  form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
  form.requestSubmit(form.querySelector('[value="ACTION"]'));
- await new Promise(resolve=>requestAnimationFrame(resolve));
+ await waitForSave(form);
  const cleared=row.dataset.unread==='false' && !row.querySelector('.list-dot') && !form.querySelector('[value="read"]') && row.hidden;
  const retained=row.dataset.unread==='true' && row.querySelector('.list-dot') && form.querySelector('[value="read"]') && !row.hidden;
  const after=EXPECTED_UNREAD ? retained : cleared;
@@ -6002,7 +6057,7 @@ window.fetch=async(_path,options={})=>{
                                       ("tell", "true", "sent to morty; update remains unread")):
             with self.subTest(action=action, unread=unread):
                 page = self.root / f"{action}-{unread}.html"
-                _ = page.write_text(markup.replace('<head>', '<head>' + setup.replace('UNREAD', unread), 1).replace('</body>',
+                _ = page.write_text(markup.replace('<head>', '<head>' + WATCH_ACTIONS + setup.replace('UNREAD', unread), 1).replace('</body>',
                     probe.replace('ACTION', action).replace('NOTICE', notice).replace('EXPECTED_UNREAD', unread) + '</body>'))
                 result = self.chrome().probe(page, "probe-result")
                 self.assertEqual(result, "PASS",
@@ -6136,9 +6191,18 @@ window.fetch=async(_path,options={})=>{
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the shared status layout check")
     def test_shared_page_status_uses_the_real_list_loader(self) -> None:
         _ = self.fixture_items()
-        assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
 
-    @unittest.skipUnless(LIST_BROWSER, "Chrome or Firefox is required for browser checks")
+        def screenshot(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            path = Path(arguments[arguments.index("--screenshot") + 1])
+            width, height = map(int, arguments[arguments.index("--window-size") + 1].split(","))
+            with self.browser_page(arguments[-1], width, height, firefox_only=True) as browser:
+                browser.screenshot(path)
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+
+        with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
+            assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the viewport layout check")
     def test_browser_sort_filters_hash_refresh_open_rows_and_phone_cards(self) -> None:
         _ = self.fixture_items()
         self.browser()
@@ -6273,7 +6337,7 @@ window.fetch=async(_path,options={})=>{
  if(options.method==='POST'){
   const fields=new URLSearchParams(options.body);posts.push(fields);
   if(realFeedback){
-   const result=await nativeFetch('/feedback',options);
+   const result=await nativeFetch('CASE_PATH/feedback',options);
    if(loseResponse){loseResponse=false;throw new Error('fixture lost response');}
    return result;
   }
@@ -6289,7 +6353,7 @@ window.fetch=async(_path,options={})=>{
   return result;
  }
  reads.push(1);if(failRefresh) throw new Error('fixture refresh failed');
- if(realFeedback) return await nativeFetch('/fresh');
+ if(realFeedback) return await nativeFetch('CASE_PATH/fresh');
  return {ok:true,status:200,text:async()=>original};
 };
 addEventListener('error',event=>errors.push(event.message));
@@ -6408,7 +6472,7 @@ try{
  check(shown.left>=0 && shown.right<=innerWidth && document.documentElement.scrollWidth<=innerWidth,
        'The count fits without horizontal overflow.');
  if(innerWidth>=960){
-  check(bounds(document.querySelector('main')).width===Math.min(1124,bounds(document.body).width),
+  check(bounds(document.querySelector('main')).width===Math.min(1124,document.documentElement.clientWidth),
         'The desktop uses the available width up to the shared limit.');
   for(const header of document.querySelectorAll('[data-sort]')){
    const label=document.createRange();label.selectNodeContents(header.firstChild);
@@ -6679,24 +6743,32 @@ try{
   check(cell('106','Producer').display==='none','a phone card leaves out the keeper as producer');
  }
 }catch(error){failed.push(String(error));}
-await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...errors])});
+await nativeFetch('CASE_PATH/results',{method:'POST',body:JSON.stringify([...failed,...errors])});
 })();</script>'''
         for name, identity in (("OWNER", OWNER.id), ("DWIGHT", DWIGHT.id), ("MORTY", MORTY.id), ("OTHER", OTHER.id)):
             probe = probe.replace(name, json.dumps(identity))
         for width in (1440, 961, 390):
             with self.subTest(width=width):
+                prefix = "/" + uuid4().hex
                 for identity in ("L105", "L106"):
                     _ = the_list.update(MORTY.id, identity,
                         {"latest_status": f"The fixture uses a width of {width} pixels."}, source="morty")
                 markup = list_page.render(self.root / "reviews").decode()
-                setup_for_width = setup.replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
-                probe_for_width = probe.replace('FIXTURE_WIDTH', str(width))
+                setup_for_width = setup.replace('CASE_PATH', prefix).replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
+                probe_for_width = probe.replace('CASE_PATH', prefix).replace('FIXTURE_WIDTH', str(width))
                 page = markup.replace('<head>', '<head>' + setup_for_width, 1).replace('</body>', probe_for_width + '</body>').encode()
                 root = self.root / "reviews"
                 results: list[list[str]] = []
                 complete = threading.Event()
+                host = (f'<iframe style="border:0;width:100vw;height:100vh" src="{prefix}/page"></iframe>'
+                        + f'<img hidden src="{prefix}/complete">').encode()
 
                 class Probe(BaseHTTPRequestHandler):
+                    result_rows: ClassVar[list[list[str]]] = results
+                    result_event: ClassVar[threading.Event] = complete
+                    probe_page: ClassVar[bytes] = page
+                    host_page: ClassVar[bytes] = host
+
                     def do_GET(self) -> None:
                         self.send_response(200)
                         self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -6704,9 +6776,9 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                         if self.path == '/fresh':
                             _ = self.wfile.write(list_page.render(root).decode().encode())
                         elif self.path == '/complete':
-                            _ = complete.wait(40)
+                            _ = self.result_event.wait(40)
                         else:
-                            _ = self.wfile.write(page if self.path == '/page' else b'<iframe style="border:0;width:100vw;height:100vh" src="/page"></iframe><img hidden src="/complete">')
+                            _ = self.wfile.write(self.probe_page if self.path == '/page' else self.host_page)
 
                     def do_POST(self) -> None:
                         if self.path == '/feedback':
@@ -6720,8 +6792,11 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                             self.end_headers()
                             _ = self.wfile.write(json.dumps(result).encode())
                             return
-                        results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                        complete.set()
+                        if self.path != '/results':
+                            self.send_error(404)
+                            return
+                        self.result_rows.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                        self.result_event.set()
                         self.send_response(204)
                         self.end_headers()
 
@@ -6729,12 +6804,11 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                     def log_message(self, format: str, *args: object) -> None:
                         pass
 
-                with self.probe_server(Probe) as server:
+                with self.probe_server(prefix, Probe) as server:
                     try:
                         with patch.object(change_page, "send_to_staff") as sends:
-                            done = self.browser_view(f'http://127.0.0.1:{server.server_port}/',
-                                                     None, width, 900, complete)
-                            self.assertEqual(done.returncode, 0, done.stderr)
+                            self.browser_results(f'http://127.0.0.1:{server.server_port}{prefix}/',
+                                                 width, 900, complete, firefox_only=True)
                             self.assertEqual(results, [[]])
                             sends.assert_called_once()
                     finally:
