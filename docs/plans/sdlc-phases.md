@@ -1674,6 +1674,23 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Fixture sessions only: sends to `uds:`, `session:`, a registry name and an URGENT text are refused with the send.py line. A helper name and a bad payload pass. The receiver block carries `suppressOriginalPrompt`. A session start during an open hold delivers nothing. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 96 — A models.conf writer leaves no temp file  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** sdlc, 12:52 EST Nov 20: 11 partial `config/models.conf.XXXXXX` files (4096 bytes, Nov 14) stayed in `config/`. The writers must remove the temp file on every failure path. Name: tempclean.
+**Spec:**
+1. `scripts/agents/models_config.sh` (the five `mktemp` writers) and `scripts/agents/sync_codex_catalog.sh` (two `mktemp` sites) leave no temp file when awk fails, the store fails, or the process gets a stop signal.
+2. A sourced function never replaces its caller's traps.
+3. A test makes each write fail and finds no temp file in the config folder.
+**Files:** the two scripts, `scripts/agents/test_models_config.sh`, `scripts/agents/test_sync_codex_catalog.sh`, `scripts/agents/test_models_conf_publish.py`.
+**Acceptance gate:** targeted tests of the two scripts pass; shellcheck clean on the changed scripts.
+
+**Workers:** 1 writer.
+
+**Order:** writes and reviews now; tests run in the next test slot after the phase 91 and 93 gates.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
