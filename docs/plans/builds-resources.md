@@ -2741,7 +2741,8 @@ The cutover removal commit deletes the script after the run.
 
 **Files:** `scripts/lib/cargo_seed.py`, `scripts/lib/test_cargo_seed.py`, `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`, `scripts/worktree/worktrees.py`, `scripts/worktree/test_worktrees.py`, `config/build_folders.conf`.
 
-### Phase 145 — A test step with no test history gives back its build reservation once tests run  · status: held
+### Phase 145 — A test step with no test history gives back its build reservation once tests run  · status: dropped
+**Dropped:** builds, 2026-11-20 07:48 EST. The replay showed about 1% less mean wait; the gain does not pay for the code. No code went to main.
 
 Builds assigned this on 11-18 (List item 78): it is the cause of the one-build natedev line at 00:33 EST. A nextest step with matching test history already falls to its test-phase charge when the sampler sees the test phase. A step with no matching history keeps its full build need until it ends (Nov 17: 11.85 GiB reserved, 0.17 GiB test peak).
 
@@ -3074,6 +3075,17 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - Module test: 368 tests pass with both layouts.
 - Blind review: 6 findings; 2 fixed in the row; 4 go to the next phase (growth alert keys, message limits, `sweep_proc_locks_reads`, `sweep_dep_info_head_bytes`).
 
+### Phase 173 — No test depends on a live tuned value (item 149)  · status: in progress
+**Source:** List item 149, producer bob, go 2026-11-19 17:06 EST through builds. Base main b4e705f34. Same class as the 2026-11-16 order ("fix the class, not the instance").
+
+#### Work Order
+1. In a test run, `write_config_fixture` and `config_environment` (`scripts/lint/memory_test_support.py`) give each inherited numeric key with a `# whole:` or `# range:` bound a different value inside that bound. A test's own settings stay as written.
+2. A failing test prints the shifted keys that it read.
+3. Add a wide bound line to each true quantity among the 39 numeric keys with no bound. Values do not change. Identifiers stay unbound and unshifted.
+4. Repair `test_sweep.py` F002, F004, F005, F006.
+5. One full suite run on natemerge's word gives the offender count and the added time. Repair the offenders in this phase.
+6. bob gets the bound list, the offender count, the added time (tell him before the merge if over 1%) and the time on main.
+
 ### Phase 177 — The folder audit never scans or removes a home folder  · status: done
 **Source:** builds, URGENT, 2026-11-19 20:24 EST. The audit removed top-level home folders on natedev (11-17) and on the Mac (11-18, 11-19). Row `e59e277e4` on main `f5eb6c184`.
 
@@ -3083,6 +3095,61 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - A test runs the real scan-root list of `main()` against a fixture home.
 - Row tests: 4 modules, both layouts, green. Blind review: 7 findings, all repaired.
 - The audit stays off. Re-arm needs the fix on main and nate's word.
+
+### Phase 143s — The ~/worktrees settings row (item 143)  · status: done
+**Source:** builds, 2026-11-20 10:35 EST: the merge checkpoint needs a review trial line for settings commit `1c76e231d`. nate approved the two values via bob (2026-11-19 about 20:10 EST) and gave natemerge his direct yes (2026-11-20).
+
+#### Work Order
+1. One read-only review of `1c76e231d` (two lines in `settings.json`): `permissions.additionalDirectories` and `sandbox.filesystem.allowWrite` name `~/worktrees` beside `~/rust`.
+
+### Phase 180 — AWS local folder removal under the item 152 rules  · status: in progress
+**Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Survey rows in phases/178/survey_reply.txt (180 rows). aws gets the lines first (sent 2026-11-20 10:3x).
+
+#### Work Order
+1. `gate_box.py:92-93`: before each reset and clean, the checkout is exactly `<GATE_BOX_DIR>/<variant>`, with no link in its path, and Git's top level equals it. Else the round fails.
+2. `gpu_size_trial.py:460`: previous trials (an earlier run) stay, with the kept line. Current-run removals stay, with a check that the path is below the current run folder.
+3. `gpu_size_trial.py:403` `remove_path`: refuses a directory where the payload expects a file.
+4. `teardown.py:508` `remove_gate_images` (called from `deploy.py:2514, 3462`): an explicit command; it checks that the state directory resolves with no link and that `gate-image` is a direct child and not a link. Else it keeps the folder with the kept line.
+5. No change to `cloud_gate.py` or to cloud deletions: their authority is the cloud resource id.
+
+### Removals to arm again (item 152)
+Each removal below is off until the bubblewrap proof is on main and nate gives his word (nate, 2026-11-19 20:42 EST). Until then, the folders stay on disk for a manual removal with `removal_guard.py remove --list <file> --sha256 <hash>`.
+
+1. Phase 178: the tmp sweep, the build sweep (`sweep.py`) and `gate_folders_delete.py` write a list and remove nothing.
+2. Phase 177: the folder audit stays off.
+3. Phase 181: six sites keep a folder from an earlier run and print the kept line (merge gate recovery, the Mac lint-copy return, Hana shot shutdown, scratch task end, selection capture, session end).
+4. Phase 180: `gpu_size_trial.py:460` `new_trial` keeps earlier trial folders. At the re-arm it removes them again, with a marker file check that prepare writes (aws, 2026-11-20 10:15 EST; bob, 10:16 EST).
+5. The masked timers: disk-floor, tmp sweep, folder-audit, transcript-retention, tmpfiles-clean.
+
+### Phase 178 — One removal guard: the guard and the sweeps (item 152)  · status: in progress
+**Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Every tool that removes folders calls one guard. It refuses a path not below a declared "can be made again" root, a folder with an unknown maker, and a root taken from a computed parent.
+
+#### Work Order
+1. `scripts/lib/removal_guard.py`: the one guard. The mount check of `build_folders.may_remove_folder_tree` moves into it.
+2. One new config key per host declares the roots (working name `removal.roots`; the name goes to nate).
+3. Callers in this phase: tmp sweep, build sweep (`sweep.py`), `gate_folders_delete.py`, and the folder audit after phase 177 is on main.
+4. One test per tool: the tool runs against a fixture home folder, and nothing in it is removed.
+5. Phases 179 (worktree removal, copies and slots, Mac cleanup) and 180 (AWS cleanup) follow. No rmtree tool is armed again or added without bob's word.
+
+### Phase 174 — Build folders track A: the form API and the worktree tool (item 143)  · status: in progress
+
+Source: bob accepted plan version 2 of item 143 at 17:54 EST 2026-11-19; the plan is `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/item143/plan.md`. Rules: `~/rust/hanadocs/bob/designs/build-folders/rules.md`.
+
+Work Order:
+1. Part 1: the form API in `scripts/lib/build_folders.py` and the new keys in `config/build_folders.conf`.
+2. Part 2: `worktrees.py make <repo> <unit> <short-name>`, the `target` link, the cargo front repair and rule 20 check, removal (rule 27), retirement (rule 28), the unit name checks, the three other makers.
+3. Part 3: the worktree move pass, old-path links, the staff path update, the transcript check, the settings lines.
+4. The main worktree of a unit or a style production has the short name `worktree` (`~/worktrees/<repo>/<unit>/worktree`, branch `<unit>-worktree`). It replaces `director` and `production`. nate, via bob, 21:54 and 21:56 EST 2026-11-19.
+
+### Phase 175 — Build folders track B: copies, the 2-day pass and the slot keys (item 143)  · status: in progress
+
+natest answered 17:59 EST (no conflict, bob reading). Work Order: plan section 6, track B, and the stall watch interface agreed with devtools 18:04 EST.
+
+### Phase 176 — Build folders track C: the other makers and the path lookups (item 143)  · status: in progress
+
+Work Order:
+1. Part 1: the call map (read-only).
+2. Part 2: the code of V6 and V13 and the path lookups of plan section 4a item 9, on the part 1 API.
 
 ### Phase 181 — The five worst removal sites refuse a path outside their own form (item 152)  · status: done
 **Source:** bob, item 152, 2026-11-19 21:03 EST; the five most severe sites of the 178 removal survey. Row `1f4c4a055` on main `f5eb6c184`.
