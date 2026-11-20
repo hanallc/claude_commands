@@ -826,6 +826,8 @@ The gate ranks deployed types and public zones by the expected USD per run befor
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 A normal gate uses natedev after all capacity choices refuse.
+With `enabled=off` in `cloud_gate.conf`, the route sends merge gates and targeted tests to natedev.
+For each request, the route reads this setting before it reads deployment state or calls AWS.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.
@@ -862,6 +864,17 @@ Reconciliation and the expiry sweep retain their existing end times.
 Results include `kernel_boot_at` from `/proc/stat` and `user_data_started_at` from the first user data command.
 Each timestamp is a UTC epoch time from the box.
 Results include `instance_running_at` when a cached instance identity document supplies `pendingTime`.
+The gate box gets `packages` from `config/cloud_gate.conf` at the deployment host's locked nixpkgs revision.
+The list includes bubblewrap.
+Before `guest.py` starts, the boot script runs `bwrap --ro-bind / / true` as `gate-trial`.
+Success writes `stage=bwrap ready` to the boot log.
+Failure reports that bwrap or unprivileged user namespaces do not work for `gate-trial`.
+The boot log and the boot error record include this reason.
+A failed check prevents the gate box from running tests.
+The production EXIT handler attempts to send any boot error before it requests poweroff.
+The handler requests poweroff and keeps the boot session exit status even if it cannot write the boot error record.
+Cloud gates and paired trials use this boot script.
+GPU size trials use their own boot script and prepared system.
 The live `gate_box.GUEST` program contains the bootstrap code.
 The bootstrap downloads or clones the candidate and verifies its requested tree.
 It prepares the environment and calls the candidate's `scripts.aws_target.gate_box.run_guest` entry point.

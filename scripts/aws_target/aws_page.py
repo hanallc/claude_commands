@@ -512,16 +512,13 @@ def output_folder() -> Path:
 
 
 def quota_help() -> str:
-    """Render the shared instructions with links to AWS settings and the case list."""
+    """Render the shared instructions with a link to the case list."""
+    link = escape(console_help.CASE_LIST_URL)
     steps: list[str] = []
     for step in console_help.QUOTA_CASE_STEPS:
-        text = escape(step)
-        for url in (console_help.SETTINGS_URL, console_help.CASE_LIST_URL):
-            link = escape(url)
-            text = text.replace(link, f'<a href="{link}">{link}</a>')
+        text = escape(step).replace(link, f'<a href="{link}">{link}</a>')
         steps.append(f'<li>{text}</li>')
-    notes = ''.join(f'\n<p>{escape(note)}</p>' for note in (console_help.WRONG_ACCOUNT, console_help.PASSKEY_NOTE))
-    return '<ol>' + ''.join(steps) + '</ol>' + notes
+    return '<ol>' + ''.join(steps) + f'</ol>\n<p>{escape(console_help.WRONG_ACCOUNT)}</p>'
 
 
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:

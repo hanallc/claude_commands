@@ -22,7 +22,7 @@ from scripts.review_links import page_frame
 
 
 class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
-    def test_quota_help_is_closed_and_contains_the_ordered_steps_and_links(self) -> None:
+    def test_quota_help_is_closed_and_contains_the_ordered_steps_and_case_link(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
         section = page.read_text().split('<section class="card" id="prices-quotas">', 1)[1].split('</section>', 1)[0]
@@ -33,17 +33,16 @@ class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
         self.assertRegex(block, r'<ol><li>.*</li></ol>')
         steps = tuple(match[1] for match in re.finditer(r'<li>(.*?)</li>', block))
         self.assertEqual(tuple(unescape(re.sub(r'<[^>]+>', '', step)) for step in steps), console_help.QUOTA_CASE_STEPS)
-        for index, url in ((0, console_help.SETTINGS_URL), (4, console_help.CASE_LIST_URL)):
-            self.assertIn(f'<a href="{url}">{url}</a>', steps[index])
-        self.assertIn(console_help.WRONG_ACCOUNT, unescape(block))
-        self.assertIn(console_help.PASSKEY_NOTE, unescape(block))
+        url = console_help.CASE_LIST_URL
+        self.assertIn(f'<a href="{url}">{url}</a>', steps[2])
+        self.assertEqual(block.count('<a href='), 1)
+        self.assertEqual(re.findall(r'<p>(.*?)</p>', unescape(block)), [console_help.WRONG_ACCOUNT])
 
     def test_quota_help_uses_the_shared_words(self) -> None:
         with (mock.patch.object(console_help, 'QUOTA_CASE_STEPS', ('Open the test console.',)),
-              mock.patch.object(console_help, 'WRONG_ACCOUNT', 'Choose the test account.'),
-              mock.patch.object(console_help, 'PASSKEY_NOTE', 'Unlock the test manager.')):
+              mock.patch.object(console_help, 'WRONG_ACCOUNT', 'Choose the test account.')):
             self.assertEqual(aws_page.quota_help(), '<ol><li>Open the test console.</li></ol>'
-                             + '\n<p>Choose the test account.</p>\n<p>Unlock the test manager.</p>')
+                             + '\n<p>Choose the test account.</p>')
 
     def test_quota_request_uses_plain_labels_when_values_are_missing(self) -> None:
         applied = aws_page.AppliedQuotaUnavailable.NOT_MEASURED

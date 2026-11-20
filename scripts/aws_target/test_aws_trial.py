@@ -30,17 +30,27 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
-from scripts.aws_target.ledger_test_support import CostFixture, install_aws_fixture_settings, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, install_aws_fixture_settings, override_fixture_settings, text_setting
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.production import merge_gate
-from scripts.lint.memory_test_support import config_environment
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment
+
+
+def write_guest_config(root: Path, *, slow_test_s: float = 1.0) -> None:
+    override_fixture_settings(root / 'cloud_gate.conf',
+        'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
+        + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux bubblewrap\n')
+    _ = (root / 'test_times.conf').write_text(
+        f'# range: 0..\nSLOW_TEST_S={slow_test_s}\n'
+        + '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
+        + '# whole: 1..\nTOP_RUNS=5\n')
 
 
 @final
@@ -49,9 +59,7 @@ class GuestTests(unittest.TestCase):
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
         install_aws_fixture_settings(root)
-        _ = (root / 'test_times.conf').write_text(
-            '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
-            + '# whole: 1..\nTOP_RUNS=5\n')
+        write_guest_config(root)
         _ = (root / 'merge_gate.conf').write_text('# range: 1..\nGATE_TIME_LIMIT_FACTOR=1.5\n')
         _ = (root / 'buildlog.conf').write_text(
             '# range: 0..\nINDEX_UNUSED_DAYS=2\n'
@@ -98,6 +106,9 @@ class GuestTests(unittest.TestCase):
             tool = root / 'fixture-tool'
             _ = tool.write_text('#!/bin/sh\nexit 0\n')
             tool.chmod(0o700)
+            bwrap = root / 'bwrap'
+            _ = bwrap.write_text('#!/bin/sh\nexit 0\n')
+            bwrap.chmod(0o700)
             basedpyright = root / 'basedpyright'
             _ = basedpyright.write_text('#!/bin/sh\necho basedpyright fixture-version\n')
             basedpyright.chmod(0o700)

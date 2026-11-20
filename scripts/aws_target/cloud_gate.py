@@ -10,7 +10,7 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
@@ -96,6 +96,11 @@ def retryable_cloud_failure(outcome: dict[str, object]) -> RetryableCloudFailure
     if status == RetryableCloudFailure.BOX:
         return RetryableCloudFailure.BOX
     return RetryableCloudFailure.NONE
+
+
+class CloudGateSwitch(StrEnum):
+    ON = 'on'
+    OFF = 'off'
 
 
 def settings() -> conf.ConfigRead:
@@ -621,15 +626,13 @@ class GateWorker:
         now = self.clock()
         max_age = policy.whole('price_max_age_seconds')
         cooldown = values.whole('capacity_cooldown_seconds')
-        days = policy.whole('run_cost_days')
-        recent = run_cost.gate_launch_history(self.book.directory, now, max(max_age, cooldown, days * 86400))
-        refused = [row for row in recent if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
+        history = run_cost.read_placement_run_history(self.book.directory, now, values, policy, self.api.region)
+        refused = [row for row in history.launch_rows
+                   if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
         zones = {(str(row.get('region', '')), str(row.get('instance_type', '')), str(row.get('availability_zone', '')))
                  for row in refused if row.get('error_code') in run_cost.ZONE_REFUSALS}
-        moment = datetime.fromtimestamp(now, UTC)
-        evidence = run_cost.run_evidence(recent, moment - timedelta(days=days), moment, self.api.region)
         cap = values.whole('max_gate_minutes')
-        eligibility = run_cost.gate_variant_eligibility(variants, self.book.directory, evidence, mode,
+        eligibility = run_cost.gate_variant_eligibility(variants, self.book.directory, history.evidence, mode,
             now=now, max_age=max_age, max_gate_minutes=cap, live_prices=live_prices)
         for (size, region), box in sorted(eligibility.slow_box_seconds.items()):
             print(f'Cloud gate skips {size} in {region}: its median gate time {run_cost.median_run_time([box])} '
@@ -654,7 +657,7 @@ class GateWorker:
             return pool in marked, full, key in zones
         if not eligibility.prices:
             return sorted(eligibility.variants, key=capacity_order)
-        pricing = run_cost.GateRunPricing.from_config(values, evidence, self.api.region, (mode,))
+        pricing = run_cost.GateRunPricing.from_config(values, history.evidence, self.api.region, (mode,))
         def order(item: tuple[int, GateLaunchVariant]) -> tuple[tuple[bool, bool, bool], bool, Decimal, int, int]:
             position, variant = item
             price = eligibility.prices.get(variant)
@@ -1213,6 +1216,8 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
+    if settings().value('enabled', CloudGateSwitch, recover_invalid=False) is CloudGateSwitch.OFF:
+        return LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')
     directory = attempt.directory
     command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'
