@@ -1259,22 +1259,20 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertIn("--timeout", command)
                     self.assertEqual(command[command.index("--timeout") + 1], "300000")
                 if proof in {"absent", "task_started"}:
-                    self.assertEqual(result, worker.ExitCode.REFUSED)
-                    self.assertEqual(len(self.agent.submitted), before)
-                    self.assertIn("compaction has no transcript proof", errors.getvalue())
-                    self.assertIn("no prompt sent", errors.getvalue())
+                    self.assertEqual(errors.getvalue().splitlines(),
+                        [f"{current.row.name}: compaction failed: compaction has no transcript proof"])
                     if proof == "absent":
                         keys.assert_called_once_with(current.pane, "ctrl-u", target=str(current.row.current_session),
                                                      expected_text="/compact")
                     else:
                         keys.assert_not_called()
                 else:
-                    self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
-                    self.assertEqual(self.agent.submitted[before:], [(current.pane,
-                        script_prompt("End your final reply with DONE compact-proof"))])
                     keys.assert_not_called()
                     if proof == "delayed":
                         self.assertEqual(order, ["compacted", "prompt"])
+                self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                self.assertEqual(self.agent.submitted[before:], [(current.pane,
+                    script_prompt("End your final reply with DONE compact-proof"))])
                 self.assertEqual(self.agent.compact_inputs[current.pane], "")
 
     def test_compaction_dispatch_returns_before_completion_and_reports_detached_failure(self) -> None:
@@ -1321,10 +1319,10 @@ class WorkerCommandTests(unittest.TestCase):
                 wait_turn_end = self.fixture.world.wait_turn_end
 
                 def finish_compaction(pane: str, timeout_ms: int) -> herdr.ObservedAgentState | herdr.WaitTimedOut:
+                    ended = wait_turn_end(pane, timeout_ms)
                     if outcome == "timeout":
                         return herdr.WaitTimedOut()
-                    ended = wait_turn_end(pane, timeout_ms)
-                    if outcome not in {"no proof", "hook write", "reply write", "notice failure"}:
+                    if outcome != "no proof":
                         with source.open("a") as stream:
                             _ = stream.write(json.dumps({"type": "compacted"}) + "\n")
                         self.agent.compact_inputs[pane] = ""
@@ -1397,6 +1395,8 @@ class WorkerCommandTests(unittest.TestCase):
                         return run_finished(owner)
 
                     with ExitStack() as failures:
+                        if outcome in {"hook write", "reply write", "notice failure"}:
+                            _ = failures.enter_context(patch.object(worker, "dispatch_turn", return_value=worker.ExitCode.REFUSED))
                         if outcome == "first staff read":
                             _ = failures.enter_context(patch.object(staff, "snapshot", side_effect=staff_read))
                         if outcome == "hook write":
@@ -1410,11 +1410,22 @@ class WorkerCommandTests(unittest.TestCase):
                         if outcome == "reply write":
                             _ = failures.enter_context(patch.object(worker, "save_reply", side_effect=OSError("reply write failed")))
                         code = worker.main(commands[0][2:])
+                        if outcome in {"no proof", "timeout"}:
+                            self.assertEqual(worker.main(commands[0][2:]), worker.ExitCode.OK)
                 if outcome in {"compacted", "timeout with proof"}:
                     self.assertEqual(code, worker.ExitCode.OK)
                     self.assertEqual(order, ["returned", "compacted", "prompt"])
                     self.assertEqual(len(self.agent.submitted), before + 1)
                     self.assertIsInstance(progress_history.active_dispatch(current.row.id, self.run_dir), progress_history.ActiveDispatch)
+                elif outcome in {"no proof", "timeout"}:
+                    self.assertEqual(code, worker.ExitCode.OK)
+                    self.assertEqual(order, ["returned", "prompt"])
+                    self.assertEqual(len(self.agent.submitted), before + 1)
+                    self.assertEqual(status.read_text(), "running\n")
+                    self.assertEqual(len(self.agent.notices), notices_before)
+                    reason = ("compaction has no transcript proof" if outcome == "no proof"
+                              else "compaction did not finish before the compaction bound")
+                    self.assertEqual(errors.getvalue().splitlines(), [f"{current.row.name}: compaction failed: {reason}"])
                 elif outcome == "no receipt":
                     self.assertEqual(code, worker.ExitCode.UNCERTAIN)
                     passed = worker_panes.worker_pass(current.row, self.run_dir)
@@ -1606,15 +1617,9 @@ class WorkerCommandTests(unittest.TestCase):
                         self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
                         result = worker.main(commands[0][2:])
                 if failure:
-                    self.assertIs(result, worker.ExitCode.REFUSED)
-                    self.assertEqual(len(self.agent.submitted), before)
-                    self.assertIn(failure, errors.getvalue())
-                    self.assertIn(f"{name}: compaction failed:", errors.getvalue())
-                    self.assertIn("no prompt sent", errors.getvalue())
-                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
-                    self.assertNotIn("prompt delivered to pane", errors.getvalue())
-                    continue
+                    self.assertEqual(errors.getvalue().splitlines(), [f"{name}: compaction failed: {failure}"])
                 self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+                self.assertEqual(len(self.agent.submitted), before + 1)
                 reopened = self.agent.submitted[-1][0]
                 self.assertNotEqual(reopened, pane)
                 self.assertEqual(self.agent.row(reopened).current_session, row.current_session)
@@ -2727,7 +2732,7 @@ class WorkerCommandTests(unittest.TestCase):
                                 _ = patches.enter_context(patch.object(worker_panes, "start_or_resume", side_effect=incomplete))
                             elif failure in ("target", "compact"):
                                 if failure == "compact":
-                                    _ = patches.enter_context(patch.object(worker, "_compact_before_dispatch", side_effect=OSError("TEST compact failed")))
+                                    _ = patches.enter_context(patch.object(worker, "_compaction_plan", side_effect=OSError("TEST compact failed")))
                                 check = cast(Callable[..., bool], herdr.check_target)
                                 def refuse(*arguments: object, **options: object) -> bool:
                                     return False if options.get("action") == "keys" and options.get("text") else check(*arguments, **options)
@@ -2759,12 +2764,12 @@ class WorkerCommandTests(unittest.TestCase):
                                     case.assertIsInstance(case.dispatch(), worker.ExitCode)
                             else:
                                 code = case.dispatch(dispatch_id="TEST-other-pass" if failure == "dispatch id" else "")
-                                case.assertEqual(code, worker.ExitCode.REFUSED if failure in ("dispatch id", "compact") else
+                                case.assertEqual(code, worker.ExitCode.REFUSED if failure == "dispatch id" else
                                                  worker.ExitCode.BUSY if failure == "busy" else worker.ExitCode.UNCERTAIN)
                         case.assertEqual(case.agent.submitted, [])
                         if failure == "compact":
-                            case.assertIn("TEST compact failed; no prompt sent", errors.getvalue())
-                            case.assertNotIn("dispatch target is unproved", errors.getvalue())
+                            case.assertIn("compaction failed: TEST compact failed", errors.getvalue())
+                            case.assertIn("dispatch target is unproved", errors.getvalue())
                         if existing:
                             case.assertEqual(staff.snapshot().rows, before[0])
                             case.assertEqual(set(case.fixture.world.locations), before[1])

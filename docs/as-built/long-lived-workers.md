@@ -28,10 +28,10 @@ The child uses a separate session, so a signal to the caller's process group doe
 `WORKER_COMPACT_SECONDS` sets the deadline for `/compact --wait --timeout` and the following turn-end wait.
 Only a new compaction record in the transcript proves completion.
 If the deadline expires, the worker checks for this record before it reports a timeout.
-A complete compaction record lets the worker send the assignment.
-The child then sends the prompt and confirms its transcript receipt within `WORKER_SETTLE_SECONDS`.
+A compaction failure logs one line and clears only matching `/compact` composer text.
+The child sends the prompt after the compaction attempt.
+It confirms the transcript receipt within `WORKER_SETTLE_SECONDS`.
 It writes its output to `compact-<dispatch id>.log` in the run folder.
-A compaction failure sends no prompt and clears only matching `/compact` composer text.
 A detached delivery failure ends the pass with `error` and reports through the existing completion hook.
 Unit pause, move, and end use staff membership.
 Usage reports compare checkpointed phases through the usage store.

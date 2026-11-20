@@ -851,11 +851,12 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
     if current.status not in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
         print(f"{current.row.name}: agent is {current.status.value}", file=sys.stderr)
         return ExitCode.BUSY
+    defer = False
     try:
-        if callable(defer_compaction) and isinstance(_compaction_plan(current.row), CompactionRequired):
-            defer_compaction()
-            return DispatchSubmission.SUBMITTED
-        _compact_before_dispatch(client, current)
+        if callable(defer_compaction):
+            defer = isinstance(_compaction_plan(current.row), CompactionRequired)
+        else:
+            _compact_before_dispatch(client, current)
     except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
         reason = " ".join(str(error).splitlines())
         try:
@@ -864,8 +865,15 @@ def dispatch_turn(parent: StaffId, started: worker_panes.OpenWorker, client: her
                 client.send_keys(current.pane, "ctrl-u", target=str(current.row.current_session), expected_text="/compact")
         except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as cleanup_error:
             reason += f"; compaction input cleanup failed: {' '.join(str(cleanup_error).splitlines())}"
-        print(f"{current.row.name}: compaction failed: {reason}; no prompt sent", file=sys.stderr)
-        return ExitCode.REFUSED
+        print(f"{current.row.name}: compaction failed: {reason}", file=sys.stderr)
+    if defer and callable(defer_compaction):
+        try:
+            defer_compaction()
+        except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+            reason = " ".join(str(error).splitlines())
+            print(f"{current.row.name}: detached dispatch failed: {reason}; no prompt sent", file=sys.stderr)
+            return ExitCode.REFUSED
+        return DispatchSubmission.SUBMITTED
     try:
         _agent_command(client, current, "prompt", line, on_submission=on_submission)
     except OSError as error:
@@ -975,7 +983,9 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
                 result = dispatch_turn(parent, current, _client(), delivery.line, completion_id, run=run)
                 if result is DispatchSubmission.SUBMITTED:
                     _accept_dispatch(parent, row, run, instance, completion_id)
-                    return result
+        if result is DispatchSubmission.SUBMITTED:
+            print(diagnostics.getvalue(), end="", file=sys.stderr)
+            return result
         detail = diagnostics.getvalue().strip() or f"dispatch failed with exit {int(result)}"
         submission_unproved = result is ExitCode.UNCERTAIN
     except recorder_state.OldRecorderState as error:
