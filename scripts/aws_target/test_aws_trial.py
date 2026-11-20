@@ -36,11 +36,20 @@ from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.production import merge_gate
-from scripts.lint.memory_test_support import config_environment
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+def write_guest_config(root: Path) -> None:
+    _ = (root / 'cloud_gate.conf').write_text(
+        'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
+        + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux bubblewrap\n')
+    _ = (root / 'test_times.conf').write_text(
+        '# range: 0..\nSLOW_TEST_S=1.0\n'
+        + '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
+        + '# whole: 1..\nTOP_RUNS=5\n')
 
 
 @final
@@ -48,13 +57,7 @@ class GuestTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
-        _ = (root / 'cloud_gate.conf').write_text(
-            'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
-            + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux\n')
-        _ = (root / 'test_times.conf').write_text(
-            '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
-            + '# whole: 1..\nTOP_RUNS=5\n')
+        write_guest_config(root)
         _ = (root / 'merge_gate.conf').write_text('# range: 1..\nGATE_TIME_LIMIT_FACTOR=1.5\n')
         _ = (root / 'buildlog.conf').write_text(
             '# range: 0..\nINDEX_UNUSED_DAYS=2\n'
@@ -68,6 +71,7 @@ class GuestTests(unittest.TestCase):
             + 'patterns.tool={purpose}{suffix}\n'
             + '# range: 0.001..60\nlocks.probe_wait_seconds=0.25\n'
             + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(root)})))
 
     def test_user_data_fits_ec2_limit_with_module_times_and_400_character_signed_links(self) -> None:
         prefix = 'https://fixture.invalid/object?X-Amz-Signature='
@@ -100,6 +104,9 @@ class GuestTests(unittest.TestCase):
             tool = root / 'fixture-tool'
             _ = tool.write_text('#!/bin/sh\nexit 0\n')
             tool.chmod(0o700)
+            bwrap = root / 'bwrap'
+            _ = bwrap.write_text('#!/bin/sh\nexit 0\n')
+            bwrap.chmod(0o700)
             basedpyright = root / 'basedpyright'
             _ = basedpyright.write_text('#!/bin/sh\necho basedpyright fixture-version\n')
             basedpyright.chmod(0o700)

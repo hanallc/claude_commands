@@ -1414,7 +1414,9 @@ take_features() {
         usage
         exit 2
     fi
-    features="$(merge_dev_features "$features")"
+    if [[ "$CMD" != test || "${PINNED_TARGET:-}" != hana-gpu ]]; then
+        features="$(merge_dev_features "$features")"
+    fi
     if [[ -n "$features" ]]; then
         FEATURE_FLAGS=(--features "$(qualify_features "$PKG" "$features")")
     fi
@@ -3269,6 +3271,7 @@ placement_once() {
         IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
         return 0
     fi
+    [[ -z "${PINNED_TARGET:-}" ]] || placement_args+=(--pinned-refusals)
     # A builtin wait lets the parent handle TERM during a service outage.
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
@@ -3288,13 +3291,13 @@ placement_once() {
                 printf '%s\n' "${line#left }"
                 buildlog_memory_event left ;;
             refused$'\t'*)
+                if [[ -n "${PINNED_TARGET:-}" ]]; then
+                    pinned_target_refuse "${line#*$'\t'}"
+                fi
                 if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
                     LAST_TARGET_OUTCOME=declined LAST_TARGET_REASON=${line#*$'\t'}
                     status=$LINT_LEFT_QUEUE_STATUS
                     continue
-                fi
-                if [[ -n "$PINNED_TARGET" ]]; then
-                    pinned_target_refuse "${line#*$'\t'}"
                 fi
                 BUILDLOG_MAC=declined BUILDLOG_MAC_REASON=${line#*$'\t'} BUILDLOG_MAC_S=0
                 # The backoff can outlast a short outage, so one fresh probe decides a Mac-only

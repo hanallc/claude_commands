@@ -26,6 +26,12 @@ from scripts.test_times import task_cpu
 
 
 class VerifyPythonStartsTests(VerifyLintCacheFixture):
+    @override
+    def build_fixture(self) -> None:
+        # Model a parent that calls the tests from copies.py run.
+        with patch.dict(os.environ, COPIES_RUN_PID=str(os.getpid())):
+            super().build_fixture()
+
     def test_lint_trace_has_one_start_per_key_pair_and_no_unnamed_helper(self) -> None:
         _ = self.enable_cache()
         trace = self.root / "python-starts.tsv"
@@ -43,6 +49,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         print("lint helper starts:", dict(sorted(counts.items())), "total:", len(rows), flush=True)
         self.assertNotIn("INLINE_PY", counts, rows)
         self.assertNotIn("STDIN_PY", counts, rows)
+        self.assertNotIn("copies.py", counts, rows)
         # The trace counts interpreter starts, not calls inside the helper.
         self.assertEqual(counts["tree_watch.py"], 2, rows)
         self.assertEqual(counts["memory_kill.py"], 1, rows)

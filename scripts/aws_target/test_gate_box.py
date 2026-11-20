@@ -127,8 +127,7 @@ subprocess.run = fail_log_put
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        for name in ('cloud_gate.conf', 'test_times.conf'):
-            _ = (root / name).write_bytes((ROOT / 'config' / name).read_bytes())
+        trial_tests.write_guest_config(root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(root)})))
 
     def test_trial_and_route_share_one_guest(self) -> None:
@@ -196,6 +195,8 @@ subprocess.run = fail_log_put
         self.assertNotIn('#awscli2', script)
         self.assertNotIn('#basedpyright', script)
         self.assertIn('#chromium', script)
+        self.assertIn('github:NixOS/nixpkgs/fixture-revision#bubblewrap', script)
+        self.assertIn('stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial', script)
         self.assertLessEqual(len(script.encode()), 16384)
         result = subprocess.run(['sh', '-n'], input=script, text=True, capture_output=True,
                                 timeout=TEST_HANG_GUARD_SECS, check=False)
@@ -207,6 +208,12 @@ subprocess.run = fail_log_put
                 self.assertIn(f'-o "$box_dir/{name}"', script)
         session = shlex.split(script[script.index('nix --extra-experimental-features'):])[-1]
         self.assertLess(session.index("gate_curl 'GET guest'"), session.index('exec python3'))
+        check = session.index('if ! bwrap --ro-bind / / true; then')
+        self.assertLess(session.index('stage=tools ready'), check)
+        self.assertLess(session.index('runuser -u gate-trial'), check)
+        self.assertLess(session.index('export PATH="$tool_path:$PATH"'), check)
+        self.assertLess(check, session.index('stage=bwrap ready'))
+        self.assertLess(session.index('stage=bwrap ready'), session.index('exec python3'))
 
     def test_full_gate_downloads_program_and_request_without_inlining_modules(self) -> None:
         modules = [f'scripts/fixture/test_module_{index:04d}.py' for index in range(740)]
@@ -243,8 +250,8 @@ subprocess.run = fail_log_put
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
-        self.production_boot_stubs(('', 'boot', 'nix', 'tools shell', 'tools ready', 'source ready',
-                                    'tests start', 'result upload'))
+        self.production_boot_stubs(('', 'boot', 'nix', 'tools shell', 'tools ready', 'bwrap unavailable',
+                                    'source ready', 'tests start', 'result upload'))
 
     def test_transfer_failures_remove_signed_urls_from_boot_and_result(self) -> None:
         self.production_boot_stubs(('source download', 'timings download', 'final log upload',
@@ -258,6 +265,9 @@ subprocess.run = fail_log_put
 
     def test_shell_boot_error_filters_the_completed_record(self) -> None:
         self.production_boot_stubs(('boot error record',))
+
+    def test_production_boot_powers_off_when_the_error_record_write_fails(self) -> None:
+        self.production_boot_stubs(('boot error write',))
 
     def test_signed_shell_transfers_suppress_curl_output_and_shell_traces(self) -> None:
         signed = 'https://fixture.invalid/artifact?signature=' + TRANSFER_MARKER
@@ -296,14 +306,15 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
         self.assertEqual(reply.returncode, 0, reply.stdout + reply.stderr)
 
     def production_boot_stubs(self, failures: tuple[str, ...], *, candidate_change: str = '') -> None:
-        stages = ['boot', 'tool preparation', 'tools ready', 'tools checked', 'source ready', 'tests start',
-                  'result upload']
+        stages = ['boot', 'tool preparation', 'tools ready', 'bwrap ready', 'tools checked',
+                  'source ready', 'tests start', 'result upload']
         boot_errors = {
             'boot': 'The box failed at stage boot (exit 7)',
             'boot error record': 'The box failed at stage boot (exit 7)',
             'nix': 'Tool preparation failed (exit 7)',
             'tools shell': 'Tool preparation failed (exit 7)',
             'tools ready': 'The box failed at stage tools ready (exit 7)',
+            'bwrap unavailable': 'stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial (exit 1)',
             'result upload': 'The box failed at stage result upload (exit 1)',
             'paired request download': 'The box failed at stage tools ready (exit 7)',
         }
@@ -313,6 +324,8 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                 tools, box, repo = root / 'bin', root / 'box', root / 'repo'
                 tools.mkdir()
                 (root / 'home').mkdir()
+                if failure == 'boot error write':
+                    (box / 'boot-error.json').mkdir(parents=True)
                 for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'scripts/lib', 'config'):
                     folder = repo / name
                     folder.mkdir(parents=True, exist_ok=True)
@@ -429,6 +442,9 @@ elif name == 'runuser':
     command = args[args.index('--') + 1:]
     command = ['HOME=' + str(root / 'home') if word.startswith('HOME=') else word for word in command]
     sys.exit(subprocess.call(command))
+elif name == 'bwrap':
+    assert args == ['--ro-bind', '/', '/', 'true'], args
+    fail('bwrap unavailable')
 elif name == 'ps':
     if 'etimes,pcpu,rss,args' in args:
         print('1 0.0 0 fixture-process')
@@ -449,14 +465,18 @@ elif name == 'git' and 'rev-parse' in args:
 elif name == 'loginctl':
     fail('boot')
     fail('boot error record')
-elif name in ('systemd-run', 'mount', 'chown', 'ln', 'cp', 'shutdown', 'git'):
+    fail('boot error write')
+elif name == 'shutdown':
+    assert args == ['-h', 'now'], args
+    event('shutdown -h now')
+elif name in ('systemd-run', 'mount', 'chown', 'ln', 'cp', 'git'):
     pass
 else:
     print('fixture-version')
 '''
                 for name in ('nix', 'runuser', 'systemd-run', 'loginctl', 'useradd', 'mount', 'curl', 'ps',
                              'id', 'git', 'chown', 'ln', 'cp', 'shutdown', 'cargo', 'rustc', 'rustdoc', 'rustup',
-                             'cargo-nextest', 'uv', 'sqlite3'):
+                             'cargo-nextest', 'uv', 'sqlite3', 'bwrap'):
                     command = tools / name
                     _ = command.write_text(stub)
                     command.chmod(0o700)
@@ -497,6 +517,13 @@ else:
                 uploads = [ledger.mapping(cast(object, json.loads(line))) for line in uploaded.splitlines()]
                 results = [ledger.mapping(cast(object, json.loads(ledger.text(row, 'body'))))
                            for row in uploads if ledger.text(row, 'destination').endswith(('/result.json', '/boot-error.json'))]
+                trace = (root / 'trace').read_text().splitlines()
+                if failure == 'boot error write':
+                    self.assertIn('boot-error.json:', log)
+                    self.assertIn('shutdown -h now', trace)
+                    self.assertEqual(reply.returncode, 7, log + reply.stderr)
+                    self.assertEqual(results, [])
+                    continue
                 self.assertTrue(results, log + reply.stderr)
                 expected_error = failure not in ('', 'final log upload', 'shell log signal') or candidate_change in (
                     'missing', 'old transfer')
@@ -528,6 +555,10 @@ else:
                     detail = ledger.text(results[-1], field)
                     self.assertIn(f'{stage} failed (curl exit 7, HTTP 403)', detail)
                     self.assertNotIn('CalledProcessError', detail)
+                if failure in ('bwrap unavailable', 'result upload'):
+                    self.assertEqual(reply.returncode, 1, log + reply.stderr)
+                    self.assertIn('shutdown -h now', trace)
+                    self.assertLess(trace.index('upload result'), trace.index('shutdown -h now'))
                 if failure in boot_errors:
                     self.assertEqual(results[-1]['error'], boot_errors[failure], log)
                     if failure == 'boot error record':
@@ -541,6 +572,11 @@ else:
                         self.assertIn('Traceback', ledger.text(uploads[-2], 'body'))
                     if failure == 'paired request download':
                         self.assertIn('GET request failed (curl exit 7, HTTP 403)', log)
+                    if failure == 'bwrap unavailable':
+                        self.assertIn('stage=bwrap unavailable: bwrap or unprivileged user namespaces do not work for gate-trial',
+                                      ledger.text(uploads[-2], 'body'))
+                        self.assertNotIn('stage=tools checked', log)
+                        self.assertNotIn('stage=tests start', log)
                 else:
                     self.assertTrue(all(row['retries'] == 2 for row in uploads))
                 if not failure and candidate_change not in ('missing', 'old transfer'):
@@ -557,7 +593,8 @@ else:
                     self.assertEqual([line.split(' stage=', 1)[1] for line in lines], stages)
                     for line in lines:
                         self.assertRegex(line, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ stage=')
-                    trace = (root / 'trace').read_text().splitlines()
+                    self.assertIn('shutdown -h now', trace)
+                    self.assertLess(trace.index('upload result'), trace.index('shutdown -h now'))
                     self.assertIn('fetch ' + links['commit'], trace)
                     record = ledger.mapping(results[-1]['record'])
                     self.assertEqual(record['head'], 'e' * 40)

@@ -97,6 +97,11 @@ def retryable_cloud_failure(outcome: dict[str, object]) -> RetryableCloudFailure
     return RetryableCloudFailure.NONE
 
 
+class CloudGateSwitch(StrEnum):
+    ON = 'on'
+    OFF = 'off'
+
+
 def settings() -> conf.ConfigRead:
     return conf.read_or_repository('cloud_gate')
 
@@ -1195,6 +1200,8 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
+    if settings().value('enabled', CloudGateSwitch, recover_invalid=False) is CloudGateSwitch.OFF:
+        return LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')
     directory = attempt.directory
     deployment_path = directory / 'gate-deployment.json'
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))

@@ -136,6 +136,7 @@ A `#` starts a comment only at the line start or after whitespace.
 The first key wins, and `key.<host>` overrides `key`.
 The comment immediately above a key defines its whole-number range, numeric range, or allowed words.
 An invalid setting warns on stderr and uses the newest usable committed value under that revision's limits.
+Recovery prefers a value that also passes the current setting's limit.
 No usable value raises `conf.Unusable` with the source, key, and reason.
 `ConfigRead.origin` returns live, recovered, or unavailable evidence without printing a warning.
 The [accounts configuration section](accounts.md#runtime-configuration-and-constraints) defines repository defaults and explicit-folder behavior.

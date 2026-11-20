@@ -76,8 +76,8 @@ def main(arguments):
     root = Path(os.environ["TEST_RUNNER_STATE"])
     request_placement = admission_client.request_placement
 
-    def observe(request):
-        reply = request_placement(request)
+    def observe(request, **options):
+        reply = request_placement(request, **options)
         events = root / "ssh-events.jsonl"
         attempts = len(events.read_text().splitlines()) if events.exists() else 0
         if attempts < int(os.environ.get("TEST_OBSERVE_AFTER_ATTEMPTS", "0")):
