@@ -1079,8 +1079,12 @@ def validate_result(row: dict[str, object], request: dict[str, object], *, insta
     if row.get('verdict') != ('pass' if run.passed else 'fail'):
         raise ValueError('The result has no complete verdict and log')
     modules = ['scripts/' + job.suite + '/' + job.module for job in run.jobs]
-    if (any(job.kind is not gate.GateJobKind.TEST_MODULE for job in run.jobs)
-            or len(modules) != len(set(modules)) or set(modules) != set(cast(list[str], request['modules']))):
+    expected = gate_box.request_modules(request)
+    executions = run.executions or run.jobs
+    if (expected is None or any(job.kind is not gate.GateJobKind.TEST_MODULE for job in run.jobs)
+            or len(modules) != len(set(modules)) or set(modules) != set(expected)
+            or {f'scripts/{job.suite}/{job.module}' for job in executions} != set(expected)
+            or any(job.kind is not gate.GateJobKind.TEST_MODULE for job in executions)):
         raise ValueError('The result has a different module list')
     host = ledger.text(row, 'host')
     if not host or Path(host).name != host or host in ('.', '..'):
@@ -1090,6 +1094,28 @@ def validate_result(row: dict[str, object], request: dict[str, object], *, insta
             or record.get('sha') != request['commit'] or record.get('host') != row.get('host')
             or record.get('kind') != 'gate_run' or record.get('status') != int(not run.passed)):
         raise ValueError('The buildlog record differs from the result')
+    _ = gate_box.selection_fields(request, 'cloud gate')
+    if 'modules_selected' in record:
+        count = record['modules_selected']
+        if type(count) is not int or count != len(expected):
+            raise ValueError('The buildlog record has a different selected module count')
+    _ = observed_record_modules(record, run)
+
+
+def observed_record_modules(record: dict[str, object], run: gate.GateRun) -> tuple[
+        list[gate_record.ModuleRun], list[gate_record.Execution]]:
+    """Match record rows to executions. Exclude jobs that did not start."""
+    modules = cast(list[gate_record.ModuleRun], list(ledger.rows(record, 'modules')))
+    paths = [(module['suite'], module['module']) for module in modules]
+    observed = gate_box.execution_records(run, observed_only=True)
+    observed_paths = [(job.suite, job.module) for job in observed]
+    if paths == observed_paths:
+        return modules, observed
+    if not run.time_limit_report or paths != [(job.suite, job.module) for job in gate_box.execution_records(run)]:
+        raise ValueError('The buildlog record has a different module list')
+    started = set(observed_paths)
+    # Older timeouts wrote a row for each module that did not start.
+    return [module for module, path in zip(modules, paths, strict=True) if path in started], observed
 
 
 def _import_already_appended(marker: Path, handle: BinaryIO, destination: Path, record_id: str) -> bool:
@@ -1115,7 +1141,7 @@ def _import_already_appended(marker: Path, handle: BinaryIO, destination: Path, 
     return False
 
 
-def import_record(folder: Path, row: dict[str, object]) -> None:
+def import_record(folder: Path, row: dict[str, object], *, request: dict[str, object] | None = None) -> None:
     record = ledger.mapping(row['record'])
     host = ledger.text(record, 'host')
     if not host or Path(host).name != host or host in ('.', '..'):
@@ -1133,8 +1159,12 @@ def import_record(folder: Path, row: dict[str, object]) -> None:
             # An older box names the step merge-gate or targeted-test.
             record = {**record, 'step': gate.SuiteMode.step(ledger.text(record, 'step'))}
             run = gate_box.decode_run(row['gate'])
-            gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at,
-                cast(list[gate_record.ModuleRun], record['modules']), gate_box.execution_records(run))
+            if request is not None:
+                reason = 'time limit' if run.time_limit_report else 'cloud gate'
+                record.update(gate_box.selection_fields(request, reason))
+            modules, executions = observed_record_modules(record, run)
+            record['modules'] = modules
+            gate_record.keep_failure_logs(record_id, store.CLOUD_GATE_PLACE, at, modules, executions)
             store.append_locked(handle, record)
     from scripts.buildlog.record import keep_result
     imported: dict[str, object] = {'id': record_id}
@@ -1461,7 +1491,7 @@ def _complete_outcome(repo: Path, folder: Path, request: dict[str, object],
         return LocalFallback(str(error))
     if gate.checked_git(repo, 'rev-parse', 'HEAD') != head:
         return LocalFallback('The checkout changed during the cloud attempt')
-    import_record(folder, row)
+    import_record(folder, row, request=request)
     print((folder / 'gate.log').read_text(), end='', flush=True)
     return CloudCompleted(gate_box.decode_run(row['gate']))
 

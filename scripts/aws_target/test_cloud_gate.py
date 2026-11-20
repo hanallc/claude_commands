@@ -1816,6 +1816,28 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         run = gate.GateRun((gate.GateJobResult('fixture', 'test_other.py', 0, 1, ''),), 1, 1)
         with self.assertRaises(ValueError):
             cloud_gate.validate_result({**self.result(), 'gate': gate_box.encode_run(run)}, self.request)
+        row = self.result()
+        record = ledger.mapping(row['record'])
+        record['modules_selected'] = 2
+        with self.assertRaises(ValueError):
+            cloud_gate.validate_result(row, self.request)
+        record['modules_selected'] = 1
+        record['modules'] = [{**ledger.rows(record, 'modules')[0], 'module': 'test_other.py'}]
+        with self.assertRaises(ValueError):
+            cloud_gate.validate_result(row, self.request)
+
+    def test_import_classifies_an_old_record_from_the_request(self) -> None:
+        row = self.result()
+        record = ledger.mapping(row['record'])
+        self.assertEqual(record['selection'], 'full')
+        self.assertNotIn('modules_selected', record)
+        request = {**self.request, 'selection': 'affected', 'selection_reason': 'certified base fixture'}
+        cloud_gate.validate_result(row, request)
+        cloud_gate.import_record(self.folder, row, request=request)
+        imported, = store.locked_rows(store.host_file('aws', self.now))
+        self.assertEqual((imported['step'], imported['selection'], imported['reason'], imported['modules_selected']),
+                         ('gate', 'affected', 'certified base fixture', 1))
+        self.assertEqual(record['selection'], 'full')
 
     def test_missing_final_log_allows_local_fallback(self) -> None:
         self.fake.has_log = False

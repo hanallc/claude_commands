@@ -7,7 +7,7 @@ import inspect
 import json
 import shlex
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 from enum import StrEnum
 import math
 
@@ -17,6 +17,53 @@ if TYPE_CHECKING:
     from scripts.production.gate import GateRun
     from scripts.test_times import gate_record
 
+
+
+def request_modules(request: dict[str, object]) -> tuple[str, ...] | None:
+    """Read the expected paths. An absent field requests full discovery."""
+    if 'modules' not in request:
+        return None
+    value = request['modules']
+    if not isinstance(value, list):
+        raise ValueError('The request must contain a list of module paths')
+    paths: list[str] = []
+    for path in cast(list[object], value):
+        if not isinstance(path, str):
+            raise ValueError('The request contains an invalid module path')
+        parts = path.split('/')
+        if len(parts) < 3 or parts[0] != 'scripts' or any(part in ('', '.', '..') for part in parts):
+            raise ValueError('The request contains an invalid module path')
+        paths.append(path)
+    if len(paths) != len(set(paths)):
+        raise ValueError('The request contains duplicate module paths')
+    return tuple(paths)
+
+
+def request_selection(request: dict[str, object]) -> Literal['full', 'affected']:
+    """Read the selection or derive it from the old request fields."""
+    if 'selection' not in request:
+        if ('modules' in request and request.get('mode') in ('test-affected', 'targeted-test')
+                and not request.get('full', False)):
+            return 'affected'
+        return 'full'
+    selection = request['selection']
+    if selection == 'full':
+        return 'full'
+    if selection == 'affected' and 'modules' in request:
+        return 'affected'
+    raise ValueError('The request contains an invalid selection')
+
+
+def selection_fields(request: dict[str, object], default_reason: str) -> dict[str, object]:
+    """Return the selection metadata for a gate record."""
+    reason = request.get('selection_reason', default_reason)
+    if not isinstance(reason, str):
+        raise ValueError('The request selection reason must be text')
+    fields: dict[str, object] = {'selection': request_selection(request), 'reason': reason}
+    paths = request_modules(request)
+    if paths is not None:
+        fields['modules_selected'] = len(paths)
+    return fields
 
 
 class TrialVariant(StrEnum):
@@ -785,13 +832,15 @@ def decode_run(value: object) -> GateRun:
                    str(row.get('time_limit_report', '')))
 
 
-def execution_records(value: GateRun) -> list[gate_record.Execution]:
-    """Keep every attempt's output for the gate record writer."""
+def execution_records(value: GateRun, *, observed_only: bool = False) -> list[gate_record.Execution]:
+    """Keep the output of each attempt for the gate record."""
     from scripts.test_times import gate_record
     return [gate_record.Execution(job.suite, job.module, job.seconds, job.cpu_seconds, job.peak_mib,
                                   job.returncode, job.restart, job.times, job.output,
                                   wall_clock=job.wall_clock)
-            for job in value.executions or value.jobs]
+            for job in value.executions or value.jobs
+            if not (observed_only and value.time_limit_report and job.returncode == 124
+                    and job.seconds == 0 and job.killed_for)]
 
 
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
