@@ -296,6 +296,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
     deadline = worker.clock() + settings().number('termination_timeout_s')
     boxes: list[GateTermination] = []
     uncertain: list[UncertainGateLaunch] = []
+    absent: list[str] = []
     for item in attempts:
         reservation, launch = item.reservation, item.launch
         if isinstance(reservation.state, (ledger.GateAbsent, ledger.GateTerminated)):
@@ -312,7 +313,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
                 uncertain.append(UncertainGateLaunch(reservation.attempt, (region,),
                     'Name=client-token,Values=' + token, reservation.expires))
             elif item.launch_record_checked:
-                worker.book.resolve_gate(reservation.attempt, ledger.GateAbsent(int(worker.clock())))
+                absent.append(reservation.attempt)
             else:
                 regions = (reservation.region,) if reservation.region else tuple(settings().words('regions'))
                 uncertain.append(UncertainGateLaunch(reservation.attempt, regions,
@@ -320,7 +321,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
         except (ValueError, KeyError, TypeError) as error:
             print('gate cleanup: ' + str(error), file=sys.stderr)
             complete = False
-    boxes = worker.request_terminations(boxes, deadline)
+    boxes = worker.request_terminations(boxes)
     for launch in uncertain:
         try:
             found = False
@@ -333,10 +334,8 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
                 instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
                 if instances:
                     discovered = [GateTermination(launch.attempt, ledger.text(row, 'InstanceId'), region) for row in instances]
-                    try:
-                        worker.book.gate_region(launch.attempt, region)
-                    finally:
-                        boxes.extend(worker.request_terminations(discovered, deadline))
+                    boxes.extend(worker.request_terminations(discovered))
+                    worker.book.gate_region(launch.attempt, region)
                     found = True
                     break
             if not found:
@@ -347,7 +346,14 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             print('gate cleanup: ' + str(error), file=sys.stderr)
             complete = False
-    return worker.confirm_terminations(boxes, deadline) and complete
+    complete = worker.confirm_terminations(boxes, deadline) and complete
+    for attempt in absent:
+        try:
+            worker.book.resolve_gate(attempt, ledger.GateAbsent(int(worker.clock())))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print('gate cleanup: ' + str(error), file=sys.stderr)
+            complete = False
+    return complete
 
 
 @dataclass
@@ -425,12 +431,13 @@ class GateWorker:
             region=self.box_region, zone=self.box_zone))
 
     def charges(self, record_query: Callable[[Decimal], None] = lambda _fee: None, *,
-                before_page: Callable[[], None] = lambda: None) -> None:
+                page_timeout: Callable[[float], float] = lambda timeout: timeout,
+                after_page: Callable[[], None] = lambda: None) -> None:
         now = int(self.clock())
         def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
             policy = read_settings(self.settings_path)
             readings = fetch_account_charges(self.api, start, end, now, policy.cost_explorer_read_usd,
-                                             before_page=before_page)
+                                             page_timeout=page_timeout, after_page=after_page)
             record_query(sum((reading.query_usd for reading in readings), Decimal(0)))
             return readings
         _ = self.book.refresh_charges(self.settings_path, now, fetch)
@@ -515,12 +522,23 @@ class GateWorker:
             pending.append(box)
         return pending
 
-    def request_terminations(self, boxes: Sequence[GateTermination], deadline: float) -> list[GateTermination]:
+    def request_terminations(self, boxes: Sequence[GateTermination]) -> list[GateTermination]:
         """Request termination and return boxes that still need confirmation."""
+        if not boxes:
+            return []
+        batches: dict[str, list[str]] = {}
+        for box in boxes:
+            batches.setdefault(box.region, []).append(box.instance)
+        timeout = settings().number('api_timeout_s')
+
+        def request(region: str, instances: Sequence[str]) -> set[str]:
+            return self.confirmed_ends(region, 'terminate-instances', instances, self.clock() + timeout)
+
+        with ThreadPoolExecutor(max_workers=len(batches)) as pool:
+            requests = {region: pool.submit(request, region, instances) for region, instances in batches.items()}
         pending = list(boxes)
-        for region in dict.fromkeys(box.region for box in boxes):
-            instances = [box.instance for box in boxes if box.region == region]
-            ended = self.confirmed_ends(region, 'terminate-instances', instances, deadline)
+        for region, result in requests.items():
+            ended = result.result()
             if ended:
                 pending = self.record_ends(pending, region, ended)
         return pending

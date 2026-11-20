@@ -62,6 +62,7 @@ def host_nixpkgs_revision() -> str:
 
 TRIAL_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 PAIRED_TRIAL_JOB = StepJob('test-modules', modules=1)
+SERVICE_TIMEOUT_FILE = 'service-timeout.json'
 
 
 def main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
@@ -98,6 +99,7 @@ class TrialWait(Enum):
     LOCAL_GIT = 'local Git'
     NETWORK_GIT = 'network Git'
     SERVICE = 'the paired service to finish'
+    SERVICE_RUNTIME = 'the paired service within its systemd time limit'
     SERVICE_STOP = 'systemd to stop the paired service'
     COMMAND_REAP = 'a stopped trial command to exit'
 
@@ -106,6 +108,11 @@ class TrialWaitExpired(GateRefused):
     def __init__(self, wait_for: TrialWait) -> None:
         self.wait_for: TrialWait = wait_for
         super().__init__(f'Timed out waiting for {wait_for.value}')
+
+
+class TrialServiceStopUnconfirmed(GateRefused):
+    def __init__(self, status: int) -> None:
+        super().__init__(f'systemd did not confirm the paired service stop. systemctl returned {status}')
 
 
 @dataclass(frozen=True)
@@ -128,8 +135,15 @@ def cleanup_seconds(settings: conf.ConfigRead) -> float:
     return settings.number('termination_timeout_s') + 2 * settings.number('api_timeout_s')
 
 
+def preparation_seconds(settings: conf.ConfigRead, modules: int) -> float:
+    # Allow reconciliation, reservation and billing locks, and one lock for each module.
+    return (cleanup_seconds(settings) + settings.number('paired_cost_refresh_timeout_s')
+            + settings.number('api_timeout_s') * (modules + 3))
+
+
 @contextmanager
 def trial_lock(path: Path, deadline: TrialDeadline, wait_for: TrialWait) -> Generator[file_lock.LockResult]:
+    retry_seconds = cloud_gate.settings().number('paired_lock_retry_s')
     path.parent.mkdir(parents=True, exist_ok=True)
     while True:
         deadline.check(wait_for)
@@ -137,7 +151,7 @@ def trial_lock(path: Path, deadline: TrialDeadline, wait_for: TrialWait) -> Gene
             if result is file_lock.LockResult.ACQUIRED:
                 yield result
                 return
-        time.sleep(min(0.1, deadline.remaining()))
+        time.sleep(min(retry_seconds, deadline.remaining()))
 
 
 def trial_ledger(directory: Path) -> ledger.CostLedger:
@@ -216,10 +230,11 @@ def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int,
         remote = checked_git(repo, 'ls-remote', '--heads', clone_url, namespace + '*')
     except TrialWaitExpired as error:
         print(f'paired trial: could not list branches for trial {trial_id}. {error}', file=sys.stderr)
-        return
+        raise
     except (OSError, ValueError, subprocess.SubprocessError):
         print(f'paired trial: could not list branches for trial {trial_id}', file=sys.stderr)
         return
+    timeouts: list[TrialWaitExpired] = []
     for line in remote.splitlines():
         fields = line.split()
         if len(fields) != 2 or not fields[1].startswith(namespace):
@@ -229,8 +244,11 @@ def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int,
             _ = checked_git(repo, 'push', clone_url, '--delete', branch)
         except TrialWaitExpired as error:
             print(f'paired trial: could not delete branch {branch.removeprefix("refs/heads/")}. {error}', file=sys.stderr)
+            timeouts.append(error)
         except (OSError, ValueError, subprocess.SubprocessError):
             print(f'paired trial: could not delete branch {branch.removeprefix("refs/heads/")}', file=sys.stderr)
+    if timeouts:
+        raise timeouts[0]
 
 
 def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> None:
@@ -289,7 +307,26 @@ def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, ob
     check_workers()
     worker.reconcile()
     check_workers()
-    worker.charges(record_query, before_page=before_charge_page)
+    refresh_deadline = TrialDeadline.after(cloud_gate.settings().number('paired_cost_refresh_timeout_s'))
+    page_deadline = refresh_deadline
+
+    def page_timeout(api_timeout: float) -> float:
+        nonlocal page_deadline
+        before_charge_page()
+        page_deadline = TrialDeadline(min(refresh_deadline.expires_at, time.monotonic() + api_timeout))
+        remaining = page_deadline.remaining()
+        if not remaining:
+            raise TrialWaitExpired(TrialWait.COST_REFRESH)
+        return remaining
+
+    def after_page() -> None:
+        page_deadline.check(TrialWait.COST_REFRESH)
+        before_charge_page()
+
+    try:
+        worker.charges(record_query, page_timeout=page_timeout, after_page=after_page)
+    except subprocess.TimeoutExpired as error:
+        raise TrialWaitExpired(TrialWait.COST_REFRESH) from error
     check_workers()
     fallback = Decimal(str(cloud_gate.settings().number('spot_max_usd_per_hour')))
     readings = worker.book.read_bills()
@@ -367,12 +404,18 @@ def paired_cleanup_main(argv: Sequence[str], settings_path: Path, directory: Pat
     class CleanupArguments(argparse.Namespace):
         paired_cleanup: Path = Path()
     args = parser.parse_args(list(argv), namespace=CleanupArguments())
+    if os.environ.get('SERVICE_RESULT') == 'timeout':
+        cloud_gate.save(args.paired_cleanup / SERVICE_TIMEOUT_FILE, {'wait': TrialWait.SERVICE_RUNTIME.name})
     policy = conf.read(settings_path)
     worker = cloud_gate.GateWorker(AwsCli(policy.text('credentials_profile'), policy.text('region'),
         cloud_gate.settings().number('api_timeout_s')), trial_ledger(directory), settings_path,
         args.paired_cleanup / 'reservation.cgroup', clock=time.time)
     with cancellation.defer_cleanup_signals():
-        return int(not cleanup_trial(args.paired_cleanup, worker))
+        try:
+            return int(not cleanup_trial(args.paired_cleanup, worker))
+        except TrialWaitExpired as error:
+            print('paired trial: ' + str(error), file=sys.stderr)
+            return 1
 
 
 class TrialMessage(Enum):
@@ -419,15 +462,18 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
     """Keep one queue slot while the shared worker owns its box."""
     try:
         policy = conf.read(settings_path)
+        settings = cloud_gate.settings()
         worker = cloud_gate.GateWorker(AwsCli(policy.text('credentials_profile'), policy.text('region'),
-            cloud_gate.settings().number('api_timeout_s')), trial_ledger(directory), settings_path,
+            settings.number('api_timeout_s')), trial_ledger(directory), settings_path,
             folder / 'reservation.cgroup', clock=time.time)
+        # The coordinator stops this worker if the queue does not grant admission by its deadline.
         with redirect_stdout(sys.stderr), cloud_gate.cloud_reservation(
                 folder, worker.sidecar, PAIRED_TRIAL_JOB, group=group) as slot:
             try:
                 connection.send(TrialMessage.READY)
                 try:
-                    if not connection.poll(cloud_gate.settings().number('paired_admission_timeout_s')):
+                    launch_timeout = settings.number('paired_admission_timeout_s') + preparation_seconds(settings, group.size)
+                    if not connection.poll(launch_timeout):
                         raise TrialWaitExpired(TrialWait.LAUNCH)
                     decision = connection.recv()
                 except EOFError:
@@ -520,7 +566,7 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
             assert isinstance(descriptor, int)
             attempt, _connection = workers[descriptor]
             raise GateRefused(f'{attempt}: The module ended before launch')
-        admission.check(wait_for)
+        preparation.check(wait_for)
 
     def abort_unlaunched() -> None:
         nonlocal abort_sent
@@ -587,11 +633,13 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
                 outcome = folder / attempt / 'outcome.json'
                 reason = cloud_gate.read(outcome).get('reason') if outcome.exists() else None
                 raise GateRefused(f'{attempt}: {reason or "The module exited before cloud admission"}')
+        preparation = TrialDeadline.after(preparation_seconds(settings, len(requests)))
         # The lock protects the batch of cost reservations across trials.
-        with trial_lock(directory / 'paired-trial-slots' / 'controller.lock', admission, TrialWait.RESERVATION_LOCK):
+        with trial_lock(directory / 'paired-trial-slots' / 'controller.lock', TrialDeadline.after(api_timeout),
+                        TrialWait.RESERVATION_LOCK):
             pending = [request for request in requests
                        if not (folder / ledger.text(request, 'attempt') / 'outcome.json').exists()]
-            # The box lifetime starts at launch, so a queue wait does not shorten the run budget.
+            # Set the box expiry after admission and before reserving costs.
             expires = int(worker.clock()) + lifetime
             worker_exit = TrialDeadline.after(expires - worker.clock() + cleanup_timeout)
             for request in pending:
@@ -620,16 +668,29 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
             abort_unlaunched()
             for _, connection in children:
                 connection.close()
+            reap_failed = False
             try:
                 stop_workers([process for process, _ in children], api_timeout, cleanup_timeout)
             except TrialWaitExpired as error:
-                print('paired trial: ' + str(error), file=sys.stderr)
-                failed = True
-            try:
-                cleanup_confirmed = cleanup_trial(folder, worker)
-            except TrialWaitExpired as error:
-                print('paired trial: ' + str(error), file=sys.stderr)
-                cleanup_confirmed = False
+                reap_failed = True
+                with suppress(OSError, ValueError):
+                    print('paired trial: ' + str(error), file=sys.stderr, flush=True)
+            finally:
+                try:
+                    cleanup_confirmed = cleanup_trial(folder, worker)
+                except TrialWaitExpired as error:
+                    cleanup_confirmed = False
+                    with suppress(OSError, ValueError):
+                        print('paired trial: ' + str(error), file=sys.stderr)
+                finally:
+                    if reap_failed:
+                        # Python can wait for an unreaped worker during shutdown.
+                        try:
+                            for stream in (sys.stdout, sys.stderr):
+                                with suppress(OSError, ValueError):
+                                    _ = stream.flush()
+                        finally:
+                            os._exit(1)
     summaries: list[dict[str, object]] = []
     cursor = folder / 'emitted.json'
     emitted = cloud_gate.read(cursor) if cursor.exists() else {}
@@ -690,19 +751,34 @@ def paired_service(command: Sequence[str], unit: str) -> int:
     api_timeout = settings.number('api_timeout_s')
     stop_timeout = 2 * cleanup_timeout + api_timeout
     runtime = (settings.number('paired_admission_timeout_s') + 60 * settings.whole('lifetime_minutes')
-               + 3 * cleanup_timeout + api_timeout)
+               + preparation_seconds(settings, settings.whole('slots')) + 3 * cleanup_timeout + api_timeout)
     command = [command[0], f'--property=RuntimeMaxSec={runtime:g}', *command[1:]]
     completed = False
+    failure = ''
     try:
         status = trial_command(command, TrialWait.SERVICE, timeout=runtime + stop_timeout).returncode
         completed = True
-        return status
     except KeyboardInterrupt:
         return 1
+    except BaseException as error:
+        failure = str(error)
+        raise
     finally:
         if not completed:
             with cancellation.defer_cleanup_signals():
-                _ = trial_command(['systemctl', '--user', 'stop', unit], TrialWait.SERVICE_STOP, timeout=stop_timeout)
+                try:
+                    stop = trial_command(['systemctl', '--user', 'stop', unit],
+                                         TrialWait.SERVICE_STOP, timeout=stop_timeout)
+                    if stop.returncode:
+                        raise TrialServiceStopUnconfirmed(stop.returncode)
+                except (OSError, TrialWaitExpired, TrialServiceStopUnconfirmed):
+                    if failure:
+                        print('paired trial: ' + failure, file=sys.stderr)
+                    raise
+    folder = Path(command[command.index('--paired-worker') + 1])
+    if (folder / SERVICE_TIMEOUT_FILE).exists():
+        raise TrialWaitExpired(TrialWait.SERVICE_RUNTIME)
+    return status
 
 
 def paired_main(argv: Sequence[str], directory: Path) -> int:
@@ -725,6 +801,7 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
     clone_url = ''
     expires = 0
     service_attempted = False
+    status = 1
     try:
         modules = args.modules
         if len(modules) > cloud_gate.settings().whole('slots'):
@@ -752,19 +829,21 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         command = cloud_gate.service_command('scripts.aws_target.aws_trial', ['--paired-worker', str(folder)],
                                              'cloud-paired-trial-' + folder.name, paired=True)
         service_attempted = True
-        return paired_service(command, 'cloud-paired-trial-' + folder.name)
-    except TrialWaitExpired as error:
+        status = paired_service(command, 'cloud-paired-trial-' + folder.name)
+    except (TrialWaitExpired, TrialServiceStopUnconfirmed) as error:
         print('paired trial: ' + str(error), file=sys.stderr)
         print(json.dumps({'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': not service_attempted}))
-        return 1
     except (OSError, ValueError, GateRefused, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print('paired trial: ' + str(error), file=sys.stderr)
         print(json.dumps({'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': True}))
-        return 1
     finally:
         with cancellation.defer_cleanup_signals():
             if trial_id:
-                delete_trial_branches(args.repo, clone_url, prefix, expires, trial_id)
+                try:
+                    delete_trial_branches(args.repo, clone_url, prefix, expires, trial_id)
+                except TrialWaitExpired:
+                    status = 1
+    return status
 
 
 if __name__ == '__main__':
