@@ -19,7 +19,7 @@ from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY, VerifyTokenWaitFixture
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, recorded_holders, wait_for_verify_state, wait_rows
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
-from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
+from scripts.build_queue.admission_test_support import PrivateHostEvidence, caller_admission, caller_provider_controls
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.atomic_file import write_text_atomic
@@ -33,6 +33,9 @@ from scripts.production.staff_test_support import isolated_staff_file
 
 FIRST_SESSION = fixture_runtime_id("thread-first")
 NEXT_SESSION = fixture_runtime_id("thread-second")
+
+# The fixture waits for a fresh probe and allows 15 seconds for scheduling delays.
+TARGET_PROBE_TIMEOUT_SECONDS = 15
 
 
 def isolate_run_sources(environment: dict[str, str], root: Path) -> None:
@@ -636,7 +639,8 @@ def main():
         with (root / "reservation-results").open("a") as output:
             output.write(str(status) + "\\n")
     if inject and status == 11:
-        # Temporary hold for the stale evidence race in verify.sh:3174 and admission_service.py:4250.
+        # Temporary hold; queue 44ds (A busy Linux reservation gets no second assignment from old evidence) removes it.
+        # See verify.sh:3174 and admission_service.py:4250.
         wait_for_file(root / "reservation-observed")
     return status
 
@@ -652,6 +656,8 @@ class VerifyTargetWaitHolderTests(_RecordedHoldWaitFixture):
         binaries = root / "bin"
         claims = Path(self.fixture.environment["MAC_TEST_STATE_DIR"]) / "claims"
         claims.mkdir(parents=True, exist_ok=True)
+        settings = Path(self.fixture.environment["MAC_TEST_CONFIG"])
+        _ = write_config_fixture(settings, f"probe_timeout_s={TARGET_PROBE_TIMEOUT_SECONDS}\n", template="mac_test")
         local_wait = root / "target-local-wait.py"
         _ = local_wait.write_text(f"""import sys
 sys.path.insert(0, {str(VERIFY.parents[2])!r})
@@ -675,6 +681,7 @@ wanted=rev-parse
 def hold_after_cleanup():
     if os.environ.get("TEST_REHOLD_FINAL") == "1" and globals().get("attempt") == 1:
         assigned_mac_test.write_json(Path(os.environ["TEST_CLAIM_FILE"]), json.loads(os.environ["TEST_NEXT_CLAIM"]))
+        (Path(os.environ["PACKAGE_ROOT"]) / "target-next-final-claim").touch()
 atexit.register(hold_after_cleanup)
 if "--assignment-file" in arguments:''', 1)
         source = source.replace('raise SystemExit(runner_status)', RUN_HISTORY + 'raise SystemExit(runner_status)')
@@ -698,9 +705,43 @@ if "--assignment-file" in arguments:''', 1)
         write_text_atomic(path, json.dumps(row))
         return row
 
-    def pause(self, process: subprocess.Popen[str], number: int) -> list[dict[str, object]]:
-        marker = self.fixture.root / f"target-holder-{number}"
-        wait_for_verify_state(marker.exists, marker.parent, process, marker.name)
+    def pause(self, process: subprocess.Popen[str], number: int, *, target: str = "mac") -> list[dict[str, object]]:
+        root = self.fixture.root
+        marker = root / f"target-holder-{number}"
+        retry = root / f"target-retry-{number}"
+        admission = caller_admission(self.fixture, root, self.fixture.environment)
+        server = admission.server
+        with admission.loop_turn():
+            read_after = admission.clock.now()
+            previous_pass = server.last_pass_started
+            reply_bytes = server.reply_bytes
+
+            def has_new_target_reading(episode: str) -> bool:
+                for (candidate_episode, destination), key in server.placement_host_keys.items():
+                    if candidate_episode != episode or destination.target != target:
+                        continue
+                    if destination.provider == "local":
+                        # The private admission pass reads the local hold directly.
+                        return server.last_pass_started > previous_pass
+                    evidence = server.host_observations.get(key)
+                    if isinstance(evidence, placement.FreshHostEvidence) and evidence.observed_at > read_after:
+                        return True
+                return False
+
+            def observe(reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
+                data = reply_bytes(reply, version=version)
+                if (isinstance(reply, wire.PlacementWait) and not retry.exists()
+                        and has_new_target_reading(reply.episode)):
+                    write_text_atomic(retry, reply.episode)
+                return data
+
+            observer = mock.patch.object(server, "reply_bytes", new=observe)
+            _ = observer.start()
+        try:
+            wait_for_verify_state(marker.exists, root, process, marker.name)
+        finally:
+            with admission.loop_turn():
+                observer.stop()
         return wait_rows(Path(self.fixture.environment["UNIT_RUN_DIR"]))
 
     def resume(self, number: int) -> None:
@@ -725,7 +766,8 @@ if "--assignment-file" in arguments:''', 1)
         _ = self.prepare_target_wait(pauses=1)
         root = self.fixture.root
         settings = root / "linux-box.conf"
-        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\nslots=1\n",
+        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\nslots=1\n"
+                                 + f"probe_timeout_s={TARGET_PROBE_TIMEOUT_SECONDS}\n",
                                  template="mac_test")
         _ = (root / "build_targets.conf").write_text(
             "targets=linux-box,natedev\nkind.linux-box=ssh\nplatform.linux-box=linux\n"
@@ -750,14 +792,15 @@ if "--assignment-file" in arguments:''', 1)
 
             def claim_observed() -> bool:
                 with admission.loop_turn():
-                    return any(isinstance(evidence := reader.latest, placement.FreshHostEvidence)
-                               and evidence.holder == placement.ResourceHolderSession(NEXT_SESSION)
+                    return any(isinstance(evidence := reader.latest, PrivateHostEvidence)
+                               and isinstance(evidence.holder_claim, placement.ProviderClaimReference)
+                               and evidence.holder_claim.claim_id == owner["claim_id"]
                                for key, reader in admission.server.host_readers.items()
                                if key.destination.target == "linux-box")
 
             wait_for_verify_state(claim_observed, admission.state_dir, process, "the provider reading for the new claim")
             (root / "reservation-observed").touch()
-            rows = self.pause(process, 1)
+            rows = self.pause(process, 1, target="linux-box")
             self.assertEqual(recorded_holders(rows), [named_holder("slot", "linux-box", NEXT_SESSION)])
             self.assertEqual((root / "reservation-results").read_text().splitlines(), ["11"])
             self.assertEqual(self.fixture.runner_events(), [])
@@ -800,6 +843,8 @@ if "--assignment-file" in arguments:''', 1)
         self.assertEqual(recorded_holders(rows)[-1], named_holder("slot", "mac", FIRST_SESSION))
         claim.unlink()
         self.resume(1)
+        next_claim_ready = self.fixture.root / "target-next-final-claim"
+        wait_for_verify_state(next_claim_ready.exists, next_claim_ready.parent, process, "the second final claim")
         rows = self.pause(process, 2)
         self.assertEqual(recorded_holders(rows)[-1], named_holder("slot", "mac", NEXT_SESSION))
         claim.unlink()
@@ -854,11 +899,11 @@ if "--assignment-file" in arguments:''', 1)
         _ = self.claim(claim, FIRST_SESSION)
         self.fixture.environment["TEST_RUNNER_BUSY_UNTIL"] = str(self.fixture.root / "mac-free")
         process = self.start("test", "sample", "--no-cache")
-        rows = self.pause(process, 1)
+        rows = self.pause(process, 1, target="natedev")
         self.assertEqual(recorded_holders(rows)[-1], named_holder("slot", "natedev", FIRST_SESSION))
         os.rename(holders / FIRST_SESSION, holders / NEXT_SESSION)
         self.resume(1)
-        rows = self.pause(process, 2)
+        rows = self.pause(process, 2, target="natedev")
         self.assertEqual(recorded_holders(rows)[-1], named_holder("slot", "natedev", NEXT_SESSION))
         (holders / NEXT_SESSION).unlink()
         self.resume(2)
