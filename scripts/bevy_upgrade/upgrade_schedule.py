@@ -12,7 +12,7 @@ from pathlib import Path
 
 from scripts.lib.process_failure import failure_detail
 from scripts.production import staff
-from scripts.message import session_send
+from scripts.message import send_result, session_send
 from scripts.bevy_upgrade.upgrade_record import Record
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -72,7 +72,7 @@ def tell_showrunner(staff_id: str, summary: str, text: str) -> bool:
         except OSError as error:
             outcome = f"FAILED: {error}"
         else:
-            if result.returncode == 0 and result.stdout.strip().startswith("SENT:"):
+            if send_result.delivered_or_kept(result.returncode, result.stdout):
                 return True
             outcome = failure_detail(result)
     print(f"bevy_upgrade: the showrunner was not told: {outcome}", file=sys.stderr)

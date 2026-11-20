@@ -8,22 +8,24 @@ except FileNotFoundError:
     pass
 
 import argparse
+from array import array
 from collections.abc import Generator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from enum import Enum
+import fcntl
 import json
 import math
 import os
 import re
 import selectors
-import signal
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import termios
 import time
-from typing import TYPE_CHECKING, BinaryIO, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 import uuid
 
 from scripts.lib import process_stat
@@ -36,7 +38,6 @@ from scripts.lib.dev_shell import (
 )
 from scripts.mac_test.abandoned_sessions import removal_script
 from scripts.mac_test.floor_claims import inherited_mirror_descriptors
-from scripts.lib.process_group import send_process_group
 
 if TYPE_CHECKING:
     from scripts.copies import copies
@@ -99,10 +100,16 @@ def execution_descriptors() -> tuple[int, ...]:
                                *build_folders.held_build_folder_descriptors())))
 
 
+def _pending_pipe_bytes(fd: int) -> int:
+    count = array('i', [0])
+    _ = cast(int, fcntl.ioctl(fd, termios.FIONREAD, count))
+    return count[0]
+
+
 def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
                            environment: Mapping[str, str], output_max_bytes: int, *, timeout_s: float,
                            extra_descriptors: tuple[int, ...] = ()) -> LeasedCommandResult:
-    """Capture bounded output while every child retains the maker lease."""
+    """Capture output through command exit, including bytes still pending at exit."""
     if output_max_bytes <= 0 or not math.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError('The command output bound and deadline must be positive')
     started_at, started = time.time(), time.monotonic()
@@ -112,44 +119,53 @@ def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
             pass_fds=tuple(dict.fromkeys((*execution_descriptors(), *execution.descriptors, *extra_descriptors))),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     assert child.stdout is not None and child.stderr is not None
-    try:
-        try:
-            with selectors.DefaultSelector() as streams:
-                _ = streams.register(child.stdout, selectors.EVENT_READ, 0)
-                _ = streams.register(child.stderr, selectors.EVENT_READ, 1)
-                while streams.get_map():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise LeasedCommandLost('The Hana command exceeded its execution deadline')
-                    for event, _ in streams.select(remaining):
-                        stream = cast(BinaryIO, event.fileobj)
-                        content = os.read(stream.fileno(), 65536)
-                        if not content:
-                            _ = streams.unregister(stream)
-                            continue
-                        if sum(map(len, output)) + len(content) > output_max_bytes:
-                            raise LeasedCommandLost('The command output exceeds its transport bound')
-                        output[cast(int, event.data)].extend(content)
-            try:
-                status = child.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                raise LeasedCommandLost('The Hana command exceeded its execution deadline') from None
-        except BaseException:
-            try:
-                send_process_group(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                _ = child.wait(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                # Root enforces the same deadline on the entire command cgroup.
-                pass
-            raise
-    finally:
-        child.stdout.close()
-        child.stderr.close()
+    pipe_fds = (child.stdout.fileno(), child.stderr.fileno())
+    with ExitStack() as cleanup:
+        _ = cleanup.enter_context(child.stdout)
+        _ = cleanup.enter_context(child.stderr)
+        exit_fd = os.pidfd_open(child.pid)
+        _ = cleanup.callback(os.close, exit_fd)
+        streams = cleanup.enter_context(selectors.DefaultSelector())
+        _ = streams.register(exit_fd, selectors.EVENT_READ)
+        for index, fd in enumerate(pipe_fds):
+            os.set_blocking(fd, False)
+            _ = streams.register(fd, selectors.EVENT_READ, index)
+
+        while True:
+            remaining = deadline - time.monotonic()
+            events = streams.select(max(0, remaining))
+            if any(key.fd == exit_fd for key, _ in events):
+                break
+            if remaining <= 0:
+                # The systemd unit owns process cleanup.
+                raise LeasedCommandLost('The Hana command exceeded its execution deadline')
+            for key, _ in events:
+                try:
+                    content = os.read(key.fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not content:
+                    _ = streams.unregister(key.fd)
+                    continue
+                if sum(map(len, output)) + len(content) > output_max_bytes:
+                    raise LeasedCommandLost('The command output exceeds its transport bound')
+                output[cast(int, key.data)].extend(content)
+
+        finished_at, finished = time.time(), time.monotonic()
+        # A descendant can write while the runner reads either pipe.
+        pending = tuple(_pending_pipe_bytes(fd) for fd in pipe_fds)
+        status = child.wait()
+        if sum(map(len, output)) + sum(pending) > output_max_bytes:
+            raise LeasedCommandLost('The command output exceeds its transport bound')
+        for fd, remaining, buffer in zip(pipe_fds, pending, output, strict=True):
+            while remaining > 0:
+                content = os.read(fd, min(remaining, 65536))
+                if not content:
+                    raise LeasedCommandLost('The command output ended before the pending bytes were read')
+                buffer.extend(content)
+                remaining -= len(content)
     return LeasedCommandResult(status if status >= 0 else 128 - status, bytes(output[0]), bytes(output[1]),
-                               started_at, time.time(), time.monotonic() - started)
+                               started_at, finished_at, finished - started)
 
 
 CARGO_START_ERROR = 'The guest could not start Cargo because the executable is missing from the prepared PATH'
