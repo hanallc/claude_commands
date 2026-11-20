@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
+from scripts.lib.strict_json import DuplicateJsonKey, unique_json_fields
 from scripts.aws_target import hana_result
 from scripts.message import send_result, session_send
 from scripts.aws_target.config import (
@@ -1210,15 +1211,6 @@ class _DuplicateChargeField(LedgerUnavailable):
     pass
 
 
-def unique_charge_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    fields: dict[str, object] = {}
-    for key, value in pairs:
-        if key in fields:
-            raise _DuplicateChargeField('duplicate charge field')
-        fields[key] = value
-    return fields
-
-
 @dataclass(frozen=True)
 class _ChargeAmountRead:
     at: int
@@ -1315,7 +1307,10 @@ def read_strict_charge(path: Path) -> ChargeRead:
 
 
 def _strict_charge_record(document: str) -> dict[str, object]:
-    return mapping(cast(object, json.loads(document, object_pairs_hook=unique_charge_fields)))
+    try:
+        return mapping(cast(object, json.loads(document, object_pairs_hook=unique_json_fields)))
+    except DuplicateJsonKey as error:
+        raise _DuplicateChargeField('duplicate charge field') from error
 
 
 def matches_utc_charge_day(name: str, reading: ChargeRead, day: date) -> bool:

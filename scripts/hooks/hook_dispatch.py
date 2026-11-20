@@ -56,6 +56,8 @@ from pathlib import Path
 from types import FrameType
 from typing import NoReturn, TypedDict, cast
 
+from scripts.lib.strict_json import reject_json_constant
+
 DISPATCH_OVERHEAD_SECONDS = 30
 
 
@@ -385,10 +387,6 @@ def _valid_output(document: dict[str, object], event: str) -> bool:
     return "updatedInput" not in specific or isinstance(specific["updatedInput"], dict)
 
 
-def _reject_json_constant(value: str) -> NoReturn:
-    raise ValueError(f"invalid JSON constant: {value}")
-
-
 def _merge_fields(documents: Sequence[dict[str, object]]) -> dict[str, object]:
     merged: dict[str, object] = {}
     for document in documents:
@@ -425,7 +423,7 @@ def combine_results(event: str, results: Sequence[HookResult]) -> DispatchResult
         document: dict[str, object] = {}
         if result.exit_code == 0 and result.stdout.strip():
             try:
-                loaded = cast(object, json.loads(result.stdout, parse_constant=_reject_json_constant))
+                loaded = cast(object, json.loads(result.stdout, parse_constant=reject_json_constant))
                 if not isinstance(loaded, dict):
                     invalid = True
                 else:

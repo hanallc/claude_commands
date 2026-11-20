@@ -55,6 +55,7 @@ scripts/lib/conf_reads.py
 scripts/lib/copy_record.py
 scripts/lib/dev_shell.py
 scripts/lib/file_lock.py
+scripts/lib/fix_delta_paths.py
 scripts/lib/git_files.py
 scripts/lib/git_index.py
 scripts/lib/git_rescue.py
@@ -68,6 +69,7 @@ scripts/lib/scratch.py
 scripts/lib/session_folder.py
 scripts/lib/session_paths.py
 scripts/lib/slot_root.py
+scripts/lib/strict_json.py
 scripts/lib/suite_runners.py
 scripts/lib/test_phase.py
 scripts/lib/time_limit.py

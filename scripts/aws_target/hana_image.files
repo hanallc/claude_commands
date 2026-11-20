@@ -7,4 +7,6 @@ scripts/aws_target/hana_receiver.py
 scripts/aws_target/hana_result.py
 scripts/build_queue/execution_identity.py
 scripts/lib/build_folder_lock.py
+scripts/lib/fix_delta_paths.py
 scripts/lib/process_stat.py
+scripts/lib/strict_json.py
