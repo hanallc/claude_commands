@@ -177,6 +177,8 @@ request_slow_seconds=0.25
         f"""roots.system=/tmp
 roots.temporary=${{TMPDIR}}/builds
 roots.gate={gate}
+roots.build={root / 'build'}
+roots.build.{host_name()}={root / 'build'}
 roots.slots={root / 'slots'}
 roots.slot_cargo={root / 'cargo'}
 roots.workspace={root / 'workspaces'}
@@ -185,6 +187,8 @@ roots.copies={root / 'copies'}
 roots.scratch={root / 'scratch'}
 roots.mirror={root / 'mirrors'}
 roots.shell={root / 'shells'}
+# whole: 1..
+folders.unused_days=2
 # whole: 1..
 slots.{host_name()}.default_max=2
 # whole: 1..
@@ -228,6 +232,7 @@ seed.min_free_gib=350
     _ = (directory / "copies.conf").write_text(
         f"""remote_registry={root / 'remote-mirrors'}
 wait_seconds=0.01
+# range: 5e-324..
 git_timeout_seconds=10
 guard_timeout_seconds=10
 guard_choice_limit=32
@@ -517,7 +522,7 @@ class MergeGateLedgerTests(MergeGateFixture):
             assert isinstance(selected, CertifiedBase)
             self.assertEqual(selected.commit, head)
 
-    def test_nightly_without_a_build_cache_sends_the_result_and_removes_its_copy(self) -> None:
+    def test_nightly_without_a_build_cache_sends_the_result_and_releases_its_copy(self) -> None:
         from scripts.production import showrunners
 
         _ = self.git(self.checkout, "rm", "Cargo.toml")
@@ -578,7 +583,8 @@ class MergeGateLedgerTests(MergeGateFixture):
                         mock.patch.object(merge_gate, "run_suites", side_effect=suite_run), \
                         mock.patch.object(merge_gate, "tell_nightly_red", return_value=merge_gate.NightlyNoticeUnreceived()) as notice, \
                         mock.patch.object(merge_gate, "nightly_owner", return_value="quiet"), redirect_stdout(output):
-                    code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
+                    code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration",
+                                            "--unit", "fixture-merge"])
                 self.assertEqual(code, int(red), output.getvalue())
                 self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), before_head)
                 self.assertEqual(self.git(self.checkout, "status", "--porcelain"), before_status)
@@ -598,8 +604,7 @@ class MergeGateLedgerTests(MergeGateFixture):
                 else:
                     notice.assert_not_called()
 
-    def test_nightly_without_an_identified_production_runs_in_the_configured_role_pool(self) -> None:
-        from scripts.copies import copies
+    def test_nightly_without_an_identified_production_uses_the_callers_unit(self) -> None:
         from scripts.production import change_review, showrunners
 
         _ = self.git(self.unit, "push", "origin", "HEAD:integration")
@@ -610,20 +615,20 @@ class MergeGateLedgerTests(MergeGateFixture):
             observed.append(repo)
             retained.append((repo / "target").resolve().parent)
             lease = cast(dict[str, object], json.loads(repo.with_name(repo.name + ".lease.json").read_text()))
-            self.assertEqual(lease["unit"], "configured-nightly")
+            self.assertEqual(lease["unit"], "fixture-merge")
             self.assertTrue((repo / ".git").is_file())
             return merge_gate.GateRun((merge_gate.GateJobResult("hooks", "test_first.py", 0, 0, "fixture"),), 0, 0)
 
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(change_review, "production_doc", side_effect=change_review.ChangeReviewError("none")),
               mock.patch.object(showrunners, "timer_docs", return_value={}),
-              mock.patch.object(copies, "fallback_owner", return_value="configured-nightly"),
               mock.patch.object(merge_gate, "run_suites", side_effect=suite_run),
               redirect_stdout(io.StringIO())):
-            code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
+            code = merge_gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration",
+                                    "--unit", "fixture-merge"])
         self.assertEqual(code, 0)
         checkout, = observed
-        self.assertEqual(checkout.name, "origin-slot1")
+        self.assertEqual(checkout, self.root / "build/origin/fixture-merge/1")
         self.assertTrue(checkout.exists())
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
         self.assertEqual(retained[0], checkout)

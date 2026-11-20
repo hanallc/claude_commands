@@ -43,7 +43,7 @@ from scripts.build_queue import placement
 from scripts.build_queue import step_estimator
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import cloud_progress
-from scripts.build_queue import queue_snapshot, slot_wait
+from scripts.build_queue import queue_snapshot
 from scripts.build_targets import target_config
 from scripts.build_targets.execution_transport import ExecutionTransport, HanaGpuNextestTransport
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
@@ -1200,15 +1200,6 @@ class WaitingAdmission:
     continuation_claim: records.ContinuationSlot | NoContinuationClaim = NoContinuationClaim()
 
 
-@dataclass
-class WaitingRepositorySlot:
-    """The loop owns this connection until capacity or the deadline ends its wait."""
-    request: wire.RepositorySlotRequest
-    connection: Connection | NoConnection
-    reply: wire.RepositorySlotWaiting | wire.RepositorySlotReady | wire.RepositorySlotExpired | NoWaitReply = NoWaitReply()
-    last_sent: float = float("-inf")
-
-
 @dataclass(frozen=True)
 class NoPass:
     pass
@@ -1390,7 +1381,6 @@ class AdmissionServer:
         self.socket_path: Path = socket_path if socket_path is not None else wire.admission_socket_path()
         self.waiters: dict[str, WaitingAdmission] = {}
         self.pending_cloud_groups: dict[str, PendingCloudGroup] = {}
-        self.repository_slot_waiters: dict[str, WaitingRepositorySlot] = {}
         self.reservations: dict[str, ReservationRecord] = {}
         self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
         self.places: dict[str, WaiterPlace] = {}
@@ -2238,7 +2228,6 @@ class AdmissionServer:
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
               ) -> gate.PassResult | gate.UnusableAdmissionConfiguration:
         self.last_pass_started = self.clock.monotonic()
-        self._advance_repository_slots()
         self._prune_runs()
         self.configuration = configuration
         self.pass_stale = False
@@ -2345,7 +2334,7 @@ class AdmissionServer:
             if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
-        interval = (config.waiting_pass_seconds if self.waiters or self.repository_slot_waiters or any(self._placement_waiting(request)
+        interval = (config.waiting_pass_seconds if self.waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         self.next_pass = self.clock.monotonic() + interval
         if starts or cloud_started:
@@ -2512,11 +2501,7 @@ class AdmissionServer:
         if recorded_launch:
             self.persist()
         waiting_cloud = self._cloud_waiters()
-        slot_rows = tuple(wire.RepositorySlotRow(waiting.request.owner, waiting.request.identity,
-            waiting.request.since, waiting.request.machine, waiting.reply)
-            for waiting in sorted(self.repository_slot_waiters.values(), key=lambda item: (item.request.since, item.request.owner.pid))
-            if isinstance(waiting.reply, wire.RepositorySlotWaiting))
-        if not rows and not waiting_cloud and not slot_rows:
+        if not rows and not waiting_cloud:
             return reading
         for waiting in waiting_cloud:
             request = waiting.request
@@ -2526,58 +2511,7 @@ class AdmissionServer:
                 cloud_progress.read(sidecar) if request.sidecar else cloud_progress.NoCloudProgress(),
                 progress.read_counter(sidecar) if request.sidecar else progress.NoCounter(), wire.CloudSlotWait(used, slots)))
         return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
-            tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes, repository_slots=slot_rows)
-
-    def _advance_repository_slots(self) -> None:
-        if not self.repository_slot_waiters:
-            return
-        pools: dict[tuple[str, str, str], list[WaitingRepositorySlot]] = {}
-        for episode, waiting in list(self.repository_slot_waiters.items()):
-            request = waiting.request
-            if not self._live(request.owner):
-                del self.repository_slot_waiters[episode]
-                continue
-            pools.setdefault((request.repository, request.machine, request.root), []).append(waiting)
-        if not pools:
-            return
-        locks = read_proc_text(Path("/proc/locks"))
-        now = self.clock.now()
-        for (repository, machine, root), waiting_pool in pools.items():
-            pool = slot_wait.read_pool(repository, machine, Path(root), locks)
-            available = len(pool.held) < pool.maximum
-            for waiting in sorted(waiting_pool, key=lambda item: (item.request.since, item.request.owner.pid)):
-                request = waiting.request
-                reply: wire.RepositorySlotWaiting | wire.RepositorySlotReady | wire.RepositorySlotExpired
-                if now >= request.deadline:
-                    reply = wire.RepositorySlotExpired(pool.expired_text)
-                elif available:
-                    reply = wire.RepositorySlotReady()
-                    available = False
-                else:
-                    reply = wire.RepositorySlotWaiting(repository, pool.held, pool.maximum, pool.maximum_key)
-                previous = waiting.reply
-                waiting.reply = reply
-                if not isinstance(reply, wire.RepositorySlotWaiting):
-                    del self.repository_slot_waiters[request.episode]
-                repeat_due = (isinstance(self.last_usable_configuration, records.MemoryConfig)
-                              and now - waiting.last_sent >= self.last_usable_configuration.wait_reply_seconds)
-                if isinstance(waiting.connection, Connection) and (previous != reply or repeat_due):
-                    self._send(waiting.connection, reply)
-                    waiting.last_sent = now
-
-    def _repository_slot(self, request: wire.RepositorySlotRequest,
-                         connection: Connection | NoConnection) -> list[wire.Reply]:
-        waiting = self.repository_slot_waiters.get(request.episode)
-        if waiting is None:
-            waiting = WaitingRepositorySlot(request, connection)
-            self.repository_slot_waiters[request.episode] = waiting
-        else:
-            waiting.connection = connection
-        self._advance_repository_slots()
-        self._publish_replies()
-        if isinstance(waiting.reply, NoWaitReply):
-            return [wire.Refused("slot waiter owner no longer exists")]
-        return [waiting.reply]
+            tuple(rows), slots, cloud_gate_stale_pushes=configuration.cloud_gate_stale_pushes)
 
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
         remote: list[records.RunningStep] = []
@@ -4387,7 +4321,7 @@ done
                 status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
             return [status_wire.PlacementStatusReply(status)]
         if isinstance(request, wire.RepositorySlotRequest):
-            return self._repository_slot(request, connection)
+            return [wire.Refused("Repository copy capacity no longer requires admission")]
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
@@ -4681,11 +4615,6 @@ done
 
     def _disconnect(self, connection: Connection) -> None:
         self._drop_deferred_requests(connection)
-        removed = [episode for episode, waiting in self.repository_slot_waiters.items() if waiting.connection is connection]
-        for episode in removed:
-            del self.repository_slot_waiters[episode]
-        if removed:
-            self._publish_replies()
         descriptor = connection.socket.fileno()
         if descriptor < 0:
             return

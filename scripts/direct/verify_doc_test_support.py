@@ -216,6 +216,7 @@ class VerifyDocFixture(unittest.TestCase):
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
         _ = self.git("init", "-q", "-b", "test")
+        _ = self.git("remote", "add", "origin", "https://example.invalid/workspace.git")
         _ = self.git("add", "-A")
         _ = self.git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
                      "commit", "-q", "-m", "base")

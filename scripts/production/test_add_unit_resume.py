@@ -34,8 +34,8 @@ def setUpModule() -> None:
 @final
 class AddUnitResumeTests(AddUnitTestCase):
     def test_resume_preserves_existing_config_settings_and_launches_with_the_same_staff_id(self) -> None:
-        worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        worktree = self.unit_tree("alpha")
+        _ = self.git("worktree", "add", str(worktree), "-b", "alpha-worktree")
         row = unit_membership("build-followups", "alpha")
         fixed_id = row.id
         row = staff.update_current_session(row.current_session, staff.native_id("3001165e-ca76-59c2-9490-878224585fad"))
@@ -80,7 +80,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         old_head = self.git("rev-parse", "build-followups")
         row = unit_membership("build-followups", "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.unit_tree("alpha")), expected=row.worktree)
         stopped = unit_lookup.LabeledSession("alpha", unit_lookup.ClaudeNotRunning(),
                                         HerdrPlace("old-host", "w2:p3"), identity=unit_lookup.LiveSession(unit_membership("build-followups", "alpha").current_session))
         running = unit_lookup.LabeledSession("alpha",
@@ -104,10 +104,10 @@ class AddUnitResumeTests(AddUnitTestCase):
         waited.assert_called_once()
         self.assertIn("alpha started:", result.stdout)
         row = unit_membership("build-followups", "alpha")
-        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.unit_tree("alpha")))
         self.assertEqual(self.git("rev-parse", "build-followups"), old_head)
-        self.assertTrue((self.root / "project-alpha").is_dir())
-        self.assertEqual(self.git("rev-parse", "build-followups-alpha"),
+        self.assertTrue((self.unit_tree("alpha")).is_dir())
+        self.assertEqual(self.git("rev-parse", "alpha-worktree"),
                          self.git("rev-parse", "build-followups"))
         self.assertEqual(self.opened()[7], str(prior))
         arguments = self.agent_arguments()
@@ -142,7 +142,7 @@ class AddUnitResumeTests(AddUnitTestCase):
                                  + "to make it this unit, run add_unit with --attach 62ccbd64-f22e-5647-b20e-7899aa39d766\n")
                 self.assert_no_launch_change(document, head)
                 self.assertEqual([row for row in self.herdr_calls() if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
-                self.assertNotIn("build-followups-alpha", self.git("branch", "--list"))
+                self.assertNotIn("alpha-worktree", self.git("branch", "--list"))
         # Brief launches must refuse before their stub is written too.
         result = self.cli("alpha", "--brief", "Repair the unit", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
@@ -192,11 +192,11 @@ class AddUnitResumeTests(AddUnitTestCase):
         row = unit_membership("build-followups", "alpha")
         self.assertEqual(row.unit_type, staff.UnitDetails("merge"))
         self.assertIn("Load /unit:merge before waiting for orders.", self.opening_prompt())
-        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.unit_tree("alpha")))
         self.assertNotIn("STAFF_ID", self.pane_environment())
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--resume") + 1], row.current_session)
-        self.assertEqual(unit_config.read(self.root / "project-alpha"),
+        self.assertEqual(unit_config.read(self.unit_tree("alpha")),
                          unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), ()))
 
     def test_attach_requires_cwd_supported_mode_and_exclusive_session_flag(self) -> None:
@@ -285,7 +285,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         prior.mkdir()
         row = unit_membership("build-followups", "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
-        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.unit_tree("alpha")), expected=row.worktree)
         before = self.repository_state()
         head = self.git("rev-parse", "HEAD")
 
@@ -302,15 +302,15 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(staff.by_id(row.id), row)
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
-        self.assertFalse((self.root / "project-alpha").exists())
+        self.assertFalse((self.unit_tree("alpha")).exists())
 
     def test_retired_permanent_resume_keeps_the_existing_branch_and_refuses_admission(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        _ = self.git("branch", "build-followups-alpha")
+        _ = self.git("branch", "alpha-worktree")
         row = unit_membership("build-followups", "alpha")
         row = staff.update_current_session(row.current_session, staff.native_id("62ccbd64-f22e-5647-b20e-7899aa39d766"))
-        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"), expected=row.worktree)
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.unit_tree("alpha")), expected=row.worktree)
         before = self.repository_state()
 
         result = self.cli("alpha", "--permanent", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
@@ -321,7 +321,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertFalse(any(call[2:4] == ["agent", "start"] for call in self.herdr_calls()))
         self.assertEqual(staff.by_id(row.id), row)
         self.assertEqual(self.repository_state(), before)
-        self.assertFalse((self.root / "project-alpha").exists())
+        self.assertFalse((self.unit_tree("alpha")).exists())
 
     def test_retired_as_built_plan_resumes_without_a_production_header(self) -> None:
         plan = "docs/as-built/alpha.md"
@@ -331,7 +331,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         _ = self.git("add", plan)
         _ = self.git("commit", "-m", "add the as-built plan")
         _ = self.git("push", "origin", "build-followups")
-        worktree = self.root / "project-alpha"
+        worktree = self.unit_tree("alpha")
         _ = self.prepare_restored_worktree("alpha", worktree, plan=plan)
         document = self.doc.read_bytes()
 
@@ -349,7 +349,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         path.parent.mkdir(parents=True)
         _ = path.write_text("# Alpha as built\n", encoding="utf-8")
         _ = self.git("add", plan)
-        worktree = self.root / "project-alpha"
+        worktree = self.unit_tree("alpha")
         _ = self.prepare_restored_worktree("alpha", worktree, plan=plan)
         before = self.repository_state()
 
@@ -370,7 +370,7 @@ class AddUnitResumeTests(AddUnitTestCase):
                           if call[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])], [])
 
     def test_retired_plan_resume_reuses_its_worktree_after_a_failed_launch(self) -> None:
-        worktree = self.root / "project-alpha"
+        worktree = self.unit_tree("alpha")
         _ = self.prepare_restored_worktree("alpha", worktree)
         before = self.repository_state()
 
@@ -423,7 +423,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assert_director_flags("opus", "xhigh")
         command = self.opening_prompt()
         self.assertIn("You are now alpha in production build-followups", command)
-        promoted_plan = self.root / "project-alpha/docs/plans/given.md"
+        promoted_plan = self.unit_tree("alpha") / "docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
         self.assertIn(f"Run /unit:style {promoted_plan}", command)
         selected = staff.unit_command(unit_membership("build-followups", "alpha"))
@@ -461,7 +461,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         _ = self.successful("alpha", "--plan", plan.as_posix(), "--check")
         self.assertEqual(self.repository_state(), initial)
         _ = self.successful("alpha", "--plan", plan.as_posix())
-        worktree = self.root / "project-alpha"
+        worktree = self.unit_tree("alpha")
         copied = worktree / plan
         self.assertEqual(copied.read_text(encoding="utf-8"), standing)
         self.assertEqual(self.git("check-ignore", "--", plan.as_posix(), cwd=worktree), plan.as_posix())

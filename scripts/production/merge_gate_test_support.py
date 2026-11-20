@@ -391,6 +391,9 @@ class MergeGateFixture(unittest.TestCase):
         self.bind_fixture(self.fixture_root)
         pin_gate_root(Path(self.environment["CONF_DIR"]) / "build_folders.conf", self.fixture_root.parent)
         pin_gate_root(self.root / "build_folders.conf", self.fixture_root.parent)
+        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
+                                 f"roots.gate={self.fixture_root.parent}\nroots.build={self.fixture_root / 'build'}\n"
+                                 + f"roots.build.natedev={self.fixture_root / 'build'}\n")
         self.configure_gate("program_first_peak_gib.merge-gate=4\n")
         seed = self.fixture_seeds[folders]
         self.base, self.checkpoint = seed.base, seed.checkpoint
