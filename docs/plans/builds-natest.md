@@ -323,3 +323,21 @@
   1. 20 repeated runs pass under a load like the gate's, TMPDIR=/tmp, 2 GB scope.
   2. basedpyright zero errors and warnings on changed files.
   3. Full natedev gate passes (reds that also occur on base do not count).
+
+### Phase 397 — the step-wait interrupt test passes under load  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** scripts/direct/test_verify_hold_signals.py test_interrupt_during_a_step_wait_records_seconds_and_removes_the_call passes under gate load. It hit its fixture hang guard in the sdlc restorepass gate. It passes alone on that tip and on main 10fd385ee. Phase 353 last changed it.
+- **Spec:**
+  1. Find each place where the test or its fixture depends on time: a hang guard, a deadline, a poll, or an order of events that load can change. Look first at `wait_for_call`, the step hold, and the TERM sent while the step waits.
+  2. Make each wait end on the event the code gives (a record, a pipe, a FIFO, a reap). A hang guard stays only as a last limit far above any healthy run.
+  3. Fix it in the test or fixture. Change verify code only when production has the same race; then report it before you edit.
+  4. Tests read no /tune value. No new signal handler, mask or disposition.
+- **Files:** `scripts/direct/test_verify_hold_signals.py` and its fixture support module; verify production files only for a production race.
+- **Workers:** 1 writer.
+- **Constraints from prior phases:** phase 396 made the wait holder tests wait on the new holder record; use the same event method. Builds ranks it after 355.
+- **Acceptance gate:**
+  1. 20 repeated runs pass under a load like the gate's, TMPDIR=/tmp, 2 GB scope.
+  2. basedpyright zero errors and warnings on changed files.
+  3. Full natedev gate passes (reds that also occur on base do not count).
