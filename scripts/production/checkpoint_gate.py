@@ -11,7 +11,6 @@ import tomllib
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
@@ -21,22 +20,9 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.message import session_send
 from scripts.production import staff
-from scripts.production.production_doc import ProductionDocument, Refusal
+from scripts.production.production_doc import ProductionDocument
 
 TREE_CHANGED_STATUS = 77
-
-
-def integration_production[T: ProductionDocument](production: T) -> T:
-    """Use the enrolled integration checkout and live LOG for a gate."""
-    from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, resolve_production_paths
-
-    try:
-        paths = resolve_production_paths(production.doc)
-    except ProductionPathsError as error:
-        raise Refusal(str(error)) from error
-    if isinstance(paths, EnrolledPaths):
-        return replace(production, checkout=paths.integration, log=paths.log)
-    return production
 
 
 class Stop(Exception):
@@ -308,6 +294,7 @@ class BumpGateRecord(TypedDict):
     name: str
     merge_branch: str
     checkout: str
+    # Older gates store the LOG relative to their recorded checkout.
     production_log: str
     zone: str
     unit: str
