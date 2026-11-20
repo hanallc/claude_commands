@@ -345,7 +345,9 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
             else:
                 start = admission_records.process_start_time(record.program.pid)
                 if start is None or start == record.program.start_time:
-                    # Linux publishes the scope before Cargo starts. Mac recovery uses the process tree.
+                    # RUNNER programs (CI Cargo) start without a scope.
+                    # As on main, recovery relies on the process tree and group.
+                    # A reparented descendant that calls setsid can leave both trackers.
                     tree = ProgramTree(record.program.pid)
                     tree.observed[record.program.pid] = record.program.start_time
                     stop_members(lambda: tree.live_members(set()), deadline, configuration.program_sample_seconds)
@@ -386,10 +388,10 @@ def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequenc
 
 
 def _scope_is_empty(scope: Path) -> bool:
-    events = scope / "cgroup.events"
-    memory_admit.check_memory_reading(events)
     try:
-        populated = [line for line in events.read_text().splitlines() if line.startswith("populated ")]
+        return not memory_admit.scope_populated(scope, require_events=True)
+    except snapshot_codec.SnapshotParseError as error:
+        raise CleanupUnresolved(str(error)) from error
     except OSError as error:
         if error.errno not in (errno.ENOENT, errno.ENODEV):
             raise
@@ -398,7 +400,6 @@ def _scope_is_empty(scope: Path) -> bool:
         except FileNotFoundError:
             return True
         raise CleanupUnresolved(f"scope {scope} has no readable cgroup.events") from error
-    return populated == ["populated 0"]
 
 
 def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:

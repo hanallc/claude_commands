@@ -1459,6 +1459,41 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 with self.assertRaisesRegex(queue.CleanupUnresolved, "no readable cgroup.events"):
                     queue.stop_scope(scope, 2, 0.5)
 
+    def test_scope_recovery_keeps_the_record_when_events_is_a_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scope = root / "scope"
+            scope.mkdir()
+            _ = (scope / "cgroup.procs").write_text("")
+            events = scope / "cgroup.events"
+            os.mkfifo(events)
+            sidecar = root / "program.cgroup"
+            _ = sidecar.write_text(str(scope))
+            owner = wire.Owner(101, "100")
+            record = root / "program.json"
+            saved = wire.encode_record(queue.ProgramStart(owner, owner, str(scope), sidecar=str(sidecar)))
+            _ = record.write_text(saved)
+
+            read_text = Path.read_text
+
+            def read_regular_text(path: Path) -> str:
+                self.assertNotEqual(path, events, "Read cgroup.events with the regular-file opener.")
+                return read_text(path)
+
+            errors = io.StringIO()
+            timing = wire.RunnerExecutionTiming(program_sample_seconds=0.1, program_stop_seconds=0,
+                                                peak_wave_seconds=1)
+            with (mock.patch.object(Path, "read_text", autospec=True, side_effect=read_regular_text),
+                  mock.patch.object(queue, "program_starts", return_value=root),
+                  mock.patch.object(records, "process_start_time", return_value=None),
+                  redirect_stderr(errors)):
+                with self.assertRaisesRegex(snapshot_codec.SnapshotParseError, "expected a regular file"):
+                    _ = gate.scope_populated(scope)
+                self.assertEqual(queue.cleanup_program_starts(timing), {sidecar})
+            self.assertIn(f"UNRESOLVED: recovery kept {record}", errors.getvalue())
+            self.assertEqual(record.read_text(), saved)
+            self.assertEqual(sidecar.read_text(), str(scope))
+
     def assert_pending_scope_keeps_folder(self, *, legacy: bool) -> None:
         with QueuePlaceFixture() as fixture:
             with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
