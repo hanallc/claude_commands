@@ -87,7 +87,7 @@ def read_measurement(settings_path: Path, directory: Path, now: int, *,
     try:
         go_live_row = mac_test.read_json_object(directory / 'go-live.json')
         go_live = ledger.instant(go_live_row, 'at') if go_live_row is not None else MeasurementUnavailable('go-live time is not recorded')
-        readings = tuple(read_charge(path) for path in sorted((directory / 'charges').glob('*.json')))
+        readings = ledger.CostLedger(directory).validated_bills(now)
         return AwsMeasurement(status.permission, status.costs, status.events,
                               status.monthly_limit_usd, readings, go_live)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
@@ -136,7 +136,7 @@ def daily_usage(settings_path: Path, directory: Path, day: str, now: int, *,
         uptime = sum(row.confirmed_uptime_s for row in costs.intervals)
         usd = ledger.period_cost(costs.intervals, start, end)
         book = ledger.CostLedger(directory)
-        if source.state.gate_reservations or any(ledger.is_billed_day(row) for row in book.read_bills()):
+        if source.state.gate_reservations or book.validated_bills(now):
             usd = ledger.period_cost((charge for spend in book.spend_days(source.settings, now)
                                       for charge in spend.intervals), start, end)
         return DailyUsage(uptime, usd)

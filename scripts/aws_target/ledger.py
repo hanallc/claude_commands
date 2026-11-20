@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time as day_time, timedelta
@@ -1264,7 +1264,8 @@ def complete_day_adjustment(complete_days: Sequence[CompleteDayAmount], interval
 
 
 def read_charge(path: Path) -> ChargeRead:
-    return _decode_charge(cast(object, json.loads(path.read_text())))
+    fields, _duplicates = _read_charge_fields(path.read_text())
+    return _decode_charge(fields)
 
 
 def _decode_charge(record: object) -> ChargeRead:
@@ -1285,13 +1286,17 @@ class _DuplicateChargeField(LedgerUnavailable):
     pass
 
 
-def unique_charge_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    fields: dict[str, object] = {}
-    for key, value in pairs:
-        if key in fields:
-            raise _DuplicateChargeField('duplicate charge field')
-        fields[key] = value
-    return fields
+def _read_charge_fields(document: str) -> tuple[dict[str, object], bool]:
+    duplicates = False
+
+    def fields_from(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        nonlocal duplicates
+        fields = dict(pairs)
+        duplicates |= len(fields) != len(pairs)
+        return fields
+
+    fields = mapping(cast(object, json.loads(document, object_pairs_hook=fields_from)))
+    return fields, duplicates
 
 
 @dataclass(frozen=True)
@@ -1304,6 +1309,7 @@ class _ChargeAmountRead:
 class _ChargeReadHistory:
     latest: ChargeRead
     amounts: tuple[_ChargeAmountRead, ...]
+    aws_marked_final: bool = False
 
 
 @dataclass(frozen=True)
@@ -1382,7 +1388,7 @@ def _decode_charge_history(record: dict[str, object], latest: ChargeRead) -> _Ch
                     for item in rows(record, 'amount_reads')) if 'amount_reads' in record else (last,)
     if not amounts or amounts[-1] != last or any(a.at >= b.at for a, b in zip(amounts, amounts[1:])):
         raise LedgerUnavailable('invalid charge amount history')
-    return _ChargeReadHistory(latest, amounts)
+    return _ChargeReadHistory(latest, amounts, record.get('provisional') is False)
 
 
 def read_strict_charge(path: Path) -> ChargeRead:
@@ -1390,7 +1396,10 @@ def read_strict_charge(path: Path) -> ChargeRead:
 
 
 def _strict_charge_record(document: str) -> dict[str, object]:
-    return mapping(cast(object, json.loads(document, object_pairs_hook=unique_charge_fields)))
+    fields, duplicates = _read_charge_fields(document)
+    if duplicates:
+        raise _DuplicateChargeField('duplicate charge field')
+    return fields
 
 
 def matches_utc_charge_day(name: str, reading: ChargeRead, day: date) -> bool:
@@ -1400,16 +1409,46 @@ def matches_utc_charge_day(name: str, reading: ChargeRead, day: date) -> bool:
             and (reading.period_start, reading.period_end) == period_bounds(day, ZoneInfo('UTC')))
 
 
-def _bill_day_reads(readings: Iterable[tuple[str, _ChargeReadHistory]], now: int) -> Iterator[_ChargeReadHistory]:
-    for name, history in readings:
-        reading = history.latest
-        try:
-            matches = matches_utc_charge_day(name, reading, date.fromisoformat(reading.day))
-        except (OSError, ValueError, ArithmeticError):
-            continue
-        if (matches and reading.at <= now
-                and reading.account_bill and reading.actual_usd >= Decimal('.01')):
-            yield history
+class BillRecordRejection(Enum):
+    DUPLICATE_FIELDS = 'duplicate JSON fields'
+    INVALID_HISTORY = 'invalid amount history'
+    UTC_DAY_MISMATCH = 'file name, day label, or bounds do not match a full UTC day'
+    FUTURE_READ = 'read time is in the future'
+    NOT_ACCOUNT_BILL = 'account bill marker is absent'
+    BELOW_ONE_CENT = 'amount is below USD 0.01'
+
+
+@dataclass(frozen=True)
+class SavedBillRecord:
+    """A pricing read and its eligibility for the account bill."""
+
+    pricing_read: ChargeRead
+    usable_bill: _ChargeReadHistory | BillRecordRejection
+
+
+def read_saved_bill(path: Path, now: int) -> SavedBillRecord:
+    """Validate the saved account bill and keep its existing pricing evidence."""
+    fields, duplicates = _read_charge_fields(path.read_text())
+    reading = _decode_charge(fields)
+    if duplicates:
+        return SavedBillRecord(reading, BillRecordRejection.DUPLICATE_FIELDS)
+    try:
+        history = _decode_charge_history(fields, reading)
+    except (ValueError, ArithmeticError):
+        return SavedBillRecord(reading, BillRecordRejection.INVALID_HISTORY)
+    try:
+        matches = matches_utc_charge_day(path.name, reading, date.fromisoformat(reading.day))
+    except (OSError, ValueError, ArithmeticError):
+        matches = False
+    if not matches:
+        return SavedBillRecord(reading, BillRecordRejection.UTC_DAY_MISMATCH)
+    if reading.at > now:
+        return SavedBillRecord(reading, BillRecordRejection.FUTURE_READ)
+    if not reading.account_bill:
+        return SavedBillRecord(reading, BillRecordRejection.NOT_ACCOUNT_BILL)
+    if reading.actual_usd < Decimal('.01'):
+        return SavedBillRecord(reading, BillRecordRejection.BELOW_ONE_CENT)
+    return SavedBillRecord(reading, history)
 
 
 def _bill_is_complete(history: _ChargeReadHistory, settings: SpendingSettings, now: int) -> bool:
@@ -2231,35 +2270,33 @@ class CostLedger:
         return tuple(sorted((self.directory / 'charges').glob('*.json')))
 
     def read_bills(self) -> tuple[ChargeRead, ...]:
+        """Read the pricing inputs that the existing cap counts require."""
         return tuple(read_charge(path) for path in self.bill_paths())
 
-    def _strict_charge_reads(self) -> Iterator[tuple[str, _ChargeReadHistory]]:
+    def _saved_bill_records(self, now: int) -> Iterator[SavedBillRecord]:
         for path in self.bill_paths():
             try:
-                record = _strict_charge_record(path.read_text())
-                history = _decode_charge_history(record, _decode_charge(record))
+                yield read_saved_bill(path, now)
             except (OSError, ValueError, ArithmeticError):
                 continue
-            yield path.name, history
+
+    def validated_bills(self, now: int) -> tuple[ChargeRead, ...]:
+        """Read the usable account amount for each canonical UTC day."""
+        return tuple(bill.latest for record in self._saved_bill_records(now)
+                     if isinstance(bill := record.usable_bill, _ChargeReadHistory))
 
     def read_complete_day_amounts(self, settings: SpendingSettings, now: int) -> tuple[CompleteDayAmount, ...]:
         """Read amounts that qualify to replace a full UTC day."""
-        return tuple(CompleteDayAmount(history.latest.period_start, history.latest.period_end, history.latest.actual_usd)
-                     for history in _bill_day_reads(self._strict_charge_reads(), now)
-                     if _bill_is_complete(history, settings, now))
+        return tuple(CompleteDayAmount(bill.latest.period_start, bill.latest.period_end, bill.latest.actual_usd)
+                     for record in self._saved_bill_records(now)
+                     if isinstance(bill := record.usable_bill, _ChargeReadHistory)
+                     and _bill_is_complete(bill, settings, now))
 
     def read_charge_watch(self, settings: SpendingSettings, now: int) -> tuple[WatchedChargeDay, ...]:
-        """Read the settlement status of every recorded account bill day."""
-        watched: list[WatchedChargeDay] = []
-        for name, history in self._strict_charge_reads():
-            latest = history.latest
-            try:
-                day = date.fromisoformat(latest.day)
-                if latest.account_bill and latest.at <= now and matches_utc_charge_day(name, latest, day):
-                    watched.append(WatchedChargeDay(latest.day, latest.at, _charge_settlement(history, settings)))
-            except (ValueError, ArithmeticError):
-                continue
-        return tuple(watched)
+        """Read the settlement status of each usable account bill."""
+        return tuple(WatchedChargeDay(history.latest.day, history.latest.at, _charge_settlement(history, settings))
+                     for record in self._saved_bill_records(now)
+                     if isinstance(history := record.usable_bill, _ChargeReadHistory))
 
     def launches(self) -> tuple[dict[str, object], ...]:
         path = self.launch_history_path
@@ -2310,7 +2347,7 @@ class CostLedger:
 
     def spend_days(self, settings: SpendingSettings, now: int) -> tuple[DailySpend, ...]:
         state = self.read_snapshot()
-        readings = self.read_bills()
+        readings = self.validated_bills(now)
         self._price_gates(state, readings, now)
         days = gate_spend_days(state, settings, readings, now)
         launches = self.launches()
@@ -2327,39 +2364,25 @@ class CostLedger:
         state = self.read_snapshot()
         settings = read_settings(settings_path)
         pricing_reads: list[ChargeRead] = []
-        strict_reads: list[tuple[str, _ChargeReadHistory]] = []
-        final_bill_names: set[str] = set()
-        unavailable: CostEvidenceUnavailable | None = None
-        for path in self.bill_paths():
-            try:
-                document = path.read_text()
-                try:
-                    record = _strict_charge_record(document)
-                    read = _decode_charge(record)
-                except _DuplicateChargeField:
-                    read = _decode_charge(cast(object, json.loads(document)))
-                else:
-                    try:
-                        history = _decode_charge_history(record, read)
-                    except (ValueError, ArithmeticError):
-                        pass
-                    else:
-                        strict_reads.append((path.name, history))
-                        if record.get('provisional') is False:
-                            final_bill_names.add(path.name)
-                pricing_reads.append(read)
-            except (OSError, ValueError, ArithmeticError) as error:
-                unavailable = unavailable or CostEvidenceUnavailable(str(error))
-
         complete_days: list[CompleteDayAmount] = []
         aws_amounts_so_far: dict[date, Decimal] = {}
         final_days: set[date] = set()
-        for history in _bill_day_reads(strict_reads, now):
+        unavailable: CostEvidenceUnavailable | None = None
+        for path in self.bill_paths():
+            try:
+                record = read_saved_bill(path, now)
+            except (OSError, ValueError, ArithmeticError) as error:
+                unavailable = unavailable or CostEvidenceUnavailable(str(error))
+                continue
+            pricing_reads.append(record.pricing_read)
+            history = record.usable_bill
+            if isinstance(history, BillRecordRejection):
+                continue
             read = history.latest
             day = date.fromisoformat(read.day)
             if _bill_is_complete(history, settings, now):
                 complete_days.append(CompleteDayAmount(read.period_start, read.period_end, read.actual_usd))
-                if read.day + '.json' in final_bill_names:
+                if history.aws_marked_final:
                     final_days.add(day)
             else:
                 aws_amounts_so_far[day] = read.actual_usd

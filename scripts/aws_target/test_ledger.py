@@ -1071,6 +1071,46 @@ class LedgerTests(CostFixture):
                 if name:
                     path.unlink()
 
+    def test_page_uses_only_usable_bill_records(self) -> None:
+        start = self.start
+        end = start + 86400
+        now = end + 3600
+        day = '2026-01-15'
+        self.inventory(start)
+        self.observe(start, 'terminated')
+        charge = ledger.ChargeRead(day, end, start, end, Decimal(5), Decimal(0), Decimal(0))
+        for name, bill, change, reason in (
+            (day + '.json', replace(charge, period_start=start + 1), '',
+             ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+            ('alias.json', charge, '', ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+            (day + '.json', replace(charge, at=now + 1), '', ledger.BillRecordRejection.FUTURE_READ),
+            (day + '.json', charge, '"actual_usd": "8", ', ledger.BillRecordRejection.DUPLICATE_FIELDS),
+            (day + '.json', charge, '"amount_reads": [], ', ledger.BillRecordRejection.INVALID_HISTORY),
+            (day + '.json', replace(charge, actual_usd=Decimal('.006')), '',
+             ledger.BillRecordRejection.BELOW_ONE_CENT),
+        ):
+            with self.subTest(reason=reason, name=name):
+                self.write_complete_bill_fixture(bill, name)
+                path = self.state / 'charges' / name
+                if change:
+                    _ = path.write_text('{' + change + path.read_text()[1:])
+                self.assertEqual(ledger.read_saved_bill(path, now).usable_bill, reason)
+                self.assertEqual(self.book.read_bills(), (bill,))
+                self.assertEqual(self.book.validated_bills(now), ())
+                published = spend.read_spend(self.settings, self.state, now, '2026-01-16')
+                self.assertIsInstance(published, spend.Spend)
+                assert isinstance(published, spend.Spend)
+                self.assertTrue(all(row.source != 'AWS bill' and row.usd == 0 for row in published.days))
+                path.unlink()
+
+        self.write_complete_bill_fixture(charge)
+        self.write_complete_bill_fixture(replace(charge, actual_usd=Decimal(8)), 'alias.json')
+        self.assertEqual(self.book.validated_bills(now), (charge,))
+        published = spend.read_spend(self.settings, self.state, now, '2026-01-16')
+        assert isinstance(published, spend.Spend)
+        bill_rows = tuple(row.usd for row in published.days if row.source == 'AWS bill')
+        self.assertEqual(bill_rows, (Decimal(5),))
+
     def test_complete_bill_replaces_the_estimate_with_the_newest_amount(self) -> None:
         self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'monthly_limit_usd': '5'})
         start = self.start
