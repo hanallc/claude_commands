@@ -66,7 +66,7 @@ from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
 
 
-class RecoveringFailedProbe(placement.TemporaryExclusion):
+class HostWithFailedProbe(placement.TemporaryExclusion):
     """Only an exact pin can override this probe exclusion."""
 
 
@@ -3079,7 +3079,7 @@ class AdmissionServer:
                     request.constraints.package, kind, target_config.ANY_ELIGIBLE_TARGET, session=key.session,
                     configuration=configuration)
             if isinstance(answer, build_targets.FailedProbeExclusion):
-                eligibility = RecoveringFailedProbe(answer.reason)
+                eligibility = HostWithFailedProbe(answer.reason)
             elif isinstance(answer, target_config.ExcludedTarget):
                 eligibility = placement.TemporaryExclusion(answer.reason)
             else:
@@ -3460,9 +3460,13 @@ done
                     local_holder = evidence.holder
                 permitted = (evidence.eligibility if isinstance(evidence, placement.FreshHostEvidence)
                              else placement.EvidenceNeeded(evidence.reason))
-                if isinstance(permitted, RecoveringFailedProbe):
-                    permitted = (placement.AllowedHost() if isinstance(selection, placement.PinnedHost)
-                                 else placement.TemporaryExclusion(permitted.reason))
+                if isinstance(permitted, HostWithFailedProbe):
+                    from scripts.build_targets.build_targets import failed_probe_excludes
+                    from scripts.direct.step_selection import Pinned, ROUTED
+
+                    selected = Pinned(selection.target) if isinstance(selection, placement.PinnedHost) else ROUTED
+                    permitted = (placement.TemporaryExclusion(permitted.reason)
+                                 if failed_probe_excludes(destination.target, selected) else placement.AllowedHost())
                 if isinstance(evidence, placement.FreshHostEvidence) and isinstance(permitted, placement.AllowedHost):
                     from scripts.mac_test.mac_test import scopes_overlap
 

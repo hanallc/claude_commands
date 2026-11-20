@@ -2179,6 +2179,7 @@ def free_now(
     paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+    check_failed_probe_when_busy: bool = False,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -2189,6 +2190,8 @@ def free_now(
     claim gives way to a new test, so it holds the scope only for another copy
     (`copy`). A kept claim leaves the answer free: its holder is gone, and the
     next claim takes it over and cleans its leftovers.
+
+    A new Linux reservation checks the failed probe even when capacity is busy.
     """
     from scripts.mac_test import eligibility
     from scripts.buildlog import repository
@@ -2214,11 +2217,10 @@ def free_now(
     except (OSError, StateReadError):
         return "state"
     repository_name = repository.repo_name(str(repo_root))
-    if repository_name is not None and isinstance(
-            eligibility.read_mirror_busy(time.time(), repository_name, paths.target), eligibility.ActiveBackoff):
-        return "busy"
+    mirror_busy = repository_name is not None and isinstance(
+        eligibility.read_mirror_busy(time.time(), repository_name, paths.target), eligibility.ActiveBackoff)
     scopes: tuple[ClaimScope, ...] = (scope,)
-    if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
+    if not mirror_busy and not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
         try:
             scopes = tuple(RepositoryScope(scope.name, scope.key, slot)
                            for slot in range(1, slot_capacity(paths, scope, configuration=capacity_settings) + 1))
@@ -2226,15 +2228,17 @@ def free_now(
             if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
                 raise
             return "state"
-    held = all(any(
+    busy = mirror_busy or all(any(
         scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
         and (copy or not copy_gives_way(claim.record)) for claim in claims
     ) for candidate in scopes)
-    if held:
+    if busy and not check_failed_probe_when_busy:
         return "busy"
     probe = eligibility.read_failed_probe(paths.target)
     if isinstance(probe, eligibility.FailedProbe):
         return probe
+    if busy:
+        return "busy"
     if repository_name is not None and eligibility.linux_version_decline_path(paths.target, repository_name).exists():
         return "bad"
     return "free"

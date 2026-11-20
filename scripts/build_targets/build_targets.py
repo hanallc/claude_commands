@@ -768,12 +768,9 @@ class FailedProbeExclusion(ExcludedTarget):
     reason: str = "failed probe"
 
 
-def linux_probe_excludes(target: SshTarget, selection: TargetSelection, answer: mac_test.FreeNowAnswer) -> bool:
-    """An exact pin can use a Linux target before probe recovery."""
-    from scripts.mac_test import eligibility
-
-    return (target.platform == "linux" and selection != Pinned(target.name)
-            and isinstance(answer, eligibility.FailedProbe))
+def failed_probe_excludes(target: str, selection: TargetSelection) -> bool:
+    """A failed Linux probe excludes the target unless the caller pins it."""
+    return selection != Pinned(target)
 
 
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
@@ -845,13 +842,14 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     paths = mac_test.state_paths(target.name)
     answer = mac_test.free_now(paths, target.settings, repo_root, session=session,
                                  configuration=configuration)
-    if isinstance(answer, eligibility.FailedProbe) or answer == "bad":
+    if mac_test.needs_probe_recovery(answer):
         if new_step and not isinstance(selection, Pinned):
             start_probe_recovery(target, repo_root, package, kind)
-        if linux_probe_excludes(target, selection, answer):
+        if isinstance(answer, eligibility.FailedProbe) and failed_probe_excludes(target.name, selection):
             return FailedProbeExclusion(target)
         return EligibleTarget(target)
     if answer != "free":
+        assert isinstance(answer, str)
         return ExcludedTarget(target, answer)
     from scripts.mac_test import offload
 
@@ -1106,10 +1104,13 @@ def command_reserve(args: CliArguments) -> int:
         paths = mac_test.state_paths(target.name)
         identity = wait_claim_identity(paths, args.repo_root, args.pid, session=session)
         if isinstance(identity, claim_state.NoClaimIdentity):
-            answer = mac_test.free_now(paths, target.settings, Path(args.repo_root), session=session)
-            if answer not in ("free", "busy") and not (
-                    args.new_step and mac_test.needs_probe_recovery(answer)
-                    and not linux_probe_excludes(target, selection, answer)):
+            linux_new_step = args.new_step and target.platform == "linux"
+            answer = mac_test.free_now(paths, target.settings, Path(args.repo_root), session=session,
+                                      check_failed_probe_when_busy=linux_new_step)
+            if (linux_new_step and isinstance(answer, eligibility.FailedProbe)
+                    and failed_probe_excludes(target.name, selection)):
+                continue
+            if answer not in ("free", "busy") and not (args.new_step and mac_test.needs_probe_recovery(answer)):
                 continue
         policy = eligibility.mac_step_eligibility(config, Path(args.repo_root), args.package, verb, target.name, kind=args.kind)
         if isinstance(policy, eligibility.IneligibleMacStep):

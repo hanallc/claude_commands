@@ -154,6 +154,22 @@ class SshEligibilityTests(unittest.TestCase):
         claim, = mac_test.read_claims(paths)
         self.assertEqual(claim.record["pid"], 501)
 
+    def test_new_reservation_skips_ssh_and_claims_when_a_busy_linux_probe_failed(self) -> None:
+        self.mac_offload_off()
+        self.occupy(71)
+        self.occupy(72)
+        paths = mac_test.state_paths("linux")
+        claims = mac_test.read_claims(paths)
+        (paths.directory / "failed_probe").touch()
+
+        with mock.patch.object(mac_test, "command_claim_wait", wraps=mac_test.command_claim_wait) as claim:
+            self.assertEqual(self.reserve("", new_step=True), 1)
+
+        self.assertEqual(self.commands, [])
+        claim.assert_not_called()
+        self.assertEqual(mac_test.read_claims(paths), claims)
+        self.assertFalse((self.root / "reservation.tsv").exists())
+
     def test_kind_eligibility_excludes_failed_linux_probe_unless_pinned(self) -> None:
         self.mac_offload_off()
         (mac_test.state_paths("linux").directory / "failed_probe").touch()
