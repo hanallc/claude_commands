@@ -10,9 +10,9 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import subprocess
-import sys
 import time
 import threading
 from typing import cast, override
@@ -26,33 +26,103 @@ from scripts.aws_target import ledger
 from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_targets import build_targets, target_config, targets
-from scripts.direct.verify_lint_scope_test_support import VerifyLintScopeFixture
+from scripts.direct.verify_lint_scope_test_support import GIT_STUB, VerifyLintScopeFixture
+from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.process_group import send_process_group
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
 from scripts.mac_test import eligibility, mac_test, offload, claim_state
-from scripts.mac_test.offload_test_support import OffloadCommandFixture
+from scripts.mac_test.offload_test_commands import write_shell
+from scripts.mac_test.offload_test_support import FIXTURE_MIRROR_ROOT, OffloadCommandFixture
+from scripts.production.cli_fixture import invoke_cli
 
-VERIFY = Path(__file__).resolve().parents[1] / "direct/verify.sh"
+PROBE_CONFIG = {
+    "connect_timeout_s": "6",
+    "probe_timeout_s": "300",
+    "leftover_timeout_s": "300",
+    "unreachable_backoff_s": "300",
+    "mirror_busy_backoff_s": "120",
+    "free_floor_gib": "60",
+    "abandoned_session_minutes": "9",
+    "mac_budget_gib": "24",
+    "mac_budget_gib.hana": "64",
+    "mirror_root": "~/" + FIXTURE_MIRROR_ROOT,
+    "ci_repo": "",
+    "gh_timeout_s": "30",
+    "block_hours": "4",
+    "block_max_hours": "48",
+    "block_warn_minutes": "15",
+    "claim_idle_minutes": "15",
+    "claim_poll_seconds": "60",
+}
+
+PINNED_PROBE_CONFIG = "".join(f"{name}={value}\n" for name, value in PROBE_CONFIG.items())
+
+PINNED_ADMISSION_CONFIG = ADMISSION_CONFIG_FIXTURE.read_text() + (
+    "merge_gate_governor_gib=4\npeak_history_share_percent=10\nprogress_profile_sweep_seconds=0.05\n"
+    + "program_first_peak_gib.targeted-test=4\nremote_start_hold_seconds=1200\nhead_stall_alert_minutes=30\n"
+    + "peak_hold_seconds.merge-gate=180\npeak_hold_seconds.targeted-test=180\nnested_tokens=3\n"
+)
+
+TRACKED_SCRIPT_GIT = r'''
+case " $* " in
+    *" ls-files -z scripts config "*) printf "scripts/mac_test/linux_runner.py\0"; exit 0 ;;
+    *" rev-parse HEAD "*) printf "fixture\n"; exit 0 ;;
+    *" diff HEAD --quiet -- scripts/mac_test/linux_runner.py "*) exit 0 ;;
+esac
+'''
 
 
 class FailedProbeTests(OffloadCommandFixture):
     linux_settings: Path = Path()
     identity: eligibility.KnownRepository = eligibility.KnownRepository("hana")
 
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        assert cls.tools_root is not None
+        git = shutil.which("git")
+        assert git is not None
+        checkout = Path(__file__).resolve().parents[2]
+        write_shell(cls.tools_root / "git",
+            f'if [[ ${{1-}} == -C && ${{2-}} == {shlex.quote(str(checkout))} ]]; then\n'
+            + TRACKED_SCRIPT_GIT + f'fi\nexec {shlex.quote(git)} "$@"\n')
+        write_python_tool(cls.tools_root / "receive-tree.py", '''
+import shlex
+import shutil
+import sys
+from pathlib import Path
+from scripts.copies import copies
+
+source = Path(sys.argv[1])
+destination = Path.home() / shlex.split(sys.argv[2].split(":", 1)[1])[0]
+shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+copies.mark_mirror(destination, "verify", "hana", "fixture")
+''')
+
     @override
     def setUp(self) -> None:
         super().setUp()
+        # This checkout has no origin or commits. Use its folder name for identity.
+        (self.repository / ".git/config").unlink()
+        self.config.update(PROBE_CONFIG)
+        self.sync_config()
         self.linux_settings = self.root / "box.conf"
         _ = write_config_fixture(self.linux_settings,
             "offload=on\nhost=fake-box\nkinds=test,check,lint,doc,build\nslots=1\nslots.hana=1\n"
             + "shell_timeout_s=2\nparity.rustc=fixture\nparity.nextest=fixture\n"
-            + "parity.mend=fixture\nparity.scripts_commit=fixture\n", template="mac_test")
+            + "parity.mend=fixture\nparity.scripts_commit=fixture\n" + PINNED_PROBE_CONFIG, template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
         self.environment.update({name: "" for name in (
             "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
+
+    @override
+    def start_admission(self) -> None:
+        _ = write_config_fixture(self.root / "build_admission.conf", PINNED_ADMISSION_CONFIG)
+        super().start_admission()
 
     def probe(self, target: str = "box") -> offload.ProbeResult:
         self.sync_fixture()
@@ -181,12 +251,14 @@ class FailedProbeTests(OffloadCommandFixture):
         self.assertEqual(self.release_reservation(), 0)
 
     def run_reserve_cli(self, *, new_step: bool) -> subprocess.CompletedProcess[str]:
-        command = [sys.executable, str(Path(build_targets.__file__)), "reserve", "--target", "box",
+        command = ["reserve", "--target", "box",
                    "--repo-root", str(self.repository), "--package", "hana", "--kind", "test",
                    "--pid", str(os.getpid()), "--reservation-file", str(self.root / "ssh-reservation")]
         if new_step:
             command.append("--new-step")
-        return subprocess.run(command, capture_output=True, text=True, check=False, env=self.environment)
+        admission = caller_admission(self, self.root, self.environment)
+        return invoke_cli(build_targets, build_targets.main, command, self.environment, self.root,
+                          environment_lock=admission.loop_access)
 
     def test_retry_refuses_a_failed_target_without_a_new_probe(self) -> None:
         self.fixture["probe_status"] = 255
@@ -264,45 +336,26 @@ class FailedProbeTests(OffloadCommandFixture):
             self.assertEqual(mac_test.command_target_status(mac_test.state_paths("mac")), 0)
         self.assertEqual(output.getvalue(), "free\n")
 
-    def install_script_copy_tools(self) -> None:
+    def install_script_copy_tools(self, *, copy_source: bool = False) -> None:
         stub = self.bin_directory / "command-stub"
-        source = stub.read_text().replace('command=${0##*/}',
-            'command=${0##*/}\n'
-            + 'if [[ $command == rsync ]]; then printf "start %s\\n" "$EPOCHREALTIME" >> "$root/probe-timing"; fi')
-        source = source.replace("printf 'started\\n' > \"$root/probe-started\"",
+        source = stub.read_text().replace("printf 'started\\n' > \"$root/probe-started\"",
             'if [[ ${!#} == *".build-target-script-commit"* && ${!#} == printf* ]]; then\n'
             + '    printf fixture > "$root/remote-stamp"\nfi\n'
             + "printf 'started\\n' > \"$root/probe-started\"")
         source = source.replace("for line in \"${probe_lines[@]}\"; do printf '%s\\n' \"$line\"; done",
             'for line in "${probe_lines[@]}"; do\n'
-            + '    if [[ $line == scripts_commit=fixture ]]; then line="scripts_commit=$(cat "$root/remote-stamp")"; fi\n'
+            + '    if [[ $line == scripts_commit=fixture ]]; then\n'
+            + '        line="scripts_commit=$(< "$root/remote-stamp")"\n    fi\n'
             + "    printf '%s\\n' \"$line\"\ndone")
-        receiver = self.stub_directory / "receive-tree.py"
-        self.write_executable(receiver,
-            'import shlex, subprocess, sys\nfrom pathlib import Path\n'
-            + 'from scripts.copies import copies\n'
-            + 'source = Path(sys.argv[1])\n'
-            + 'destination = Path.home() / shlex.split(sys.argv[2].split(":", 1)[1])[0]\n'
-            + 'destination.mkdir(parents=True, exist_ok=True)\n'
-            + 'subprocess.run(["cp", "-a", str(source) + "/.", str(destination)], check=True)\n'
-            + 'copies.mark_mirror(destination, "verify", "hana", "fixture")\n')
-        source = source.replace('    exit "$rsync_status"',
-            '    if [[ " $* " != *" --files-from="* ]]; then\n'
-            + f'        {shlex.quote(sys.executable)} {shlex.quote(str(receiver))} "${{@: -2:1}}" "${{!#}}" || exit $?\n'
-            + '    fi\n    exit "$rsync_status"')
-        os.environ["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "lib/python_startup")
-        self.environment["PYTHONPATH"] = os.environ["PYTHONPATH"]
-        source = source.replace('exit "$probe_status"',
-            'printf "end %s\\n" "$EPOCHREALTIME" >> "$root/probe-timing"\nexit "$probe_status"')
+        tools = self.private_tools()
+        if copy_source:
+            receiver = tools / "receive-tree.py"
+            source = source.replace('    exit "$rsync_status"',
+                '    if [[ " $* " != *" --files-from="* ]]; then\n'
+                + f'        {shlex.quote(str(receiver))} "${{@: -2:1}}" "${{!#}}" || exit $?\n'
+                + '    fi\n    exit "$rsync_status"')
         _ = stub.write_text(source)
-        real_git = subprocess.run(["bash", "-c", "command -v git"], capture_output=True,
-                                  text=True, check=True).stdout.strip()
-        self.write_executable(self.bin_directory / "git",
-            'import os, sys\nfrom pathlib import Path\nargs=sys.argv[1:]\n'
-            + 'if "ls-files" in args and "scripts" in args and "config" in args:\n print("scripts/mac_test/linux_runner.py", end="\\0")\n'
-            + 'elif "rev-parse" in args and args[-1] == "HEAD":\n print("fixture")\n'
-            + 'elif "diff" in args:\n pass\n'
-            + f'else:\n os.execv({real_git!r}, [{real_git!r}, *args])\n')
+        (self.bin_directory / "git").symlink_to(tools / "git")
 
     def test_new_step_copies_the_tree_and_deduplicates_the_probe(self) -> None:
         self.fixture["probe_status"] = 255
@@ -313,7 +366,7 @@ class FailedProbeTests(OffloadCommandFixture):
         self.healthy()
         self.fixture["hold_probe"] = True
         self.sync_fixture()
-        self.install_script_copy_tools()
+        self.install_script_copy_tools(copy_source=True)
         _ = (self.stub_directory / "remote-stamp").write_text("old")
         mirror = Path(self.environment["HOME"]) / offload.remote_mirror(self.identity, "box")
         mirror.mkdir(parents=True)
@@ -321,7 +374,6 @@ class FailedProbeTests(OffloadCommandFixture):
         _ = stale_source.write_text("old repository tree")
         _ = (self.repository / "stale-source").write_text("current repository tree")
         target = target_config.configured_ssh_target("box")
-        started = time.monotonic()
         result = build_targets.ssh_target_eligibility(target, self.repository, "hana", "test",
                                                      targets.LocalRequired("local step"), new_step=True)
         self.assertIsInstance(result, targets.ExcludedTarget)
@@ -339,7 +391,6 @@ class FailedProbeTests(OffloadCommandFixture):
             os.close(descriptor)
         with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-        elapsed = time.monotonic() - started
         self.assertIsInstance(eligibility.read_failed_probe("box"), eligibility.NoFailedProbe)
         self.assertEqual(eligibility.linux_version_decline_path("box", "hana").read_text(), decline)
         self.assertEqual(stale_source.read_text(), "current repository tree")
@@ -348,10 +399,6 @@ class FailedProbeTests(OffloadCommandFixture):
         self.assertTrue(any(word.startswith("--files-from=") for word in copies[0]["args"]))
         self.assertIn("--delete", copies[1]["args"])
         self.assertEqual(mac_test.read_claims(mac_test.state_paths("box")), ())
-        timing = [line.split() for line in (self.stub_directory / "probe-timing").read_text().splitlines()]
-        copy_started = next(float(words[1]) for words in timing if words[0] == "start")
-        probe_ended = float(timing[-1][1])
-        print(f"RECOVERY script copy plus probe: {probe_ended - copy_started:.6f} s; worker total: {elapsed:.6f} s")
 
     def test_new_pinned_step_reserves_before_recovery_can_take_its_claim(self) -> None:
         self.healthy()
@@ -586,7 +633,7 @@ fi
         with redirect_stderr(io.StringIO()):
             self.assertIsInstance(self.probe(), offload.UnavailableProbe)
         self.healthy()
-        self.install_script_copy_tools()
+        self.install_script_copy_tools(copy_source=True)
         _ = (self.repository / "flake.nix").write_text("{ outputs = _: {}; }\n")
         _ = (self.repository / "flake.lock").write_text("{}\n")
         _ = write_config_fixture(self.linux_settings,
@@ -603,23 +650,18 @@ fi
             path.chmod(0o755)
         ssh = self.bin_directory / "ssh"
         ssh.unlink()
-        self.write_executable(ssh, r'''
-import os
-from pathlib import Path
-import shlex
-import subprocess
-import sys
-command = sys.argv[-1]
-if command == "true":
-    raise SystemExit(0)
-if command.startswith("printf"):
-    raise SystemExit(subprocess.run(["bash", "-c", command], check=False).returncode)
-words = shlex.split(command)
-if "dispatch_start_settled=" in command and "leftovers=0" in command:
-    raise SystemExit(subprocess.run(["bash", "-c", command], cwd=Path.home(), check=False).returncode)
-if "probe" in words and any("linux_runner.py" in word for word in words):
-    raise SystemExit(subprocess.run(["bash", "-c", command], cwd=Path.home(), check=False).returncode)
-raise SystemExit("Unexpected remote command: " + command)
+        write_shell(ssh, r'''
+command=${!#}
+case $command in
+    true) exit 0 ;;
+    printf*) exec bash -c "$command" ;;
+    *dispatch_start_settled=*leftovers=0*|*".claude/scripts/mac_test/linux_runner.py probe "*)
+        cd -- "$HOME" || exit 1
+        exec bash -c "$command"
+        ;;
+esac
+printf 'Unexpected remote command: %s\n' "$command" >&2
+exit 1
 ''')
         result = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("box"),
             self.repository, "hana", "test", targets.LocalRequired("local fixture tools"), new_step=True)
@@ -634,9 +676,14 @@ raise SystemExit("Unexpected remote command: " + command)
 
 
 class StepRecoveryTests(VerifyLintScopeFixture):
+    @override
+    def build_fixture(self) -> None:
+        super().build_fixture()
+        _ = write_config_fixture(self.root / "build_admission.conf", PINNED_ADMISSION_CONFIG)
+
     def test_each_compiling_lint_command_has_one_placement_episode(self) -> None:
         settings = self.root / "mac_test.conf"
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n")
+        _ = write_config_fixture(settings, PINNED_PROBE_CONFIG + f"offload=on\nlinux_only.{self.root.name}=\n")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
@@ -679,12 +726,13 @@ class StepRecoveryTests(VerifyLintScopeFixture):
         self.assertEqual(list((self.root / "mac-state/claims").glob("*.json")), [])
 
     def test_local_work_finishes_while_a_new_step_recovers_linux(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n")
+        _ = write_config_fixture(self.root / "mac_test.conf",
+            PINNED_PROBE_CONFIG + f"offload=on\nlinux_only.{self.root.name}=\n")
         _ = write_config_fixture(self.root / "linux.conf",
             "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc,lint\nslots=1\n"
             + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n"
             + "parity.rustc=fixture\nparity.nextest=fixture\nparity.mend=fixture\n"
-            + "parity.scripts_commit=fixture\n", template="mac_test")
+            + "parity.scripts_commit=fixture\n" + PINNED_PROBE_CONFIG, template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
@@ -701,43 +749,33 @@ class StepRecoveryTests(VerifyLintScopeFixture):
         os.mkfifo(gate)
         descriptor = os.open(gate, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, descriptor)
-        git = self.root / "bin/git"
-        source = git.read_text()
-        prefix = ('case " $* " in\n'
-            + '    *" ls-files -z scripts config "*) printf "scripts/mac_test/linux_runner.py\\0"; exit 0 ;;\n'
-            + '    *" rev-parse HEAD "*) printf "fixture\\n"; exit 0 ;;\n'
-            + '    *" diff HEAD --quiet -- scripts/mac_test/linux_runner.py "*) exit 0 ;;\nesac\n')
-        _ = git.write_text(source.replace('#!/bin/sh\n', '#!/bin/sh\n' + prefix, 1)
-            if source.startswith('#!/bin/sh\n') else '#!/bin/bash\n' + prefix + source.removeprefix('#!/bin/bash\n'))
-        self.write_executable(self.root / "bin/rsync",
-            'import json, os, sys\nfrom pathlib import Path\n'
-            + 'with Path(os.environ["PACKAGE_ROOT"], "script-copies").open("a") as output:\n'
-            + '    output.write(json.dumps(sys.argv[1:]) + "\\n")\n')
-        self.write_executable(self.root / "bin/ssh", r'''
-import json
-import os
-from pathlib import Path
-import subprocess
-import sys
-root = Path(os.environ["PACKAGE_ROOT"])
-command = sys.argv[-1]
-if command == "true":
-    raise SystemExit(0)
-if command.startswith("printf") and ".build-target-script-commit" in command:
-    (root / "remote-stamp").write_text("fixture")
-    raise SystemExit(0)
-if "dispatch_start_settled=" in command and "leftovers=0" in command:
-    raise SystemExit(subprocess.run(["bash", "-c", command], cwd=Path.home(), check=False).returncode)
-if "linux_runner.py" in command and "probe" in command:
-    with (root / "recovery-probes").open("a") as output:
-        output.write(json.dumps(sys.argv[1:]) + "\n")
-    with (root / "probe-release").open() as release:
-        assert release.readline() == "continue\n"
-    print("free_gib=1000\nhost=fake-linux\nnextest=fixture\nmend=fixture\nrc=0")
-    print("scripts_commit=" + (root / "remote-stamp").read_text())
-    raise SystemExit(0)
-print("fake Mac unavailable", file=sys.stderr)
-raise SystemExit(255)
+        self.write_shell(self.root / "bin/git", TRACKED_SCRIPT_GIT + GIT_STUB)
+        write_shell(self.root / "bin/rsync", r'''
+{ json_args "$@"; printf '\n'; } >> "$PACKAGE_ROOT/script-copies"
+''')
+        write_shell(self.root / "bin/ssh", r'''
+command=${!#}
+case $command in
+    true) exit 0 ;;
+    printf*".build-target-script-commit"*)
+        printf fixture > "$PACKAGE_ROOT/remote-stamp"
+        exit
+        ;;
+    *dispatch_start_settled=*leftovers=0*)
+        cd -- "$HOME" || exit 1
+        exec bash -c "$command"
+        ;;
+    *".claude/scripts/mac_test/linux_runner.py probe "*)
+        { json_args "$@"; printf '\n'; } >> "$PACKAGE_ROOT/recovery-probes"
+        IFS= read -r release < "$PACKAGE_ROOT/probe-release" || exit 1
+        [[ $release == continue ]] || exit 1
+        printf 'free_gib=1000\nhost=fake-linux\nnextest=fixture\nmend=fixture\nrc=0\n'
+        printf 'scripts_commit=%s\n' "$(< "$PACKAGE_ROOT/remote-stamp")"
+        exit
+        ;;
+esac
+printf 'fake Mac unavailable\n' >&2
+exit 255
 ''')
         self.write_config(clippy="on")
         self.environment["BUILD_TARGETS_SCRIPT"] = str(Path(build_targets.__file__))
