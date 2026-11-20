@@ -1365,31 +1365,29 @@ class OffloadCommandTests(OffloadCommandFixture):
             self.assert_wire("declined", f"copy: rsync: copies: {mirror}: mirror process scan unavailable; rsync error: code 23")
             self.assertFalse(backoff.exists())
 
-        with self.subTest(launch_scan="unavailable"):
-            self.clear_events()
-            self.fixture["rsync_status"] = 0
-            self.fixture["cleanup_status"] = 1
-            self.fixture["cleanup_lines"] = []
-            self.fixture["cleanup_error"] = "lsof failed"
-            self.sync_fixture()
-            # Run the fence settlement from the SSH command after the receiver refuses.
-            launch_refusal = (
-                "remote=${!#}\n"
-                + "if [[ $remote == *'copies.py mirror-use '* ]]; then\n"
-                + f"    printf '%s\\n' {shlex.quote(refusal)} >&2\n"
-                + r'''    settlement=${remote##*$'\nexec 8<&-\n'}
-    exec /bin/bash -c "dispatch_status=2; $settlement"
-fi
+        self.fixture["rsync_status"] = 0
+        self.fixture["cleanup_status"] = 1
+        self.fixture["cleanup_lines"] = []
+        self.fixture["cleanup_error"] = "lsof failed"
+        self.sync_fixture()
+        refuse = f"    printf '%s\\n' {shlex.quote(refusal)} >&2\n"
+        settle = r'''    settlement=${remote##*$'\nexec 8<&-\n'}
+    /bin/bash -c "dispatch_status=2; $settlement"
 '''
-            )
-            _ = stub.write_text(original.replace("remote=${!#}\n", launch_refusal))
-            result = self.command(runner_options=("--target", "mac"))
-            self.assertEqual(result.returncode, 75, result.stdout)
-            self.assert_wire("declined", f"copy: mirror-use: copies: {mirror}: mirror process scan unavailable")
-            self.assertEqual(len(self.events_for("rsync")), 1)
-            self.assertEqual(self.leftover_events(), [])
-            self.assertFalse(self.claim_file.exists())
-            self.assertFalse(backoff.exists())
+        for order, signals in (("refusal first", refuse + settle), ("settlement first", settle + refuse)):
+            with self.subTest(launch_scan="unavailable", order=order):
+                self.clear_events()
+                launch_refusal = ("remote=${!#}\n"
+                    + "if [[ $remote == *'copies.py mirror-use '* ]]; then\n"
+                    + signals + "    exit 2\nfi\n")
+                _ = stub.write_text(original.replace("remote=${!#}\n", launch_refusal))
+                result = self.command(runner_options=("--target", "mac"))
+                self.assertEqual(result.returncode, 75, result.stdout)
+                self.assert_wire("declined", f"copy: mirror-use: copies: {mirror}: mirror process scan unavailable")
+                self.assertEqual(len(self.events_for("rsync")), 1)
+                self.assertEqual(self.leftover_events(), [])
+                self.assertFalse(self.claim_file.exists())
+                self.assertFalse(backoff.exists())
 
     def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
         controller = offload.ProcessController()

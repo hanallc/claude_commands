@@ -1098,6 +1098,7 @@ class ProcessController:
         held_status_line = ""
         mismatch = ""
         mirror_refused = False
+        scan_refusal = ""
         start_settled = False
         build_target_directory = ""
         received_bytes = 0
@@ -1168,9 +1169,8 @@ class ProcessController:
                     print(held_status_line, end="", flush=True)
                     held_status_line = ""
                 status = MISSING_MAC_STATUS
-                if (not start_settled and marker.startswith("copies: ")
-                        and marker.endswith(": mirror process scan unavailable")):
-                    status = MirrorUseScanRefused(marker)
+                if marker.startswith("copies: ") and marker.endswith(": mirror process scan unavailable"):
+                    scan_refusal = marker
                 cleanup = CleanupUnconfirmed()
                 print(line, end="", flush=True)
             finished_output = True
@@ -1199,9 +1199,8 @@ class ProcessController:
             return MirrorUseBusy()
         if isinstance(status, UnresolvedSlotStartup):
             return status
-        if (isinstance(status, MirrorUseScanRefused) and start_settled and exit_status == 2
-                and isinstance(self.pending, SettledDispatchOperations)):
-            return status
+        if scan_refusal and start_settled and exit_status == 2 and isinstance(self.pending, SettledDispatchOperations):
+            return MirrorUseScanRefused(scan_refusal)
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
 
 

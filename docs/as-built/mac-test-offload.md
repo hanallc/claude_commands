@@ -728,6 +728,6 @@ The claim and mirror lease still make the final decision under their locks.
 Read access alone does not make a mirror busy.
 A working directory, a mapped file, or a file open for writing still makes it busy.
 An unavailable process scan refuses the copy without starting a retry delay.
-A scan refusal during `mirror-use` releases the claim after the start fence settles.
-This refusal needs no cleanup scan.
+Offload checks for a `mirror-use` scan refusal and settlement for the same claim when SSH ends.
+If both arrive and SSH exits with status 2, offload releases the claim without a cleanup scan.
 A live process in a recorded lease group protects the mirror when the scan cannot read its working directory.
