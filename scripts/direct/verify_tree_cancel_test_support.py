@@ -22,7 +22,7 @@ from typing import cast, override
 
 from scripts.agents.detached_runs import RunRecord
 from scripts.direct.test_tree_watch import write_workspace
-from scripts.direct.verify_lint_scope_test_support import write_fixture_cargo_mend
+from scripts.direct.verify_lint_scope_test_support import CARGO_MEND_DISPATCH_SOURCE, write_fixture_cargo_mend
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -45,11 +45,11 @@ import subprocess
 import sys
 import signal
 from pathlib import Path
+''' + CARGO_MEND_DISPATCH_SOURCE + r'''
 
 args = sys.argv[1:]
 if args == ["mend", "--build-info"]:
-    mend = str(Path(__file__).with_name("cargo-mend"))
-    os.execv(mend, [mend, args[-1]])
+    exec_fixture_cargo_mend(args[-1])
 root = Path(os.environ["TEST_CONTROL"])
 if "--version" in args:
     print("cargo fixture 1.0")

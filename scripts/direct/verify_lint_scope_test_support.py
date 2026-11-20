@@ -74,11 +74,19 @@ if sys.argv[-1] == "--build-info":
 ''')
 
 
+CARGO_MEND_DISPATCH_SOURCE = '''
+def exec_fixture_cargo_mend(flag: str) -> None:
+    mend = str(Path(__file__).with_name("cargo-mend"))
+    os.execv(mend, [mend, flag])
+'''
+
+
 CARGO_STUB = r'''
 import json
 import os
 from pathlib import Path
 import sys
+''' + CARGO_MEND_DISPATCH_SOURCE + r'''
 
 arguments = sys.argv[1:]
 version_tools = {
@@ -97,8 +105,7 @@ if version_tool:
         with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
             output.write(version_tool + "\n")
     if version_tool == "MEND":
-        mend = str(Path(__file__).with_name("cargo-mend"))
-        os.execv(mend, [mend, arguments[-1]])
+        exec_fixture_cargo_mend(arguments[-1])
     print(os.environ.get("TEST_VERSION_" + version_tool, version_tool + " fixture"))
     raise SystemExit(0)
 if arguments[:1] == ["metadata"]:
