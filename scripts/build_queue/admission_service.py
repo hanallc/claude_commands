@@ -3458,21 +3458,31 @@ done
                 if isinstance(evidence, placement.FreshHostEvidence) and isinstance(permitted, placement.AllowedHost):
                     from scripts.mac_test.mac_test import scopes_overlap
 
-                    retained = tuple((attempt.provider, report.received_at) for attempt in self.assignments.values()
-                        for report in (attempt.terminal_report,)
-                        if isinstance(attempt.state, placement.ClosedAssignment)
-                        and isinstance(report, placement.TerminalAttemptReport)
-                        and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
-                        and isinstance(attempt.provider, placement.ProviderClaimReference)
-                        and attempt.provider.provider == destination.provider and attempt.provider.target == destination.target
-                        and scopes_overlap(attempt.provider.scope, destination.scope))
+                    retained: set[placement.ProviderClaimReference] = set()
+                    latest_refusal_at = float("-inf")
+                    for attempt in self.assignments.values():
+                        report = attempt.terminal_report
+                        if (not isinstance(attempt.state, placement.ClosedAssignment)
+                                or not isinstance(report, placement.TerminalAttemptReport)
+                                or not isinstance(report.outcome, (placement.PrelaunchRefused,
+                                                                    execution_identity.HanaCommandAdmissionRefused))):
+                            continue
+                        provider = attempt.provider
+                        if (isinstance(provider, placement.ProviderClaimReference)
+                                and provider.provider == destination.provider and provider.target == destination.target
+                                and scopes_overlap(provider.scope, destination.scope)):
+                            retained.add(provider)
+                            latest_refusal_at = max(latest_refusal_at, report.received_at)
+                        elif (attempt.assignment.episode == request.episode and attempt.assignment.destination == destination
+                                and isinstance(report.outcome, placement.PrelaunchRefused) and report.outcome.reason == "busy"):
+                            latest_refusal_at = max(latest_refusal_at, report.received_at)
                     if any(scopes_overlap(claim.reference.scope, destination.scope)
                             and (isinstance(claim, placement.RetainedCleanupClaim)
-                                 or any(claim.reference == item[0] for item in retained))
+                                 or claim.reference in retained)
                             for claim in (*evidence.cleanup_claims, *evidence.claims)):
                         permitted = placement.TemporaryExclusion("busy")
-                    elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
-                        permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
+                    elif evidence.observed_at < latest_refusal_at:
+                        permitted = placement.EvidenceNeeded("provider evidence predates the refusal")
             result.append(placement.CandidateEligibility(destination, permitted))
         return tuple(result), local_holder
 

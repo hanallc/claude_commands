@@ -1054,41 +1054,70 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(fixture.caller_reservations(), {})
 
     def test_terminal_reports_close_the_exact_attempt_and_cannot_close_its_replacement(self) -> None:
-        cases = (("busy", 0, False, False, False), ("blocked", 0, False, False, False),
-                 ("disk", 0, False, False, False), ("unreachable", 180, False, False, False),
-                 ("disk", 0, True, False, False), ("disk", 0, False, True, False),
-                 ("busy", 0, True, False, True), ("busy", 0, False, True, True))
-        for reason, delay, delayed_absence, stale_absence, foreign_claim in cases:
+        cases = (("busy", 0, False, False, "adopted claim"), ("blocked", 0, False, False, "adopted claim"),
+                 ("disk", 0, False, False, "adopted claim"), ("unreachable", 180, False, False, "adopted claim"),
+                 ("disk", 0, True, False, "adopted claim"), ("disk", 0, False, True, "adopted claim"),
+                 ("busy", 0, True, False, "foreign claim"), ("busy", 0, False, True, "foreign claim"),
+                 ("busy", 0, False, True, "Linux reservation"))
+        for reason, delay, delayed_absence, stale_absence, refusal in cases:
             with self.subTest(reason=reason, delayed_absence=delayed_absence,
-                              stale_absence=stale_absence, foreign_claim=foreign_claim), PlacementFixture() as fixture:
+                              stale_absence=stale_absence, refusal=refusal), PlacementFixture() as fixture:
                 request = placement_request(fixture)
-                _ = publish_candidate(fixture, request)
+                linux_reservation = refusal == "Linux reservation"
+                if linux_reservation:
+                    _ = (fixture.root / "build_targets.conf").write_text(
+                        "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
+                    _ = write_config_fixture(fixture.root / "box.conf",
+                        "offload=on\nhost=fixture-box\nkinds=test\nslots=1\n", template="mac_test")
+                    destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
+                    request = replace(request, constraints=replace(request.constraints,
+                        selection=placement.PinnedHost(destination.target),
+                        candidates=(placement.PlacementCandidate(destination),)))
+                cached_free = publish_candidate(fixture, request)
                 original = assignment_for(fixture, request)
-                claim = adopt_assignment(fixture, request, original)
-                if foreign_claim:
-                    claim = replace(claim, claim_id="retained-claim", episode="previous-episode", attempt="previous-attempt")
-                    retained = placement.AdoptedProviderClaim(claim, coordinator_holder(original), original.session,
-                        original.destination.host, "host-generation-a")
-                    _ = publish_candidate(fixture, request, claims=(retained,))
+                report: wire.ClaimFailure | wire.ExecutionReport
+                if linux_reservation:
+                    report = wire.ClaimFailure("linux-reservation-refused", original, reason)
+                    claim = report.claim
                 else:
-                    _ = fixture.connect(consume_permission("consume-original", original, claim)).replies()
+                    claim = adopt_assignment(fixture, request, original)
+                    if refusal == "foreign claim":
+                        claim = replace(claim, claim_id="retained-claim", episode="previous-episode", attempt="previous-attempt")
+                        retained = placement.AdoptedProviderClaim(claim, coordinator_holder(original), original.session,
+                            original.destination.host, "host-generation-a")
+                        _ = publish_candidate(fixture, request, claims=(retained,))
+                        report = wire.ClaimFailure("retained-claim-refused", original, reason, claim)
+                    else:
+                        _ = fixture.connect(consume_permission("consume-original", original, claim)).replies()
+                        report = wire.ExecutionReport("prelaunch-refused", original, claim,
+                            execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused(reason),
+                            placement.DispatchPathSettled())
                 if not delayed_absence:
-                    _ = publish_candidate(fixture, request)
+                    cached_free = publish_candidate(fixture, request)
                 if stale_absence:
                     fixture.clock.advance(1)
-                report = (wire.ClaimFailure("retained-claim-refused", original, reason, claim) if foreign_claim
-                    else wire.ExecutionReport("prelaunch-refused", original, claim, execution_identity.ExecutionNotStarted(),
-                        placement.PrelaunchRefused(reason), placement.DispatchPathSettled()))
                 reported_at = fixture.clock.now()
                 _ = fixture.connect(report).replies()
                 if stale_absence:
                     closed = fixture.server.assignments[execution_identity.attempt_key(original.episode, original.attempt)]
                     self.assertIsInstance(closed.state, placement.ClosedAssignment)
                     self.assertEqual(closed.provider, claim)
+                    if linux_reservation:
+                        self.assertEqual(fixture.server.host_evidence(cached_free.key), cached_free)
+                        self.assertLess(cached_free.observed_at, reported_at)
                     self.assertIsInstance(fixture.connect(request).replies()[-1], wire.PlacementWait)
+                    if linux_reservation:
+                        self.assertNotIn(request.episode, fixture.server.current_assignments)
+                        _ = publish_candidate(fixture, request, placement.TemporaryExclusion("busy"))
+                        waiting, = fixture.server.handle_request(request)
+                        assert isinstance(waiting, wire.PlacementWait)
+                        self.assertEqual(waiting.eligibility[0].eligibility, placement.TemporaryExclusion("busy"))
                     fixture.clock.advance(1)
                     _ = publish_candidate(fixture, request)
                     _ = fixture.run_pass()
+                    if linux_reservation:
+                        granted = assignment_for(fixture, request)
+                        self.assertNotEqual(granted.attempt, original.attempt)
                 if delayed_absence:
                     closed = fixture.server.assignments[execution_identity.attempt_key(original.episode, original.attempt)]
                     self.assertIsInstance(closed.state, placement.ClosedAssignment)
