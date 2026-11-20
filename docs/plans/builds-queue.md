@@ -3223,6 +3223,14 @@ Tests: one row each in the existing removal tests, each failing first.
 
 Tests: one row in the existing bare copy removal test, failing first.
 
+### Phase 44dm — A Mac run waits for a held repository mirror in place of a refusal  · status: todo
+**From builds, 2026-11-19 20:30 EST:** run `20261119T190452-4093004-111a` (`verify.sh test --mac`, cargo-liner-style-s3) waited 19:04 to 20:29 for the Mac, then exited 2 before cargo: `copies: …/mac-test/mirror/cargo-liner: busy; held by session 294cac84`. The holder was a live run of the same repository from another worktree (ticket 1513 verify, `20261119T185840-3407562-3ac3`, 18:58 to 20:29:51). One Mac mirror for each repository is the design (offload.py:1392).
+
+1. The Mac side takes the mirror lease without a wait (copies.py:2070, `local_mirror_lease`), and offload makes a busy mirror a `copy` refusal (offload.py:3193). A movable step then goes to natedev through the `mirror_busy` backoff. A `--mac` run has no other route, so verify.sh exits 2. Fix: a run that meets a mirror that a live run holds keeps its queue place and waits for the release. A lease that no live process holds is not busy (no change to that rule).
+2. Find why the Mac opened for the waiter while the holder still held the mirror (the holder's last step and its cleanup at the run end). The dispatch treats a mirror that a live run holds as a busy Mac for that repository.
+
+Tests: one row each in the existing Mac offload busy-mirror test and the existing dispatch test, each failing first.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
