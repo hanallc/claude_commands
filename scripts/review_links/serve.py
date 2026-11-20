@@ -196,6 +196,16 @@ class PageCaptures:
             if capture is not None and capture.state is image:
                 capture.state = filed
 
+    def file(self, key: str) -> new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot:
+        """Claim the reserved image and keep only its digest."""
+        with self._lock:
+            capture = self._active(key)
+            if capture is None or not capture.filing or not isinstance(capture.state, new_item_dialog.PageScreenshot):
+                return new_item_dialog.NO_PAGE_SCREENSHOT
+            image = capture.state
+            capture.state = new_item_dialog.FiledPageScreenshot(image.digest)
+            return image
+
     def preview(self, key: str) -> new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot:
         """Return the held PNG after the capture completes."""
         with self._lock:
@@ -1145,8 +1155,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
                 request = new_item_dialog.read_request(fields, has_capture=bool(key))
                 if not key and request.page_state is not None and request.page_state.include_screenshot:
-                    refusal = (new_item_dialog.SubmissionScreenshotExpired() if browser_draft
-                               else new_item_dialog.SubmissionScreenshotReload())
+                    if browser_draft:
+                        refusal = new_item_dialog.SubmissionScreenshotExpired()
+                    elif not review_submissions.DRAFT_ID.fullmatch(request.request_id):
+                        refusal = new_item_dialog.SubmissionScreenshotReload()
                 if key and (not request.page or not isinstance(
                         request.evidence, (new_item_dialog.PageDataEvidence, new_item_dialog.NoEvidence))):
                     raise new_item_dialog.SubmissionError("Open the New item dialog from a page owner.")
@@ -1177,26 +1189,30 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 if (key and not edited and isinstance(screenshot, new_item_dialog.PageScreenshot)
                         and review_submissions.PAGE_SCREENSHOT in details.images):
                     server.page_captures.mark_filed(key, screenshot)
-            main_request = request if isinstance(request, new_item_dialog.NewItemRequest) and (
-                request.page == "list" or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
-            evidence_url = ""
-            if (details.images or details.page_state is not None
-                    or (main_request is not None and main_request.page_state is not None)
-                    or isinstance(details.evidence, new_item_dialog.PageDataEvidence)):
-                site = f"http://{server.bound_address}:{server.server_port}"
-                evidence_url = site + review_page.PAGE_PATH + "#" + urlencode({"item": created.key})
-            status = server.delivery_status
-            # Concurrent Sends wait for the delivery of the same item.
-            with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
-                delivery = review_actions.prepare_submission_delivery(
-                    saved, saved.words, status, evidence_url=evidence_url)
-                if main_request is None:
-                    self.deliver_review(server, delivery)
-                    path, row = saved.original_path, saved.request_id
-                    message = status.metadata_page(change_page.ReviewPage(path, path.parent, (row,), ""))
-                    if not isinstance(message, change_page.ReviewMessagePage) or not message.saved.get("submission_delivered"):
-                        self.json_response(503, {"error": "Could not deliver the item. Try Send again."})
-                        return
+                main_request = request if isinstance(request, new_item_dialog.NewItemRequest) and (
+                    request.page == "list" or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
+                evidence_url = ""
+                if (details.images or details.page_state is not None
+                        or (main_request is not None and main_request.page_state is not None)
+                        or isinstance(details.evidence, new_item_dialog.PageDataEvidence)):
+                    site = f"http://{server.bound_address}:{server.server_port}"
+                    evidence_url = site + review_page.PAGE_PATH + "#" + urlencode({"item": created.key})
+                status = server.delivery_status
+                # Concurrent Sends wait for the delivery of the same item.
+                with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
+                    delivery = review_actions.prepare_submission_delivery(
+                        saved, saved.words, status, evidence_url=evidence_url)
+                    if main_request is None:
+                        self.deliver_review(server, delivery)
+                        path, row = saved.original_path, saved.request_id
+                        message = status.metadata_page(change_page.ReviewPage(path, path.parent, (row,), ""))
+                        if not isinstance(message, change_page.ReviewMessagePage) or not message.saved.get("submission_delivered"):
+                            self.json_response(503, {"error": "Could not deliver the item. Try Send again."})
+                            return
+                if (main_request is not None and main_request.page == "list"
+                        and isinstance(screenshot, new_item_dialog.PageScreenshot)
+                        and review_submissions.PAGE_SCREENSHOT not in details.images):
+                    screenshot = server.page_captures.file(key)
         except new_item_dialog.SubmissionScreenshotReload:
             self.json_response(409, {"code": "reload_page", "error": SCREENSHOT_RELOAD})
             return
@@ -1219,6 +1235,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         finally:
             if main_request is not None:
                 self.deliver_review(server, delivery)
+                if (main_request.page == "list" and isinstance(screenshot, new_item_dialog.PageScreenshot)
+                        and review_submissions.PAGE_SCREENSHOT not in details.images):
+                    server.attach_page_screenshot(saved, screenshot.png)
             if saved.kind == new_item_dialog.SubmissionKind.BUG and (
                     details.page_state is not None or (main_request is not None and main_request.page_state is not None)):
                 server.finish_bug_evidence(created, main_request, self.headers.get("Host", ""), screenshot)
@@ -1798,6 +1817,12 @@ class ReviewLinksServer(ThreadingHTTPServer):
         finally:
             self.capture_slot.release()
         return self.review_cache.attach_page_screenshot(saved, image)
+
+    def attach_page_screenshot(self, saved: review_submissions.SavedSubmission, image: bytes) -> None:
+        try:
+            _ = self.review_cache.attach_page_screenshot(saved, image)
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"review-links screenshot for {saved.id}: {error}", file=sys.stderr)
 
     def request_tailscale_address(self) -> str:
         """Reuse the startup address for the request guard."""

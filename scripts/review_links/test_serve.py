@@ -1184,7 +1184,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     attempt = replace(request, request_id="r2-" + uuid4().hex,
                                       page_state=replace(state, url=url, include_screenshot=checked))
                     fields = {**asdict(attempt), "token": self.server.new_item_token}
-                    viewport = None
+                    viewport = state.viewport
                     if checked:
                         capture_key = self.start_page_capture()
                         self.assertEqual(self.page_capture_preview(capture_key).status, 200)
@@ -1204,18 +1204,47 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(deliver.call_count, 2)
         capture.assert_called_once()
 
-    def test_checked_legacy_bug_without_a_capture_key_requires_a_reload(self) -> None:
+    def test_r2_bug_without_a_capture_key_uses_the_server_screenshot(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
         folder, cache, request = self.page_bug_fixture(screenshot=True)
-        with patch.object(change_page, "send_to_staff") as deliver:
+        state = request.page_state
+        assert state is not None
+        image = base64.b64decode(PNG)
+        with (patch.object(change_page, "send_to_staff") as deliver,
+              patch.object(shutil, "which", side_effect=fake_firefox),
+              patch.object(serve, "page_screenshot", return_value=image) as capture):
             reply = self.new_item_http(self.new_item_body(request), finished=True)
-        self.assertEqual(reply.status, 409, reply.body)
+        self.assertEqual(reply.status, 200, reply.body)
         result = cast(dict[str, str], json.loads(reply.body))
-        self.assertEqual(result["code"], "reload_page")
-        self.assertIn("Reload the page", result["error"])
-        self.assertEqual(cache.get().records, {})
-        self.assertEqual(list(folder.glob("*.json")), [])
-        self.assertEqual(investigation.records(request.recipient_id), [])
-        deliver.assert_not_called()
+        capture.assert_called_once_with("/test/firefox", state.url, new_item_dialog.PageCaptureRequest(
+            "/console/review.html#owner=builds", 1280, 800, True))
+        deliver.assert_called_once()
+        path, = folder.glob("*.json")
+        self.assertEqual(json.loads(path.read_text())["screenshot"], review_submissions.PAGE_SCREENSHOT.id)
+        key = result["key"]
+        self.assertIn(b"Screenshot of Review", cache.get().body(key))
+        attachment = self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
+            {"key": key, "id": review_submissions.PAGE_SCREENSHOT.id}))
+        self.assertEqual(attachment, HttpReply(200, "image/png", image))
+
+    def test_r2_bug_without_a_screenshot_keeps_the_reported_viewport(self) -> None:
+        folder, cache, request = self.page_bug_fixture()
+        state = request.page_state
+        assert state is not None and state.viewport is not None
+        with (patch.object(change_page, "send_to_staff"),
+              patch.object(serve, "page_screenshot") as capture):
+            reply = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual(reply.status, 200, reply.body)
+        capture.assert_not_called()
+        result = cast(dict[str, str], json.loads(reply.body))
+        origin = review_items.submission_origin(cache.get().records[result["key"]])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        self.assertEqual(origin.page_state, state)
+        path, = folder.glob("*.json")
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual(record["viewport"], asdict(state.viewport))
+        self.assertIsNone(record["screenshot"])
 
     def test_capture_key_from_before_a_restart_expires_without_filing(self) -> None:
         from scripts.review_links.test_review_submissions import PNG
@@ -1422,6 +1451,59 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
             {"key": key, "id": review_submissions.PAGE_SCREENSHOT.id})), preview)
         self.assertEqual(len(investigation.records(request.recipient_id)), 1)
+
+    def test_list_investigation_retry_attaches_the_ready_preview(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={owner.id}\n")
+        server = self.server
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id),
+                          page="list", request_id="r2-" + uuid4().hex,
+                          evidence=new_item_dialog.PageDataEvidence("List", (("Item", "State"),)))
+        handler = cast(type[serve.ReviewLinksHandler], server.RequestHandlerClass)
+        respond = handler.json_response
+        lost: dict[str, object] = {}
+
+        def lose_first_reply(active: serve.ReviewLinksHandler, status: int, fields: Mapping[str, object]) -> None:
+            if active.path == review_page.NEW_ITEM_PATH and status == 200 and not lost:
+                lost.update(fields)
+                active.close_connection = True
+                return
+            respond(active, status, fields)
+
+        image = base64.b64decode(PNG)
+        with (patch.object(server, "review_cache", cache),
+              patch.object(server, "delivery_status", case.status),
+              patch.object(handler, "json_response", lose_first_reply),
+              patch.object(change_page, "send_to_staff") as deliver):
+            with self.assertRaises(RemoteDisconnected):
+                _ = self.new_item_http(self.new_item_body(request), finished=True)
+            key = str(lost["key"])
+            origin = review_items.submission_origin(cache.get().records[key])
+            assert isinstance(origin, new_item_dialog.ReviewSubmission)
+            self.assertEqual(origin.images, ())
+            capture_key = server.page_captures.start()
+            viewport = new_item_dialog.PageViewport(876, 640, True)
+            server.page_captures.complete(capture_key, new_item_dialog.PageScreenshot(image, viewport))
+            preview = self.page_capture_preview(capture_key)
+            self.assertEqual(preview, HttpReply(200, "image/png", image))
+            fields = {**asdict(request), "token": server.new_item_token, "capture_key": capture_key}
+            retry = self.new_item_http(json.dumps(fields).encode(), finished=True)
+            self.assertEqual(retry.status, 200, retry.body)
+            saved = cast(dict[str, str], json.loads(retry.body))
+            for name in ("id", "key", "list_key"):
+                self.assertEqual(saved[name], lost[name])
+            self.assertEqual(self.page_capture_preview(capture_key).status, 404)
+            with server.page_captures.for_filing(capture_key):
+                self.assertIs(server.page_captures.file(capture_key), new_item_dialog.NO_PAGE_SCREENSHOT)
+            deliver.assert_called_once()
+        self.assertEqual(len(investigation.records(owner.id)), 1)
+        self.assertEqual(len(the_list.records(owner.id)), 1)
+        self.assertEqual(self.request(review_page.ATTACHMENT_PATH + "?" + urlencode(
+            {"key": key, "id": review_submissions.PAGE_SCREENSHOT.id})), preview)
 
     def test_interrupted_list_send_replaces_its_unfiled_preview(self) -> None:
         from scripts.review_links.test_review_submissions import PNG

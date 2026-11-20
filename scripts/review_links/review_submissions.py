@@ -1172,7 +1172,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             evidence = NoEvidence()
         if state is not None:
             state = replace(state, viewport=screenshot.viewport, include_screenshot=True)
-    elif state is not None:
+    elif state is not None and not legacy_draft:
         state = replace(state, viewport=None, include_screenshot=False)
     request = replace(request, kind=kind, evidence=evidence, page_state=state)
     folder: Path | None = None
