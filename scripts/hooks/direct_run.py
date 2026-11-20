@@ -10,11 +10,11 @@ try:
 except FileNotFoundError:
     pass
 
-import json
 import time
 from pathlib import Path
 from typing import cast
 
+from scripts.direct import recorder_state
 from scripts.lib import unit_runs
 from scripts.direct.worker_state import worker_status_paths
 
@@ -65,13 +65,14 @@ def running_work(session_dir: Path) -> str | None:
     if any(_text(path) == "reviewing" for path in statuses):
         return "a review pass"
     try:
-        state = cast("dict[str, object]", json.loads(_text(session_dir / "progress_history_state.json")))
-    except json.JSONDecodeError:
+        phases = recorder_state.read_open_phases(session_dir)
+    except ValueError:
         return None
-    activity = state.get("activity")
-    if isinstance(activity, dict):
-        entry = cast("dict[str, object]", activity)
-        if entry.get("status") == "active":
-            label = entry.get("label")
-            return label if isinstance(label, str) and label else "an activity"
+    for phase in phases:
+        activity = phase.get("activity")
+        if isinstance(activity, dict):
+            entry = cast("dict[str, object]", activity)
+            if entry.get("status") == "active":
+                label = entry.get("label")
+                return label if isinstance(label, str) and label else "an activity"
     return None

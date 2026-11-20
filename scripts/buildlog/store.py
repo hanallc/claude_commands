@@ -276,7 +276,7 @@ def note_error(context: str) -> None:
     try:
         path = root() / ERRORS_NAME
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
+        with path.open("a", errors="backslashreplace") as handle:
             _ = handle.write(f"{utc_iso(datetime.now(UTC).timestamp())} {context}\n{traceback.format_exc()}\n")
     except OSError:
         pass

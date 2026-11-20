@@ -274,16 +274,57 @@ def hourly() -> int:
     return status
 
 
-def run_in_user_zone() -> None:
-    """Make the user's zone this process's zone: every printed time and every `localtime` day in the SQL follows it."""
-    from scripts.lib.user_zone import user_zone_name
+def process_zone_file(zone_key: str) -> Path:
+    import atexit
+    from contextlib import ExitStack
+    from importlib.resources import as_file, files
+    from zoneinfo import TZPATH
 
-    os.environ["TZ"] = user_zone_name()
+    for directory in TZPATH:
+        zone_file = Path(directory) / zone_key
+        if zone_file.is_file():
+            return zone_file
+
+    try:
+        packaged = files("tzdata.zoneinfo").joinpath(*zone_key.split("/"))
+        if packaged.is_file():
+            with ExitStack() as cleanup:
+                zone_file = cleanup.enter_context(as_file(packaged))
+                # Keep an extracted zone file while libc can still read it.
+                _ = atexit.register(cleanup.pop_all().close)
+            return zone_file
+    except ModuleNotFoundError:
+        pass
+    raise ValueError(f"{zone_key!r}: no zone file for the process in zoneinfo.TZPATH or tzdata")
+
+
+def run_in_user_zone() -> None:
+    """Set the process zone for report times and SQLite local dates."""
+    from datetime import UTC, datetime, timedelta
+
+    from scripts.lib.user_zone import user_zone
+
+    zone = user_zone()
+    os.environ["TZ"] = f":{process_zone_file(zone.key)}"
     time.tzset()
+    year = datetime.now(UTC).year
+    for month in (1, 7):
+        at = datetime(year, month, 15, 12, tzinfo=UTC)
+        process_offset = timedelta(seconds=time.localtime(at.timestamp()).tm_gmtoff)
+        expected_offset = at.astimezone(zone).utcoffset()
+        if process_offset != expected_offset:
+            raise ValueError(
+                f"{zone.key!r}: process offset {process_offset} differs from zoneinfo offset "
+                + f"{expected_offset} at {at.isoformat()}"
+            )
 
 
 def main(argv: list[str]) -> int:
-    run_in_user_zone()
+    try:
+        run_in_user_zone()
+    except (OSError, ValueError) as error:
+        print(f"buildlog: {error}", file=sys.stderr)
+        return 2
     command, rest = (argv[0], argv[1:]) if argv else ("", [])
     if command == "query":
         return query(rest)

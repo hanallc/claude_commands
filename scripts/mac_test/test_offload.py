@@ -17,7 +17,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import fields
+from dataclasses import fields, replace
 import io
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
@@ -26,8 +26,9 @@ from scripts.build_queue import execution_identity
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import eligibility, nextest_log, offload, claim_state
-from scripts.build_queue import admission_client, admission_protocol as wire, placement
-from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue import admission_client, admission_protocol as wire, placement, queue_snapshot
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_hold.owning_session import NoOwningSession
 if TYPE_CHECKING:
     from scripts.lib import copy_record, nix_env, scratch
     from scripts.build_targets import target_config
@@ -770,6 +771,58 @@ class OffloadSettingsTests(unittest.TestCase):
                                        return_value=eligibility.KnownRepository("cargo-liner")):
                     result = offload.run_offload(offload.ProcessController(), config, request, time.monotonic())
                 self.assertEqual(result.reason if isinstance(result, offload.DeclinedMacRun) else result, reason)
+
+
+@final
+class MacPlacementWaitTests(unittest.TestCase):
+    def test_a_mac_copy_waits_for_the_mac_while_its_local_parent_holds_memory(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.fixture_owner(4094003, "35916506")
+            run = wire.RunIdentity(owner.pid, owner.start_time)
+            parent = fixture.request(need=14912008192, owner=owner,
+                                     since=fixture.clock.now() - 3600, run=run)
+            grant, = fixture.server.handle_request(parent)
+            assert isinstance(grant, wire.Admitted)
+
+            child = fixture.fixture_owner(3682121, "36172697")
+            mac = placement.PlacementDestination("mac", "mac", "fixture-mac", claim_state.RepositoryScope("hana"))
+            constraints = placement.PlacementConstraints(execution_identity.SourceKeyKnown("fixture-tree"),
+                ("cargo", "nextest", "run"), str(fixture.root), "hana", NoOwningSession(),
+                (placement.PlacementCandidate(mac),), placement.PinnedHost("mac"))
+            request = wire.PlacementRequest("mac-copy", placement.SubmittingOwner(
+                fixture.server.host, child.pid, child.start_time), fixture.clock.now() - 3100,
+                parent.profile, constraints, identity=parent.identity, run=run,
+                purpose=placement.SpeculativeCopy(parent.episode, parent.since))
+            key = fixture.server.host_evidence_key(request, mac)
+            busy = placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.TemporaryExclusion("busy"))
+            fixture.server.publish_host_evidence(busy)
+
+            reply, = fixture.server.handle_request(request)
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertEqual(reply.wait, wire.PlacementResourceWait("mac", "busy"))
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [])
+            self.assertEqual([row["pid"] for row in snapshot.inputs.reservations], [owner.pid])
+            view, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(view, wire.ViewReply)
+            self.assertEqual(view.reading.view.waiting, ())
+
+            fixture.allow_next_start()
+            younger = fixture.request(owner=fixture.fixture_owner(1855215, "36200000"))
+            self.assertIsInstance(fixture.server.handle_request(younger)[0], wire.Admitted)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+
+            fixture.server.publish_host_evidence(replace(busy, observed_at=fixture.clock.now(),
+                                                         eligibility=placement.AllowedHost()))
+            assigned, = fixture.server.handle_request(request)
+            assert isinstance(assigned, wire.Assignment)
+            self.assertEqual(assigned.assignment.destination, mac)
+            self.assertEqual(fixture.server.reservations[parent.episode].reservation_id, grant.reservation)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual(snapshot.inputs.ordered, [])
 
 
 @final
