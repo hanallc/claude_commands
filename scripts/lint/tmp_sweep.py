@@ -117,6 +117,10 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.agents import remote
 from scripts.mac_test import nextest_log
+from scripts.lint.sweep_state import (
+    DEFAULT_STATE_DIR as DEFAULT_STATE_DIR, STATE_ENV as STATE_ENV,
+    TARGET_DELETES_NAME as TARGET_DELETES_NAME, state_dir as state_dir,
+)
 from scripts.direct import phase_reservation, recorder_state
 
 if TYPE_CHECKING:
@@ -192,11 +196,8 @@ START_SLACK_SECONDS = 2.0
 EMPTY_TREE_FOLDERS = 1000
 DARWIN_TEMP_NAME = "CS_DARWIN_USER_TEMP_DIR"
 DELETED_SUFFIX = " (deleted)"
-STATE_ENV = "LINT_SWEEP_STATE_DIR"
-DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "lint-sweep")
 LOG_NAME = "tmp-sweep.jsonl"
 STAMP_NAME = "tmp-sweep.stamp"
-TARGET_DELETES_NAME = "target-deletes.json"
 DRY_RUN_FLAG = "--dry-run"
 
 ROOT = "a root"
@@ -1494,10 +1495,6 @@ def wide_idle_seconds(*, lint_settings: conf.ConfigRead | UseConfiguredValue = U
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     return lint_settings.whole("folder_remove_after_seconds")
-
-
-def state_dir() -> Path:
-    return Path(os.path.expanduser(os.environ.get(STATE_ENV) or DEFAULT_STATE_DIR))
 
 
 def record(result: Sweep, dry_run: bool, now: float, *,

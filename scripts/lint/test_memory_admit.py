@@ -36,7 +36,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 
-from scripts.lint import memory_admit as gate, tmp_sweep
+from scripts.lint import memory_admit as gate, sweep_state, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib import conf
@@ -1704,7 +1704,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         with patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(other)}):
             self.assertFalse(self.fresh())
         self.assertTrue(self.fresh())
-        with patch.object(tmp_sweep, "state_dir", return_value=other) as authority:
+        with patch.object(sweep_state, "state_dir", return_value=other) as authority:
             self.assertFalse(self.fresh())
             authority.assert_called_once_with()
 

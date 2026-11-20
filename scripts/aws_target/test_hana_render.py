@@ -40,7 +40,6 @@ UNSHIPPED_IMPORTS = {
     'build_queue/admission_client.py': {'accounts/__init__.py', 'accounts/outage_alerts.py',
         'message/send_budget.py', 'message/send_result.py', 'message/session_send.py', 'notify/push_texts.py'},
     'build_queue/slot_wait.py': {'hooks/checkpoint_gate.py', 'lib/shell_test_support.py'},
-    'build_queue/step_estimator.py': {'lint/tmp_sweep.py'},
     'buildlog/record.py': {'aws_target/config.py', 'direct/step_record.py'},
     'buildlog/step_context.py': {'lib/cargo_target_config.py'},
     'copies/copies.py': {'lint/tmp_sweep.py', 'agents/remote.py', 'accounts/__init__.py', 'accounts/accounts.py'},
