@@ -1631,28 +1631,29 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
-### Phase 94 — A native SendMessage to a session in a review goes through send.py  · status: todo
+### Phase 94 — A native SendMessage to another session goes through send.py  · status: todo
 **Depends on:** Phase 89
 
 #### Work Order
 
-**Goal:** sdlc, 09:32 EST Nov 20. Name: reviewhold2. In the dwight session, nate was in an adhoc review. morty sent 3 native SendMessage messages. The UserPromptSubmit hook kept them, but Claude Code printed each one in full: "UserPromptSubmit operation blocked by hook: Kept for the end of the review. Original prompt: <whole message>". nate: "look what is happening - it's actually worse that things are getting blocked". Only send.py keeps a message without a mark on the receiver's screen.
+**Goal:** sdlc, 09:32 EST Nov 20. Name: reviewhold2. In the dwight session, nate was in an adhoc review. morty sent 3 native SendMessage messages. The UserPromptSubmit hook kept them, but Claude Code printed each one in full: "UserPromptSubmit operation blocked by hook: Kept for the end of the review. Original prompt: <whole message>". nate: "look what is happening - it's actually worse that things are getting blocked". sdlc, 09:41: nate said "how can we make it so that agents have to decide how to send messages - that is not really workable - it doesn't scale". So every send to another session goes through send.py, and the hook reads no hold state. dwight facts A and C, 09:41: a compaction during an open review delivered the held messages and ended the hold while the count was 2.
 
 **Spec:**
-1. Add a PreToolUse hook on `SendMessage`. It finds the target session from `to`: a `uds:` socket path or a session name, through the Claude Code `sessions/<pid>.json` files in each config dir.
-2. When that session has an open review hold, the hook refuses the send. Its reason tells the sender to send the same text with `send.py --to <name>`, which answers KEPT.
-3. Every other native send goes through unchanged: no hold, an unknown target, an `URGENT:` text, or a read error.
-4. `review_hold.py` gets one public check for an open hold. The hook and `keep_native_message` use the same rule.
-5. The settings.json entry goes in only after nate types "go" in the phases tab.
+1. Add a PreToolUse hook on `SendMessage`. It refuses every native send to another session: a `uds:` or `session:` target, or a bare name (also with " [ref]") that a live `sessions/<pid>.json` record has. URGENT is refused too.
+2. The reason names `send.py --to <same target>`, and `--urgent` for an URGENT message.
+3. Any other target is the session's own helper and passes. A read or parse error passes. The hook reads no hold state.
+4. The receiver block in `user-prompt-submit-conversation-pause.py` sets `suppressOriginalPrompt: true`, so Claude Code omits the "Original prompt" text.
+5. `review_hold.deliver_at_session_start` delivers nothing and changes no state while the hold is open. After the hold ends, it still delivers (the crash backstop).
+6. The settings.json entry goes in only after nate types "go" in the phases tab.
 
-**Files:** `scripts/hooks/pre-tool-use-review-hold-send.py` (new), its test module, `scripts/message/review_hold.py`, `settings.json` (after nate's go), `docs/as-built/message-clarity.md` where it states the review hold.
+**Files:** `scripts/hooks/pre-tool-use-review-hold-send.py` (new), its test module, `scripts/hooks/user-prompt-submit-conversation-pause.py`, `scripts/message/review_hold.py`, `scripts/hooks/test_conversation_pause.py`, `settings.json` (after nate's go), `docs/as-built/message-clarity.md` where it states the review hold.
 
 **Workers:** 1 writer.
 
 **Order:** before other phases work, after the phase 93 and 91 test slot. Tests run only when natemerge allows them.
 
 **Acceptance gate:**
-1. Fixture sessions only: a send to a held session is refused with the send.py line; sends with no hold, an unknown target, or `URGENT:` pass. basedpyright: 0 errors, 0 warnings. Full gate green.
+1. Fixture sessions only: sends to `uds:`, `session:`, a registry name and an URGENT text are refused with the send.py line. A helper name and a bad payload pass. The receiver block carries `suppressOriginalPrompt`. A session start during an open hold delivers nothing. basedpyright: 0 errors, 0 warnings. Full gate green.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
