@@ -100,7 +100,8 @@ class StandingTests(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="copies-source-seed-"))).resolve()
+        root = Path(tempfile.mkdtemp(prefix="copies-source-seed-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, root)
         home = root / "home"
         home.mkdir()
         environment = {key: value for key, value in os.environ.items()
@@ -127,7 +128,8 @@ class StandingTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = self.enterContext(fake_cargo_output_roots(children=True))
-        self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.base = Path(tempfile.mkdtemp(prefix="copies-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, self.base)
         temporary = self.base / "temporary"
         temporary.mkdir()
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
@@ -201,7 +203,8 @@ source_check_seconds=1
         self.write_config(self.settings)
         # A run inside a build slot carries that slot's Cargo cache; the test's gates lease their own.
         environment = {key: value for key, value in os.environ.items()
-                       if not key.startswith("GIT_") and key not in ("UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR")}
+                       if not key.startswith("GIT_") and key not in
+                       ("UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR", "BASH_ENV", "STAFF_CONFIG")}
         environment.update({
             **slot_configuration.environment,
             "HOME": str(home),
@@ -549,7 +552,7 @@ source_check_seconds=1
                 with (mock.patch.object(copies, "rescue_workspace", wraps=copies.rescue_workspace) as rescue,
                       mock.patch.object(scratch, "remove", side_effect=OSError("stop after intent"))):
                     with self.assertRaisesRegex(copies.CopyError, "stop after intent"):
-                        copies.end_workspaces(task, [tree])
+                        copies.remove_trees(self.owner_id)
                     rescue.assert_called_once()
                 self.assertTrue(scratch.removal_mark(tree).is_file())
                 if changed:
@@ -557,9 +560,9 @@ source_check_seconds=1
                 with mock.patch.object(copies, "rescue_workspace", side_effect=AssertionError("duplicate rescue")):
                     if changed:
                         with self.assertRaisesRegex((copies.CopyError, scratch.ScratchError), "uncommitted changes"):
-                            copies.end_workspaces(task, [tree])
+                            copies.remove_trees(self.owner_id)
                     else:
-                        copies.end_workspaces(task, [tree])
+                        copies.remove_trees(self.owner_id)
                 if changed:
                     self.assertEqual((tree / "tracked.txt").read_text(), "new edit after rescue\n")
                     self.assertTrue(scratch.removal_mark(tree).is_file())
@@ -610,10 +613,10 @@ source_check_seconds=1
                 if export_failure:
                     with mock.patch.object(copies, "git", side_effect=refuse_export):
                         with self.assertRaisesRegex(copies.CopyError, "stash rescue export refused"):
-                            copies.end_workspaces(f"gate:{name}", [tree])
+                            copies.remove_trees(self.owner_id)
                     self.assertTrue(tree.exists())
                     self.assertEqual(self.git(tree, "reflog", "show", "--format=%H", "refs/stash").splitlines(), stashes)
-                copies.end_workspaces(f"gate:{name}", [tree])
+                copies.remove_trees(self.owner_id)
                 self.assertFalse(tree.exists())
                 root = copy_record.copies_root()
                 destination = (root.with_name(root.name + "-rescues.git") if source_gone
@@ -692,8 +695,8 @@ source_check_seconds=1
         self.assertIs(record.fields["test_hana_clone"], True)
         self.assertEqual(record.fields["source_path"], str(self.source))
         self.assertEqual(record.fields["source_commit"], self.git(checkout, "rev-parse", "HEAD"))
-        self.assertEqual(scratch.end("gate:camera"), [checkout])
-        self.assertFalse(checkout.exists())
+        self.assertEqual([entry.path for entry in scratch.end("gate:camera")], [checkout])
+        self.assertTrue(checkout.is_dir())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
 
     def test_task_end_during_clone_setup_keeps_completion_fields(self) -> None:
@@ -702,7 +705,7 @@ source_check_seconds=1
         initialize = copies.initialize_git
 
         def end_during_setup(path: Path, source: Path) -> None:
-            self.assertEqual(scratch.end(task, now=ended), [])
+            self.assertEqual([entry.path for entry in scratch.end(task, now=ended)], [path])
             self.assertTrue(path.is_dir())
             initialize(path, source)
 
@@ -954,14 +957,13 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.assertEqual(build_folders.build_folder_state(checkout), "held")
                 with scratch.busy_path(checkout).open("rb") as other, self.assertRaises(BlockingIOError):
                     fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                result = scratch.end(task)
-                self.assertEqual(result, [])
-                self.assertEqual(result.kept, [scratch.KeptFolder(checkout, scratch.BUSY_REASON)])
+                result = scratch.remove_task_copy(checkout, task, time.time())
+                self.assertEqual(result, scratch.KeptFolder(checkout, scratch.BUSY_REASON))
                 self.assertTrue(checkout.is_dir())
                 release.close()
                 self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0], "Git did not exit")
                 self.assertEqual(ready.read(), "")
-                self.assertEqual(scratch.end(task), [checkout])
+                self.assertTrue(scratch.end_copy(checkout, task, time.time()))
                 self.assertFalse(checkout.exists())
             finally:
                 release.close()
@@ -973,7 +975,8 @@ with patch.object(subprocess, 'run', pause_clone):
         task = "gate:retry-source"
         clone = copies.clone(self.source, task, "source")
         with mock.patch.object(scratch, "remove", side_effect=OSError("stop after removal intent")):
-            self.assertTrue(scratch.end(task).kept)
+            with self.assertRaisesRegex(OSError, "stop after removal intent"):
+                _ = scratch.remove_task_copy(clone, task, time.time())
         self.assertTrue(scratch.removal_mark(clone).is_file())
         busy = scratch.busy_path(clone)
         busy.unlink()
@@ -988,9 +991,8 @@ with patch.object(subprocess, 'run', pause_clone):
         work = clone / "new-work" / scratch.BUSY
         work.parent.mkdir()
         _ = work.write_text("Keep this file")
-        kept = scratch.end(task)
-        self.assertEqual(kept, [])
-        self.assertTrue(kept.kept)
+        kept = scratch.remove_task_copy(clone, task, time.time())
+        self.assertIsInstance(kept, scratch.KeptFolder)
         self.assertEqual(work.read_text(), "Keep this file")
         work.unlink()
         work.parent.rmdir()
@@ -1007,7 +1009,7 @@ with patch.object(subprocess, 'run', pause_clone):
             remove(path)
 
         with mock.patch.object(scratch, "remove", side_effect=check_retry):
-            self.assertEqual(scratch.end(task), [clone])
+            self.assertTrue(scratch.end_copy(clone, task, time.time()))
         self.assertFalse(scratch.removal_mark(clone).exists())
         self.assertFalse(destination.exists())
 
@@ -1191,7 +1193,7 @@ with patch.object(subprocess, 'run', pause_clone):
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:end-trust")
         self.add_clone_project_settings(checkout, paths)
-        self.assertEqual(scratch.end("gate:end-trust"), [checkout])
+        self.assertTrue(scratch.end_copy(checkout, "gate:end-trust", time.time()))
         self.assert_clone_project_removed(checkout, paths)
 
     def test_mirror_metadata_allows_task_cleanup_but_user_changes_keep_the_clone(self) -> None:
@@ -1415,7 +1417,7 @@ with patch.object(subprocess, 'run', pause_clone):
         record = scratch.task_of(folder)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["claude_trust_folder"], str(folder.resolve()))
-        self.assertEqual(scratch.end("gate:stop-before-trust"), [folder])
+        self.assertTrue(scratch.end_copy(folder, "gate:stop-before-trust", time.time()))
         self.assertEqual({path: path.read_bytes() for path in paths}, before)
 
     def test_removal_without_a_recorded_trust_key_keeps_account_trust(self) -> None:
@@ -1423,7 +1425,7 @@ with patch.object(subprocess, 'run', pause_clone):
         checkout = copies.clone(self.source, "gate:no-trust-field")
         self.assertIsInstance(accounts.set_claude_folder_trust(checkout, trusted=True), accounts.FolderTrustComplete)
         before = {path: path.read_bytes() for path in paths}
-        self.assertEqual(scratch.end("gate:no-trust-field"), [checkout])
+        self.assertTrue(scratch.end_copy(checkout, "gate:no-trust-field", time.time()))
         self.assertEqual({path: path.read_bytes() for path in paths}, before)
 
     def test_clone_trust_key_survives_task_transfer_and_renewal(self) -> None:
@@ -1478,8 +1480,8 @@ with patch.object(subprocess, 'run', pause_clone):
             records.append(record)
         self.assertNotEqual(records[0].task, records[1].task)
 
-        self.assertEqual(scratch.end(records[0].task), [checkouts[0]])
-        self.assertFalse(checkouts[0].exists())
+        self.assertEqual([entry.path for entry in scratch.end(records[0].task)], [checkouts[0]])
+        self.assertTrue(checkouts[0].is_dir())
         self.assertEqual((checkouts[1] / "tracked.txt").read_text(), "source HEAD\n")
         self.assertEqual(self.git(checkouts[1], "rev-parse", "HEAD"), self.head)
         self.assertEqual(scratch.task_of(checkouts[1]), records[1])
@@ -1503,8 +1505,8 @@ with patch.object(subprocess, 'run', pause_clone):
                          str((checkout / ".git").resolve()))
         self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.head)
         self.assertEqual((checkout / "tracked.txt").read_text(), "source HEAD\n")
-        self.assertEqual(scratch.end("gate:symlink"), [checkout])
-        self.assertFalse(checkout.exists())
+        self.assertEqual([entry.path for entry in scratch.end("gate:symlink")], [checkout])
+        self.assertTrue(checkout.is_dir())
 
     def test_symlink_scratch_clone_refuses_foreign_git_directory(self) -> None:
         _ = self.symlink_scratch_root()
@@ -2076,7 +2078,7 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.assertEqual(self.git(tree, "config", "user.name"), "Checkout Hook")
                 self.assertEqual(self.git(tree, "config", "user.email"), "hook@example.invalid")
 
-    def test_legacy_workspace_keeps_commits_index_and_journal_and_ends_through_holds(self) -> None:
+    def test_legacy_workspace_keeps_commits_index_journal_and_the_checkout_at_task_end(self) -> None:
         tree = self.base / "old-run/worker"
         tree.mkdir(parents=True)
         copies.initialize_git(tree, self.source)
@@ -2096,15 +2098,14 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertEqual(self.git(tree, "diff", "--cached", "--name-only"), "tracked.txt")
             self.assertEqual(journal.read_text(), "journal\n")
             self.assertEqual((tree / "pending.txt").read_text(), "pending\n")
-        _ = self.git(self.source, "fetch", "-q", str(tree), "worker:refs/heads/legacy")
-        _ = self.git(tree, "reset", "--hard", self.head)
-        (tree / "pending.txt").unlink()
-        with copies.workspace(self.owner_id, self.source, self.head, name="legacy", branch="worker",
-                              task="gate:legacy-run", path=tree):
-            pass
-        copies.end_workspaces("gate:legacy-run", [tree])
-        self.assertNotIn(str(tree), scratch.holds())
-        self.assertFalse(tree.exists())
+        with redirect_stderr(io.StringIO()) as errors:
+            copies.end_workspaces("gate:legacy-run", [tree])
+        self.assertGreater(scratch.holds()[str(tree)]["ended"], 0)
+        self.assertIn(f"kept for a manual removal list: {tree} (scratch, task gate:legacy-run ended)", errors.getvalue())
+        self.assertEqual(self.git(tree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(self.git(tree, "diff", "--cached", "--name-only"), "tracked.txt")
+        self.assertEqual(journal.read_text(), "journal\n")
+        self.assertEqual((tree / "pending.txt").read_text(), "pending\n")
 
     def test_legacy_workspace_refuses_matching_relative_urls_for_different_repositories(self) -> None:
         tree = self.base / "old-run/worker"

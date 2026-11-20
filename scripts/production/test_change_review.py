@@ -31,6 +31,7 @@ from scripts.production import change_review
 from scripts.lib import conf, copy_record, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production import (
     showrunners, staff, change_routing, merge_checkpoint, session_staff, production_doc, unit_config, unit_lookup,
 )
@@ -84,17 +85,20 @@ DEMO_ID = fixture_runtime_id("showrunner::demo")
 
 
 def setUpModule() -> None:
-    """The pin on the row `show` printed and the scratch folders a verdict removes are in a temporary
-    folder, never ~/.local/state/next, /tmp/claude/scratch or ~/rust/repro."""
+    """Keep the verdict state and scratch folders in the module fixture."""
     unittest.enterModuleContext(foreign_hostname())
-    folder = tempfile.TemporaryDirectory()
-    unittest.addModuleCleanup(folder.cleanup)
+    folder = Path(tempfile.mkdtemp(prefix="change-review-fixture-")).resolve()
+    unittest.addModuleCleanup(shutil.rmtree, folder)
+    environment = fixture_git_environment(folder)
+    for key in ("BASH_ENV", "STAFF_CONFIG"):
+        _ = environment.pop(key, None)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
-        "STAFF_FILE": str(Path(folder.name) / "staff.json"), "NEXT_STATE_DIR": folder.name,
-        "REVIEW_LINKS_ROOT": str(Path(folder.name) / "links"), "CHANGE_REVIEW_DIR": folder.name,
-        "SHOWRUNNER_STATE_DIR": f"{folder.name}/showrunner-state",
-        "UNIT_HISTORY_DIR": f"{folder.name}/history", copy_record.ROOT_ENV: f"{folder.name}/scratch",
-        scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro", scratch.HOLDS_ENV: f"{folder.name}/holds.json"}))
+        **environment,
+        "STAFF_FILE": str(folder / "staff.json"), "NEXT_STATE_DIR": str(folder),
+        "REVIEW_LINKS_ROOT": str(folder / "links"), "CHANGE_REVIEW_DIR": str(folder),
+        "SHOWRUNNER_STATE_DIR": str(folder / "showrunner-state"),
+        "UNIT_HISTORY_DIR": str(folder / "history"), copy_record.ROOT_ENV: str(folder / "scratch"),
+        scratch.VISIBLE_ROOT_ENV: str(folder / "repro"), scratch.HOLDS_ENV: str(folder / "holds.json")}, clear=True))
     _ = fixture_member("showrunner", name="fixture")
     _ = fixture_member("showrunner", name="demo", runtime_id=DEMO_ID,
                        doc=staff.LiveDoc(remote.local_machine(), PRODUCTION))
@@ -2751,7 +2755,7 @@ class ActionTest(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        directory = tempfile.TemporaryDirectory()
+        directory = tempfile.TemporaryDirectory(dir=os.environ["CHANGE_REVIEW_DIR"])
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "change-review.md"
         _ = self.path.write_text(LIST, encoding="utf-8")
@@ -3070,11 +3074,11 @@ class ActionTest(unittest.TestCase):
             self.assertIn("scratch not removed: fixture scratch configuration is unavailable", output)
             self.assertIn(held, scratch.holds())
             self.assertEqual(self.path.read_bytes(), before)
-            code, output, error = run(*arguments)
-            self.assertEqual((code, error), (0, ""))
-        self.assertIn(f"removed {folder}\n", output)
-        self.assertFalse(folder.exists())
-        self.assertNotIn(held, scratch.holds())
+            code, _, error = run(*arguments)
+            self.assertEqual(code, 0)
+        self.assertIn(f"kept for a manual removal list: {folder} (scratch,", error)
+        self.assertTrue(folder.is_dir())
+        self.assertGreater(scratch.holds()[held]["ended"], 0)
         self.assertEqual(self.path.read_bytes(), before)
         snapshot = change_review.review_snapshot(self.path)
         self.assertEqual([row["#"] for row in snapshot.pending], ["C77"])
@@ -3142,13 +3146,13 @@ class ActionTest(unittest.TestCase):
                 self.assertNotIn("C76", [row["#"] for row in change_review.pending(self.path)])
                 before = self.path.read_bytes()
                 code, output, error = run(*command)
-                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(code, 0)
                 self.assertIn("change-review/C76 already has this verdict (", output)
                 self.assertIn("change-review/C76 landed\n" if verdict == "works" else
                               "change-review/C76 returns to its unit (merged 2026-10-14)\n", output)
-                self.assertIn(f"removed {folder}\n", output)
-                self.assertFalse(folder.exists())
-                self.assertNotIn(os.path.realpath(folder), scratch.holds())
+                self.assertIn(f"kept for a manual removal list: {folder} (scratch, task {task} ended)", error)
+                self.assertTrue(folder.is_dir())
+                self.assertGreater(scratch.holds()[os.path.realpath(folder)]["ended"], 0)
                 self.assertEqual(self.path.read_bytes(), before)
                 self.assertEqual(self.path.read_text().split("## Reviewed")[1].count("| C76 |"), 1)
 
@@ -3161,14 +3165,14 @@ class ActionTest(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     _ = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "works")
             before = self.path.read_bytes()
-            code, output, error = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "still broken")
+            code, _, error = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76", "--verdict", "still broken")
             self.assertEqual(code, 1)
             self.assertIn('C76 has the verdict "works" from ', error)
             self.assertIn("this verdict is not recorded", error)
-            self.assertIn(f"removed {folder}", output)
+            self.assertIn(f"kept for a manual removal list: {folder} (scratch,", error)
             self.assertEqual(self.path.read_bytes(), before)
-            self.assertFalse(folder.exists())
-            self.assertNotIn(os.path.realpath(folder), scratch.holds())
+            self.assertTrue(folder.is_dir())
+            self.assertGreater(scratch.holds()[os.path.realpath(folder)]["ended"], 0)
 
     def test_missing_merge_is_explicit_for_new_and_earlier_reviewed_rows(self) -> None:
         _ = self.path.write_text(LIST.replace("Panels keep shields | 2026-10-14", "Panels keep shields |"))
@@ -3215,17 +3219,19 @@ class ActionTest(unittest.TestCase):
                 self.assertIn(f"| C76 | Panels keep shields | {verdict} | {change_review.today().isoformat()} "
                               + "| 2026-10-14 |\n| C70 |", text)
 
-    def test_a_verdict_removes_the_rows_scratch_folders_either_way(self) -> None:
+    def test_a_verdict_keeps_the_rows_scratch_folders_either_way(self) -> None:
         demo = scratch.new("row:natedev-C1", "demo", visible=True)
         copy = scratch.new("row:natedev-C2", "copy")
         kept = scratch.new("row:natedev-C3")
         _ = change_review.append_rows(self.fresh, pictured_changes([Visible(name, "B", "C") for name in "XYZ"]), date(2026, 10, 15), "",
                                       PRODUCTION, record=staff.snapshot())
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", "C1", "--verdict", "works"),
-                         (0, f"demo/C1 landed\nremoved {demo}\n", ""))
+                         (0, "demo/C1 landed\n",
+                          f"kept for a manual removal list: {demo} (scratch, task row:natedev-C1 ended)\n"))
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", "C2", "--verdict", "no"),
-                         (0, f"demo/C2 returns to its unit (merged 2026-10-15)\nremoved {copy}\n", ""))
-        self.assertFalse(demo.exists() or copy.exists())
+                         (0, "demo/C2 returns to its unit (merged 2026-10-15)\n",
+                          f"kept for a manual removal list: {copy} (scratch, task row:natedev-C2 ended)\n"))
+        self.assertTrue(demo.is_dir() and copy.is_dir())
         self.assertTrue(kept.is_dir())
 
     def test_a_verdict_for_a_row_not_to_review_is_refused(self) -> None:
@@ -3235,13 +3241,13 @@ class ActionTest(unittest.TestCase):
             self.assertEqual(len(error.splitlines()), 1, row)
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
-    def test_row_cleanup_reports_retained_folders(self) -> None:
+    def test_row_cleanup_delegates_to_scratch(self) -> None:
         folder = self.path.parent / "retained-copy"
-        result = scratch.TaskCleanup()
-        result.kept.append(scratch.KeptFolder(folder, "it has uncommitted changes"))
-        with mock.patch.object(scratch, "end", return_value=result):
+        result = [scratch.KeptFolder(folder, "it has uncommitted changes")]
+        with mock.patch.object(scratch, "end", return_value=result) as end:
             lines = change_review.end_row_scratch(self.path, "C76")
-        self.assertEqual(lines, [f"kept {folder}: it has uncommitted changes"])
+        end.assert_called_once()
+        self.assertEqual(lines, [])
 
     def attached_lists(self) -> Path:
         earlier = self.path.with_name("change-review - child.md")
@@ -3258,12 +3264,13 @@ class ActionTest(unittest.TestCase):
         scratch_folder = scratch.new("row:child-C9", "earlier")
         current_scratch = scratch.new("row:current-C9", "current")
         self.assertEqual(run("verdict", "--production", DOC, "--row", "child/C9", "--verdict", "works"),
-                         (0, f"child/C9 landed\nremoved {scratch_folder}\n", ""))
+                         (0, "child/C9 landed\n",
+                          f"kept for a manual removal list: {scratch_folder} (scratch, task row:child-C9 ended)\n"))
         self.assertEqual(self.path.read_bytes(), before)
         self.assertNotIn("C9", {row["#"] for row in change_review.pending(earlier)})
         self.assertIn("| C9 | Earlier change | works |", earlier.read_text())
         self.assertNotIn("child/C9", earlier.read_text())
-        self.assertFalse(scratch_folder.exists())
+        self.assertTrue(scratch_folder.is_dir())
         self.assertTrue(current_scratch.exists())
 
     def test_list_named_important_mark_changes_only_that_lists_local_row(self) -> None:

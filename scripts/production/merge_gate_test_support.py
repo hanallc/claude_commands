@@ -19,6 +19,7 @@ import contextlib
 import os
 from pathlib import Path
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -32,7 +33,7 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
 from scripts.lib import build_folders
-from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lib.git_test_support import fixture_git_environment, write_fixture_git_config
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
 from scripts.production import merge_gate, staff, targeted_test
@@ -147,7 +148,7 @@ class FixtureTest(unittest.TestCase):
     def test_gate_fixture(self):
         tmp = Path(os.environ["TMPDIR"])
         self.assertTrue(tmp.is_dir())
-        self.assertTrue(str(tmp).startswith("/dev/shm/"), tmp)
+        self.assertTrue(tmp.is_relative_to(Path(os.environ["MERGE_GATE_FIXTURE_TMP"])), tmp)
         buildlog = Path(os.environ["BUILDLOG_DIR"])
         self.assertTrue(buildlog.is_dir())
         self.assertTrue(buildlog.is_relative_to(tmp), buildlog)
@@ -317,11 +318,18 @@ class MergeGateFixture(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        # A leased folder: a run that ends by a signal leaves it free, and the next allocation removes it.
-        configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir="/tmp")))
-        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, config_environment(configuration))))
-        parent = merge_gate.gate_test_parent(build_folders.tmpfs_temporary_parent())
-        parent.mkdir(mode=0o700, exist_ok=True)
+        private = Path(tempfile.mkdtemp(prefix="merge-gate-fixture-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, private)
+        configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir=private)))
+        host = socket.gethostname().partition(".")[0]
+        _ = write_config_fixture(configuration / "build_folders.conf", f"roots.gate={private}\nroots.gate.{host}={private}\n")
+        environment = fixture_git_environment(private)
+        for key in ("BASH_ENV", "STAFF_CONFIG"):
+            _ = environment.pop(key, None)
+        environment.update(config_environment(configuration))
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, environment, clear=True)))
+        parent = merge_gate.gate_test_parent(private)
+        parent.mkdir(mode=0o700)
         build_folders.sweep_temporary_build_folders(parent, wait=False)
         directory = cls.enterClassContext(build_folders.temporary_build_folder(
             build_folders.UniqueBuildFolder("merge-gate-test-", build_folders.ExplicitBuildParent(parent))))
@@ -361,8 +369,10 @@ class MergeGateFixture(unittest.TestCase):
             # to the seed's original path, with its private origin and refs.
             _ = shutil.copytree(self.fixture_seeds[folders].snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
+        host = socket.gethostname().partition(".")[0]
+        parent = self.fixture_root.parent
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
-                                 f"roots.gate={self.fixture_root.parent}\n")
+                                 f"roots.gate={parent}\nroots.gate.{host}={parent}\n")
         self.configure_gate("program_first_peak_gib.merge-gate=4\n")
         seed = self.fixture_seeds[folders]
         self.base, self.checkpoint = seed.base, seed.checkpoint
@@ -436,6 +446,7 @@ class MergeGateFixture(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": str(git_config),
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
             "MERGE_GATE_TEST_STATE": str(self.state),
+            "MERGE_GATE_FIXTURE_TMP": str(self.fixture_root.parent),
             "MERGE_GATE_TEST_REPO": str(SCRIPT.parents[2]),
             "MERGE_GATE_PYTHON": str(self.bin / "suite-python"),
             "MERGE_GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
@@ -452,6 +463,8 @@ class MergeGateFixture(unittest.TestCase):
             # The calling showrunner is found from these update timers, never the live ones.
             "NOTIFIER_STATE_DIR": str(home / "notifier"), "CLAUDE_CODE_SESSION_ID": "fixture-showrunner",
         }
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+            _ = self.environment.pop(key, None)
         self.environment["MERGE_GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
         readings = root / "memory"
         readings.mkdir(exist_ok=True)

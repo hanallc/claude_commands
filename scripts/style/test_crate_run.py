@@ -39,6 +39,7 @@ from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.copies.copies_test_support import AdmissionWaitReached
 from scripts.lib import build_folders, copy_record, scratch
+from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -48,8 +49,10 @@ from scripts.style.style_reader_test_support import oracle_reader
 
 class StyleQueueIsolationTests(unittest.TestCase):
     def test_the_style_fixture_replaces_an_inherited_admission_socket(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="style-socket-") as directory, socket.socket(socket.AF_UNIX) as outside:
-            inherited = Path(directory) / "outside.sock"
+        directory = Path(tempfile.mkdtemp(prefix="style-socket-"))
+        self.addCleanup(shutil.rmtree, directory)
+        with socket.socket(socket.AF_UNIX) as outside:
+            inherited = directory / "outside.sock"
             outside.bind(str(inherited))
             outside.listen(1)
             with mock.patch.dict(os.environ, {"ADMISSION_SOCKET": str(inherited)}):
@@ -246,10 +249,12 @@ class CrateRunTests(CargoProjectTests):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        clean_environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        clean_environment = {name: value for name, value in os.environ.items()
+                             if not name.startswith("GIT_") and name not in ("BASH_ENV", "STAFF_CONFIG")}
         _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, clean_environment, clear=True)))
         # Build the complete class seed without the base class seed.
-        seeds = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="crate-run-seed-")))
+        seeds = Path(tempfile.mkdtemp(prefix="crate-run-seed-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, seeds)
         cls.cold_seed = seeds / "cold"
         cls.fixture_seed = seeds / "initial"
         cls.frozen_seed = seeds / "frozen"
@@ -560,59 +565,59 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(self.batch.read(), manifest)
         self.assertTrue(Path(manifest["crates"]["bulk_sample"]["result_path"]).exists())
 
-    def test_terminal_run_removes_adopted_worker_and_keeps_result_evidence(self) -> None:
+    def test_terminal_run_keeps_adopted_worker_and_result_evidence(self) -> None:
         worker = self.legacy_worker()
         manifest = self.finish_run()
-        self.assertFalse(worker.exists())
-        self.assertNotIn(str(worker), scratch.holds())
+        self.assertTrue(worker.is_dir())
+        self.assertGreater(scratch.holds()[str(worker)]["ended"], 0)
         self.assertEqual(self.batch.read(), manifest)
         result = Path(manifest["crates"]["bulk_sample"]["result_path"])
         self.assertTrue(result.is_file())
         self.assertFalse(scratch.removal_mark(worker).exists())
 
-    def test_terminal_recovery_finishes_each_adopted_worker_removal_boundary(self) -> None:
-        worker = self.legacy_worker()
-        original_remove = scratch.remove
-        original_release = scratch.release
-        original_end = copies.end_workspaces
-        for boundary in ("before cleanup", "after git deletion", "after folder deletion", "before hold release"):
-            with self.subTest(boundary=boundary):
-                # Restore only the legacy worker between terminal recovery attempts.
-                if not worker.exists():
-                    self.initialize_legacy_worker(worker)
-                with copies.workspace(self.batch.owner, self.repo, self.base, name=worker.name,
-                                      branch=self.batch.read()["crates"]["bulk_sample"]["branch"],
-                                      task=self.batch.task, path=worker):
-                    pass
-                def remove(path: Path) -> None:
-                    if path == worker and boundary == "after git deletion":
-                        shutil.rmtree(path / ".git")
-                        raise RuntimeError(boundary)
-                    original_remove(path)
-                    if path == worker and boundary == "after folder deletion":
-                        raise RuntimeError(boundary)
-                def release(path: Path) -> bool:
-                    if path == worker and boundary == "before hold release":
-                        raise RuntimeError(boundary)
-                    return original_release(path)
-                def end(task: str, paths: list[Path], *,
-                        run_lock: copies.CrateRunRemovalLock = copies.ACQUIRE_CRATE_RUN_LOCK) -> None:
-                    if boundary == "before cleanup":
-                        raise RuntimeError(boundary)
-                    original_end(task, paths, run_lock=run_lock)
-                with (mock.patch.object(scratch, "remove", side_effect=remove),
-                      mock.patch.object(scratch, "release", side_effect=release),
-                      mock.patch.object(copies, "end_workspaces", side_effect=end)):
-                    with self.assertRaisesRegex(RuntimeError, boundary):
-                        _ = self.finish_run()
-                self.assertIn(str(worker), scratch.holds())
-                _ = self.finish_run()
-                self.assertFalse(worker.exists())
-                self.assertNotIn(str(worker), scratch.holds())
-                self.assertFalse(scratch.removal_mark(worker).exists())
-                self.assertTrue(Path(self.batch.read()["crates"]["bulk_sample"]["result_path"]).is_file())
+    def test_terminal_run_keeps_external_cargo_output(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        worker = Path(self.batch.read()["crates"]["bulk_sample"]["checkout"])
+        target = self.root / "external-target"
+        build = self.root / "external-build"
+        for folder in (target, build):
+            folder.mkdir()
+            _ = (folder / "keep").write_text("earlier output")
 
-    def test_terminal_cleanup_keeps_locked_adopted_workers_then_removes_unsaved_work(self) -> None:
+        with (fake_cargo_output_roots(CargoOutputRoots(worker, target, build)),
+              mock.patch.object(scratch, "clean_cargo_outputs") as clean,
+              redirect_stderr(io.StringIO()) as report):
+            manifest = self.finish_run()
+
+        self.assertEqual(Path(manifest["crates"]["bulk_sample"]["checkout"]), worker)
+        self.assertFalse(worker.exists())
+        self.assertFalse(scratch.cargo_removal_mark(worker).exists())
+        clean.assert_not_called()
+        notices = [line for line in report.getvalue().splitlines()
+                   if line.startswith("kept for a manual removal list:")]
+        self.assertCountEqual(notices, [
+            f"kept for a manual removal list: {folder} (scratch, Cargo output is outside the crate workspace)"
+            for folder in (target, build)
+        ])
+        for folder in (target, build):
+            self.assertEqual((folder / "keep").read_text(), "earlier output")
+
+    def test_terminal_recovery_retries_a_failed_end_record_write(self) -> None:
+        worker = self.legacy_worker()
+        with mock.patch.object(scratch, "record_task_end", side_effect=OSError("record write failed")):
+            with self.assertRaisesRegex(OSError, "record write failed"):
+                _ = self.finish_run()
+        self.assertTrue(worker.is_dir())
+        _ = self.finish_run()
+        record = scratch.task_of(worker)
+        assert isinstance(record, copy_record.Registered)
+        self.assertTrue(scratch.task_has_end_evidence(record))
+        self.assertTrue(worker.is_dir())
+        self.assertGreater(scratch.holds()[str(worker)]["ended"], 0)
+        self.assertFalse(scratch.removal_mark(worker).exists())
+        self.assertTrue(Path(self.batch.read()["crates"]["bulk_sample"]["result_path"]).is_file())
+
+    def test_terminal_completion_keeps_locked_workers_and_unsaved_work(self) -> None:
         worker = self.legacy_worker()
         with mock.patch.object(copies, "end_workspaces"):
             manifest = self.finish_run()
@@ -624,14 +629,14 @@ class CrateRunTests(CargoProjectTests):
             self.assertIn(str(worker), scratch.holds())
         _ = (worker / "pending.txt").write_text("keep unsaved work\n")
         _ = self.finish_run()
-        self.assertFalse(worker.exists())
-        self.assertNotIn(str(worker), scratch.holds())
+        self.assertEqual((worker / "pending.txt").read_text(), "keep unsaved work\n")
+        self.assertGreater(scratch.holds()[str(worker)]["ended"], 0)
         self.assertEqual(self.batch.read(), manifest)
         with (self.subTest(resume="without frozen checkout"),
               mock.patch.object(self.batch, "frozen_checkout",
                                 side_effect=AssertionError("terminal resume builds the frozen checkout"))):
             _ = self.finish_run()
-        self.assertFalse(worker.exists())
+        self.assertTrue(worker.is_dir())
 
     def test_pending_run_survives_expiry_and_terminal_resume_ends_its_task(self) -> None:
         with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
@@ -654,9 +659,10 @@ class CrateRunTests(CargoProjectTests):
                 _ = self.advance("beta")
         self.assertTrue(worker.exists())
         _ = self.advance("beta")
-        self.assertIsInstance(scratch.task_of(worker), copy_record.NotRegistered)
-        self.assertNotIn(worker, scratch.end(self.batch.task))
-        self.assertFalse(worker.exists())
+        recorded = scratch.task_of(worker)
+        assert isinstance(recorded, copy_record.Registered)
+        self.assertTrue(scratch.task_has_end_evidence(recorded))
+        self.assertTrue(worker.is_dir())
 
     def test_nested_proof_keeps_the_canonical_owner_with_the_real_resolver(self) -> None:
         self.freeze(paths=("src/lib.rs",))
@@ -1756,14 +1762,15 @@ class CrateRunTests(CargoProjectTests):
         self.freeze(paths=("src/lib.rs",))
         end_workspaces = copies.end_workspaces
 
-        def unchanged_before_removal(task: str, paths: list[Path], *,
-                                     run_lock: copies.CrateRunRemovalLock = copies.ACQUIRE_CRATE_RUN_LOCK) -> None:
+        def unchanged_before_task_end(task: str, paths: list[Path], *,
+                                     run_lock: copies.CrateRunRemovalLock,
+                                     created: dict[Path, os.stat_result]) -> None:
             record = self.batch.read()["crates"]["bulk_sample"]
             self.assertEqual((Path(record["checkout"]) / "src/lib.rs").read_bytes(),
                              (self.repo / "src/lib.rs").read_bytes())
-            end_workspaces(task, paths, run_lock=run_lock)
+            end_workspaces(task, paths, run_lock=run_lock, created=created)
 
-        with mock.patch.object(copies, "end_workspaces", side_effect=unchanged_before_removal):
+        with mock.patch.object(copies, "end_workspaces", side_effect=unchanged_before_task_end):
             result = self.advance("bulk_sample")
         record = result["crates"]["bulk_sample"]
         self.assertEqual(record["stage"], crates.CrateStage.ABANDONED)
