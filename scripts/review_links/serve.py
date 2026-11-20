@@ -137,11 +137,16 @@ class PageCapturePending:
     pass
 
 
+@dataclass(frozen=True)
+class PageCaptureForSavedItem:
+    saved: review_submissions.SavedSubmission
+
+
 @dataclass
 class PageCapture:
     expires: float
-    state: PageCapturePending | new_item_dialog.PageScreenshot | new_item_dialog.FiledPageScreenshot = field(
-        default_factory=PageCapturePending)
+    state: (PageCapturePending | PageCaptureForSavedItem | new_item_dialog.PageScreenshot
+            | new_item_dialog.FiledPageScreenshot) = field(default_factory=PageCapturePending)
     completed: threading.Event = field(default_factory=threading.Event)
     filing: bool = False
     discard_after_filing: bool = False
@@ -181,7 +186,7 @@ class PageCaptures:
     def discard(self, key: str) -> None:
         with self._lock:
             capture = self._sessions.get(key)
-            if capture is None:
+            if capture is None or isinstance(capture.state, PageCaptureForSavedItem):
                 return
             if capture.filing:
                 capture.discard_after_filing = True
@@ -196,15 +201,20 @@ class PageCaptures:
             if capture is not None and capture.state is image:
                 capture.state = filed
 
-    def file(self, key: str) -> new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot:
-        """Claim the reserved image and keep only its digest."""
+    def file(self, key: str, saved: review_submissions.SavedSubmission, *, allow_pending: bool = False
+             ) -> new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot:
+        """Claim a finished image or reserve the pending image for this item."""
         with self._lock:
             capture = self._active(key)
-            if capture is None or not capture.filing or not isinstance(capture.state, new_item_dialog.PageScreenshot):
+            if capture is None or not capture.filing or (allow_pending and capture.discard_after_filing):
                 return new_item_dialog.NO_PAGE_SCREENSHOT
-            image = capture.state
-            capture.state = new_item_dialog.FiledPageScreenshot(image.digest)
-            return image
+            state = capture.state
+            if isinstance(state, new_item_dialog.PageScreenshot):
+                capture.state = new_item_dialog.FiledPageScreenshot(state.digest)
+                return state
+            if allow_pending and isinstance(state, PageCapturePending):
+                capture.state = PageCaptureForSavedItem(saved)
+            return new_item_dialog.NO_PAGE_SCREENSHOT
 
     def preview(self, key: str) -> new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot:
         """Return the held PNG after the capture completes."""
@@ -220,18 +230,23 @@ class PageCaptures:
         return new_item_dialog.NO_PAGE_SCREENSHOT
 
     @contextmanager
-    def for_filing(self, key: str) -> Generator[new_item_dialog.SubmissionScreenshot]:
-        """Keep the PNG available while Send files the item."""
-        screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT
+    def for_filing(self, key: str, *, allow_pending: bool = False
+                   ) -> Generator[new_item_dialog.SubmissionScreenshot | PageCapturePending | PageCaptureForSavedItem]:
+        """Reserve the capture while Send files the item."""
+        screenshot: (new_item_dialog.SubmissionScreenshot | PageCapturePending
+                     | PageCaptureForSavedItem) = new_item_dialog.NO_PAGE_SCREENSHOT
         with self._lock:
             capture = self._active(key)
-            if capture is not None and isinstance(capture.state, new_item_dialog.PageScreenshot):
+            if capture is not None and (
+                    isinstance(capture.state, new_item_dialog.PageScreenshot)
+                    or (allow_pending and isinstance(capture.state, PageCapturePending))):
                 if capture.filing:
                     raise new_item_dialog.SubmissionConflict("This screenshot is in use. Try Send again.")
                 screenshot = capture.state
                 capture.filing = True
             else:
-                if capture is not None and isinstance(capture.state, new_item_dialog.FiledPageScreenshot):
+                if capture is not None and isinstance(capture.state, (
+                        new_item_dialog.FiledPageScreenshot, PageCaptureForSavedItem)):
                     screenshot = capture.state
                 capture = None
 
@@ -249,17 +264,28 @@ class PageCaptures:
                     capture.expires = time.monotonic() + PAGE_CAPTURE_TTL_SECONDS
                     capture.filing = False
 
-    def complete(self, key: str, image: new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot) -> None:
-        """Hold the finished image until Send files it."""
+    def complete(self, key: str, image: new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot
+                 ) -> review_submissions.SavedSubmission | None:
+        """Hold the finished image or return the item that needs it."""
         with self._lock:
             capture = self._active(key)
             if capture is None:
-                return
+                return None
             if isinstance(image, new_item_dialog.NoPageScreenshot):
-                self._remove(key)
-            else:
-                capture.state = image
+                if capture.filing:
+                    capture.discard_after_filing = True
+                    capture.completed.set()
+                else:
+                    self._remove(key)
+                return None
+            if isinstance(capture.state, PageCaptureForSavedItem):
+                saved = capture.state.saved
+                capture.state = new_item_dialog.FiledPageScreenshot(image.digest)
                 capture.completed.set()
+                return saved
+            capture.state = image
+            capture.completed.set()
+            return None
 
 
 @dataclass
@@ -1176,10 +1202,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError:
             self.json_response(400, {"error": "Could not read the New item request."})
             return
+        legacy_page_draft = (isinstance(request, new_item_dialog.NewItemRequest) and request.page != "list"
+                             and review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None)
         try:
-            with server.page_captures.for_filing(key if valid_token else "") as screenshot:
+            with server.page_captures.for_filing(key if valid_token else "", allow_pending=legacy_page_draft) as capture:
+                pending = isinstance(capture, PageCapturePending)
+                claimed = isinstance(capture, PageCaptureForSavedItem)
+                screenshot = new_item_dialog.NO_PAGE_SCREENSHOT if pending or claimed else capture
+                capture_requested = bool(key) and (not legacy_page_draft or claimed)
                 created = server.review_cache.create_submission(
-                    request, screenshot=screenshot, capture_requested=bool(key), refusal=refusal)
+                    request, screenshot=screenshot, capture_requested=capture_requested, refusal=refusal)
                 saved = created.saved
                 details = saved.details
                 edited = isinstance(saved, review_submissions.EditedSubmission)
@@ -1192,7 +1224,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 main_request = request if isinstance(request, new_item_dialog.NewItemRequest) and (
                     request.page == "list" or review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None) else None
                 evidence_url = ""
-                if (details.images or details.page_state is not None
+                if ((legacy_page_draft and key) or details.images or details.page_state is not None
                         or (main_request is not None and main_request.page_state is not None)
                         or isinstance(details.evidence, new_item_dialog.PageDataEvidence)):
                     site = f"http://{server.bound_address}:{server.server_port}"
@@ -1209,10 +1241,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         if not isinstance(message, change_page.ReviewMessagePage) or not message.saved.get("submission_delivered"):
                             self.json_response(503, {"error": "Could not deliver the item. Try Send again."})
                             return
-                if (main_request is not None and main_request.page == "list"
-                        and isinstance(screenshot, new_item_dialog.PageScreenshot)
-                        and review_submissions.PAGE_SCREENSHOT not in details.images):
-                    screenshot = server.page_captures.file(key)
+                if pending or (main_request is not None and main_request.page == "list"
+                               and isinstance(screenshot, new_item_dialog.PageScreenshot)):
+                    if review_submissions.PAGE_SCREENSHOT not in details.images:
+                        screenshot = server.page_captures.file(key, saved, allow_pending=pending)
+                    elif pending:
+                        server.page_captures.discard(key)
         except new_item_dialog.SubmissionScreenshotReload:
             self.json_response(409, {"code": "reload_page", "error": SCREENSHOT_RELOAD})
             return
@@ -1235,7 +1269,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         finally:
             if main_request is not None:
                 self.deliver_review(server, delivery)
-                if (main_request.page == "list" and isinstance(screenshot, new_item_dialog.PageScreenshot)
+                if ((pending or main_request.page == "list") and isinstance(screenshot, new_item_dialog.PageScreenshot)
                         and review_submissions.PAGE_SCREENSHOT not in details.images):
                     server.attach_page_screenshot(saved, screenshot.png)
             if saved.kind == new_item_dialog.SubmissionKind.BUG and (
@@ -1764,7 +1798,9 @@ class ReviewLinksServer(ThreadingHTTPServer):
             pass
         finally:
             self.capture_slot.release()
-            self.page_captures.complete(key, image)
+            saved = self.page_captures.complete(key, image)
+        if saved is not None and isinstance(image, new_item_dialog.PageScreenshot):
+            self.attach_page_screenshot(saved, image.png)
 
     def finish_bug_evidence(self, created: review_page.PublishedSubmission, request: new_item_dialog.NewItemRequest | None,
                             host: str, screenshot: new_item_dialog.SubmissionScreenshot) -> None:
