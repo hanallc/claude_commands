@@ -3083,3 +3083,11 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - A test runs the real scan-root list of `main()` against a fixture home.
 - Row tests: 4 modules, both layouts, green. Blind review: 7 findings, all repaired.
 - The audit stays off. Re-arm needs the fix on main and nate's word.
+
+### Phase 181 — The five worst removal sites refuse a path outside their own form (item 152)  · status: done
+**Source:** bob, item 152, 2026-11-19 21:03 EST; the five most severe sites of the 178 removal survey. Base main f5eb6c184. Merges tonight, after 177.
+
+#### Work Order
+1. Merge gate recovery (`merge_gate.py`), the Mac lint-copy return (`fix_return.py`, `verify.sh`), Hana shot shutdown (`hana_shot.py`), scratch task end (`scratch.py`) and selection capture (`selection_capture.py`) each remove only a path of their own written form.
+2. None of them removes after a failed check.
+3. Fixture-home tests for each.
