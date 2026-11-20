@@ -111,13 +111,16 @@ class ListPageTests(unittest.TestCase):
             datetime(2026, 12, 3, 8, 30, tzinfo=UTC),
             date(2026, 11, 20), NOW.date(), NOW.date() - timedelta(days=1),
         ), start=1):
-            item = self.add(f"ETA example {number}", number=number, next_check=past)
+            item = self.add(f"ETA example {number}", number=number, next_check=future if number == 3 else past)
             _ = the_list.update(MORTY.id, item.id, {"eta": eta}, source="morty")
+            if number == 8:
+                _ = the_list.park(MORTY.id, item.id, datetime(2026, 11, 20, 14, tzinfo=UTC), source="nate")
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         probe = r'''<script>
 const failures=[];
 const check=(condition,message)=>{if(!condition) failures.push(message);};
-const eta=number=>document.querySelector('[data-number="'+number+'"] .list-eta');
+const row=number=>document.querySelector('[data-number="'+number+'"]');
+const eta=number=>row(number).querySelector('.list-eta');
 const etaLine=number=>eta(number).querySelector('.list-eta-text');
 const range='2026-11-17 13:00 EST – 2026-11-18 13:00 EST';
 const desktop=innerWidth>960;
@@ -126,6 +129,13 @@ const long=eta(longNumber),line=etaLine(longNumber);
 const style=getComputedStyle(line);
 check(etaLine(3).textContent==='Nov 16 14:00 EST','The cell shows the date for today.');
 check(etaLine(8).textContent==='Nov 20 03:30 EST','The cell shows the time in the user zone.');
+const checkLine=number=>row(number).querySelector('[data-list-check]');
+check(checkLine(3).textContent==='Check Nov 16 14:00 EST','The next check uses the ETA date form.');
+check(checkLine(2).textContent==='Check overdue Nov 16 12:00 EST' && checkLine(2).getClientRects().length>0,
+ 'An unparked item shows the overdue check in the same date form.');
+check(row(8).querySelector('[data-parked-note]').textContent==='Parked until Nov 20 09:00 EST',
+ 'The parked time uses the ETA date form.');
+check(!checkLine(8).getClientRects().length,'A parked item hides its overdue check.');
 check(etaLine(9).textContent==='Paused','The cell shows the status as stored.');
 check(etaLine(10).textContent==='Dec 3 03:30 EST','The cell omits the leading zero from the day.');
 check(etaLine(11).textContent==='Nov 20' && eta(11).title==='2026-11-20',
@@ -1170,7 +1180,7 @@ frame.addEventListener('load',async()=>{
             '- 2026-11-17 03:12:17.088559+00:00 Updated state: "Working" — builds, 22:12 EST')
         self.assertIn("ETA</dt><dd>Pending (check 16:45 EST)</dd>", log)
         self.assertIn("ETA</dt><dd>16:00 EST</dd>", log)
-        self.assertIn("Next check</dt><dd>2026-11-17 16:00 EST</dd>", log)
+        self.assertIn("Next check</dt><dd>Nov 17 16:00 EST</dd>", log)
         self.assertIn("State</dt><dd>Working</dd>", log)
         self.assertNotIn("EtaDescription", log)
 
@@ -1191,7 +1201,7 @@ frame.addEventListener('load',async()=>{
         log = self.legacy_log(
             "- 2026-11-16 18:10:00+00:00 Parked until 2026-11-17T05:00:00+00:00 — nate",
             "- 2026-11-16 18:20:00+00:00 Parked until not parked — nate")
-        self.assertIn("Parked until</dt><dd>2026-11-17</dd>", log)
+        self.assertIn("Parked until</dt><dd>Nov 17 00:00 EST</dd>", log)
         self.assertIn("Parked until</dt><dd>Not parked</dd>", log)
         self.assertNotIn("2026-11-17T05:00:00+00:00", log)
 
@@ -1201,10 +1211,10 @@ frame.addEventListener('load',async()=>{
         _ = the_list.park(MORTY.id, item.id, the_list.time_value("2026-11-18T02:00:00+00:00"), source="nate")
         with self.subTest(view="table"):
             body = list_page.render(root).decode()
-            self.assertIn("Parked until 2026-11-17 21:00 EST</small>", body)
-            self.assertIn("Parked until</dt><dd>2026-11-17 21:00 EST</dd>", body)
+            self.assertIn("Parked until Nov 17 21:00 EST</small>", body)
+            self.assertIn("Parked until</dt><dd>Nov 17 21:00 EST</dd>", body)
         with self.subTest(view="response"):
-            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "2026-11-17 21:00 EST")
+            self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "Nov 17 21:00 EST")
 
     def test_old_closed_log_uses_the_closing_words_renderer(self) -> None:
         log = self.legacy_log("- 2026-11-16 18:10:00+00:00 Closed: The **check** passed. — nate")
@@ -2379,10 +2389,10 @@ window.fetch=(url,options)=>{
         _ = list_page.submit(root, urlencode(self.fields(item, "park", until=until)))
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(saved.parked_until, datetime(2026, 12, 4, 0, 30, tzinfo=UTC))
-        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "2026-12-03 19:30 EST")
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "Dec 3 19:30 EST")
         body = list_page.render(root).decode()
-        self.assertIn("Parked until 2026-12-03 19:30 EST</small>", body)
-        self.assertIn("Parked until</dt><dd>2026-12-03 19:30 EST</dd>", body)
+        self.assertIn("Parked until Dec 3 19:30 EST</small>", body)
+        self.assertIn("Parked until</dt><dd>Dec 3 19:30 EST</dd>", body)
 
     def test_park_retry_compares_the_saved_instant_to_the_second(self) -> None:
         item = self.add("Retry the exact parking time")
@@ -2553,17 +2563,19 @@ window.fetch=async(_path,options={})=>{
  sheet.querySelector('[data-date="2026-12-03"]').click();
  const field=sheet.querySelector('[data-later-time]');
  field.value='1930';field.dispatchEvent(new Event('input',{bubbles:true}));
- check(sheet.querySelector('[data-later-summary]').textContent==='Parks until Thu 3 Dec 19:30',
-  'The shared sheet shows the 24-hour time in the user zone');
+ const summary=sheet.querySelector('[data-later-summary]').textContent;
+ check(summary==='Parks until Dec 3 19:30 EST','The Park picker shows the short time in the user zone');
  check(!requests.length,'Changing the selection does not submit the form');
  sheet.querySelector('[value="park"]').click();
  check(sheet.hidden && requests.length===1,'Save closes the shared sheet and submits once');
  check(requests[0]?.get('action')==='park' && requests[0].get('until')==='2026-12-04T00:30:00.000Z',
   'Save sends the selected instant');
- finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-03 19:30 EST'});
+ finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 19:30 EST'});
  await flush();
- check(row.querySelector('[data-parked-note]').textContent==='Parked until 2026-12-03 19:30 EST',
-  'The row shows the saved time');
+ check(row.querySelector('[data-parked-note]').textContent===summary.replace('Parks until','Parked until'),
+  'The row shows the same time as the picker');
+ check(form.querySelector('[data-parked-detail]').textContent==='Parked until Dec 3 19:30 EST',
+  'The expanded form uses the same saved time.');
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -2763,7 +2775,7 @@ window.fetch=async(_path,options={})=>{
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
  const labels=()=>[...row.querySelectorAll('[data-label="State"] small')].map(note=>note.textContent);
  try{
-  check(labels().join() === 'Parked until 2026-11-18 13:00 EST','The row starts with one saved time label');
+  check(labels().join() === 'Parked until Nov 18 13:00 EST','The row starts with one saved time label');
   form.elements.until.value='2026-12-03';
   const park=submit('park');losePost();await flush();
   check(submit('park')===park,'an exact Park retry keeps its request ID');
@@ -2775,9 +2787,9 @@ window.fetch=async(_path,options={})=>{
   await Promise.allSettled(returning.map(animation=>animation.finished));
   form.elements.until.value='2026-12-04';
   check(submit('park')!==park,'a different Park date gets a different ID');
-  finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-05'});await flush();
+  finishPost({item_state:'Working',parked:'true',parked_until:'Dec 5 00:00 EST'});await flush();
   check(labels().length===1,'a successful Park keeps one date label');
-  check(labels().join()==='Parked until 2026-12-05','the label uses the saved date from the response');
+  check(labels().join()==='Parked until Dec 5 00:00 EST','the label uses the saved date from the response');
  }catch(error){failures.push(String(error));}
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
@@ -2786,9 +2798,13 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_unpark_controls_layout_and_focus(self) -> None:
-        parked = self.add("Parked item", number=1)
+        parked = self.add("Parked item", number=1, next_check=NOW + timedelta(hours=1))
         _ = self.add("Unparked item", number=2)
         _ = the_list.park(MORTY.id, parked.id, NOW + timedelta(days=2), source="nate")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        with patch.object(the_list, "now", return_value=NOW + timedelta(hours=2)):
+            _ = the_list.unpark(MORTY.id, parked.id, source="nate")
+            saved = json.dumps({**list_page.saved_action_state(MORTY.id, parked.id), "unpark_outcome": "cleared"})
         self.browser_action_sequence(r"""
  show('all');
  const other=document.querySelector('[data-number="2"]');
@@ -2814,24 +2830,32 @@ window.fetch=async(_path,options={})=>{
  }
  const unpark=form.querySelector('[value=unpark]');
  show('parked');
+ const hiddenCheck=row.querySelector('[data-list-check]');
+ check(!hiddenCheck.getClientRects().length && hiddenCheck.textContent==='Check Nov 16 14:00 EST',
+  'The parked row hides the check before it is overdue.');
  unpark.focus();
  const first=submit('unpark');
  losePost();await flush();
  check(!row.hidden && !unpark.hidden,'a lost response leaves Unpark available');
  check(document.activeElement===unpark,'a lost response returns focus to Unpark');
  check(submit('unpark').id===first.id,'an exact Unpark retry keeps its request ID');
- finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});await flush();
+ finishPost(SAVED_UNPARK);await flush();
  check(row.hidden && document.activeElement===document.querySelector('#filter-show-parked'),'focus moves to Parked');
  const status=document.querySelector('[data-hidden-action-status][role="status"]');
  check(!status.hidden && status.getClientRects().length>0 && status.textContent==='Item #1 unparked.',
        'Parked announces which item left');
  show('all');
  check(status.hidden,'All shows the confirmation in the row');
+ const nextCheck=row.querySelector('[data-list-check]');
+ check(nextCheck.getClientRects().length>0 &&
+  nextCheck.querySelector('.warning')?.textContent==='Check overdue Nov 16 14:00 EST',
+  'Unpark shows the current check with the warning style before a refresh.');
  form.elements.words.value='Keep these words.';
  form.elements.until.value='2026-12-03';
  submit('park');
- finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-03'});await flush();
+ finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST'});await flush();
  show('parked');
+ check(!nextCheck.getClientRects().length,'Park hides the saved check without a refresh.');
  document.querySelector('[data-sort="3"]').click();
  unpark.focus();
  submit('unpark');
@@ -2845,7 +2869,7 @@ window.fetch=async(_path,options={})=>{
        'Unpark clears the parking draft and keeps the words');
  show('working');
  check(!row.hidden && !row.querySelector('[data-detail]').hidden,'Working shows the expanded unparked row');
-""", reduced_motion=True, add_item=False, window_size=(1440, 1120))
+""".replace("SAVED_UNPARK", saved), reduced_motion=True, add_item=False, window_size=(1440, 1120), markup=markup)
         self.browser_waiting_parking_refresh(unpark=True)
 
     def browser_waiting_parking_refresh(self, *, unpark: bool) -> None:
@@ -2953,7 +2977,7 @@ window.fetch=async(_path,options={})=>{
  const first=submit('unpark');
  losePost();await flush();
  check(submit('unpark').id===first.id,'The retry sends the original request ID.');
- finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-04',
+ finishPost({item_state:'Working',parked:'true',parked_until:'Dec 4 00:00 EST',
   unpark_outcome:'cleared_newer_parking_active'});
  await flush();
  const message=form.querySelector('[data-send-status]').textContent;
@@ -2961,7 +2985,7 @@ window.fetch=async(_path,options={})=>{
        'The replay reports the original result and the newer parking time.');
  check(!row.hidden && !unpark.hidden && document.activeElement===unpark,
        'The reparked row stays in view and Unpark keeps focus.');
- check(form.querySelector('[data-parked-detail]').textContent==='Parked until 2026-12-04',
+ check(form.querySelector('[data-parked-detail]').textContent==='Parked until Dec 4 00:00 EST',
        'The row shows the newer parking time.');
  check(form.elements.until.value==='2026-12-03','The replay preserves the parking draft.');
 ''', reduced_motion=True, add_item=False)
@@ -3964,13 +3988,13 @@ observer.observe(original.parentNode,{childList:true});
  show('parked');
  const chip=document.querySelector('[data-filter-row="show"] [data-filter-value="parked"]');
  submit('unpark');
- finishPost({parked:'true',parked_until:'2026-11-26',waiting_for_answer:'true',
+ finishPost({parked:'true',parked_until:'Nov 26 00:00 EST',waiting_for_answer:'true',
   open_question:'true',unpark_outcome:'cleared_newer_parking_active'});
  await flush();
  check(!row.hidden && chip.dataset.filterCount==='1','The newer parking keeps the waiting item in Parked.');
  check(row.querySelector('[data-waiting-note]') && row.dataset.waitingForAnswer==='true',
   'The parked row shows that the producer will answer.');
- check(row.querySelector('[data-parked-note]').textContent==='Parked until 2026-11-26',
+ check(row.querySelector('[data-parked-note]').textContent==='Parked until Nov 26 00:00 EST',
   'The parked row shows the newer time.');
  show('all');
  check(!row.hidden,'All shows the waiting item with the newer park.');
@@ -4034,16 +4058,16 @@ observer.observe(original.parentNode,{childList:true});
  const park=submit('park');
  losePost();await flush();
  check(row.hidden && readKey===row.dataset.key,'Park waits for the current item before restoring the row.');
- finishReadback({item_state:'Working',unread:'true',parked:'true',parked_until:'2026-12-03',park_request_saved:true});
+ finishReadback({item_state:'Working',unread:'true',parked:'true',parked_until:'Dec 3 00:00 EST',park_request_saved:true});
  await flush();
  check(row.hidden,'The saved Park stays out of Working.');
  show('parked');
- check(!row.hidden && row.querySelector('[data-parked-note]').textContent==='Parked until 2026-12-03',
+ check(!row.hidden && row.querySelector('[data-parked-note]').textContent==='Parked until Dec 3 00:00 EST',
   'Parked shows the saved parking time.');
  check(submit('park').id===park.id,'The exact Park retry uses the original request ID.');
- finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-03'});await flush();
+ finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST'});await flush();
  submit('remove');losePost();await flush();
- finishReadback({item_state:'Closed',unread:'false',parked:'true',parked_until:'2026-12-03'});
+ finishReadback({item_state:'Closed',unread:'false',parked:'true',parked_until:'Dec 3 00:00 EST'});
  await flush();
  show('all');
  check(row.hidden && row.dataset.state==='Closed','The saved Remove stays closed after readback.');
@@ -4081,7 +4105,7 @@ observer.observe(original.parentNode,{childList:true});
  check(isLinked(),'The read item starts linked under Parked with Unread only on.');
  const saved=PARK_RECEIPT;
  const action=PARK_ACTION;
- const previous='2026-11-17 13:00 EST';
+ const previous='Nov 17 13:00 EST';
  const until=saved && action==='park-until-delivered' ? 'delivered' : previous;
  readback=(key,request)=>{
   check(key===row.dataset.key && request===park.id,'The read uses the exact Park request ID.');
@@ -4336,7 +4360,7 @@ observer.observe(original.parentNode,{childList:true});
   if(section) check(!section.hidden,'The linked section stays visible during its fade.');
   const parked=action==='park' || row.dataset.parked==='true';
   finishPost({unread:action==='read' ? 'false' : 'true',parked:String(parked),
-   parked_until:parked ? '2026-12-03' : ''});
+   parked_until:parked ? 'Dec 3 00:00 EST' : ''});
   await flush();
   for(const animation of document.getAnimations()) animation.finish();
   await flush();
@@ -4355,7 +4379,7 @@ observer.observe(original.parentNode,{childList:true});
   show('parked');
   const note=row.querySelector('[data-detail]').hidden ?
    row.querySelector('[data-parked-note]') : form.querySelector('[data-parked-detail]');
-  check(!row.hidden && note.textContent==='Parked until 2026-12-03' && note.getClientRects().length>0,
+  check(!row.hidden && note.textContent==='Parked until Dec 3 00:00 EST' && note.getClientRects().length>0,
    'Parked shows the row and its parking note.');
  }
 """, add_item=False)
@@ -5973,7 +5997,7 @@ try{
  }
  check(shownNumbers()==='58,105,106,63,41','Parked rows come last in the initial default order.');
  await refreshOrder('Parked rows stay last in the default order after a refresh.');
- check(visible().at(-1).querySelector('[data-parked-note]')?.textContent==='Parked until 2026-11-18 13:00 EST',
+ check(visible().at(-1).querySelector('[data-parked-note]')?.textContent==='Parked until Nov 18 13:00 EST',
        'The parked row shows its park end time.');
  check(['owner','producer','show'].every(name=>staffCount(name,'all')===5),
        'All three All chips count the parked row with no filters.');
