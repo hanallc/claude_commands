@@ -2160,6 +2160,29 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(cloud_gate.read(self.folder / 'launch.json')['arguments'], self.fake.launches[0])
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
 
+    def test_bill_update_during_progress_write_blocks_the_launch(self) -> None:
+        worker, updated_bill, small, large = self.launch_rate_fixture()
+        initial_bill = replace(updated_bill, actual_usd=Decimal('.22'), usage_types=(
+            updated_bill.usage_types[0], replace(updated_bill.usage_types[1], usd=Decimal('.10'))))
+        directory = self.state / 'charges'
+        directory.mkdir()
+        bill_path = directory / f'{initial_bill.day}.json'
+        cloud_gate.save(bill_path, ledger.charge_record(initial_bill))
+        self.book_small_box(small)
+        cloud_gate.save(self.folder / 'launch.json', {'variant': 0, 'variants': [asdict(large)]})
+        publish = cloud_progress.publish
+
+        def publish_with_bill_update(sidecar: Path, progress: cloud_progress.CloudProgress) -> None:
+            cloud_gate.save(bill_path, ledger.charge_record(updated_bill))
+            publish(sidecar, progress)
+
+        with mock.patch.object(cloud_progress, 'publish', side_effect=publish_with_bill_update) as published:
+            outcome = worker.launch(self.folder, self.request, self.deployment)
+        published.assert_called_once()
+        self.assertEqual(outcome,
+            cloud_gate.LocalFallback('m7a.8xlarge in us-east-2 costs 0.80 USD/h with 0.12 USD/h reserved'))
+        self.assertEqual(self.fake.launches, [])
+
     def test_saved_retry_skips_a_box_above_the_off_reservation(self) -> None:
         worker, reading, small, large = self.launch_rate_fixture()
         self.request['retry_launch'] = {'variant': 0, 'variants': [asdict(large), asdict(small)]}

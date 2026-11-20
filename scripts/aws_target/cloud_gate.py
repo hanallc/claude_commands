@@ -934,6 +934,9 @@ class GateWorker:
             candidate = ledger.GateRateCandidate(size, self.box_region)
             try:
                 for retry in range(settings().whole('launch_reply_tries')):
+                    if retry == 0:
+                        cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
+                            'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
                     check = self.book.check_gate_launch_rate(reservation, candidate, int(self.clock()))
                     if not isinstance(check, ledger.GateRateWithinReservation):
                         rate_refusal = check
@@ -945,9 +948,6 @@ class GateWorker:
                         save(path, launch)
                         break
                     try:
-                        if retry == 0:
-                            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
-                                'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
                         reply = api.call('run-instances', '--cli-input-json', launch_json)
                         self.record_launch(request, size, zone, 'launched')
                     except AwsUnavailable as error:
