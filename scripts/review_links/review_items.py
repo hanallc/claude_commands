@@ -1247,10 +1247,12 @@ def ordered(items: list[ReviewItem], sources: list[Path] | None = None) -> list[
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
          owner_options: dict[staff.StaffId, str] | None = None,
-         sources: list[Path] | None = None, assign_ids: bool = True) -> list[ReviewItem]:
+         sources: list[Path] | None = None, assign_ids: bool = True,
+         later_mode: LaterReadMode = LaterReadMode.DISPLAY) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
-    return project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS, assign_ids=assign_ids)
+    return project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS,
+                   assign_ids=assign_ids, later_mode=later_mode)
 
 
 def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, ...], states: tuple[ReviewState, ...],

@@ -21,7 +21,7 @@ from scripts.lib import atomic_file, conf
 from scripts.message import send_result
 from scripts.production import change_review, delivery_state, investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
-from scripts.review_links import change_page, list_page, question_record, review_items
+from scripts.review_links import change_page, list_page, question_record, review_items, review_later
 
 MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "producer", "morty", staff.StaffRoot(),
                        current_session=staff.StaffId("20fa30c6-3cad-493a-b74a-0e408a93f865"))
@@ -816,6 +816,25 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(self.command(command, item.id, "--review", identities[0], "--source", "morty"),
                     (1, "", f"the_list: {item.id}: reopen the Closed item before changing it\n"))
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_review_link_refuses_to_write_when_the_later_file_is_malformed(self) -> None:
+        report = investigation.file(OWNER.id, "Read the result", "Check the result.", waiting_why="Check the result.")
+        item = self.add()
+        record = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = record.read_bytes(), record.stat().st_mtime_ns
+        later = review_later.path()
+        later.parent.mkdir(parents=True, exist_ok=True)
+        _ = later.write_text("{")
+        command = ("link", item.id, "--review", f"{OWNER.name}/{report.id}", "--source", "morty")
+        with patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root / "reviews")}):
+            code, output, error = self.command(*command)
+            self.assertEqual((code, output), (1, ""))
+            self.assertIn("the_list: Expecting property name", error)
+            self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), before)
+
+            _ = later.write_text("{}")
+            self.assertEqual(self.command(*command), (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).reviews, (f"investigation/{OWNER.id}/{report.id}",))
 
     def test_review_link_ignores_a_producer_directory(self) -> None:
         folder = self.root / "producer"

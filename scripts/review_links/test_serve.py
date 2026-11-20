@@ -3095,6 +3095,37 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(self.post("/console/news", body)[0], 400)
         self.assertEqual(self.request("/console/" + console.SEEN_NAME).status, 404)
 
+    def test_console_news_keeps_seen_records_during_a_later_read_failure(self) -> None:
+        self.server.review_cache.close()
+        case = self.review_fixture()
+        key = case.question()
+        target = review_later.path()
+        review_later.save(key, datetime.now(timezone.utc) + timedelta(days=1))
+        valid = target.read_bytes()
+        _ = target.write_bytes(b'{')
+        degraded = review_page.build_snapshot(case.root)
+        self.assertTrue(degraded.records[key].times.later_read_failed)
+        seen = change_page.console_folder(self.root) / console.SEEN_NAME
+        before = b'{"review": ["previous item"]}\n'
+        _ = seen.write_bytes(before)
+        page = console.ConsolePage('review', 'Review', 'inbox', 'Review',
+                                  console.AvailablePage(review_page.PAGE_PATH), review_page.waiting_items)
+        with (patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'),
+              patch.object(console, 'read_pages', return_value=(page,)),
+              patch.object(self.server.review_cache, 'get', return_value=degraded) as read):
+            for state in ('damaged file', 'recovered file with the degraded snapshot'):
+                with self.subTest(state=state):
+                    status, reply = self.post('/console/news', 'open=review')
+                    self.assertEqual(status, 400, reply)
+                    self.assertIn(b'The Later file cannot be read. Nothing was saved.', reply)
+                    self.assertEqual(seen.read_bytes(), before)
+                _ = target.write_bytes(valid)
+            read.assert_called_once()
+            read.return_value = review_page.build_snapshot(case.root)
+            self.assertEqual(self.post('/console/news', 'open=review'), (200, b'{"new": []}'))
+        self.assertNotEqual(seen.read_bytes(), before)
+        self.assertNotIn(key, seen.read_text())
+
     def test_investigation_mark_read_saves_and_reports_refused_or_failed_requests(self) -> None:
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())))

@@ -1371,24 +1371,33 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         """Record the page the console shows, and name the other pages that hold new items."""
         server = cast(ReviewLinksServer, self.server)
 
-        def waiting_review(request: console.NewsRequest) -> frozenset[str]:
-            return review_page.waiting_items(request, snapshot=server.review_cache.get())
-
         try:
             length = int(self.headers.get("Content-Length", "0"))
             opened = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True).get("open", [])
             pages: list[console.ConsolePage] = []
             with server.staff_read_scope():
-                for page in console.read_pages():
-                    if page.items is review_page.waiting_items:
-                        page = replace(page, items=waiting_review)
-                    elif page.items is images.waiting_images:
-                        page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
-                    pages.append(page)
+                configured = console.read_pages()
                 # Rebuilds has no navigation entry, so its request uses an empty name.
-                if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
+                if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in configured)}:
                     raise ValueError("name one console page or none")
-                fresh = console.news(server.root, tuple(pages), opened[0])
+                with review_later.page_write():
+                    for page in configured:
+                        if page.items is review_page.waiting_items and isinstance(page.destination, console.AvailablePage):
+                            try:
+                                snapshot = server.review_cache.get()
+                            except ValueError as error:
+                                print(f"review-links news: {page.identity}: {error}", file=sys.stderr)
+                                continue
+                            if any(item.times.later_read_failed for item in snapshot.records.values()):
+                                raise review_later.LaterSaveRefused()
+                            page = replace(page, items=partial(review_page.waiting_items, snapshot=snapshot))
+                        elif page.items is images.waiting_images:
+                            page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
+                        pages.append(page)
+                    fresh = console.news(server.root, tuple(pages), opened[0])
+        except review_later.LaterSaveRefused as error:
+            self.browser_failure(400, str(error), error)
+            return
         except ValueError as error:
             self.browser_failure(400, "Name one console page.", error)
             return

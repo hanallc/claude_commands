@@ -2124,8 +2124,9 @@ def main(argv: list[str] | None = None) -> int:
 
             needs_read = any(isinstance(selection, ReviewByShownId)
                              or (name == "link" and selection.value not in current.reviews) for selection in selections)
-            known = ({item.key: item for item in review_items.read(review_link.review_root(), members=record)}
-                     if needs_read else {})
+            later_mode = review_items.LaterReadMode.STRICT if name == "link" else review_items.LaterReadMode.DISPLAY
+            known = ({item.key: item for item in review_items.read(
+                review_link.review_root(), members=record, later_mode=later_mode)} if needs_read else {})
             resolved: list[str] = []
             for selection in selections:
                 if isinstance(selection, ReviewByKey):
