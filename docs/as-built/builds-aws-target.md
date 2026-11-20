@@ -1271,7 +1271,8 @@ The usual cost order still includes the estimated cost of waiting.
 A speed promotion needs a positive time saving and recent box times for both instance types.
 The worker can use times from other regions for the same type.
 The time comparison includes regional extra seconds and any seconds for a region with no measurements.
-The worker orders promoted variants by time, then uses the usual cost and tie order.
+The worker orders promoted variants by estimated AWS spend, then by configured type and input order.
+A slightly faster choice can win over a much faster one. A minimum time saving against the reference, in seconds, needs user approval.
 The worker reports the preferred box and reports the actual box that AWS accepts.
 Live prices affect each fresh rank. Retries use the saved order.
 A capacity refusal advances to the next saved variant.

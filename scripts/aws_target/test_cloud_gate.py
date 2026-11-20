@@ -669,13 +669,28 @@ class CloudGateTests(CostFixture):
                            for row, seconds in zip(choices, (600, 450, 300))])
         for rates, order in (
             (('.3', '.56', '1.176'), [medium, small, large]),
-            (('.3', '.56', '.90'), [large, medium, small]),
+            (('.3', '.56', '.90'), [medium, large, small]),
             (('.3', '.64', '1.176'), [small, medium, large]),
         ):
             with self.subTest(rates=rates):
                 prices = [ledger.RegionalSpotPrice(row.region, row.zone, row.instance_type, Decimal(rate), int(self.now))
                           for row, rate in zip(choices, rates)]
                 self.assertEqual(worker.rank_variants(choices, 'merge-gate', prices), order)
+
+    def test_faster_order_chooses_the_lowest_aws_spend_at_each_ratio(self) -> None:
+        worker, variants = self.steering_fixture()
+        cheapest, faster, reference = variants[0], variants[2], variants[4]
+        fastest = replace(variants[4], instance_type='m7a.2xlarge')
+        choices = [fastest, faster, cheapest, reference]
+        self.gate_history([(row.instance_type, row.region, seconds)
+                           for row, seconds in zip(choices, (263, 266, 273, 300))])
+        # The estimated costs round to $0.0285, $0.0178, $0.0166 and $0.0133.
+        prices = [ledger.RegionalSpotPrice(row.region, row.zone, row.instance_type, Decimal(rate), int(self.now))
+                  for row, rate in zip(choices, ('.39', '.241', '.219', '.1596'))]
+        for ratio in ('1.3', '2.1', '2.2'):
+            with self.subTest(ratio=ratio):
+                override_fixture_settings(self.root / 'cloud_gate.conf', f'faster_box_max_cost_ratio={ratio}')
+                self.assertEqual(worker.rank_variants(choices, 'merge-gate', prices)[0], cheapest)
 
     def test_speed_keeps_capacity_first_and_uses_the_cheapest_full_box_as_reference(self) -> None:
         worker, variants = self.steering_fixture()

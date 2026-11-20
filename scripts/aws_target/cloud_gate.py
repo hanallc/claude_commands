@@ -792,10 +792,11 @@ class GateWorker:
             elif isinstance(row.cost_ratio, Decimal):
                 rows[index] = replace(row, decision=FasterWithinRatio(reference, saving, row.cost_ratio))
 
-        def faster_order(row: GateRankedChoice) -> tuple[GateCapacity, Decimal, bool, Decimal, int]:
+        def faster_order(row: GateRankedChoice) -> tuple[GateCapacity, bool, bool, Decimal, int]:
             cap_order, unpriced, cost, configured = order(row)
-            saving = row.decision.saved_seconds if isinstance(row.decision, FasterWithinRatio) else Decimal(0)
-            return cap_order, -saving, unpriced, cost, configured
+            if isinstance(row.decision, FasterWithinRatio) and isinstance(row.estimate, run_cost.GatePlacementEstimate):
+                return cap_order, False, unpriced, row.estimate.aws_spend_usd, configured
+            return cap_order, True, unpriced, cost, configured
 
         return sorted(rows, key=faster_order)
 
