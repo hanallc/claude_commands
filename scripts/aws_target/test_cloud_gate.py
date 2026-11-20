@@ -9,6 +9,7 @@ from decimal import Decimal
 from hashlib import sha256
 from io import StringIO
 import base64
+import faulthandler
 import fcntl
 import gzip
 import json
@@ -22,6 +23,7 @@ import threading
 import time
 from types import SimpleNamespace
 from typing import cast, override
+import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
@@ -58,7 +60,18 @@ def service_environment(command: Sequence[str]) -> dict[str, str]:
                 for argument in command if argument.startswith('--setenv='))
 
 
-class CloudWorkerHoldTests(IsolatedBuildHoldTest):
+class CloudGateHangGuard(unittest.TestCase):
+    @override
+    def run(self, result: unittest.TestResult | None = None) -> unittest.TestResult | None:
+        # The guard also covers synchronous waits in setup and cleanup.
+        faulthandler.dump_traceback_later(TEST_HANG_GUARD_SECS, file=2, exit=True)
+        try:
+            return super().run(result)
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+
+class CloudWorkerHoldTests(CloudGateHangGuard, IsolatedBuildHoldTest):
     @classmethod
     @override
     def setUpClass(cls) -> None:
@@ -187,7 +200,7 @@ class FakeGateAws:
         return subprocess.CompletedProcess(args, int(bool(error)), json.dumps(reply), error)
 
 
-class CloudGateTests(CostFixture):
+class CloudGateTests(CloudGateHangGuard, CostFixture):
     now: float = 0
     book: ledger.CostLedger = ledger.CostLedger(Path())
     fake: FakeGateAws = FakeGateAws()
@@ -2528,8 +2541,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(aws_trial.trial_cost(self.book, {'uncertain'}, self.settings, int(self.now) + 2), (Decimal(0), True))
 
     def test_paired_coordinator_interrupt_and_kill_cleanup(self) -> None:
-        script = r'''import json, multiprocessing, os, signal, sys
-from collections.abc import Generator
+        script = r'''import multiprocessing, os, signal, sys, threading
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
@@ -2538,9 +2550,16 @@ from scripts.aws_target.aws_target import AwsCli
 from scripts.aws_target.test_cloud_gate import FakeGateAws
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 folder, directory, settings = map(Path, sys.argv[1:4])
-at, number = float(sys.argv[4]), int(sys.argv[5])
+at, number, before_launch = float(sys.argv[4]), int(sys.argv[5]), bool(int(sys.argv[6]))
 coordinator = os.getpid()
 barrier = multiprocessing.get_context('fork').Barrier(2)
+reserve_trial = aws_trial.reserve_trial
+
+def reserve(*args, **kwargs):
+    if before_launch:
+        os.kill(coordinator, number)
+    return reserve_trial(*args, **kwargs)
+
 @contextmanager
 def slot(repo, sidecar, job, *, group):
     assert job == aws_trial.PAIRED_TRIAL_JOB
@@ -2553,6 +2572,7 @@ def create_api(*args, **kwargs):
     fake = FakeGateAws()
     fake.has_result = False
     def execute(arguments, **options):
+        assert not before_launch or 'run-instances' not in arguments
         reply = fake(arguments, **options)
         if 'list-objects-v2' in arguments:
             turn = barrier.wait(timeout=TEST_HANG_GUARD_SECS)
@@ -2560,20 +2580,24 @@ def create_api(*args, **kwargs):
                 os.kill(coordinator, number)
             if number != signal.SIGINT:
                 os._exit(0)
-            signal.pause()
+            if not threading.Event().wait(TEST_HANG_GUARD_SECS):
+                raise AssertionError('The coordinator did not stop the worker')
         return reply
     return AwsCli('fixture', 'us-east-1', 1, execute=execute)
 with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
+      mock.patch.object(aws_trial, 'reserve_trial', side_effect=reserve),
       mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=slot),
       mock.patch.object(cloud_gate.GateWorker, 'charges'), mock.patch.object(cloud_gate.GateWorker, 'reconcile'),
       mock.patch.object(aws_trial.time, 'time', return_value=at)):
     raise SystemExit(aws_trial.coordinate_trial(folder, directory, settings))
 '''
-        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
-            with self.subTest(number=number):
-                cohort = self.root / ('cancel-cohort-' + str(number))
+        for number, before_launch in ((signal.SIGKILL, True), (signal.SIGINT, False),
+                                      (signal.SIGTERM, False), (signal.SIGKILL, False)):
+            with self.subTest(number=number, before_launch=before_launch):
+                cohort = self.root / f'cancel-cohort-{number}-{before_launch}'
                 cohort.mkdir()
-                for name in (str(number) + '-first', str(number) + '-second'):
+                attempts = (cohort.name + '-first', cohort.name + '-second')
+                for name in attempts:
                     folder = cohort / name
                     folder.mkdir()
                     request = {**self.request, 'attempt': name, 'task': 'paired', 'rounds': 1, 'module': name + '/test_ok.py',
@@ -2581,7 +2605,8 @@ with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
                     cloud_gate.save(folder / 'request.json', request)
                     cloud_gate.save(folder / 'deployment.json', self.deployment)
                 with subprocess.Popen([sys.executable, '-c', script, str(cohort), str(self.state), str(self.settings),
-                                       str(self.now), str(number)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       str(self.now), str(number), str(int(before_launch))],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       text=True, start_new_session=True) as process:
                     try:
                         stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -2593,11 +2618,16 @@ with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
                         _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                         self.fail('The cancellation fixture did not exit.\n' + stderr)
                 self.assertEqual(process.returncode, 1 if number == signal.SIGINT else -number, stderr)
+                if before_launch:
+                    for name in attempts:
+                        self.assertTrue((cohort / name / 'released').is_file(), stderr)
+                        self.assertFalse((cohort / name / 'launch.json').exists())
+                    continue
                 api = AwsCli('fixture', 'us-east-1', 1, execute=FakeGateAws())
                 with mock.patch.object(aws_trial, 'AwsCli', return_value=api):
                     self.assertEqual(aws_trial.main(['--paired-cleanup', str(cohort)], self.settings, self.state), 0)
                 reservations = [row for row in self.book.read_snapshot().gate_reservations
-                                if row.attempt in (str(number) + '-first', str(number) + '-second')]
+                                if row.attempt in attempts]
                 self.assertEqual(len(reservations), 2)
                 self.assertTrue(all(isinstance(row.state, ledger.GateTerminated) for row in reservations),
                     repr(reservations) + stderr + repr([cloud_gate.read(path) for path in cohort.glob('*/outcome.json')]))
@@ -2610,7 +2640,7 @@ with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
                     if path.name not in ('request.json', 'deployment.json'):
                         path.unlink()
 
-class CloudRouteTests(CostFixture):
+class CloudRouteTests(CloudGateHangGuard, CostFixture):
     repo: Path = Path()
     modules: list[tuple[str, Path]] = []
     admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
@@ -2995,9 +3025,9 @@ class CloudRouteTests(CostFixture):
         environment = {**os.environ, 'GIT_INDEX_FILE': str(self.root / 'expected-index')}
         for arguments in (('read-tree', 'HEAD'), ('add', '-A')):
             _ = subprocess.run(['git', *arguments], cwd=self.repo, env=environment,
-                               check=True, capture_output=True)
+                               check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         expected = subprocess.run(['git', 'write-tree'], cwd=self.repo, env=environment,
-                                  check=True, capture_output=True, text=True).stdout.strip()
+                                  check=True, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
         self.assertNotEqual(expected, gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         tree, dirty = cloud_gate.working_tree(self.repo)
         self.assertIn('racy', dirty)
