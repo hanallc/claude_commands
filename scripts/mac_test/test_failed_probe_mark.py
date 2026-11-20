@@ -52,7 +52,7 @@ class FailedProbeTests(OffloadCommandFixture):
             + "kind.natedev=local\nplatform.natedev=linux\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
         self.environment.update({name: "" for name in (
             "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")})
-        self.enterContext(self.admission.replace_environment({**os.environ, **self.environment}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
 
     def probe(self, target: str = "box") -> offload.ProbeResult:
         self.sync_fixture()
@@ -741,19 +741,19 @@ raise SystemExit(255)
 ''')
         self.write_config(clippy="on")
         self.environment["BUILD_TARGETS_SCRIPT"] = str(Path(build_targets.__file__))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
         admission = caller_admission(self, self.root, self.environment)
-        self.enterContext(admission.replace_environment({**os.environ, **self.environment}))
         admission.server.host_probe = admission.server.read_provider_evidence
         result = self.verify("lint", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(args[:1] == ["clippy"] for args in self.cargo_calls()))
         # The remote probe remains blocked after local work finishes.
-        with admission.replace_environment({**os.environ, **self.environment}):
+        with mock.patch.dict(os.environ, self.environment):
             self.assertIsInstance(eligibility.read_failed_probe("linux"), eligibility.FailedProbe)
         _ = os.write(descriptor, b"continue\n")
         with (state / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-        with admission.replace_environment({**os.environ, **self.environment}):
+        with mock.patch.dict(os.environ, self.environment):
             self.assertEqual(mac_test.free_now(mac_test.state_paths("linux"),
                 self.root / "linux.conf", self.root), "free")
             answer = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("linux"),

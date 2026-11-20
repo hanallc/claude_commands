@@ -1198,7 +1198,7 @@ route_test
               mock.patch.object(record, 'publish_hana_loss') as loss,
               mock.patch.object(record, 'ssh_attempt'),
               mock.patch.object(admission_client, 'report_execution', side_effect=report_after_release) as report,
-              queue.replace_environment({**os.environ, 'BUILDLOG_PINNED_TARGET': target.name}),
+              mock.patch.dict(os.environ, {'BUILDLOG_PINNED_TARGET': target.name}),
               redirect_stdout(StringIO()) as text):
             status = offload.main()
         self.assertEqual(text.getvalue(), '')

@@ -58,7 +58,7 @@ from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue import admission_code, queue_snapshot, queue_view, head_facts, placement
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
-from scripts.build_queue.queue_fixture import write_memory_config, write_process
+from scripts.build_queue.queue_fixture import write_memory_config, write_process, write_scope
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
 
 
@@ -2768,6 +2768,19 @@ class WaitHolderServiceTests(unittest.TestCase):
 
 
 class AdmissionCallerPersistenceTests(unittest.TestCase):
+
+    def test_serving_keeps_the_build_cgroup_after_the_environment_key_is_removed(self) -> None:
+        with AdmissionFixture() as fixture, mock.patch.dict(os.environ, {
+            "BUILDLOG_USER_CGROUP": str(fixture.root / "unused-cgroup"),
+        }), fixture.serving():
+            with fixture.loop_turn():
+                scope = Path(os.environ.pop("BUILDLOG_BUILDS_CGROUP")) / "fixture.scope"
+                write_scope(scope, current=GIB)
+                _ = fixture.run_pass()
+                inputs = fixture.server.last_inputs
+                assert isinstance(inputs, records.QueueInputs)
+                self.assertIn(str(scope), [row.measured.cgroup for row in inputs.running
+                    if isinstance(row.measured, records.UnownedSliceMemory)])
 
     def test_serving_rejects_direct_calls_without_loop_turn(self) -> None:
         with AdmissionFixture() as fixture, fixture.serving():

@@ -1177,9 +1177,11 @@ def compiler_jobs(source: ScopeSource, proc: Path) -> tuple[tuple[CompilerJob, .
     return jobs, source if complete else records.NoSource()
 
 
-def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
+def sccache_memory(proc: Path = PROC, *,
+                   cgroups: MemoryCgroups | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> list[StepMemory]:
     """Charge the compiler service outside the step scopes. Each step counts its compiler jobs."""
-    directory = builds_slice_cgroup() / "sccache.service"
+    builds = cgroups.builds if isinstance(cgroups, MemoryCgroups) else builds_slice_cgroup()
+    directory = builds / "sccache.service"
     try:
         reading = slice_working_set(directory)
         try:
@@ -1268,7 +1270,8 @@ class SwapInHistory:
         return (pages - self.samples[0].pages) * page_size
 
 
-def read_meminfo(path: Path) -> HostMemory:
+def read_meminfo(path: Path, *,
+                 cgroups: MemoryCgroups | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> HostMemory:
     check_memory_reading(path)
     values: dict[str, int] = {}
     try:
@@ -1280,7 +1283,7 @@ def read_meminfo(path: Path) -> HostMemory:
     if "MemAvailable" not in values:
         raise ValueError(f"cannot read MemAvailable from {path}")
     swap_total, swap_free = values.get("SwapTotal", 0), values.get("SwapFree", 0)
-    excluded = read_build_and_ci_swap() if swap_total > swap_free else 0
+    excluded = read_build_and_ci_swap(cgroups=cgroups) if swap_total > swap_free else 0
     return HostMemory(values["MemAvailable"], values.get("MemTotal", UnknownHostTotal()),
                       swap_total, swap_free, build_and_ci_swap=excluded)
 
@@ -1288,10 +1291,16 @@ def read_meminfo(path: Path) -> HostMemory:
 NO_HOST_SWAP = HostMemory(0, UnknownHostTotal())
 
 
-def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -> Pressure:
+def memory_pressure_path() -> Path:
+    return Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
+
+
+def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy,
+                  path: Path | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> Pressure:
     """Read PSI once and retain missing evidence for scheduling and display."""
     readings: dict[str, float] = {}
-    path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
+    if isinstance(path, conf.UseConfiguredValue):
+        path = memory_pressure_path()
     check_memory_reading(path)
     try:
         for line in _read_proc_text(path).splitlines():
@@ -2764,6 +2773,24 @@ def builds_slice_cgroup() -> Path:
     return Path(os.environ.get("BUILDLOG_BUILDS_CGROUP", str(user_manager_cgroup() / "builds.slice")))
 
 
+@dataclass(frozen=True)
+class ResolveCiSliceWithSystemd:
+    """Ask systemd for the configured CI slice when the reader needs it."""
+
+
+@dataclass(frozen=True)
+class MemoryCgroups:
+    """Keep the build cgroup and the CI cgroup override for memory readings."""
+
+    builds: Path
+    ci_override: Path | ResolveCiSliceWithSystemd
+
+    @classmethod
+    def configured(cls) -> MemoryCgroups:
+        private_ci = os.environ.get("BUILDLOG_CI_CGROUP", "")
+        return cls(builds_slice_cgroup(), Path(private_ci) if private_ci else ResolveCiSliceWithSystemd())
+
+
 def desktop_guarantee() -> int | ReadingUnavailable:
     """Read the memory the desktop session keeps protected (session.slice memory.min)."""
     path = user_manager_cgroup() / "session.slice" / "memory.min"
@@ -2808,23 +2835,29 @@ class InactiveSlice:
     """systemd names no cgroup for a slice that holds no process."""
 
 
-def read_build_and_ci_swap() -> int | ReadingUnavailable:
+def read_build_and_ci_swap(*, cgroups: MemoryCgroups | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                           ) -> int | ReadingUnavailable:
     """Read the build and CI slice swap that is not agent demand; an absent slice holds none."""
     try:
+        if isinstance(cgroups, conf.UseConfiguredValue):
+            cgroups = MemoryCgroups.configured()
         name = conf.read("build_admission").text("ci_memory_slice")
-        ci = systemd_slice_group(name) if name else InactiveSlice()
+        ci = systemd_slice_group(name, cgroups=cgroups) if name else InactiveSlice()
         if isinstance(ci, ReadingUnavailable):
             return ci
-        groups = [builds_slice_cgroup()] if isinstance(ci, InactiveSlice) else [builds_slice_cgroup(), ci]
+        groups = [cgroups.builds] if isinstance(ci, InactiveSlice) else [cgroups.builds, ci]
         return sum(slice_swap_current(group) for group in groups if group.is_dir())
     except (OSError, UnicodeError, ValueError, conf.Unusable) as error:
         return ReadingUnavailable(f"swap demand unavailable: {error}")
 
 
-def systemd_slice_group(name: str) -> Path | InactiveSlice | ReadingUnavailable:
-    private = os.environ.get("BUILDLOG_CI_CGROUP", "")
-    if private:
-        return Path(private)
+def systemd_slice_group(name: str, *,
+                        cgroups: MemoryCgroups | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                        ) -> Path | InactiveSlice | ReadingUnavailable:
+    if isinstance(cgroups, conf.UseConfiguredValue):
+        cgroups = MemoryCgroups.configured()
+    if isinstance(cgroups.ci_override, Path):
+        return cgroups.ci_override
     try:
         reply = subprocess.run(["systemctl", "show", "--property=ControlGroup", "--value", name],
                                capture_output=True, text=True, check=True, timeout=5)
@@ -2838,8 +2871,10 @@ def systemd_slice_group(name: str) -> Path | InactiveSlice | ReadingUnavailable:
         return ReadingUnavailable(f"{name}: cannot read ControlGroup: {error}")
 
 
-def ci_slice_cgroup(name: str) -> Path | ReadingUnavailable:
-    group = systemd_slice_group(name)
+def ci_slice_cgroup(name: str, *,
+                    cgroups: MemoryCgroups | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                    ) -> Path | ReadingUnavailable:
+    group = systemd_slice_group(name, cgroups=cgroups)
     if isinstance(group, InactiveSlice):
         return ReadingUnavailable(f"{name}: cannot read ControlGroup: systemd returns no slice cgroup")
     return group
@@ -2893,9 +2928,12 @@ def service_job_state(workers: Iterable[int], processes: dict[int, ProcessIdenti
 
 def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
                          *, activity_reader: ScopeActivityReader | None = None,
-                         ci_memory_slice: str = "", waiters: Sequence[Waiter] = ()) -> tuple[UnownedSliceMemory, ...]:
+                         ci_memory_slice: str = "", waiters: Sequence[Waiter] = (),
+                         cgroups: MemoryCgroups | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                         ) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
-    directory = builds_slice_cgroup()
+    if isinstance(cgroups, conf.UseConfiguredValue):
+        cgroups = MemoryCgroups.configured()
     owned: set[Path] = set()
     tree_pids: set[int] = set()
     for row in rows:
@@ -2910,10 +2948,11 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
     result: list[UnownedSliceMemory] = []
     activity_reader = activity_reader or ScopeActivityReader(processes, proc)
     try:
-        children = list(directory.iterdir())
+        children = list(cgroups.builds.iterdir())
     except OSError:
         children = []
-    ci_group = ci_slice_cgroup(ci_memory_slice) if ci_memory_slice else ReadingUnavailable("CI slice not configured")
+    ci_group = (ci_slice_cgroup(ci_memory_slice, cgroups=cgroups) if ci_memory_slice
+                else ReadingUnavailable("CI slice not configured"))
     ci_groups = (ci_group,) if isinstance(ci_group, Path) else ()
     if ci_memory_slice and isinstance(ci_group, ReadingUnavailable):
         result.append(UnownedSliceMemory(0, pid=PidNotRecorded(), owner=ci_memory_slice, diagnostic=ci_group.reason))

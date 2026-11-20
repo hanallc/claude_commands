@@ -77,7 +77,7 @@ class OffloadCommandTests(SeededCleanupFixture):
                 self.assertNotIn("Traceback", result.stdout + result.stderr)
 
     def test_leftover_check_uses_connection_settings_and_the_recorded_host(self) -> None:
-        self.enterContext(self.admission.replace_environment({**os.environ, **self.environment}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
         connection = eligibility.SshConnectionSettings("current-host", 7, 19)
         repository = eligibility.KnownRepository("hana")
         response = subprocess.CompletedProcess(["ssh"], 0, "leftovers=0\nrc=0\n", "")
@@ -92,7 +92,7 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.assertEqual(run.call_args.kwargs["timeout"], 19)
 
     def test_connection_reader_ignores_execution_values_and_reads_changes_at_use(self) -> None:
-        self.enterContext(self.admission.replace_environment({**os.environ, **self.environment}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
         self.config["free_floor_gib"] = "broken"
         self.config["host"] = "first-host"
         self.config["connect_timeout_s"] = "7"

@@ -402,6 +402,12 @@ class OffloadCommandFixture(unittest.TestCase):
     def admission(self) -> AdmissionFixture:
         return caller_admission(self, self.root, self.environment)
 
+    def invoke_offload_cli(self, arguments: list[str], *, assigned_adapter: bool = False,
+                           separate_stderr: bool = True) -> subprocess.CompletedProcess[str]:
+        main = assigned_adapter_main if assigned_adapter else offload.main
+        return invoke_cli(offload, main, arguments, self.environment, self.root,
+                          combined_output=not separate_stderr, environment_lock=self.admission.loop_access)
+
     def start_admission(self) -> None:
         admission = self.admission
         admission.configure(waiting_pass_seconds=0.25)
@@ -532,12 +538,7 @@ class OffloadCommandFixture(unittest.TestCase):
             self.repository if repository is None else repository, verb, settings, runner_options))
         arguments.extend(["--result", str(self.result_path), *runner_options, *assignment_options, "--"])
         arguments.extend(nextest_arguments)
-        if assigned_adapter:
-            if not subprocess_cli:
-                return invoke_cli(offload, assigned_adapter_main, arguments[2:],
-                                  self.admission.with_private_memory(self.environment), self.root,
-                                  combined_output=not separate_stderr,
-                                  environment_lock=self.admission.loop_access)
+        if assigned_adapter and subprocess_cli:
             entry = self.root / "assigned-adapter.py"
             _ = entry.write_text(
                 f"import sys\nsys.path.insert(0, {str(SCRIPT.resolve().parents[2])!r})\n"
@@ -548,10 +549,7 @@ class OffloadCommandFixture(unittest.TestCase):
             return subprocess.run(arguments, cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
                                   text=True, check=False, timeout=timeout)
-        return invoke_cli(offload, offload.main, arguments[2:],
-                          self.admission.with_private_memory(self.environment), self.root,
-                          combined_output=not separate_stderr,
-                          environment_lock=self.admission.loop_access)
+        return self.invoke_offload_cli(arguments[2:], assigned_adapter=assigned_adapter, separate_stderr=separate_stderr)
 
     def process_command(self, *arguments: str, separate_stderr: bool = False,
                         last_decline: str = "", assigned_adapter: bool = False,

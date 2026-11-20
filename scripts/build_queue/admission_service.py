@@ -214,6 +214,8 @@ class Clock(Protocol):
 
 
 class Readings(Protocol):
+    @property
+    def cgroups(self) -> gate.MemoryCgroups: ...
     def host(self) -> records.HostMemory | records.ReadingUnavailable: ...
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure: ...
     def compilers(self) -> list[records.StepMemory]: ...
@@ -223,22 +225,26 @@ class Readings(Protocol):
 
 class SystemReadings:
     def __init__(self) -> None:
+        self.cgroups: gate.MemoryCgroups = gate.MemoryCgroups.configured()
+        self.host_path: Path = Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo"))
+        self.vmstat_path: Path = Path(os.environ.get("BUILDLOG_VMSTAT", "/proc/vmstat"))
+        self.pressure_path: Path = gate.memory_pressure_path()
         self.swap_in: gate.SwapInHistory = gate.SwapInHistory()
 
     def host(self) -> records.HostMemory | records.ReadingUnavailable:
         try:
-            host = gate.read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
+            host = gate.read_meminfo(self.host_path, cgroups=self.cgroups)
             window = conf.read("build_admission").whole("agent_swap_window_seconds")
-            returning = self.swap_in.read(Path(os.environ.get("BUILDLOG_VMSTAT", "/proc/vmstat")), time.monotonic(), window)
+            returning = self.swap_in.read(self.vmstat_path, time.monotonic(), window)
             return replace(host, swap_in_window_bytes=returning) if isinstance(returning, int) else returning
         except (OSError, ValueError, conf.Unusable) as error:
             return records.ReadingUnavailable(str(error) or "memory reading unavailable")
 
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:
-        return gate.read_pressure(host, policy=policy)
+        return gate.read_pressure(host, policy=policy, path=self.pressure_path)
 
     def compilers(self) -> list[records.StepMemory]:
-        return gate.sccache_memory()
+        return gate.sccache_memory(cgroups=self.cgroups)
 
     def reservation(self, path: Path, row: records.Reservation, now: datetime,
                     processes: dict[int, gate.ProcessIdentity], proc: Path, policy: records.AdmissionPolicy) -> records.StepMemory:
@@ -704,7 +710,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
             sample_file(Path(record.path).with_suffix(".wave")), gate.observed_test_phase(row), scope)
     # Capture every scope before the loop applies current reservation ownership.
     unowned = gate.unowned_slice_memory([], processes, proc.path,
-        activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice)
+        activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice, cgroups=readings.cgroups)
     members: dict[str, frozenset[int]] = {}
     workers: dict[str, frozenset[int]] = {}
     for reading in unowned:
