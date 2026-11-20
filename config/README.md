@@ -370,10 +370,15 @@ It uses no tag filter and needs no tag activation or deployment change.
 `cost_explorer_tag_key=BuildTarget` and `cost_explorer_tag_value=aws-build` still supply the deployment tags.
 The reader saves each day's account total, usage costs, usage quantities, units, provisional flag, and read time in `charges/<day>.json`.
 The saved `excludes_credits` mark identifies usage bills.
-A later scheduled read replaces those values, including zero amounts.
-An old saved format requires an immediate read, regardless of the previous schedule.
+A later scheduled read replaces the newest values, including zero amounts.
+The file keeps earlier read times and amounts.
+An old saved format without the account mark requires an immediate read.
 An empty daily reply is an error for both callers.
-The gate cap uses the account amount for each completed UTC day whose bill rounds to at least one cent.
+The guard and gate cap adjust the total for full UTC days that qualify for the account amount.
+The latest valid amount must be at least USD 0.01 before rounding.
+Within the lookback, the last `bill_settled_equal_reads` reads after the day ends must agree.
+Reads less than `cost_explorer_interval_seconds` apart count once.
+Outside the lookback, use the latest valid amount.
 For an unbilled day, each box uses the newest positive billed Spot rate for its instance type.
 The rate equals the type's daily Spot cost divided by its daily Spot hours.
 The newest day for one type can differ from the newest day for another type.

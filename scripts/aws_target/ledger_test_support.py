@@ -46,7 +46,7 @@ def numeric_settings(path: Path, values: dict[str, str]) -> None:
         else:
             lines.append(line)
     for key, value in values.items():
-        form = "whole" if key.endswith(("_seconds", "_timeout_s", "_days")) else "range"
+        form = "whole" if key.endswith(("_seconds", "_timeout_s", "_days", "_reads")) else "range"
         if key in ("connect_timeout_s", "leftover_timeout_s"):
             form = "range"
         lines.extend((f"# {form}: 0..", f"{key}={value}"))
@@ -72,7 +72,7 @@ def install_cost_settings(path: Path, overrides: str = "") -> None:
         "price_refresh_seconds": "3600", "price_max_age_seconds": "7200",
         "observation_max_age_seconds": "86400", "cost_explorer_interval_seconds": "86400",
         "notification_timeout_s": "5", "notification_retry_s": "60", "cost_explorer_lookback_days": "1",
-        "bill_complete_after_seconds": "172800",
+        "bill_settled_equal_reads": "2",
     })
     text_setting(path, "cost_explorer_tag_key", "Project")
     text_setting(path, "cost_explorer_tag_value", "fixture-build")

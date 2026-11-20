@@ -888,12 +888,17 @@ Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
 Reports keep the existing reconciliation floors.
-The account checks adjust the existing total for each complete UTC day inside the limit window.
-They subtract that day's existing usage and add the newest complete AWS amount.
+The account checks adjust the existing total for each qualifying UTC day inside the limit window.
+They subtract that day's existing usage and add the newest qualifying AWS amount.
 An account bill qualifies when the name, day label, and bounds match one full UTC day.
 The bill must exclude credits and give at least USD 0.01 before rounding.
-The read time must be valid and at least `bill_complete_after_seconds` after the day ends.
-The read time cannot be in the future.
+The newest read time must be valid and cannot be in the future.
+The charge file keeps each read time and amount. A legacy file without a list supplies one read.
+Known limit. Concurrent refreshes can record one USD 0.01 fee for two Cost Explorer reads.
+Within the lookback, the last `bill_settled_equal_reads` reads after the UTC day ends must agree.
+Reads less than `cost_explorer_interval_seconds` apart count once.
+A different amount starts a new count. The AWS service logs the day and both amounts when the day becomes unsettled.
+Outside the lookback, the latest valid amount qualifies.
 The adjustment preserves query fees and any open gate allowances or reservations already in the total.
 The report's costs pane must call `CostLedger.accrued_cost` for the current day or month to date.
 The function returns `cost`, `limit_count`, and the cost and bill state for each UTC day in the window.
@@ -904,7 +909,7 @@ The per-day costs add up to `cost` and include separately named query fees and a
 The pane displays a counted bill as “Billed, final” only when the bill sets `provisional` to JSON `false`.
 The pane displays all other counted bills as “Billed, not final”.
 The pane displays other days as “Estimate”.
-An estimate can show `aws_amount_so_far` when a valid saved bill has yet to meet the age requirement.
+An estimate can show the newest valid AWS amount in `aws_amount_so_far` while the day remains unsettled.
 The tooltip labels this value “AWS amount so far”.
 The pane's “Time on AWS” row reads `run_cost.hana_billed_hours` for one UTC day.
 The reader returns billed Spot hours for Hana's configured region and machine types.
