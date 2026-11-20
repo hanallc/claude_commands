@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import replace
+from decimal import Decimal
 from html import unescape
 import json
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_page, console_help, ledger, ledger_test_support
+from scripts.aws_target import aws_page, console_help, ledger, ledger_test_support, quota_requests, spot_table
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
@@ -42,6 +43,27 @@ class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
             self.assertEqual(aws_page.quota_help(), '<ol><li>Open the test console.</li></ol>'
                              + '\n<p>Choose the test account.</p>\n<p>Unlock the test manager.</p>')
 
+    def test_quota_request_uses_plain_labels_when_values_are_missing(self) -> None:
+        applied = aws_page.AppliedQuotaUnavailable.NOT_MEASURED
+        for status, expected in (
+            ('APPROVED', 'closed, quota unknown'), ('IN_PROGRESS', 'open'), ('FIXTURE_UNKNOWN', 'status unknown'),
+        ):
+            with self.subTest(status=status):
+                request = quota_requests.quota_request(status, Decimal(32), None, None)
+                self.assertEqual(aws_page.quota_request_cell(request, applied, 0),
+                                 {'text': f'32 vCPUs wanted · {expected}, age unknown'})
+        reading = quota_requests.QuotaRequestReadFailed('fixture private diagnostic')
+        self.assertEqual(aws_page.quota_request_cell(reading, applied, 0), {'text': 'request read failed'})
+
+    def test_future_quota_request_dates_have_unknown_age(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        future = '2026-01-22T12:00:00Z'
+        past = '2026-01-14T12:00:00Z'
+        for created, updated in ((future, past), (None, future)):
+            with self.subTest(created=created, updated=updated):
+                request = quota_requests.quota_request('PENDING', Decimal(32), created, updated)
+                self.assertEqual(aws_page.quota_request_age(request, now), 'age unknown')
+
 
 class PageCostFixture(ledger_test_support.CostFixture):
     @override
@@ -58,7 +80,48 @@ gate_wait_usd_per_minute=0
 unmeasured_region_extra_seconds={}
 # whole: 1..
 lifetime_minutes=30
+# whole: 1..
+gpu_spot_quota_request_vcpus=32
 """)
+
+
+class AwsGpuQuotaSummaryTests(PageCostFixture):
+    now: int = ledger_test_support.instant('2026-01-15T12:00:00Z')
+
+    def quota_summary(self, applied: dict[str, str], history: dict[str, dict[str, str]]) -> aws_page.GpuQuotaSummary:
+        _ = (self.state / 'spot-prices.json').write_text(json.dumps({
+            'prices': [],
+            'regions': [{'region': region, 'read_at': self.now, 'standard_vcpus': '64', 'gpu_vcpus': vcpus}
+                        for region, vcpus in applied.items()],
+            'quota_requests': [{'region': region, 'standard': {'state': 'no_request'}, 'gpu': reading}
+                               for region, reading in history.items()],
+        }))
+        tables = spot_table.spot_tables(self.state, self.now, settings_path=self.settings)
+        return aws_page.quota_history_data(tables, self.now)['gpu_summary']
+
+    def test_applied_quota_counts_without_request_history(self) -> None:
+        for history in (
+            {},
+            {'us-east-1': {'state': 'no_request'}},
+            {'us-east-1': {'state': 'not_measured', 'reason': 'fixture'}},
+            {'us-east-1': {'state': 'read_failed', 'reason': 'fixture'}},
+        ):
+            with self.subTest(history=history):
+                self.assertEqual(self.quota_summary({'us-east-1': '32'}, history), {
+                    'target_vcpus': 32,
+                    'regions_by_outcome': {'granted': ['us-east-1'], 'open': [], 'closed, not granted': []},
+                })
+
+    def test_summary_counts_regions_in_the_quota_table(self) -> None:
+        config = self.root / 'cloud_gate.conf'
+        ledger_test_support.text_setting(config, 'regions', 'us-east-1 us-east-2')
+        ledger_test_support.text_setting(config, 'spot_candidate_regions', 'us-east-1 eu-north-1')
+        request = {'state': 'requested', 'status': 'PENDING', 'requested_vcpus': '32'}
+        self.assertEqual(self.quota_summary(
+            {'us-east-1': '32', 'eu-north-1': '8'},
+            {'us-east-1': request, 'eu-north-1': request},
+        ), {'target_vcpus': 32,
+            'regions_by_outcome': {'granted': ['us-east-1'], 'open': ['eu-north-1'], 'closed, not granted': []}})
 
 
 class AwsPageLaunchStateTests(PageCostFixture):
@@ -182,7 +245,8 @@ class AwsPageLaunchStateTests(PageCostFixture):
 
 @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the AWS table checks")
 class AwsCombinedTableTests(PageCostFixture):
-    def fixture_page(self, *, blocked: bool = False) -> Path:
+    def fixture_page(self, *, blocked: bool = False,
+                     quota_history: tuple[dict[str, object], ...] = ()) -> Path:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         regions = ('us-east-1', 'us-east-2', 'eu-west-1')
         standard = ('c7a.4xlarge', 'm7a.8xlarge')
@@ -200,12 +264,13 @@ class AwsCombinedTableTests(PageCostFixture):
             for size, usd in zip((*standard, gpu), row, strict=True) if usd
         ]
         readings = [
-            {'region': region, 'read_at': now - age, 'standard_vcpus': '137', 'gpu_vcpus': '32'}
+            {'region': region, 'read_at': now - age, 'standard_vcpus': '137', 'gpu_vcpus': '8' if quota_history and region != 'us-east-2' else '32'}
             for region, age in zip(regions, (240, 7201, 240), strict=True)
         ]
         failures = [{'region': regions[0], 'at': now - 120, 'read': 'price', 'error': 'FixtureError'}]
         _ = (self.state / 'spot-prices.json').write_text(json.dumps({
             'prices': prices, 'regions': readings, 'failures': failures,
+            **({'quota_requests': quota_history} if quota_history else {}),
         }))
         events: list[dict[str, object]] = []
         for mode, times in (('merge-gate', (3600, 360)), ('targeted-test', (600, 1800))):
@@ -224,8 +289,9 @@ class AwsCombinedTableTests(PageCostFixture):
             (ledger.SpotPlacementScore(ledger.SpotPlacementRegion(regions[0]), 9),)),), now)
         return aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
 
-    def run_browser_checks(self, query: str, checks: str, *, blocked: bool = False) -> None:
-        page = self.fixture_page(blocked=blocked)
+    def run_browser_checks(self, query: str, checks: str, *, blocked: bool = False,
+                           quota_history: tuple[dict[str, object], ...] = ()) -> None:
+        page = self.fixture_page(blocked=blocked, quota_history=quota_history)
         probe = """<script>
 (async () => {
   const result = document.createElement("p");
@@ -298,7 +364,11 @@ class AwsCombinedTableTests(PageCostFixture):
     check(table().tHead.rows[1].cells[1].textContent === "Gate USD", "Gate unit");
     check(table().tHead.rows[1].cells[2].textContent === "Fit boxes", "Fit unit");
     const first = table().tBodies[0].rows[0];
-    check(first.cells[1].textContent === "137" && first.cells[4].textContent === "8", "Quota and Fit numbers");
+    check(first.cells[1].firstChild.textContent === "137" && first.cells[4].textContent === "8", "Quota and Fit numbers");
+    check([...table().querySelectorAll(".quota-request")].map(cell => cell.textContent).join(",")
+          === "not measured,not measured,not measured", "Legacy snapshots have no request history");
+    check(document.querySelector("#quota-request-note").textContent === "The snapshot has no quota request history.",
+          "One note for the legacy table");
     check(first.cells[1].className === "n edge region-quota" && first.cells[4].className === "n", "No quota marks");
     check(spot().textContent === "0.1000" && spot().classList.contains("cheapest"), "Lowest Spot price");
     check(first.querySelector(".spot-status").textContent === "read failed", "Visible failed read");
@@ -349,6 +419,57 @@ class AwsCombinedTableTests(PageCostFixture):
       check(indices.every(index => colors.get(`${index},1`) === `var(--scale-${color})`), `Tied ${color} endpoint`);
     }
 """)
+
+    def test_quota_cells_and_gpu_summary_use_the_latest_request(self) -> None:
+        gpu = {'state': 'requested', 'requested_vcpus': '32', 'created_at': '2026-01-11T10:00:00Z',
+               'updated_at': '2026-01-15T10:00:00Z'}
+        not_measured = {'state': 'not_measured',
+                        'reason': 'The AWS plan key is locked. Run github-warmup in a terminal on natedev.'}
+        self.run_browser_checks('?types=gpu&show=quota', """
+    const summary = document.querySelector("#gpu-quota-summary");
+    const cell = region => [...document.querySelectorAll("#price-table tbody tr")]
+      .find(row => row.cells[0].textContent === region).cells[1];
+    const request = region => cell(region).querySelector(".quota-request").textContent;
+    check(summary?.textContent === "G and VT quota (32 vCPUs): 1 granted · 1 open · 1 closed, not granted",
+          "GPU progress across the three regions");
+    check(cell("us-east-2").firstChild.textContent === "32" && request("us-east-2") === "32 vCPUs wanted · granted, 4 days",
+          "The applied quota meets an open request");
+    check(cell("us-east-1").firstChild.textContent === "8"
+          && request("us-east-1") === "32 vCPUs wanted · closed, not granted, 4 days",
+          "The applied quota is below the approved request");
+    check(request("eu-west-1") === "32 vCPUs wanted · open, 2 hours", "Age uses the update time without a creation time");
+    const grantRegion = document.querySelector("#regions [data-region='us-east-2']");
+    grantRegion.click();
+    check(summary.textContent === "G and VT quota (32 vCPUs): 0 granted · 1 open · 1 closed, not granted",
+          "The summary counts only the visible rows");
+    grantRegion.click();
+    document.querySelector("#types [data-types='standard']").click();
+    check(request("us-east-2") === "not measured" && request("us-east-1") === "not measured",
+          "Standard has its own request history");
+    check(request("eu-west-1") === "no request", "Empty history remains distinct");
+    check(document.querySelector("#quota-request-note").textContent
+          === "The plan identity is locked. Run github-warmup on natedev.", "One note for the locked identity");
+    check(document.querySelectorAll("#price-table td").length === 12, "No extra table column");
+""", quota_history=(
+            {'region': 'us-east-2', 'standard': not_measured, 'gpu': {**gpu, 'status': 'CASE_OPENED'}},
+            {'region': 'us-east-1', 'standard': not_measured, 'gpu': {**gpu, 'status': 'APPROVED'}},
+            {'region': 'eu-west-1', 'standard': {'state': 'no_request'},
+             'gpu': {**gpu, 'status': 'PENDING', 'created_at': None}},
+        ))
+
+    def test_missing_history_note_requires_every_visible_row_to_lack_history(self) -> None:
+        self.run_browser_checks('?types=gpu&show=quota', """
+    const note = document.querySelector("#quota-request-note");
+    const requests = [...document.querySelectorAll("#price-table .quota-request")];
+    check(requests.some(cell => cell.textContent === "not measured"), "A missing history cell says not measured");
+    check(requests.some(cell => cell.textContent === "no request"), "An empty history has a record");
+    check(note.hidden && note.textContent === "", "Mixed history has no whole-snapshot note");
+    document.querySelector("#regions [data-region='us-east-1']").click();
+    check(!note.hidden && note.textContent === "The snapshot has no quota request history.",
+          "The note appears when all visible rows lack history");
+""", quota_history=(
+            {'region': 'us-east-1', 'standard': {'state': 'no_request'}, 'gpu': {'state': 'no_request'}},
+        ))
 
     def test_url_selects_gpu_and_omits_gate(self) -> None:
         self.run_browser_checks('?show=spot,cost,quota&types=gpu&runs=both', """

@@ -14,13 +14,14 @@ import sys
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import Enum, StrEnum
 from html import escape
 from pathlib import Path
 from statistics import median
 from typing import Literal, NotRequired, TypedDict
 
-from scripts.aws_target import config as aws_config, console_help, ledger, spend as aws_spend, spot_table
+from scripts.aws_target import config as aws_config, console_help, ledger, quota_requests, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
@@ -187,6 +188,23 @@ class LaunchesRefused(TypedDict):
 type LaunchState = NoLaunchEvidence | LaunchesWorking | LaunchesRefused
 
 
+class QuotaRequestCell(TypedDict):
+    text: str
+    note: NotRequired[str]
+    history_missing: NotRequired[Literal[True]]
+
+
+class GpuQuotaSummary(TypedDict):
+    target_vcpus: int
+    regions_by_outcome: dict[QuotaRequestOutcome, list[str]]
+
+
+class QuotaHistoryData(TypedDict):
+    standard: dict[str, QuotaRequestCell]
+    gpu: dict[str, QuotaRequestCell]
+    gpu_summary: GpuQuotaSummary
+
+
 class PageData(TypedDict):
     read_at: int
     render_seconds: float
@@ -198,6 +216,7 @@ class PageData(TypedDict):
     prices: list[TableRowsData]
     placement_scores: TableData
     quotas: list[TableRowsData]
+    quota_history: QuotaHistoryData
     cached_spot_status: dict[str, Literal['read failed', 'old']]
     runs: list[RunCostData]
     hours: TableData
@@ -340,6 +359,98 @@ def launch_state(records: Sequence[dict[str, object]]) -> LaunchState:
     return state
 
 
+class QuotaRequestOutcome(StrEnum):
+    GRANTED = 'granted'
+    OPEN = 'open'
+    CLOSED_NOT_GRANTED = 'closed, not granted'
+    CLOSED_QUOTA_UNKNOWN = 'closed, quota unknown'
+    STATUS_UNKNOWN = 'status unknown'
+
+
+class AppliedQuotaUnavailable(Enum):
+    NOT_MEASURED = 'not measured'
+
+
+def quota_request_outcome(request: quota_requests.QuotaRequest, applied: Decimal | AppliedQuotaUnavailable,
+                          wanted: Decimal) -> QuotaRequestOutcome:
+    if isinstance(applied, Decimal) and applied >= wanted:
+        return QuotaRequestOutcome.GRANTED
+    if request.status in quota_requests.CLOSED_QUOTA_REQUEST_STATUSES:
+        return (QuotaRequestOutcome.CLOSED_NOT_GRANTED if isinstance(applied, Decimal)
+                else QuotaRequestOutcome.CLOSED_QUOTA_UNKNOWN)
+    if request.status is quota_requests.QuotaRequestStatus.UNKNOWN:
+        return QuotaRequestOutcome.STATUS_UNKNOWN
+    return QuotaRequestOutcome.OPEN
+
+
+def quota_request_age(request: quota_requests.QuotaRequest, now: int) -> str:
+    stamp = request.created_at if isinstance(request.created_at, datetime) else request.updated_at
+    if not isinstance(stamp, datetime) or (seconds := now - stamp.timestamp()) < 0:
+        return 'age unknown'
+    hours = int(seconds // 3600)
+    if hours >= 24:
+        days = hours // 24
+        return f'{days} day' + ('s' if days != 1 else '')
+    if hours == 0:
+        return 'less than 1 hour'
+    return f'{hours} hour' + ('s' if hours != 1 else '')
+
+
+def quota_request_note(reason: str) -> str:
+    if reason.startswith('The AWS plan key is locked.'):
+        return 'The plan identity is locked. Run github-warmup on natedev.'
+    if reason.startswith('The AWS plan key is missing.'):
+        return 'The plan identity is missing.'
+    if reason == 'The quota request history deadline expired.':
+        return 'The quota request history read timed out.'
+    return 'The page could not measure quota request history.'
+
+
+def quota_request_cell(reading: quota_requests.QuotaRequestReading,
+                       applied: Decimal | AppliedQuotaUnavailable, now: int) -> QuotaRequestCell:
+    if isinstance(reading, quota_requests.QuotaRequest):
+        wanted = reading.requested_vcpus
+        outcome = quota_request_outcome(reading, applied, wanted)
+        return {'text': f'{wanted:f} vCPUs wanted · {outcome}, {quota_request_age(reading, now)}'}
+    if isinstance(reading, quota_requests.NoQuotaRequest):
+        return {'text': 'no request'}
+    if isinstance(reading, quota_requests.QuotaRequestReadFailed):
+        return {'text': 'request read failed'}
+    if reading.reason == 'The snapshot has no quota request history for this region.':
+        return {'text': 'not measured', 'history_missing': True}
+    return {'text': 'not measured', 'note': quota_request_note(reading.reason)}
+
+
+def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryData:
+    standard, gpu = (
+        {row[0]: value if isinstance(value := numbers[1], Decimal) else AppliedQuotaUnavailable.NOT_MEASURED
+         for row, numbers in zip(table.rows, table.values, strict=True)}
+        for table in tables.quotas
+    )
+    regions_by_outcome: dict[QuotaRequestOutcome, list[str]] = {
+        QuotaRequestOutcome.GRANTED: [],
+        QuotaRequestOutcome.OPEN: [],
+        QuotaRequestOutcome.CLOSED_NOT_GRANTED: [],
+    }
+    needed = Decimal(tables.gpu_quota_needed)
+    data: QuotaHistoryData = {'standard': {}, 'gpu': {},
+                             'gpu_summary': {'target_vcpus': tables.gpu_quota_needed,
+                                             'regions_by_outcome': regions_by_outcome}}
+    for history in tables.quota_requests:
+        region = history.region
+        applied = gpu[region]
+        request = history.gpu
+        data['standard'][region] = quota_request_cell(history.standard, standard[region], now)
+        data['gpu'][region] = quota_request_cell(request, applied, now)
+        if isinstance(applied, Decimal) and applied >= needed:
+            regions_by_outcome[QuotaRequestOutcome.GRANTED].append(region)
+        elif isinstance(request, quota_requests.QuotaRequest) and request.requested_vcpus >= needed:
+            outcome = quota_request_outcome(request, applied, needed)
+            if outcome in regions_by_outcome:
+                regions_by_outcome[outcome].append(region)
+    return data
+
+
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
               launch_records: Sequence[dict[str, object]] = ()) -> PageData:
@@ -356,6 +467,7 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
         'prices': [table_rows_data(table) for table in tables.prices],
         'placement_scores': table_data(placement),
         'quotas': [table_rows_data(table) for table in tables.quotas],
+        'quota_history': quota_history_data(tables, now),
         'cached_spot_status': {read.region: 'read failed' if read.failure else 'old'
                                for read in tables.regions if read.failure or read.stale},
         'runs': [{'scope': costs.scope.name, 'label': costs.scope.label, 'explanation': costs.explanation,
