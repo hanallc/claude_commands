@@ -30,8 +30,10 @@ from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_types
 from scripts.lib import conf, models_registry, nix_env, unit_runs
 from scripts.whoami import quota_state
-from scripts.production import staff, worker_admission
-from scripts.agents import detached_run_process, shutdown_record, worker_lifecycle
+from scripts.production import session_staff, staff, worker_admission
+from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, resolve_production_paths
+from scripts.production.staff import serving_merge_unit
+from scripts.agents import detached_run_process, pane_record, shutdown_record, worker_lifecycle
 from scripts.direct import recorder_state
 
 if TYPE_CHECKING:
@@ -44,6 +46,49 @@ WorkerRole = staff.WorkerRole
 
 WORKER_SANDBOX = "danger-full-access"
 READ_ONLY_SANDBOX = "read-only"
+REVIEW_ROLES: frozenset[WorkerRole] = frozenset({"review", "astra-reviewer"})
+CLAUDE_REVIEW_TOOLS = "Read,Grep,Glob"
+CLAUDE_REVIEW_MCP = '{"mcpServers":{}}'
+CLAUDE_REVIEW_ARGUMENTS = ("--tools", CLAUDE_REVIEW_TOOLS, "--mcp-config", CLAUDE_REVIEW_MCP, "--strict-mcp-config")
+
+
+class OrdinaryWorkerOwner(Enum):
+    LEGACY_OR_UNIT = "the worker uses the existing unit or legacy policy"
+
+
+def enrolled_worker_owner(owner: staff.StaffRow) -> EnrolledPaths | OrdinaryWorkerOwner:
+    if owner.kind == "showrunner" and isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        paths = resolve_production_paths(owner.doc.path)
+        if isinstance(paths, EnrolledPaths):
+            return paths
+    return OrdinaryWorkerOwner.LEGACY_OR_UNIT
+
+
+def worker_directory(record: staff.StaffSnapshot, reference: StaffId) -> Path:
+    row = record.by_id(reference)
+    owner = record.parent_of(row) if row is not None and row.kind == "worker" else row
+    if owner is not None:
+        paths = enrolled_worker_owner(owner)
+        if isinstance(paths, EnrolledPaths):
+            return paths.main
+    return session_staff.worker_directory(record, reference)
+
+
+def review_role_refusal(owner: staff.StaffRow, role: WorkerRole | WorkerRoleUnavailable) -> AdmissionRefused | None:
+    if isinstance(role, str) and role in REVIEW_ROLES:
+        return None
+    merge = serving_merge_unit(owner.id)
+    route = f"unit {merge.name}" if merge is not None else "a unit with the assigned work"
+    return AdmissionRefused(f"{owner.name}: only review and astra-reviewer can run here. Send write work to {route}.")
+
+
+def review_run_refusal(run: Path, paths: EnrolledPaths, *artifacts: Path) -> AdmissionRefused | None:
+    root = run.resolve()
+    if not root.is_dir() or any(root.is_relative_to(tree) for tree in (paths.main, paths.integration)):
+        return AdmissionRefused("showrunner reviews require an existing run directory outside the checkouts")
+    if any(not artifact.resolve().is_relative_to(root) for artifact in artifacts):
+        return AdmissionRefused("showrunner review orders and replies must stay in the run directory")
+    return None
 
 
 @dataclass(frozen=True)
@@ -325,11 +370,17 @@ class UseRolePolicy(Enum):
     CURRENT = "resolve the role policy"
 
 
+class ToolAccess(Enum):
+    ROLE_DEFAULT = "use the role's tools"
+    SHOWRUNNER_REVIEW = "permit Claude read tools only"
+
+
 @dataclass(frozen=True)
 class LaunchPolicy:
     settings: models_registry.LaunchSettings
     sandbox: str
     permission: str
+    tools: ToolAccess = ToolAccess.ROLE_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -1014,7 +1065,7 @@ def launch_policy(role: WorkerRole, family: Literal["claude", "codex", "assigned
     from scripts.astra import design_roles
     section, key = ("design_roles", role.removeprefix("astra-")) if role.startswith("astra-") else ("direct", role)
     settings = models_registry.launch_settings(section, key, family)
-    sandbox = READ_ONLY_SANDBOX if role in ("review", "astra-reviewer") else WORKER_SANDBOX
+    sandbox = READ_ONLY_SANDBOX if role in REVIEW_ROLES else WORKER_SANDBOX
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
     return _launch_policy(settings, sandbox)
@@ -1061,6 +1112,8 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
         arguments = ["--model", settings.model, "--permission-mode", policy.permission]
         if settings.effort and settings.effort != "unset":
             arguments += ["--effort", settings.effort]
+        if policy.tools is ToolAccess.SHOWRUNNER_REVIEW:
+            arguments += CLAUDE_REVIEW_ARGUMENTS
     return arguments + _turn_end_arguments(settings.kind)
 
 
@@ -1119,6 +1172,50 @@ def launch_environment(policy: LaunchPolicy, account: ConfiguredWorkerAccount | 
                 if isinstance(selected_claude_account, accounts.NamedAccount) else {})
     except (OSError, ValueError) as error:
         return StartRefused(StartRefusal.ACCOUNT_UNAVAILABLE, str(error))
+
+
+def _argument_values(arguments: Sequence[str], flags: frozenset[str]) -> list[str]:
+    values: list[str] = []
+    for index, argument in enumerate(arguments):
+        flag, equals, value = argument.partition("=")
+        if flag in flags:
+            values.append(value if equals else arguments[index + 1] if index + 1 < len(arguments) else "")
+    return values
+
+
+def _codex_read_only(arguments: Sequence[str]) -> bool:
+    if any(arg.partition("=")[0] in ("--yolo", "--dangerously-bypass-approvals-and-sandbox", "--full-auto")
+           for arg in arguments):
+        return False
+    if _argument_values(arguments, frozenset({"--sandbox", "-s"})) != [READ_ONLY_SANDBOX]:
+        return False
+    if _argument_values(arguments, frozenset({"--ask-for-approval", "-a"})) != ["never"]:
+        return False
+    return all(setting.partition("=")[0].strip() in
+               ("model_reasoning_effort", "notice.hide_rate_limit_model_nudge", "service_tier")
+               for setting in _argument_values(arguments, frozenset({"-c", "--config"})))
+
+
+def require_review_process(client: herdr.Herdr, pane: str, paths: EnrolledPaths) -> None:
+    """Prove the running worker uses the review tools in main."""
+    info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"), "review launch")
+    owner = herdr.foreground_pane_owner(info)
+    if not isinstance(owner, (herdr.ProvedCodexForeground, herdr.ProvedClaudeForeground)):
+        raise ValueError("the running showrunner review process is unproved")
+    if not isinstance(owner.cwd, str) or Path(owner.cwd).resolve() != paths.main:
+        raise ValueError("the retained showrunner worker does not run in main")
+    actual = owner.arguments
+    if isinstance(owner, herdr.ProvedCodexForeground):
+        if _codex_read_only(actual):
+            return
+    elif (not any(arg.partition("=")[0] in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+                                           "--allowedTools", "--allowed-tools", "--plugin-dir", "--add-dir") for arg in actual)
+          and _argument_values(actual, frozenset({"--permission-mode"})) == ["plan"]
+          and _argument_values(actual, frozenset({"--tools"})) == [CLAUDE_REVIEW_TOOLS]
+          and _argument_values(actual, frozenset({"--mcp-config"})) == [CLAUDE_REVIEW_MCP]
+          and "--strict-mcp-config" in actual):
+        return
+    raise ValueError("the retained showrunner worker does not have the read-only review policy")
 
 
 def _live_policy(worker: OpenWorker, policy: LaunchPolicy, client: herdr.Herdr, *, same_role: bool) -> bool | UncertainWorker:
@@ -1256,15 +1353,27 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
     owner = record.by_id(parent)
     if owner is None or owner.kind not in ("unit", "showrunner"):
         return AdmissionRefused("only a unit or showrunner can admit a worker")
+    try:
+        paths = enrolled_worker_owner(owner)
+        if isinstance(paths, EnrolledPaths) and (refusal := review_role_refusal(owner, role)):
+            return refusal
+    except (OSError, ValueError, ProductionPathsError, staff.StaffRefused, staff.StaffUnreadable) as error:
+        return AdmissionRefused(str(error))
     existing = worker_admission.find_worker(record, parent, name.value)
     run = worker_run(existing if existing is not None else owner, record=record, scanned=runs)
     if existing is not None and not isinstance(worker_dispatch_state(existing, run, lock), DispatchHoldsWorker):
         run = worker_run(owner, record=record, scanned=runs)
+    if isinstance(paths, EnrolledPaths) and (refusal := review_run_refusal(run, paths)):
+        return refusal
     allowed = worker_admission.WorkerStartAllowed(name.value, parent, run,
         worker_admission.ExistingWorkerSlot(existing) if existing is not None else worker_admission.NewWorkerSlot())
     keep_model = isinstance(policy, UseRolePolicy)
     try:
         policy = launch_policy(role) if isinstance(policy, UseRolePolicy) else policy
+        if isinstance(paths, EnrolledPaths):
+            if policy.sandbox != READ_ONLY_SANDBOX or policy.permission != "plan":
+                return AdmissionRefused("showrunner review requires a read-only launch policy")
+            policy = replace(policy, tools=ToolAccess.SHOWRUNNER_REVIEW)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return StartRefused(StartRefusal.INVALID_ROLE_CONFIGURATION, str(error))
     try:
@@ -1275,7 +1384,7 @@ def start_or_resume(parent: StaffId, name: WorkerName, role: WorkerRole | Worker
             if not held.active or held.parent != parent or held.name != name:
                 return StartRefused(StartRefusal.BUSY_ROLE_CHANGE, "worker lock does not own this worker")
             with worker_admission.worker_operation(allowed):
-                result = _start_locked(owner, name, role, policy, account, allowed, held, codex, keep_model=keep_model)
+                result = _start_locked(owner, name, role, policy, account, allowed, held, codex, paths, keep_model=keep_model)
                 if isinstance(result, OpenWorker) and result.row.role != staff.KnownWorkerRole(role):
                     return replace(result, row=staff.set_worker_role(result.row.id, staff.KnownWorkerRole(role)))
                 return result
@@ -1323,7 +1432,8 @@ def unpublished_cleanup_text(result: UnpublishedWorker) -> str:
 def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, policy: LaunchPolicy,
                   account: ConfiguredWorkerAccount | DestinationWorkerAccount | accounts.AccountSelection,
                   allowed: worker_admission.WorkerStartAllowed, lock: WorkerLockHold,
-                  codex: herdr.CodexConversations | herdr.CodexLaunchRead, *, keep_model: bool) -> WorkerStart:
+                  codex: herdr.CodexConversations | herdr.CodexLaunchRead,
+                  paths: EnrolledPaths | OrdinaryWorkerOwner, *, keep_model: bool) -> WorkerStart:
     started = time.monotonic()
     try:
         settings = conf.read("direct")
@@ -1344,6 +1454,16 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         lock.bind(row)
     if isinstance(current, (ProcessUnknownWorker, UncertainWorker)):
         return current
+    if isinstance(paths, EnrolledPaths):
+        try:
+            if isinstance(current, OpenWorker):
+                require_review_process(client, current.pane, paths)
+            elif row is not None and isinstance(backend, staff.CodexBackend):
+                retained = pane_record.publication_for_session(row.current_session, record=record)
+                if retained is not None and not _codex_read_only(retained.entry.get("codex_policy", [])):
+                    return AdmissionRefused("the retained Codex worker launch does not prove read-only access")
+        except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+            return AdmissionRefused(str(error))
     if current is None:
         pane = _interrupted_pane(owner, name.value, evidence, client)
         if isinstance(pane, (StartRefused, UncertainWorker, ProcessUnknownWorker)):
@@ -1362,6 +1482,11 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
             except (worker_admission.AdmissionRefused, herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 return ProcessUnknownWorker(owner, identity, _text(pane, "terminal_id"), str(error))
             if not isinstance(activity, herdr.PaneAtShell):
+                if isinstance(paths, EnrolledPaths):
+                    try:
+                        require_review_process(client, identity, paths)
+                    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                        return AdmissionRefused(str(error))
                 try:
                     native = (_codex_start_session(client, identity, pane_row=pane) if policy.settings.kind == "codex" else
                               client.native_session(identity, policy.settings.kind, herdr.PROGRAM_TIMEOUT_SECONDS, pane_row=pane))
@@ -1434,11 +1559,12 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     launch_home = (staff.SessionHome(Path(environment["CODEX_HOME"]))
                    if policy.settings.kind == "codex" else staff.HomeUnknown())
     environment["UNIT_TEAM_ROLE"] = name.value
-    if owner.kind == "unit":
+    if owner.kind == "unit" or isinstance(paths, EnrolledPaths):
         environment["UNIT_RUN_DIR"] = str(allowed.run)
     if temporary := os.environ.get("TMPDIR"):
         environment["TMPDIR"] = temporary
-    directory = owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd()
+    directory = (paths.main if isinstance(paths, EnrolledPaths)
+                 else owner.worktree.path if isinstance(owner.worktree, staff.PresentWorktree) else Path.cwd())
     prepared = herdr.prepare_session_environment(str(row.current_session) if row is not None and not switching else "", str(directory), environment,
                                                frozenset({"STAFF_ID"}))
     if isinstance(prepared, nix_env.Refused):
