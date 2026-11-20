@@ -2374,7 +2374,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         record = self.record(row)
         record.update(status="finished", exit_code=143, self_stop=True, stop_pass_requested=True,
                       stop_reason="The check is obsolete.", pane_dispatch_id="earlier-pass",
-                      delivery="deferred: worker is stopped")
+                      delivery="deferred: worker is stopped", completion_pending=True)
         path = Path(record["log"]).with_suffix(".json")
         write_text_atomic(path, json.dumps(record))
 
