@@ -155,13 +155,16 @@ def _write_state(path: Path, state: ReviewState) -> None:
     write_text_atomic(path, json.dumps(record), new_file_mode=0o600)
 
 
-def _idle(active_at: float, at: float) -> bool:
-    return at - active_at >= conf.read("send").number("review_hold_idle_minutes") * 60
+def _enabled(settings: conf.ConfigRead) -> bool:
+    value = settings.origin("review_hold", str)
+    return isinstance(value, conf.UsableLiveValue) and value.value == "on"
 
 
-def _hold_open(count: Path, state: ReviewState, at: float) -> bool:
+def _hold_open(count: Path, state: ReviewState, at: float, settings: conf.ConfigRead) -> bool:
     activity = state.last_activity
-    return not isinstance(activity, EndedReview) and _read_count(count) > 0 and not _idle(activity, at)
+    if isinstance(activity, EndedReview) or not _read_count(count):
+        return False
+    return _enabled(settings) and at - activity < settings.number("review_hold_idle_minutes") * 60
 
 
 def keep_native_message(session: str, message: ReviewMessage) -> bool:
@@ -172,8 +175,11 @@ def keep_native_message(session: str, message: ReviewMessage) -> bool:
     if not (count.exists() or path.exists()):
         return False
     with _locked(path):
+        settings = conf.read("send")
+        if not _enabled(settings):
+            return False
         state = _read_state(count, path)
-        if not _hold_open(count, state, message.sent):
+        if not _hold_open(count, state, message.sent, settings):
             return False
         OpenReview(path, state).keep(message)
         return True
@@ -276,7 +282,9 @@ def set_count(session: str, remaining: int, at: float, emit: Callable[[str], Non
         with _locked(path):
             state = _read_state(count, path)
             if remaining > 0:
-                if item_count(session) == 0:
+                if not _enabled(conf.read("send")):
+                    _write_state(path, replace(state, last_activity=EndedReview.HOLD_ENDED))
+                elif item_count(session) == 0:
                     _write_state(path, replace(state, last_activity=_last_prompt(path, at), release_pending=False))
                 elif not path.exists():
                     _write_state(path, state)
@@ -299,7 +307,7 @@ def record_user_prompt(session: str, at: float, emit: Callable[[str], None], *,
             state = _read_state(count, path)
             previous = state.last_activity
             if not isinstance(previous, EndedReview):
-                if _hold_open(count, state, at):
+                if _hold_open(count, state, at, conf.read("send")):
                     state = replace(state, last_activity=max(previous, at))
                     _write_state(path, state)
                 else:
@@ -310,6 +318,16 @@ def record_user_prompt(session: str, at: float, emit: Callable[[str], None], *,
 
 
 def deliver_at_session_start(session: str, emit: Callable[[str], None], *, record_keys: RecordReleasedKeys) -> None:
+    _deliver_saved(session, datetime.now(timezone.utc).timestamp(), emit, record_keys)
+
+
+def deliver_if_disabled(session: str, at: float, emit: Callable[[str], None], *,
+                        record_keys: RecordReleasedKeys) -> None:
+    if not _enabled(conf.read("send")):
+        _deliver_saved(session, at, emit, record_keys)
+
+
+def _deliver_saved(session: str, at: float, emit: Callable[[str], None], record_keys: RecordReleasedKeys) -> None:
     count = _count_file(session)
     path = _state_file(count)
     if not path.exists():
@@ -320,7 +338,7 @@ def deliver_at_session_start(session: str, emit: Callable[[str], None], *, recor
             if not (state.messages or state.reserved):
                 return
             held = _reserve(path, _end_review(path, state), delivery)
-        _emit_saved(count, path, held, datetime.now(timezone.utc).timestamp(), emit, record_keys)
+        _emit_saved(count, path, held, at, emit, record_keys)
 
 
 @contextmanager
@@ -346,28 +364,30 @@ def route(session: str, message: ReviewMessage, *, urgent: bool,
     path = _state_file(count)
     if count.exists() or path.exists():
         with ExitStack() as delivery:
+            held: tuple[ReviewMessage, ...] = ()
+            messages: tuple[ReviewMessage, ...] = ()
             with _locked(path):
-                state = _read_state(count, path)
-                if _hold_open(count, state, message.sent):
-                    if include_new and not urgent:
-                        saved = (*state.reserved, *state.messages)
-                        yield (AlreadyKeptForReview() if message.key and any(item.key == message.key for item in saved)
-                               else OpenReview(path, state))
-                        return
-                    held = (_reserve(path, state, delivery, key=message.key)
-                            if include_new and urgent and message.key else ())
-                    messages: tuple[ReviewMessage, ...] = ()
-                else:
-                    held = _reserve(path, _end_review(path, state), delivery)
-                    if not held:
-                        messages = ()
-                    elif not include_new:
-                        messages = held
-                    elif urgent:
-                        messages = (*[item for item in held if not message.key or item.key != message.key], message)
+                settings = conf.read("send")
+                if _enabled(settings):
+                    state = _read_state(count, path)
+                    if _hold_open(count, state, message.sent, settings):
+                        if include_new and not urgent:
+                            saved = (*state.reserved, *state.messages)
+                            yield (AlreadyKeptForReview() if message.key and any(item.key == message.key for item in saved)
+                                   else OpenReview(path, state))
+                            return
+                        if include_new and urgent and message.key:
+                            held = _reserve(path, state, delivery, key=message.key)
                     else:
-                        repeated = message.key and any(item.key == message.key for item in held)
-                        messages = held if repeated else (*held, message)
+                        held = _reserve(path, _end_review(path, state), delivery)
+                        if held:
+                            if not include_new:
+                                messages = held
+                            elif urgent:
+                                messages = (*[item for item in held if not message.key or item.key != message.key], message)
+                            else:
+                                repeated = message.key and any(item.key == message.key for item in held)
+                                messages = held if repeated else (*held, message)
             if held:
                 with _settle_release(count, path, ReleasedMessages(messages, held), record_keys) as batch:
                     yield batch

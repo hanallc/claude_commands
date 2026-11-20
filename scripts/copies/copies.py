@@ -2047,6 +2047,7 @@ def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Gene
     parent_lock.parent.mkdir(parents=True, exist_ok=True)
     with ExitStack() as leases:
         lease_files: list[TextIO] = []
+        check = "mirror lease"
         try:
             outside = leases.enter_context(parent_lock.open("a+"))
             lease_files.append(outside)
@@ -2058,15 +2059,16 @@ def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Gene
             lock = leases.enter_context(floor_claims.mirror_lock_path(tree).open("a+"))
             lease_files.append(lock)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            check = "mirror process check"
             busy = mirror_has_process(tree, scan_mirror_processes((tree,)))
         except (BlockingIOError, FileNotFoundError):
             busy = True
         if busy:
             try:
-                held = (tree / floor_claims.MIRROR_SESSION).read_text().strip()
+                held = (tree / floor_claims.MIRROR_SESSION).read_text().strip() or "unreadable"
             except OSError:
                 held = "unreadable"
-            raise CopyError(f"{tree}: busy; held by session {held}")
+            raise CopyError(f"{tree}: busy; held by session {held} ({check})")
         if create:
             tree.mkdir(parents=True, exist_ok=True)
             write_text_atomic(tree / floor_claims.MIRROR_SESSION, session + "\n")

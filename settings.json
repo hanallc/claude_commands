@@ -183,6 +183,7 @@
     "additionalDirectories": [
       "~/Library",
       "~/rust",
+      "~/worktrees",
       "/tmp",
       "/tmp/claude/",
       "~/.claude/projects",
@@ -480,6 +481,7 @@
         "~/Library/Application Support",
         "~/Library/Caches/Mozilla.sccache",
         "~/rust",
+        "~/worktrees",
         "/private/tmp",
         "/tmp"
       ]

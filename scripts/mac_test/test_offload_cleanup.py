@@ -56,7 +56,7 @@ from scripts.lib import conf_reads
 from scripts.lint import sweep
 
 # The Mac has no /proc. Use a private missing path on the test host.
-sweep.process_uses = partial(sweep.process_uses, proc=os.environ["CLEANUP_TEST_PROC"])
+sweep.sweep_workspace = partial(sweep.sweep_workspace, proc=os.environ["CLEANUP_TEST_PROC"])
 fixture = Path(os.environ["CLEANUP_TEST_DIR"])
 with StringIO() as output, conf_reads.record_reads(fixture / "trim-config-reads"):
     try:
@@ -80,6 +80,7 @@ def shell_environment(root: Path) -> dict[str, str]:
         "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
         "PYTHONPYCACHEPREFIX": os.environ.get("PYTHONPYCACHEPREFIX", str(root / "pycache")),
         "LINT_SWEEP_STATE_DIR": str(root / "sweep-state"),
+        "BUILDLOG_DIR": str(root / "buildlog"),
         "LINT_SWEEP_DOC_INDEX_MIB": DOC_INDEX_MIB,
         "USER_ZONE": "UTC",
     }

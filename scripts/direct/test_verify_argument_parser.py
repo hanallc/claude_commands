@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -22,6 +23,7 @@ printf '%s\\n' "$MAC_ONLY" "$MAC_REASON" "$LOCAL_ONLY" "$NO_CACHE" "$PINNED_TARG
             accepted = subprocess.run(
                 ["bash", "--noprofile", "--norc", "-c", script, "parser-test",
                  "--mac", "macOS graphics", "--no-cache", "sample", "exact test"],
+                env=verify_test_environment(),
                 cwd=directory, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
@@ -30,6 +32,7 @@ printf '%s\\n' "$MAC_ONLY" "$MAC_REASON" "$LOCAL_ONLY" "$NO_CACHE" "$PINNED_TARG
             self.assertEqual(accepted.stderr, "")
             refused = subprocess.run(
                 ["bash", "--noprofile", "--norc", "-c", script, "parser-test", "sample", "--mac"],
+                env=verify_test_environment(),
                 cwd=directory, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(refused.returncode, 2)

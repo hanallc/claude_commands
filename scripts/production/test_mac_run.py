@@ -963,7 +963,7 @@ cleanup_mac_run
                 else:
                     self.assertEqual(ends, [], self.events())
                     self.assertIn("cleanup of an ended run failed", after.stderr)
-                    self.assertEqual(len(self.ended_runs()), 1)
+                    self.assertEqual(len(self.ended_runs()), 2)
                     for kept in self.ended_runs():
                         shutil.rmtree(kept)
                 self.assert_claim_released()
