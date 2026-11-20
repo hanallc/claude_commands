@@ -263,3 +263,24 @@
 **Workers:** 2 writers. impl8: lib, production and build_queue files (hub: cancellation.py). impl5: aws_target files and their tests, after impl8 removes the helpers (same branch; impl5 starts from impl8's first commit).
 
 **Acceptance gate:** basedpyright zero errors and zero warnings on each changed file; git diff --check. After the test hold lifts: each changed module 20 times under load, then the full merge gate.
+
+### Phase 394 — the review page test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** review_links/test_review_page.py uses half its gate CPU (rank 2: 97.1 CPU s median, 130 tests, 107.9 s wall; slowest test 18.7 s, a Firefox check) with every assertion kept.
+- **Spec:**
+  1. Test hold: read the code and write the change now. Measure after natemerge releases units: module_cost.py (`--tests 20 --commands 20`) on base f5eb6c184 and on the result, fresh TMPDIR, bytecode on.
+  2. Cut the cost at its cause: repeated Firefox starts, page renders, server starts, Git calls and process starts become one shared fixture where tests only read it; fixed waits become events the test drives.
+  3. Change review page production code only when the same cost also hits production runs.
+  4. Tests read no /tune-changeable value; pin each config value the fixture reads. The shared Firefox window minimum (500 px) stays.
+  5. If the floor is above half, report the floor and an architecture proposal.
+- **Files:** `scripts/review_links/test_review_page.py` and its test support; review page production files only for a production cause.
+- **Workers:** 1 writer. One test module.
+  - impl: test_review_page.py and its support.
+- **Constraints from prior phases:** AWS account blocked: measure locally. No test or profile makes load on purpose. Phase 350 pinned List and status fixture settings in review_links tests; keep its pins.
+- **Acceptance gate:**
+  1. Local module_cost.py CPU at most half of the base.
+  2. 20 repeated runs pass, TMPDIR=/tmp, 2 GB scope.
+  3. basedpyright zero errors and warnings on changed files.
+  4. Full natedev gate passes (reds that also occur on base do not count).
