@@ -299,6 +299,21 @@ subprocess.run = fail_log_put
             with self.subTest(mode=mode):
                 self.production_boot_stubs(('transient result upload',), mode=mode, wire=False)
 
+    def test_candidate_runs_the_gate_manifest_or_discovers_the_full_suite(self) -> None:
+        one = 'scripts/fixture/test_one.py'
+        two = 'scripts/fixture/test_two.py'
+        cases: tuple[tuple[str, dict[str, object], tuple[str, ...]], ...] = (
+            ('affected', {'modules': [one], 'selection': 'affected', 'selection_reason': 'fixture base'}, (one,)),
+            ('full', {'modules': [one, two], 'selection': 'full', 'selection_reason': 'fixture full'}, (one, two)),
+            ('old controller', {'modules': [one, two]}, (one, two)),
+            ('omitted', {}, (one, two)),
+            ('empty', {'modules': [], 'selection': 'affected'}, ()),
+        )
+        for name, manifest, paths in cases:
+            with self.subTest(name=name):
+                self.production_boot_stubs(('',), manifest=manifest, expected_paths=paths)
+        self.production_boot_stubs(('invalid modules',), manifest={'modules': [one, one]})
+
     def test_candidate_without_entry_point_publishes_named_refusal(self) -> None:
         self.production_boot_stubs(('',), candidate_change='missing')
 
@@ -316,7 +331,9 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
         self.assertEqual(reply.returncode, 0, reply.stdout + reply.stderr)
 
     def production_boot_stubs(self, failures: tuple[str, ...], *, candidate_change: str = '',
-                              mode: gate.SuiteMode = gate.SuiteMode.GATE, wire: bool = True) -> None:
+                              mode: gate.SuiteMode = gate.SuiteMode.GATE, wire: bool = True,
+                              manifest: dict[str, object] | None = None,
+                              expected_paths: tuple[str, ...] | None = None) -> None:
         stages = ['boot', 'tool preparation', 'tools ready', 'bwrap ready', 'tools checked',
                   'source ready', 'tests start', 'result upload']
         boot_errors = {
@@ -337,7 +354,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                 (root / 'home').mkdir()
                 if failure == 'boot error write':
                     (box / 'boot-error.json').mkdir(parents=True)
-                for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'scripts/lib', 'config'):
+                for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'scripts/lib', 'scripts/fixture', 'config'):
                     folder = repo / name
                     folder.mkdir(parents=True, exist_ok=True)
                     if name != 'config':
@@ -346,24 +363,39 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                 _ = (library / 'py').write_text('#!/bin/sh\nexec python3 "$@"\n')
                 self.assertFalse((library / 'python_startup/sitecustomize.py').exists())
                 _ = (library / 'cancellation.py').write_bytes((ROOT / 'scripts/lib/cancellation.py').read_bytes())
+                for name in ('test_one.py', 'test_two.py'):
+                    _ = (repo / 'scripts/fixture' / name).write_text(f'assert __file__.endswith({name!r})\n')
                 _ = (repo / 'scripts/production/merge_gate.py').write_text(
-                    'from __future__ import annotations\nfrom types import SimpleNamespace\nfrom enum import Enum\nfrom typing import override\nimport os\n'
+                    'from __future__ import annotations\nfrom types import SimpleNamespace\nfrom enum import Enum\n'
+                    + 'from typing import override\nimport os\nimport runpy\n'
                     + inspect.getsource(gate.SuiteMode)
-                    + 'WholeMachine = lambda times: times\nSelectedModules = tuple\n'
+                    + 'WholeMachine = lambda times: times\nSelectedModules = tuple\nALL_MODULES = object()\n'
                     + 'gate_record = SimpleNamespace(GateTimeLimit=lambda seconds: seconds, NoGateTimeLimit=lambda reason: reason)\n'
-                    + 'def run_suites(*args, **kwargs):\n'
+                    + 'def run_suites(repo, **kwargs):\n'
                     + '    if os.environ["FAIL_STAGE"] == "tests start": raise RuntimeError("fixture tests start failure")\n'
                     + '    with open(os.environ["FIXTURE"] + "/received-limit", "w") as output: output.write(str(kwargs["time_limit"]))\n'
                     + '    with open(os.environ["FIXTURE"] + "/received-mode", "w") as output: output.write(kwargs["mode"].value)\n'
-                    + '    return SimpleNamespace(passed=True, jobs=(), seconds=1, peak_memory_mib=0)\n')
+                    + '''    paths = kwargs["selected"]
+    if paths is ALL_MODULES:
+        paths = sorted(path.relative_to(repo).as_posix() for path in repo.glob("scripts/fixture/test_*.py"))
+    jobs = []
+    for path in paths:
+        runpy.run_path(str(repo / path))
+        _, suite, module = path.split("/", 2)
+        jobs.append(SimpleNamespace(suite=suite, module=module, times={}, returncode=0, seconds=1, killed_for=""))
+    return SimpleNamespace(passed=True, jobs=jobs, seconds=1, peak_memory_mib=0)
+''')
                 _ = (repo / 'scripts/aws_target/gate_box.py').write_text(
-                    'import json\nfrom pathlib import Path\nfrom typing import cast\n'
+                    'import json\nfrom pathlib import Path\nfrom typing import Literal, cast\n'
                     + f'GUEST_TRANSFERS = {gate_box.GUEST_TRANSFERS!r}\n'
                     + f'PAIRED_GUEST = {gate_box.PAIRED_GUEST!r}\n'
                     + f'CANDIDATE_GUEST = {gate_box.CANDIDATE_GUEST!r}\n'
+                    + inspect.getsource(gate_box.request_modules)
+                    + inspect.getsource(gate_box.request_selection)
+                    + inspect.getsource(gate_box.selection_fields)
                     + inspect.getsource(gate_box.run_guest)
                     + '\ndef encode_run(run): return {"passed": run.passed}\n'
-                    + 'def completion_record(*args): return {"kind": "gate_run"}\n')
+                    + 'def completion_record(*args, request): return {"kind": "gate_run", **selection_fields(request, "cloud gate")}\n')
                 if candidate_change == 'rename':
                     for relative in ('scripts/aws_target/gate_box.py', 'scripts/production/merge_gate.py'):
                         path = repo / relative
@@ -386,9 +418,10 @@ def run_guest(root, links, result):
                 _ = (root / 'source.py').write_text(gate_box.GUEST)
                 request_mode = mode.wire if wire else mode.value
                 _ = (root / 'request.json').write_text(json.dumps({
-                    'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': [],
+                    'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40,
                     'mode': request_mode,
-                    'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py']}))
+                    'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py'],
+                    **({'modules': []} if manifest is None else manifest)}))
                 stub = '#!' + sys.executable + '\n' + r'''import json, os, pathlib, shutil, signal, subprocess, sys
 from urllib.parse import urlsplit
 root = pathlib.Path(os.environ['FIXTURE'])
@@ -547,6 +580,8 @@ else:
                 passed = failure in ('', 'final log upload', 'shell log signal', 'transient result upload')
                 expected_error = not passed or candidate_change in ('missing', 'old transfer')
                 self.assertEqual(results[-1]['verdict'], 'error' if expected_error else 'pass', log)
+                if failure == 'invalid modules':
+                    self.assertFalse((root / 'received-mode').exists())
                 if candidate_change == 'old transfer':
                     error = ledger.text(results[-1], 'error')
                     self.assertIn('CalledProcessError', error)
@@ -622,6 +657,14 @@ else:
                                          [links['result']])
                     self.assertIn('fetch ' + links['commit'], trace)
                     record = ledger.mapping(results[-1]['record'])
+                    if expected_paths is not None:
+                        self.assertEqual(tuple('scripts/' + ledger.text(job, 'module')
+                                               for job in ledger.rows(result, 'modules')), expected_paths)
+                        assert manifest is not None
+                        self.assertEqual(record['selection'], manifest.get('selection', 'full'))
+                        self.assertEqual(record['reason'], manifest.get('selection_reason', 'cloud gate'))
+                        self.assertEqual(record.get('modules_selected'),
+                                         len(expected_paths) if 'modules' in manifest else None)
                     self.assertEqual(record['head'], 'e' * 40)
                     self.assertTrue(record['dirty'])
                     self.assertEqual(record['dirty_paths'], ['scripts/fixture/test_one.py'])
@@ -647,7 +690,11 @@ else:
         decoded = gate_box.decode_run(encoded)
         self.assertEqual(decoded.executions, decoded.jobs)
         self.assertTrue(decoded.passed)
-        record = gate_box.completion_record(run, "attempt", "commit", "tree", "remote-host", 9, 15, "gate")
+        record = gate_box.completion_record(run, "attempt", "commit", "tree", "remote-host", 9, 15, "gate",
+            request={'mode': 'merge-gate', 'modules': ['scripts/fixture/test_one.py'], 'selection': 'affected',
+                     'selection_reason': 'fixture base'})
+        self.assertEqual((record['step'], record['selection'], record['reason'], record['modules_selected']),
+                         ('gate', 'affected', 'fixture base', 1))
         module, = ledger.rows(record, "modules")
         self.assertEqual(module["content_reads"], ["scripts/fixture/data.json"])
         self.assertEqual(module["folder_scans"], ["scripts/fixture"])

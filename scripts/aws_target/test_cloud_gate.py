@@ -200,7 +200,8 @@ class CloudGateTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "BUILDLOG_DIR": str(self.root / "buildlog"), "GATE_STATE_DIR": str(self.root / "gate-state")})))
         override_fixture_settings(self.root / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
         override_fixture_settings(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
@@ -229,12 +230,16 @@ class CloudGateTests(CostFixture):
 
     def test_time_limit_returns_red_with_traceback_and_ends_the_box(self) -> None:
         import sqlite3
+        modules = ['scripts/fixture/test_ok.py', 'scripts/fixture/nested/test_busy.py', 'scripts/fixture/test_pending.py']
         _ = index.update()
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
-                VALUES ('normal', '2026-01-01', 'gate', 32, 32, 0, 0, 'full', 7, 1)""").close()
-        modules = ['scripts/fixture/test_ok.py', 'scripts/fixture/nested/test_busy.py']
+                VALUES ('normal', '2026-01-01', 'gate', 32, 32, 0, 0, 'full', 7, 3)""").close()
+            connection.executemany("""INSERT INTO gate_modules
+                (run_id, suite, module, status, restart, wall_s, attempt)
+                VALUES ('normal', 'fixture', ?, 0, '', 6, 1)""",
+                [(path.removeprefix('scripts/fixture/'),) for path in modules]).close()
         log = ('Runner: 2 modules, whole machine, 32 CPUs\n'
                'Starting module: fixture/test_ok.py\n'
                '--- fixture/test_ok.py exit=1 ---\n'
@@ -248,7 +253,9 @@ class CloudGateTests(CostFixture):
             with self.subTest(attempt=attempt):
                 folder = self.root / attempt
                 folder.mkdir()
-                request = {**self.request, 'attempt': attempt, 'modules': modules, 'source_key': ''}
+                affected = attempt == 'list-timeout'
+                request = {**self.request, 'attempt': attempt, 'modules': modules, 'source_key': '',
+                           'selection': 'affected' if affected else 'full', 'selection_reason': 'fixture selection'}
                 cloud_gate.save(folder / 'request.json', request)
                 fake = FakeGateAws()
                 fake.has_result = False
@@ -319,12 +326,19 @@ class CloudGateTests(CostFixture):
                 cloud_gate.validate_result(row, request)
                 run = gate_box.decode_run(row['gate'])
                 self.assertFalse(run.passed)
-                self.assertIn('limit 14 s; elapsed 15.000 s; running modules: fixture/nested/test_busy.py', run.time_limit_report)
+                self.assertIn(f'limit {12 if affected else 14} s; elapsed 15.000 s; running modules: fixture/nested/test_busy.py',
+                              run.time_limit_report)
                 self.assertIn('Traceback (most recent call last):\nAssertionError: fixture red', run.time_limit_report)
                 self.assertIn('fixture/test_ok.py', run.time_limit_report)
                 self.assertEqual(run.jobs[0].returncode, 1)
                 self.assertEqual(run.jobs[1].returncode, 124)
-                self.assertEqual(ledger.mapping(row['record'])['vcpus'], 32)
+                self.assertEqual(run.jobs[2].returncode, 124)
+                record = ledger.mapping(row['record'])
+                self.assertEqual(record['vcpus'], 32)
+                self.assertEqual((record['selection'], record['reason'], record['modules_selected']),
+                                 (request['selection'], 'fixture selection', 3))
+                self.assertEqual([module['module'] for module in ledger.rows(record, 'modules')],
+                                 ['test_ok.py', 'nested/test_busy.py'])
 
     def test_finished_result_wins_when_polling_crosses_the_time_limit(self) -> None:
         import sqlite3
@@ -2117,12 +2131,12 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
 
     def test_remote_red_never_calls_the_local_runner(self) -> None:
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)
-        for mode, full in ((gate.SuiteMode.GATE, False), (gate.SuiteMode.TARGETED, True)):
-            with (self.subTest(mode=mode, full=full),
+        for mode in gate.SuiteMode:
+            with (self.subTest(mode=mode),
                   mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.CloudCompleted(remote)) as run,
                   mock.patch.object(gate, 'select_affected', side_effect=AssertionError('The full suite needs no selection')),
                   mock.patch.object(gate, 'run_suites') as local):
-                self.assertEqual(gate.run_gate_suites(self.root, mode=mode, full=full), remote)
+                self.assertEqual(gate.run_gate_suites(self.root, mode=mode, full=True), remote)
             local.assert_not_called()
             self.assertIsInstance(cast(object, run.call_args.kwargs['selected']), gate.AllModules)
 
@@ -2663,7 +2677,8 @@ class CloudRouteTests(CostFixture):
         self.modules = [('fixture', path) for path in sorted(folder.glob('test_*.py'))]
         _ = self.enterContext(mock.patch.object(cloud_gate, 'discover_test_modules', return_value=self.modules))
         _ = self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state))
-        self.admission = caller_admission(self, self.root, {'BUILDLOG_DIR': str(self.root / 'buildlog')})
+        self.admission = caller_admission(self, self.root, {
+            'BUILDLOG_DIR': str(self.root / 'buildlog'), 'GATE_STATE_DIR': str(self.root / 'gate-state')})
 
     def test_old_checkout_modes_reach_the_box(self) -> None:
         runner = self.repo / 'scripts/production/gate.py'
@@ -3003,6 +3018,7 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(request['source_key'], '')
         self.assertFalse((folder / 'source.bundle').exists())
         self.assertEqual(request['modules'], ['scripts/fixture/test_one.py', 'scripts/fixture/test_two.py'])
+        self.assertEqual(request['selection'], 'full')
 
     def test_bundle_contains_only_the_commit_ahead_of_main(self) -> None:
         base = gate.checked_git(self.repo, 'rev-parse', 'refs/remotes/origin/main')
@@ -3335,6 +3351,8 @@ class CloudRouteTests(CostFixture):
         root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
         folder = root / 'legacy-attempt'
         request = cloud_gate.prepare(self.repo, folder, mode, 1800)
+        del request['selection']
+        cloud_gate.save(folder / 'request.json', request)
         cloud_gate.save(root / 'current.json', {'attempt': folder.name, 'tree': request['tree'], 'commit': request['head'],
             'mode': mode.value, 'full': False, 'module_time_limit_s': 1800, 'modules': 'all', 'selection_tree': 'all'})
         cloud_gate.save(folder / 'launch.json', {'instance': 'i-fixture', 'region': 'us-east-2',
@@ -3529,6 +3547,15 @@ class CloudRouteTests(CostFixture):
         selected = gate.TreeSelection(paths, tree)
         _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                            module_time_limit_s=1800, service=service, selected=selected)
+        for reason in ('first base', 'first base', 'second base'):
+            _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False, module_time_limit_s=1800,
+                               service=service, selected=selected, selection_reason=reason)
+        first, repeated, second = folders[-3:]
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, second)
+        request = cloud_gate.read(second / 'request.json')
+        self.assertEqual((request['selection'], request['selection_reason'], request['modules']),
+                         ('affected', 'second base', list(paths)))
         stale = gate.TreeSelection(paths, gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         with self.subTest(selection='different tree with a saved request'):
             count = len(folders)
@@ -3898,10 +3925,11 @@ class CloudRouteTests(CostFixture):
             return 0
         run = cloud_gate.run
         def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
-                  selected: gate.AllModules | gate.TreeSelection, gate_job: StepJob | GateJobNotRecorded
+                  selected: gate.AllModules | gate.TreeSelection, gate_job: StepJob | GateJobNotRecorded,
+                  selection_reason: str | None = None,
                   ) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
             return run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                       selected=selected, gate_job=gate_job, service=service)
+                       selected=selected, gate_job=gate_job, service=service, selection_reason=selection_reason)
         def local(repo: Path, *_args: object, **_kwargs: object) -> gate.GateRun:
             self.assertTrue(self.admission.callers_released())
             with gate.gate_reservation(repo, self.root, gate.BuildHoldWait(), mode=gate.SuiteMode.TARGETED) as place:

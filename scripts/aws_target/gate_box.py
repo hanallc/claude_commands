@@ -355,19 +355,22 @@ try:
         cpu_started = busy_cpu_seconds()
         result['gate_started_at'] = time.time()
         if links.get('production'):
+            selected = (merge_gate.ALL_MODULES if module_paths is None
+                        else merge_gate.SelectedModules(module_paths))
             gate = merge_gate.run_suites(repo, full=gate_request.get('full', False), machine=merge_gate.WholeMachine(timings),
                                         time_limit=(merge_gate.gate_record.GateTimeLimit(float(links['gate_time_limit_s']))
                                                     if float(links.get('gate_time_limit_s', 0)) > 0 else
                                                     merge_gate.gate_record.NoGateTimeLimit('no passing history on the controller')),
                                         module_time_limit_s=links['module_time_limit_s'],
-                                        selected=merge_gate.SelectedModules(tuple(gate_request['modules'])),
+                                        selected=selected,
                                         mode=merge_gate.SuiteMode(links['mode']))
         else:
             gate = merge_gate.run_suites(repo, full=True, machine=merge_gate.WholeMachine(timings),
                                         module_time_limit_s=links['module_time_limit_s'])
         if links.get('production'):
             result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
-                                                 result['gate_started_at'], time.time(), merge_gate.SuiteMode.step(links['mode']))
+                                                 result['gate_started_at'], time.time(), merge_gate.SuiteMode.step(links['mode']),
+                                                 request=gate_request)
             dirty = gate_request['dirty_paths']
             result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
                                     dirty_path_count=len(dirty))
@@ -433,6 +436,7 @@ def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -
             process_memory_mib=merge_gate.process_memory_mib)
         exec('import json, os, subprocess, sys, time, traceback\n' + PAIRED_GUEST, namespace)
         return
+    namespace['module_paths'] = request_modules(request)
     exec(CANDIDATE_GUEST, namespace)
 
 
@@ -844,7 +848,8 @@ def execution_records(value: GateRun, *, observed_only: bool = False) -> list[ga
 
 
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
-                      started: float, ended: float, mode: str) -> dict[str, object]:
+                      started: float, ended: float, mode: str, *,
+                      request: dict[str, object] | None = None, observed_only: bool = False) -> dict[str, object]:
     """Return an explicit buildlog record with the remote host identity."""
     from scripts.test_times import gate_record
     from datetime import UTC
@@ -853,15 +858,17 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     import os
     if not isinstance(value, GateRun):
         raise TypeError('expected a completed gate')
-    modules = gate_record.module_runs(execution_records(value), gate_record.slow_test_s())
+    modules = gate_record.module_runs(execution_records(value, observed_only=observed_only), gate_record.slow_test_s())
+    default_reason = 'time limit' if value.time_limit_report else 'cloud gate'
+    metadata = (selection_fields(request, default_reason) if request is not None else
+                {'selection': 'affected' if mode == 'test-affected' else 'full', 'reason': default_reason})
     suites = [{'suite': suite, 'wall_s': max((job.seconds for job in value.jobs if job.suite == suite), default=0),
                'status': int(any(job.returncode for job in value.jobs if job.suite == suite))}
               for suite in sorted({job.suite for job in value.jobs})]
     return {'kind': 'gate_run', 'v': record.RECORD_VERSION, 'id': 'gate-' + attempt, 'host': host,
             'started_at': datetime.fromtimestamp(started, UTC).isoformat(),
             'ended_at': datetime.fromtimestamp(ended, UTC).isoformat(), 'wall_s': value.seconds,
-            'hold_wait_s': 0, 'selection': 'affected' if mode == 'test-affected' else 'full',
-            'reason': 'time limit' if value.time_limit_report else 'cloud gate',
+            'hold_wait_s': 0, **metadata,
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',
             'branch': 'HEAD', 'sha': commit, 'tree': tree, 'source': store.CLOUD_GATE_SOURCE, 'step': mode,

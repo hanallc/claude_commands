@@ -740,9 +740,14 @@ class GateWorker:
                 prefix = 'artifacts/' + ledger.text(request, 'attempt')
                 links = {key: ledger.text(request, key) for key in ('attempt', 'commit', 'tree', 'mode', 'origin')}
                 vcpus = int(size.split('.')[1].removesuffix('xlarge')) * 4
-                budget = (gate_record.NoGateTimeLimit('paired trial') if request.get('task') == 'paired'
-                          else gate.read_time_limit(vcpus, cast(list[str], request['modules']), vcpus,
-                              gate.SuiteMode(str(request['mode'])) is gate.SuiteMode.TARGETED and not request.get('full', False)))
+                if request.get('task') == 'paired':
+                    budget = gate_record.NoGateTimeLimit('paired trial')
+                else:
+                    paths = gate_box.request_modules(request)
+                    if paths is None:
+                        raise ValueError('The controller request lacks an expected module list')
+                    budget = gate.read_time_limit(vcpus, paths, vcpus,
+                                                  gate_box.request_selection(request) == 'affected')
                 seconds = budget.seconds if isinstance(budget, gate_record.GateTimeLimit) else 0.0
                 links['gate_time_limit_s'] = str(seconds)
                 credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
@@ -1030,7 +1035,10 @@ def time_limit_result(request: dict[str, object], text: str, elapsed: float,
     report = (f"time limit: limit {limit:g} s; elapsed {elapsed:.3f} s; "
               f"running modules: {', '.join(running) or '(none)'}")
     jobs: list[gate.GateJobResult] = []
-    for path in cast(list[str], request['modules']):
+    paths = gate_box.request_modules(request)
+    if paths is None:
+        raise ValueError('The controller request lacks an expected module list')
+    for path in paths:
         name = path.removeprefix('scripts/')
         suite, module = name.split('/', 1)
         status, seconds = completed.get(name, (124, elapsed if name in started else 0.0))
@@ -1045,7 +1053,8 @@ def time_limit_result(request: dict[str, object], text: str, elapsed: float,
     now = time.time()
     record = gate_box.completion_record(run, ledger.text(request, 'attempt'), ledger.text(request, 'commit'),
                                         ledger.text(request, 'tree'), store.host_name(), now - elapsed, now,
-                                        gate.SuiteMode.step(ledger.text(request, 'mode')))
+                                        gate.SuiteMode.step(ledger.text(request, 'mode')), request=request,
+                                        observed_only=True)
     record['vcpus'] = vcpus
     record['max_jobs'] = vcpus
     return {'attempt': request['attempt'], 'commit': request['commit'], 'tree': request['tree'],
@@ -1194,20 +1203,27 @@ def working_tree(repo: Path) -> tuple[str, set[str]]:
         return tree.stdout.strip(), dirty
 
 
+def expected_paths(repo: Path, selected: gate.AllModules | gate.TreeSelection) -> list[str]:
+    """Read the paths for the request from the candidate checkout."""
+    modules = [path.relative_to(repo).as_posix() for _, path in discover_test_modules(repo)]
+    if isinstance(selected, gate.TreeSelection):
+        paths = set(selected.paths)
+        if not paths <= set(modules):
+            raise GateRefused('selected modules are absent from the tested tree')
+        return [path for path in modules if path in paths]
+    return modules
+
+
 def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
             selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
+            selection_reason: str | None = None,
             gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> dict[str, object]:
     head = gate.checked_git(repo, 'rev-parse', 'HEAD')
     tree, dirty = working_tree(repo)
     if isinstance(selected, gate.TreeSelection) and tree != selected.tree:
         raise GateRefused('The checkout changed after the test selection')
+    modules = expected_paths(repo, selected)
     commit = gate.checked_git(repo, 'commit-tree', tree, '-p', head, '-m', 'Cloud gate snapshot') if dirty else head
-    modules = discover_test_modules(repo)
-    if isinstance(selected, gate.TreeSelection):
-        paths = set(selected.paths)
-        if not paths <= {str(path.relative_to(repo)) for _, path in modules}:
-            raise GateRefused('selected modules are absent from the tested tree')
-        modules = [(suite, path) for suite, path in modules if str(path.relative_to(repo)) in paths]
     origin_main = gate.checked_git(repo, 'rev-parse', 'refs/remotes/origin/main')
     origin = gate.checked_git(repo, 'remote', 'get-url', 'origin')
     from urllib.parse import urlsplit
@@ -1226,9 +1242,12 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
         source_key = 'source/' + digest + '.bundle'
     request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'head': head, 'tree': tree, 'dirty_paths': sorted(dirty), 'origin': origin,
         'origin_main': origin_main, 'clone_url': settings().text('clone_url'),
-        'mode': mode.wire, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': source_key,
+        'mode': mode.wire, 'modules': modules, 'source_key': source_key,
+        'selection': 'affected' if isinstance(selected, gate.TreeSelection) else 'full',
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
         'module_time_limit_s': min(limit, settings().number('module_time_limit_s'))}
+    if selection_reason is not None:
+        request['selection_reason'] = selection_reason
     if isinstance(gate_job, StepJob):
         request['gate_job'] = snapshot_codec.snapshot_value(gate_job)
     save(folder / 'request.json', request)
@@ -1261,13 +1280,14 @@ def accepts_suite_mode(repo: Path, commit: str, mode: gate.SuiteMode) -> bool:
 
 def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
         selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
+        selection_reason: str | None = None,
         gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
         service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command)) -> LocalFallback | CloudCompleted:
     # Record the final fallback here so worker replies and service errors produce one row.
     attempt = CloudAttempt(target_config.ssh_target_state_directory('aws'), mode, gate_job=gate_job)
     try:
         outcome = run_cloud(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                            selected=selected, service=service, attempt=attempt)
+                            selected=selected, selection_reason=selection_reason, service=service, attempt=attempt)
     except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError,
             GateRefused, affected_modules.GraphError) as error:
         outcome = LocalFallback(str(error))
@@ -1285,9 +1305,25 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
     return outcome
 
 
+def read_saved_request(repo: Path, folder: Path, identity: dict[str, object],
+                       selected: gate.AllModules | gate.TreeSelection) -> dict[str, object]:
+    """Check that a saved request uses the same tree and selection."""
+    request = read(folder / 'request.json')
+    if (request.get('tree') != identity['tree'] or request.get('head') != identity['commit']
+            or request.setdefault('attempt', folder.name) != folder.name
+            or gate.SuiteMode.step(ledger.text(request, 'mode')) != gate.SuiteMode.step(ledger.text(identity, 'mode'))
+            or request.get('full', identity['full']) != identity['full']
+            or gate_box.request_selection(request) != identity['selection']
+            or request.get('selection_reason') != identity['selection_reason']
+            or gate_box.request_modules(request) != tuple(expected_paths(repo, selected))):
+        raise ValueError('The saved request differs from the current cloud attempt')
+    return request
+
+
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
-              selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
+              selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
+              selection_reason: str | None = None) -> LocalFallback | CloudCompleted:
     switch = launch_switch(settings())
     if isinstance(switch, InvalidCloudGateSwitch):
         return LocalFallback(switch.reason)
@@ -1303,21 +1339,26 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             return LocalFallback('image or stack is absent')
         tree, _dirty = working_tree(repo)
         previous = read(current) if current.exists() else {}
+        if full:
+            selected = gate.ALL_MODULES
+        if isinstance(selected, gate.TreeSelection) and selected.tree != tree:
+            raise GateRefused('The checkout changed after the test selection')
         identity: dict[str, object] = {'tree': tree, 'commit': gate.checked_git(repo, 'rev-parse', 'HEAD'),
                                       'mode': mode.wire, 'full': full, 'module_time_limit_s': module_time_limit_s,
                                       'modules': list(selected.paths) if isinstance(selected, gate.TreeSelection) else 'all',
-                                      'selection_tree': selected.tree if isinstance(selected, gate.TreeSelection) else 'all'}
-        same_request = all(previous.get(key) == value for key, value in identity.items())
+                                      'selection_tree': selected.tree if isinstance(selected, gate.TreeSelection) else 'all',
+                                      'selection': 'affected' if isinstance(selected, gate.TreeSelection) else 'full',
+                                      'selection_reason': selection_reason}
+        previous_identity = {**previous, 'selection': gate_box.request_selection(previous),
+                             'mode': gate.SuiteMode.step(str(previous.get('mode', '')))}
+        same_request = all(previous_identity.get(key) == value for key, value in
+                           (identity | {'mode': mode.value}).items())
         folder = root / ledger.text(previous, 'attempt') if same_request else root / uuid4().hex
         result_path = folder / 'outcome.json'
         saved_result = read(result_path) if result_path.exists() else {}
         if same_request and saved_result.get('status') == 'complete' and not _outcome_imported(folder):
             try:
-                request = read(folder / 'request.json')
-                saved_attempt = request.setdefault('attempt', folder.name)
-                if (request.get('tree') != identity['tree'] or request.get('head') != identity['commit']
-                        or saved_attempt != folder.name):
-                    raise ValueError('The saved request differs from the current cloud attempt')
+                request = read_saved_request(repo, folder, identity, selected)
                 row = outcome_result(folder, saved_result)
             except (OSError, ValueError, KeyError, TypeError):
                 pass
@@ -1386,9 +1427,10 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     command = service_command('scripts.aws_target.cloud_gate',
                         ['--worker', str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
                          '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
-                    request = (read(folder / 'request.json') if (folder / 'request.json').exists()
+                    request = (read_saved_request(repo, folder, identity, selected) if (folder / 'request.json').exists()
                                else prepare(repo, folder, mode, module_time_limit_s,
-                                            selected=selected, gate_job=attempt.gate_job))
+                                            selected=selected, selection_reason=selection_reason,
+                                            gate_job=attempt.gate_job))
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
                         raise GateRefused('The checkout changed between cloud attempts')
                     if not accepts_suite_mode(repo, ledger.text(request, 'commit'), mode):
@@ -1525,10 +1567,11 @@ def main() -> int:
 
 def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
           selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
+          selection_reason: str | None = None,
           gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> gate.GateRun | str:
     """Return a completed gate or the reason for local fallback."""
     outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                  selected=selected, gate_job=gate_job)
+                  selected=selected, selection_reason=selection_reason, gate_job=gate_job)
     return outcome.reason if isinstance(outcome, LocalFallback) else outcome.run
 
 
