@@ -3216,6 +3216,13 @@ Tests (after the hold): a copy of a copy of a copy has alternates only to the ro
 
 Tests: one row each in the existing removal tests, each failing first.
 
+### Phase 44dl — A bare copy keeps every store its objects link passes through  · status: todo
+**From the 44dk review (pass 1), 2026-11-19:** the builds landing rule moves this gap out of 44dk. After 44dk merges.
+
+1. 44dk protects only the final target of a bare copy's `objects` symbolic link (`objects.resolve()`, scratch.py:1093). When the link passes through another managed copy, removal can delete that intermediate copy and break the bare copy. `owned_workspaces` also misses that order (copies.py:1728). Fix: storage includes each managed path the link chain passes through.
+
+Tests: one row in the existing bare copy removal test, failing first.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
