@@ -759,7 +759,7 @@ class StatusTests(IsolatedBuildTargetTest):
 class EligibleCommandTests(IsolatedBuildTargetTest):
     def test_cli_prints_every_target_in_config_order_with_resolved_settings(self) -> None:
         config = self.write_config(
-            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            "enabled.mac=on\ntargets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
         )
         for settings, local, reason in (("linux_only.hana=\n", [], "-"),

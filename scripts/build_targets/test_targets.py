@@ -346,7 +346,7 @@ class EligibilityTests(IsolatedTargetTest):
         alternate = self.root / "alternate.conf"
         _ = write_config_fixture(alternate, "linux_only.hana=hana\n", template="mac_test")
         config = self.write_config(
-            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            "enabled.mac=on\ntargets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=alternate.conf\n"
         )
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
