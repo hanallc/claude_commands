@@ -111,10 +111,12 @@ After this change reaches the installed scripts:
 
 Later reads run through the existing timer.
 `GateGpuTrialScalerPolicy` allows `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota` in every candidate region.
+It also allows `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` for only the Standard Spot and the G and VT Spot quotas.
+That permission reads the quota increase requests and their status; the snapshot does not use it yet.
 The deployed stack gets this policy only from `~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources`.
 Until the user runs that command, each hourly read logs the refused read and sends the `aws.snapshot_failed` alert.
 The command reads prices and quotas at its end; `aws_page.py publish` then shows them at once.
-The snapshot makes only these two read calls.
+The snapshot makes only two read calls: `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
 It does not use Cost Explorer or create resources.
 
 `prices` reads deployed-region configuration and candidate-region configuration without duplicates.
