@@ -2,20 +2,23 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from enum import StrEnum
-import fcntl
+from enum import Enum, StrEnum
 from hashlib import sha256
 import json
 import math
 import os
 import re
+from threading import Thread
 from types import MappingProxyType
 from typing import Callable, Literal, NotRequired, TypedDict, assert_never, cast
 from zoneinfo import ZoneInfo
 
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 
@@ -30,7 +33,8 @@ from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse, store
 from scripts.lib import conf
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import sync_folder
+from scripts.lib import process_start
 from scripts.lib.proc_text import read_proc_text
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
@@ -48,7 +52,7 @@ class PlacementWaitReason(StrEnum):
     HOLD = "hold"
     REMOTE_START = "remote_start"
     AWS_REFUSAL_RETRY = "aws_refusal_retry"
-    LOCAL_SETUP = "local_setup"
+    HANA_RECOVERY = "hana_recovery"
 
 
 @dataclass(frozen=True)
@@ -63,34 +67,117 @@ NO_PLACEMENT_WAIT = NoPlacementWait()
 class PlacementWaitKey:
     call_id: str
     episode: str
+    attempt: str = ""
 
 
 @dataclass(frozen=True)
 class OpenPlacementWait:
     episode: str
-    reason: str
+    reason: PlacementWaitReason
     started_at: float
+    interval_id: str
+    attempt: str = ""
 
 
 class PlacementWaitRow(TypedDict):
     kind: Literal["placement_wait_s"]
+    interval_id: str
     call_id: str
     placement_episode: str
-    reason: str
+    reason: PlacementWaitReason
     started_at: float
     ended_at: float
     placement_wait_s: float
 
 
 @dataclass(frozen=True)
-class PlacementWaitHistory:
-    rows: tuple[PlacementWaitRow, ...] = ()
-    active: OpenPlacementWait | NoPlacementWait = field(default_factory=NoPlacementWait)
-    finished: bool = False
+class PlacementWaitOwner:
+    pid: int
+    start_time: str
+
+
+@dataclass(frozen=True)
+class UntrackedWaitOwner:
+    """The transition does not change the owner of the call."""
+
+
+UNTRACKED_WAIT_OWNER = UntrackedWaitOwner()
+
+
+class PlacementWaitAction(StrEnum):
+    REGISTER = "register"
+    CONTINUE = "continue"
+    ROUTING_IF_IDLE = "routing_if_idle"
+    CHANGE = "change"
+    CLOSE = "close"
+    CLOSE_ATTEMPT = "close_attempt"
+    COMMAND = "command"
+    STARTED_ATTEMPT = "started_attempt"
+    FINISH = "finish"
+    FINISH_CONTINUED = "finish_continued"
+
+
+WAIT_ACTION_ORDER = {action: position for position, action in enumerate(PlacementWaitAction)}
+
+
+@dataclass(frozen=True)
+class PlacementWaitTransition:
+    episode: str
+    action: PlacementWaitAction
+    reason: PlacementWaitReason | NoPlacementWait
+    only: PlacementWaitReason | NoPlacementWait
+    at: float
+    interval_id: str
+    observed_at: float
+    attempt: str = ""
+
+
+@dataclass(frozen=True)
+class PreparationTimeUnrecorded:
+    """The journal lacks a call start or a preparation end."""
+
+
+@dataclass(frozen=True)
+class CallPreparation:
+    started_at: float
+    ended_at: float
+
+
+@dataclass(frozen=True)
+class PlacementWaitJournal:
+    rows: tuple[PlacementWaitRow, ...]
+    preparation: CallPreparation | PreparationTimeUnrecorded
+
+
+@dataclass(frozen=True)
+class OwnerLastSeen:
+    at: float
+
+
+class OwnerObservationNotRecorded(Enum):
+    MISSING = "missing"
+
+
+class OrphanWaitEnd(Enum):
+    LAST_RECORD = "last_record"
+
+
+@dataclass(frozen=True)
+class WaitOwnerStillTracked:
+    """The owner is live or its identity is unknown."""
+
+
+WAIT_OWNER_STILL_TRACKED = WaitOwnerStillTracked()
+WAIT_RECORD_SEPARATOR = b"\x1e"
 
 
 def _placement_wait_path(root: Path, call_id: str) -> Path:
-    return root / "placement-waits" / (sha256(call_id.encode()).hexdigest() + ".json")
+    return root / "placement-waits" / sha256(call_id.encode()).hexdigest()
+
+
+def _placement_wait_owner_path(path: Path, *, continued: bool = False) -> Path:
+    suffix = ".continued.owner" if continued else ".owner"
+    return path.parent / "active" / path.with_suffix(suffix).name
 
 
 def verify_run_call_id(pid: int, start_time: str) -> str:
@@ -98,89 +185,446 @@ def verify_run_call_id(pid: int, start_time: str) -> str:
     return f"v-run-{pid}-{start_time}"
 
 
-def _read_placement_wait_history(path: Path) -> PlacementWaitHistory:
+def _wait_number(value: object) -> float:
+    return cast(float, snapshot_codec.parse_snapshot_value(value, float))
+
+
+def _wait_text(value: object) -> str:
+    return cast(str, snapshot_codec.parse_snapshot_value(value, str))
+
+
+def _wait_object(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("invalid placement wait record")
+    return cast(dict[str, object], value)
+
+
+def _read_wait_object(data: bytes) -> dict[str, object]:
+    return _wait_object(cast(object, json.loads(data)))
+
+
+def _wait_interval_id(episode: str, reason: PlacementWaitReason, started_at: float) -> str:
+    identity = json.dumps((episode, reason, float(started_at).hex()), separators=(",", ":"))
+    return sha256(identity.encode()).hexdigest()
+
+
+def _decode_open_wait(value: object) -> OpenPlacementWait | NoPlacementWait:
+    if value is None:
+        return NO_PLACEMENT_WAIT
+    fields = _wait_object(value)
+    if fields.get("kind") == "NoPlacementWait" or fields.get("reason") == "local_setup":
+        return NO_PLACEMENT_WAIT
+    episode = _wait_text(fields["episode"])
+    reason = PlacementWaitReason(_wait_text(fields["reason"]))
+    started_at = _wait_number(fields["started_at"])
+    interval_id = _wait_text(fields["interval_id"]) if "interval_id" in fields else _wait_interval_id(episode, reason, started_at)
+    return OpenPlacementWait(episode, reason, started_at, interval_id)
+
+
+def _decode_wait_row(call_id: str, value: object) -> PlacementWaitRow:
+    fields = _wait_object(value)
+    episode = _wait_text(fields["placement_episode"])
+    reason = PlacementWaitReason(_wait_text(fields["reason"]))
+    started_at = _wait_number(fields["started_at"])
+    interval_id = _wait_text(fields["interval_id"]) if "interval_id" in fields else _wait_interval_id(episode, reason, started_at)
+    return {"kind": "placement_wait_s", "call_id": call_id, "interval_id": interval_id,
+            "placement_episode": episode, "reason": reason, "started_at": started_at,
+            "ended_at": _wait_number(fields["ended_at"]), "placement_wait_s": _wait_number(fields["placement_wait_s"])}
+
+
+def _transition_order(event: PlacementWaitTransition) -> tuple[float, int, str]:
+    return event.at, WAIT_ACTION_ORDER[event.action], event.interval_id
+
+
+def _decode_transition(fields: dict[str, object]) -> PlacementWaitTransition:
+    reason = fields["reason"]
+    action_name = _wait_text(fields["action"])
+    action = PlacementWaitAction.REGISTER if action_name == "setup" else PlacementWaitAction(action_name)
+    only = fields.get("only", reason if action is PlacementWaitAction.CLOSE else None)
+    return PlacementWaitTransition(_wait_text(fields["episode"]), action,
+        PlacementWaitReason(_wait_text(reason)) if reason not in (None, "local_setup") else NO_PLACEMENT_WAIT,
+        PlacementWaitReason(_wait_text(only)) if only not in (None, "local_setup") else NO_PLACEMENT_WAIT,
+        _wait_number(fields["at"]), _wait_text(fields["interval_id"]), _wait_number(fields["observed_at"]),
+        _wait_text(fields.get("attempt", "")))
+
+
+def _close_wait(call_id: str, active: OpenPlacementWait, at: float) -> PlacementWaitRow:
+    return {"kind": "placement_wait_s", "call_id": call_id, "interval_id": active.interval_id,
+            "placement_episode": active.episode, "reason": active.reason, "started_at": active.started_at,
+            "ended_at": at, "placement_wait_s": at - active.started_at}
+
+
+def _wait_rows_order(row: PlacementWaitRow) -> tuple[float, float, str]:
+    return row["started_at"], row["ended_at"], row["interval_id"]
+
+
+def _read_placement_wait_journal(call_id: str) -> PlacementWaitJournal:
+    path = _placement_wait_path(store.root(), call_id)
+    rows: dict[str, PlacementWaitRow] = {}
+    events: dict[str, PlacementWaitTransition] = {}
+    active: OpenPlacementWait | NoPlacementWait = NO_PLACEMENT_WAIT
+    last_recorded_at = 0.0
+    started_at = math.inf
+    command_at = math.inf
+    finished_at = math.inf
+    finished = False
+    orphan_ends: dict[bool, OwnerLastSeen | OrphanWaitEnd] = {}
+    diagnosed = False
+
+    def note(error: Exception) -> None:
+        nonlocal diagnosed
+        if not diagnosed:
+            print(f"buildlog: invalid placement wait for {call_id}: {error}", file=sys.stderr)
+            diagnosed = True
+
+    def add_legacy(value: object) -> None:
+        nonlocal last_recorded_at, started_at
+        fields = _wait_object(value)
+        if fields["reason"] == "local_setup":
+            started_at = min(started_at, _wait_number(fields["started_at"]))
+            last_recorded_at = max(last_recorded_at, _wait_number(fields["ended_at"]))
+        else:
+            row = _decode_wait_row(call_id, fields)
+            add(row)
+            last_recorded_at = max(last_recorded_at, row["ended_at"])
+
+    def add(row: PlacementWaitRow) -> None:
+        saved = rows.get(row["interval_id"])
+        if saved is None or _wait_rows_order(row) < _wait_rows_order(saved):
+            rows[row["interval_id"]] = row
+
     try:
-        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        older = _read_wait_object(path.with_suffix(".json").read_bytes())
+        active = _decode_open_wait(older["active"])
+        finished = older["finished"] is True
+        if isinstance(active, OpenPlacementWait):
+            last_recorded_at = active.started_at
+        for value in cast(list[object], older["rows"]):
+            try:
+                add_legacy(value)
+            except (ValueError, TypeError, KeyError) as error:
+                note(error)
     except FileNotFoundError:
-        return PlacementWaitHistory()
-    return cast(PlacementWaitHistory, snapshot_codec.parse_snapshot_value(value, PlacementWaitHistory))
+        pass
+    except (ValueError, TypeError, KeyError) as error:
+        note(error)
+
+    try:
+        with path.with_suffix(".jsonl").open("rb") as stream:
+            legacy_snapshot = (last_recorded_at, finished, b"")
+            for line in stream:
+                if not line.endswith(b"\n") or line == b"\n":
+                    continue
+                # A frame starts after any torn append. The newline commits the frame.
+                data = line.rsplit(WAIT_RECORD_SEPARATOR, 1)[-1]
+                try:
+                    value = _read_wait_object(data)
+                    if value.get("kind") == "transition":
+                        event = _decode_transition(value)
+                        saved = events.get(event.interval_id)
+                        if saved is None or event.observed_at > saved.observed_at:
+                            events[event.interval_id] = event
+                    elif value.get("kind") == "orphan":
+                        detached = value.get("continued") is True
+                        seen = value["last_seen_at"]
+                        if seen is not None:
+                            end = OwnerLastSeen(_wait_number(seen))
+                            previous = orphan_ends.get(detached)
+                            if not isinstance(previous, OwnerLastSeen) or end.at > previous.at:
+                                orphan_ends[detached] = end
+                        else:
+                            _ = orphan_ends.setdefault(detached, OrphanWaitEnd.LAST_RECORD)
+                    else:
+                        snapshot_order = (_wait_number(value["at"]), value["finished"] is True, data)
+                        legacy_active = _decode_open_wait(value["active"])
+                        if "closed" in value:
+                            add_legacy(value["closed"])
+                        if snapshot_order > legacy_snapshot:
+                            legacy_snapshot = snapshot_order
+                            snapshot_at, finished, _ = snapshot_order
+                            last_recorded_at = max(last_recorded_at, snapshot_at)
+                            active = legacy_active
+                except (ValueError, TypeError, KeyError) as error:
+                    note(error)
+    except FileNotFoundError:
+        pass
+
+    legacy_at = last_recorded_at
+    if finished:
+        finished_at = legacy_at
+    closed_attempts: set[tuple[str, str]] = set()
+    late_attempts: set[tuple[str, str]] = set()
+    continued = any(event.action in (PlacementWaitAction.CONTINUE, PlacementWaitAction.FINISH_CONTINUED)
+                    for event in events.values())
+    for event in sorted(events.values(), key=_transition_order):
+        if event.action in (PlacementWaitAction.REGISTER, PlacementWaitAction.CONTINUE):
+            started_at = min(started_at, event.at)
+            last_recorded_at = max(last_recorded_at, event.observed_at)
+            continue
+        if event.action is PlacementWaitAction.FINISH and continued:
+            continue
+        if event.at < legacy_at:
+            continue
+        attempt = (event.episode, event.attempt)
+        closes_attempt = event.action in (PlacementWaitAction.CLOSE_ATTEMPT, PlacementWaitAction.STARTED_ATTEMPT)
+        if attempt in closed_attempts:
+            if not closes_attempt and attempt not in late_attempts:
+                identity = f"{call_id}/{event.episode}/{event.attempt}"
+                print(f"buildlog: ignored placement wait after attempt close for {identity}", file=sys.stderr)
+                late_attempts.add(attempt)
+            continue
+        if finished:
+            continue
+        if closes_attempt:
+            closed_attempts.add(attempt)
+
+        last_recorded_at = max(last_recorded_at, event.observed_at)
+        if event.action in (PlacementWaitAction.COMMAND, PlacementWaitAction.STARTED_ATTEMPT):
+            command_at = min(command_at, event.at)
+        if isinstance(event.only, PlacementWaitReason) and (
+                not isinstance(active, OpenPlacementWait) or active.reason is not event.only):
+            continue
+        if event.action is PlacementWaitAction.ROUTING_IF_IDLE and isinstance(active, OpenPlacementWait):
+            continue
+        if closes_attempt or event.action is PlacementWaitAction.CLOSE:
+            if not isinstance(active, OpenPlacementWait) or active.episode != event.episode:
+                continue
+            if active.attempt != event.attempt and (not closes_attempt or active.attempt):
+                continue
+        if isinstance(active, OpenPlacementWait):
+            if active.episode == event.episode and active.reason is event.reason:
+                if active.attempt == event.attempt:
+                    continue
+                if not active.attempt:
+                    active = replace(active, attempt=event.attempt)
+                    continue
+            add(_close_wait(call_id, active, event.at))
+        active = NO_PLACEMENT_WAIT
+        if event.action in (PlacementWaitAction.FINISH, PlacementWaitAction.FINISH_CONTINUED):
+            finished = True
+            finished_at = event.at
+        elif isinstance(event.reason, PlacementWaitReason):
+            active = OpenPlacementWait(event.episode, event.reason, event.at, event.interval_id, event.attempt)
+
+    orphan_end = orphan_ends.get(continued)
+    if not finished and orphan_end is not None:
+        finished_at = orphan_end.at if isinstance(orphan_end, OwnerLastSeen) else last_recorded_at
+        if math.isfinite(command_at):
+            finished_at = max(finished_at, command_at)
+        if isinstance(active, OpenPlacementWait):
+            add(_close_wait(call_id, active, max(finished_at, active.started_at)))
+    ended_at = min(command_at, finished_at)
+    preparation = (CallPreparation(started_at, max(started_at, ended_at))
+                   if math.isfinite(started_at) and math.isfinite(ended_at) else PreparationTimeUnrecorded())
+    return PlacementWaitJournal(tuple(sorted(rows.values(), key=_wait_rows_order)), preparation)
 
 
 def read_placement_waits(call_id: str) -> tuple[PlacementWaitRow, ...]:
-    """Read the elapsed intervals for one call in time order."""
-    return _read_placement_wait_history(_placement_wait_path(store.root(), call_id)).rows
+    """Read complete named waits in time order."""
+    return _read_placement_wait_journal(call_id).rows
 
 
-def placement_step_start(root: Path, key: PlacementWaitKey, request_since: float) -> float:
-    """Read the journal start without changing the waiter's queue age."""
-    try:
-        history = _read_placement_wait_history(_placement_wait_path(root, key.call_id))
-    except (OSError, ValueError, TypeError, KeyError):
-        return request_since
-    for row in history.rows:
-        if row["placement_episode"] == key.episode:
-            return row["started_at"]
-    active = history.active
-    return active.started_at if isinstance(active, OpenPlacementWait) and active.episode == key.episode else request_since
+def placement_wait_totals(call_id: str) -> dict[str, float]:
+    """Report the named waits and remaining time before the first command."""
+    journal = _read_placement_wait_journal(call_id)
+    totals: dict[str, float] = {}
+    preparation = journal.preparation
+    if isinstance(preparation, PreparationTimeUnrecorded):
+        for row in journal.rows:
+            reason = row["reason"]
+            totals[reason] = totals.get(reason, 0.0) + row["placement_wait_s"]
+        return totals
+
+    cursor = preparation.started_at
+    for row in journal.rows:
+        started = max(cursor, row["started_at"])
+        ended = min(preparation.ended_at, row["ended_at"])
+        if ended > started:
+            reason = row["reason"]
+            totals[reason] = totals.get(reason, 0.0) + (ended - started)
+            cursor = ended
+    totals["local_setup"] = (preparation.ended_at - preparation.started_at) - sum(totals.values())
+    return totals
 
 
-def _update_placement_wait(key: PlacementWaitKey, reason: PlacementWaitReason | NoPlacementWait,
-                           at: float, root: Path, *, finished: bool = False, if_idle: bool = False,
-                           only: PlacementWaitReason | NoPlacementWait = NO_PLACEMENT_WAIT) -> None:
-    """Close and open intervals in one atomic change."""
-    path = _placement_wait_path(root, key.call_id)
-    if (isinstance(reason, NoPlacementWait) or isinstance(only, PlacementWaitReason)) and not path.exists():
-        return
+def _append_wait_event(path: Path, value: dict[str, object], *, durable: bool = False) -> None:
+    data = WAIT_RECORD_SEPARATOR + json.dumps(value, separators=(",", ":"), allow_nan=False).encode() + b"\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    descriptor = os.open(path.with_suffix(".jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        history = _read_placement_wait_history(path)
-        active = history.active
-        if history.finished or (if_idle and isinstance(active, OpenPlacementWait)) or (isinstance(only, PlacementWaitReason)
-                and (isinstance(active, NoPlacementWait) or active.reason != only.value)):
-            return
-        rows = history.rows
-        if isinstance(active, OpenPlacementWait):
-            if key.episode == active.episode and active.reason == reason:
-                return
-            if at < active.started_at or (isinstance(reason, NoPlacementWait) and not finished
-                    and key.episode != active.episode):
-                return
-            if at > active.started_at:
-                row: PlacementWaitRow = {"kind": "placement_wait_s", "call_id": key.call_id,
-                    "placement_episode": active.episode, "reason": active.reason,
-                    "started_at": active.started_at, "ended_at": at, "placement_wait_s": at - active.started_at}
-                rows = (*rows, row)
-        elif isinstance(reason, NoPlacementWait) and not finished:
-            return
-        if rows:
-            at = max(at, rows[-1]["ended_at"])
-        next_wait = OpenPlacementWait(key.episode, reason.value, at) if isinstance(reason, PlacementWaitReason) else reason
-        updated = PlacementWaitHistory(rows, next_wait, finished)
-        write_text_atomic(path, json.dumps(snapshot_codec.snapshot_value(updated), separators=(",", ":")) + "\n")
+        if os.write(descriptor, data) != len(data):
+            raise OSError("short placement wait write")
+        if durable:
+            os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    if durable:
+        sync_folder(path.parent)
+        sync_folder(path.parent.parent)
+
+
+def _record_wait_transition(path: Path, episode: str, action: PlacementWaitAction,
+                            reason: PlacementWaitReason | NoPlacementWait, at: float, observed_at: float,
+                            *, only: PlacementWaitReason | NoPlacementWait = NO_PLACEMENT_WAIT,
+                            attempt: str = "", durable: bool = False) -> None:
+    cause = reason if isinstance(reason, PlacementWaitReason) else None
+    required = only if isinstance(only, PlacementWaitReason) else None
+    identity = json.dumps((episode, attempt, action, cause, required, float(at).hex()), separators=(",", ":"))
+    interval_id = sha256(identity.encode()).hexdigest()
+    _append_wait_event(path, {"kind": "transition", "episode": episode, "action": action, "reason": cause,
+                              "only": required, "at": at, "observed_at": observed_at, "interval_id": interval_id,
+                              "attempt": attempt}, durable=durable)
+
+
+def append_placement_wait(key: PlacementWaitKey, reason: PlacementWaitReason | NoPlacementWait,
+                          at: float, *, root: Path, begin_routing: bool = False,
+                          only: PlacementWaitReason | NoPlacementWait = NO_PLACEMENT_WAIT,
+                          command_started: bool = False) -> None:
+    """Append a wait transition and report write errors to the caller."""
+    if not key.call_id:
+        return
+    action = PlacementWaitAction.CHANGE
+    if isinstance(reason, NoPlacementWait):
+        if command_started:
+            action = PlacementWaitAction.STARTED_ATTEMPT
+        else:
+            action = PlacementWaitAction.CLOSE_ATTEMPT if key.attempt else PlacementWaitAction.CLOSE
+    elif begin_routing:
+        action = PlacementWaitAction.ROUTING_IF_IDLE
+    _record_wait_transition(_placement_wait_path(root, key.call_id), key.episode, action, reason, at, at,
+                            only=only, attempt=key.attempt)
 
 
 def record_placement_wait(key: PlacementWaitKey, reason: PlacementWaitReason | NoPlacementWait,
-                          at: float, *, root: Path | None = None, if_idle: bool = False,
+                          at: float, *, root: Path | None = None, begin_routing: bool = False,
                           only: PlacementWaitReason | NoPlacementWait = NO_PLACEMENT_WAIT) -> None:
-    """Record the transition for one episode."""
+    """Record a wait transition at the time it occurs."""
     if not key.call_id:
         return
     try:
-        _update_placement_wait(key, reason, at, store.root() if root is None else root, only=only, if_idle=if_idle)
-    except (OSError, ValueError, TypeError, KeyError) as error:
+        append_placement_wait(key, reason, at, root=store.root() if root is None else root,
+                              begin_routing=begin_routing, only=only)
+    except (OSError, ValueError) as error:
         print(f"buildlog: cannot record placement wait for {key.call_id}: {error}", file=sys.stderr)
 
 
-def finish_placement_waits(call_id: str, at: float) -> None:
-    """Close the last wait at the end of the call."""
+def register_placement_waits(call_id: str, owner: PlacementWaitOwner | UntrackedWaitOwner,
+                          started_at: float, *, entered_at: float,
+                          owner_seen: OwnerLastSeen | OwnerObservationNotRecorded = OwnerObservationNotRecorded.MISSING,
+                          continued: bool = False) -> None:
+    """Record the original start or transfer the call to its detached owner."""
+    path = _placement_wait_path(store.root(), call_id)
     try:
-        _update_placement_wait(PlacementWaitKey(call_id, ""), NoPlacementWait(), at, store.root(), finished=True)
-    except (OSError, ValueError, TypeError, KeyError) as error:
+        if isinstance(owner, PlacementWaitOwner):
+            owner_path = _placement_wait_owner_path(path, continued=continued)
+            owner_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", dir=owner_path.parent, prefix=f".wait-owner.{os.getpid()}.",
+                                             suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                try:
+                    _ = stream.write(json.dumps({"call_id": call_id, "pid": owner.pid, "start_time": owner.start_time,
+                        "seen_at": owner_seen.at if isinstance(owner_seen, OwnerLastSeen) else None}))
+                    stream.close()
+                    os.replace(temporary, owner_path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        action = PlacementWaitAction.CONTINUE if continued else PlacementWaitAction.REGISTER
+        _record_wait_transition(path, "", action, NO_PLACEMENT_WAIT, started_at, entered_at)
+    except (OSError, ValueError) as error:
+        print(f"buildlog: cannot start placement waits for {call_id}: {error}", file=sys.stderr)
+
+
+def stamp_verify_command(call_id: str, at: float, observed_at: float) -> None:
+    """Try to write the start of a command that ran."""
+    try:
+        path = _placement_wait_path(store.root(), call_id)
+        _record_wait_transition(path, "", PlacementWaitAction.COMMAND, NO_PLACEMENT_WAIT, at, observed_at, durable=True)
+    except (OSError, ValueError) as error:
+        with suppress(OSError, ValueError):
+            message = f"buildlog: cannot record command start for {call_id}: {error}\n"
+            _ = os.write(sys.stderr.fileno(), message.encode(errors="replace"))
+
+
+def record_started_verify_command(call_id: str, pid: int) -> None:
+    """Read the start time before reaping the child and write it in a daemon thread."""
+    observed_at = time.time()
+    at = observed_at
+    if hasattr(time, "CLOCK_BOOTTIME"):
+        identity = process_start.process_start(pid)
+        if not isinstance(identity, (process_start.Started, process_start.Zombie)):
+            return
+        try:
+            uptime = time.clock_gettime(time.CLOCK_BOOTTIME)
+            at = observed_at - uptime + int(identity.start) / os.sysconf("SC_CLK_TCK")
+        except (OSError, ValueError):
+            return
+    with suppress(RuntimeError):
+        Thread(target=stamp_verify_command, args=(call_id, at, observed_at), daemon=True).start()
+
+
+def finish_placement_waits(call_id: str, at: float, *, continued: bool = False) -> None:
+    """Record the time the call ends."""
+    try:
+        path = _placement_wait_path(store.root(), call_id)
+        action = PlacementWaitAction.FINISH_CONTINUED if continued else PlacementWaitAction.FINISH
+        _record_wait_transition(path, "", action, NO_PLACEMENT_WAIT, at, at)
+        _placement_wait_owner_path(path, continued=continued).unlink(missing_ok=True)
+        if continued:
+            _placement_wait_owner_path(path).unlink(missing_ok=True)
+    except (OSError, ValueError) as error:
         print(f"buildlog: cannot finish placement waits for {call_id}: {error}", file=sys.stderr)
+
+
+def _read_wait_owner(path: Path) -> tuple[str, PlacementWaitOwner, OwnerLastSeen | OwnerObservationNotRecorded]:
+    value = _read_wait_object(path.read_bytes())
+    seen = value.get("seen_at")
+    return _wait_text(value["call_id"]), PlacementWaitOwner(
+        cast(int, snapshot_codec.parse_snapshot_value(value["pid"], int)), _wait_text(value["start_time"])), (
+        OwnerLastSeen(_wait_number(seen)) if seen is not None else OwnerObservationNotRecorded.MISSING)
+
+
+def _remove_orphaned_owner_temps(directory: Path) -> None:
+    for path in directory.glob(".wait-owner.*.tmp"):
+        match = re.fullmatch(r"\.wait-owner\.([1-9][0-9]*)\.[^.]+\.tmp", path.name)
+        if match is None:
+            continue
+        try:
+            try:
+                os.kill(int(match[1]), 0)
+            except ProcessLookupError:
+                path.unlink(missing_ok=True)
+        except (OSError, OverflowError):
+            continue
+
+
+def close_orphaned_placement_waits(root: Path,
+                                  observe: Callable[[PlacementWaitOwner, OwnerLastSeen | OwnerObservationNotRecorded],
+                                      OwnerLastSeen | OrphanWaitEnd | WaitOwnerStillTracked]) -> set[PlacementWaitOwner]:
+    """Observe each registered owner and record the end of each orphan."""
+    owners: set[PlacementWaitOwner] = set()
+    directory = root / "placement-waits/active"
+    _remove_orphaned_owner_temps(directory)
+    for path in directory.glob("*.owner"):
+        try:
+            call_id, owner, registered = _read_wait_owner(path)
+            journal = _placement_wait_path(root, call_id)
+            continued = path == _placement_wait_owner_path(journal, continued=True)
+            if not continued and _placement_wait_owner_path(journal, continued=True).exists():
+                path.unlink(missing_ok=True)
+                continue
+            owners.add(owner)
+            end = observe(owner, registered)
+            if not isinstance(end, WaitOwnerStillTracked):
+                at = end.at if isinstance(end, OwnerLastSeen) else None
+                identity = json.dumps((owner.pid, owner.start_time, at), separators=(",", ":"))
+                _append_wait_event(journal, {"kind": "orphan", "last_seen_at": at, "continued": continued,
+                    "interval_id": sha256(identity.encode()).hexdigest()})
+                path.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            print(f"buildlog: cannot check placement wait at {path}: {error}", file=sys.stderr)
+    return owners
 
 
 @dataclass(frozen=True)
@@ -482,7 +926,13 @@ class NoTestWidth:
 
 TestWidth = RequestedTestWidth | UnspecifiedTestWidth | NoTestWidth
 
-Call = CallRecord | NoCallRecord
+@dataclass(frozen=True)
+class StepCallRecord(CallRecord):
+    """The verify step has its own journal start."""
+    step_started_at: float
+
+
+Call = CallRecord | StepCallRecord | NoCallRecord
 
 
 @dataclass(frozen=True)

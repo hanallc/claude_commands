@@ -221,6 +221,16 @@
 
 set -euo pipefail
 
+verify_wait_time() {
+    local now=""
+    if [[ -x /usr/bin/perl ]]; then
+        now="$(/usr/bin/perl -MTime::HiRes=time -e 'printf "%.6f", time' 2>/dev/null)" || now=""
+    fi
+    printf '%s\n' "${now:-$(date +%s)}"
+}
+
+VERIFY_ENTRY_AT="${EPOCHREALTIME:-$(verify_wait_time)}"
+
 usage() {
     sed -n '/^# Usage:$/,/^# End usage\./{
         /^# End usage\./d
@@ -520,7 +530,121 @@ if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final && " ${VERIFY_QUERY_ARGS[*]} " == *" 
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
     exec "$PY" "$VERIFY_START_DIR/final_pass.py" query "$VERIFY_START_DIR/verify.sh" "$SAVED_TREE"
 fi
-export VERIFY_SETUP_STARTED="${VERIFY_SETUP_STARTED:-${EPOCHREALTIME:-$(date +%s)}}"
+BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
+source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
+build_override_refusal "${BASH_SOURCE[0]}" direct/verify.sh || exit 2
+launch_verify_wait_recorder() {
+    (
+        local log
+        if [[ -n "${UNIT_DETACHED_RECORD:-}" ]]; then
+            log="${UNIT_DETACHED_RECORD%.json}.log"
+        else
+            local root="${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/verify-runs"
+            mkdir -p -- "$root" || exit 0
+            log="$root/${VERIFY_PLACEMENT_CALL_ID:-$BUILDLOG_CALL_ID}.log"
+        fi
+        exec >>"$log" 2>&1 <"$log"
+        exec "$VERIFY_START_DIR/../lib/py" -c '
+import subprocess
+import sys
+
+try:
+    subprocess.run([sys.executable, *sys.argv[1:]], timeout=10, check=False)
+except subprocess.TimeoutExpired:
+    print("verify.sh: wait recorder exceeded 10 seconds", file=sys.stderr)
+except OSError as error:
+    print(f"verify.sh: cannot start wait recorder: {error}", file=sys.stderr)
+' "$VERIFY_START_DIR/../build_queue/admission_client.py" "$@"
+    ) </dev/null >/dev/null 2>&1 9>&- 70>&- 71<&- 72>&- 73<&- &
+}
+
+transition_verify_wait() {
+    local call_id="${VERIFY_PLACEMENT_CALL_ID:-${BUILDLOG_CALL_ID:-}}"
+    [[ -n "$call_id" ]] || return 0
+    if [[ "$1" == register ]]; then
+        shift
+        launch_verify_wait_recorder placement-wait-start --call-id "$call_id" "$@"
+        return
+    fi
+    local reason=$1 episode="${2:-}" at="${3:-${EPOCHREALTIME:-$(verify_wait_time)}}" attempt="${4:-}" only=""
+    if [[ "$reason" == token-ready ]]; then reason=done only=slot; fi
+    local args=(--call-id "$call_id" --episode "$episode" --wait-reason "$reason" --wait-at "${at/,/.}")
+    [[ -z "$attempt" ]] || args+=(--attempt "$attempt")
+    [[ -z "$only" ]] || args+=(--wait-only "$only")
+    if [[ "$reason" == finish && "${VERIFY_WAIT_CONTINUED:-0}" == 1 ]]; then args+=(--continue-call); fi
+    launch_verify_wait_recorder placement-wait "${args[@]}"
+}
+
+finish_verify_waits() {
+    [[ -n "${VERIFY_PLACEMENT_CALL_ID:-}" && "${VERIFY_WAIT_HANDED_OFF:-0}" == 0 ]] || return 0
+    [[ "${BUILDLOG_FIRST_STEP_WAIT_CALL_ID:-}" != "$VERIFY_PLACEMENT_CALL_ID" ]] || return 0
+    transition_verify_wait finish "" "$1"
+}
+
+verify_exit() {
+    local ended_at="${VERIFY_EXIT_AT:-${EPOCHREALTIME:-$(verify_wait_time)}}"
+    set +e
+    finish_verify_waits "$ended_at"
+    [[ "${VERIFY_EXIT_CLEANED:-0}" == 0 ]] || return "$1"
+    EXIT_STATUS=$1
+    if [[ -n "${VERIFY_EXIT_CLEANUP:-}" ]]; then
+        "$VERIFY_EXIT_CLEANUP" "$2"
+    fi
+    if [[ -n "${FINAL_PASS_START:-}${VERIFY_EXIT_CLEANUP:-}" ]]; then
+        finish_verify_run "$EXIT_STATUS"
+    fi
+    exit "$EXIT_STATUS"
+}
+VERIFY_EXIT_CLEANUP=""
+VERIFY_EXIT_CLEANED=0
+VERIFY_EXIT_AT=""
+VERIFY_WAIT_HANDED_OFF=0
+trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
+
+if [[ -z "${VERIFY_NIX_ENV_REEXEC:-}" || -z "${VERIFY_PLACEMENT_CALL_ID:-}" ]]; then
+    verify_wait_owner=$$ verify_wait_start="" verify_copy_pid="${COPIES_RUN_PID:-0}"
+    VERIFY_WAIT_CONTINUED=0
+    VERIFY_WAIT_STARTED_AT="$VERIFY_ENTRY_AT"
+    verify_wait_transfer=()
+    if [[ -n "${UNIT_DETACHED_RUN:-}" && -n "${VERIFY_CONTINUED_CALL_ID:-}" ]]; then
+        VERIFY_PLACEMENT_CALL_ID=$VERIFY_CONTINUED_CALL_ID
+        VERIFY_WAIT_CONTINUED=1
+        VERIFY_WAIT_STARTED_AT="${VERIFY_CONTINUED_STARTED_AT:-$VERIFY_ENTRY_AT}"
+        verify_wait_transfer=(--continue-call --call-started "${VERIFY_WAIT_STARTED_AT/,/.}")
+        verify_copy_pid=0
+    elif [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}${BUILDLOG_PREPARED_COPY:-}${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}" &&
+            "${BUILDLOG_RUN:-}" =~ ^[0-9]+:[0-9]+$ ]]; then
+        VERIFY_PLACEMENT_CALL_ID="v-run-${BUILDLOG_RUN/:/-}"
+        verify_wait_owner="${BUILDLOG_RUN%%:*}"
+        verify_wait_start="${BUILDLOG_RUN#*:}"
+        if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+            verify_copy_pid="$verify_wait_owner"
+        fi
+    else
+        VERIFY_PLACEMENT_CALL_ID="v$(date -u +%Y%m%dT%H%M%S)-$$-$RANDOM"
+    fi
+    verify_wait_seen=0
+    if [[ "${OSTYPE:-}" == darwin* ]]; then
+        verify_wait_start=$(LC_ALL=C TZ=UTC ps -p "$$" -o lstart=) || verify_wait_start=""
+        if [[ -n "$verify_wait_start" ]]; then verify_wait_seen="${EPOCHREALTIME:-$(verify_wait_time)}"; fi
+    elif IFS= read -r verify_wait_stat < "/proc/$verify_wait_owner/stat"; then
+        read -r -a verify_wait_fields <<< "${verify_wait_stat##*) }"
+        if [[ "${verify_wait_fields[19]:-}" =~ ^[0-9]+$ && "${verify_wait_fields[0]:-}" != [ZXx] &&
+            ( -z "$verify_wait_start" || "$verify_wait_start" == "${verify_wait_fields[19]}" ) ]]; then
+            verify_wait_start="${verify_wait_fields[19]}"
+            verify_wait_seen="${EPOCHREALTIME:-$(verify_wait_time)}"
+        fi
+    fi
+    if [[ "${BUILDLOG_FIRST_STEP_WAIT_CALL_ID:-}" != "$VERIFY_PLACEMENT_CALL_ID" ||
+          -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
+        transition_verify_wait register --pid "$verify_wait_owner" \
+            --owner-start "$verify_wait_start" --owner-seen-at "${verify_wait_seen/,/.}" --copy-pid "$verify_copy_pid" \
+            --wait-at "${VERIFY_ENTRY_AT/,/.}" ${verify_wait_transfer[@]+"${verify_wait_transfer[@]}"}
+    fi
+fi
+unset VERIFY_CONTINUED_CALL_ID VERIFY_CONTINUED_STARTED_AT
+
 VERIFY_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 if [[ ! -f "$VERIFY_REPO_ROOT/Cargo.toml" ]]; then
     printf 'verify.sh: %s has no Cargo.toml; verify.sh checks Cargo repositories only\n' "$VERIFY_REPO_ROOT" >&2
@@ -542,16 +666,13 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     VERIFY_NIX_SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
-    export VERIFY_NIX_ENV_REEXEC=1
+    export VERIFY_NIX_ENV_REEXEC=1 VERIFY_PLACEMENT_CALL_ID VERIFY_WAIT_CONTINUED VERIFY_WAIT_STARTED_AT
     exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
         exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
 fi
 unset VERIFY_NIX_ENV_REEXEC
+export -n VERIFY_PLACEMENT_CALL_ID VERIFY_WAIT_CONTINUED VERIFY_WAIT_STARTED_AT
 
-BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
-[[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
-source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
-build_override_refusal "${BASH_SOURCE[0]}" direct/verify.sh || exit 2
 BUILD_HELPER_ROOT="$(build_helper_root "${BASH_SOURCE[0]}")" || exit 2
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
@@ -818,10 +939,6 @@ finish_step_token() {
 }
 
 run() {
-    if [[ "${VERIFY_SETUP_OPEN:-0}" == 1 ]]; then
-        record_verify_wait done setup
-        VERIFY_SETUP_OPEN=0
-    fi
     if [[ "${TOKEN_USED:-0}" == 1 ]]; then sync_token_state; fi
     local held_before=${TOKEN_HELD:-0} status=0
     run_step "$@" || status=$?
@@ -1481,11 +1598,20 @@ DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$BUILD_HELPER_ROOT/agents/d
 verify_helper --start
 if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" && " ${*:2} " != *" --attached "* ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    DETACH_LABEL="verify.sh ${VERIFY_ORIGINAL_ARGS[*]-} [$VERIFY_PLACEMENT_CALL_ID]"
     DETACH_STATUS=0
-    verify_helper "$DETACHED_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
+    VERIFY_CONTINUED_CALL_ID="$VERIFY_PLACEMENT_CALL_ID" \
+        VERIFY_CONTINUED_STARTED_AT="${VERIFY_WAIT_STARTED_AT/,/.}" \
+        verify_helper "$DETACHED_RUNS_SCRIPT" start --label "$DETACH_LABEL" -- \
         bash "$VERIFY_SELF" ${VERIFY_ORIGINAL_ARGS[@]+"${VERIFY_ORIGINAL_ARGS[@]}"} || DETACH_STATUS=$?
     case "$DETACH_STATUS" in
-        0) exit 0 ;;
+        0)
+            if verify_helper "$VERIFY_START_DIR/../build_queue/admission_client.py" verify-detached-handoff \
+                --label "$DETACH_LABEL" -- bash "$VERIFY_SELF" ${VERIFY_ORIGINAL_ARGS[@]+"${VERIFY_ORIGINAL_ARGS[@]}"}; then
+                VERIFY_WAIT_HANDED_OFF=1
+            fi
+            exit 0
+            ;;
         3) ;;
         4) exit 4 ;;
         *) echo "verify.sh: detached_runs.py could not detach this run (exit $DETACH_STATUS); running attached" >&2 ;;
@@ -1512,7 +1638,6 @@ parse_command_arguments "${ARGS[@]}"
 set -- ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}
 if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ONLY" == 0 && "$LOCAL_ONLY" == 0 ]]; then
     FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
-    trap 'final_status=$?; finish_verify_run "$final_status"; exit "$final_status"' EXIT
 fi
 finish_mac_fix || exit 2
 # invoke.sh reads prebuild declarations from the same manifest.
@@ -1554,11 +1679,7 @@ fi
 # Every step run() runs below carries this call's id, which buildlog joins to
 # the call record note_event writes.
 export BUILDLOG_CALLER=verify
-BUILDLOG_CALL_ID="v$(date -u +%Y%m%dT%H%M%S)-$$-$RANDOM"
-if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}${BUILDLOG_PREPARED_COPY:-}${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}" &&
-        "${BUILDLOG_RUN:-}" =~ ^[0-9]+:[0-9]+$ ]]; then
-    BUILDLOG_CALL_ID="v-run-${BUILDLOG_RUN/:/-}"
-fi
+BUILDLOG_CALL_ID="$VERIFY_PLACEMENT_CALL_ID"
 # Children carry this id only after its live record exists.
 export -n BUILDLOG_CALL_ID
 # The newest call wins a Mac copy (copy_watch.py); bash 3.2 has no EPOCHREALTIME.
@@ -1569,13 +1690,6 @@ HOLD_WAIT_DIR=""
 HOLD_WAITER_PID=""
 RUN_STEP_PID=""
 ROUTING_WAIT_STARTED=""
-
-record_verify_wait() {
-    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 0
-    local script="$VERIFY_START_DIR/../build_queue/admission_client.py" at="${3:-${EPOCHREALTIME:-$(date +%s)}}"
-    verify_helper "$script" placement-wait --call-id "$BUILDLOG_CALL_ID" --episode "${2:-}" \
-        --wait-reason "$1" --wait-at "${at/,/.}" >/dev/null || true
-}
 
 # Each blocked resource interval has its own recorder id. Files carry ids from
 # step subshells to the parent cleanup, which also ends interrupted waits.
@@ -2875,7 +2989,7 @@ placement_once() {
     if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
-        --call-id "$BUILDLOG_CALL_ID" --step-since "${PLACEMENT_STEP_SINCE:-$PLACEMENT_SINCE}"
+        --call-id "$BUILDLOG_CALL_ID" --step-since "${PLACEMENT_STEP_SINCE:-${EPOCHREALTIME:-$(date +%s)}}"
         --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$token"
@@ -2905,6 +3019,9 @@ placement_once() {
         local metadata
         metadata=$(verify_helper "$BUILD_TARGETS_SCRIPT" assigned-info --assignment-file "$PLACEMENT_ASSIGNMENT_FILE") || return $?
         IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
+        if [[ "$PLACEMENT_PROVIDER" != local ]]; then
+            transition_verify_wait remote_start "$PLACEMENT_EPISODE" "" "$PLACEMENT_ATTEMPT"
+        fi
         return 0
     fi
     # A builtin wait lets the parent handle TERM during a service outage.
@@ -3049,18 +3166,19 @@ wait_for_step_folder() {
     fi
     rm -f -- "$VERIFY_SLOT_CAPACITY_FILE.memory-released"
     step_state waiting_hold
-    record_verify_wait folder "$PLACEMENT_EPISODE"
+    transition_verify_wait folder "$PLACEMENT_EPISODE"
     "$PY" "$STEP_COPIES_SCRIPT" wait-slot --repo "$VERIFY_SLOT_SOURCE" --step "$CMD" \
         --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE" --deadline "$deadline" --pid "$$" &
     HOLD_WAITER_PID=$!
     wait "$HOLD_WAITER_PID" || status=$?
     HOLD_WAITER_PID=""
-    record_verify_wait done "$PLACEMENT_EPISODE"
     if (( status != 0 )); then
+        transition_verify_wait done "$PLACEMENT_EPISODE"
         verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
             --pid "$PLACEMENT_OWNER_PID" --reason "the folder wait ended" >/dev/null || return $?
         return "$status"
     fi
+    transition_verify_wait routing "$PLACEMENT_EPISODE"
     # Closing the attempt allows the same episode to ask for memory again.
     verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" finish-step --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
         --status 75 --reason "repository slot capacity" >/dev/null || return $?
@@ -3528,12 +3646,18 @@ fi
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
-trap 'hold_status=$?; interrupt_hold_wait; record_verify_wait finish; finish_hold_wait; release_wait_claim; remove_step_record; finish_verify_run "$hold_status"; exit "$hold_status"' EXIT
+verify_hold_exit() {
+    interrupt_hold_wait
+    finish_hold_wait
+    release_wait_claim
+    remove_step_record
+}
+VERIFY_EXIT_CLEANUP=verify_hold_exit
 hold_interrupted() {
     local signal_name=$1 code=$2
     # Ignore repeated signals while cleanup closes the hold record.
     trap '' INT TERM HUP
-    local ended_at="${EPOCHREALTIME:-$(date +%s)}"
+    VERIFY_EXIT_AT="${EPOCHREALTIME:-$(verify_wait_time)}"
     if [[ -n "$HOLD_WAITER_PID" ]]; then
         # A background Bash sleep inherits ignored INT. End that waiter with
         # TERM for every caller signal; keep the caller's status in the record.
@@ -3541,23 +3665,12 @@ hold_interrupted() {
         collect_child "$HOLD_WAITER_PID" "$signal_name"
     fi
     interrupt_hold_wait
-    record_verify_wait finish "" "$ended_at"
     note_event interrupted "$SECONDS" 0 "" 0 "$code"
     exit "$code"
 }
 trap 'hold_interrupted INT 130' INT
 trap 'hold_interrupted TERM 143' TERM
 trap 'hold_interrupted HUP 129' HUP
-VERIFY_SETUP_OPEN=0
-if [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}" ]]; then
-    setup_started=$VERIFY_SETUP_STARTED
-    if [[ -n "${BUILDLOG_PREPARED_COPY:-}" ]]; then
-        setup_started=$VERIFY_CALL_STARTED
-    fi
-    record_verify_wait local_setup setup "$setup_started"
-    VERIFY_SETUP_OPEN=1
-fi
-unset VERIFY_SETUP_STARTED
 initialize_step_record
 if [[ "$MAC_ONLY" == 0 ]] && cache_lookup; then
     exit "${LOOKUP_STATUS}"
@@ -3623,7 +3736,11 @@ token_wait_clock() {
 # A hold check ended the wait before the token came; this call holds no token.
 token_wait_left() {
     phase_wait_finish token
-    record_verify_wait done "${PLACEMENT_EPISODE:-token}"
+    if [[ "$1" == 10 && -n "${PLACEMENT_EPISODE:-}" ]]; then
+        transition_verify_wait routing "$PLACEMENT_EPISODE"
+    else
+        transition_verify_wait done "${PLACEMENT_EPISODE:-token}"
+    fi
     [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
     TOKEN_WAIT_ENTRY=""
     trap - INT TERM HUP
@@ -3765,7 +3882,7 @@ token_wait_note() {
 token_wait_orphaned() {
     [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
     trap - INT TERM HUP
-    record_verify_wait finish
+    transition_verify_wait finish
     echo "verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token." >&2
     exit 1
 }
@@ -3805,6 +3922,9 @@ acquire_token() {
     TOKEN_WAITED=0
     [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
     local started noted=-1 waited pause
+    if [[ "${1:-}" == after-hold ]]; then
+        transition_verify_wait slot "${PLACEMENT_EPISODE:-token}"
+    fi
     # A step's subshell has no traps of its own, though trap -p there prints
     # the parent's: restoring those would run the parent's cleanup in the step.
     TOKEN_CALLER_TRAPS=""
@@ -3836,7 +3956,7 @@ acquire_token() {
             if (( hold_status != 0 )); then
                 token_wait_clock
                 TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
-                token_wait_left
+                token_wait_left "$hold_status"
                 return "$hold_status"
             fi
         fi
@@ -3845,7 +3965,7 @@ acquire_token() {
         # The line goes out before the first try when the token is not free.
         if (( noted < 0 )) && { (( TOKEN_WAITERS_AHEAD > 0 )) || [[ -d "${BOARD_DIR}/locks/cargo.d" ]]; }; then
             phase_wait_start token "cargo token"
-            record_verify_wait slot "${PLACEMENT_EPISODE:-token}"
+            transition_verify_wait slot "${PLACEMENT_EPISODE:-token}"
             token_wait_note first 0
             noted=0
         fi
@@ -3876,7 +3996,7 @@ acquire_token() {
         waited=$(( (TOKEN_CLOCK_NOW - started) / 60 ))
         if (( noted < 0 )); then
             phase_wait_start token "cargo token"
-            record_verify_wait slot "${PLACEMENT_EPISODE:-token}"
+            transition_verify_wait slot "${PLACEMENT_EPISODE:-token}"
             token_wait_note first 0
             noted=0
         elif (( waited >= noted + TOKEN_WAIT_NOTE_MIN )); then
@@ -3886,7 +4006,9 @@ acquire_token() {
         (( TOKEN_SUPERSEDED )) || sleep "$pause"
     done
     phase_wait_finish token
-    if (( noted >= 0 )); then record_verify_wait done "${PLACEMENT_EPISODE:-token}"; fi
+    if (( noted >= 0 )) || [[ "${1:-}" == after-hold ]]; then
+        transition_verify_wait token-ready "${PLACEMENT_EPISODE:-token}"
+    fi
     TOKEN_WAITER_PID=""
     token_acquired
     TOKEN_FIRST_WAIT_DONE=1
@@ -4059,9 +4181,18 @@ stop_token_renewer() {
 }
 
 buildlog_exec() {
+    local call_id="${VERIFY_PLACEMENT_CALL_ID:-${BUILDLOG_CALL_ID:-}}"
+    local call_args=()
+    if [[ -n "${VERIFY_START_DIR:-}" && -n "$call_id" && "${LINT_VERIFY_COMMAND_WRAPPED:-0}" == 0 ]]; then
+        call_args=(--call-id "$call_id")
+    fi
     if [[ -n "${VERIFY_SLOT_SOURCE:-}" ]] && buildlog_step_compiles "$@"; then
+        if [[ -n "${call_args[0]:-}" ]]; then call_args=(--verify-call-id "$call_id"); fi
         set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
-            --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" -- "$@"
+            --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" ${call_args[@]+"${call_args[@]}"} -- "$@"
+    elif [[ -n "${call_args[0]:-}" ]]; then
+        set -- "$VERIFY_START_DIR/../lib/py" "$VERIFY_START_DIR/../build_queue/admission_client.py" \
+            verify-command "${call_args[@]}" -- "$@"
     fi
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
         local TOKEN_RENEWER_PID="" step_status=0
@@ -4075,9 +4206,8 @@ buildlog_exec() {
                 "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
         stop_token_renewer
         return "$step_status"
-    else
-        buildlog_exec_unowned "$@"
     fi
+    buildlog_exec_unowned "$@"
 }
 
 # Retry only when the ownership guard started no command.
@@ -4185,11 +4315,11 @@ build_hold_wait_local() {
     step_state waiting_hold
     phase_wait_start hold "build hold"
     local wait_episode="${PLACEMENT_EPISODE:-hold}"
-    if declare -F record_verify_wait >/dev/null; then record_verify_wait hold "$wait_episode"; fi
+    if declare -F transition_verify_wait >/dev/null; then transition_verify_wait hold "$wait_episode"; fi
     # A step without the token (before the first take, or after a Mac trip) only waits.
     if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
         build_hold_wait_local_only "$@" || status=$?
-        if declare -F record_verify_wait >/dev/null; then record_verify_wait done "$wait_episode"; fi
+        if declare -F transition_verify_wait >/dev/null; then transition_verify_wait done "$wait_episode"; fi
         phase_wait_finish hold
         if [[ "${status:-0}" -ne 0 ]]; then return "$status"; fi
         if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
@@ -4197,10 +4327,12 @@ build_hold_wait_local() {
     fi
     release_token || return $?
     build_hold_wait_local_only "$@" || status=$?
-    if declare -F record_verify_wait >/dev/null; then record_verify_wait done "$wait_episode"; fi
     phase_wait_finish hold
-    [[ "$status" == 0 ]] || return "$status"
-    acquire_token || return $?
+    if (( status != 0 )); then
+        if declare -F transition_verify_wait >/dev/null; then transition_verify_wait done "$wait_episode"; fi
+        return "$status"
+    fi
+    acquire_token after-hold || return $?
     record_token_wait
     if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
     return "$status"
@@ -4302,7 +4434,6 @@ verify_cleanup() {
     fi
     stop_copy_watch || true
     if [[ "$status" != interrupted ]]; then interrupt_hold_wait; fi
-    if [[ -n "${2:-}" ]]; then record_verify_wait finish "" "$2"; fi
     finish_run "${status}" || true
     # finish_run notes only a run with a record log; every other call is noted
     # here (note_event notes a call once). Its build time is unknown.
@@ -4331,40 +4462,27 @@ verify_cleanup() {
     remove_step_record
     [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
 }
-# EXIT alone would report success for a failed cargo run, so branch on the
-# status the trap receives; a lint failure record keeps it. $2 is the command
-# that ended the shell. An untrapped fatal signal, such as SIGPIPE after a
-# hold stop ends the run-log readers, runs this trap with the status of the
-# last command, often 0. Only an exit command completes a run, so any other
-# command records the run as interrupted (status 128: the signal is
-# unknown here) and writes no pass. Cleanup is best effort: errexit is off,
-# so one failed cleanup command does not end the trap with its status.
-verify_exit() {
-    EXIT_STATUS=$1
-    set +e
-    local ended_at="${EPOCHREALTIME:-$(date +%s)}"
-    if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
+# An explicit exit completes the run. An untrapped signal can leave a zero status.
+verify_run_exit() {
+    if (( EXIT_STATUS == 0 )) && [[ "$1" != exit && "$1" != "exit "* ]]; then
         EXIT_STATUS=128
         interrupt_hold_wait
-        verify_cleanup interrupted "$ended_at"
+        verify_cleanup interrupted
     elif (( EXIT_STATUS == 0 )); then
-        verify_cleanup completed "$ended_at"
+        verify_cleanup completed
     else
-        verify_cleanup error "$ended_at"
+        verify_cleanup error
     fi
-    finish_verify_run "$EXIT_STATUS"
-    exit "$EXIT_STATUS"
 }
-trap 'verify_exit "$?" "$BASH_COMMAND"' EXIT
+VERIFY_EXIT_CLEANUP=verify_run_exit
 verify_interrupted() {
-    trap - EXIT
+    VERIFY_EXIT_CLEANED=1
     # A process-group stop can deliver the same signal more than once.
     # Ignore later signals until cleanup removes this call's records.
     trap '' INT TERM HUP
     EXIT_STATUS=$((128 + $1))
-    local ended_at="${EPOCHREALTIME:-$(date +%s)}"
+    VERIFY_EXIT_AT="${EPOCHREALTIME:-$(verify_wait_time)}"
     interrupt_hold_wait
-    record_verify_wait finish "" "$ended_at"
     if [[ -n "$RUN_STEP_PID" ]]; then
         "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         release_token || true

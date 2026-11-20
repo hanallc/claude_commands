@@ -475,17 +475,30 @@ run_step_attempt() {
         done
         BUILDLOG_MEM_WAIT_S=$memory_wait
     fi
-    local holder=() LINT_NEXTEST_WIDTH_FILE=""
+    local holder=() LINT_NEXTEST_WIDTH_FILE="" LINT_VERIFY_COMMAND_WRAPPED=0
     if [[ -n "${LINT_NEXTEST_POOL:-}" && "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run
           && "${4:-}" == --test-threads ]]; then
         LINT_NEXTEST_WIDTH_FILE="${TMPDIR:-/tmp}/nextest_tokens.$$.$RANDOM.width"
-        holder=("$BUILDLOG_MEM_PY" "$LINT_TEST_TOKENS_SCRIPT" --pool "$LINT_NEXTEST_POOL"
-                --width-file "$LINT_NEXTEST_WIDTH_FILE" --reservation "${BUILDLOG_MEM_RESERVATION:-}" --)
+        if [[ -n "${VERIFY_PLACEMENT_CALL_ID:-}" ]]; then
+            holder=("$BUILD_HELPER_ROOT/lib/py" "$LINT_PREBUILD_SCRIPT" --verify-nextest
+                    --call-id "$VERIFY_PLACEMENT_CALL_ID")
+            LINT_VERIFY_COMMAND_WRAPPED=1
+        else
+            holder=("$BUILDLOG_MEM_PY" "$LINT_TEST_TOKENS_SCRIPT")
+        fi
+        holder+=(--pool "$LINT_NEXTEST_POOL" --width-file "$LINT_NEXTEST_WIDTH_FILE"
+                 --reservation "${BUILDLOG_MEM_RESERVATION:-}" --)
     elif [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
         nextest_thread_report "$@"
     fi
     local LINT_PREBUILD_PREFIX=()
     if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then lint_prebuild_prefix; fi
+    local step=("$@")
+    if [[ -n "${VERIFY_PLACEMENT_CALL_ID:-}" && -n "${LINT_PREBUILD_PREFIX[0]:-}" && "$LINT_VERIFY_COMMAND_WRAPPED" == 0 ]]; then
+        step=("$BUILD_HELPER_ROOT/lib/py" "$BUILD_HELPER_ROOT/build_queue/admission_client.py"
+              verify-command --call-id "$VERIFY_PLACEMENT_CALL_ID" -- "$@")
+        LINT_VERIFY_COMMAND_WRAPPED=1
+    fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
         buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
@@ -506,7 +519,7 @@ run_step_attempt() {
         tty=1
         set +e
         buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
-            ${holder[@]+"${holder[@]}"} "$@" 9>&-
+            ${holder[@]+"${holder[@]}"} "${step[@]}" 9>&-
         status=$?
     else
         # $RANDOM too: a background sweep's run() shares this shell's $$.
@@ -518,7 +531,7 @@ run_step_attempt() {
         # Keep output streaming for heartbeat_watch.sh and the watching worker.
         set +e
         buildlog_exec_with_progress ${LINT_PREBUILD_PREFIX[@]+"${LINT_PREBUILD_PREFIX[@]}"} \
-            ${holder[@]+"${holder[@]}"} "$@" 9>&- 2>&1 | tee -a "$log" | without_progress_frames
+            ${holder[@]+"${holder[@]}"} "${step[@]}" 9>&- 2>&1 | tee -a "$log" | without_progress_frames
         status=${PIPESTATUS[0]}
     fi
     set -e
@@ -748,7 +761,11 @@ lint_prebuild_prefix() {
         [[ "$line" == *prebuild* ]] || continue
         before=${line%%#*}
         if [[ "$before" == *prebuild* || "$before" == *[\"\']* ]]; then
-            LINT_PREBUILD_PREFIX=("${BUILD_FOLDERS_SCRIPT%/*}/py" "$LINT_PREBUILD_SCRIPT" --manifest "$manifest" --)
+            LINT_PREBUILD_PREFIX=("${BUILD_FOLDERS_SCRIPT%/*}/py" "$LINT_PREBUILD_SCRIPT" --manifest "$manifest")
+            if [[ -n "${VERIFY_PLACEMENT_CALL_ID:-}" ]]; then
+                LINT_PREBUILD_PREFIX+=(--verify-call-id "$VERIFY_PLACEMENT_CALL_ID")
+            fi
+            LINT_PREBUILD_PREFIX+=(--)
             return 0
         fi
     done < "$manifest"
