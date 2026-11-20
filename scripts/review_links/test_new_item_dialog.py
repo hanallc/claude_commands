@@ -638,6 +638,7 @@ const dialog = document.querySelector('dialog');
 const checkbox = dialog.querySelector('[name="include_page"]');
 const words = dialog.querySelector('textarea');
 const state = dialog.querySelector('[data-bug-page-state]');
+const term = label => [...state.querySelectorAll('dt')].find(node => node.textContent === label);
 const trigger = document.querySelector('[data-owner-new]');
 const open = () => new Promise(resolve => {
  const recipients = dialog.querySelector('[data-recipients]');
@@ -685,12 +686,20 @@ const send = async () => {
   check(dialog.querySelector('[data-kind="proposal"]').getClientRects().length === 0,
         'The console owner dialog does not display Proposal.');
   check(state.textContent.includes('Type All · State Open · Owner builds'), 'The dialog shows the selected filters.');
-  const address = [...state.querySelectorAll('dt')].find(term => term.textContent === 'Address');
+  const address = term('Address');
   check(address?.nextElementSibling.textContent === location.href, 'The Address row shows the full address.');
   check(state.querySelector('[data-visible-text]').textContent === 'Visible text from this page (up to 48 rows)',
         'The Bug block lists the visible text.');
   check(state.textContent.includes('2.40 s') && state.textContent.includes('Could not load …/brain.'),
         'The dialog shows the render time and the notice.');
+  const errorLines = term('Error lines')?.nextElementSibling;
+  check(errorLines?.classList.contains('error-line') && errorLines.textContent === 'Could not load …/brain.',
+        'Error lines shows the notice with the error style.');
+  if (!__PHOTO__) {
+   const scriptErrors = term('Script errors')?.nextElementSibling;
+   check(scriptErrors?.classList.contains('error-line') && scriptErrors.textContent.includes('Rejected'),
+         'Script errors shows the rejection with the error style.');
+  }
   check(checkbox.checked && checkbox.labels[0].textContent.trim() === 'Include a screenshot',
         'The screenshot box is checked by default.');
   check(wire.length === 1 && wire[0].page_capture.place === location.pathname+location.search+location.hash,
@@ -733,6 +742,19 @@ const send = async () => {
    check(bytes <= 64*1024 && evidence.rows.length < 48 &&
          evidence.rows.some(row=>row.includes('😀'.repeat(240))),
          'The fallback keeps complete rows within the UTF-8 byte budget.');
+
+   document.querySelector('.notice').remove();
+   window.consoleScriptErrors.length = 0;
+   await open();
+   check(!term('Error lines') && !term('Script errors'),
+         'A page with no errors omits both error rows.');
+   checkbox.click();
+   type('Send the page details without errors.');
+   await send();
+   const clean = wire.at(-1).page_state;
+   check(Array.isArray(clean.notices) && clean.notices.length === 0 &&
+         Array.isArray(clean.script_errors) && clean.script_errors.length === 0,
+         'The request includes both empty error lists.');
   }
  } catch (error) {
   failures.push(String(error));

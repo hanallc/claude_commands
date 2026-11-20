@@ -1172,10 +1172,10 @@ SCRIPT = r'''(() => {
    ['Page', state.title],
    ['Address', state.url],
    ['Filters', state.filters || 'None'],
-   ['Render time', state.render_seconds === null ? 'Unavailable' : state.render_seconds.toFixed(2) + ' s'],
-   ['Error lines', state.notices.join('\n') || 'None', state.notices.length],
-   ['Script errors', state.script_errors.map(error => error.message).join('\n') || 'None', state.script_errors.length]
+   ['Render time', state.render_seconds === null ? 'Unavailable' : state.render_seconds.toFixed(2) + ' s']
   ];
+  if (state.notices.length) rows.push(['Error lines', state.notices.join('\n'), true]);
+  if (state.script_errors.length) rows.push(['Script errors', state.script_errors.map(error => error.message).join('\n'), true]);
   bugStateBox.querySelector('dl').replaceChildren(...rows.flatMap(([label, value, failed]) =>
    [node('dt', label), node('dd', value, failed ? 'error-line' : '')]));
  }
