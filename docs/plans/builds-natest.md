@@ -29,6 +29,7 @@ This plan has no end. An agent with no memory runs one cycle from this section a
 ### The prize
 
 - The prize is one number: the AWS CPU that `~/.claude` test gates use each day. It is the mean CPU of a green full gate, times the gates each day. (user, 2026-11-20)
+- In money the prize is small: all AWS merge gate runs cost about 87 USD each month, and box start and setup is 1.1 min of each 7.3 min run (account cost and launch log, 11-13 to 11-19). The CPU work buys gate time and capacity.
 - Test count is a cause to treat. It is never a score, a report or a gate. (user, 2026-11-20)
 - Keep these three header numbers. Update them by hand at each refill, with host and date.
   1. AWS full gate, green, mean CPU: 4,192 s on 11-16 (low), 5,602 s on 11-19 (last AWS day). The first target is to return to the 11-16 value.
@@ -140,7 +141,7 @@ Full wording of P1 to P5 and P7: `report_process.md` (sections 6 and 7) and `pla
 | P7 | Python review rule in `config/review/code.md`, after the last `Option<T>` bullet: a class whose only purpose is to name absence is a finding | builds assigns | | approved (user, 2026-11-20) |
 | P8 | `aws_target/test_real_aws_cli.py` runs in the nightly gate only (384 natedev CPU s in 2 tests; 0.7 s on AWS) | aws, through builds | | not approved; proposal |
 
-P6. Affected-module merge gate on AWS, full gate each night. Owner: natest, Phase 406 (builds, 2026-11-20). Today the AWS box always runs the full suite: `scripts/production/merge_gate.py:1474` sets `FullSuite("whole machine")` for a not-shared machine, and `scripts/aws_target/gate_box.py:819` records 'cloud gate'. The box has no certified base (`affected_modules.py:967`). Computed saving: about 1,860 CPU s for each AWS gate; at about 129 AWS gates each day (1,674 in 13 days) this is about 240,000 CPU s each day (computed, not measured).
+P6. Affected-module merge gate on AWS, full gate each night. Owner: natest, Phase 406 (builds, 2026-11-20). Today the AWS box always runs the full suite: `scripts/production/merge_gate.py:1474` sets `FullSuite("whole machine")` for a not-shared machine, and `scripts/aws_target/gate_box.py:819` records 'cloud gate'. The box has no certified base (`affected_modules.py:967`). Saving from the AWS launch log, 11-13 to 11-19 (measured on old runs, not on the new code): a merge gate run is 6.2 min of gate time and 7.3 min of box time; an affected run is 4.9 to 5.3 min of gate time; box start and setup is 1.1 min in each. So the saving is 0.9 to 1.3 wall minutes for each AWS gate, 12 to 18% of box time, and about 10 USD each month. All AWS merge gates cost about 87 USD each month (account cost, 1,075 runs in 7 days). Run time does not follow the module count: a few slow modules that almost every change selects hold the time, so Lane A work on those modules is the larger lever.
 
 P6 risk, approved by the user on 2026-11-20: a defect outside the selected modules reaches main, and the nightly gate finds it.
 
@@ -757,7 +758,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 #### Work Order
 
-**Goal:** an AWS merge gate runs only the modules that the change affects, and one full gate runs each night. Predicted saving (computed, AWS): about 1,860 CPU s for each AWS gate (full about 4,940, affected about 3,080); at about 129 AWS gates each day this is about 240,000 CPU s each day.
+**Goal:** an AWS merge gate runs only the modules that the change affects, and one full gate runs each night. Predicted saving (AWS launch log, 11-13 to 11-19): 0.9 to 1.3 wall minutes of a 7.3 minute box run for each AWS gate, and about 10 USD each month.
 
 **Spec:**
 1. Start from a tip that holds Phase 355 (the gate code is `scripts/production/gate.py` there). Find each current line with `git grep`.
