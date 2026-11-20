@@ -690,6 +690,7 @@ region_transfer_usd={"us-west-1":0.00015}
                 self.assertEqual(evidence.box_seconds(size, region, ('merge-gate',)), ([Decimal(time) for time in times], source))
 
     def test_page_holds_the_tables_as_data_and_its_link_needs_the_page(self) -> None:
+        self.configure('hours_table_open_row_limit=6')
         self.assertEqual(self.snapshot(), 0)
         folder = self.root / 'page'
         with (mock.patch.object(aws_page, 'output_folder', return_value=folder),
@@ -707,7 +708,7 @@ region_transfer_usd={"us-west-1":0.00015}
         payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
         data = cast(aws_page.PageData, json.loads(payload))
         tables = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings)
-        expected = aws_page.page_data(tables, data["spend"], int(self.clock.now))
+        expected = aws_page.page_data(tables, data["spend"], int(self.clock.now), hours_table_open_row_limit=6)
         self.assertGreater(data["render_seconds"], 0)
         self.assertEqual(data, {**expected, "render_seconds": data["render_seconds"]})
         self.assertEqual([(entry['scope'], entry['label']) for entry in data['runs']],
@@ -1279,8 +1280,11 @@ class HoursCheckTests(CostFixture):
         window = run_cost.hours_checks(ledger.CostLedger(self.state), end - timedelta(days=3), end, self.home,
                                        self.builder, run_cost.SpotHoursScope((self.size,), {}), self.limit)
         self.assertEqual(window[self.size, self.home],
-                         run_cost.hours_check(within + above, Decimal(2), self.limit))
-        self.assertEqual(window[self.size, self.other], run_cost.HoursCheck(Decimal(0), Decimal('0.5'), Decimal(1), True))
+                         run_cost.ComparedMachineHours(within + above, Decimal(2), Decimal(0), True,
+                                                       two.date(), one.date()))
+        self.assertEqual(window[self.size, self.other],
+                         run_cost.ComparedMachineHours(Decimal(0), Decimal('0.5'), Decimal(0), True,
+                                                       one.date(), one.date()))
 
     def test_builder_running_time_counts_as_box_hours_of_the_builder_type(self) -> None:
         one = self.day(1)
@@ -1400,7 +1404,6 @@ class HoursCheckTests(CostFixture):
         row = next(row for row in table.rows if row.size == fallback)
         self.assertTrue(row.check.hours_gap_over)
         data = aws_page.hours_row_data(row)
-        assert data['kind'] == 'compared'
         self.assertEqual((data['billed_tenths'], data['recorded_tenths'], data.get('hana_reserved_tenths')), (20, 0, 10))
 
     def test_unusable_hana_size_setting_preserves_gate_notices_and_table(self) -> None:
@@ -1420,7 +1423,6 @@ class HoursCheckTests(CostFixture):
         row, = table.rows
         self.assertTrue(row.check.hours_gap_over)
         data = aws_page.hours_row_data(row)
-        assert data['kind'] == 'compared'
         self.assertEqual((data['billed_tenths'], data['recorded_tenths']), (20, 10))
         self.assertNotIn('hana_reserved_tenths', data)
 
@@ -1445,7 +1447,7 @@ class HoursCheckTests(CostFixture):
         self.assertEqual(self.notice_run(), 0)
         self.assertEqual(len(self.notice_commands), 1)
 
-    def test_spot_table_shows_separate_hours_and_the_signed_difference(self) -> None:
+    def test_spot_table_keeps_billed_rows_and_their_utc_dates(self) -> None:
         one, two = self.day(1), self.day(2)
         gpu = conf.read_or_repository('cloud_gate').words('gpu_instance_types')[0]
         self.gate(self.size, self.home, one, 3600)
@@ -1454,15 +1456,14 @@ class HoursCheckTests(CostFixture):
         self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2})
         hours = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).hours
         assert isinstance(hours, spot_table.HoursComparison)
-        billed, lower, unbilled = (aws_page.hours_row_data(row) for row in hours.rows)
-        assert billed['kind'] == 'compared' and lower['kind'] == 'compared'
-        self.assertEqual((billed['size'], billed['region'], billed['billed_tenths'], billed['recorded_tenths'],
-                          billed['signed_difference']), (self.size, self.home, 13, 10, '+0.3'))
-        self.assertEqual((lower['size'], lower['region'], lower['billed_tenths'], lower['recorded_tenths'],
-                          lower['signed_difference']), (self.size, self.other, 0, 5, '-0.5'))
-        self.assertEqual(unbilled, {'kind': 'unbilled', 'size': gpu, 'region': self.home, 'recorded_tenths': 10})
-        self.assertEqual((hours.first_utc_day, hours.last_utc_day), (self.day(7).date(), one.date()))
-        self.assertEqual([row.check.hours_gap_over for row in hours.rows], [True, True, False])
+        billed, lower = (aws_page.hours_row_data(row) for row in hours.rows)
+        self.assertEqual((billed['size'], billed['region'], billed['billed_tenths'], billed['recorded_tenths']),
+                         (self.size, self.home, 13, 10))
+        self.assertEqual((lower['size'], lower['region'], lower['billed_tenths'], lower['recorded_tenths']),
+                         (self.size, self.other, 0, 5))
+        for row in (billed, lower):
+            self.assertEqual((row['first_utc_day'], row['last_utc_day']), (one.date().isoformat(),) * 2)
+        self.assertEqual([row.check.hours_gap_over for row in hours.rows], [True, True])
 
     def test_over_uses_the_full_precision_of_the_hours_and_limit(self) -> None:
         day = self.day(1)
@@ -1475,22 +1476,21 @@ class HoursCheckTests(CostFixture):
                 assert isinstance(hours, spot_table.HoursComparison)
                 row, = hours.rows
                 data = aws_page.hours_row_data(row)
-                assert data['kind'] == 'compared'
-                self.assertEqual(data['signed_difference'], '+0.2')
+                self.assertEqual((data['billed_tenths'], data['recorded_tenths']), (12, 10))
                 self.assertEqual(row.check.hours_gap_over, mark)
 
-    def test_hours_difference_rounds_only_after_subtracting(self) -> None:
+    def test_hours_row_data_rounds_each_amount_for_display(self) -> None:
+        day = self.day(1).date()
         for billed, recorded, expected in (
-            ('0.96', '1', (10, 10, '-0.0')),
-            ('4.24', '4.26', (42, 43, '-0.0')),
-            ('1.24', '1.06', (12, 11, '+0.2')),
+            ('0.96', '1', (10, 10)),
+            ('4.24', '4.26', (42, 43)),
+            ('1.24', '1.06', (12, 11)),
         ):
             with self.subTest(billed=billed, recorded=recorded):
-                check = run_cost.hours_check(Decimal(billed), Decimal(recorded), self.limit)
-                row = spot_table.MachineHoursRow(self.size, self.home, check)
+                check = run_cost.ComparedMachineHours(Decimal(billed), Decimal(recorded), Decimal(0), False, day, day)
+                row = spot_table.ComparedMachineHoursRow(self.size, self.home, check)
                 data = aws_page.hours_row_data(row)
-                assert data['kind'] == 'compared'
-                self.assertEqual((data['billed_tenths'], data['recorded_tenths'], data['signed_difference']), expected)
+                self.assertEqual((data['billed_tenths'], data['recorded_tenths']), expected)
 
     def test_billed_hours_empty_states_distinguish_a_missing_bill_from_no_hours(self) -> None:
         def check(note: str) -> None:
@@ -1502,12 +1502,8 @@ class HoursCheckTests(CostFixture):
         check('There are no machine hours to compare.')
         self.gate(self.size, self.home, self.day(1), 3600)
         hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
-        assert isinstance(hours, spot_table.HoursComparison)
-        row, = hours.rows
-        self.assertEqual(aws_page.hours_row_data(row), {
-            'kind': 'unbilled', 'size': self.size, 'region': self.home, 'recorded_tenths': 10,
-        })
-        self.assertFalse(row.check.hours_gap_over)
+        self.assertEqual(hours, spot_table.HoursComparisonUnavailable(
+            'No AWS bill is available yet for the recorded hours.', frozenset({self.home})))
 
     def test_spot_table_keeps_gate_hours_and_shows_the_hana_allowance(self) -> None:
         day = self.day(1)
@@ -1523,7 +1519,6 @@ class HoursCheckTests(CostFixture):
         for size, billed_hours, recorded_hours in ((self.size, 30, 10), (fallback, 9, 0)):
             with self.subTest(size=size):
                 data = readings[size]
-                assert data['kind'] == 'compared'
                 self.assertEqual((data['region'], data['billed_tenths'], data['recorded_tenths'],
                                   data.get('hana_reserved_tenths')), (self.other, billed_hours, recorded_hours, 20))
         self.assertFalse(any(row.check.hours_gap_over for row in table.rows))

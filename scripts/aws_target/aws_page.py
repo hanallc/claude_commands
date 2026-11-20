@@ -216,33 +216,22 @@ class QuotaHistoryData(TypedDict):
     gpu_summary: GpuQuotaSummary
 
 
-class MachineHoursRowData(TypedDict):
+class ComparedHoursRowData(TypedDict):
     size: str
     region: str
-    recorded_tenths: int
-
-
-class UnbilledHoursRowData(MachineHoursRowData):
-    kind: Literal['unbilled']
-
-
-class ComparedHoursRowData(MachineHoursRowData):
-    kind: Literal['compared']
-    billed: float
-    recorded: float
     billed_tenths: int
-    difference_tenths: int
-    signed_difference: str
+    recorded_tenths: int
+    first_utc_day: str
+    last_utc_day: str
     hana_reserved_tenths: NotRequired[int]
     limit_result: Literal['within_limit', 'higher_bill', 'lower_bill']
 
 
 class HoursComparisonData(TypedDict):
     kind: Literal['comparison']
-    rows: list[ComparedHoursRowData | UnbilledHoursRowData]
+    rows: list[ComparedHoursRowData]
     limit_percent: str
-    first_utc_day: str
-    last_utc_day: str
+    open_row_limit: int
 
 
 class HoursComparisonUnavailableData(TypedDict):
@@ -279,32 +268,20 @@ def table_data(table: spot_table.Table) -> TableData:
     return {'title': table.title, **table_rows_data(table)}
 
 
-def hours_row_data(row: spot_table.MachineHoursRow) -> ComparedHoursRowData | UnbilledHoursRowData:
+def hours_row_data(row: spot_table.ComparedMachineHoursRow) -> ComparedHoursRowData:
     check = row.check
     billed = check.billed_hours
-    record: MachineHoursRowData = {'size': row.size, 'region': row.region,
-                                   'recorded_tenths': round(check.box_hours * 10)}
-    if billed is None:
-        return {'kind': 'unbilled', **record}
-    difference = billed - check.box_hours
     limit_result: Literal['within_limit', 'higher_bill', 'lower_bill'] = 'within_limit'
     if check.hours_gap_over:
         limit_result = 'higher_bill' if billed > check.box_hours else 'lower_bill'
     compared: ComparedHoursRowData = {
-        'kind': 'compared', **record, 'billed': float(billed), 'recorded': float(check.box_hours),
-        'billed_tenths': round(billed * 10), 'difference_tenths': int(round(difference, 1) * 10),
-        'signed_difference': f'{difference:+.1f}' if difference else '0.0', 'limit_result': limit_result,
+        'size': row.size, 'region': row.region, 'limit_result': limit_result,
+        'billed_tenths': round(billed * 10), 'recorded_tenths': round(check.box_hours * 10),
+        'first_utc_day': check.first_utc_day.isoformat(), 'last_utc_day': check.last_utc_day.isoformat(),
     }
-    if difference >= 0 and check.hana_reserved_hours > 0:
+    if billed >= check.box_hours and check.hana_reserved_hours > 0:
         compared['hana_reserved_tenths'] = round(check.hana_reserved_hours * 10)
     return compared
-
-
-def hours_difference_order(row: spot_table.MachineHoursRow) -> tuple[bool, Decimal]:
-    billed = row.check.billed_hours
-    if billed is None:
-        return True, Decimal(0)
-    return False, row.check.box_hours - billed
 
 
 def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.SpotPlacementReading],
@@ -561,6 +538,7 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
 
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
+              hours_table_open_row_limit: int,
               launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = (),
               gate_switch: cloud_gate.CloudGateSetting = cloud_gate.CloudGateSwitch.ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
@@ -573,8 +551,9 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
             percent = percent.rstrip('0').rstrip('.')
         hours = {
             'kind': 'comparison', 'limit_percent': f'{percent}%',
-            'rows': [hours_row_data(row) for row in sorted(tables.hours.rows, key=hours_difference_order)],
-            'first_utc_day': tables.hours.first_utc_day.isoformat(), 'last_utc_day': tables.hours.last_utc_day.isoformat(),
+            'rows': [hours_row_data(row) for row in sorted(
+                tables.hours.rows, key=lambda row: row.check.box_hours - row.check.billed_hours)],
+            'open_row_limit': hours_table_open_row_limit,
         }
     else:
         hours = {'kind': 'unavailable', 'reason': tables.hours.reason}
@@ -655,6 +634,7 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
     tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
     data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches(),
+                     hours_table_open_row_limit=configuration.whole('hours_table_open_row_limit'),
                      settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
     comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
