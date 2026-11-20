@@ -847,6 +847,47 @@ class UsageWindow:
     end: datetime
 
 
+class RustCacheCounters(NamedTuple):
+    host: str
+    boot_id: str
+    server_started_us: int
+    hits: int
+    misses: int
+
+    def server(self) -> tuple[str, str, int]:
+        return self.host, self.boot_id, self.server_started_us
+
+
+def sccache_hit_rate(connection: sqlite3.Connection, first: date, last: date) -> str:
+    """Sum observed Rust cache deltas within each server life."""
+    zone = user_zone()
+    start = store.utc_iso(datetime.combine(first, datetime.min.time(), zone).timestamp())
+    end = store.utc_iso(datetime.combine(last + timedelta(days=1), datetime.min.time(), zone).timestamp())
+    rows = fetch(connection, "SELECT host, boot_id, server_started_us, rust_hits, rust_misses FROM sccache_samples"
+                 + " WHERE at >= ? AND at < ? AND " + natedev_host_predicate("sccache_samples")
+                 + " ORDER BY host, at, rowid", start, end)
+    hits = misses = 0
+    previous: RustCacheCounters | None = None
+    for row in rows:
+        host, boot_id, server_start, raw_hits, raw_misses = row
+        started, hit_count, miss_count = map(recorded_number, (server_start, raw_hits, raw_misses))
+        if not (isinstance(host, str) and isinstance(boot_id, str) and boot_id
+                and isinstance(started, int) and started > 0
+                and isinstance(hit_count, int) and isinstance(miss_count, int)):
+            continue
+        current = RustCacheCounters(host, boot_id, started, hit_count, miss_count)
+        if previous is not None and current.server() == previous.server():
+            added_hits = current.hits - previous.hits
+            added_misses = current.misses - previous.misses
+            if added_hits >= 0 and added_misses >= 0:
+                hits += added_hits
+                misses += added_misses
+        previous = current
+    requests = hits + misses
+    rate = f"{hits / requests:.2%} ({hits:,} hits, {misses:,} misses)" if requests else "unavailable (no deltas with requests)"
+    return f"Rust sccache hit rate ({first} to {last}): {rate}"
+
+
 def usage_window(day: str = "") -> UsageWindow:
     end = (datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time(), user_zone()).astimezone(UTC)
            if day else datetime.now(UTC))
