@@ -1751,6 +1751,85 @@ Fit with the phase 97 test rules: one place for each rule, no copies.
 
 **Order:** on the phase 97 branch; one hash with phase 97.
 
+### Phase 100 — Item 154 tools: paths and protection  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** item 154 step 2, group 1 of 4. sdlc, 18:35 EST Nov 20: start the four writer groups. Plan: bob's item 154 draft 11, steps 2.1, 2.2, 2.4, 2.5 and 2.6 (record update). Name: item154paths.
+**Spec:**
+1. Add the `Merge checkout` field, `resolve_production_paths`, `protected_checkouts` and the `guard-ready.json` reader in `production_doc.py`.
+2. Refuse removal of a protected integration worktree or its ref in every removal route.
+3. Split the live document move from the branch rename. Prepare the exact exclusions and the `.gitignore` pattern.
+4. Add `live_file_conflicts` in `main_sync.py`. Refuse sync and checkout updates that conflict with live files.
+5. Prepare the cargo-liner record update and its reverse in `worktrees.py`.
+**Files:** `production_doc.py`, `git_exclude.py`, `shutdown.py`, `worktrees.py`, `main_sync.py`, `waiting_rows.py`, `worktree_delete_validation.sh`, `perform_deletion.sh`, `gate_folders_delete.py`, `.gitignore`, `record_store.py`, `outcomes.py`, `working_set_owners.json`, `bevy_upgrade.py`, `docs/production_format.md`, `docs/as-built/showrunner-automation.md`, and their tests.
+**Tests:** the tests that plan steps 2.1–2.6 name, as rows in existing tables where a table fits. A break removes a live integration worktree or overwrites a live LOG.
+**Acceptance gate:** targeted tests of the changed modules pass in the test slot; basedpyright 0/0 on changed files; then the full gate with phases 101–103.
+
+**Workers:** 1 writer, 1 reviewer.
+
+**Order:** parallel with phases 101–103; one combined hash after the drain (plan step 2.9).
+
+### Phase 101 — Item 154 tools: lifecycle and staff  · status: todo
+**Depends on:** none (imports the phase 100 names by contract)
+
+#### Work Order
+
+**Goal:** item 154 step 2, group 2 of 4. Plan steps 2.1 (wrap loop, demotion switch), 2.3, 2.5 (`production_lifecycle.py:344`) and 2.6 (`ci_steps`). Name: item154life.
+**Spec:**
+1. Add `approve-move`, `move-files` and `stage-notes` to `production_lifecycle.py` under move.json v1.
+2. Refuse a first launch of a non-merge unit until a merge unit serves an enrolled production. Apply the same rule to transfers.
+3. Refuse new production creation without a valid guard proof, in the four creation paths.
+4. Update the registration and launch readers for enrolled productions.
+5. Write the `settings.json` change as a proposal file only; nate's go comes before any edit.
+**Files:** `production_lifecycle.py`, `add_unit.py`, `staff.py`, `session_staff.py`, `update_registration.py`, `transfer_unit.py`, `add_showrunner.py`, `promote_showrunner.py`, `demote_showrunner.py`, `scripts/style/` readers, `docs/style_production.md`, `shutdown_record.py`, `restart.py`, `launch_names.py`, `stop_resume.py`, `pane_launch.py`, and their tests.
+**Tests:** the tests that plan step 2.3 names. A break starts a unit with no merge unit, or loses LOG bytes in a move.
+**Acceptance gate:** as phase 100.
+
+**Workers:** 1 writer, 1 reviewer.
+
+**Order:** parallel with phases 100, 102 and 103.
+
+### Phase 102 — Item 154 tools: integration and publication  · status: todo
+**Depends on:** none (imports the phase 100 names by contract)
+
+#### Work Order
+
+**Goal:** item 154 step 2, group 3 of 4. Plan steps 2.5 (pushes), 2.6 (`ci_collect`), 2.7 (receipt and batch paths) and the integration reader rows. Name: item154integ.
+**Spec:**
+1. Use the integration checkout for Git, locks and receipts. Use staff for the LOG. Keep old receipts readable.
+2. Refuse pushes that conflict with live files, through `live_file_conflicts`.
+3. Require successful CI on the exact integration tip for cargo-liner.
+4. Protect the origin merge branch and keep former unit evidence on the branch page.
+**Files:** `merge_checkpoint.py`, `merge_gate.py`, `ci_points.py`, `checkpoint_gate.py`, `bump_gate.py`, `land_queue.py`, `branch_page.py`, `unit_phases.py`, `waiting.py`, `unit_move.py`, `phase_table.py`, `smoke_launch.sh`, `commands/unit/merge.md`, and their tests.
+**Tests:** the tests that plan steps 2.5–2.6 and the branch page row name. A break pushes over a live file or promotes an untested tip.
+**Acceptance gate:** as phase 100.
+
+**Workers:** 1 writer, 1 reviewer.
+
+**Order:** parallel with phases 100, 101 and 103.
+
+### Phase 103 — Item 154 tools: review workers and backup  · status: todo
+**Depends on:** none (imports the phase 100 and 101 names by contract)
+
+#### Work Order
+
+**Goal:** item 154 step 2, group 4 of 4. Plan steps 2.7, 2.8 and the step 2.9 helper text. Name: item154backup.
+**Spec:**
+1. Admit only read-only `review` and `astra-reviewer` workers for an enrolled showrunner, on every launch route.
+2. Replace the LOG copies with one Git backup repository per production, pushed to the Mac, with an hourly `production-backup` job.
+3. Route live questions, reviews and summaries through staff.
+4. Update the helper orders in the step 2.9 command files.
+5. Write the Mac Git module change as a proposal file for devtools.
+**Files:** `worker.py`, `worker_panes.py`, `log_backup.py`, `production_check.sh`, `notifier.sh`, `config/production_backup.conf`, `scripts/direct/workers.py`, `roster.py`, `showrunner_footer.py`, `showrunners.py`, `change_routing.py`, `change_review.py`, `change_page.py`, `review_items.py`, the step 2.9 command files, and their tests.
+**Tests:** the tests that plan steps 2.7 and 2.8 name. A break lets a showrunner worker write, or loses a backup commit.
+**Acceptance gate:** as phase 100.
+
+**Workers:** 1 writer, 1 reviewer.
+
+**Order:** parallel with phases 100–102.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
