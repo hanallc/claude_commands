@@ -699,7 +699,7 @@ else:
 
     def test_result_rejects_missing_or_invalid_status_and_metrics(self) -> None:
         run = gate.GateRun((gate.GateJobResult('fixture', 'test_one.py', 0, 1, ''),), 1, 1)
-        for field, value in (('returncode', False), ('seconds', -1), ('seconds', float('nan')),
+        for field, value in (('returncode', False), ('seconds', -1), ('seconds', float('nan')), ('seconds', 10**400),
                              ('kind', 'UNKNOWN'), ('restart', 'other'),
                              ('started_at', -1), ('started_at', float('nan')),
                              ('ended_at', -1), ('ended_at', float('nan'))):
