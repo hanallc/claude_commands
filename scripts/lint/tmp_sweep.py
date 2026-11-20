@@ -103,7 +103,6 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator, Sequence
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
@@ -116,6 +115,7 @@ from scripts.lib.conf import UseConfiguredValue  # noqa: E402
 from scripts.lib.testing_folders import RUN_FOLDER_ENV
 from scripts.lib.python_startup.sitecustomize import dataclass_code_root, dataclass_code_usable  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.mac_test import nextest_log
 from scripts.message import sessions  # noqa: E402
 from scripts.agents import remote
 from scripts.direct import phase_reservation, recorder_state
@@ -143,23 +143,6 @@ class SessionTemporaryRoot(Protocol):
 
 
 _session_temp = cast(SessionTemporaryRoot, cast(object, import_module("scripts.hooks.session-start-temp-root")))
-
-
-class NextestLogAccess(Protocol):
-    REMOVE: Enum
-
-
-class NextestLogCleanup(Protocol):
-    DIRECTORY: str
-    LOG_NAME: re.Pattern[str]
-    LogAccess: NextestLogAccess
-
-    def retention_days(self) -> int: ...
-
-    def locked_log(self, folder: int, name: str, access: Enum) -> AbstractContextManager[int]: ...
-
-
-nextest_log = cast(NextestLogCleanup, cast(object, import_module("scripts.mac_test.nextest_log")))
 SESSION_TEMP_ROOT = _session_temp.ROOT
 RUN_TEMP_NAME = unit_runs.RUN_TEMP_NAME
 # Claude Code keeps each session's scratch in /tmp/claude-<uid>/<project>/<session id>/.

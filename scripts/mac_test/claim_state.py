@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import fcntl
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
@@ -20,6 +21,13 @@ if TYPE_CHECKING:
 
 
 SubmittingSession = OwningSession | NoOwningSession
+
+MIRROR_LEASE_FDS_ENV = "COPIES_MIRROR_LEASE_FDS"
+
+
+def inherited_mirror_descriptors() -> tuple[int, ...]:
+    """Read the mirror lease descriptors for a child process."""
+    return tuple(int(value) for value in os.environ.get(MIRROR_LEASE_FDS_ENV, "").split(",") if value)
 
 
 CiSwitch = Literal[
