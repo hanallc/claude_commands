@@ -44,7 +44,7 @@ These fields do not change the recipient, reply name, or message key.
 ### Messages during an ad hoc review
 
 `review_hold=off` in `config/send.conf` disables message holding for all sessions.
-The next user prompt or session start delivers any messages still held.
+The next prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.
 
 `send.py` keeps local messages during an open review and returns `KEPT`.

@@ -160,11 +160,10 @@ def _enabled(settings: conf.ConfigRead) -> bool:
     return isinstance(value, conf.UsableLiveValue) and value.value == "on"
 
 
-def _hold_open(count: Path, state: ReviewState, at: float) -> bool:
+def _hold_open(count: Path, state: ReviewState, at: float, settings: conf.ConfigRead) -> bool:
     activity = state.last_activity
     if isinstance(activity, EndedReview) or not _read_count(count):
         return False
-    settings = conf.read("send")
     return _enabled(settings) and at - activity < settings.number("review_hold_idle_minutes") * 60
 
 
@@ -175,9 +174,12 @@ def keep_native_message(session: str, message: ReviewMessage) -> bool:
     path = _state_file(count)
     if not (count.exists() or path.exists()):
         return False
+    settings = conf.read("send")
+    if not _enabled(settings):
+        return False
     with _locked(path):
         state = _read_state(count, path)
-        if not _hold_open(count, state, message.sent):
+        if not _hold_open(count, state, message.sent, settings):
             return False
         OpenReview(path, state).keep(message)
         return True
@@ -305,7 +307,7 @@ def record_user_prompt(session: str, at: float, emit: Callable[[str], None], *,
             state = _read_state(count, path)
             previous = state.last_activity
             if not isinstance(previous, EndedReview):
-                if _hold_open(count, state, at):
+                if _hold_open(count, state, at, conf.read("send")):
                     state = replace(state, last_activity=max(previous, at))
                     _write_state(path, state)
                 else:
@@ -316,6 +318,16 @@ def record_user_prompt(session: str, at: float, emit: Callable[[str], None], *,
 
 
 def deliver_at_session_start(session: str, emit: Callable[[str], None], *, record_keys: RecordReleasedKeys) -> None:
+    _deliver_saved(session, datetime.now(timezone.utc).timestamp(), emit, record_keys)
+
+
+def deliver_if_disabled(session: str, at: float, emit: Callable[[str], None], *,
+                        record_keys: RecordReleasedKeys) -> None:
+    if not _enabled(conf.read("send")):
+        _deliver_saved(session, at, emit, record_keys)
+
+
+def _deliver_saved(session: str, at: float, emit: Callable[[str], None], record_keys: RecordReleasedKeys) -> None:
     count = _count_file(session)
     path = _state_file(count)
     if not path.exists():
@@ -325,8 +337,7 @@ def deliver_at_session_start(session: str, emit: Callable[[str], None], *, recor
             state = _read_state(count, path)
             if not (state.messages or state.reserved):
                 return
-            at = datetime.now(timezone.utc).timestamp()
-            if _hold_open(count, state, at):
+            if _hold_open(count, state, at, conf.read("send")):
                 return
             held = _reserve(path, _end_review(path, state), delivery)
         _emit_saved(count, path, held, at, emit, record_keys)
@@ -354,10 +365,14 @@ def route(session: str, message: ReviewMessage, *, urgent: bool,
     count = _count_file(session)
     path = _state_file(count)
     if count.exists() or path.exists():
+        settings = conf.read("send")
+        if not _enabled(settings):
+            yield ReleasedMessages(())
+            return
         with ExitStack() as delivery:
             with _locked(path):
                 state = _read_state(count, path)
-                if _hold_open(count, state, message.sent):
+                if _hold_open(count, state, message.sent, settings):
                     if include_new and not urgent:
                         saved = (*state.reserved, *state.messages)
                         yield (AlreadyKeptForReview() if message.key and any(item.key == message.key for item in saved)
