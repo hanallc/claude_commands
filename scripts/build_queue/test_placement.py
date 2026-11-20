@@ -2575,12 +2575,11 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     self.assertEqual([item.record["claim_id"] for item in mac_test.live_claims(paths)], [claim.claim_id])
                     self.assertEqual(assignment_for(fixture, request), assignment)
                 finally:
+                    fixture.clock.advance(1)
+                    finish.set()
                     reader = fixture.server.host_readers.get(key)
                     if reader is not None:
                         reader.close()
-                    fixture.clock.advance(1)
-                    finish.set()
-                    if reader is not None:
                         LauncherHangGuard("Remote evidence probe cleanup").join(reader.thread)
             observed = fixture.server.host_evidence(key)
             self.assertIsInstance(observed, placement.StaleHostEvidence)
