@@ -14,12 +14,13 @@ import sys
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from html import escape
 from pathlib import Path
 from statistics import median
 from typing import Literal, TypedDict
 
-from scripts.aws_target import config as aws_config, console_help, ledger, spend as aws_spend, spot_table
+from scripts.aws_target import config as aws_config, console_help, ledger, run_cost, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
@@ -169,6 +170,31 @@ def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.Spot
     return spot_table.Table('Spot placement scores', headers, frozenset(range(2, len(headers))), rows, 'rows')
 
 
+def gate_time_price_table(comparisons: Sequence[run_cost.GateTimeComparison]) -> spot_table.Table:
+    """Show the run costs and the time price that makes the 32-vCPU box cheaper."""
+    def cells(estimate: run_cost.GateRunEstimate | run_cost.NoPricedGateVariant) -> tuple[str, str, str, str]:
+        if isinstance(estimate, run_cost.NoPricedGateVariant):
+            return '—', '—', '—', '—'
+        minutes = estimate.median_minutes
+        return (estimate.instance_type, f'{estimate.spot_usd_per_hour:.4f}',
+                f'{minutes:.1f}' if isinstance(minutes, Decimal) else 'no measurement',
+                f'{estimate.usd_per_run:.4f}')
+
+    def break_even(row: run_cost.GateTimeComparison) -> str:
+        result = run_cost.gate_break_even(row.small, row.large)
+        if isinstance(result, run_cost.BreakEvenCondition):
+            return result.value
+        direction = 'more' if result.faster_32_vcpu else 'less'
+        return f'{result.usd_per_minute:.4f} or {direction}'
+
+    headers = ('Region', '16 vCPU type', '16 vCPU Spot (USD/h)', '16 vCPU median (min)', '16 vCPU run (USD)',
+               '32 vCPU type', '32 vCPU Spot (USD/h)', '32 vCPU median (min)', '32 vCPU run (USD)',
+               '32 vCPU break-even (USD/min)')
+    rows = tuple((row.region, *cells(row.small), *cells(row.large), break_even(row))
+                 for row in sorted(comparisons, key=lambda row: region_filter_key(row.region)))
+    return spot_table.Table('32-vCPU merge gate break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
+
+
 def without_prices(table: spot_table.Table) -> spot_table.Table:
     """Omit the Spot price and estimate that the Prices and quotas card shows."""
     keep = [index for index, header in enumerate(table.headers)
@@ -262,13 +288,21 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     except (OSError, ValueError, KeyError) as error:
         print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
         placement = ()
-    data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now, placement)
+    values = conf.read_or_repository('cloud_gate')
+    gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
+    tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
+    data = page_data(tables, spend, now, placement)
+    comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
+    gate_time_price = table_data(gate_time_price_table(comparisons))
+    regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
+    gate_time_data = {'table': gate_time_price, 'regions': regions}
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     # A '</' in a cell must not end the script element.
     data['render_seconds'] = time.perf_counter() - started
     page = (page_frame.template(source, 'AWS', 'aws')
             .replace('__AWS_QUOTA_HELP__', quota_help(), 1)
-            .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/')))
+            .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/'))
+            .replace('__AWS_GATE_TIME_DATA__', json.dumps(gate_time_data).replace('</', '<\\/')))
     page_path = folder / PAGE_NAME
     folder.mkdir(parents=True, exist_ok=True)
     write_text_atomic(page_path, page, new_file_mode=0o644)

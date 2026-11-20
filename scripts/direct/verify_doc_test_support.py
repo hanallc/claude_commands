@@ -9,6 +9,7 @@ from scripts.build_queue import placement
 from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.copies import copies
+from scripts.lib import conf
 from scripts.lib.build_slots_test_support import private_slot_config
 from unittest import mock
 
@@ -106,6 +107,7 @@ class VerifyDocFixture(unittest.TestCase):
         builder = cls()
         builder.root = cls.fixture_root
         builder.build_fixture()
+        builder.environment["PYTHONPYCACHEPREFIX"] = str(cls.fixture_root.parent / "bytecode")
         cls.fixture_environment = builder.environment.copy()
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(cls.fixture_root)
@@ -148,8 +150,6 @@ class VerifyDocFixture(unittest.TestCase):
         write_test_scope_launcher(tools)
         self.executable(tools / "cargo", CARGO_STUB)
         self.executable(tools / "rustc", '#!/bin/sh\nprintf "rustc fixture\\n"\n')
-        targets = tools / "build-targets.py"
-        self.executable(targets, f'import runpy\nrunpy.run_path({str(SCRIPTS / "build_targets/build_targets.py")!r}, run_name="__main__")\n')
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         for name in ("ssh", "rsync", "scp", "gh"):
@@ -177,12 +177,13 @@ class VerifyDocFixture(unittest.TestCase):
                                           "src_path": str(source), "required-features": []}]})
         self.environment = {
             name: value for name, value in os.environ.items()
-            if not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_", "CARGO_", "RUST",
+            if name != "PYTHONDONTWRITEBYTECODE"
+            and not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_", "CARGO_", "RUST",
                                     "NEXTEST_", "CLAUDE_CODE_", "CODEX_", "GIT_"))
         }
         self.environment.update({
             "HOME": str(home), "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
-            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": str(self.root / "bytecode"),
             "LINT_SKIP_SWEEP": "1",
             "TEST_CARGO_EVENTS": str(self.events),
             "TEST_ORIGINAL_REPO": str(self.repo),
@@ -195,13 +196,19 @@ class VerifyDocFixture(unittest.TestCase):
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_OFF": "1",
             **memory_environment,
-            "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
+            "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
             "LINT_SKIP_SWEEP": "1",
             "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
         private = private_slot_config(self.root, repository=self.repo.name)
+        slot_settings = private.settings.read_text().splitlines(keepends=True)
+        for key, value in (("locks.probe_wait_seconds", "0.25"), ("locks.probe_retry_seconds", "1")):
+            line, _ = conf.editable_line(private.settings, key)
+            slot_settings[line] = f"{key}={value}\n"
+        _ = private.settings.write_text("".join(slot_settings))
+        _ = write_config_fixture(Path(private.environment["COPIES_CONFIG"]), "git_timeout_seconds=600\n")
         configuration = Path(self.environment["CONF_DIR"])
         _ = shutil.copy2(private.settings, configuration / "build_folders.conf")
         self.environment.update({key: value for key, value in private.environment.items() if key != "CONF_DIR"})
