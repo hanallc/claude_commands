@@ -16,7 +16,7 @@ import gzip
 import json
 import os
 import re
-import select
+import selectors
 import signal
 from pathlib import Path
 import subprocess
@@ -73,6 +73,7 @@ with subprocess.Popen(sys.argv[1:], stdout=subprocess.PIPE) as coordinator:
     status = coordinator.wait()
 sys.exit(status if status >= 0 else 128 - status)
 """
+WATCHDOG_RESULT_TIMEOUT_SECS = TEST_HANG_GUARD_SECS / 2
 
 
 def stop_trial_group(process: subprocess.Popen[bytes]) -> None:
@@ -124,7 +125,7 @@ class CloudGateFixtureWatchdog:
                 stop_trial_group(process)
             for process in self.trials:
                 with suppress(subprocess.TimeoutExpired):
-                    _ = process.wait(timeout=self.limit_seconds / 4)
+                    _ = process.wait(timeout=WATCHDOG_RESULT_TIMEOUT_SECS)
             reports = [diagnostics.read() for diagnostics in self.trials.values()]
         _ = os.write(report_fd, f'{self.name}: cloud gate fixture watchdog expired\n'.encode())
         for report in reports:
@@ -159,12 +160,14 @@ class CloudGateFixtureWatchdog:
         command = [sys.executable, '-c', TRIAL_GROUP_LEADER, *command, str(started + remaining / 4)]
         stop_at = started + remaining / 2
         output = bytearray()
-        with self.trial(command, reap_timeout=remaining / 4, worker_stacks=worker_stacks) as (process, diagnostics):
+        with (self.trial(command, reap_timeout=remaining / 4, worker_stacks=worker_stacks) as (process, diagnostics),
+              selectors.DefaultSelector() as stdout_ready):
             assert process.stdout is not None
+            _ = stdout_ready.register(process.stdout, selectors.EVENT_READ)
             try:
                 while True:
                     seconds = stop_at - time.monotonic()
-                    if seconds <= 0 or not select.select([process.stdout], [], [], seconds)[0]:
+                    if seconds <= 0 or not stdout_ready.select(seconds):
                         raise subprocess.TimeoutExpired(command, remaining / 2)
                     chunk = os.read(process.stdout.fileno(), 65536)
                     if not chunk:
@@ -2778,21 +2781,23 @@ def wait_for_watchdog():
 
 wait_for_watchdog()
 '''
-        limit = 2.0
-        watchdog = CloudGateFixtureWatchdog('blocked trial', limit)
+        watchdog = CloudGateFixtureWatchdog('blocked trial', limit_seconds=2.0)
         stacks = self.root / 'worker-stacks.log'
         stacks.touch()
         with (TemporaryFile() as report,
               mock.patch.object(sys.modules[__name__], 'send_process_group', wraps=send_process_group) as stop,
-              watchdog.trial([sys.executable, '-c', worker, str(stacks)], reap_timeout=limit,
-                             worker_stacks=(stacks,)) as (process, _)):
+              watchdog.trial([sys.executable, '-c', worker, str(stacks)], reap_timeout=WATCHDOG_RESULT_TIMEOUT_SECS,
+                             worker_stacks=(stacks,)) as (process, _),
+              selectors.DefaultSelector() as stdout_ready):
             assert process.stdout is not None
+            _ = stdout_ready.register(process.stdout, selectors.EVENT_READ)
             try:
-                wait_until(lambda: 'in wait_for_watchdog' in stacks.read_text(), self.root, limit, watch_writes=True)
+                wait_until(lambda: 'in wait_for_watchdog' in stacks.read_text(), self.root,
+                           WATCHDOG_RESULT_TIMEOUT_SECS, watch_writes=True)
             except TimeoutError:
                 self.fail('The blocked worker did not write its stack')
             with mock.patch.object(os, '_exit') as exit_process, watchdog.watch(report_fd=report.fileno()):
-                self.assertTrue(select.select([process.stdout], [], [], limit * 2)[0], 'The worker kept its pipe open')
+                self.assertTrue(stdout_ready.select(WATCHDOG_RESULT_TIMEOUT_SECS), 'The worker kept its pipe open')
                 self.assertEqual(os.read(process.stdout.fileno(), 1), b'')
             exit_process.assert_called_once_with(1)
             self.assertEqual(process.returncode, -signal.SIGKILL)
