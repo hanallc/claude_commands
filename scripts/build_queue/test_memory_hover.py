@@ -1064,6 +1064,21 @@ function fitLabels() {}
         groups = cast(list[int], self.page_expression("['builds', 'free', 'else'].map(group => groupBytes(data.ram, group))", {}))
         self.assertEqual(groups, [7 * GIB, 30 * GIB, 27 * GIB])
 
+    def test_build_tool_parts_keep_the_displayed_total_and_hide_an_empty_remainder(self) -> None:
+        for remainder, python_tests, waiting_runs, expected in (
+            (0, 264, 248, ["+ Python tests  0.3 GiB", "+ Waiting runs  0.2 GiB"]),
+            (128, 136, 248, ["+ Python tests  0.1 GiB", "+ Waiting runs  0.3 GiB", "+ Other build tools  0.1 GiB"]),
+            (192, 256, 64, ["+ Python tests  0.3 GiB", "+ Waiting runs  <0.1 GiB", "+ Other build tools  0.2 GiB"]),
+            (492, 20, 0, ["+ Python tests  <0.1 GiB", "+ Waiting runs  0.0 GiB", "+ Other build tools  0.5 GiB"]),
+        ):
+            ram = {**RAM_FIXTURE, "python_tests_bytes": python_tests * MIB, "waiting_runs_bytes": waiting_runs * MIB,
+                   "other_build_tools_bytes": remainder * MIB}
+            with self.subTest(remainder=remainder):
+                result = self.page_expression("[tipText('tools', data), tipText('cap', data)]", {"ram": ram, "cap": 31})
+                self.assertEqual(result, [["Build tools  2.0 GiB", "\n".join([
+                    "RAM that build tools use now", "rust-analyzer  1.0 GiB", "+ sccache  0.5 GiB", *expected])],
+                    ["Queue cap  31.0 GiB", "What builds may use\nBuilds  7.0 GiB\n+ Build reserved  6.0 GiB\n+ Free  18.0 GiB"]])
+
     def test_missing_reserves_small_amounts_and_unavailable_readings_have_their_own_text(self) -> None:
         for description, needed, covered, expected in (
                 ("Running builds grow into it.", 9, 5,
@@ -1088,7 +1103,7 @@ function fitLabels() {}
         self.assertEqual(tips[0], ["Shortfall  7.0 GiB", "Reserves that free RAM does not cover\nUncovered swap  1.0 GiB\n+ Uncovered reserve  6.0 GiB"])
         self.assertEqual(tips[1], ["Build reserved  0.0 GiB", "Held for running builds to grow into\nTarget  6.0 GiB\nNot covered  6.0 GiB"])
         self.assertEqual(tips[2], ["Kernel  unavailable", ""])
-        self.assertEqual(tips[3], ["Build tools  0.5 GiB", "RAM that build tools use now\nrust-analyzer  0.0 GiB\n+ sccache  0.0 GiB\n+ Other build tools  0.5 GiB"])
+        self.assertEqual(tips[3], ["Build tools  0.5 GiB", "RAM that build tools use now\nrust-analyzer  0.0 GiB\n+ sccache  <0.1 GiB\n+ Other build tools  0.5 GiB"])
         self.assertEqual(tips[5], ["Not attributed  2.0 GiB", "RAM that the readings do not explain\nKernel, no counter  0.0 GiB\n+ No program name  2.0 GiB"])
         self.assertEqual(tips[4], "0.0 GiB")
         self.assertEqual(tips[6], ["System reserved  5.0 GiB", "RAM kept outside the queue cap\nSafety net  4.0 GiB\n+ Swap coming back  1.0 GiB"])
