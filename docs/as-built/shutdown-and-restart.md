@@ -293,9 +293,20 @@ The reader finds transcripts through `scripts/lib/transcripts.py` and reads from
 
 `agents add-producer NAME` reads `producer_defaults.model` from `config/models.conf`.
 The create command validates the name and records its profile and README text before it writes them.
+The staff owner publishes the creation machine and creation ID under `[producer_creations]` with the profile.
+The staff owner compares names without case distinctions and refuses a claim when a marker or staff row exists.
+The staff owner checks the current marker before removal.
+A pending creation requires the local creation record on that machine.
+Resume on another machine names the machine that holds the record and gives the `add-producer` command.
 It creates the README from `templates/producer/README.md` when the README is absent.
 The first conversation receives a prompt to read the README and run `/producer:produce`.
-The producer admission record keeps the time for prompt recovery after a failed start.
+The creation record keeps the time for prompt recovery after a failed start.
+Resume accepts a matching Codex user turn even when the turn has no timestamp.
+A malformed Codex rollout line blocks automatic retries of the opening prompt.
+Check the reserved pane for the opening prompt.
+If the prompt is absent, run `agents resume NAME --resend-opening-prompt` on the creation machine.
+The command sends the prompt once when the pane is idle and its input is empty.
+The create or resume command removes the shared creation entry after prompt confirmation, staff admission, and pane publication.
 The command reports the staff id, account and tab.
 
 ### Rename or retire a producer
@@ -765,8 +776,10 @@ The command runs in its own session, including through the scope prefix.
 The record saves the command's process group.
 The supervisor uses default TERM, INT, and HUP dispositions.
 It installs no signal handler.
-`detached_runs.py stop` checks the supervisor and command identity, then signals the command group.
-The supervisor stays alive, records the exit status and delivers the result.
+`detached_runs.py stop` checks the supervisor and the command identity before it signals the command group.
+The supervisor stays alive to record the exit status and deliver the result.
+A worker that stops its own run keeps its pass active.
+A stop from another caller can end the pass and notify the director.
 The command gate starts a watcher in the command group. The watcher reads the supervisor pipe.
 The supervisor writes "done" to the pipe after the command ends.
 If the pipe closes without "done", the supervisor ended first: a signal, a SIGKILL or a crash.

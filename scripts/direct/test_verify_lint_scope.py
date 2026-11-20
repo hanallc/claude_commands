@@ -37,17 +37,20 @@ from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 
 
 class VerifyLintScopeTests(support.VerifyLintScopeFixture):
-    def test_cache_reads_each_tool_version_once_per_run_and_rejects_a_changed_version(self) -> None:
+    def test_cache_reads_build_info_again_only_for_publication(self) -> None:
         _ = self.enable_cache()
         events = self.root / "version-events"
         self.environment["TEST_VERSION_EVENTS"] = str(events)
-        for version, recorded in (("before", False), ("before", True), ("after", False)):
-            with self.subTest(version=version, recorded=recorded):
+        for build_id, recorded in (("before", False), ("before", True), ("after", False)):
+            with self.subTest(build_id=build_id, recorded=recorded):
                 events.unlink(missing_ok=True)
-                self.environment["TEST_VERSION_MEND"] = version
+                support.write_fixture_cargo_mend(self.root / "bin/cargo-mend", build_id)
                 result = self.verify("lint", "sample")
                 self.assertEqual("(recorded)" in result.stdout, recorded)
-                self.assertEqual(events.read_text().splitlines(), ["TAPLO", "MEND", "RUSTFMT", "CLIPPY"])
+                expected = ["MEND", "TAPLO", "RUSTFMT", "CLIPPY"]
+                if not recorded:
+                    expected.append("MEND")
+                self.assertEqual(events.read_text().splitlines(), expected)
                 self.assertEqual(self.clippy_ran(), not recorded)
 
     def test_uncached_lint_reads_only_the_formatter_availability_version(self) -> None:

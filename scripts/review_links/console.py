@@ -17,6 +17,8 @@ from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
 from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, review_link, review_legacy
 
+PHONE_QUERY = "(max-width:680px)"
+
 PAGE_NAME = "console.html"
 # The console posts the open page here and reads which other pages hold new items.
 NEWS_NAME = "news"
@@ -277,7 +279,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
               + icon_svg("inbox") + '<span class="for-you-label">For you</span><b data-for-you-count>?</b>'
               + '<span class="for-you-state" data-for-you-state>Unavailable</span></button>')
     content = content.replace("<!-- FOR YOU BUTTON -->", button)
-    content = content.replace("<!-- FOR YOU STYLE -->", page_frame.COPY_STYLE + FOR_YOU_STYLE)
+    content = content.replace("<!-- SHARED STYLES -->", page_frame.BUTTON_STATES + page_frame.COPY_STYLE + FOR_YOU_STYLE)
     notifier = FOR_YOU_SCRIPT
     if any(page.identity == "accounts" and isinstance(page.destination, AvailablePage) for page in pages):
         icons = {level: accounts_page.quota_icon(level)
@@ -291,7 +293,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu") + '<span class="new-mark" id="menu-new" hidden>' + new_mark + '</span>')
     content = content.replace('<script>', '<script>'+REVIEW_PLACE_SCRIPT, 1)
-    return content.encode("utf-8")
+    return content.replace("/* Phone query */", PHONE_QUERY).encode("utf-8")
 
 
 FOR_YOU_STYLE = r'''
@@ -300,7 +302,6 @@ FOR_YOU_STYLE = r'''
 .collapsed .for-you-slot{width:72px}
 .for-you-button{position:relative;display:flex;align-items:center;gap:12px;min-height:48px;width:100%;padding:12px 14px;
 border:1px solid var(--notice-hover);border-radius:9px;background:var(--notice);color:var(--notice-text);font-weight:600;text-align:left;cursor:pointer}
-.for-you-button:hover{background:var(--notice-hover)}
 .for-you-button b{margin-left:auto;background:var(--notice-text);color:var(--notice);border-radius:999px;min-width:24px;line-height:24px;text-align:center;font-size:13px}
 .for-you-button[data-state=quiet]{background:var(--hover);border-color:var(--border);color:var(--muted)}
 .for-you-button[data-state=quiet] b{background:var(--border);color:var(--muted)}
@@ -328,7 +329,7 @@ font:14px/1.4 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 #action-popover a{color:var(--accent);font-size:13px;text-decoration:none}
 #action-popover footer{padding:14px 20px;border-top:1px solid var(--border);background:var(--hover)}
 .mobile-header .for-you-button{display:none}
-@media(max-width:680px){.for-you-slot{display:none}.mobile-header .for-you-button{display:flex;width:auto;gap:6px;min-height:36px;padding:5px 8px;font-size:12px}
+@media /* Phone query */{.for-you-slot{display:none}.mobile-header .for-you-button{display:flex;width:auto;gap:6px;min-height:36px;padding:5px 8px;font-size:12px}
 .mobile-header .for-you-button svg{width:16px;height:16px}.mobile-header .for-you-label{display:inline}
 .mobile-header .for-you-state{display:none}.mobile-header .for-you-button b{position:static;min-width:20px;line-height:20px}
 .mobile-header .for-you-button[data-state=stale] b{outline:2px dotted var(--notice-text);outline-offset:2px}
@@ -480,7 +481,7 @@ DOCUMENT = """<!doctype html>
 h1{font-size:16px;letter-spacing:-.3px;margin:0;font-weight:650;white-space:nowrap;flex:1}
 button,a{-webkit-tap-highlight-color:transparent}button{font:inherit}
 .toggle{border:0;border-radius:8px;background:transparent;color:var(--muted);width:36px;height:36px;
-display:grid;place-items:center;cursor:pointer;flex:none;padding:8px}.toggle:hover{background:var(--hover);color:var(--text)}
+display:grid;place-items:center;cursor:pointer;flex:none;padding:8px}
 svg{width:20px;height:20px;flex:none}.open-icon{display:none}
 nav{padding:22px 12px;display:flex;flex-direction:column;gap:6px}
 .nav-entry{position:relative;display:flex;gap:12px;align-items:center;min-height:46px;padding:11px 14px;border-radius:9px;
@@ -521,7 +522,7 @@ background:var(--notice);color:var(--notice-text);font-weight:600;text-align:lef
 border-radius:9px;background:var(--notice-text);color:var(--notice);font-size:11px;font-weight:700}
 .collapsed .rebuild-link:hover .tooltip,.collapsed .rebuild-link:focus .tooltip{display:block}
 [hidden]{display:none!important}.dismiss,.mobile-header{display:none}
-@media(max-width:680px){.shell,.shell.collapsed{display:flex;flex-direction:column}
+@media /* Phone query */{.shell,.shell.collapsed{display:flex;flex-direction:column}
 .mobile-header{height:56px;flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;
 background:var(--nav);border-bottom:1px solid var(--border);z-index:4}
 .sidebar{position:fixed;inset:56px auto 0 0;width:244px;box-shadow:10px 0 32px #0002;overflow-y:auto}
@@ -532,7 +533,7 @@ background:var(--nav);border-bottom:1px solid var(--border);z-index:4}
 .rebuild-slot:has(>[hidden]){display:none}
 .rebuild-link,.collapsed .rebuild-link{width:auto;max-width:none;margin:12px}
 .collapsed .rebuild-link .entry-label{display:inline}.collapsed .rebuild-count,.collapsed .rebuild-link .tooltip{display:none!important}}
-<!-- FOR YOU STYLE -->
+<!-- SHARED STYLES -->
 </style></head><body>
 <div class="shell" id="console-shell" <!-- SHELL -->>
 <header class="mobile-header"><button class="toggle" id="mobile-nav-toggle" type="button"
@@ -566,7 +567,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   const shell = document.getElementById('console-shell');
   const toggle = document.getElementById('nav-toggle');
   const mobileToggle = document.getElementById('mobile-nav-toggle');
-  const phone = matchMedia('(max-width:680px)');
+  const phone = matchMedia('/* Phone query */');
   const entries = [...document.querySelectorAll('.nav-entry')];
   const rebuildLink = document.getElementById('rebuild-link');
   // The rebuild link opens its page as a navigation entry does, so it is one of the pages.

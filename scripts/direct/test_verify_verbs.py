@@ -185,7 +185,7 @@ class VerifyWorkspaceFormTests(FinalPassFixture):
         self.assertIn("check --workspace --all-targets --features extra", self.calls_made())
         calls = [call for call in self.calls_made() if call.startswith("nextest run ")]
         self.assertEqual(len(calls), 1)
-        self.assertIn("--workspace --tests -E package(sample)", calls[0])
+        self.assertIn("--workspace --tests -E package(sample) --features extra", calls[0])
         self.assertEqual([row["package"] for row in self.recorded_calls()], ["sample"])
         self.assertEqual(self.pass_files(), [])
 

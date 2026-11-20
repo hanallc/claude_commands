@@ -220,7 +220,7 @@
 # Test keys also include the result environment selected in direct.conf.
 # Fixed terminal values replace caller values locally and on remote targets.
 # New result inputs and --env values do not change the build key.
-# Lint keys include mend, nightly rustfmt, Clippy and Taplo versions.
+# Lint keys include tool versions and the cargo-mend content hash.
 # Filter keys sort names and remove duplicate names.
 # Do not cache usage errors, sandbox failures or killed runs.
 # Do not cache lint failures if the last repair and format pass changed files.
@@ -853,6 +853,29 @@ run() {
 }
 
 run_step() {
+    local -a command=("$@")
+    local cargo_index=0 BUILDLOG_VERIFY_POSITION=1
+    if [[ "${command[0]:-}" == env ]]; then
+        cargo_index=1
+        while :; do
+            case "${command[cargo_index]:-}" in
+                -u) (( cargo_index += 2 )) ;;
+                *=*) (( cargo_index += 1 )) ;;
+                *) break ;;
+            esac
+        done
+    fi
+    if [[ "${command[cargo_index]:-}" == cargo ]]; then
+        (( cargo_index += 1 ))
+        if [[ "${command[cargo_index]:-}" == +* ]]; then (( cargo_index += 1 )); fi
+        case "${CMD:-}:${command[cargo_index]:-}" in
+            final:nextest) BUILDLOG_VERIFY_POSITION=2 ;;
+            lint:clippy) BUILDLOG_VERIFY_POSITION=${VERIFY_STEP_COUNT:-1} ;;
+        esac
+    fi
+    local -x BUILDLOG_VERIFY_VERB="${CMD:-}" BUILDLOG_VERIFY_CALL="${VERIFY_CALL_TEXT:-}"
+    local -x BUILDLOG_VERIFY_TOTAL="${VERIFY_STEP_COUNT:-1}"
+    export BUILDLOG_VERIFY_POSITION
     if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
         if buildlog_step_compiles "$@"; then
             local STEP_WRITES_TREE=0
@@ -1525,6 +1548,24 @@ if [[ "$CMD" == example-test ]]; then
 fi
 
 
+# Use the same safe characters and single quotes as shlex.join.
+format_verify_call() {
+    local LC_ALL=C arg
+    VERIFY_CALL_TEXT=verify
+    if [[ "${1:-}" == --session-dir ]]; then shift 2; fi
+    for arg in "$@"; do
+        case "$arg" in
+            ''|*[!a-zA-Z0-9_@%+=:,./-]*)
+                arg="'${arg//\'/\'\"\'\"\'}'"
+                ;;
+        esac
+        VERIFY_CALL_TEXT+=" $arg"
+    done
+}
+format_verify_call "${VERIFY_ORIGINAL_ARGS[@]}"
+VERIFY_STEP_COUNT=1
+if [[ "$CMD" == final ]]; then VERIFY_STEP_COUNT=2; fi
+
 parse_routing_arguments "$@"
 if [[ "$CMD" == batch ]]; then
     if [[ ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ]]; then
@@ -1718,11 +1759,14 @@ phase_wait_start() {
     fi
     local args=(start-wait --session-dir "$PHASE_WAIT_SESSION"
         --kind WaitingForMemoryOrSlot --reason "$reason")
-    local owner="${CODEX_THREAD_ID:-}"
-    if [[ -n "$owner" ]]; then
-        args+=(--worker-thread-id "$owner" --owner-session "$owner")
+    local owner="${CODEX_THREAD_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
+    args+=(--owner-session "$owner")
+    if [[ -n "${UNIT_PHASE_ID:-}" ]]; then
+        args+=(--verify-phase-id "$UNIT_PHASE_ID")
+    elif [[ -n "${CODEX_THREAD_ID:-}" ]]; then
+        args+=(--worker-thread-id "$owner")
     else
-        args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
+        args+=(--director)
     fi
     if id="$(verify_helper "$PHASE_WAIT_RECORDER" "${args[@]}" ${holder_args[@]+"${holder_args[@]}"})"; then
         if [[ -n "$id" ]]; then
@@ -1938,6 +1982,7 @@ VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
 LINT_FIX_INCOMPLETE=0
+LINT_USED_REMOTE_MEND=0
 PLACEMENT_FAILED=0
 RUN_STARTED=0
 CALL_NOTED=0
@@ -2003,7 +2048,7 @@ tree_key() {
         # Keyed on the package's own build, read from the call's metadata.
         if [[ -n "${ARGS[0]}" ]]; then scope=(--package "${ARGS[0]}"); fi
     fi
-    if [[ "$CMD" == lint && -z "${CACHE_DIR:-}" ]]; then
+    if [[ "$CMD" == lint && ( "$content" == 1 || -z "${CACHE_DIR:-}" ) ]]; then
         key_options+=(--without-lint-versions)
     fi
     VERIFY_RESULT_ENVIRONMENT_FD=3 \
@@ -2047,6 +2092,12 @@ find_mac_runner_pid() {
     fi
 }
 
+stop_assigned_gpu_unit() {
+    if [[ -n "${PLACEMENT_ASSIGNMENT_FILE:-}" ]]; then
+        verify_helper "$BUILD_TARGETS_SCRIPT" stop-hana-gpu --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" || true
+    fi
+}
+
 cancel_tree_run() {
     after_tree_change || return 0
     local runner_pid
@@ -2058,6 +2109,7 @@ cancel_tree_run() {
         collect_child "$runner_pid" TERM
         MAC_RUNNER_PID=""
     fi
+    if [[ "${STEP_ASSIGNED_TARGET:-}" == hana-gpu ]]; then stop_assigned_gpu_unit; fi
     # Board release also stops a step's separately owned process group.
     if declare -F release_token >/dev/null; then release_token || true; fi
     if [[ -n "${RUN_STEP_PID:-}" ]]; then
@@ -2103,21 +2155,28 @@ finish_tree_watch() {
     TREE_WATCH_DIR=""
 }
 
+# Match the checkout selection for Python on standard input.
+doc_staged_helper() {
+    local folder script="$VERIFY_START_DIR/doc_step.py"
+    folder=$(pwd -P) || return
+    while :; do
+        if [[ -f "${folder%/}/scripts/lib/py" ]]; then
+            if [[ "$folder" != "${VERIFY_START_DIR%/*/*}" ]]; then
+                VERIFY_PY_HELPER=DOC_STEP_PY "$PY" - "$script" "$@" < "$script"
+                return
+            fi
+            break
+        fi
+        [[ "$folder" != / ]] || break
+        folder=${folder%/*}
+        folder=${folder:-/}
+    done
+    verify_helper "$script" "$@"
+}
+
 # Read the staged tree through the copy owner's private index.
 doc_tree() {
-    VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" "$DOC_REPO_TOP" "${1:-}" <<'PYDOC'
-from pathlib import Path
-import sys
-with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
-from scripts.buildlog.treekey import committed_tree_key
-from scripts.copies import copies
-
-tree = copies.staged_tree(Path(sys.argv[2]))
-if sys.argv[3] == "with-key":
-    print(tree, committed_tree_key(tree.encode("ascii")))
-else:
-    print(tree)
-PYDOC
+    doc_staged_helper "${1:-tree}" "$DOC_REPO_TOP"
 }
 
 doc_checkout() {
@@ -2185,52 +2244,7 @@ step_close_checkout() {
 }
 
 doc_record() {
-    local current_tree
-    current_tree="$(doc_tree)" || return
-    if [[ "$current_tree" != "$DOC_TREE" ]]; then
-        echo 'verify.sh: the staged tree changed while doc ran; no doc pass record was written.'
-        return 0
-    fi
-    VERIFY_PY_HELPER=DOC_RECORD_PY "$PY" - "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID" <<'PYDOC'
-from datetime import datetime, timezone
-import json
-import os
-from pathlib import Path
-import sys
-import tempfile
-import time
-
-records = Path.home() / ".local/state/verify/doc_pass"
-records.mkdir(parents=True, exist_ok=True)
-cutoff = time.time() - 14 * 24 * 60 * 60
-for old in records.glob("*.json"):
-    try:
-        if old.stat().st_mtime < cutoff:
-            old.unlink()
-    except FileNotFoundError:
-        pass
-record = dict(repo_top=str(Path(sys.argv[1]).resolve()), tree_id=sys.argv[2],
-              time=datetime.now(timezone.utc).isoformat(), call_id=sys.argv[3])
-with tempfile.NamedTemporaryFile(mode="w", dir=records, prefix=".doc-", delete=False) as output:
-    temporary = Path(output.name)
-    try:
-        json.dump(record, output)
-        output.flush()
-        os.fsync(output.fileno())
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-try:
-    temporary.replace(records / (sys.argv[2] + ".json"))
-    directory_fd = os.open(records, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-finally:
-    temporary.unlink(missing_ok=True)
-print("verify.sh: doc pass recorded for tree " + sys.argv[2])
-PYDOC
+    doc_staged_helper record "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID"
 }
 
 # note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in
@@ -2316,6 +2330,7 @@ forward_mac_runner_signal() {
     if [[ -n "$runner_pid" ]]; then
         collect_child "$runner_pid" "$signal_name"
     fi
+    if [[ "${STEP_ASSIGNED_TARGET:-}" == hana-gpu ]]; then stop_assigned_gpu_unit; fi
     if [[ -n "$MAC_RESULT_FILE" ]]; then
         if [[ -d "$MAC_RESULT_FILE" ]]; then
             rmdir "$MAC_RESULT_FILE" 2>/dev/null || true
@@ -2433,17 +2448,24 @@ with open(3, "rb") as handoff:
 sys.argv = sys.argv[1:]
 runpy.run_path(sys.argv[0], run_name="__main__")
 '
+    local runner="$MAC_RUNNER"
+    if [[ "$selected_target" == hana-gpu ]]; then
+        runner="$BUILD_TARGETS_SCRIPT"
+        runner_args=(run-hana-gpu --assignment-file "$PLACEMENT_ASSIGNMENT_FILE"
+            --repo-root "$runner_root" --package "$PKG"
+            --result-file "$MAC_RESULT_FILE" -- "${PLACEMENT_COMMAND[@]}")
+    fi
     MAC_RUNNER_PRIOR_JOB=${!:-}
     MAC_RUNNER_LAUNCHING=1
     (
         if [[ -n "$MAC_SOURCE_ROOT" && "$runner_root" == "$MAC_SOURCE_ROOT" ]]; then
-            if [[ "$MAC_RUNNER" != /* ]]; then MAC_RUNNER=$PWD/$MAC_RUNNER; fi
+            if [[ "$runner" != /* ]]; then runner=$PWD/$runner; fi
             cd -- "$runner_root" || exit $?
         fi
         if [[ -z ${VERIFY_MAC_ENVIRONMENT[0]+set} ]]; then
-            exec "$PY" "$MAC_RUNNER" "${runner_args[@]}"
+            exec "$PY" "$runner" "${runner_args[@]}"
         fi
-        VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$MAC_RUNNER" "${runner_args[@]}" \
+        VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$runner" "${runner_args[@]}" \
             3< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
     ) > >(tee -a /dev/fd/9) 2> >(tee -a /dev/fd/9 >&2) &
     MAC_RUNNER_PID=$!
@@ -2502,6 +2524,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     fi
 
     LAST_TARGET_OUTCOME="$result_word" LAST_TARGET_REASON="$result_reason"
+    if [[ "$CMD" == lint && "$MAC_VERB" == mend-* && ( "$result_word" == passed || "$result_word" == failed ) ]]; then
+        LINT_USED_REMOTE_MEND=1
+    fi
     BUILDLOG_MAC="$result_word"
     BUILDLOG_MAC_REASON="$result_reason"
     BUILDLOG_MAC_S="$result_seconds"
@@ -2788,7 +2813,7 @@ release_wait_claim() {
 try_reserved_target() {
     [[ -n "${PLACEMENT_ASSIGNMENT_FILE:-}" && -s "$PLACEMENT_ASSIGNMENT_FILE" ]] || return 2
     [[ "${PLACEMENT_PROVIDER:-local}" != local ]] || return 2
-    if [[ ! -f "$MAC_RUNNER" ]]; then
+    if [[ "$STEP_ASSIGNED_TARGET" != hana-gpu && ! -f "$MAC_RUNNER" ]]; then
         release_wait_claim
         verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" claim-failed --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
             --reason runner >/dev/null || return $?
@@ -2900,6 +2925,7 @@ placement_failed() {
 }
 
 placement_once() {
+    local repository="${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
     local token=none reply line route="" status=0 monitor=0 refresh_source=${1:-0}
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
@@ -2923,8 +2949,7 @@ placement_once() {
             snapshot=$(verify_helper "$STEP_COPIES_SCRIPT" snapshot-tree --repo "$VERIFY_SLOT_SOURCE") || return $?
             read -r tree key head <<< "$snapshot"
         else
-            key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key \
-                --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}") || return $?
+            key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "$repository") || return $?
         fi
         VERIFY_SLOT_TREE=$tree PLACEMENT_SOURCE_KEY=$key VERIFY_SLOT_HEAD=$head
         PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
@@ -2940,7 +2965,7 @@ placement_once() {
     if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
-        --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
+        --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "$repository" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$token"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
@@ -3188,7 +3213,8 @@ route_test() {
             continue
         fi
         (( placement_status == 0 )) || return "$placement_status"
-        if [[ "${PLACEMENT_COMMAND[0]:-}" == cargo && "${PLACEMENT_COMMAND[1]:-}" == nextest ]]; then
+        if [[ "$STEP_ASSIGNED_TARGET" != hana-gpu && "${PLACEMENT_COMMAND[0]:-}" == cargo
+                && "${PLACEMENT_COMMAND[1]:-}" == nextest ]]; then
             require_nextest
         fi
         collect_routing_wait
@@ -3221,10 +3247,9 @@ route_test() {
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" report-prerequisite --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
                 --token after-grant >/dev/null || return $?
         fi
-        local claim_status=0
         local STEP_REMOTE_REPO_ROOT=${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}
         # Direct doc keeps its own repository as the runner's repo root.
-        if [[ -f "$MAC_RUNNER" && -n "${VERIFY_SLOT_SOURCE:-}" ]]; then
+        if [[ -n "${VERIFY_SLOT_SOURCE:-}" && ( "$STEP_ASSIGNED_TARGET" == hana-gpu || -f "$MAC_RUNNER" ) ]]; then
             if [[ "$PLACEMENT_PROVIDER" == ssh && "$STEP_ASSIGNED_PLATFORM" == linux &&
                     ( "$CMD" != doc || "$VERIFY_SLOT_SOURCE" == "${COPIES_STEP_SOURCE:-}" ) ]]; then
                 doc_checkout "$VERIFY_SLOT_SOURCE" "$VERIFY_SLOT_TREE" "${COPIES_STEP_REPOSITORY:-$VERIFY_SLOT_SOURCE}" || return $?
@@ -3234,39 +3259,42 @@ route_test() {
                 STEP_REMOTE_REPO_ROOT=$MAC_SOURCE_ROOT
             fi
         fi
-        local -a reservation_words=(--assignment-file "$PLACEMENT_ASSIGNMENT_FILE"
-            --repo-root "$STEP_REMOTE_REPO_ROOT" --package "$PKG"
-            --kind "$(remote_step_kind)" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation"
-            --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity")
-        verify_helper "$BUILD_TARGETS_SCRIPT" reserve "${reservation_words[@]}" || claim_status=$?
-        if (( claim_status != 0 && claim_status != 13 )); then
-            local recovered=78
-            while (( recovered == 78 )); do
-                recovered=0
-                verify_helper "$BUILD_TARGETS_SCRIPT" recover-reservation "${reservation_words[@]}" || recovered=$?
-                if (( recovered == 78 )); then wait_for_claim_recovery; fi
-            done
-            if (( recovered == 0 || recovered == 13 )); then
-                claim_status=$recovered
-            elif (( recovered != 1 )); then
-                step_close_checkout || true
-                return "$recovered"
-            fi
-        fi
-        if (( claim_status != 0 && claim_status != 13 )); then
-            step_close_checkout || return $?
-            local claim_reason=state
-            if (( claim_status == 11 )); then claim_reason=busy; fi
-            if (( claim_status == 10 )); then claim_reason=blocked; fi
-            verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" claim-failed --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
-                --reason "$claim_reason" || return $?
-            if [[ -n "$PINNED_TARGET" && "$claim_reason" != busy ]]; then
-                if (( claim_status == 1 )) && [[ "$STEP_ASSIGNED_PLATFORM" == linux ]]; then
-                    pinned_target_refuse 'admission changed'
+        if [[ "$STEP_ASSIGNED_TARGET" != hana-gpu ]]; then
+            local claim_status=0
+            local -a reservation_words=(--assignment-file "$PLACEMENT_ASSIGNMENT_FILE"
+                --repo-root "$STEP_REMOTE_REPO_ROOT" --package "$PKG"
+                --kind "$(remote_step_kind)" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation"
+                --claim-identity-file "$HOLD_WAIT_DIR/ssh-reservation.identity")
+            verify_helper "$BUILD_TARGETS_SCRIPT" reserve "${reservation_words[@]}" || claim_status=$?
+            if (( claim_status != 0 && claim_status != 13 )); then
+                local recovered=78
+                while (( recovered == 78 )); do
+                    recovered=0
+                    verify_helper "$BUILD_TARGETS_SCRIPT" recover-reservation "${reservation_words[@]}" || recovered=$?
+                    if (( recovered == 78 )); then wait_for_claim_recovery; fi
+                done
+                if (( recovered == 0 || recovered == 13 )); then
+                    claim_status=$recovered
+                elif (( recovered != 1 )); then
+                    step_close_checkout || true
+                    return "$recovered"
                 fi
-                pinned_target_refuse "$claim_reason"
             fi
-            continue
+            if (( claim_status != 0 && claim_status != 13 )); then
+                step_close_checkout || return $?
+                local claim_reason=state
+                if (( claim_status == 11 )); then claim_reason=busy; fi
+                if (( claim_status == 10 )); then claim_reason=blocked; fi
+                verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" claim-failed --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" \
+                    --reason "$claim_reason" || return $?
+                if [[ -n "$PINNED_TARGET" && "$claim_reason" != busy ]]; then
+                    if (( claim_status == 1 )) && [[ "$STEP_ASSIGNED_PLATFORM" == linux ]]; then
+                        pinned_target_refuse 'admission changed'
+                    fi
+                    pinned_target_refuse "$claim_reason"
+                fi
+                continue
+            fi
         fi
         try_reserved_target "$last_decline" || return $?
         [[ "$MAC_PASSED" != 1 ]] || return 0
@@ -3390,7 +3418,13 @@ finish_copy_win() {
 run_local_test() {
     local status=0
     export BUILDLOG_TARGET=natedev
-    run_nextest "${NEXTEST_ARGS[@]}" || status=$?
+    if [[ "$PINNED_TARGET" == hana-gpu ]]; then
+        local -a profile=()
+        if [[ -n "${NEXTEST_PROFILE:-}" ]]; then profile=(--profile "$NEXTEST_PROFILE"); fi
+        run cargo nextest run "${profile[@]}" "${NEXTEST_ARGS[@]}" || status=$?
+    else
+        run_nextest "${NEXTEST_ARGS[@]}" || status=$?
+    fi
     if [[ -n "${COPY_WATCH_PID:-}" ]]; then
         stop_copy_watch
         if [[ "$COPY_WORD" == won && "$COPY_STOPPED" == 1 && "$status" != 0 \
@@ -3406,31 +3440,57 @@ run_local_test() {
 # with. Sets LOOKUP_KEY either way, --no-cache included.
 cache_lookup() {
     [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 1
-    local record outcome="" word
+    # The lint key identifies the local cargo-mend binary.
+    if [[ "$CMD" == lint && ( "$MAC_ONLY" == 1 || "${PINNED_TARGET:-natedev}" != natedev ) ]]; then
+        return 1
+    fi
+    local record kind record_text first_line host status_line saved_s line outcome="" word recheck_mend=0
     [[ -n "${CACHE_DIR}" ]] || return 1
     LOOKUP_KEY="$(tree_key)"
     [[ -n "${LOOKUP_KEY}" && "${NO_CACHE}" -eq 0 ]] || return 1
     record="${CACHE_DIR}/${LOOKUP_KEY}"
-    # --local needs a natedev pass; --mac needs a Mac pass.
-    if [[ -f "${record}.pass" \
-          && ! ( "$LOCAL_ONLY" == 1 && "$(sed -n 's/^host=//p' "${record}.pass")" == mac ) \
-          && ! ( "$MAC_ONLY" == 1 && "$(sed -n 's/^host=//p' "${record}.pass")" != mac ) ]]; then
-        record+=.pass outcome=reused word=PASS
-    elif [[ -f "${record}.fail" ]]; then
-        record+=.fail outcome=replayed word=FAIL
-    fi
+    if [[ "$CMD" == lint && "${1:-}" == --after-wait ]]; then recheck_mend=1; fi
+    for kind in pass fail; do
+        [[ -f "${record}.${kind}" ]] || continue
+        if (( recheck_mend )); then
+            verify_helper "$TREE_WATCH_SCRIPT" --recheck-mend </dev/null 2>/dev/null || return 1
+            recheck_mend=0
+        fi
+        record_text="$(cat -- "${record}.${kind}" 2>/dev/null)" || return 1
+        [[ -n "$record_text" ]] || return 1
+        host="" status_line="" saved_s=""
+        while IFS= read -r line; do
+            case "$line" in
+                host=*) host="${line#host=}" ;;
+                status=*) status_line="$line" ;;
+                saved_s=*) saved_s="${line#saved_s=}" ;;
+            esac
+        done <<< "$record_text"
+        if [[ "$kind" == pass ]]; then
+            # Pass records must match the requested host.
+            if [[ ( "$LOCAL_ONLY" == 1 && "$host" == mac ) || ( "$MAC_ONLY" == 1 && "$host" != mac ) ]]; then
+                continue
+            fi
+            outcome=reused word=PASS
+        else
+            outcome=replayed word=FAIL
+        fi
+        break
+    done
     [[ -n "${outcome}" ]] || return 1
+    # Old pass records have no status line.
+    if [[ -z "$status_line" && "$kind" == pass ]]; then status_line=status=0; fi
+    [[ -n "${status_line#status=}" ]] || return 1
+    LOOKUP_STATUS="${status_line#status=}"
     if [[ -n "${VERIFY_BATCH_CACHE_HIT:-}" ]]; then : > "$VERIFY_BATCH_CACHE_HIT"; fi
-    LOOKUP_STATUS="$(sed -n 's/^status=//p' "${record}")"
-    LOOKUP_STATUS="${LOOKUP_STATUS:-0}"
-    note_event "${outcome}" "${SECONDS}" 0 0 "$(sed -n 's/^saved_s=//p' "${record}")" \
-        "${LOOKUP_STATUS}" || true
+    first_line="${record_text%%$'\n'*}"
+    note_event "${outcome}" "${SECONDS}" 0 0 "$saved_s" "${LOOKUP_STATUS}" || true
     if [[ "${FILTER_RUN}" -eq 1 ]]; then
-        echo "verify.sh: ${word} (recorded), skipped — $(head -n 1 "${record}"); the tree and every input are unchanged since, so nothing was built or run (--no-cache runs it anyway)."
+        echo "verify.sh: ${word} (recorded), skipped — ${first_line}; the tree and every input are unchanged since, so nothing was built or run (--no-cache runs it anyway)."
         return 0
     fi
-    echo "verify.sh: ${word} (recorded) — $(head -n 1 "${record}")"
-    if ! head -n 1 "${record}" | grep -qF "\`verify.sh $CMD${VERIFY_PACKAGE:+ $VERIFY_PACKAGE}${COMMAND_ARGS[*]:+ ${COMMAND_ARGS[*]}}\`"; then
+    echo "verify.sh: ${word} (recorded) — ${first_line}"
+    if [[ "$first_line" != *"\`verify.sh $CMD${VERIFY_PACKAGE:+ $VERIFY_PACKAGE}${COMMAND_ARGS[*]:+ ${COMMAND_ARGS[*]}}\`"* ]]; then
         echo "verify.sh: lint covers the workspace and every changed member, so that result answers this package too."
     fi
     if [[ "${outcome}" == reused ]]; then
@@ -3467,7 +3527,7 @@ user_clock() {
 }
 
 cache_record() {
-    local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
+    local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail key_options=()
     # A lost token gives no verdict about the tree.
     (( EXIT_STATUS != 125 )) || return 1
     if [[ -n "${VERIFY_SLOT_EXECUTED_TREE:-}" ]]; then
@@ -3476,9 +3536,12 @@ cache_record() {
         [[ "${snapshot%% *}" == "$VERIFY_SLOT_EXECUTED_TREE" ]] || return 1
     fi
     if [[ "$CMD" == lint ]]; then
+        # A remote mend result has no binary identity in the local key.
+        [[ "${LINT_USED_REMOTE_MEND:-0}" == 0 ]] || return 1
         [[ -n "$LINT_LOADED_CODE_KEY" && "$(lint_code_key)" == "$LINT_LOADED_CODE_KEY" ]] || return 1
+        key_options+=(--recheck-mend)
     fi
-    key="$(tree_key)"
+    key="$(tree_key ${key_options[@]+"${key_options[@]}"})"
     [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
     if [[ "${key}" != "${VERDICT_KEY}" ]]; then
         if [[ -z "$VERDICT_TREE_KEY" || "$(tree_key --tree-content)" != "$VERDICT_TREE_KEY" ]]; then
@@ -3627,6 +3690,7 @@ trap - INT TERM HUP
 # rule applies here too — the thing that runs the work opens the window.
 PROGRESS_HISTORY="${BUILD_HELPER_ROOT}/direct/progress_history.py"
 ACTIVITY_SESSION_DIR="${UNIT_SESSION_DIR:-}"
+ACTIVITY_PHASE_ID="${UNIT_PHASE_ID:-}"
 
 # A phase runs two workers against one target/ directory and one Cargo lock,
 # so every cargo run below has to be serialized against its peers. Taking the
@@ -3745,8 +3809,7 @@ supersede_older_waiters() {
         [[ "$pid" =~ ^[0-9]+$ && "$stamp" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
         if ! kill -0 "$pid" 2>/dev/null; then
             rm -f "$file"
-        elif (( 10#$stamp < 10#$own )) \
-            && ps -p "$pid" -o args= 2>/dev/null | grep -q 'verify\.sh'; then
+        elif (( 10#$stamp < 10#$own )) && token_waiter_runs_verify "$pid"; then
             kill -USR1 "$pid" 2>/dev/null || true
         fi
     done
@@ -4249,7 +4312,7 @@ build_hold_wait_local() {
 
 # Again before the first step: a peer running this same call on this tree may
 # have recorded its result since the first lookup.
-if [[ "$MAC_ONLY" == 0 ]] && cache_lookup; then
+if [[ "$MAC_ONLY" == 0 ]] && cache_lookup --after-wait; then
     if ! release_token && (( LOOKUP_STATUS == 0 )); then
         LOOKUP_STATUS=1
     fi
@@ -4307,6 +4370,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
     if [[ "${VERIFY_BATCH_STEP:-}" == format ]]; then ACTIVITY_VERB=format; fi
     if verify_helper "${PROGRESS_HISTORY}" start-activity \
         --session-dir "${ACTIVITY_SESSION_DIR}" \
+        --phase-id "${ACTIVITY_PHASE_ID}" \
         --label "Verification" \
         --activity "verify.sh ${ACTIVITY_VERB}${*:+ $*}" >/dev/null 2>&1; then
         ACTIVITY_ACTIVE=1
@@ -4322,6 +4386,7 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
             esac
             verify_helper "${PROGRESS_HISTORY}" finish-activity \
                 --session-dir "${ACTIVITY_SESSION_DIR}" \
+                --phase-id "${ACTIVITY_PHASE_ID}" \
                 --status "${status}" \
                 --result "${result}" >/dev/null 2>&1 || true
         }
@@ -4823,6 +4888,10 @@ case "$CMD" in
             run_lint_format fix-toml
             exit 0
         fi
+        # Only mend and clippy take queue steps. Repairs reuse their positions.
+        VERIFY_STEP_COUNT=0
+        if lint_config_enabled mend; then VERIFY_STEP_COUNT=$((VERIFY_STEP_COUNT + 1)); fi
+        if lint_config_enabled clippy; then VERIFY_STEP_COUNT=$((VERIFY_STEP_COUNT + 1)); fi
         run_lint_sequence
         ;;
     doc)
@@ -4846,7 +4915,7 @@ case "$CMD" in
             load_metadata
             CARGO_TARGET_DIR="$TARGET_DIRECTORY"
         fi
-        CARGO_TARGET_DIR="$(VERIFY_PY_HELPER=DOC_TARGET_PATH_PY "$PY" -c 'from pathlib import Path; import sys; print((Path(sys.argv[1]) / sys.argv[2]).resolve())' "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
+        CARGO_TARGET_DIR="$(verify_helper "$VERIFY_START_DIR/doc_step.py" target-path "$DOC_REPO_TOP" "$CARGO_TARGET_DIR")"
         export CARGO_TARGET_DIR
         DOC_COPY_LEASE_FD=""
         DOC_SOURCE_KEY=""
@@ -4854,7 +4923,7 @@ case "$CMD" in
             if [[ "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
                 DOC_TREE=$(doc_tree)
             else
-                DOC_SOURCE=$(doc_tree with-key)
+                DOC_SOURCE=$(doc_tree source)
                 read -r DOC_TREE DOC_SOURCE_KEY <<< "$DOC_SOURCE"
             fi
         fi

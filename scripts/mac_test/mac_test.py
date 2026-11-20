@@ -658,6 +658,11 @@ def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
     return "remote_host" in run and process_identity.process_start(run["pid"]) != process_identity.Started(run["proc_start"])
 
 
+def run_holds_work(run: RunRecord) -> bool:
+    """Report running work without counting claims kept for cleanup."""
+    return run_is_live(run) and not run_is_kept(run)
+
+
 def copy_gives_way(run: RunRecord) -> bool:
     """A live test copy whose process still runs, so a new step can stop it.
 
@@ -2215,7 +2220,7 @@ def free_now(
                 raise
             return "state"
     held = all(any(
-        scopes_overlap(claim.scope, candidate) and run_is_live(claim.record) and not run_is_kept(claim.record)
+        scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
         and (copy or not copy_gives_way(claim.record)) for claim in claims
     ) for candidate in scopes)
     if held:
@@ -2527,7 +2532,7 @@ def command_target_status(paths: StatePaths) -> int:
 
     try:
         block = read_claim_block(paths)
-        claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
+        claims = tuple(claim for claim in read_claims(paths) if run_holds_work(claim.record))
     except (OSError, StateReadError) as error:
         print(f"state unreadable: {error}")
         return 12

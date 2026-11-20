@@ -104,7 +104,6 @@ color:var(--filter-selected-ink)}
 [data-filter-row] button[data-filter-count="0"][aria-pressed=true]{
 background:color-mix(in srgb,var(--filter-selected-bg) 75%,var(--card))}
 [data-filter-row] b{font-variant-numeric:tabular-nums}[data-filter-row] b:empty{display:none}
-.record-filter-row+[data-list-count]{display:block;margin:8px 0 12px;text-align:right}
 .list-table{border:1px solid var(--line);border-radius:12px;background:var(--card);overflow:hidden}
 .list-table table{width:100%;border-collapse:collapse;table-layout:fixed}
 .list-table th{text-align:left;color:var(--ink-2);font-size:13px;border-bottom:1px solid var(--line)}
@@ -247,7 +246,7 @@ function createRecordTable(options){
 const contentProxy=()=>options.content();
 const defaultShow=options.defaultShow ?? 'open';
 let content=contentProxy(),owner='',show=defaultShow,query='',sort='',direction='asc',type='',sourceOwner='',keys=new Set();
-let linkedItem='';
+let linkedItem='',revealedLinkedItem='';
 let placeHash=location.hash;
 let highlightedRow,highlightTimer;
 const opened=new Set(),filterNames=options.filters || [],filters={};
@@ -394,6 +393,11 @@ function placeParams(){
  return params;
 }
 function place(){return readPlace(placeParams());}
+function itemWithKey(key){
+ if(options.hasKey && !options.hasKey(key)) return;
+ return options.entries ? options.entries().map(dataset=>({dataset})).find(item=>item.dataset.key===key) :
+  [...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===key);
+}
 function readPlace(params,followingItemLink=false){
  placeHash=location.hash;
  keys=new Set(params.getAll('key'));
@@ -407,12 +411,15 @@ function readPlace(params,followingItemLink=false){
  const item=params.get('item');if(item && !followingItemLink){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
-   owner='';show='all';query='';type='';for(const name of filterNames) filters[name]='';}
+   owner='';show='all';
+   query='';type='';for(const name of filterNames) filters[name]='';}
   if(options.single) opened.clear();opened.add(item);revealKey=item;
  }
  const saved=followingItemLink ? null : history.state?.recordTable;
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
+ const reveal=options.revealLinked && params.get('reveal')==='1';
+ revealedLinkedItem=reveal || saved?.revealedLinkedItem===linkedItem ? linkedItem : '';
  if(saved && (!options.mount || saved.top!==undefined)){
   opened.clear();
   saved.opened.forEach(key=>opened.add(key));
@@ -483,14 +490,16 @@ function animateRow(table,item,showRow,previousItem=item){
  copyTable.append(columns.cloneNode(true),copy);clip.append(copyTable);cell.append(clip);
  item.after(spacer);
  if(showRow) item.classList.add('record-motion-source');
+ const duration=Number(showRow ? content.dataset.cardFadeInMs : content.dataset.cardFadeOutMs);
  const animation=clip.animate([
   {height:(heightBefore ?? (showRow ? 0 : height))+'px',opacity:opacityBefore},
   {height:(showRow ? height : 0)+'px',opacity:Number(showRow)},
- ],{duration:200,easing:'ease-in-out',fill:'both'});
+ ],{duration,easing:'ease-in-out',fill:'both'});
  const finished=animation.finished.then(()=>{
   if(rowMotion.get(item)?.animation!==animation) return;
   stopMotion(item);
-  scheduleWindow();
+  if(table.closest('[data-linked-item]')) apply(false,{animate:true});
+  else scheduleWindow();
  },()=>{});
  rowMotion.set(item,{spacer,clip,copy,animation,finished,sortValues:showRow ? sortValues(item.dataset) :
   previous?.sortValues ?? sortValues(item.dataset)});
@@ -524,11 +533,16 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  }
 }
 function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
-function canRevealLinked(item,selection){return options.revealLinked?.(item.dataset,selection);}
-function matches(item,selection,counts){
+function canRevealLinked(item,selection){
+ return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
+}
+function matches(item,selection,counts,allowExpanded=false){
  if(!isSelected(item)) return false;
  if(!options.filterValues) return options.visible(item.dataset,selection);
- const values=options.filterValues(item.dataset,selection.query,selection);
+ const data=item.dataset;
+ const activeValues=options.filterValues(data,selection.query,selection);
+ const expanded=!activeValues && allowExpanded && opened.has(data.key) && options.expandedSelection?.(data,selection);
+ const values=activeValues || (expanded && options.filterValues(data,expanded.query,expanded));
  if(!values) return false;
  const selected={show:selection.show,owner:selection.owner,...selection.filters};
  const excluded=Object.entries(values).filter(([name,choices])=>
@@ -536,8 +550,11 @@ function matches(item,selection,counts){
  // A record counts for a row when it matches every other row.
  if(counts && excluded.length<2){
   for(const [name,choices] of Object.entries(values)){
-   if(excluded.length && excluded[0][0]!==name) continue;
-   for(const value of ['all',...choices.map(choice=>filterChipValue(name,choice))])
+   // A change to Show ends the exception for an open read row.
+   const sameShow=expanded && name==='show';
+   if(excluded.length && (excluded[0][0]!==name || sameShow)) continue;
+   const chipValues=sameShow ? [selection.show] : ['all',...choices.map(choice=>filterChipValue(name,choice))];
+   for(const value of chipValues)
     counts[name][value]=(counts[name][value] ?? 0)+1;
   }
  }
@@ -550,7 +567,8 @@ function apply(write=true,layout={}){
  options.beforeApply?.();
  applyRows(write,layout);
 }
-function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false,top}={}){
+function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=false,pushPlace=false,top}={}){
+ const previousReveal=revealedLinkedItem;
  const motion=animate && !matchMedia('(prefers-reduced-motion: reduce)').matches;
  if(!motion) for(const item of rowMotion.keys()) stopMotion(item);
  const rows=options.entries ? options.entries().map(dataset=>({dataset})) : [...content.querySelectorAll('[data-list-item]')];
@@ -565,10 +583,11 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   opened.delete(linkedItem);
   linkedItem='';
  }
+ if(revealedLinkedItem!==linkedItem) revealedLinkedItem='';
  const previousOwner=owner,previousShow=show,previousFilters={...filters};
  owner=options.resolveOwner?.(owner) ?? owner;
  const search=query.trim().toLowerCase();
- owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
+ if(normalizeOwner) owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
  owner=filterSelection('owner').set(owner);
  if(previousOwner && !owner) sourceOwner='';
  show=filterSelection('show').set(show);
@@ -579,16 +598,18 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  const counts=options.filterValues ? Object.fromEntries(['show','owner',...filterNames].map(name=>[name,Object.create(null)])) : undefined;
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
+ const currentKeys=windowMotions && new Set(rows.map(item=>item.dataset.key));
+ const departingRows=currentKeys ? [...rowMotion.keys()].filter(item=>!currentKeys.has(item.dataset.key)) : [];
  const sortValue=item=>{
   const transition=windowMotions ? windowMotions.get(item.dataset.key) : rowMotion.get(item);
   return (transition?.sortValues ?? sortValues(item.dataset))[column];
  };
- const items=rows.toSorted((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
-  (compare(sortValue(a),sortValue(b)) ||
-   Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
- const table=content.querySelector('table');let count=0,expandedOutsideFilter=false;
+ const compareOrder=(a,b)=>compare(Number(a.dataset.order),Number(b.dataset.order));
+ const items=[...rows,...departingRows].sort((a,b)=>column<0 ? compareOrder(a,b) :
+  (compare(sortValue(a),sortValue(b)) || compareOrder(a,b))*(direction==='desc' ? -1 : 1));
+ const table=content.querySelector('table');let count=0;
  if(options.mount){
-  const visibleKeys=new Set(items.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
+  const visibleKeys=new Set(rows.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
   count=visibleKeys.size;
   for(const [key,node] of mounted){
    if(visibleKeys.has(key)) continue;
@@ -606,11 +627,17 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   const linkedTable=linkedSection?.querySelector('table');
   const linked=linkedTable && opened.has(linkedItem) && items.find(item=>
    item.dataset.key===linkedItem && canRevealLinked(item,active) && !matches(item,active));
-  if(linked && linked.parentElement!==linkedTable){
-   stopMotion(linked);
-   linkedTable.append(linked);
+  if(linked){
+   // Keep the link when a refresh changes the item's filter values.
+   revealedLinkedItem=linkedItem;
+   if(linked.parentElement!==linkedTable){
+    stopMotion(linked);
+    linkedTable.append(linked);
+   }
   }
-  const results=linked ? items.filter(item=>item!==linked) : items;
+  const leavingLinked=motion && linkedTable && items.find(item=>item!==linked && item.parentElement===linkedTable &&
+   (!item.hidden || rowMotion.has(item)) && !matches(item,active));
+  const results=linked || leavingLinked ? items.filter(item=>item!==linked && item!==leavingLinked) : items;
   const tableRows=linkedTable ? rows.filter(item=>item.parentElement===table) : rows;
   if(results.some((item,index)=>item!==tableRows[index])) for(const item of results){
    if(linkedTable && item.parentElement===linkedTable) stopMotion(item);
@@ -618,16 +645,13 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
    const spacer=rowMotion.get(item)?.spacer;
    if(spacer) table.append(spacer);
   }
-  if(linkedSection) linkedSection.hidden=!linked;
+  if(linkedSection) linkedSection.hidden=!linked && !leavingLinked;
   items.forEach(item=>{
    const expanded=opened.has(item.dataset.key);
-   const matched=matches(item,active,counts);
-   const selection=expanded && !matched && item!==linked && options.expandedSelection?.(item.dataset,active);
-   const keepExpanded=selection && matches(item,selection);
-   const showRow=matched || item===linked || keepExpanded,wasShown=!item.hidden;
-   if(motion && wasShown && !showRow) animateRow(table,item,false);
+   const matched=matches(item,active,counts,item!==linked);
+   const showRow=matched || item===linked,wasShown=!item.hidden;
+   if(motion && wasShown && !showRow) animateRow(item.parentElement,item,false);
    item.hidden=!showRow;if(matched) count++;
-   if(keepExpanded) expandedOutsideFilter=true;
    const expansionChanged=setExpanded(item,expanded);
    const transition=rowMotion.get(item);
    if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(item.parentElement,item,true);
@@ -650,7 +674,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
   notice.hidden=!missing.length;
  }
- empty.hidden=count>0 || expandedOutsideFilter || missing.length>0;
+ empty.hidden=count>0 || missing.length>0;
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
   const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
@@ -666,7 +690,8 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  if(!options.mount) showHiddenActionResults(items);
  options.applied?.(selection,active);
  if(write || location.hash===placeHash &&
-  (owner!==previousOwner || show!==previousShow || filterNames.some(name=>filters[name]!==previousFilters[name])))
+  (revealedLinkedItem!==previousReveal || owner!==previousOwner || show!==previousShow ||
+   filterNames.some(name=>filters[name]!==previousFilters[name])))
   writePlace(pushPlace,top);
 }
 function writePlace(push=false,top){
@@ -675,8 +700,9 @@ function writePlace(push=false,top){
  const item=linkedItem || [...opened][0];
  if(item) place.set('item',item);
  if(options.persistLinkedTarget && linkedItem) place.set('linked','1');
+ if(linkedItem && revealedLinkedItem===linkedItem) place.set('reveal','1');
  keys.forEach(key=>place.append('key',key));
- const hash='#'+place,state={recordTable:{opened:[...opened],linkedItem,top}};
+ const hash='#'+place,state={recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top}};
  if(push && hash!==location.hash) history.pushState(state,'',location.pathname+hash);
  else history.replaceState(state,'',location.pathname+hash);
  placeHash=location.hash;
@@ -686,26 +712,25 @@ function restorePlace(event){
  // A changed fragment sends hashchange after popstate.
  if(event?.type==='popstate' && location.hash!==placeHash) return;
  const top=place();
- apply(false,{top});
+ apply(false,{top,normalizeOwner:!history.state?.recordTable});
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
 }
 function saveDeparturePlace(){
  if(sharedWords() && query!==words().value){
   query=words().value;
   writePlace(false,scrollY);
- }else history.replaceState({recordTable:{opened:[...opened],linkedItem,top:scrollY}},'');
+ }else history.replaceState({recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top:scrollY}},'');
 }
-function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}){
+function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false}={}){
  if(pushPlace) saveDeparturePlace();
- const target=options.entries ? options.entries().map(dataset=>({dataset})).find(item=>item.dataset.key===key) :
-  [...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===key);
+ const target=itemWithKey(key);
  linkedItem=options.missingItem ? key : '';
  if(target){
   if(keys.size) keys.add(key);
   if(options.single) opened.clear();
   opened.add(key);
   const selection=currentSelection();
-  if(!canRevealLinked(target,selection) && !matches(target,selection)){
+  if(!preserveFilters && !canRevealLinked(target,selection) && !matches(target,selection)){
    const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
    if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
    if(!keepMatchingFilters || sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
@@ -718,7 +743,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}
   }
  }
  if(options.mount && target) revealKey=key;
- apply(true,{pushPlace});
+ apply(true,{pushPlace,normalizeOwner:!preserveFilters});
  const mountedTarget=options.mount ? mounted.get(key) : target;
  if(!mountedTarget){
   content.querySelector('[data-missing-item]')?.scrollIntoView({block:'nearest',behavior:'instant'});
@@ -742,7 +767,7 @@ function setRowsExpanded(items,expanded){
  for(const item of items){
   const key=item.dataset.key;
   if(opened.has(key)===expanded) continue;
-  linkedItem='';
+  if(!expanded && key===linkedItem) linkedItem='';
   if(expanded){
    if(options.single) opened.clear();
    opened.add(key);
@@ -753,8 +778,8 @@ function setRowsExpanded(items,expanded){
 }
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
- const changePlace=()=>apply(true,{dismissMissingItem:true});
- const changeFilter=()=>{if(sharedWords()) query=words().value;changePlace();};
+ const changePlace=(normalizeOwner=false)=>apply(true,{dismissMissingItem:true,normalizeOwner});
+ const changeFilter=()=>{if(sharedWords()) query=words().value;changePlace(true);};
  content.querySelector('[data-clear-linked-reviews]')?.addEventListener('click',()=>{
   keys.clear();changeFilter();words().focus({preventScroll:true});
  });
@@ -784,10 +809,17 @@ function bind(){
   if(expanded && !item.hidden) options.itemOpened?.(item);
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
-  type=button.dataset.typeChip;changePlace();
+  type=button.dataset.typeChip;changeFilter();
  }));
 }
 return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDeparturePlace,get linkedItem(){return linkedItem;},
+ revealMatchingItem(key){
+  const target=itemWithKey(key);
+  const selection=currentSelection({query:words().value.trim().toLowerCase()});
+  if(!target || !matches(target,selection)) return false;
+  jump(key,{preserveFilters:true});
+  return true;
+ },
  setShownExpanded(expanded){
   const currentQuery=words().value;
   if(query!==currentQuery){
@@ -798,9 +830,22 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  },
  closeCard(key){
   const wasOpen=opened.delete(key);
-  if(linkedItem===key) linkedItem='';
+  if(linkedItem===key){linkedItem='';revealedLinkedItem='';}
   else if(!wasOpen) return;
   if(location.hash===placeHash) writePlace();
+ },
+ releaseLink(key){
+  if(linkedItem!==key) return;
+  const wasRevealed=revealedLinkedItem===key;
+  linkedItem='';revealedLinkedItem='';
+  if(location.hash===placeHash) writePlace();
+  const releasedAt=placeHash;
+  return ()=>{
+   if(linkedItem || location.hash!==releasedAt || placeHash!==releasedAt) return;
+   linkedItem=key;
+   if(wasRevealed) revealedLinkedItem=key;
+   writePlace();
+  };
  },
  startAction(item){
   const submission=++latestSubmission;
@@ -812,6 +857,7 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  showActionResult,
  actionNotice(item){return actionNotices.get(item.dataset.key)?.message ?? '';},
  applyAction(){apply(false,{animate:true});},
+ rowFading(key){return [...rowMotion.keys()].some(item=>item.dataset.key===key);},
  async rowSettled(item){while(rowMotion.has(item)) await rowMotion.get(item).finished;},
  get hasActiveRowAnimations(){return rowMotion.size>0;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
@@ -987,7 +1033,9 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
    }
    return;
   }
-  const list=items(),index=list.indexOf(document.activeElement);
+  const list=items();
+ if(!list.length) return;
+ const index=list.indexOf(document.activeElement);
   const next={ArrowDown:index+1,ArrowUp:index-1+list.length,Home:0,End:list.length-1}[event.key];
   if(next===undefined) return;
   event.preventDefault();list[next%list.length].focus();

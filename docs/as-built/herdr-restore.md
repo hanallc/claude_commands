@@ -190,13 +190,21 @@ A composer with a draft waits until the deadline without changes to the draft.
 Pane reports keep failed pane lists, unassigned panes, and unreadable registry evidence. A proved owner establishes presence even when other observations fail. A lookup requires complete relevant evidence to report absence.
 
 An observed empty pane requires one foreground shell with the same PID as the pane shell and the foreground process group.
-An empty pane adds no failure to a conversation search. Demotion can resume the conversation after a complete search proves absence.
+The unit lookup checks the ancestry and controlling terminal of each other holder.
+It ignores a holder outside the pane shell's process tree if the holder has a different controlling terminal or no controlling terminal.
+A shell descendant or a holder on the pane terminal keeps the pane owner unknown.
+Unknown ancestry or terminal evidence also keeps the pane owner unknown.
+On Linux, a changed or unreadable process start time makes its ancestry and terminal unknown.
+An empty pane adds no failure to a conversation search.
+A complete search can prove absence and let a resume use the empty pane.
 
 The unit lookup requires a recorded process start and a matching native conversation for every Claude owner.
 For a pane, the lookup also requires proof of the foreground PID.
 A failed native check or a missing recorded start leaves ownership unknown.
 Inherited marks can identify candidates for the report.
-The lookup publishes a messaging socket only after a successful connection.
+The lookup takes the socket path from the current record for the proved PID and process start.
+It rejects a different path in the snapshot.
+It checks the connected peer PID and verifies the process start before and after the connection.
 A proved Claude owner can have no messaging address.
 The lookup combines pane and standalone proofs for each conversation before it selects an owner.
 Repeated proofs for the same PID and process start count as one owner.
@@ -204,3 +212,6 @@ A single proved owner takes precedence over incomplete evidence.
 Proofs for different processes or process starts leave the owner unknown.
 
 Process placement can prove a Herdr pane, prove that a process is outside Herdr, or report an unknown placement. The bulk scan retains read failures. A cache miss requires a PID lookup before Codex can use its process arguments.
+
+An action clears the pane evidence in the enclosing report before report reads resume.
+Two Darwin processes that hold one Herdr listener cause a placement scan failure.

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Shared verify cache key and conservative workspace-input watcher.
 
---key [--with-tree-content] [--watch-start FILE] [tree_key args] prints the cache key.
---with-tree-content also prints the key without script files.
+--key [--with-tree-content] [--watch-start FILE] [--recheck-mend] [tree_key args]
+prints the cache key.
+--with-tree-content also prints the key without script files or lint tool identities.
+--recheck-mend checks the current mend identity against the saved identity.
 --watch-key [tree_key args] prints only the watched input key.
 START FIRED PARENT [--signal-parent] [tree_key args] watches until changed (0)
 or the parent exits (3). Cargo metadata is supplied once on stdin.
@@ -53,24 +55,46 @@ def run(*args: str | bytes) -> bytes:
     return subprocess.check_output(list(args), stderr=subprocess.DEVNULL)
 
 
-def lint_tool_versions() -> bytes:
-    """Identify each lint tool through the command that runs it."""
+def read_lint_tool_output(command: tuple[str, ...]) -> bytes:
+    return subprocess.check_output(command, stderr=subprocess.DEVNULL, timeout=10).strip()
+
+
+def cargo_mend_build_info() -> bytes:
+    """Read the build identity from the executable that Cargo selects."""
+    info = read_lint_tool_output(("cargo", "mend", "--build-info"))
+    if b"\0" in info:
+        raise ValueError("invalid cargo-mend build info")
+    lines = info.splitlines()
+    for field in (b"git_hash:", b"build_id:"):
+        values = [line[len(field):].strip() for line in lines if line.startswith(field)]
+        if len(values) != 1 or values[0] in (b"", b"unknown"):
+            raise ValueError("cargo-mend build identity is unavailable")
+    return info
+
+
+def lint_tool_versions(*, recheck_mend: bool = False) -> bytes:
+    """Read lint tool identities and recheck mend when requested."""
     saved = os.environ.get("VERIFY_LINT_VERSIONS_FILE", "")
     if saved and Path(saved).exists():
         versions = Path(saved).read_bytes()
         if not versions:
             raise ValueError("lint tool versions are unavailable")
+        if recheck_mend and cargo_mend_build_info() != versions.partition(b"\0")[0]:
+            raise ValueError("cargo-mend build identity changed")
         return versions
-    versions = bytearray()
+    if recheck_mend:
+        raise ValueError("lint tool versions are unavailable")
     try:
-        for command in (("taplo", "--version"), ("cargo", "mend", "--version"),
-                        ("cargo", "+nightly", "fmt", "--version"), ("cargo", "clippy", "--version")):
+        # The first field is the mend identity used for the publication check.
+        versions = bytearray(cargo_mend_build_info() + b"\0")
+        for command in (("taplo", "--version"), ("cargo", "+nightly", "fmt", "--version"),
+                        ("cargo", "clippy", "--version")):
             formatter = os.environ.get("VERIFY_LINT_RUSTFMT_VERSION_FILE", "") if command[1:2] == ("+nightly",) else ""
             if formatter and Path(formatter).exists():
                 version = Path(formatter).read_bytes().strip()
             else:
                 try:
-                    version = subprocess.check_output(command, stderr=subprocess.DEVNULL, timeout=10).strip()
+                    version = read_lint_tool_output(command)
                 except (OSError, subprocess.SubprocessError):
                     if formatter:
                         _ = Path(formatter).write_bytes(b"")
@@ -180,7 +204,9 @@ class TreeInputs:
         cargo_root = cargo_path in (b"Cargo.toml", b"Cargo.lock", b"rust-toolchain", b"rust-toolchain.toml") or cargo_path.startswith(b".cargo/")
         return TreeEntryScope.CACHE_AND_WATCH if cargo_root else TreeEntryScope.CACHE_ONLY
 
-    def keys(self, *, cache: bool = True, watch: bool = True, lint_versions: bool = True) -> tuple[str, str]:
+    def keys(
+        self, *, cache: bool = True, watch: bool = True, lint_versions: bool = True, recheck_mend: bool = False,
+    ) -> tuple[str, str]:
         self.tree_content_key = ""
         # status never refreshes the index; diff does, even with no-optional-locks.
         status = run("git", "--no-optional-locks", "-C", self.top, *treekey.WORKTREE_STATUS_ARGS)
@@ -223,13 +249,6 @@ class TreeInputs:
             for path in changed:
                 key.update(path + b"\0" + treekey.content(os.path.join(self.top, path)))
         key.update(run("rustc", "-vV"))
-        if lint_versions and self.words[:1] == ["lint"]:
-            try:
-                versions = lint_tool_versions()
-            except (OSError, ValueError, subprocess.SubprocessError):
-                # Unknown tool versions prevent cache reuse and publication.
-                return "", watch_key
-            key.update(versions)
         tree_content = key.copy()
         for name in self.files:
             key.update(treekey.content(os.fsencode(name)))
@@ -283,6 +302,12 @@ class TreeInputs:
                     _ = Path(output).write_text("\n".join((build_key.hexdigest(),
                         str(roots.target_directory), str(roots.build_directory), "")))
         self.tree_content_key = tree_content.hexdigest()
+        if lint_versions and self.words[:1] == ["lint"]:
+            try:
+                key.update(lint_tool_versions(recheck_mend=recheck_mend))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                # Unknown tool identity prevents cache reuse and publication.
+                return "", watch_key
         return key.hexdigest(), watch_key
 
 
@@ -298,6 +323,12 @@ def parent_alive(pid: int) -> bool:
 
 
 def main(args: list[str]) -> int:
+    if args[:1] == ["--recheck-mend"]:
+        try:
+            _ = lint_tool_versions(recheck_mend=True)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return 1
+        return 0
     metadata = sys.stdin.read()
     if args[0] in ("--key", "--watch-key"):
         mode, args = args[0], args[1:]
@@ -307,12 +338,17 @@ def main(args: list[str]) -> int:
         start = ""
         if args[:1] == ["--watch-start"]:
             start, args = args[1], args[2:]
+        recheck_mend = args[:1] == ["--recheck-mend"]
+        if recheck_mend:
+            args = args[1:]
         lint_versions = args[:1] != ["--without-lint-versions"]
         if not lint_versions:
             args = args[1:]
         inputs = TreeInputs(args, metadata)
         cache, watched = inputs.keys(
-            cache=mode == "--key", watch=bool(start) or mode == "--watch-key", lint_versions=lint_versions)
+            cache=mode == "--key", watch=bool(start) or mode == "--watch-key",
+            lint_versions=lint_versions, recheck_mend=recheck_mend,
+        )
         if start:
             _ = Path(start + ".paths").write_text(json.dumps(inputs.watch_entries))
             _ = Path(start).write_text(watched + "\n")

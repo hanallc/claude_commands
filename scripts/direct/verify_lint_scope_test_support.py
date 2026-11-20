@@ -61,15 +61,37 @@ class CargoWorkspaceMetadata(TypedDict):
     packages: list[CargoPackageMetadata]
 
 
+def write_fixture_cargo_mend(path: Path, build_id: str = "fixture") -> None:
+    """Install a fixture with a stable version and a selectable build ID."""
+    write_stdlib_tool(path, f'''import os
+import sys
+
+print(os.environ.get("TEST_VERSION_MEND", "cargo-mend 0.23.0-dev"))
+if sys.argv[-1] == "--build-info":
+    print("git_hash: fixture")
+    print({("build_id: " + build_id)!r})
+    print("build_sysroot: fixture")
+''')
+
+
+CARGO_MEND_DISPATCH_SOURCE = '''
+def exec_fixture_cargo_mend(flag: str) -> None:
+    mend = str(Path(__file__).with_name("cargo-mend"))
+    os.execv(mend, [mend, flag])
+'''
+
+
 CARGO_STUB = r'''
 import json
 import os
 from pathlib import Path
 import sys
+''' + CARGO_MEND_DISPATCH_SOURCE + r'''
 
 arguments = sys.argv[1:]
 version_tools = {
     ("mend", "--version"): "MEND",
+    ("mend", "--build-info"): "MEND",
     ("+nightly", "fmt", "--version"): "RUSTFMT",
     ("clippy", "--version"): "CLIPPY",
 }
@@ -82,6 +104,8 @@ if version_tool:
     if "TEST_VERSION_EVENTS" in os.environ:
         with Path(os.environ["TEST_VERSION_EVENTS"]).open("a", encoding="utf-8") as output:
             output.write(version_tool + "\n")
+    if version_tool == "MEND":
+        exec_fixture_cargo_mend(arguments[-1])
     print(os.environ.get("TEST_VERSION_" + version_tool, version_tool + " fixture"))
     raise SystemExit(0)
 if arguments[:1] == ["metadata"]:
@@ -231,6 +255,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         self.config = self.root / "lint.conf"
         self.write_config(clippy="on")
         write_stdlib_tool(bin_directory / "cargo", CARGO_STUB)
+        write_fixture_cargo_mend(bin_directory / "cargo-mend")
         write_stdlib_tool(bin_directory / "taplo", TAPLO_STUB)
         self.write_shell(bin_directory / "git", GIT_STUB)
         self.write_shell(bin_directory / "rustc", 'printf "rustc fixture\\n"\n')
