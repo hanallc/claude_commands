@@ -2957,7 +2957,7 @@ Work:
 5. An interrupted call and a call whose owner is gone still write their wait records up to the end.
 6. Tests prove that, for a replayed call, the parts sum to elapsed time with no overlap.
 
-### Phase 44cm — verify.sh doc never calls copies.py hold without --tree  · status: todo
+### Phase 44cm — verify.sh doc never calls copies.py hold without --tree  · status: done (merged 720c68cfa, main 00d79a0293)
 **From builds, 2026-11-18 21:5x (hana showrunner fault ~21:45 EST):** `verify.sh doc hana_diegetic` failed one time at start with "copies: the following arguments are required: --tree". `verify.sh doc hana` passed in the same session. 44bt (bddbd51cf, merged e648e4d9e) added `copies.py hold --tree` and changed the doc step's tree read. fix1 saw the same error on 44bu at about 21:0x.
 1. Find the cause with a failing test first: a caller without `--tree`, a verify.sh run that started before the 44bt merge and reached the doc step after it, or another path.
 2. Fix it at its cause. A run that mixes an old verify.sh with a new copies.py must fail with a clear message or work, never with an argparse error.
