@@ -1789,6 +1789,11 @@ class AdmissionServer:
         return replace(remaining, slots=tuple(self.slots.values()), cargo_folders=folders,
                        occupied_cargo_folders=occupied)
 
+    @property
+    def pending_wait_closes(self) -> tuple[PlacementWaitClose, ...]:
+        """Read the wait closures that still need a journal entry."""
+        return tuple(self.wait_records.closes.values())
+
     def persist(self) -> None:
         self._release_refused_placement_choices()
         self._apply_recorded_placement_ends(self.wait_records.append_pending_closes())
@@ -1815,7 +1820,7 @@ class AdmissionServer:
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
             self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
             self.landing_first_places, self.landing_pass_counts,
-            tuple(self.wait_records.closes.values()), self.placement_ends_awaiting_close)
+            self.pending_wait_closes, self.placement_ends_awaiting_close)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 

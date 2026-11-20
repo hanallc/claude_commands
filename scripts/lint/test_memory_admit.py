@@ -3914,7 +3914,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
                         tree.assert_not_called()
                     elif owner == "live":
                         self.assertEqual(reading, admission_records.MeasuredMemory(2 * GIB, promise=admission_records.LifetimePromise(12 * GIB)))
-                        tree.assert_called_once_with(100, "first", processes, self.root / "proc")
+                        tree.assert_called_once_with(100, "first", processes, self.root / "proc", track_compilers=False)
                     else:
                         self.assertIsInstance(reading, admission_records.GoneMemory)
                         tree.assert_not_called()

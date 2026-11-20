@@ -322,6 +322,7 @@ class PlacementWaitCloseTests(unittest.TestCase):
                 prerequisite=placement.TokenNotRequired(), constraints=replace(request.constraints,
                     candidates=(*request.constraints.candidates, local_candidate(fixture))))
             fixture.free(0)
+            fixture.hold_starts()
             _ = publish_candidate(fixture, request)
             assignment = assignment_for(fixture, request)
             self.assertEqual(assignment.destination.target, "hana-aws")
@@ -383,10 +384,10 @@ class PlacementStatusTests(unittest.TestCase):
     def test_repeated_placement_polls_share_the_pass_until_the_next_reading(self) -> None:
         from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
 
-        cases = ((False, 60), (True, 60), (False, 0.1))
+        cases = ((False, 60), (True, 60), (False, 1))
         for report_prerequisite, reroute_seconds in cases:
             with self.subTest(report_prerequisite=report_prerequisite, reroute_seconds=reroute_seconds), PlacementFixture() as fixture:
-                fixture.configure(natedev_reroute_seconds=reroute_seconds)
+                fixture.configure(natedev_reroute_seconds=reroute_seconds, waiting_pass_seconds=2)
                 fixture.free(0)
                 fixture.hold_starts()
                 request = placement_request(fixture)
@@ -402,7 +403,7 @@ class PlacementStatusTests(unittest.TestCase):
                 state = fixture.state_text()
                 with mock.patch.object(fixture.server, "run_pass", wraps=fixture.server.run_pass) as passed:
                     for index in range(20):
-                        fixture.clock.advance(0.02)
+                        fixture.clock.advance(0.06)
                         if report_prerequisite:
                             report = wire.PrerequisiteReport(f"same-prerequisite-{index}", request.episode,
                                 request.owner, request.prerequisite)
@@ -1575,11 +1576,11 @@ class LandingWaitTests(unittest.TestCase):
             fixture.allow_next_start()
             _ = write_config_fixture(fixture.root / "linux.conf", "probe_timeout_s=1\n", template="mac_test")
             _ = (fixture.root / "build_targets.conf").write_text(
-                "targets=aws\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=linux.conf\n")
+                "targets=aws-peer\nkind.aws-peer=ssh\nplatform.aws-peer=linux\nsettings.aws-peer=linux.conf\n")
             request = placement_request(fixture)
             assert isinstance(request.profile, records.StepProfile)
             candidate, = request.constraints.candidates
-            aws = replace(candidate, destination=replace(candidate.destination, provider="ssh", target="aws", host="fixture-aws"))
+            aws = replace(candidate, destination=replace(candidate.destination, provider="ssh", target="aws-peer", host="fixture-aws"))
             request = replace(request, identity=replace(request.identity, step="merge-gate", job=StepJob("test-all")),
                 profile=replace(request.profile, repo="claude_commands", step="merge-gate"))
             _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(aws,))))
