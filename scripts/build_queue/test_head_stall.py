@@ -339,7 +339,8 @@ class WatchTests(unittest.TestCase):
         _ = (self.paths.admission / "queue_times.jsonl").write_text(
             json.dumps({"kind": "admitted", "admitted_at": at, "need": GIB}, separators=(",", ":")) + "\n")
 
-    def observe(self, queue: QueueSnapshot, now: float, *, accept: bool = True) -> head_stall.HeadStall | head_stall.NoStall:
+    def observe(self, queue: QueueSnapshot, now: float, *, accept: bool = True
+                ) -> head_stall.HeadStall | head_stall.AdmissionDecisionUnreadable | head_stall.NoStall:
         write_queue_snapshot(self.paths.admission, replace(queue.inputs, now=now), queue.policy)
         return head_stall.watch_once(self.paths, now, self.run_send(accept))
 
@@ -410,8 +411,52 @@ class WatchTests(unittest.TestCase):
 
     def test_an_unavailable_admission_decision_sends_no_alert(self) -> None:
         with mock.patch.object(admission_client, "explain", side_effect=AdmissionUnavailable("no fixture reply")):
-            self.assertEqual(self.observe(STALLED, NOW), head_stall.NoStall())
+            _ = self.observe(STALLED, NOW)
         self.assertEqual(self.sent, [])
+
+    def test_unreadable_decisions_log_each_skip_and_alert_after_the_limit(self) -> None:
+        self.mock_send_outcomes((0, "SENT"), (0, "SENT"))
+        diagnostics = StringIO()
+        stale = replace(fixture_explanation(STALLED), now=NOW - 121)
+        replies = iter((AdmissionUnavailable("socket permission denied"), stale,
+                        AdmissionUnavailable("socket permission denied"), AdmissionUnavailable("socket permission denied")))
+
+        def explain() -> records.QueueExplanation:
+            reply = next(replies)
+            if isinstance(reply, AdmissionUnavailable):
+                raise reply
+            return reply
+
+        with (mock.patch.object(sample, "sample") as take_sample,
+              mock.patch.object(mac_idle, "watch_once"),
+              mock.patch.object(mac_idle, "watch_paths"),
+              mock.patch.object(head_stall, "default_paths", return_value=self.paths),
+              mock.patch.object(admission_client, "explain", side_effect=explain),
+              redirect_stderr(diagnostics)):
+            for elapsed, sent in ((0, 0), (LIMIT - 1, 0), (LIMIT, 2), (LIMIT + 60, 2)):
+                now = NOW + elapsed
+                write_queue_snapshot(self.paths.admission, replace(STALLED.inputs, now=now), STALLED.policy)
+                take_sample.return_value = sample.SampleTaken(now, "natedev")
+                self.assertEqual(cli.main(["sample"]), 0)
+                self.assertEqual(len(self.sent), sent)
+
+        lines = diagnostics.getvalue().splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertIn("socket permission denied", lines[0])
+        self.assertIn("old", lines[1])
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+        for _, report in self.sent:
+            self.assertIn("cannot read the admission decision", report)
+            self.assertIn("socket permission denied", report)
+
+    def test_a_fresh_queue_without_an_old_waiter_clears_the_decision_outage(self) -> None:
+        with mock.patch.object(admission_client, "explain", side_effect=AdmissionUnavailable("no fixture reply")):
+            _ = self.observe(STALLED, NOW)
+            now = NOW + LIMIT
+            fresh = snapshot([waiter(now - 60)], STALLED.inputs.running)
+            self.assertEqual(self.observe(fresh, now), head_stall.NoStall())
+            _ = self.observe(STALLED, now + 60)
+            self.assertEqual(self.sent, [])
 
     def test_test_phase_reduces_the_alert_charge_while_nextest_stays_active(self) -> None:
         memory = records.MeasuredMemory(GIB, anonymous=records.AnonymousRunUse(GIB))
@@ -464,14 +509,15 @@ class WatchTests(unittest.TestCase):
         _ = head_stall.watch_once(self.paths, NOW + 60)
         self.assertEqual(self.sent_recipients(), ["builds", "bob"])
         self.assertEqual([argv[argv.index("--key") + 1] for argv, _ in self.sent],
-                         [f"head-stall-{NOW - 3 * 3600}"] * 2)
+                         [f"head-stall-1618939-19509458-{NOW - 3 * 3600}"] * 2)
 
     def test_a_stop_between_recipients_does_not_resend_to_builds(self) -> None:
         self.mock_send_outcomes((0, "SENT"), RuntimeError("watch stopped"), (0, "SENT"), (0, "SENT"))
         write_queue_snapshot(self.paths.admission, STALLED.inputs, STALLED.policy)
         with self.assertRaisesRegex(RuntimeError, "watch stopped"):
             _ = head_stall.watch_once(self.paths, NOW)
-        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"], {"builds": NOW - 3 * 3600})
+        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"],
+                         {"builds": {"1618939-19509458": NOW - 3 * 3600}})
         _ = head_stall.watch_once(self.paths, NOW + 60)
         self.assertEqual(self.sent_recipients(), ["builds", "bob", "bob"])
 
@@ -484,9 +530,9 @@ class WatchTests(unittest.TestCase):
         _ = head_stall.watch_once(self.paths, NOW + 120)
         self.assertEqual(self.sent_recipients(), ["builds", "bob", "builds", "bob"])
 
-    def test_four_heads_in_one_stall_alert_builds_and_bob_once(self) -> None:
+    def test_each_head_in_one_stall_alerts_builds_and_bob_once(self) -> None:
         self.admit_at(NOW - 32 * 60)
-        for index, minutes in enumerate((0, 18, 19, 32)):
+        for index, minutes in ((0, 0), (1, 18), (2, 19), (0, 32), (3, 33)):
             now = NOW + minutes * 60
             head = waiter(NOW - 2 * 3600)
             head.update(pid=head["pid"] + index, start_time=str(100 + index))
@@ -494,7 +540,8 @@ class WatchTests(unittest.TestCase):
             stall = self.observe(queue, now)
             self.assertIsInstance(stall, head_stall.HeadStall)
 
-        self.assertEqual([command[command.index("--to") + 1] for command, _ in self.sent], ["builds", "bob"])
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"] * 4)
+        self.assertEqual(len({argv[argv.index("--key") + 1] for argv, _ in self.sent}), 4)
 
     def test_one_alert_per_stall_and_a_new_stall_alerts_again(self) -> None:
         _ = self.observe(STALLED, NOW)
@@ -514,7 +561,7 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(bob, [*builds[:recipient], "bob", *builds[recipient + 1:]])
         self.assertEqual(builds_message, head_stall.builds_text(later))
         self.assertEqual(bob_message, builds_message)
-        self.assertEqual(builds[builds.index("--key") + 1], f"head-stall-{admission}")
+        self.assertEqual(builds[builds.index("--key") + 1], f"head-stall-1618939-19509458-{admission}")
 
     def test_failed_sends_retry_on_the_next_minute(self) -> None:
         last_start = NOW - 3600 + 0.25
@@ -523,7 +570,8 @@ class WatchTests(unittest.TestCase):
         self.assertFalse(self.paths.state.exists())
         _ = self.observe(STALLED, NOW + 60)
         self.assertEqual(len(self.sent), 4)
-        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"], {"builds": last_start, "bob": last_start})
+        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"],
+                         {"builds": {"1618939-19509458": last_start}, "bob": {"1618939-19509458": last_start}})
 
     def test_a_snapshot_gap_and_an_older_holder_do_not_repeat_an_alert(self) -> None:
         later_holder = replace(holder(NOW - 3600), pid=706238)
@@ -537,24 +585,22 @@ class WatchTests(unittest.TestCase):
     def test_the_previous_state_format_suppresses_an_alert_for_the_same_stall(self) -> None:
         last_start = NOW - 3600 + 0.25
         self.admit_at(last_start)
-        for saved in (f"1618939:19509458:{int(last_start)}", last_start):
-            with self.subTest(saved=saved):
-                _ = self.paths.state.write_text(json.dumps({"alerted": saved, "at": NOW}))
-                self.assertIsInstance(self.observe(STALLED, NOW + 60), head_stall.HeadStall)
-                self.assertEqual(self.sent_recipients(), ["bob"])
-                self.sent.clear()
-                self.assertIsInstance(self.observe(STALLED, NOW + 120), head_stall.HeadStall)
-                self.assertEqual(self.sent, [])
+        saved = f"1618939:19509458:{int(last_start)}"
+        _ = self.paths.state.write_text(json.dumps({"alerted": saved, "at": NOW}))
+        self.assertIsInstance(self.observe(STALLED, NOW + 60), head_stall.HeadStall)
+        self.assertEqual(self.sent_recipients(), ["bob"])
+        self.sent.clear()
+        self.assertIsInstance(self.observe(STALLED, NOW + 120), head_stall.HeadStall)
+        self.assertEqual(self.sent, [])
 
-    def test_a_legacy_delivery_record_still_allows_bobs_first_alert(self) -> None:
+    def test_a_legacy_timestamp_without_a_head_does_not_suppress_an_alert(self) -> None:
         last_start = NOW - 3600 + 0.25
         self.admit_at(last_start)
         _ = self.paths.state.write_text(json.dumps({"alerted": last_start, "at": NOW}))
         self.assertIsInstance(self.observe(STALLED, NOW), head_stall.HeadStall)
-        self.assertEqual(self.sent_recipients(), ["bob"])
-        self.assertEqual(json.loads(self.paths.state.read_text())["alerted"], {"builds": last_start, "bob": last_start})
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
         self.assertIsInstance(self.observe(STALLED, NOW + 60), head_stall.HeadStall)
-        self.assertEqual(self.sent_recipients(), ["bob"])
+        self.assertEqual(self.sent_recipients(), ["builds", "bob"])
 
     def test_state_write_failures_do_not_stop_sends_and_report_once(self) -> None:
         diagnostics = StringIO()

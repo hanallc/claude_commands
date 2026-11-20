@@ -2625,8 +2625,25 @@ class AdmissionServer:
                 or not isinstance(self.last_policy, records.AdmissionPolicy)
                 or not isinstance(self.last_result, gate.PassResult)):
             return
-        reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
-                          diagnostics=self.last_diagnostics)
+        inputs, result = self.last_inputs, self.last_result
+        remaining = {records.waiter_owner(waiting.row) for waiting in self.waiters.values()}
+        ordered = [(path, row) for path, row in inputs.ordered if records.waiter_owner(row) in remaining]
+        if len(ordered) != len(inputs.ordered):
+            # Keep the decisions from the pass. Publish only the waiters that remain.
+            inputs = replace(inputs, ordered=ordered)
+            rows = tuple(row for row in result.rows if row.owner in remaining)
+            candidate = gate.first_queued_waiter((row for _, row in gate.ranked_queue_waiters(inputs)),
+                                                 inputs.pending_remote_starts)
+            head: gate.QueuedHead | gate.NoQueuedHead = gate.NoQueuedHead()
+            if isinstance(candidate, gate.QueuedWaiter):
+                waiter = candidate.waiter
+                head = gate.QueuedHead(waiter)
+                owner = records.waiter_owner(waiter)
+                available = inputs.host.available if isinstance(inputs.host, records.HostMemory) else 0
+                rows = tuple(self._published_head_row(row, waiter["need"], available) if row.owner == owner else row
+                             for row in rows)
+            result = replace(result, rows=rows, policy=replace(result.policy, queued_head=head))
+        reading = replace(gate.queue_read_from_pass(inputs, self.last_policy, result), diagnostics=self.last_diagnostics)
         waiting = tuple(replace(step, verify=row["verify"]) if "verify" in row else step
                         for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True))
         reading = replace(reading, view=replace(reading.view, waiting=waiting))
@@ -2645,6 +2662,14 @@ class AdmissionServer:
         view = wire.ViewReply(reading)
         explain = wire.ExplainReply(reading.explanation, self.last_diagnostics)
         self.published = PublishedReplies(view, explain)
+
+    @staticmethod
+    def _published_head_row(row: gate.PassRow, need: int, available: int) -> gate.PassRow:
+        reason = row.reason
+        if isinstance(reason, records.HeadAdmissionStatus):
+            return row
+        assert not isinstance(reason, (records.TokenWaitingWaiter, records.NatedevHeld))
+        return replace(row, reason=records.HeadAdmissionStatus(row.decision, need, available, cause=reason))
 
     def reply_bytes(self, reply: wire.Reply, *, version: int = wire.VERSION) -> bytes:
         if version != wire.VERSION:
