@@ -17,7 +17,7 @@ from unittest import mock
 from scripts.aws_target import aws_cli, deploy, hana_box, hana_image, hana_render, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.config import DeploymentSettings
-from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_hana_config
+from scripts.aws_target.ledger_test_support import CostFixture, override_fixture_settings, text_setting, write_hana_config
 from scripts.aws_target.test_hana_box import FakeProvider
 from scripts.aws_target.test_hana_provider import FakeAws, IDENTITY
 from scripts.lib import conf
@@ -944,7 +944,7 @@ class HanaSetupTests(CostFixture):
         self.assertEqual(remote.read_record(saved_path), saved)
 
     def test_resume_preserves_the_hana_stack_network_and_approved_hash(self) -> None:
-        text_setting(self.workload, 'stop_wait_timeout_s', '25')
+        override_fixture_settings(self.workload, 'stop_wait_timeout_s=25')
         fake = FakeAws(self.clock, state='running')
         calls: list[str] = []
         alternative = deploy.DeploymentNetwork('us-east-2', 'discovered-vpc', [
