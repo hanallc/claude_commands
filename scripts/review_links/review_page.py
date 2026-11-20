@@ -1607,9 +1607,9 @@ let deferredLink=null,revealCreated=null;
 function allEntries(){return [...index.values()];}
 function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
 function matchesOwner(entry,owner){return !owner || entry.owner===owner || isInvestigation(entry) && entry.sourceOwner===owner;}
-function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
+function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys,now=Date.now()}){
  const linked=keys?.has(entry.key);
- return (!keys?.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=Date.now()) &&
+ return (!keys?.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=now) &&
   matchesOwner(entry,owner) &&
   (!type || (type==='investigations' ? isInvestigation(entry) : entry.type===type)) &&
   (!sourceOwner || entry.sourceOwner===sourceOwner) &&
@@ -1672,9 +1672,9 @@ const view=createRecordTable({content:()=>content,
  visible:isListed,
  sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
  applied:(_items,filters)=>{
-  const {type,show,owner,query,keys}=filters;
+  const {type,show,owner,query,keys,now}=filters;
   content.dataset.show=show;loadBodies();
-  const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys}));
+  const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys,now}));
   content.querySelectorAll('[data-owner-chip]').forEach(button=>{
    const id=button.dataset.ownerChip;
    button.hidden=Boolean(id) && id!==owner && !eligibleOwners.some(entry=>matchesOwner(entry,id));

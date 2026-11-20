@@ -940,7 +940,8 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(!sharedWords()) words().value=query;
  for(const name of filterNames)
   filters[name]=filterSelection(name).set(filters[name]);
- const active=currentSelection();
+ // One clock read per pass, so rows and counts agree when a time passes mid-pass.
+ const active={...currentSelection(),now:Date.now()};
  const counts=options.filterValues ? Object.fromEntries(['show','owner',...filterNames].map(name=>[name,Object.create(null)])) : undefined;
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
