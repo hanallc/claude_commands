@@ -432,6 +432,16 @@ class ConversationPauseTests(ConversationPauseFixture):
                 record_keys=review_hold_delivery.record_keys)
         return held
 
+    def test_open_hold_check_uses_the_review_count_and_idle_limit(self) -> None:
+        self.open_review()
+        with patch.dict(os.environ, self.environment):
+            self.assertTrue(review_hold.has_open_hold(SESSION, 159))
+            self.assertFalse(review_hold.has_open_hold(SESSION, 160))
+            self.assertFalse(review_hold.has_open_hold("missing-session", 159))
+        self.assertEqual(self.end_review(159), [])
+        with patch.dict(os.environ, self.environment):
+            self.assertFalse(review_hold.has_open_hold(SESSION, 159))
+
     def test_native_peer_and_scheduled_prompts_are_saved_before_the_hook_blocks(self) -> None:
         self.open_review()
         for sender, body, at in (("Review peer", "The checks passed.\nURGENT: quoted text", 120),

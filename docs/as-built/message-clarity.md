@@ -41,6 +41,14 @@ The prefix also applies after leading spaces. Generated stamp lines keep their o
 Queue records and logs keep the raw caller text.
 These fields do not change the recipient, reply name, or message key.
 
+### Messages during an ad hoc review
+
+`send.py` keeps local messages during an open review and returns `KEPT`.
+The sender's `pre-tool-use-review-hold-send.py` hook denies native `SendMessage` calls to a session with an open hold.
+It asks the sender to send the same text with `send.py`.
+Messages that start with `URGENT:` pass through the hook.
+The hook works only after its `PreToolUse` entry is in `settings.json`.
+
 ### Replies to relay sockets
 
 The headless Claude relay uses the session name `relay/<sender>`. Before Claude starts, the launcher records the sender and process start in `message/relay_senders/<pid>.identity`.
