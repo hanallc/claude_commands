@@ -42,11 +42,12 @@ from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture, write_pressure_reading
 from scripts.production.cli_fixture import ImmutableGitSeed, locked_environment
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
-from scripts.production import bump_gate, checkpoint_gate, waiting
+from scripts.production import bump_gate, checkpoint_gate, staff, waiting
 from scripts.production.production_doc import Production
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
+SESSION_VARIABLES = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 GATE_COMMAND = """from pathlib import Path
 import json, os, sys, time
 sys.path.insert(0, os.environ['SLOT_ORDER_CHECKOUT'])
@@ -73,6 +74,7 @@ class SlotOrderTests(unittest.TestCase):
     source: Path = Path()
     slot_root: Path = Path()
     owner: str = ""
+    session_environment: dict[str, str] = {}
     queue: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     processes: list[subprocess.Popen[str]] = []
     requests: list[wire.Request] = []
@@ -84,7 +86,9 @@ class SlotOrderTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="slot-order-"))).resolve()
-        environment = copies_environment(self.root, repository="origin")
+        runner_session = staff.caller_identity()
+        self.session_environment = {key: os.environ.get(key, "") for key in SESSION_VARIABLES}
+        environment = {**copies_environment(self.root, repository="origin"), **self.session_environment}
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.queue = self.enterContext(AdmissionFixture(root=Path(environment["CONF_DIR"])))
         self.queue.clock.epoch = time.time()
@@ -95,9 +99,11 @@ class SlotOrderTests(unittest.TestCase):
             _ = os.environ.pop(key, None)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         parent = fixture_member("showrunner", name="builds")
-        member = fixture_member("unit", name="slot-order", parent=parent.id)
+        member = fixture_member("unit", name="slot-order", parent=parent.id, runtime_id=runner_session)
         self.owner = str(member.id)
-        os.environ["CLAUDE_CODE_SESSION_ID"] = member.current_session
+        if not runner_session:
+            self.session_environment["CLAUDE_CODE_SESSION_ID"] = member.current_session
+            os.environ.update(self.session_environment)
         seed = ImmutableGitSeed.create(self.root / "repository", "main", "Slot Tests", "slots@example.invalid",
             {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "merge_gate.py": GATE_COMMAND,
              ".gitignore": "target/\n"})
@@ -553,11 +559,20 @@ placement_once
         self.finish(process)
         self.assertFalse(snapshot.exists())
 
+    def test_snapshot_command_inherits_the_runner_session(self) -> None:
+        program = ("import json, os\n"
+                   f"print(json.dumps({{key: os.getenv(key, '') for key in {SESSION_VARIABLES!r}}}))")
+        process = self.start((sys.executable, "-c", program))
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(output.strip(), json.dumps(self.session_environment))
+
     def verify_source(self) -> VerifyMacOffloadFixture:
         tools = VerifyMacOffloadFixture()
         tools.root = self.root / "verify"
         tools.root.mkdir()
         tools.build_fixture()
+        tools.environment.update(self.session_environment)
         real_git = shutil.which("git")
         assert real_git is not None
         shutil.rmtree(tools.root / ".git")
@@ -590,7 +605,7 @@ placement_once
     def verify_run_environment(self, tools: VerifyMacOffloadFixture) -> dict[str, str]:
         environment = {**tools.environment, **{key: os.environ[key] for key in (
             "CONF_DIR", "COPIES_CONFIG", "SESSION_TEMP_ROOT", "SESSION_FORMER_ROOT",
-            "SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "SCRATCH_HOLDS", "CLAUDE_CODE_SESSION_ID", "STAFF_FILE")},
+            "SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "SCRATCH_HOLDS", "STAFF_FILE")},
             "ADMISSION_SOCKET": str(self.queue.socket_path), "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": ""}
         _ = shutil.copy2(tools.root / "build_targets.conf", Path(environment["CONF_DIR"]) / "build_targets.conf")
         _ = shutil.copy2(tools.root / "mac settings.conf", Path(environment["CONF_DIR"]) / "mac settings.conf")
