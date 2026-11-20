@@ -328,7 +328,7 @@ status.aws.age_limit_seconds=3900
         checks = {('c7a.4xlarge', region, '2026-01-14'): run_cost.hours_check(Decimal(billed), Decimal(box), limit)
                   for region, billed, box, _kind, _text in readings}
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
-        with (mock.patch.dict(os.environ, {'CONF_DIR': str(root), 'USER_ZONE': 'UTC'}),
+        with (mock.patch.dict(os.environ, CONF_DIR=str(root), AWS_TARGET_CONFIG=str(settings), USER_ZONE='UTC'),
               mock.patch.object(run_cost, 'day_hours_checks', return_value=checks)):
             page = aws_page.publish(state, now, root / 'page', settings_path=settings).read_text()
         payload = page.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
