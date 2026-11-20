@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -98,6 +99,17 @@ def _expand_proposals_folder(doc: Path, value: Path) -> Path:
     folder = value.expanduser()
     # A relative folder starts at the checkout that contains docs/plans.
     return folder if folder.is_absolute() else doc.parent.parent.parent / folder
+
+
+def _has_unknown_home_account(folder: Path) -> bool:
+    home = next(iter(folder.parts), "")
+    if not home.startswith("~") or home == "~" or "\x00" in str(folder):
+        return False
+    try:
+        _ = pwd.getpwnam(home[1:])
+    except KeyError:
+        return True
+    return False
 
 
 def issues_folder(doc: Path, *, lines: list[str] | None = None) -> Path | None:
@@ -326,11 +338,13 @@ def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path
                   *, document: Path | None = None, current_source: Path | None = None, strict: bool = False,
                   include_history: bool = True, require_document: bool = True,
                   require_existing_document: bool = False, sources: list[Path] | None = None,
+                  skip_unknown_history_accounts: bool = False,
                   on_source_error: Callable[[Path, Exception], None] | None = None) -> tuple[Path, ...]:
     """Return current and former store roots. Use stored_paths to include their archives.
 
     Use current_source to name the source of the supplied roots.
     If given, on_source_error reports each source failure and keeps the other roots.
+    Use skip_unknown_history_accounts to omit historical paths with unknown named home accounts.
     """
     def source_failed(path: Path, error: Exception, *, required: bool) -> None:
         if on_source_error is not None:
@@ -343,7 +357,12 @@ def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path
     def add_resolved_folder(folder: Path, source: Path, *, expand_proposals_value: bool = False) -> None:
         try:
             if expand_proposals_value:
-                folder = _expand_proposals_folder(source, folder)
+                try:
+                    folder = _expand_proposals_folder(source, folder)
+                except RuntimeError:
+                    if skip_unknown_history_accounts and _has_unknown_home_account(folder):
+                        return
+                    raise
             if "\x00" in str(folder):
                 raise ValueError("A folder path cannot contain NUL.")
             resolved[folder.resolve()] = None

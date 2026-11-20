@@ -421,7 +421,7 @@ def find_review_proposal(folders: Path | tuple[Path, ...], recipient: staff.Staf
     keys = frozenset((NUMBER_FIELD, "production_id", "proposed_by", "review_submission", "tags"))
     folders = (folders,) if isinstance(folders, Path) else folders
     roots = record_store.known_folders(record_store.RecordKind.PROPOSAL, recipient, folders, document=document,
-                                       strict=True, require_document=False)
+                                       strict=True, require_document=False, skip_unknown_history_accounts=True)
     for path in record_store.stored_paths(roots, strict=True):
         issue = Issue(path, record_store.read_header(path, keys=keys, strict=True))
         if proposal_owner(issue, issue.value("proposed_by")) != recipient or not issue.value("review_submission"):

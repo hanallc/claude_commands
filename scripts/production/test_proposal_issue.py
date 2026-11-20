@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import io
 import json
+import subprocess
 import threading
 import time
 import os
@@ -17,6 +18,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import final, override
 from unittest import mock
+from uuid import uuid4
 
 from scripts.production import proposal_issue
 from scripts.production.issues import Issue, frontmatter
@@ -101,6 +103,38 @@ class ProposalIssueTests(unittest.TestCase):
         saved = proposal_issue.find_review_proposal(folder, recipient, new_item_dialog.ByRequestId(details.request_id))
         assert saved is not None
         self.assertEqual(saved.path, archived)
+        self.assertEqual(proposal_issue.review_submission(saved), details)
+
+    def test_review_lookup_skips_an_unknown_history_account_and_finds_the_saved_proposal(self) -> None:
+        original = self.root / "original"
+        former = self.root / "former"
+        current = self.root / "current"
+        recipient = next(row.id for row in staff.snapshot().rows if row.name == "hana")
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        sent = proposal_issue.file_review_proposal(original, recipient, "Saved proposal", "Words",
+                                                   "hana answers this", details)
+        saved_path = original.rename(former) / sent.path.name
+        current.mkdir()
+        document = self.root / "production.md"
+        unknown = Path(f"~review-test-{uuid4().hex}/proposals")
+
+        def git(*arguments: str) -> None:
+            _ = subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Fixture",
+                                "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+                                *arguments], capture_output=True, check=True)
+
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}):
+            git("init", "-b", "main")
+            for folder in (former, unknown, current):
+                _ = document.write_text(f"- **Proposals:** {folder}\n")
+                git("add", document.name)
+                git("commit", "-m", "Set the proposals folder.")
+
+            saved = proposal_issue.find_review_proposal(
+                current, recipient, new_item_dialog.ByRequestId(details.request_id), document=document)
+
+        assert saved is not None
+        self.assertEqual(saved.path, saved_path.resolve())
         self.assertEqual(proposal_issue.review_submission(saved), details)
 
     def test_approve_clears_the_waiting_mark_of_a_review_submission(self) -> None:
