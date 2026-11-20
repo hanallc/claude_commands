@@ -634,6 +634,10 @@ Provider errors expose safe action names rather than cloud identifiers or signed
 The provider persists its operation before dispatch and holds a separate mutation lock.
 Existing writes store the lifecycle generation and UTC epoch seconds for dispatch, acceptance, or cancellation.
 Acceptance writes identify a direct response or a bootstrap observation.
+The scaler gives `StartInstances` one attempt.
+The provider saves a definite service refusal as `start_refusal_code` before returning the error.
+The record contains the code only.
+A later active observation takes precedence over the refusal for accounting.
 Recovery takes that lock without blocking an active mutation.
 Recovery fences an operation that has not reached dispatch.
 A late worker cannot dispatch that fenced operation.
@@ -913,6 +917,16 @@ Paired trials use this booked cost for completed gates.
 Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
+An unbilled day is idle only if every run exposure that starts before its end has a confirmed closure before its start.
+An expired permit or reservation still counts until the ledger confirms closure.
+The page, spending guard, and admission use the usual prices and bill carry on run days.
+After the latest bill, an unbilled idle day carries retained resource costs and unknown usage types.
+It skips usage linked to runs and uses the usual accounting for Cost Explorer fees.
+The page, spending guard, and admission use the same idle-day rule.
+The guard keeps any higher established charges.
+The ledger and hours table exclude a closed Hana exposure only when its START record has a valid `start_refusal_code`.
+A possible start or an observed acceptance in any generation of the exposure keeps the full exposure.
+Legacy cancellations and stopped states retain the full exposure when the journal has no refusal code.
 Reports keep the existing reconciliation floors.
 The account checks adjust the existing total for each qualifying UTC day inside the limit window.
 They subtract that day's existing usage and add the newest qualifying AWS amount.
