@@ -3111,7 +3111,7 @@ Work:
 2. Comments only: no key, value or order changes.
 3. Run each file's reader tests; the readers still parse the files.
 
-### Phase 44dc — A test run stops holding a full build's memory promise  · status: todo
+### Phase 44dc — A test run stops holding a full build's memory promise  · status: next (after 44eb fix round 4; builds 18:49)
 **From builds (item 78; nate yes 12:12 EST via bob), 2026-11-19:** a test run keeps a full build's memory promise for its whole life. At 09:07 a merge gate using 0.3 GiB still kept 4.6 GiB aside (the 44da read: designed behavior today). Repair it.
 
 Today the need falls only for a progress window or for a nextest step past its build (`reservation_need`, scripts/lint/memory_admit.py). Otherwise the full row need holds until the reservation ends (`step_promise`, `LifetimePromise`).
@@ -3320,6 +3320,15 @@ Cause: the fixtures gave their child runs a made-up session id. During natemerge
 2. Merge test requests carry a landing reference through `step_request` and `Identity`.
 3. One eligibility check before local, cloud and routed grants holds each other claude_commands test run. The waiter shows "waits for the merge test" and keeps its queue order.
 4. When the merge test ends, the held runs start in their original order.
+
+### Phase 44ec — A nextest run gets its token floor in test threads  · status: todo
+**From builds, 2026-11-20 18:49 EST (head-stall 18:46).** Two hana nextest runs started at load 30 on 32 CPUs. Each waited for `test_token_floor`=4 tokens. Then `nested_tokens`=3 took 3 of the 4 (`scripts/lint/nextest_tokens.py:309-310`), so each ran 1 test thread for about 3 hours.
+
+1. Part A: the floor counts test threads only. A run waits for `min(test_token_floor, selected tests)` test tokens, plus up to `nested_tokens` tokens for nested Cargo on top.
+2. The config comment for `test_token_floor` and the as-built text change with the meaning. The key name and value stay.
+3. Part B (the width grows as tokens free) is a follow-up: nextest fixes `--test-threads` at start, so growth needs batched runs or a restart. Its cost is a new run per batch and a more complex launcher.
+
+Tests (each failing first): a busy pool with 4 free tokens gives 4 test threads, not 1; with nested Cargo the run waits for 4 plus 3; a selection of 2 tests waits for 2 test tokens.
 
 ### Phase 44dv — Admission tests run on the Mac, with no skip  · status: todo
 **From builds, 2026-11-20 05:30 EST (found by report).** After the group merges; not urgent. User rule: tests run on the Mac too; no Mac skip.
