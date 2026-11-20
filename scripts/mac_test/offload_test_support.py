@@ -33,6 +33,7 @@ from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
 from scripts.lib import test_hang_guard
 from scripts.lib.process_group import send_process_group
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production.cli_fixture import invoke_cli
 from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, placement
@@ -381,6 +382,7 @@ class OffloadCommandFixture(unittest.TestCase):
             **os.environ, **interpreter_cache_environment(self.root / "cache"),
             **config_environment(self.root),
             **copies_environment(self.root),
+            **fixture_zsh_environment(),
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),

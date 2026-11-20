@@ -30,6 +30,7 @@ from scripts.for_you.action import ActionStore
 from scripts.hooks import showrunner_footer
 from scripts.lib import conf
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production import footer_counts, investigation, session_labels, staff
 from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
@@ -44,8 +45,7 @@ SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
 CONSOLE_HOST_SHELL = "export STATUSLINE_SYSTEM=Linux; "
 USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# Preserve the fixture PATH when NixOS starts a child shell.
-SHELL_ENVIRONMENT = {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED": "1"}
+SHELL_ENVIRONMENT = fixture_zsh_environment()
 SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 # Where NixOS's glibc finds zone files; Claude Code's environment carries it.
 ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
