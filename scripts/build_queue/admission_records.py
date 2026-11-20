@@ -967,6 +967,10 @@ class ReadingUnavailable:
     reason: str = "memory reading unavailable"
 
 
+# Use the existing unavailable reason so older clients can read the wait.
+ADMISSION_DECISION_PENDING = ReadingUnavailable("admission decision pending")
+
+
 @dataclass(frozen=True)
 class EstimateExpired:
     """The estimate has expired since this recorded estimate time."""

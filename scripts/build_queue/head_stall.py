@@ -10,7 +10,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
-import math
 from pathlib import Path
 import subprocess
 import sys
@@ -32,6 +31,7 @@ TIMES_TAIL_BYTES = 1 << 20
 PROC = gate.PROC
 
 type AlertRecipient = Literal["builds", "bob"]
+type AlertDeliveries = dict[AlertRecipient, float | str]
 ALERT_RECIPIENTS: tuple[AlertRecipient, ...] = ("builds", "bob")
 DECISION_OUTAGE = "admission-decision"
 
@@ -72,7 +72,6 @@ class HeadStall:
     """The head waited at least the limit while reservations held memory and no step started."""
     last_start: float
     head: records.HeadExplanation
-    head_owner: str
     room: records.RoomCheck | records.ReadingUnavailable
     waited: float
     quiet: float
@@ -98,7 +97,8 @@ class NoDecisionOutage:
 
 @dataclass(frozen=True)
 class WatchState:
-    alerted: dict[AlertRecipient, dict[str, float]] = field(default_factory=dict)
+    alerted: AlertDeliveries = field(default_factory=dict)
+    outage_alerted: AlertDeliveries = field(default_factory=dict)
     unreadable_since: float | NoDecisionOutage = NoDecisionOutage()
 
 
@@ -178,7 +178,7 @@ def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
 
 def find_stall(decision: records.QueueExplanation, admitted: float, now: float, limit: float) -> HeadStall | NoStall:
     head = decision.head
-    if not isinstance(head, records.HeadExplanation):
+    if not isinstance(head, records.HeadExplanation) or head.cause == records.ADMISSION_DECISION_PENDING:
         return NoStall()
     inputs = decision.decided_from
     last_running_start = max((step.started_at for step in inputs.running if step.promise > 0), default=0.0)
@@ -192,11 +192,7 @@ def find_stall(decision: records.QueueExplanation, admitted: float, now: float, 
     if not holders:
         return NoStall()
     head_room = head.room if isinstance(decision.room, records.MemoryRoom) else decision.room
-    waiter = head.waiter
-    owner = next((records.waiter_owner(row) for row in decision.ordered
-                  if row["pid"] == waiter.pid and row["since"] == waiter.since),
-                 f"{waiter.pid}@{waiter.since}")
-    return HeadStall(last_start, head, owner, head_room, waited, quiet, holders, _compiler_scan(inputs.running))
+    return HeadStall(last_start, head, head_room, waited, quiet, holders, _compiler_scan(inputs.running))
 
 
 def memory_holders(decision: records.QueueExplanation, now: float) -> tuple[Holder, ...]:
@@ -348,50 +344,62 @@ def _read_state(path: Path) -> WatchState:
     saved = fields.get("alerted")
     # An old key covers builds only. It cannot confirm delivery to bob.
     values = cast(dict[str, object], saved) if isinstance(saved, dict) else {"builds": saved}
-    alerted: dict[AlertRecipient, dict[str, float]] = {}
+    outages = fields.get("outage_alerted")
+    outage_values = cast(dict[str, object], outages) if isinstance(outages, dict) else {}
+    alerted: AlertDeliveries = {}
+    outage_alerted: AlertDeliveries = {}
     for recipient in ALERT_RECIPIENTS:
         value = values.get(recipient)
+        outage = outage_values.get(recipient)
         if isinstance(value, dict):
-            alerted[recipient] = {key: float(at) for key, at in cast(dict[str, object], value).items()
-                                  if isinstance(at, (int, float)) and not isinstance(at, bool)}
-        elif isinstance(value, str):
-            owner, _, second = value.rpartition(":")
-            pid, separator, start_time = owner.partition(":")
-            # The old key stored only whole seconds.
-            if separator and pid.isdecimal() and start_time and second.isdecimal() and len(second) <= 20:
-                alerted[recipient] = {f"{pid}-{start_time}": math.nextafter(int(second) + 1.0, -math.inf)}
+            # Keep the latest delivery from the old format that stored one timestamp per head.
+            heads = cast(dict[str, object], value)
+            outage = heads.get(DECISION_OUTAGE, outage)
+            value = max((at for key, at in heads.items() if key != DECISION_OUTAGE
+                         and isinstance(at, (int, float)) and not isinstance(at, bool)), default=None)
+        if isinstance(value, (int, float, str)) and not isinstance(value, bool):
+            alerted[recipient] = value
+        if isinstance(outage, (int, float)) and not isinstance(outage, bool):
+            outage_alerted[recipient] = outage
     since = fields.get("unreadable_since")
-    return WatchState(alerted, float(since) if isinstance(since, (int, float))
+    return WatchState(alerted, outage_alerted, float(since) if isinstance(since, (int, float))
                       and not isinstance(since, bool) else NoDecisionOutage())
 
 
 def _write_state(path: Path, state: WatchState, now: float) -> None:
     fields: dict[str, object] = {"alerted": state.alerted, "at": now}
+    if state.outage_alerted:
+        fields["outage_alerted"] = state.outage_alerted
     if isinstance(state.unreadable_since, float):
         fields["unreadable_since"] = state.unreadable_since
     write_text_atomic(path, json.dumps(fields) + "\n")
 
 
-def _send_alert(path: Path, state: WatchState, now: float, owner: str, event_at: float, text: Callable[[], str],
+def _already_alerted(value: float | str, event_at: float) -> bool:
+    if isinstance(value, str):
+        # The old key stored the last start in whole seconds.
+        _, separator, second = value.rpartition(":")
+        return bool(separator) and second.isdecimal() and len(second) <= 20 and int(event_at) <= int(second)
+    return event_at <= value
+
+
+def _send_alert(path: Path, state: WatchState, delivered: AlertDeliveries, now: float,
+                key: str, event_at: float, text: Callable[[], str],
                 run: Callable[[list[str], str], bool]) -> None:
     """Record each accepted alert before sending to the next recipient."""
     from scripts.message.session_send import session_send_argv
 
     pending: tuple[AlertRecipient, ...] = tuple(recipient for recipient in ALERT_RECIPIENTS
-        if state.alerted.get(recipient, {}).get(owner, -math.inf) < event_at)
+        if recipient not in delivered or not _already_alerted(delivered[recipient], event_at))
     if not pending:
         return
     report = text()
     write_errors: list[OSError] = []
     for recipient in pending:
         command = session_send_argv(recipient, sender=SENDER)
-        command.extend(["--key", f"head-stall-{owner}-{event_at}"])
+        command.extend(["--key", key])
         if run(command, report):
-            delivered = state.alerted.setdefault(recipient, {})
-            if owner != DECISION_OUTAGE:
-                delivered = {head: at for head, at in delivered.items() if head == DECISION_OUTAGE or at >= event_at}
-                state.alerted[recipient] = delivered
-            delivered[owner] = event_at
+            delivered[recipient] = event_at
             try:
                 _write_state(path, state, now)
             except OSError as error:
@@ -402,7 +410,7 @@ def _send_alert(path: Path, state: WatchState, now: float, owner: str, event_at:
 
 def watch_once(paths: StallPaths, now: float, run: Callable[[list[str], str], bool] = _run
                ) -> HeadStall | AdmissionDecisionUnreadable | NoStall:
-    """Alert once for each head and report prolonged failures to read the decision."""
+    """Alert once per stall. Report prolonged failures to read the decision."""
     limit, freshest = configured_limits()
     stall = current_stall(paths, now, limit, freshest)
     state = _read_state(paths.state)
@@ -412,7 +420,7 @@ def watch_once(paths: StallPaths, now: float, run: Callable[[list[str], str], bo
         if isinstance(since, NoDecisionOutage):
             _write_state(paths.state, replace(state, unreadable_since=now), now)
         elif now - since >= limit and stall.waited >= limit:
-            _send_alert(paths.state, state, now, DECISION_OUTAGE, since,
+            _send_alert(paths.state, state, state.outage_alerted, now, f"head-stall-{DECISION_OUTAGE}-{since}", since,
                         lambda: "The head-stall check cannot read the admission decision. "
                         + f"The queue snapshot shows a head that has waited {stall.waited / 60:.0f} min.\n"
                         + stall.reason, run)
@@ -421,5 +429,6 @@ def watch_once(paths: StallPaths, now: float, run: Callable[[list[str], str], bo
         state = replace(state, unreadable_since=NoDecisionOutage())
         _write_state(paths.state, state, now)
     if isinstance(stall, HeadStall):
-        _send_alert(paths.state, state, now, stall.head_owner, stall.last_start, lambda: _alert_text(stall, now), run)
+        _send_alert(paths.state, state, state.alerted, now, f"head-stall-{stall.last_start}", stall.last_start,
+                    lambda: _alert_text(stall, now), run)
     return stall
