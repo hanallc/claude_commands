@@ -100,8 +100,9 @@ def wait_for_verify_state(ready: Callable[[], bool], directory: Path, process: s
 
 
 def wait_for_target_holder(episode: str) -> None:
-    """Pause after verify processes the marked placement reply."""
+    """Pause when the recorder writes a new holder entry."""
     root = Path(os.environ["PACKAGE_ROOT"])
+    session = Path(os.environ["UNIT_RUN_DIR"])
     pauses = int(os.environ["TEST_TARGET_PAUSES"])
     admission = Path(os.environ["TEST_TARGET_ADMISSION"])
     snapshot = admission / "queue.json"
@@ -119,8 +120,7 @@ def wait_for_target_holder(episode: str) -> None:
         resume = root / f"target-resume-{number}"
         if resume.exists():
             continue
-        retry = root / f"target-retry-{number}"
-        if retry.exists() and retry.read_text() == episode:
+        if len(recorded_holders(wait_rows(session))) >= number:
             (root / f"target-holder-{number}").touch()
             wait_for_file(resume)
             return
