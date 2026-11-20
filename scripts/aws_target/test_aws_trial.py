@@ -30,7 +30,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
-from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_gate_config
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
@@ -48,10 +48,8 @@ class GuestTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
+        write_gate_config(root / 'cloud_gate.conf')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
-        _ = (root / 'cloud_gate.conf').write_text(
-            'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
-            + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux\n')
         _ = (root / 'test_times.conf').write_text(
             '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
             + '# whole: 1..\nTOP_RUNS=5\n')
@@ -407,17 +405,11 @@ class Sample(unittest.TestCase):
         self.changed = trial.checked_git(self.repo, 'rev-parse', 'HEAD')
         self.origin = self.root / 'origin.git'
         _ = subprocess.run(['git', 'clone', '--bare', str(self.repo), str(self.origin)], check=True, capture_output=True)
-        _ = (self.root / 'cloud_gate.conf').write_text(
-            f'clone_url={self.origin}\n'
-            + f'credential_file={self.root / "credentials"}\n'
-            + 'regions=us-east-2 us-west-2\n'
-            + 'trial_branch_prefix=gate-trial\n'
-            + '# whole: 1..9\nslots=9\n'
-            + '# whole: 1..60\nlifetime_minutes=20\n'
-            + '# range: 0.01..300\ngit_network_timeout_s=60\n'
-            + '# range: 1..3600\nmodule_time_limit_s=1800\n'
-            + '# range: 1..600\ntermination_timeout_s=120\n'
-            + '# range: 1..120\napi_timeout_s=30\n')
+        gate_settings = self.root / 'cloud_gate.conf'
+        text_setting(gate_settings, 'clone_url', str(self.origin))
+        text_setting(gate_settings, 'credential_file', str(self.root / 'credentials'))
+        text_setting(gate_settings, 'regions', 'us-east-2 us-west-2')
+        text_setting(gate_settings, 'trial_branch_prefix', 'gate-trial')
 
     def test_expired_sweep_preserves_a_racing_coordinator_termination(self) -> None:
         now = 1700000000

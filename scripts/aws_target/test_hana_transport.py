@@ -5,7 +5,6 @@ from collections.abc import Sequence
 from pathlib import Path
 import json
 import os
-import re
 import subprocess
 import tempfile
 from typing import cast
@@ -25,9 +24,9 @@ class HanaTransportPolicyTests(unittest.TestCase):
             private = private_slot_config(root, repository='hana')
             with mock.patch.dict(os.environ, private.environment):
                 settings = Path(private.environment['CONF_DIR']) / 'hana_aws.conf'
-                # Private values keep the two limits distinct whatever the repository defaults are.
-                _ = settings.write_text(re.sub(r'(?m)^source_upload_timeout_s=.*$', 'source_upload_timeout_s=77',
-                    re.sub(r'(?m)^aws_timeout_s=.*$', 'aws_timeout_s=7', settings.read_text())))
+                _ = settings.write_text(
+                    '# whole: 1..\naws_timeout_s=7\n# whole: 1..\nsource_upload_timeout_s=77\n'
+                    + '# whole: 1..604800\nsource_url_seconds=3600\n')
                 configuration = conf.read(settings)
                 calls: list[tuple[str, float]] = []
                 objects: dict[str, bytes] = {}

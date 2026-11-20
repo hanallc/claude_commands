@@ -18,6 +18,7 @@ from unittest import mock
 
 from scripts.aws_target import aws_trial, gate_box, ledger
 from scripts.aws_target import test_aws_trial as trial_tests
+from scripts.aws_target.ledger_test_support import write_gate_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import merge_gate as gate
 from scripts.test_times import gate_record
@@ -127,8 +128,10 @@ subprocess.run = fail_log_put
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        for name in ('cloud_gate.conf', 'test_times.conf'):
-            _ = (root / name).write_bytes((ROOT / 'config' / name).read_bytes())
+        write_gate_config(root / 'cloud_gate.conf')
+        _ = (root / 'test_times.conf').write_text(
+            '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n# whole: 1..\nTOP_RUNS=5\n'
+            + '# range: 0..\nSLOW_TEST_S=0.5\n')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(root)})))
 
     def test_trial_and_route_share_one_guest(self) -> None:

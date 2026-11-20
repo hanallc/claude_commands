@@ -17,7 +17,6 @@ from scripts.aws_target import aws_page, cloud_gate, console_help, ledger, ledge
 from scripts.aws_target.aws_cli import AwsCli
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import page_frame
 
 
@@ -54,7 +53,7 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
         standard = ('c7a.4xlarge', 'm7a.8xlarge')
         gpu = 'g6.2xlarge'
         config = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(config, 'max_gate_minutes=60\n')
+        self.configure_gate('max_gate_minutes=60\n')
         for key, value in (
             ('spot_candidate_regions', ' '.join(reversed(regions))), ('instance_types', ' '.join(standard)),
             ('price_compare_instance_types', standard[1]), ('gpu_instance_types', gpu),
@@ -267,8 +266,7 @@ class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
         slow_type = 'm7a.4xlarge'
         deployed_types = ('c7a.4xlarge', 'c7a.8xlarge', slow_type, 'm7a.8xlarge', unmeasured_type)
         self.text_setting('region', east)
-        config = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(config,
+        self.configure_gate(
             f'regions={east} {west} {north}\nspot_candidate_regions={west} {east} {candidate_only}\n'
             + f'instance_types={" ".join((*deployed_types, undeployed_type))}\n'
             + 'gate_wait_usd_per_minute=0.02\nmax_gate_minutes=12\n'

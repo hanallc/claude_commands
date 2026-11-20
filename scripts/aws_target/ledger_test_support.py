@@ -21,6 +21,7 @@ from scripts.aws_target import ledger
 
 REAL_RUN = subprocess.run
 REAL_POPEN = subprocess.Popen
+FIXTURES = Path(__file__).with_name('fixtures')
 
 
 def git_only(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -59,24 +60,16 @@ def text_setting(path: Path, key: str, value: str) -> None:
     _ = path.write_text("\n".join([*lines, f"{key}={value}"]) + "\n")
 
 
-def install_cost_settings(path: Path, overrides: str = "") -> None:
+def install_cost_settings(path: Path) -> None:
     """Install complete settings with exact, private test prices."""
-    _ = write_config_fixture(path, "region=us-east-1\ninstance_type=m7a.4xlarge\nlimit_action=drain\n"
-        + "spot_max_usd_per_hour=0.483\nbox_minimum_seconds=60\n" + overrides)
-    numeric_settings(path, {
-        "daily_limit_usd": "20", "monthly_limit_usd": "400", "limit_reserve_usd": "3",
-        "fallback_usd_per_hour": "1", "fixed_usd_per_month": "0",
-        "retained_storage_usd_per_month": "0", "root_storage_usd_per_month": "0",
-        "ipv4_usd_per_month": "0", "gp3_iops_usd_per_month": "0",
-        "gp3_throughput_usd_per_month": "0", "cost_explorer_read_usd": "0",
-        "price_refresh_seconds": "3600", "price_max_age_seconds": "7200",
-        "observation_max_age_seconds": "86400", "cost_explorer_interval_seconds": "86400",
-        "notification_timeout_s": "5", "notification_retry_s": "60", "cost_explorer_lookback_days": "1",
-    })
-    text_setting(path, "cost_explorer_tag_key", "Project")
-    text_setting(path, "cost_explorer_tag_value", "fixture-build")
-    text_setting(path, "accounting_zone", "UTC")
-    text_setting(path, "notification_recipient", "fixture-showrunner")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_bytes((FIXTURES / 'aws_target.conf').read_bytes())
+
+
+def write_gate_config(path: Path) -> None:
+    """Install fixed settings for gate and GPU trial tests."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_bytes((FIXTURES / 'cloud_gate.conf').read_bytes())
 
 
 HANA_GUEST_RUNTIME_SETTINGS = """\
@@ -209,6 +202,8 @@ class CostFixture(unittest.TestCase):
         self.settings = self.root / "aws_target.conf"
         self.state = self.root / "state"
         self.state.mkdir()
+        install_cost_settings(self.settings)
+        write_gate_config(self.root / 'cloud_gate.conf')
         _ = write_hana_config(self.root / 'hana_aws.conf')
         environment = config_environment(self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -220,10 +215,12 @@ class CostFixture(unittest.TestCase):
         # The patch above restores the removed names when the test ends.
         for name in [name for name in os.environ if name.startswith("AWS_") and name != "AWS_TARGET_CONFIG"]:
             del os.environ[name]
-        install_cost_settings(self.settings)
 
     def configure(self, overrides: str) -> None:
-        _ = write_config_fixture(self.settings, overrides)
+        _ = write_config_fixture(self.settings, overrides, template=FIXTURES / 'aws_target.conf')
+
+    def configure_gate(self, overrides: str) -> None:
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', overrides, template=FIXTURES / 'cloud_gate.conf')
 
     def costs(self, values: dict[str, str]) -> None:
         numeric_settings(self.settings, values)

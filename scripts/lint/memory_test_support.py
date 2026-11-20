@@ -40,9 +40,9 @@ def _template(name: str) -> Path:
 TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
 
 
-def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Merge committed defaults, test defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
-    source = _template(f"{template}.conf" if template else path.name)
+def write_config_fixture(path: Path, overrides: str = "", *, template: str | Path | None = None) -> int:
+    """Merge template defaults, test defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
+    source = template if isinstance(template, Path) else _template(f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
     existing = path.read_text() if path.exists() else ""
     limit_prefixes = ("# whole:", "# range:", "# one of:")

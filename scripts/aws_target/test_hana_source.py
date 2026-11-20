@@ -68,11 +68,47 @@ class HanaSourceTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        config_dir = self.root / 'config'
+        config_dir.mkdir()
+        _ = (config_dir / 'copies.conf').write_text(
+            'wait_seconds=1\ngit_timeout_seconds=60\nguard_timeout_seconds=10\n')
+        _ = (config_dir / 'build_targets.conf').write_text(
+            '# range: 0.001..\nloopback.shell_timeout_s=120\n')
         private = private_slot_config(self.root, repository='hana')
         self.enterContext(mock.patch.dict(os.environ, private.environment))
 
         self.pool_settings = private.settings
-        _ = write_config_fixture(self.configuration.source, 'host=aws-hana\n')
+        configuration = config_dir / 'hana_aws.conf'
+        _ = configuration.write_text("""\
+host=aws-hana
+enabled=on
+# whole: 1..60
+guard_grace_seconds=60
+# whole: 1..60
+watchdog_check_seconds=1
+# whole: 1..1800
+permit_max_seconds=1800
+# whole: 1..8
+step_cpu_limit=4
+# whole: 1..24
+step_memory_gib=24
+# whole: 1..60
+mount_timeout_seconds=15
+execution_shell=ci
+# whole: 1..
+free_floor_gib=30
+source_allowed_ignored=target/ .direnv/ __pycache__/ **/__pycache__/ .claude/settings.local.json .unit.toml
+source_forbidden_paths=.claude/settings.local.json .direnv/ .aws/ .env .env.* **/.env **/.env.* *.pem **/*.pem *.key **/*.key
+source_allowed_environment=RUSTFLAGS RUSTDOCFLAGS CARGO_INCREMENTAL RUST_BACKTRACE
+# whole: 1..
+source_max_bytes=1073741824
+# whole: 1..
+source_download_timeout_s=120
+# whole: 1..
+source_git_timeout_s=60
+# whole: 1..
+source_basis_max_commits=8
+""")
         self.runtime_checkout = self.root / 'commands'
         (self.runtime_checkout / 'config').mkdir(parents=True)
         for name in ('build_targets.conf', 'build_folders.conf', 'copies.conf'):
