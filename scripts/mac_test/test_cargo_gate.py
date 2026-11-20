@@ -19,10 +19,49 @@ from scripts.mac_test.mac_ci_test_support import BUSY_PROCESS_LIST
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test.mac_gate_records import MacGateRecord, MacProcessIdentity
 
 
 GATE = Path(__file__).with_name("cargo_gate") / "bin"
 FIXTURE_WORKER_BUDGET = "3"
+FIXTURE_STARTED_US = 1_793_280_000_123_456
+REGISTER_PYTHON = '''import json, os, subprocess, sys
+from pathlib import Path
+from types import SimpleNamespace
+
+root = Path(os.environ["GATE_TEST_ROOT"])
+if sys.argv[1] == "-B" and Path(sys.argv[2]).name == "register.py":
+    from unittest.mock import patch
+
+    path = Path(sys.argv[2]).resolve()
+    sys.path.insert(0, str(path.parents[3]))
+    from scripts.mac_test import mac_gate_records
+    from scripts.mac_test.cargo_gate import register
+    from scripts.mac_test.mac_gate_records import LiveMacProcess, MacProcessEvidence, MacProcessIdentity
+
+    def observe(pid):
+        if pid in json.loads(os.environ.get("GATE_TEST_UNKNOWN_PIDS", "[]")):
+            return MacProcessEvidence.UNAVAILABLE
+        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "ppid=", "-o", "state="],
+                                text=True, capture_output=True)
+        if result.returncode:
+            return MacProcessEvidence.ENDED
+        parent, state = result.stdout.split()
+        if state.startswith("Z"):
+            return MacProcessEvidence.ENDED
+        return LiveMacProcess(MacProcessIdentity(pid, FIXTURE_STARTED_US), int(parent))
+
+    with (root / "registrations").open("a") as stream:
+        stream.write("register\\n")
+    sys.argv = sys.argv[2:]
+    with (patch.object(mac_gate_records.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(root))),
+          patch.object(register, "observe_mac_process", side_effect=observe)):
+        raise SystemExit(register.main())
+if sys.argv[1:3] != ["-I", "-c"]:
+    with (root / "parsers").open("a") as stream:
+        stream.write("parser\\n")
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+'''
 PROGRAM = '''import json, os, shutil, socket, stat, subprocess, sys, tomllib
 from pathlib import Path
 
@@ -134,16 +173,13 @@ class CargoGateTests(unittest.TestCase):
             program.chmod(0o755)
         check = root / "check.py"
         _ = check.write_text(CHECK)
-        parser = fake / "python3"
-        _ = parser.write_text("#!/bin/zsh -f\nprint parser >> \"$GATE_TEST_ROOT/parsers\"\nexec "
-                              + shlex.quote(sys.executable) + ' "$@"\n')
-        parser.chmod(0o755)
+        python = fake / "python3"
+        _ = python.write_text(f"#!{sys.executable}\nFIXTURE_STARTED_US = {FIXTURE_STARTED_US}\n" + REGISTER_PYTHON)
+        python.chmod(0o755)
         ps = fake / "ps"
         list_processes = f"printf '%s' {shlex.quote(process_list)}" if process_list else '/bin/ps "$@"'
-        _ = ps.write_text('#!/bin/zsh -f\nprint -r -- \"$*\" >> \"$GATE_TEST_ROOT/ps-calls\"\nif [[ ${@[-1]} == lstart= ]]; then\n'
-                          + ' process_state=$(/bin/ps -p "$2" -o state=) || exit 1\n'
-                          + ' print "$process_state Mon Nov  9 12:00:00 2026"\n'
-                          + f'else\n {list_processes}\nfi\n')
+        _ = ps.write_text('#!/bin/zsh -f\nprint -r -- "$*" >> "$GATE_TEST_ROOT/ps-calls"\n'
+                          + list_processes + "\n")
         ps.chmod(0o755)
         _ = write_config_fixture(root / "config/mac_gate.conf",
             "placement_check_command=" + shlex.join([sys.executable, str(check)])
@@ -161,7 +197,7 @@ class CargoGateTests(unittest.TestCase):
                                       "MAC_GATE_RECORD", "MAC_GATE_JOBSERVER", "CARGO_BUILD_JOBS", "CARGO_HOME",
                                       "CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS", "NEXTEST_TEST_THREADS")}
         environment.update(config_environment(root / "config"))
-        environment.update(HOME=str(root), GATE_TEST_ROOT=str(root), GATE_TEST_BIN=str(GATE),
+        environment.update(HOME=str(root), CLAUDE_PYTHON=str(python), GATE_TEST_ROOT=str(root), GATE_TEST_BIN=str(GATE),
             PATH=os.pathsep.join((str(GATE), str(fake), str(real), "/usr/bin", "/bin")))
         return environment
 
@@ -219,12 +255,12 @@ class CargoGateTests(unittest.TestCase):
                     records = cast(list[str], rows[0]["records"])
                     self.assertEqual(len(records), 1)
                     pid, stamp, label = records[0].strip().split("\t")
-                    self.assertTrue(str(rows[0]["record"]).startswith(f"{pid}-"))
-                    self.assertEqual(stamp, "Mon Nov 9 12:00:00 2026")
+                    self.assertEqual(rows[0]["record"], f"{pid}-{FIXTURE_STARTED_US}")
+                    self.assertEqual(stamp, str(FIXTURE_STARTED_US))
                     self.assertEqual(label, "placement episode/attempt" if placement else "user")
                     self.assertEqual((root / "checks").exists(), placement)
                     if not placement:
-                        self.assertEqual(len((root / "ps-calls").read_text().splitlines()), 1)
+                        self.assertFalse((root / "ps-calls").exists())
                         self.assertFalse((root / ".local/state/mac-gate/checks").exists())
                     if placement:
                         ssh_arguments = cast(list[str], json.loads((root / "ssh-arguments").read_text()))
@@ -246,9 +282,8 @@ class CargoGateTests(unittest.TestCase):
             self.assertEqual(row["nextest_threads"], "13")
             self.assertEqual(row["cargo_makeflags"], "terminal")
             self.assertIn("\tuser\n", cast(list[str], row["records"])[0])
-            calls = (root / "ps-calls").read_text().splitlines()
-            self.assertEqual(len(calls), 1)
-            self.assertTrue(calls[0].endswith(" -o lstart="))
+            self.assertFalse((root / "ps-calls").exists())
+            self.assertEqual((root / "registrations").read_text().splitlines(), ["register"])
             self.assertFalse((root / "checks").exists())
             self.assertFalse((root / "ssh-arguments").exists())
 
@@ -362,11 +397,12 @@ class CargoGateTests(unittest.TestCase):
                 self.assertEqual(len(cast(list[str], row["records"])), 1)
 
     def test_only_the_live_root_blocks_a_second_root(self) -> None:
-        for background in (False, True):
-            with self.subTest(background=background), tempfile.TemporaryDirectory() as temporary:
+        for case in ("foreground", "background", "unreadable", "different home"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 environment = {**self.fixture(root), "SSH_CONNECTION": "fake", "MAC_PLACEMENT": "episode/attempt"}
                 event, holder = socket.socketpair()
+                background = case == "background"
                 command = "leave-child" if background else "hold-root"
                 with event, holder, subprocess.Popen(
                     [str(GATE / "cargo"), command], env={**environment, "GATE_TEST_ROOT_EVENT": str(holder.fileno())},
@@ -377,11 +413,21 @@ class CargoGateTests(unittest.TestCase):
                     try:
                         self.assertEqual(event.recv(1), b"r")
                         if not background:
-                            cache, = (root / ".local/state/mac-gate/checks").glob("*.live")
+                            state = root / ".local/state/mac-gate"
+                            cache, = (state / "checks").glob("*.live")
                             _ = cache.write_text("0\t" + environment["MAC_PLACEMENT"] + "\n")
-                            refusal = self.run_gate(environment, "build")
+                            record, = (state / "records").iterdir()
+                            message = "placement already has a live build root"
+                            if case == "unreadable":
+                                _ = record.write_bytes(b"\xff")
+                                message = "cannot verify an existing build root"
+                            home = root / "different-home" if case == "different home" else root
+                            refusal = self.run_gate({**environment, "HOME": str(home)}, "build")
                             self.assertEqual(refusal.returncode, 125, refusal.stdout + refusal.stderr)
-                            self.assertIn("placement already has a live build root", refusal.stderr)
+                            self.assertIn(message, refusal.stderr)
+                            self.assertEqual(list((state / "records").iterdir()), [record])
+                            if home != root:
+                                self.assertFalse((home / ".local/state/mac-gate").exists())
                             self.assertEqual(len(self.runs(root)), 1)
                             self.assertEqual((root / "checks").read_text().splitlines(), ["check"])
                             event.sendall(b"+")
@@ -401,6 +447,64 @@ class CargoGateTests(unittest.TestCase):
                     finally:
                         if first.returncode is None:
                             first.kill()
+
+    def test_failed_process_probe_preserves_records_and_pipe_names(self) -> None:
+        for has_record in (False, True):
+            with self.subTest(has_record=has_record), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = self.fixture(root)
+                pid = os.getpid()
+                environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt",
+                                   GATE_TEST_UNKNOWN_PIDS=json.dumps([pid]))
+                state = root / ".local/state/mac-gate"
+                (state / "records").mkdir(parents=True)
+                owner = MacGateRecord(MacProcessIdentity(pid, FIXTURE_STARTED_US), "placement episode/attempt")
+                record = state / "records" / owner.identity.key
+                if has_record:
+                    _ = record.write_text(owner.line())
+                pool = state / ("jobserver-" + owner.identity.key)
+                os.mkfifo(pool)
+                result = self.run_gate(environment, "build")
+                self.assertEqual(result.returncode, 125, result.stdout + result.stderr)
+                self.assertIn("cannot verify an existing", result.stderr)
+                self.assertTrue(pool.exists())
+                self.assertEqual(list(record.parent.iterdir()), [record] if has_record else [])
+                if has_record:
+                    self.assertEqual(record.read_text(), owner.line())
+                self.assertFalse((root / "runs").exists())
+
+    def test_pid_reuse_within_one_second_releases_the_old_record_and_pipe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
+            state = root / ".local/state/mac-gate"
+            (state / "records").mkdir(parents=True)
+            old = MacGateRecord(MacProcessIdentity(os.getpid(), FIXTURE_STARTED_US - 1), "placement episode/attempt")
+            record = state / "records" / old.identity.key
+            _ = record.write_text(old.line())
+            pool = state / ("jobserver-" + old.identity.key)
+            os.mkfifo(pool)
+            result = self.run_gate(environment, "build")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(record.exists())
+            self.assertFalse(pool.exists())
+            self.assertEqual(len(self.runs(root)), 1)
+
+    def test_cargo_refuses_relative_home_with_a_directory_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt", CARGO_HOME="cargo-home")
+            for arguments in (("-C", "project"), ("-Cproject",), ("-vCproject",), ("-vvC=project",)):
+                with self.subTest(arguments=arguments):
+                    result = self.run_gate(environment, "+nightly", "-Z", "unstable-options", *arguments, "build",
+                                           cwd=root)
+                    self.assertEqual(result.returncode, 125, result.stdout + result.stderr)
+                    self.assertIn("Cargo -C requires an absolute CARGO_HOME", result.stderr)
+            self.assertFalse((root / "checks").exists())
+            self.assertFalse((root / "registrations").exists())
+            self.assertFalse((root / "runs").exists())
 
     def test_placed_nextest_refuses_unreadable_test_thread_options(self) -> None:
         for arguments in (("-vj",), ("-vjbad",), ("--test-threads=",), ("-xj12",)):
@@ -476,7 +580,7 @@ class CargoGateTests(unittest.TestCase):
                     self.assertFalse((root / "checks").exists())
                 self.assertEqual(list((root / ".local/state/mac-gate").glob("answer-*")), [])
 
-    def test_cached_calls_start_no_parser_and_expired_calls_check_again(self) -> None:
+    def test_cached_calls_start_only_registration_and_expired_calls_check_again(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = {**self.fixture(root), "CODEX_HOME": "fake", "MAC_PLACEMENT": "episode/attempt", "CHECK_MODE": "race"}
@@ -494,6 +598,7 @@ class CargoGateTests(unittest.TestCase):
                 expected = 1 if index < 2 else 2
                 self.assertEqual(len((root / "checks").read_text().splitlines()), expected)
                 self.assertFalse((root / "parsers").exists())
+                self.assertEqual((root / "registrations").read_text().splitlines(), ["register"] * (index + 1))
                 self.assertEqual(list(state.glob("answer-*")), [])
 
     def test_child_uses_the_recorded_ancestor_without_another_record(self) -> None:

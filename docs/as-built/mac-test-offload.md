@@ -45,7 +45,10 @@ For a placed call, `worker_budget` in `config/mac_gate.conf` sets the jobserver 
 The initial budget is four slots per build root.
 The gate permits one independent build root per placement and refuses an overlap without waiting.
 If two roots start at the same time, both can receive a refusal.
-The root record stays live while its PID runs with the recorded start time.
+The gate stores state in the Mac account's home directory, independent of the caller's `HOME`.
+The gate and Builds page identify each root by its PID and kernel start time in microseconds.
+The gate removes old records and pipe names only after it confirms that their owners ended.
+A placed root receives a refusal if the gate cannot verify an existing root or pipe owner.
 A background descendant of a finished root does not prevent the next root from starting.
 Each root gets an unlinked pipe with `worker_budget - 1` tokens. The gate publishes the pipe in `CARGO_MAKEFLAGS`.
 A verified nested call uses the same pipe. Each Cargo process has one implicit slot.
@@ -53,6 +56,7 @@ With `N` concurrent Cargo processes sharing the pipe, the compile bound is `work
 Cargo can use the pipe budget when an explicit compile width is smaller.
 Cargo resolves aliases and then finds the nextest gate links on its external command path.
 The gate resolves a relative `CARGO_HOME` against the working directory.
+The gate refuses a relative `CARGO_HOME` when Cargo uses `-C`.
 The gate exports `NEXTEST_TEST_THREADS` and caps explicit test thread options before `--`.
 It preserves smaller caller values from the environment and test thread options.
 The exported value takes priority over the profile default. The audited repository profiles had no `test-threads` setting.

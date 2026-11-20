@@ -25,7 +25,7 @@ from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span
 from scripts.buildlog.parse import cargo_subcommand
 from scripts.lib import cargo_target_config, conf
-from scripts.mac_test import mac_ci, mac_process_environment
+from scripts.mac_test import mac_ci, mac_gate_records, mac_process_environment
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import RECORDED_STEP_NAMES, StepNames, command_script, read_step_names
 from scripts.build_queue import admission_records
@@ -256,9 +256,10 @@ def mac_reading_status(reading: MacBuildReading, now: float) -> str:
 
 def mac_build_script() -> str:
     """Read cargo tile registrations and process trees in one SSH call."""
-    return "python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config) + r'''
+    return ("python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config)
+            + "\n" + inspect.getsource(mac_gate_records) + r'''
+from functools import cache
 import json
-import re
 import sys
 import os
 from pathlib import Path
@@ -268,6 +269,8 @@ import time
 import tomllib
 
 CAPTURE_ROOT = Path("/tmp/cargo-tile")
+if sys.platform == "darwin":
+    sys.path.insert(0, str(mac_gate_account_home() / ".claude"))
 
 
 def output(arguments):
@@ -277,6 +280,7 @@ def output(arguments):
 
 def read_processes():
     rows = {}
+    # Cargo tile captures use whole seconds. Gate labels use the kernel start time.
     for line in output(["ps", "-axww", "-o", "pid=,ppid=,uid=,rss=,etime=,lstart=,comm="]).splitlines():
         fields = line.split(None, 10)
         if len(fields) != 11:
@@ -472,17 +476,16 @@ def build_origin(pid, processes):
 
 def read_gate_records():
     records = {}
-    for path in (Path.home() / ".local/state/mac-gate/records").glob("[0-9]*"):
-        try:
-            pid, stamp, label = path.read_text().rstrip("\n").split("\t")
-            born = int(time.mktime(time.strptime(stamp, "%a %b %d %H:%M:%S %Y")))
-            records[int(pid)] = (born, label)
-        except (OSError, ValueError):
-            continue
+    for path in (mac_gate_state() / "records").glob("[0-9]*"):
+        record = read_mac_gate_record(path)
+        if isinstance(record, MacGateRecord):
+            records[record.identity] = record.label
     return records
 
 
-PLACEMENT_FORM = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
+@cache
+def gate_process(pid):
+    return observe_mac_process(pid)
 
 
 def gate_label(pid, processes, records, ci_uid):
@@ -493,19 +496,19 @@ def gate_label(pid, processes, records, ci_uid):
     while pid in processes and pid not in seen:
         seen.add(pid)
         process = processes[pid]
-        record = records.get(pid)
-        if record and record[0] == process["started_at"]:
-            return record[1]
+        if records:
+            observed = gate_process(pid)
+            if isinstance(observed, LiveMacProcess) and observed.identity in records:
+                return records[observed.identity]
         # offload.py and mac_queue_run.py set MAC_PLACEMENT; sccache passes it on to the compiler.
         placement = process_environment(pid).get("MAC_PLACEMENT", "")
         if PLACEMENT_FORM.fullmatch(placement):
-            return "placement " + placement
+            return PLACEMENT_PREFIX + placement
         pid = process["parent"]
     return "unplaced"
 
 
 def ci_user_id():
-    import pwd
     try:
         return pwd.getpwnam("hana-ci").pw_uid
     except KeyError:
@@ -623,7 +626,7 @@ def read_reading():
 
 print(json.dumps(read_reading()))
 print("rc=0")
-''' + "MAC_READING\n"
+''' + "MAC_READING\n")
 
 
 def refresh_mac_builds() -> None:

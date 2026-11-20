@@ -20,29 +20,8 @@ real_program=$(whence -p "$program")
 [[ -n $real_program ]] || { print -u2 -r -- "mac cargo gate: real $program not found on PATH"; exit 127 }
 agent_call=0
 [[ ! -v CLAUDECODE && ! -v CODEX_HOME && ! -v SSH_CONNECTION && ! -v SSH_CLIENT ]] || agent_call=1
-state=$HOME/.local/state/mac-gate
 umask 077
-mkdir -p "$state/records" || exit 2
-jobserver_prefix=$state/jobserver-
 root_record='' fifo=''
-process_start() {
-    local process_row
-    local -a fields
-    process_row=$(env -u TZ ps -p "$1" -o state= -o lstart= 2>/dev/null) || return 1
-    fields=(${=process_row})
-    [[ $#fields == 6 && $fields[1] != Z* ]] || return 1
-    print -r -- "${(j: :)fields[2,-1]}"
-}
-process_key() {
-    print -r -- "$1-${2//[^A-Za-z0-9]/_}"
-}
-read_record() {
-    IFS=$'\t' read -r recorded_pid recorded_start recorded_label 2>/dev/null < "$1" &&
-        [[ $recorded_pid == <-> && -n $recorded_start ]]
-}
-record_is_live() {
-    [[ $(process_start "$recorded_pid") == "$recorded_start" ]]
-}
 label=user
 if (( agent_call )); then
     source ${gate_source:h}/../../lib/conf.sh
@@ -179,50 +158,52 @@ if (( agent_call )); then
         cap_nextest_threads "$@"
         set -- "${nextest_arguments[@]}"
     fi
-fi
-# Cargo can exec cargo-nextest in the recorded process.
-ancestor=${MAC_GATE_RECORD:-}
-recorded=0
-if [[ $ancestor == (<->|<->-[A-Za-z0-9_]*) && $ancestor != *[^A-Za-z0-9_-]* ]] &&
-    read_record "$state/records/$ancestor" && [[ $recorded_label == "$label" ]]; then
-    cursor=$PPID
-    [[ $recorded_pid != $$ ]] || cursor=$$
-    while [[ $cursor == <-> && $cursor != 0 ]]; do
-        if [[ $cursor == $recorded_pid ]]; then
-            record_is_live && recorded=1
-            break
-        fi
-        parent=$(ps -p "$cursor" -o ppid= 2>/dev/null)
-        cursor=${parent//[[:space:]]/}
-    done
-fi
-if (( ! recorded )); then
-    started=$(process_start $$) || exit 2
-    root_key=$(process_key "$$" "$started")
-    root_record=$state/records/$root_key
-    # Publish before reading other records. Two overlapping roots cannot both pass.
-    print -r -- "$$"$'\t'"$started"$'\t'"$label" > "$root_record" || exit 2
-    export MAC_GATE_RECORD=$root_key
-    if (( agent_call )); then
-        for file in "$state/records/"(<->|<->-[A-Za-z0-9_]*)(N); do
-            [[ $file != "$root_record" ]] || continue
-            if read_record "$file"; then
-                if record_is_live; then
-                    [[ $recorded_label != "$label" ]] || refuse 'placement already has a live build root' ''
-                    continue
-                fi
-            else
-                # A root can still be writing this record.
-                record_owner=${${file:t}%%-*}
-                process_start "$record_owner" >/dev/null && continue
+    check_relative_cargo_home() {
+        setopt localoptions extended_glob
+        local argument takes_value=0
+        for argument in "$@"; do
+            if (( takes_value )); then
+                takes_value=0
+                continue
             fi
-            rm -f -- "$file"
+            case $argument in
+                --) break ;;
+                -[Vvqh]#C*) refuse 'Cargo -C requires an absolute CARGO_HOME' '' ;;
+                -[Vvqh]#Z|--config|--color|--explain) takes_value=1 ;;
+                -*|+*) ;;
+                *) break ;;
+            esac
         done
+    }
+    if [[ $program == cargo ]]; then
+        cargo_home=${CARGO_HOME:-$HOME/.cargo}
+        if [[ $cargo_home != /* ]]; then
+            check_relative_cargo_home "$@"
+            cargo_cwd=$(pwd -P) || refuse 'cannot resolve the working directory for Cargo home' ''
+            cargo_home="${cargo_cwd%/}/$cargo_home"
+            export CARGO_HOME=$cargo_home
+        fi
     fi
+fi
+if ! registration=$("${gate_source:h}/../../lib/py" -B "${gate_source:h}/register.py" "$$" "${MAC_GATE_RECORD:-}" "$label"); then
+    if (( agent_call )); then
+        refuse "${registration:-cannot register the build root}" ''
+    fi
+    print -u2 -r -- "mac cargo gate: ${registration:-cannot register the build root}"
+    exit 2
+fi
+IFS=$'\t' read -r state root_key role <<< "$registration"
+if [[ $registration == *$'\n'* || $state != /* || $root_key != <->-<-> || $role != (root|nested) ]]; then
+    (( ! agent_call )) || refuse 'invalid build root registration' ''
+    exit 2
+fi
+if [[ $role == root ]]; then
+    root_record=$state/records/$root_key
+    export MAC_GATE_RECORD=$root_key
 fi
 if (( agent_call )); then
     check_placement
-    if (( ! recorded )); then
+    if [[ $role == root ]]; then
         for file in "$state/checks/"*.live(N); do
             IFS=$'\t' read -r checked cached < "$file"
             if [[ $checked != <->(|.<->) ]] || (( EPOCHREALTIME - checked >= recheck )); then
@@ -234,13 +215,6 @@ if (( agent_call )); then
             zstat -A modified +mtime "$file" 2>/dev/null || continue
             (( EPOCHREALTIME - modified[1] <= limit + 1 )) || rm -f -- "$file"
         done
-        for file in "$jobserver_prefix"<->-[A-Za-z0-9_]*(N); do
-            fifo_owner=${file#"$jobserver_prefix"}
-            owner_pid=${fifo_owner%%-*}
-            owner_start=$(process_start "$owner_pid")
-            [[ -n $owner_start && $fifo_owner == "$(process_key "$owner_pid" "$owner_start")" ]] \
-                || rm -f -- "$file"
-        done
     fi
     jobserver_identity() {
         local -A read_info write_info
@@ -251,7 +225,7 @@ if (( agent_call )); then
             || return 1
         REPLY="$read_info[device]:$read_info[inode]"
     }
-    if (( recorded )); then
+    if [[ $role == nested ]]; then
         # Reuse the pool only for a verified ancestor with the same placement.
         inherited_pool=${MAC_GATE_JOBSERVER:-}
         [[ $inherited_pool == <->,<->:<->:<-> ]] || refuse 'ancestor jobserver is missing' ''
@@ -260,8 +234,9 @@ if (( agent_call )); then
         jobserver_identity && [[ $REPLY == ${inherited_pool#*:} ]] \
             || refuse 'ancestor jobserver descriptors are unavailable' ''
     else
-        fifo=$jobserver_prefix$root_key
-        mkfifo "$fifo" || refuse 'cannot create the jobserver' ''
+        pool_path=$state/jobserver-$root_key
+        mkfifo "$pool_path" || refuse 'cannot create the jobserver' ''
+        fifo=$pool_path
         pipe_buf=$(getconf PIPE_BUF "$fifo" 2>/dev/null)
         if [[ $pipe_buf != <-> ]] || (( worker_budget - 1 > pipe_buf )); then
             refuse 'worker_budget exceeds the jobserver pipe limit' ''
@@ -282,12 +257,6 @@ if (( agent_call )); then
     if [[ $program == cargo ]]; then
         # Cargo resolves aliases before it searches PATH for nextest.
         # Keep Cargo from inserting its own bin ahead of the gate links.
-        cargo_home=${CARGO_HOME:-$HOME/.cargo}
-        if [[ $cargo_home != /* ]]; then
-            cargo_cwd=$(pwd -P) || refuse 'cannot resolve the working directory for Cargo home' ''
-            cargo_home="${cargo_cwd%/}/$cargo_home"
-            export CARGO_HOME=$cargo_home
-        fi
         cargo_home_bin=${cargo_home%/}/bin
         [[ $cargo_home_bin != *:* && $nextest_bin != *:* && -x $nextest_bin/cargo-nextest && -x $nextest_bin/cargo-ntr ]] \
             || refuse 'cannot route Cargo nextest through the gate' ''

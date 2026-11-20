@@ -27,6 +27,7 @@ from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
 from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.mac_test.mac_gate_records import MICROSECONDS_PER_SECOND, MacGateRecord, MacProcessIdentity
 
 
 def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
@@ -175,10 +176,12 @@ class MacQueueViewTests(unittest.TestCase):
         with QueueFixture(captured=False) as fixture:
             records = fixture.root / ".local/state/mac-gate/records"
             records.mkdir(parents=True)
-            stamp = "Mon Nov 9 12:00:00 2026"
-            born = int(time.mktime(time.strptime(stamp, "%a %b %d %H:%M:%S %Y")))
-            for pid, label in ((10, "placement episode/attempt"), (20, "user"), (100, "placement stale/attempt")):
-                _ = (records / str(pid)).write_text(f"{pid}\t{stamp}\t{label}\n")
+            born = int(NOW)
+            started_us = born * MICROSECONDS_PER_SECOND
+            for pid, delta, label in ((10, 1, "placement episode/attempt"), (20, 2, "user"),
+                    (20, 1, "placement stale/attempt"), (100, 1, "placement stale/attempt")):
+                record = MacGateRecord(MacProcessIdentity(pid, started_us + delta), label)
+                _ = (records / record.identity.key).write_text(record.line())
             processes = {pid: {"parent": parent, "uid": uid, "started_at": started,
                 "resident_bytes": 1024, "command": command, "executable": "/bin/" + command.split()[0]}
                 for pid, parent, uid, started, command in (
@@ -198,8 +201,13 @@ class MacQueueViewTests(unittest.TestCase):
                 + f"read_captures = lambda processes: {{70: dict(folder={str(fixture.root)!r}, command='cargo build', progress_tail='')}}\n"
                 + "process_environment = lambda pid: {80: {'MAC_PLACEMENT': 'episode-2/attempt'}, 90: {'MAC_PLACEMENT': 'no placement'}}.get(pid, {})\n"
                 + f"output = lambda arguments: 'p11\\nn{fixture.root}\\np21\\nn{fixture.root}\\np40\\nn{fixture.root}'\n"
+                + f"starts = {{10: {started_us + 1}, 20: {started_us + 2}, 100: {(born + 9) * MICROSECONDS_PER_SECOND}}}\n"
+                + "observe_mac_process = lambda pid: (LiveMacProcess(MacProcessIdentity(pid, starts[pid]), 1)\n"
+                + "    if pid in starts else MacProcessEvidence.UNAVAILABLE)\n"
                 + "import types\n"
-                + f"with patch.dict(os.environ, HOME={str(fixture.root)!r}), patch('pwd.getpwnam', return_value=types.SimpleNamespace(pw_uid=502)):\n"
+                + f"with patch('pwd.getpwuid', return_value=types.SimpleNamespace(pw_dir={str(fixture.root)!r})), "
+                + "patch('pwd.getpwnam', return_value=types.SimpleNamespace(pw_uid=502)):\n"
+                + "    assert len(read_gate_records()) == 4\n"
                 + "    print(json.dumps(read_reading()))")
             result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
