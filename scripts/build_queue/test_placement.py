@@ -120,9 +120,9 @@ def hana_policy_request(fixture: PlacementFixture) -> tuple[wire.PlacementReques
     repository = fixture.root / "hana"
     repository.mkdir()
     settings = fixture.root / "hana_aws.conf"
-    _ = write_config_fixture(settings, f"enabled=on\nrepository_identity={HANA_REPOSITORY}\n")
+    _ = write_config_fixture(settings, f"repository_identity={HANA_REPOSITORY}\n")
     _ = (fixture.root / "build_targets.conf").write_text(
-        "targets=hana-aws\nkind.hana-aws=ssh\nplatform.hana-aws=linux\nsettings.hana-aws=hana_aws.conf\n")
+        "targets=hana-aws\nkind.hana-aws=ssh\nplatform.hana-aws=linux\nsettings.hana-aws=hana_aws.conf\nenabled.hana-aws=on\n")
     scope = RepositoryScope("hana", HANA_REPOSITORY, 1)
     destination = placement.PlacementDestination("ssh", "hana-aws", "aws-hana", scope, 1)
     request = placement_request(fixture)
@@ -1216,18 +1216,18 @@ class PlacementTests(unittest.TestCase):
     def test_hana_retries_when_settings_are_restored_before_the_dispatch_refusal(self) -> None:
         with PlacementFixture() as fixture:
             request, transport = hana_policy_request(fixture)
-            settings = transport.settings
-            enabled_settings = settings.read_bytes()
+            registry = fixture.root / "build_targets.conf"
+            enabled_settings = registry.read_bytes()
             original = publish_candidate(fixture, request)
             assigned = assignment_for(fixture, request)
 
-            _ = write_config_fixture(settings, "enabled=off\n")
+            _ = write_config_fixture(registry, "enabled.hana-aws=off\n")
             disabled_key = fixture.server.host_evidence_key(request, assigned.destination)
             self.assertNotEqual(disabled_key.configuration_generation, original.key.configuration_generation)
 
             # The fixture executes the actual prelaunch check. No provider dispatch was started.
             with mock.patch.object(service.HostEvidenceWorker, "dispatch_pending", return_value=False):
-                report_hana_refusal(fixture, transport, assigned, before_report=lambda: settings.write_bytes(enabled_settings))
+                report_hana_refusal(fixture, transport, assigned, before_report=lambda: registry.write_bytes(enabled_settings))
                 restored = publish_candidate(fixture, request)
                 self.assertEqual(restored.key.configuration_generation, original.key.configuration_generation)
                 _ = fixture.run_pass()
@@ -1251,7 +1251,7 @@ class PlacementTests(unittest.TestCase):
 
             def disable_hana(settings: hana.HanaControlTransport, repository: str, kind: str
                              ) -> hana.HanaStepRefused | hana.EnabledHanaRoute:
-                _ = write_config_fixture(settings.settings, "enabled=off\n")
+                _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.hana-aws=off\n")
                 return policy(settings, repository, kind)
 
             with mock.patch.object(service.HostEvidenceWorker, "dispatch_pending", return_value=False):
@@ -1702,7 +1702,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             registered, request, destination = self.target_settings_fixture(fixture)
             _ = registered.write_text("execution_transport=broken\n")
             settings = fixture.root / "explicit.conf"
-            _ = write_config_fixture(settings, "enabled=on\n", template="hana_aws")
+            _ = write_config_fixture(settings, template="hana_aws")
+            _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.hana-aws=on\n")
             candidate = placement.PlacementCandidate(destination, settings=placement.ExplicitProviderSettings(settings))
             request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
             before = fixture.server.host_evidence_key(request, destination)
@@ -1788,8 +1789,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
         settings, request, _destination = self.target_settings_fixture(fixture)
         settings.unlink()
-        _ = write_config_fixture(settings, "enabled=on\nrepository_identity=https://github.com/example/hana\n",
+        _ = write_config_fixture(settings, "repository_identity=https://github.com/example/hana\n",
                                  template="hana_aws")
+        _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.hana-aws=on\n")
         assert isinstance(request.profile, records.StepProfile)
         request = replace(request, profile=replace(request.profile, step="check"),
             constraints=replace(request.constraints, command=("cargo", "check")))
@@ -1846,15 +1848,15 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             assert isinstance(evidence, placement.HostEvidenceUnavailable), evidence
             self.assertIn(f"{settings}: fallback_instance_types={duplicate!r}", evidence.reason)
 
-    def test_idle_hana_preview_uses_the_recovered_permit(self) -> None:
+    def test_idle_hana_preview_refuses_an_invalid_switch_and_ignores_guest_guard_settings(self) -> None:
         from scripts.aws_target import hana_box, hana_spend
 
         with PlacementFixture() as fixture:
             settings, request = self.idle_hana(fixture)
             good = settings.read_text()
             self.commit_settings(settings)
-            _ = settings.write_text(good.replace("enabled=on", "enabled=broken"))
-            warnings = io.StringIO()
+            registry = fixture.root / "build_targets.conf"
+            _ = write_config_fixture(registry, "enabled.hana-aws=broken\n")
 
             def preview(spending: hana_spend.HanaSpending[hana_spend.StartPermitSettings],
                         now: int, expires: int) -> hana_spend.StartAffordable:
@@ -1862,23 +1864,21 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 self.assertEqual(expires - now, spending.settings.permit_max_seconds)
                 return hana_spend.StartAffordable(expires)
 
-            with (redirect_stderr(warnings),
-                  mock.patch.object(hana_box.HanaController, "image_is_current", return_value=True),
+            with (mock.patch.object(hana_box.HanaController, "image_is_current", return_value=True),
                   mock.patch.object(hana_spend.HanaSpending, "preview_start",
                                                                autospec=True, side_effect=preview) as start):
-                evidence = self.read_target(fixture, request)
-                assert isinstance(evidence, placement.FreshHostEvidence), evidence
-                self.assertEqual(evidence.eligibility, ALLOWED_HOST)
-                start.assert_called_once()
-                self.assertEqual(warnings.getvalue().count("enabled='broken'"), 1)
-                self.assertTrue(hana_spend.read_settings(conf.read(settings)).enabled)
+                refused = self.read_target(fixture, request)
+                assert isinstance(refused, placement.HostEvidenceUnavailable), refused
+                self.assertIn("enabled.hana-aws='broken'", refused.reason)
+                start.assert_not_called()
 
+                _ = write_config_fixture(registry, "enabled.hana-aws=on\n")
                 _ = settings.write_text(good.replace("mount_timeout_seconds=15", "mount_timeout_seconds=broken"))
                 with mock.patch.object(conf, "_committed_files", return_value=()):
                     evidence = self.read_target(fixture, request)
                     assert isinstance(evidence, placement.FreshHostEvidence), evidence
                     self.assertEqual(evidence.eligibility, ALLOWED_HOST)
-                    self.assertEqual(start.call_count, 2)
+                    start.assert_called_once()
                     with self.assertRaisesRegex(conf.Unusable, "mount_timeout_seconds"):
                         _ = hana_spend.read_settings(conf.read(settings))
 

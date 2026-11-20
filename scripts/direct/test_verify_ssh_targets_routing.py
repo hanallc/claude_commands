@@ -370,9 +370,9 @@ raise SystemExit(75)
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
             + "pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n"
-            + "settings.hana-gpu=cloud_gate.conf\n")
+            + "settings.hana-gpu=cloud_gate.conf\nenabled.hana-gpu=on\n")
         _ = (self.root / "cloud_gate.conf").write_text(
-            "execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n"
+            "execution_transport=hana-gpu\n"
             + "hana_gpu_repository=https://example.com/team/hana\n"
             + "hana_gpu_instance_types=g6.2xlarge\nhana_gpu_selections=sample:shader_variants\n")
         account = self.target_state("aws")

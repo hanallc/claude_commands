@@ -880,13 +880,13 @@ class HanaGpuQueueTests(unittest.TestCase):
         with PlacementFixture() as fixture:
             settings = fixture.root / 'cloud_gate.conf'
             repository = 'https://github.com/fixture/hana'
-            _ = settings.write_text('execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n'
+            _ = settings.write_text('execution_transport=hana-gpu\n'
                 + f'hana_gpu_repository={repository}\nhana_gpu_instance_types=g6.2xlarge\n'
                 + 'hana_gpu_selections=hana_mimesis_tools:shader_variants\n# range: 1..60\napi_timeout_s=30\n')
             _ = (fixture.root / 'build_targets.conf').write_text(
                 'targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n'
                 + 'pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n'
-                + 'settings.hana-gpu=cloud_gate.conf\n')
+                + 'settings.hana-gpu=cloud_gate.conf\nenabled.hana-gpu=on\n')
             account = target_config.ssh_target_state_directory('aws')
             account.mkdir(parents=True)
             _ = (account / 'gate-deployment.json').write_text('{"gpu_instance_types":["g6.2xlarge"]}')
