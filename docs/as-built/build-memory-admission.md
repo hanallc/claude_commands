@@ -574,7 +574,9 @@ After each pass, the service publishes `admission/queue.json` atomically through
 The snapshot contains the pass readings, its policy, and the remaining waiters.
 The event loop keeps one active Mac slot wait per placement episode.
 Busy provider evidence, contention for a slot, or an accepted busy claim failure can start the wait.
-An assignment, a terminal refusal, cancellation, or owner exit clears the wait.
+A pass uses the Mac evidence even if it stops placement at a local candidate.
+Expired or missing evidence preserves an active wait.
+A decisive Mac exclusion, an assignment, a terminal refusal, cancellation, or owner exit clears the wait.
 The assignment records retain busy attempts. The service adds this history only to active waits.
 The socket view and the snapshot publish the same `mac_waits` rows.
 A change between passes updates those rows with the previous pass readings and timestamp.

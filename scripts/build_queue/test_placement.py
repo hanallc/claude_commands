@@ -1013,33 +1013,45 @@ class PlacementTests(unittest.TestCase):
 
     def test_only_a_busy_mac_candidate_appears_in_the_mac_waits(self) -> None:
         cases = ((False, "busy", "none"), (True, "off", "none"),
-                 (False, "busy", "landing pass"), (False, "busy", "disable Mac"))
+                 (False, "busy", "landing pass"), (False, "busy", "disable Mac"),
+                 (False, "busy", "expire Mac evidence"), (False, "busy", "expire local evidence"),
+                 (False, "off", "busy at local preview"), (False, "busy", "off at local preview"))
         for pinned, reason, change in cases:
             with self.subTest(reason=reason, change=change), PlacementFixture() as fixture:
-                landing_pass = change == "landing pass"
+                landing_pass = change in ("landing pass", "busy at local preview", "off at local preview")
+                local_first = change in ("expire local evidence", "busy at local preview", "off at local preview")
                 request = placement_request(fixture, since=fixture.clock.now() - 1 if landing_pass else None)
                 destination = request.constraints.candidates[0].destination
                 if pinned:
                     request = replace(request, constraints=replace(request.constraints,
                         selection=placement.PinnedHost(destination.target)))
-                if landing_pass:
+                mac_request = request
+                if landing_pass or local_first or change == "disable Mac":
                     fixture.hold_starts()
-                elif change == "disable Mac":
-                    fixture.free(0)
-                if change != "none":
-                    request = replace(request, prerequisite=placement.TokenNotRequired(), constraints=replace(
-                        request.constraints, candidates=(*request.constraints.candidates, local_candidate(fixture))))
-                _ = publish_candidate(fixture, request, placement.TemporaryExclusion(reason))
+                    local = local_candidate(fixture)
+                    candidates = ((local, *request.constraints.candidates) if local_first
+                                  else (*request.constraints.candidates, local))
+                    prerequisite = (placement.TokenRequired(placement.TokenReadinessUnchecked())
+                                    if change == "expire local evidence" else placement.TokenNotRequired())
+                    request = replace(request, prerequisite=prerequisite,
+                                      constraints=replace(request.constraints, candidates=candidates))
+                if change == "expire local evidence":
+                    fixture.server.background_local_evidence = True
+                    _ = publish_candidate(fixture, request)
+                _ = publish_candidate(fixture, mac_request, placement.TemporaryExclusion(reason))
                 reply, = fixture.server.handle_request(request)
                 waits = published_mac_waits(fixture)
                 if landing_pass:
                     self.assertIsInstance(reply, wire.PlacementWait)
-                    self.assertEqual([wait.episode for wait in waits], [request.episode])
+                    self.assertEqual([wait.episode for wait in waits], [request.episode] if reason == "busy" else [])
                     landing = fixture.request(step="merge-gate")
                     land = wire.Owner(10, "10")
                     with mock.patch.object(service, "landing_test", return_value=service.LandingTest(land)):
                         waiting, = fixture.server.handle_request(landing)
                     self.assertIsInstance(waiting, wire.Wait)
+                    if change != "landing pass":
+                        next_reason = "off" if change == "off at local preview" else "busy"
+                        _ = publish_candidate(fixture, mac_request, placement.TemporaryExclusion(next_reason))
                     write_pressure_reading(fixture.root / "pressure")
                     with mock.patch.object(service, "landing_pass_limit", return_value=1), mock.patch.object(
                             land_runs, "natemerge_land", return_value=ProcessIdentity(land.pid, land.start_time)):
@@ -1054,9 +1066,10 @@ class PlacementTests(unittest.TestCase):
                     self.assertEqual(set(fixture.caller_reservations()), {landing.episode})
                     # Read both outputs before the next pass can change the result.
                     with mock.patch.object(fixture.server, "_pass_gap_open", return_value=False):
-                        self.assertEqual([wait.episode for wait in published_mac_waits(fixture)], [request.episode])
+                        expected = [] if change == "off at local preview" else [request.episode]
+                        self.assertEqual([wait.episode for wait in published_mac_waits(fixture)], expected)
                     fixture.allow_next_start()
-                    _ = publish_candidate(fixture, request, placement.TemporaryExclusion("busy"))
+                    _ = publish_candidate(fixture, mac_request, placement.TemporaryExclusion("busy"))
                     granted, = fixture.server.handle_request(request)
                     self.assertIsInstance(granted, wire.LocalPlacementGranted)
                     self.assertEqual(published_mac_waits(fixture), ())
@@ -1068,6 +1081,24 @@ class PlacementTests(unittest.TestCase):
                     _ = fixture.run_pass()
                     self.assertEqual(published_mac_waits(fixture), ())
                     self.assertIn(request.owner.pid, fixture.queue_pids())
+                    continue
+                if change in ("expire Mac evidence", "expire local evidence"):
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    self.assertEqual([wait.episode for wait in waits], [request.episode])
+                    with mock.patch.object(fixture.server, "_evidence_lifetime", return_value=1):
+                        fixture.clock.advance(2)
+                        if local_first:
+                            _ = publish_candidate(fixture, mac_request, placement.TemporaryExclusion("busy"))
+                        _ = fixture.run_pass()
+                        eligibility = fixture.server.placement_eligibility[request.episode]
+                        self.assertIsInstance(eligibility[0].eligibility, placement.EvidenceNeeded)
+                        if local_first:
+                            self.assertEqual(eligibility[1].eligibility, placement.TemporaryExclusion("busy"))
+                        self.assertEqual(published_mac_waits(fixture), waits)
+                        if not local_first:
+                            _ = publish_candidate(fixture, mac_request, placement.TemporaryExclusion("busy"))
+                            _ = fixture.run_pass()
+                            self.assertEqual(published_mac_waits(fixture), waits)
                     continue
                 if reason == "busy":
                     self.assertIsInstance(reply, wire.PlacementWait)

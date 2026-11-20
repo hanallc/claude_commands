@@ -4299,6 +4299,32 @@ done
                          if isinstance(record.place, wire.LocalPlace)
                          and isinstance(record.cargo_folder, placement.CargoFolder))
 
+    def _next_mac_wait(self, request: wire.PlacementRequest,
+                       previous: placement.WaitingForMac | placement.NoMacWait,
+                       candidates: tuple[placement.CandidateEligibility, ...],
+                       contended: set[placement.PlacementDestination]
+                       ) -> placement.WaitingForMac | placement.NoMacWait:
+        """Use decisive Mac evidence even if the placement loop stops at a local candidate."""
+        wait = previous
+        for candidate in candidates:
+            destination, eligibility = candidate.destination, candidate.eligibility
+            if destination.provider != "mac":
+                continue
+            if eligibility == placement.TemporaryExclusion("busy"):
+                wait = placement.WaitingForMac(destination, request.since, placement.MacProbeBusy())
+                break
+            if destination in contended:
+                wait = placement.WaitingForMac(destination, request.since, placement.MacSlotContended())
+                break
+            # An eligible Mac needs a slot check before it can change the wait.
+            if (isinstance(previous, placement.WaitingForMac) and previous.destination == destination
+                    and isinstance(eligibility, (placement.FixedExclusion, placement.TemporaryExclusion))):
+                wait = placement.NoMacWait()
+        if (isinstance(wait, placement.WaitingForMac)
+                and isinstance(self._terminal_candidate_refusal(request, candidates), placement.DoNotRetry)):
+            return placement.NoMacWait()
+        return wait
+
     def _placement_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy,
                         remote_start_hold_seconds: int) -> records.QueueInputs:
         """Keep pending remote starts in the local order until their holds end."""
@@ -4348,12 +4374,10 @@ done
             initial_readiness_unchecked = (isinstance(prerequisite, placement.TokenRequired)
                 and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             waiting_for: list[PlacementHold] = []
-            mac_wait: placement.WaitingForMac | placement.NoMacWait = placement.NoMacWait()
-            local_start_proposed = False
+            contended_mac_destinations: set[placement.PlacementDestination] = set()
             candidates = self.placement_eligibility.get(request.episode, ())
             for candidate in candidates:
                 destination = candidate.destination
-                can_record_mac_wait = destination.provider == "mac" and isinstance(mac_wait, placement.NoMacWait)
                 if destination.provider == "local" and (owner in inputs.landing_waiters
                         or request.constraints.cargo_folder in local_occupied):
                     continue
@@ -4361,16 +4385,14 @@ done
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
                 if not isinstance(candidate.eligibility, placement.AllowedHost):
-                    if can_record_mac_wait and candidate.eligibility == placement.TemporaryExclusion("busy"):
-                        mac_wait = placement.WaitingForMac(destination, request.since, placement.MacProbeBusy())
                     hold = self._placement_hold(request, candidate, answers)
                     if hold is not None:
                         waiting_for.append(hold)
                     continue
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     if candidate.destination in held_copy_destinations:
-                        if can_record_mac_wait:
-                            mac_wait = placement.WaitingForMac(destination, request.since, placement.MacSlotContended())
+                        if destination.provider == "mac":
+                            contended_mac_destinations.add(destination)
                         continue
                     competing = [copy for copy in copies if any(
                         choice.destination == candidate.destination and isinstance(choice.eligibility, placement.AllowedHost)
@@ -4378,20 +4400,19 @@ done
                     newest = max(competing, key=lambda copy: placement.copy_order(
                         cast(placement.SpeculativeCopy, copy.purpose), copy.episode))
                     if newest.episode != request.episode:
-                        if can_record_mac_wait:
-                            mac_wait = placement.WaitingForMac(destination, request.since, placement.MacSlotContended())
+                        if destination.provider == "mac":
+                            contended_mac_destinations.add(destination)
                         continue
                 if destination.provider == "local":
                     if owner in local_starts:
-                        local_start_proposed = True
                         break
                     continue
                 if destination.provider == "scaler":
                     continue
                 if (any(same_remote_resource(other, destination) for other in taken)
                         or self._held_for_older(request, destination, held, holds)):
-                    if can_record_mac_wait:
-                        mac_wait = placement.WaitingForMac(destination, request.since, placement.MacSlotContended())
+                    if destination.provider == "mac":
+                        contended_mac_destinations.add(destination)
                     continue
                 assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
                 taken.append(destination)
@@ -4417,12 +4438,10 @@ done
                     # A hold lasts until the next probe of the older request; it never starts again on the same reading.
                     if start is not None and hold.observed_at < start:
                         holds[(hold.episode, hold.destination)] = start
-            if local_start_proposed or request.episode in self.current_assignments:
-                continue
-            if (isinstance(mac_wait, placement.WaitingForMac)
-                    and isinstance(self._terminal_candidate_refusal(request, candidates), placement.DoNotRetry)):
-                mac_wait = placement.NoMacWait()
-            self._set_mac_wait(request.episode, mac_wait)
+            if request.episode not in self.current_assignments:
+                previous = self.mac_waits.get(request.episode, placement.NoMacWait())
+                self._set_mac_wait(request.episode,
+                    self._next_mac_wait(request, previous, candidates, contended_mac_destinations))
         self.placement_holds = holds
         self.placement_hold_answers = answers
         local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
