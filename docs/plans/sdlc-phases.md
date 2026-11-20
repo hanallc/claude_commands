@@ -1560,19 +1560,40 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Goal:** a decision by bob and builds, sent by sdlc at 18:19 EST Nov 19. Name: gappush. It replaces phase 90. Each command that pushes a config or settings commit direct to main takes its place in natemerge's land line. It pushes only in a gap between two items. Until this merges, a direct main push asks natemerge for a gap first.
 
 **Spec:**
-1. Put the change in the shared publish path from phase 40 (`live_settings.publish`, the main push lock, one gap function in `land_queue.py`), not in each caller. It covers tune, zone, the notes timer, registry rows and settings.json commits (the case a296444e4).
+1. Put the change in the shared publish path from phase 40 (`live_settings.publish`, the main push lock, one gap function in `land_queue.py`), not in each caller. It covers the tool publishers only: tune, zone, the notes timer and registry rows. Hand commits (`/validate_and_push --to main` of a settings.json commit, the case a296444e4, and fast track of a `.conf`) and the CI receipt after a queued push are not in this phase (sdlc, 04:08 EST Nov 20). They go to phase 92. Until then a hand push during a land asks natemerge for a gap first.
 2. The live value still changes at once on natedev and on the Mac. Only the main commit and the push wait for the gap.
 3. When no land runs, the push goes at once. When a land runs, the push takes the next gap: the front of the land line, after the running land and before the next item (builds, 18:23). The runner's `next` runs it; the runner needs no change.
 4. A push that waits shows where it waits and does not block the caller's turn. It cleans up after itself.
 5. Add no new check or refusal beyond the wait. Ask sdlc first if one seems needed.
 6. A promote into the live checkout with a waiting live value does not fail and keeps the value: when the next group changes the same file, and when it does not (builds, 18:23).
-7. Tests use fixture repos and line state only: push at once, wait in front, `next` runs it, no second item, no item after another publish, and the promote cases for a `.conf` and a settings.json value.
+7. Tests use fixture repos and line state only, and one test proves that no write reaches the live land line, also when the live file is absent (sdlc, 03:15 EST Nov 20): push at once, wait in front, `next` runs it, no second item, no item after another publish, and the promote cases for a `.conf` and a settings.json value.
 
 **Files:** `scripts/lib/live_settings.py`, `scripts/lib/main_push_lock.py`, `scripts/lib/models_registry.py`, `scripts/lib/waiting_rows.py`, `scripts/production/land_queue.py`, the promote in `merge_checkpoint.py` only if a test needs it, their tests, the docs that tell a session how to change settings.json, `docs/as-built/merge-gate-and-test-speed.md` (Land line).
 
 **Workers:** 1 writer.
 
 **Order:** after phase 89. Tests run only when natemerge allows them.
+
+**Acceptance gate:**
+1. The spec cases pass. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+### Phase 92 — A hand push of a settings commit to main waits for a gap in its own process  · status: todo
+**Depends on:** Phase 91
+
+#### Work Order
+
+**Goal:** sdlc, 04:08 EST Nov 20. Phase 91 covers the tool publishers only. A hand push of a settings commit (`/validate_and_push --to main` of settings.json, the case a296444e4, and fast track of a `.conf`) can still break a running land.
+
+**Spec:**
+1. `/validate_and_push --to main` and fast track change no commit. They ask natemerge's land line for a gap and wait in their own detached process, outside the caller's turn.
+2. The caller's reply says the push waits for a gap and where. The push goes in the gap and cleans up after itself.
+3. Add no new check or refusal beyond the wait.
+4. CI starts after the push goes in, from the pushed commit.
+5. Tests use fixture repos, line state and slots only. One test proves no write reaches the live land line or `/build/slot`.
+
+**Files:** `scripts/validate_and_push/push_direct.sh`, `scripts/production/fast_track.py`, `scripts/production/ci_points.py`, `scripts/production/land_queue.py` (the phase 91 gap function), their tests, `docs/as-built/validate-and-push-cancel-prior.md`.
+
+**Workers:** 1 writer.
 
 **Acceptance gate:**
 1. The spec cases pass. basedpyright: 0 errors, 0 warnings. Full gate green.
