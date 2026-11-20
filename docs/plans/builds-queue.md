@@ -2999,7 +2999,7 @@ Work:
 3. Use the one parser. Move it to a module both scripts import if needed; keep no copy of the rule.
 4. Rules that only merge time can check (for example, the merged main or the gate result) stay at merge time.
 
-### Phase 44ct — One head-stall alert for one stall, to builds and bob only  · status: todo
+### Phase 44ct — One head-stall alert for one stall, to builds and bob only  · status: done (merged ef880a71d, on main)
 **From builds, 2026-11-19 01:3x (bob item 135; user: "I just want you to fix it"):** rank after 44bw, before 44cl. The head-stall alert sent the user 4 emergency phone pushes for one stall (23:26, 23:44, 23:45, 23:58 EST). Today `send_alert` (`scripts/build_queue/head_stall.py:168`) sends to builds and pushes to the user, keyed on the head (`stall.key`, :175, :195), so each head change sends again.
 
 Work:
@@ -3284,6 +3284,17 @@ Tests: the module passes 24 runs, 8 at a time, with no read of another process's
 4. **From builds, 07:19 EST:** `test_idle_eligible_wait_without_a_leave_hook_gets_one_row` in test_mac_idle.py failed once under the gate layout (notify_showrunner called 1 time, expected 0) and passed 6 of 6 alone. Find what leaks the notice, shared state or live config, and fix the cause.
 
 Tests: test_mac_idle.py passes 24 runs, 8 at a time, under CPU load. No admission or build queue test reads a value from a checkout `config/*.conf`.
+
+### Phase 44dy — The head-stall alert names an active build hold  · status: todo
+**From builds (bob), 2026-11-20 10:51 EST.** After 44dw. Base: current main (44ct is on main).
+
+Evidence: at 10:50 the head-stall watch reported a 53 min stall. It was natemerge's designed merge-test hold (build-hold record: holder natemerge, "landing merge test", release ETA 11:13).
+
+1. Replay the case with a failing test: an active build-hold record while the head waits. Today `scripts/build_queue/head_stall.py` sends a bare stall report.
+2. When a build hold is active, the alert says so in place of the bare stall report, for example "a merge-test hold by natemerge is active until 11:13". Read the hold from its one reader; keep no copy of the hold rule.
+3. A real stall with no active hold still sends the same report as today. A stall that outlives the hold's release time is a real stall.
+
+Tests: rows in the existing head-stall tests for a hold, no hold, and a hold past its release time. Each fails first where the behavior is new.
 
 ### Phase 44dv — Admission tests run on the Mac, with no skip  · status: todo
 **From builds, 2026-11-20 05:30 EST (found by report).** After the group merges; not urgent. User rule: tests run on the Mac too; no Mac skip.
