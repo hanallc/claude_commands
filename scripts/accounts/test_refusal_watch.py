@@ -4,11 +4,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 
 from scripts.whoami.note_file import note_name
 
 from scripts.production import staff_sources, staff, staff_test_support
+from scripts.notify.push_texts import RenderedPush
 from scripts.message import session_records
 from scripts.message import sessions as status_sessions
 import io
@@ -21,7 +24,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextvars import Context
 from collections.abc import Callable, Generator, Iterator, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -37,6 +41,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.agents import stop_resume
+from scripts.herdr import pane_launch
 from scripts.agents.test_support import write_machine_config
 from scripts.message import send as message_send
 from scripts.whoami import run_out
@@ -46,6 +51,7 @@ from scripts.whoami import usage_store
 from scripts.whoami import quota_alert
 
 local_staff_snapshot = staff.local_snapshot
+move_live_sessions = stop_resume.move_sessions
 
 send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPrivateUsage]
 deliver_notice_jobs = quota_alert.deliver_and_record
@@ -334,7 +340,9 @@ class RefusalWatchTests(unittest.TestCase):
         return [f"quota {job.kind} {job.name} -> {job.recipient}: sent" for job in jobs]
 
     def moved(self, call: MoveCall) -> None:
-        owner = next(owner for owner in self.owners if owner["session_id"] == call.session_id)
+        row = self.membership().by_id(staff.StaffId(call.session_id))
+        identity = row.current_session if row is not None else call.session_id
+        owner = next(owner for owner in self.owners if owner["session_id"] == identity)
         owner["config_dir"] = str(accounts.account_dir(call.target))
 
     def groups(self, units: str = "claude1", showrunners: str = "claude3") -> Path:
@@ -1179,6 +1187,190 @@ class RefusalWatchTests(unittest.TestCase):
             self.assertEqual(scans.call_count, 1)
         self.assertEqual(self.moves.calls, [])
 
+    def test_committed_group_completion_skips_a_member_with_a_live_move(self) -> None:
+        _ = self.groups(units="claude3")
+        _ = self.owner("claimed", host="unit")
+        _ = self.owner("available", host="unit")
+        held = self.membership().by_current_session("claimed")
+        assert held is not None
+        with staff.slot_operation(held.id, held.name), staff.mark_row_move(held.id, "claude3"):
+            _ = refusal_watch.run(NOW)
+        self.assertEqual(self.moves.calls, [MoveCall("available", "claude3", "complete units move to claude3")])
+        _ = refusal_watch.run(NOW + timedelta(minutes=1))
+        self.assertEqual([call.session_id for call in self.moves.calls], ["available", "claimed"])
+
+    def test_direct_and_watcher_moves_stop_each_group_member_once(self) -> None:
+        _ = self.groups()
+        _ = self.owner("direct", host="unit")
+        stopped: list[str] = []
+        resumed: list[str] = []
+        watcher_output: list[str] = []
+
+        def stop(identity: str) -> stop_resume.NotRunning:
+            stopped.append(identity)
+            if identity == "direct":
+                self.assertEqual(staff.row_activity(identity), staff.RowMoving("claude3"))
+                _ = self.owner("late", host="unit")
+                watcher_output.extend(refusal_watch.run(NOW, recover_units=False))
+            return stop_resume.NotRunning(identity)
+
+        def resume(identity: str, target: str, why: str, *_args: object) -> stop_resume.ClaudeUp:
+            resumed.append(identity)
+            self.moved(MoveCall(identity, target, why))
+            return stop_resume.ClaudeUp(identity, "w1:p1", target)
+
+        with (patch.object(stop_resume, "move_sessions", new=move_live_sessions),
+              patch.object(staff, "initial_snapshot", side_effect=self.membership),
+              patch.object(stop_resume, "_build_holders", return_value={}),
+              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_retire_prompt"),
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_stop", side_effect=stop),
+              patch.object(stop_resume, "_resume_move", side_effect=resume)):
+            direct = accounts.move_group("units", "claude3")
+            _ = refusal_watch.run(NOW + timedelta(minutes=1), recover_units=False)
+        self.assertIsInstance(direct, accounts.GroupMoveStarted)
+        self.assertTrue(any("late: Claude is up on claude3" in line for line in watcher_output))
+        self.assertCountEqual(stopped, ["direct", "late"])
+        self.assertCountEqual(resumed, ["direct", "late"])
+
+    def test_direct_group_moves_report_a_busy_member_while_the_watcher_holds_its_row(self) -> None:
+        _ = self.groups(units="claude3")
+        _ = self.owner("watcher", host="unit")
+        held, free_done = Event(), Event()
+        stopped: list[str] = []
+        resumed: list[str] = []
+
+        def stop(identity: str) -> stop_resume.NotRunning:
+            stopped.append(identity)
+            if identity == "watcher":
+                self.assertEqual(staff.row_activity(identity), staff.RowMoving("claude3"))
+                held.set()
+                self.assertTrue(free_done.wait(5))
+            return stop_resume.NotRunning(identity)
+
+        def resume(identity: str, target: str, why: str, *_args: object) -> stop_resume.ClaudeUp:
+            resumed.append(identity)
+            self.moved(MoveCall(identity, target, why))
+            if identity == "free":
+                self.assertEqual(staff.row_activity("watcher"), staff.RowMoving("claude3"))
+                free_done.set()
+            return stop_resume.ClaudeUp(identity, "w1:p1", target)
+
+        with (patch.object(stop_resume, "move_sessions", new=move_live_sessions),
+              patch.object(staff, "initial_snapshot", side_effect=self.membership),
+              patch.object(pane_launch, "current_kind", return_value="claude"),
+              patch.object(stop_resume, "_build_holders", return_value={}),
+              patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
+              patch.object(stop_resume, "_record_launches"),
+              patch.object(stop_resume, "_retire_prompt"),
+              patch.object(stop_resume, "_send_move_push") as send,
+              patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()),
+              patch.object(stop_resume, "_stop", side_effect=stop),
+              patch.object(stop_resume, "_resume_move", side_effect=resume),
+              patch("scripts.agents.stop_resume.time.sleep", side_effect=AssertionError("busy row was retried")),
+              ThreadPoolExecutor(max_workers=1) as pool):
+            watcher = pool.submit(refusal_watch.run, NOW, recover_units=False)
+            try:
+                self.assertTrue(held.wait(5))
+                self.reading(SOURCE_LOGIN, 80)
+                conflicting = accounts.move_group("units", "claude1")
+                self.assertIsInstance(conflicting, accounts.GroupMoveStartFailed)
+                assert isinstance(conflicting, accounts.GroupMoveStartFailed)
+                self.assertIsInstance(conflicting.outcomes[0], moves.MoveWaitingForRow)
+                self.assertIn("owner watcher: move pending", conflicting.stderr)
+                _ = self.owner("free", host="unit")
+                direct = accounts.move_group("units", "claude3")
+                self.assertIsInstance(direct, accounts.GroupMoveStarted)
+                assert isinstance(direct, accounts.GroupMoveStarted)
+                watcher_result = next(result for result in direct.outcomes if result.session_id == "watcher")
+                self.assertEqual(watcher_result, moves.MoveInProgress("watcher", "claude3"))
+            finally:
+                free_done.set()
+            self.assertTrue(any("watcher: Claude is up on claude3" in line for line in watcher.result(timeout=5)))
+        self.assertEqual(stopped, ["watcher", "free"])
+        self.assertEqual(resumed, ["free", "watcher"])
+        send.assert_called_once()
+        key = cast(str, send.call_args.args[1]).removeprefix("account-move:")
+        saved = moves.read_batch_result(key)
+        self.assertEqual(saved.pending[0].reference, "watcher")
+        self.assertEqual(saved.target, moves.FollowGroupAccount("units"))
+
+    def test_group_move_reports_a_held_mac_row_with_no_live_process(self) -> None:
+        _ = self.groups()
+        _ = self.owner("held", host="unit")
+        row = self.membership().by_current_session("held")
+        assert row is not None
+        membership = staff.StaffSnapshot((replace(row, worktree=staff.PresentWorktree("mac", self.home / "checkout")),))
+        self.live.clear()
+        self.reading(TARGET_LOGIN, 80)
+        head = self.low_rule(target="claude3")
+        self.next_entries(head)
+        with (patch.object(staff, "local_snapshot", return_value=membership),
+              patch.object(staff, "initial_snapshot", return_value=membership),
+              patch.object(inventory, "listing", return_value=[]),
+              patch.object(stop_resume, "move_sessions", new=move_live_sessions),
+              patch.object(stop_resume, "_stop") as stop,
+              patch.object(stop_resume, "_send_move_push") as send):
+            preview = accounts.move_group("units", "claude3", dry_run=True)
+            assert isinstance(preview, accounts.GroupMoveDryRun)
+            self.assertEqual(preview.session_ids, ())
+            with staff.slot_operation("held", "held"):
+                self.assertIsInstance(staff.row_activity("held"), staff.RowBusy)
+                result = accounts.move_group("units", "claude3")
+                self.assertEqual(next_moves.read_next_moves(), (head,))
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(refusal_watch.run(NOW, recover_units=False), [])
+                self.assertEqual(output.getvalue().splitlines(), ["Removed next move units 1 at 1% to claude3."])
+                self.assertEqual(next_moves.read_next_moves(), ())
+        assert isinstance(result, accounts.GroupMoveStartFailed)
+        self.assertEqual(result.outcomes, (moves.MoveWaitingForRow("held", "another operation holds this row"),))
+        self.assertIn("owner held: move pending", result.stderr)
+        stop.assert_not_called()
+        send.assert_called_once()
+        key = cast(str, send.call_args.args[1]).removeprefix("account-move:")
+        push = cast(RenderedPush, send.call_args.args[0])
+        self.assertIn(f"stop_resume.py retry {key}", push.values["action"])
+        self.assertEqual(moves.read_batch_result(key).pending, (moves.MoveMember("held", "owner held"),))
+
+    def test_group_move_uses_the_staff_id_when_a_row_becomes_busy_after_observation(self) -> None:
+        _ = self.groups()
+        _ = self.owner("old-conversation", host="unit")
+        observed = self.membership().by_current_session("old-conversation")
+        assert observed is not None
+        row = replace(observed, id=staff.StaffId("fixed-member"))
+        membership = staff.StaffSnapshot((row,))
+        self.reading(TARGET_LOGIN, 80)
+
+        with ExitStack() as held:
+            def listing() -> list[inventory.ListedSession]:
+                nonlocal membership
+                self.assertIsInstance(staff.row_activity(row.id), staff.RowAvailable)
+                _ = held.enter_context(staff.slot_operation(row.id, row.name))
+                membership = staff.StaffSnapshot((replace(row, current_session=staff.StaffId("new-conversation")),))
+                self.live.clear()
+                return []
+
+            with (patch.object(staff, "local_snapshot", side_effect=lambda: membership),
+                  patch.object(staff, "initial_snapshot", side_effect=lambda: membership),
+                  patch.object(inventory, "listing", side_effect=listing),
+                  patch.object(stop_resume, "move_sessions", new=move_live_sessions),
+                  patch.object(stop_resume, "_prepare_move", side_effect=AssertionError("busy row entered a move")),
+                  patch.object(stop_resume, "_send_move_push") as send):
+                result = accounts.move_group("units", "claude3")
+
+        assert isinstance(result, accounts.GroupMoveStartFailed)
+        self.assertEqual(result.session_ids, (row.current_session,))
+        self.assertEqual(result.outcomes, (moves.MoveWaitingForRow(row.id, "another operation holds this row"),))
+        self.assertIn(f"{row.name}: move pending", result.stderr)
+        send.assert_called_once()
+        key = cast(str, send.call_args.args[1]).removeprefix("account-move:")
+        push = cast(RenderedPush, send.call_args.args[0])
+        self.assertIn(f"stop_resume.py retry {key}", push.values["action"])
+        self.assertEqual(moves.read_batch_result(key).pending, (moves.MoveMember(row.id, row.name),))
+
     def test_changed_registered_process_identity_confirms_completion_fresh(self) -> None:
         if TYPE_CHECKING:
             from scripts.herdr import herdr
@@ -1469,13 +1661,71 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(stored_group_labels(path)["units"], "claude2")
         self.assertEqual(next_moves.read_next_moves(), (head,))
         _ = accounts.set_group_account("units", "claude1", why="operator return", now=NOW)
-        code, _, error = self.cli()
+        code, output, error = self.cli()
         self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines().count("Removed next move units 1 at 1% to claude2."), 1)
         self.assertEqual(next_moves.read_next_moves(), ())
         self.assertEqual(stored_group_labels(path)["units"], "claude1")
         history = [cast(dict[str, object], json.loads(line))
                    for line in accounts.roles_history_file().read_text().splitlines()]
         self.assertEqual([item["why"] for item in history], ["auto: units-low", "operator return"])
+
+    def test_replay_reports_the_removal_before_a_failed_hold_save(self) -> None:
+        _ = self.groups()
+        entry = self.hold_rule()
+        self.next_entries(entry)
+        duration = next_moves.ResolvedHold(10, next_moves.FixedHold(10))
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={entry.id: refusal_watch.HoldStarted("claude1", NOW, accounts.NoGroupTransition(), 1, duration)}))
+        _ = accounts.set_group_account("units", entry.to, why="auto: " + entry.id, now=NOW, origin=accounts.AutoOrigin())
+        output = io.StringIO()
+        expected = "Removed next move units 1 at 1% to claude2."
+
+        def fail_save(_state: refusal_watch.WatchState) -> None:
+            self.assertEqual(next_moves.read_next_moves(), ())
+            self.assertEqual(output.getvalue().splitlines(), [expected])
+            raise OSError("fixture hold save failed")
+
+        with (redirect_stdout(output), patch.object(refusal_watch, "_save_state", side_effect=fail_save) as save,
+              self.assertRaisesRegex(OSError, "fixture hold save failed")):
+            _ = refusal_watch.main([])
+        save.assert_called_once()
+        self.assertEqual(output.getvalue().splitlines(), [expected])
+        code, later_output, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertNotIn(expected, later_output)
+
+    def test_removal_flush_failure_preserves_the_move_and_hold_cleanup(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        entry = self.hold_rule(minutes=0.1)
+        self.next_entries(entry)
+        self.reading(SOURCE_LOGIN, 1)
+        duration = next_moves.ResolvedHold(0.1, next_moves.FixedHold(0.1))
+        hold = refusal_watch.HoldStarted("claude1", NOW - timedelta(seconds=6), accounts.NoGroupTransition(), 1, duration)
+        refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+            auto_move_holds={entry.id: hold}))
+
+        class BrokenFlush(io.StringIO):
+            flush_count: int = 0
+
+            @override
+            def flush(self) -> None:
+                self.flush_count += 1
+                raise BrokenPipeError("fixture reader closed")
+
+        output = BrokenFlush()
+        with redirect_stdout(output):
+            lines = refusal_watch.run_auto_moves(NOW)
+
+        self.assertEqual(output.getvalue().splitlines(), ["Removed next move units 1 at 1% to claude2."])
+        self.assertEqual(output.flush_count, 1)
+        self.assertIn("unit: Claude is up on claude2 in w1:p1 (0.0 s)", lines)
+        self.assertEqual(self.moves.calls, [MoveCall("unit", "claude2", "auto: " + entry.id)])
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), ())
+        saved = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(saved.get("auto_move_holds", {}), {})
 
     def test_failed_consumption_cannot_replay_a_recorded_move_after_an_operator_returns_the_group(self) -> None:
         path = self.groups()
@@ -1767,6 +2017,112 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual([entry["why"] for entry in history],
                          ["operator outward move", "operator return move", "auto: units-low"])
 
+    def test_external_round_trip_during_another_group_move_restarts_the_hold(self) -> None:
+        owner = self.owner("unit", host="unit")
+        at = NOW + timedelta(minutes=10)
+        WatchTime.at = at
+        duration = next_moves.ResolvedHold(10, next_moves.FixedHold(10))
+        for entry_point in ("run", "run_auto_moves"):
+            with self.subTest(entry_point=entry_point):
+                path = self.groups()
+                owner["config_dir"] = str(accounts.account_dir("claude1"))
+                self.moves.calls.clear()
+                first = self.low_rule(f"{entry_point}-units")
+                later = next_moves.ClaudeGroupMove(f"{entry_point}-showrunners", "showrunners", 1, 10, "claude2", NOW)
+                self.next_entries(first, later)
+                original = accounts.set_group_account("showrunners", "claude3", why="initial selection", now=NOW)
+                refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+                    auto_move_holds={later.id: refusal_watch.HoldStarted("claude3", NOW, original.move_id, 1, duration)}))
+                self.reading(SOURCE_LOGIN, 1, at=at)
+                self.reading(TARGET_LOGIN, 1, at=at)
+                self.reading("main@example.invalid", 80, at=at)
+
+                def operator_round_trip() -> accounts.GroupTransition:
+                    _ = accounts.set_group_account("showrunners", "claude1", why="operator outward move", now=at)
+                    return accounts.set_group_account("showrunners", "claude3", why="operator return move", now=at)
+
+                def moved(call: MoveCall) -> None:
+                    self.moved(call)
+                    self.assertEqual(accounts.group_transition("showrunners"), original)
+                    _ = Context().run(operator_round_trip)
+                    self.assertEqual(accounts.group_transition("showrunners"), original)
+
+                with patch.object(self.moves, "moved", side_effect=moved):
+                    if entry_point == "run":
+                        _ = refusal_watch.run(at, recover_units=False)
+                    else:
+                        _ = refusal_watch.run_auto_moves(at)
+
+                self.assertEqual(self.moves.calls, [MoveCall("unit", "claude2", "auto: " + first.id)])
+                self.assertEqual(stored_group_labels(path), {"units": "claude2", "showrunners": "claude3"})
+                self.assertEqual(next_moves.read_next_moves(), (later,))
+                returned = accounts.group_transition("showrunners")
+                assert isinstance(returned, accounts.GroupTransition)
+                self.assertNotEqual(returned.move_id, original.move_id)
+                holds = refusal_watch._load_state().get("auto_move_holds", {})  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(holds[later.id], refusal_watch.HoldStarted("claude3", at, returned.move_id, 1, duration))
+
+    def test_round_trip_while_waiting_for_the_lock_starts_a_full_hold_at_observation(self) -> None:
+        watch_lock = refusal_watch._watch_lock  # pyright: ignore[reportPrivateUsage]
+        queue_lock = next_moves.next_moves_lock
+        observed_at = NOW + timedelta(seconds=10)
+        duration = next_moves.ResolvedHold(0.1, next_moves.FixedHold(0.1))
+        for entry_point in ("run", "run_auto_moves"):
+            with self.subTest(entry_point=entry_point):
+                WatchTime.at = NOW
+                path = self.groups()
+                entry = self.hold_rule(entry_point, minutes=0.1)
+                self.next_entries(entry)
+                original = accounts.set_group_account("units", "claude1", why="initial selection",
+                                                      now=NOW - timedelta(seconds=7))
+                hold = refusal_watch.HoldStarted("claude1", NOW - timedelta(seconds=7), original.move_id, 1, duration)
+                refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+                    auto_move_holds={entry.id: hold}))
+                self.reading(SOURCE_LOGIN, 1)
+                self.reading("main@example.invalid", 80)
+
+                def operator_round_trip() -> None:
+                    WatchTime.at = NOW + timedelta(seconds=8)
+                    _ = accounts.set_group_account("units", "claude3", why="operator outward move", now=WatchTime.at)
+                    WatchTime.at = NOW + timedelta(seconds=9)
+                    _ = accounts.set_group_account("units", "claude1", why="operator return move", now=WatchTime.at)
+
+                @contextmanager
+                def delayed_lock() -> Generator[None]:
+                    Context().run(operator_round_trip)
+                    WatchTime.at = observed_at
+                    with watch_lock() if entry_point == "run" else queue_lock():
+                        yield
+
+                def run_pass() -> None:
+                    if entry_point == "run":
+                        _ = refusal_watch.run(recover_units=False)
+                    else:
+                        _ = refusal_watch.run_auto_moves(WatchTime.at)
+
+                lock = (patch.object(refusal_watch, "_watch_lock", new=delayed_lock) if entry_point == "run"
+                        else patch.object(next_moves, "next_moves_lock", new=delayed_lock))
+                with lock:
+                    run_pass()
+
+                returned = accounts.group_transition("units")
+                assert isinstance(returned, accounts.GroupTransition)
+                self.assertNotEqual(returned.move_id, original.move_id)
+                expected = refusal_watch.HoldStarted("claude1", observed_at, returned.move_id, 1, duration)
+                for seconds in (10, 11, 15):
+                    if seconds != 10:
+                        WatchTime.at = NOW + timedelta(seconds=seconds)
+                        run_pass()
+                    self.assertEqual(stored_group_labels(path)["units"], "claude1")
+                    self.assertEqual(next_moves.read_next_moves(), (entry,))
+                    state = refusal_watch._load_state()  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(state.get("auto_move_holds", {}).get(entry.id), expected)
+
+                WatchTime.at = NOW + timedelta(seconds=16)
+                run_pass()
+                self.assertEqual(stored_group_labels(path)["units"], "claude2")
+                self.assertEqual(next_moves.read_next_moves(), ())
+
     def test_changing_the_rule_percent_requires_a_new_full_hold(self) -> None:
         path = self.groups()
         self.next_entries(self.hold_rule())
@@ -1971,7 +2327,7 @@ class RefusalWatchTests(unittest.TestCase):
         before = path.read_bytes()
         code, output, error = self.cli()
         self.assertEqual((code, error), (0, ""))
-        self.assertEqual(output.splitlines(), ["units: unchanged"])
+        self.assertEqual(output.splitlines(), ["Removed next move units 1 at 1% to claude2."])
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(next_moves.read_next_moves(), ())
         self.assertEqual(self.moves.calls, [])
@@ -2298,7 +2654,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(result.session_ids, ("off-target",))
         self.assertEqual(len(self.moves.calls), 1)
         self.assertEqual(self.moves.calls, [MoveCall("off-target", "claude3", "checkpoint move")])
-        self.assertIn("off-target: Claude is up on claude3", result.stdout)
+        self.assertIn("owner off-target: Claude is up on claude3", result.stdout)
 
     def test_units_group_failed_request_returns_group_named_failure(self) -> None:
         _ = self.owner("off-target", host="unit")
@@ -2310,6 +2666,27 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(result.session_ids, ("off-target",))
         self.assertEqual(result.returncode, 1)
         self.assertIn("stop request failed", result.stderr)
+
+    def test_group_reports_each_member_by_staff_name_and_reuses_the_batch_id(self) -> None:
+        _ = self.owner("moved", host="unit")
+        _ = self.owner("waiting", host="unit")
+        _ = self.owner("failed", host="unit")
+        outcomes = (stop_resume.ClaudeUp("moved", "pane", "claude3"),
+                    moves.MoveInProgress("waiting", "claude3"),
+                    accounts.SessionMoveRefused("failed", "fixture failed"))
+        with patch.object(accounts, "move_sessions", return_value=outcomes) as move:
+            first = accounts.move_group("units", "claude3")
+            second = accounts.move_group("units", "claude3")
+        assert isinstance(first, accounts.GroupMoveStartFailed)
+        self.assertEqual(first, second)
+        self.assertEqual(first.outcomes, outcomes)
+        self.assertIn("owner moved: Claude is up on claude3", first.stdout)
+        self.assertIn("owner waiting: move to claude3 already in progress", first.stdout)
+        self.assertIn("owner failed: not moved: fixture failed", first.stderr)
+        self.assertEqual(move.call_count, 2)
+        first_call, second_call = move.call_args_list
+        self.assertTrue(cast(str, first_call.kwargs["batch_id"]))
+        self.assertEqual(cast(str, first_call.kwargs["batch_id"]), cast(str, second_call.kwargs["batch_id"]))
 
     def test_partially_moved_group_preview_uses_only_the_new_refusal_destination(self) -> None:
         path = self.groups(units="claude3")
@@ -2354,9 +2731,10 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("unit", host="unit")
         _ = self.transcript("unit")
         original = accounts.move_sessions
-        def requested(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause) -> tuple[accounts.SessionMoveOutcome, ...]:
+        def requested(ids: tuple[str, ...], target: str, *, why: str, cause: moves.MoveCause,
+                      batch_id: str, intent: moves.FollowGroupAccount) -> tuple[accounts.SessionMoveOutcome, ...]:
             self.assertEqual(stored_group_labels(path)["units"], target)
-            return original(ids, target, why=why, cause=cause)
+            return original(ids, target, why=why, cause=cause, batch_id=batch_id, intent=intent)
         with patch.object(accounts, "move_sessions", side_effect=requested):
             _ = self.cli()
         history = [cast(dict[str, object], json.loads(line)) for line in accounts.roles_history_file().read_text().splitlines()]
@@ -2378,7 +2756,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual((code, error.getvalue()), (0, ""))
         self.assertEqual(stored_group_labels(path), {"units": "claude1", "showrunners": "claude3"})
         self.assertEqual(len(self.moves.calls), 2)
-        self.assertEqual({command.session_id for command in self.moves.calls}, {first.current_session, second.current_session})
+        self.assertEqual({command.session_id for command in self.moves.calls}, {first.id, second.id})
 
     def test_refusal_of_one_unit_moves_every_live_unit_and_leaves_showrunners(self) -> None:
         path = self.groups()
@@ -2559,6 +2937,103 @@ class RefusalWatchTests(unittest.TestCase):
         command = self.moves.calls[0]
         self.assertEqual(command.session_id, "scratch")
         self.assertEqual(path.read_bytes(), before)
+
+    def test_ungrouped_refusal_retries_after_a_pending_row(self) -> None:
+        _ = self.owner("scratch", host="terminal")
+        _ = self.transcript("scratch")
+        with patch.object(accounts, "move_sessions", side_effect=[
+                (moves.MoveWaitingForRow("scratch", "another operation holds this row"),),
+                (stop_resume.ClaudeUp("scratch", "w1:p1", "claude2"),)]) as move:
+            _ = refusal_watch.run(NOW)
+            _ = refusal_watch.run(NOW + timedelta(minutes=1))
+        self.assertEqual(move.call_count, 2)
+
+    def test_another_moves_in_progress_result_does_not_retire_a_refusal(self) -> None:
+        _ = self.owner("scratch", host="terminal")
+        _ = self.transcript("scratch")
+        with patch.object(accounts, "move_sessions", side_effect=[
+                (moves.MoveInProgress("scratch", "claude3"),),
+                (stop_resume.ClaudeUp("scratch", "w1:p1", "claude3"),)]) as move:
+            _ = refusal_watch.run(NOW)
+            _ = refusal_watch.run(NOW + timedelta(minutes=1))
+        self.assertEqual(move.call_count, 2)
+
+    def test_a_pending_refusal_reuses_its_batch_key_after_its_peer_moves(self) -> None:
+        for identity in ("peer", "pending"):
+            _ = self.owner(identity, host="terminal")
+            _ = self.transcript(identity)
+        attempts: list[tuple[frozenset[str], str]] = []
+
+        def move(ids: tuple[str, ...], target: str, *, batch_id: str,
+                 **_options: object) -> tuple[accounts.SessionMoveOutcome, ...]:
+            members = frozenset(ids)
+            key = moves.move_batch_id(batch_id, target, members)
+            attempts.append((members, key))
+            _ = moves.save_batch_result(key, target, (moves.MoveMember("pending", "owner pending"),),
+                                        members - {"pending"})
+            pending = moves.MoveWaitingForRow("pending", "fixture busy")
+            if "peer" in members:
+                self.moved(MoveCall("peer", target, "fixture"))
+                return stop_resume.ClaudeUp("peer", "w1:p1", target), pending
+            return (pending,)
+
+        with patch.object(accounts, "move_sessions", side_effect=move):
+            _ = refusal_watch.run(NOW)
+            _ = refusal_watch.run(NOW + timedelta(minutes=1))
+        self.assertEqual([members for members, _key in attempts],
+                         [frozenset({"peer", "pending"}), frozenset({"pending"})])
+        self.assertEqual(attempts[0][1], attempts[1][1])
+
+    def test_watcher_removes_a_head_after_a_manual_selection_when_due_or_not_due(self) -> None:
+        for weekly in (1, 80):
+            with self.subTest(weekly=weekly):
+                _ = self.groups()
+                head = self.low_rule(target="claude3")
+                successor = self.low_rule("successor", target="claude3", threshold=2)
+                self.next_entries(head, successor)
+                self.reading(TARGET_LOGIN, 80)
+                self.assertIsInstance(accounts.move_group("units", "claude3"), accounts.GroupMoveStarted)
+                self.assertEqual(next_moves.read_next_moves(), (head, successor))
+                self.reading(TARGET_LOGIN, weekly)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(refusal_watch.run(NOW, recover_units=False), [])
+                self.assertEqual(output.getvalue().splitlines(), ["Removed next move units 1 at 1% to claude3."])
+                self.assertEqual(next_moves.read_next_moves(), (successor,))
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(refusal_watch.run(NOW, recover_units=False), [])
+                self.assertEqual(output.getvalue().splitlines(), ["Removed next move units 1 at 2% to claude3."])
+                self.assertEqual(self.head_deliveries, [])
+
+    def test_watcher_does_not_skip_another_target_to_remove_a_matching_successor(self) -> None:
+        _ = self.groups()
+        head = self.low_rule()
+        successor = self.low_rule("successor", target="claude3")
+        self.next_entries(head, successor)
+        self.reading(TARGET_LOGIN, 80)
+        self.assertIsInstance(accounts.move_group("units", "claude3"), accounts.GroupMoveStarted)
+        self.assertEqual(refusal_watch.run(NOW, recover_units=False), [])
+        self.assertEqual(next_moves.read_next_moves(), (head, successor))
+
+    def test_watcher_keeps_a_later_head_when_its_group_selection_changes(self) -> None:
+        path = self.groups(showrunners="claude2")
+        _ = self.owner("unit", host="unit")
+        first = self.low_rule()
+        later = self.low_rule("showrunners-low", group="showrunners")
+        self.next_entries(first, later)
+        self.reading(TARGET_LOGIN, 80)
+
+        def moved(call: MoveCall) -> None:
+            self.moved(call)
+            _ = accounts.set_group_account("showrunners", "claude3", why="operator selection", now=NOW)
+
+        output = io.StringIO()
+        with patch.object(self.moves, "moved", side_effect=moved), redirect_stdout(output):
+            _ = refusal_watch.run_auto_moves(NOW)
+        self.assertEqual(stored_group_labels(path), {"units": "claude2", "showrunners": "claude3"})
+        self.assertEqual(next_moves.read_next_moves(), (later,))
+        self.assertEqual(output.getvalue().splitlines(), ["Removed next move units 1 at 1% to claude2."])
 
     def test_manual_group_move_sets_account_and_requests_all_members_once(self) -> None:
         path = self.groups()
@@ -3557,7 +4032,9 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIsInstance(result, accounts.GroupMoveStarted)
         transition = accounts.group_transition("showrunners")
         assert isinstance(transition, accounts.GroupTransition)
-        move.assert_called_once_with((first.current_session, second.current_session), "claude3", why="weekly refusal", account_config=ANY)
+        move.assert_called_once_with((first.id, second.id), "claude3",
+                                     why="weekly refusal", account_config=ANY, batch_id=transition.move_id,
+                                     intent=moves.FollowGroupAccount("showrunners"), staff_members=(first, second))
 
     def test_named_window_without_known_reset_moves(self) -> None:
         _ = self.owner("refused")

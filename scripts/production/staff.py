@@ -617,6 +617,13 @@ class StaffSnapshot:
     def parent_of(self, row: StaffRow) -> StaffRow | None:
         return self.by_id(row.parent.id) if isinstance(row.parent, ReportsTo) else None
 
+    def qualified_name(self, row: StaffRow) -> str:
+        names = [row.name]
+        while (parent := self.parent_of(row)) is not None:
+            names.append(parent.name)
+            row = parent
+        return "/".join(reversed(names))
+
     def owner_of(self, reference: str) -> StaffRow | None:
         """Return the member, or the parent unit when the member is a worker."""
         row = self.by_member_reference(reference)
@@ -883,7 +890,7 @@ def slot_operation(key: str, name: str) -> Generator[None]:
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as lock:
+    with path.open("a+b") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
@@ -897,6 +904,77 @@ def slot_operation(key: str, name: str) -> Generator[None]:
                 _ = os.environ.pop(variable, None)
             else:
                 os.environ[variable] = previous
+
+
+@dataclass(frozen=True)
+class RowAvailable:
+    """No operation holds the staff row."""
+
+
+@dataclass(frozen=True)
+class RowBusy:
+    """An operation holds the row without a proved move target."""
+
+
+@dataclass(frozen=True)
+class RowMoving:
+    target: str
+
+
+def _move_fields(descriptor: int) -> dict[str, object]:
+    try:
+        value = cast(object, json.loads(os.pread(descriptor, 1024, 0)))
+    except (ValueError, UnicodeError):
+        return {}
+    return cast(dict[str, object], value) if isinstance(value, dict) else {}
+
+
+def row_activity(key: str) -> RowAvailable | RowBusy | RowMoving:
+    """Read the row lock without creating it or joining its owner."""
+    from scripts.lib import process_start
+
+    path, _ = _row_lock(key)
+    try:
+        stream = path.open("rb")
+    except FileNotFoundError:
+        return RowAvailable()
+    with stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fields = _move_fields(stream.fileno())
+            pid, start, target = fields.get("pid"), fields.get("start"), fields.get("target")
+            if isinstance(pid, int) and isinstance(start, str) and isinstance(target, str):
+                owner = process_start.process_start(pid)
+                if isinstance(owner, process_start.Started) and owner.start == start:
+                    return RowMoving(target)
+            return RowBusy()
+        return RowAvailable()
+
+
+@contextmanager
+def mark_row_move(key: str, target: str) -> Generator[None]:
+    """Publish the move while the caller holds the row lock."""
+    from scripts.lib import process_start
+
+    path, variable = _row_lock(key)
+    if not _joined_operation(path, variable):
+        raise StaffRefused("the move does not hold the row")
+    with path.open("r+b") as stream:
+        def write(fields: dict[str, object]) -> None:
+            _ = stream.seek(0)
+            _ = stream.write(json.dumps(fields).encode())
+            _ = stream.truncate()
+            stream.flush()
+
+        pid = os.getpid()
+        owner = process_start.process_start(pid)
+        write({"pid": pid, "start": owner.start, "target": target}
+              if isinstance(owner, process_start.Started) else {})
+        try:
+            yield
+        finally:
+            write({})
 
 
 def _joined_operation(path: Path, variable: str = "STAFF_OPERATION_FD") -> bool:
