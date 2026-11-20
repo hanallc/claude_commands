@@ -1,6 +1,7 @@
 """Read local evidence for the AWS Machines page without calling AWS."""
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -130,6 +131,36 @@ class WorkloadWithoutComparison:
 
 
 @dataclass(frozen=True)
+class JobMachineAddition:
+    job_name: str
+    machine: ledger.GateRateCandidate
+
+
+@dataclass(frozen=True)
+class AllJobsStep:
+    first_ratio: Decimal
+    last_ratio: Decimal
+    added: tuple[JobMachineAddition, ...]
+    extra_usd_per_month: Decimal
+    hours_saved_per_month: Decimal
+    usd_per_hour_saved: Decimal | NoHoursSaved
+    limits: tuple[MachineLimit, ...]
+
+
+@dataclass(frozen=True)
+class AllJobsProjection:
+    live_ratio: Decimal
+    live_extra_usd_per_month: Decimal
+    steps: tuple[AllJobsStep, ...]
+    assumption: str
+
+
+@dataclass(frozen=True)
+class NoMeasuredWorkloads:
+    """No job has a machine comparison."""
+
+
+@dataclass(frozen=True)
 class MachinesPageData:
     window_start: datetime
     window_end: datetime
@@ -137,6 +168,40 @@ class MachinesPageData:
     ratio_step: Decimal
     price_read: SavedSpotPriceRead | NoSavedSpotPriceRead
     workloads: tuple[MeasuredWorkload | WorkloadWithoutComparison, ...]
+
+    @property
+    def total(self) -> AllJobsProjection | NoMeasuredWorkloads:
+        """Sum the measured jobs at each slider value."""
+        measured = tuple(job for job in self.workloads if isinstance(job, MeasuredWorkload))
+        if not measured:
+            return NoMeasuredWorkloads()
+        return _sum_jobs(measured)
+
+
+def _sum_jobs(jobs: Sequence[MeasuredWorkload]) -> AllJobsProjection:
+    starts: dict[Decimal, list[tuple[int, str, MachineStep]]] = defaultdict(list)
+    ceilings: dict[Decimal, Decimal] = defaultdict(Decimal)
+    for index, job in enumerate(jobs):
+        for step in job.steps:
+            starts[step.first_ratio].append((index, job.name, step))
+            for limit in step.limits:
+                ceilings[limit.ratio] += limit.ceiling_extra_usd_per_month
+    ratios = sorted(ceilings)
+    boundaries = [bisect_left(ratios, start) for start in sorted(starts)]
+    active: dict[int, MachineStep] = {}
+    steps: list[AllJobsStep] = []
+    for begin, end in zip(boundaries, (*boundaries[1:], len(ratios)), strict=True):
+        changes = starts[ratios[begin]]
+        active.update((index, step) for index, _, step in changes)
+        added = tuple(JobMachineAddition(name, machine) for _, name, step in changes for machine in step.added)
+        limits = tuple(MachineLimit(ratio, ceilings[ratio]) for ratio in ratios[begin:end])
+        extra = sum((step.extra_usd_per_month for step in active.values()), Decimal(0))
+        hours = sum((step.hours_saved_per_month for step in active.values()), Decimal(0))
+        steps.append(AllJobsStep(limits[0].ratio, limits[-1].ratio, added, extra, hours,
+                                 extra / hours if hours else NoHoursSaved(), limits))
+    live_extra = sum((job.live_extra_usd_per_month for job in jobs), Decimal(0))
+    return AllJobsProjection(jobs[0].live_ratio, live_extra, tuple(steps),
+        'Each job uses the full quota in its estimate, so the total hours saved are an upper estimate.')
 
 
 @dataclass(frozen=True)
