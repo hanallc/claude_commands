@@ -115,7 +115,9 @@ A replacement process in that terminal stays open.
 Records and logs live under `<run>/detached_runs/`.
 `detached_run_process.py` proves supervisor identity before a caller stops a run.
 The command runs in its own session, and the record saves its process group.
-`detached_runs.py stop` signals that group, so the supervisor stays alive and delivers the result.
+`detached_runs.py stop` signals the command group.
+The supervisor stays alive and delivers the result.
+A worker that stops its own run keeps its pass active and receives the STOPPED result.
 The supervisor installs no signal handler.
 The orphan reaper finishes a dead supervisor's record and delivers its result during start, restore, or explicit recovery.
 Results return to the worker or its current holder. Callers do not poll.

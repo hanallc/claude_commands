@@ -1298,7 +1298,8 @@ class AccountsTests(unittest.TestCase):
                         _ = prompt.write_text("Check the saved dispatch.\n")
                         _ = (current_run / "progress_history_state.json").write_text(json.dumps({
                             "owner_staff_id": member.id, "pass": {},
-                            "phase": {"id": "8", "title": "Workers", "instance_id": "phase-eight", "status": "active"},
+                            "open_phases": [{"id": "8", "title": "Workers", "instance_id": "phase-eight",
+                                             "status": "active"}],
                             "history_file": str(current_run / "history.jsonl")}))
                         _ = progress_history.begin_dispatch(current_run, slot=target.name, phase="8", role="impl",
                             worker_name=target.name, worker_id=target.id, launcher_command=["assign.sh"],
@@ -2819,6 +2820,7 @@ class AccountsTests(unittest.TestCase):
         inventory = import_module("scripts.agents.inventory")
         registrations = ShowrunnerRegistrations((ShowrunnerRegistration("unseen", "runner", "plan.md"),))
         for cause in ("missing folder", "unreadable record"):
+            accounts.groups_file().unlink(missing_ok=True)
             registry = self.root / cause
             if cause == "unreadable record":
                 registry.mkdir()
@@ -2826,7 +2828,7 @@ class AccountsTests(unittest.TestCase):
             with (self.subTest(cause=cause), patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}),
                   patch.object(sessions, "read_registry", wraps=sessions.read_registry) as read,
                   patch.object(inventory, "showrunner_registrations", return_value=registrations),
-                  patch.object(accounts, "set_group_account") as select,
+                  patch.object(accounts, "set_group_account", wraps=accounts.set_group_account) as select,
                   patch.object(accounts, "move_sessions") as moved):
                 for flags in (("--dry-run",), ()):
                     with self.subTest(flags=flags):

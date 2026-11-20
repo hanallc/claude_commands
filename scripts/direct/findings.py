@@ -68,6 +68,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict, cast
 
+from scripts.direct import recorder_state  # noqa: E402
 from scripts.lib import conf, unit_runs  # noqa: E402
 from scripts.history.rounds import pass_ledger_round, phase_rounds, refunded_batches  # noqa: E402
 from scripts.usage.agents_log import LENSES as REVIEW_LENSES  # noqa: E402
@@ -78,9 +79,7 @@ FORMER_WORKER = "delegate"
 
 SCHEMA_VERSION = 1
 STATE_FILENAME = "findings_state.json"
-PROGRESS_STATE_FILENAME = "progress_history_state.json"
-# The progress recorder's key for the older open phases (progress_history.OPEN_PHASES_KEY).
-OPEN_PHASES_KEY = "open_phases"
+PROGRESS_STATE_FILENAME = recorder_state.STATE_FILENAME
 PHASE_HELP = "the plan phase id this call is for; required when more than one phase is open"
 
 SEVERITIES = ("blocker", "minor", "nit")
@@ -235,27 +234,15 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
 
 
 def _progress_state(session_dir: Path) -> dict[str, object] | None:
-    path = session_dir / PROGRESS_STATE_FILENAME
-    if not path.exists():
-        return None
     try:
-        return _json_object(path.read_text(encoding="utf-8"))
-    except OSError:
+        return recorder_state.read_state(session_dir / PROGRESS_STATE_FILENAME)
+    except (OSError, ValueError):
         return None
-
-
-def _open_phases(progress: dict[str, object]) -> list[dict[str, object]]:
-    """Every open phase, oldest first: the older ones the recorder parks, then the newest."""
-    phases = _object_list(progress.get(OPEN_PHASES_KEY))
-    current = _object_dict(progress.get("phase"))
-    if current is not None and _string(current.get("status")) == "active":
-        phases.append(current)
-    return phases
 
 
 def _newest_open_instance(session_dir: Path) -> str:
     progress = _progress_state(session_dir)
-    phases = _open_phases(progress) if progress is not None else []
+    phases = recorder_state.open_phases(progress) if progress is not None else []
     return _string(phases[-1].get("instance_id")) if phases else ""
 
 
@@ -285,7 +272,7 @@ def _phase_identity(
     progress = _progress_state(session_dir)
     if progress is None:
         return "", phase_id
-    phases = _open_phases(progress)
+    phases = recorder_state.open_phases(progress)
     if phase_id:
         for phase in phases:
             if _string(phase.get("id")) == phase_id:
@@ -299,22 +286,14 @@ def _phase_identity(
     if len(phases) > 1:
         open_ids = ", ".join(_string(phase.get("id")) for phase in phases)
         raise SystemExit(f"{len(phases)} phases are open ({open_ids}); name one with --phase")
-    phase = phases[0] if phases else _object_dict(progress.get("phase"))
-    if phase is None:
+    if not phases:
         return "", ""
-    if not closed_phase_ok and _string(phase.get("status")) not in ("", "active"):
-        raise SystemExit(f"Phase {_string(phase.get('id'))} is not open (open phases: none)")
+    phase = phases[0]
     return _string(phase.get("instance_id")), _string(phase.get("id"))
 
 
 def _history_file(session_dir: Path) -> Path | None:
-    path = session_dir / PROGRESS_STATE_FILENAME
-    if not path.exists():
-        return None
-    try:
-        progress = _json_object(path.read_text(encoding="utf-8"))
-    except OSError:
-        return None
+    progress = _progress_state(session_dir)
     if progress is None:
         return None
     value = _string(progress.get("history_file"))
@@ -363,7 +342,11 @@ def _read_state(
 ) -> dict[str, object]:
     """Load the phase's ledger: the live file, a parked one, or a fresh one."""
     instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok)
-    return read_phase_ledger(session_dir, instance_id, phase_id, now)
+    state = read_phase_ledger(session_dir, instance_id, phase_id, now)
+    if not closed_phase_ok and not instance_id and _string(state.get("phase_instance_id")):
+        ledger_phase = _string(state.get("phase_id"))
+        raise SystemExit(f"Phase {ledger_phase} is not open (open phases: none)")
+    return state
 
 
 def read_phase_ledger(
@@ -1436,12 +1419,18 @@ def main() -> None:
     handler = cast(Callable[[argparse.Namespace], None], handler_value)
     session_dir = _session_dir(args)
     session_dir.mkdir(parents=True, exist_ok=True)
-    with (session_dir / ".findings.lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            handler(args)
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    lock_path = session_dir / ".findings.lock"
+    try:
+        if not lock_path.exists():
+            _ = _progress_state(session_dir)
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                handler(args)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except recorder_state.OldRecorderState as error:
+        raise SystemExit(str(error)) from error
 
 
 if __name__ == "__main__":

@@ -559,13 +559,20 @@ The List hides an item with unanswered questions while each send is pending or s
 If any unanswered question needs a resend, the item appears with its resend control.
 The `the_list.py list` command still shows the item.
 The producer uses `the_list.py answer` to save an answer and mark the item unread.
-ETA accepts an offset ISO time, two such times separated by `/`, or `Not asked`, `Pending`, `Paused`, or `Delivered`.
-ETA also accepts a text description when a time or status cannot express the estimate.
+Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
+The command selects the date nearest to today in the user's time zone.
+The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.
+A date-only ETA becomes late at the start of the next day in the user's time zone.
+A time becomes late at that time.
+A range becomes late at its end.
+A status or text description never becomes late.
+Put the reason in `--latest-status`.
+The store still reads ISO times, ranges, text descriptions, `Not asked`, and `Pending` from existing records.
 The `eta_kind` field marks text descriptions as `text` and other estimates as `time or status`.
 The store validates text descriptions as one nonempty line and never parses them as times or ranges.
 Next check accepts a time or a text condition.
 Unknown opened and updated times remain empty.
-Time fields accept offset ISO times; a date alone uses midnight in the user's configured time zone.
+Other time fields accept offset ISO times and read a date as local midnight.
 An empty optional time removes that time.
 
 1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.
@@ -579,11 +586,16 @@ An empty optional time removes that time.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.
+The List page and the command show the saved update time beside the latest status in the user's time zone.
+They include the date for updates from another day.
+The page shows the time of each log entry beside its source.
+The command refuses a `--source` that ends with a clock time.
 Morty can use every command.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can update only `--latest-status`, `--next-step`, and `--eta` on those items.
+They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
+Only morty can close an item.
 Their updates use the caller's staff name as the log source.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
@@ -601,7 +613,8 @@ The CLI exits nonzero if a notice fails. The saved assignment stays in place.
 An unchanged producer or an assignment to morty sends no notice.
 
 Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
-They also accept `--next-step`, `--latest-status`, `--evidence`, and `--done-when`.
+They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence`, and `--done-when`.
+`--evidence` replaces the evidence text. `--add-evidence` appends one line.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
 References use numbers in the same producer folder.
@@ -986,6 +999,19 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     Each current task has one row with no equal states; `state_sentence` joins its actors' states with semicolons.
     No task row has an empty Work cell; a cell longer than the line limit continues on the next row.
     A busy session does not prove that the director works on a phase.
+    The board shows census shell commands when the conversation, machine, PID, and process start match the checked director.
+    It compares the start from the owner proof in the format from `scripts/lib/process_start.py`.
+    A matching empty shell list confirms no shell work when the checked director reports no shell activity.
+    When the checked director reports shell activity, an empty list leaves shell work unverified.
+    If no row matches the checked director, a census row for the conversation leaves shell work unverified.
+    This includes empty shell lists and older rows with no process identity.
+    A shell name that contains only whitespace appears as `Unnamed background command`.
+    A missing machine field gives `CensusMachineUnreported` on a legacy row.
+    A reported process identity requires a PID, a process start, and a nonempty machine name.
+    An unreadable census leaves shell work unverified for a checked live owner, including a paused unit.
+    If the census cannot reach the local machine, the board cannot verify shell work for its units.
+    A remote machine timeout leaves the local census evidence usable.
+    Unverified shell work prevents an idle result.
     With readable sources and no current task, open phase, pending merge, hold, or next work, the unit is idle.
     The director's busy status does not change this result.
     Its only current row is `Now | Nothing to do | The plan is complete and the queue is empty` for a complete readable plan.
