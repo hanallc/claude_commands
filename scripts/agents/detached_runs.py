@@ -66,9 +66,9 @@ RESULT_TAIL_LINES = 20
 # neither a pass nor a failure, and the newer call's result answers instead.
 SUPERSEDED_STATUS = 76
 TREE_CHANGED_STATUS = 77
-TREE_CHANGED_VERDICT = "CANCELLED (exit 77): resubmit after your edits."
-SUPERSEDED_VERDICT = ("SUPERSEDED (exit 76): a newer call of the same verb replaced this one before it built. "
-                      + "Nothing failed and nothing needs a repair; read the newer call's result.")
+TREE_CHANGED_INSTRUCTION = "Resubmit after your edits."
+SUPERSEDED_INSTRUCTION = ("A newer call of the same verb replaced this one before it built. "
+                          + "Nothing failed and nothing needs a repair. Read the newer call's result.")
 # The verdict of a run whose supervisor is gone: it reported no exit status.
 ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, so the command was killed or "
                   + "crashed before it reported. Start the run again if you still need its result.")
@@ -1113,12 +1113,35 @@ def resume_context(runs: Path, worker: str) -> str:
     return "\n".join(lines)
 
 
+SCOPE_REFUSAL = ("detached_runs: Start with systemd-run --scope or systemd-run --user --scope. "
+                 + "Use the exact option names in that order.")
+
+
+def _uses_unsupported_systemd_run(command: list[str]) -> bool:
+    """Require an exact scope prefix when systemd-run is the program."""
+    index = 0
+    while index < len(command) and Path(command[index]).name == "env":
+        index += 1
+        while index < len(command) and command[index] in ("-u", "--unset"):
+            index += 2
+        if index < len(command) and command[index].startswith("-"):
+            return any("systemd-run" in argument for argument in command[index:])
+        while index < len(command) and "=" in command[index]:
+            index += 1
+    return (index < len(command) and Path(command[index]).name == "systemd-run"
+            and command[index + 1:index + 2] != ["--scope"]
+            and command[index + 1:index + 3] != ["--user", "--scope"])
+
+
 def command_start(args: argparse.Namespace) -> int:
     command = [str(part) for part in cast(list[object], getattr(args, "command", []) or [])]
     if command and command[0] == "--":
         command = command[1:]
     if not command:
         print("detached_runs: start needs a command after --", file=sys.stderr)
+        return 2
+    if _uses_unsupported_systemd_run(command):
+        print(SCOPE_REFUSAL, file=sys.stderr)
         return 2
     session_dir = str(getattr(args, "session_dir", "") or "")
     name = str(getattr(args, "to", "") or "")
@@ -1274,15 +1297,26 @@ def _exit_words(result: CommandResult) -> str:
 def result_text(record: RunRecord, result: CommandResult) -> str:
     exit_code = result.code if isinstance(result, CompletedCommand) else result
     stop_reason = record.get("stop_reason", "")
-    lost_verdict = "STOPPED (no exit status)" if stop_reason else ORPHAN_VERDICT
-    verdict = (lost_verdict if isinstance(exit_code, SupervisorLost) else "PASS (exit 0)" if exit_code == 0
-               else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
-               else TREE_CHANGED_VERDICT if exit_code == TREE_CHANGED_STATUS
-               else f"STOPPED (exit {exit_code})" if stop_reason else f"FAIL (exit {exit_code})")
+    if stop_reason:
+        verdict = f"STOPPED ({_exit_words(result)})"
+    elif isinstance(exit_code, SupervisorLost):
+        verdict = ORPHAN_VERDICT
+    elif exit_code == 0:
+        verdict = "PASS (exit 0)"
+    elif exit_code == SUPERSEDED_STATUS:
+        verdict = "SUPERSEDED (exit 76)"
+    elif exit_code == TREE_CHANGED_STATUS:
+        verdict = "CANCELLED (exit 77)"
+    else:
+        verdict = f"FAIL (exit {exit_code})"
     heading = "Run ended with no result" if isinstance(exit_code, SupervisorLost) else "Run finished"
     lines = [f"{heading}: ", f"Result: {verdict}", f"Log: {record['log']}"]
     if stop_reason:
         lines.append(f"Stop reason: {stop_reason}")
+    if exit_code == SUPERSEDED_STATUS:
+        lines.append(SUPERSEDED_INSTRUCTION)
+    elif exit_code == TREE_CHANGED_STATUS:
+        lines.append(TREE_CHANGED_INSTRUCTION)
     cancellation = ""
     if exit_code == TREE_CHANGED_STATUS:
         # Keep the cancellation instruction when cleanup moves it outside the tail.
