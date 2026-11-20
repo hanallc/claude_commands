@@ -3066,7 +3066,7 @@ wait_for_step_folder() {
 }
 
 route_test() {
-    local last_decline="" wait_reason="" name eligibility reason settings platform refresh_source=0
+    local last_decline="" wait_reason="" wait_holder="" name eligibility reason settings platform refresh_source=0
     while IFS=$'\t' read -r name eligibility reason settings platform; do
         if [[ "$eligibility" == excluded && "$settings" != - && "$platform" == macos ]]; then
             BUILDLOG_MAC=declined
@@ -3213,6 +3213,11 @@ route_test() {
         fi
         if [[ "$MAC_ONLY" == 1 && "${LAST_TARGET_REASON:-}" != busy ]]; then
             mac_only_refuse "${LAST_TARGET_REASON:-runner}"
+        fi
+        if [[ "$STEP_ASSIGNED_PLATFORM" == macos && "$last_decline" == busy \
+                && -n "$BUILDLOG_MAC_HOLDER" && "$BUILDLOG_MAC_HOLDER" != "$wait_holder" ]]; then
+            printf 'verify.sh: Mac holder: %s.\n' "$BUILDLOG_MAC_HOLDER" >&2
+            wait_holder=$BUILDLOG_MAC_HOLDER
         fi
         if [[ "${LAST_TARGET_REASON:-}" == source_changed ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
