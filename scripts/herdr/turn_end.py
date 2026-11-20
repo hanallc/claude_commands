@@ -159,7 +159,8 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
     if details:
         message += "\n" + details
     identity = staff.StaffId(str(passed.get("worker_id", "")))
-    completion_id = progress_history.dispatch_delivery(passed).completion_id if busy else ""
+    completion_id = (progress_history.dispatch_delivery(passed).completion_id
+                     if busy or outcome == TurnOutcome.UNCERTAIN else "")
     attempt_id = uuid.uuid4() if busy else None
     if busy:
         launcher = passed.get("launcher_command")
@@ -187,6 +188,9 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
         if current is None:
             raise ValueError(f"{parent.id}: notice recipient is not in staff")
         address = ("codex:" if isinstance(staff.backend(current), staff.CodexBackend) else "session:") + str(current.current_session)
+        if outcome == TurnOutcome.UNCERTAIN and not progress_history.dispatch_uncertainty_pending(
+                run, identity, instance, completion_id):
+            return
         result = send.send(options._replace(selection=send.RosterLookup(address)))
         if result.outcome not in ("sent", "skipped"):
             raise ValueError(result.detail)
@@ -199,9 +203,8 @@ def _prepare_notice(worker_name: str, parent: staff.StaffRow, run: Path, passed:
 
     def send_notice() -> None:
         if attempt_id is not None:
-            member = staff.local_snapshot().by_id(identity)
-            if (member is not None and member.kind == "worker" and member.reports_to(parent.id)
-                    and progress_history.handoff_busy_dispatch_notice(run, identity, instance, completion_id, attempt_id)):
+            if progress_history.handoff_busy_dispatch_notice(run, identity, instance, completion_id,
+                                                            attempt_id, owner_id=parent.id):
                 deliver()
             return
         digest = hashlib.sha256(instance.encode()).hexdigest()
@@ -407,10 +410,10 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
                   client: herdr.Herdr, run: Path, passed: dict[str, object], instance: str,
                   delivery: progress_history.DispatchDelivery, hold: worker_panes.WorkerLockHold) -> TurnOutcome | TurnDecision:
     record = staff.snapshot()
-    availability = worker.CheckAssignmentAvailability.for_worker(record, hold, run)
+    availability = worker.CheckAssignmentAvailability.for_worker(record, row, run)
 
     def before_input(target: staff.StaffRow) -> worker_panes.CloseAllowed | worker_panes.DispatchHoldsWorker:
-        return availability.check(target, record, hold, retry=worker.RetryingAssignment(run.resolve(), instance))
+        return availability.check(target, hold, retry=worker.RetryingAssignment(run.resolve(), instance, delivery))
 
     with redirect_stderr(io.StringIO()) as diagnostics:
         try:
@@ -424,8 +427,7 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
         progress_history.confirm_assignment_submission(run, instance, delivery.completion_id)
         return TurnOutcome.SUBMITTED
     outcome = TurnOutcome.BUSY if result == worker.ExitCode.BUSY else TurnOutcome.UNCERTAIN
-    if outcome == TurnOutcome.BUSY:
-        passed = {**passed, "delivery": asdict(delivery)}
+    passed = {**passed, "delivery": asdict(delivery)}
     details = diagnostics.getvalue().strip() or f"Stage 2 submission returned {result}"
     path = Path(delivery.reply_file)
     path = path.with_name(path.stem + "_turn" + path.suffix)
@@ -1033,8 +1035,8 @@ def _handle_locked(event: WorkerEvent,
             return _ignored(event, f"the worker lock was kept: {hold.blocker}", row.name)
         record = staff.snapshot()
         current = record.by_id(row.id)
-        if (current is None or current.current_session != row.current_session
-                or current.name != row.name or not hold.owns(current)):
+        if (current is None or current.current_session != row.current_session or not hold.owns(current)
+                or (event.kind != EventKind.STAGE_READY and current.name != row.name)):
             if event.kind == EventKind.RUN_FINISHED:
                 return TurnOutcome.RETRY_EVIDENCE
             return _ignored(event, "the worker changed before the hook acquired its lock", row.name)
