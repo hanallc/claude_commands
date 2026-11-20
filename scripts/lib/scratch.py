@@ -2112,23 +2112,24 @@ def _repos(path: Path, depth: int, skipped: tuple[str, ...]) -> list[Path]:
     return found
 
 
-def clone_stage_identity(status: os.stat_result) -> bytes:
-    return f"{status.st_dev}:{status.st_ino}\n".encode("ascii")
+def clone_stage_identity(stage: Path, status: os.stat_result) -> bytes:
+    return f"{status.st_dev}:{status.st_ino}\n".encode("ascii") + os.fsencode(stage.resolve())
 
 
 def owns_clone_stage(stage: Path) -> bool:
-    """Require a marker that identifies this directory."""
+    """Require a marker that matches this directory and its path."""
     try:
         status = stage.lstat()
         marker_path = stage / CLONE_STAGE_OWNER
         if not stat.S_ISDIR(status.st_mode) or marker_path.is_symlink():
             return False
+        identity = clone_stage_identity(stage, status)
         descriptor = os.open(marker_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except (FileNotFoundError, NotADirectoryError):
         return False
     with os.fdopen(descriptor, "rb") as marker:
         return (stat.S_ISREG(os.fstat(descriptor).st_mode)
-                and marker.read(128) == clone_stage_identity(status))
+                and marker.read(len(identity) + 1) == identity)
 
 
 def is_private_stage_checkout(root: Path, repo: Path) -> bool:

@@ -964,7 +964,8 @@ class ScratchTests(unittest.TestCase):
                     staged = stage / "checkout"
                     self.git(source, "clone", "-q", "--shared", "--no-checkout", str(source), str(staged))
                     if state == "marked":
-                        _ = (stage / scratch.CLONE_STAGE_OWNER).write_bytes(scratch.clone_stage_identity(stage.stat()))
+                        identity = scratch.clone_stage_identity(stage, stage.stat())
+                        _ = (stage / scratch.CLONE_STAGE_OWNER).write_bytes(identity)
                     self.assertFalse((checkout / ".git").exists())
                     self.assertFalse((staged / ".git/index").exists())
                     self.assertEqual(scratch.repo_problem(staged), "it has uncommitted changes")

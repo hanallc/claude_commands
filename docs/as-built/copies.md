@@ -52,13 +52,13 @@ When no local source remains, removal exports the rescue into a sibling bare rep
 Removal verifies the exported rescue before it deletes the workspace.
 Python callers pass slot lease descriptors to their build and test children.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the gate root.
-Its Git children inherit the destination lease and busy lock.
+Git commands during checkout setup inherit the destination lease and busy lock.
 New shared copies follow Git alternates to object stores that have no alternates of their own.
 Git initializes the copy in a private stage with the configured templates.
 The stage records only the root stores as alternates.
 The fetch gives upload-pack direct access to every store in the source chain.
 Git fetches objects that the root stores lack, including a requested commit that only the source reflog holds.
-The next use clears a stage only when its marker identifies that directory.
+The next use clears a stage only when its marker matches the absolute path, device, and inode.
 Task cleanup and the expiry sweep skip the saved-work check for a private stage with a matching marker.
 Removing an intermediate copy leaves those objects available in the new copy.
 A clone of an active gate uses `--no-local` without sharing its object store.

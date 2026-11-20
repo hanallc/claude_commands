@@ -629,7 +629,7 @@ class CopyTests(TmpSweepCase):
         self.assertFalse(child.exists())
 
         scratch_root = self.tmp / "scratch"
-        for name, marked in (("marked", True), ("unmarked", False)):
+        for name, marked, moved in (("marked", True, False), ("unmarked", False, False), ("moved", True, True)):
             with self.subTest(stage=name):
                 parent = self.copy("source-" + name)
                 _ = write(parent / "tracked", "saved source")
@@ -639,13 +639,19 @@ class CopyTests(TmpSweepCase):
                 scratch.exclude_copy_metadata(parent)
 
                 child = scratch_root / name
-                stage = child / scratch.CLONE_STAGE
+                original = self.copy("original-stage") if moved else child
+                stage = original / scratch.CLONE_STAGE
                 stage.mkdir(parents=True)
-                staged = stage / "checkout"
-                _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(parent), str(staged)],
+                _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(parent),
+                                    str(stage / "checkout")],
                                    check=True, capture_output=True)
                 if marked:
-                    _ = (stage / scratch.CLONE_STAGE_OWNER).write_bytes(scratch.clone_stage_identity(stage.stat()))
+                    identity = scratch.clone_stage_identity(stage, stage.stat())
+                    _ = (stage / scratch.CLONE_STAGE_OWNER).write_bytes(identity)
+                if moved:
+                    child.mkdir()
+                    stage = stage.rename(child / stage.name)
+                staged = stage / "checkout"
                 scratch.atomic_record(child / copy_record.RECORD, {
                     "task": "until:2000-01-01T0000Z", "test_hana_clone": True,
                     "borrows_from": str(parent / ".git"),
@@ -654,15 +660,16 @@ class CopyTests(TmpSweepCase):
                 self.assertFalse((staged / ".git/index").exists())
                 self.assertEqual(tmp_sweep.repo_git_work(staged), tmp_sweep.GitWork.UNSAVED)
 
+                removable = marked and not moved
                 with mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(scratch_root)}):
                     result = self.sweep()
                     self.assertIn(str(parent), result.kept[f"borrowed: {child} still uses its git objects"])
                     self.assertTrue(parent.is_dir())
-                    if not marked:
+                    if not removable:
                         self.assertIn(str(child), result.kept[tmp_sweep.UNSAVED_WORK])
-                    self.assertEqual(child.is_dir(), not marked)
+                    self.assertEqual(child.is_dir(), not removable)
                     _ = self.sweep()
-                self.assertEqual(parent.is_dir(), not marked)
+                self.assertEqual(parent.is_dir(), not removable)
 
 
 class IdleTests(TmpSweepCase):

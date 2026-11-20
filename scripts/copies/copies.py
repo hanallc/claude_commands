@@ -768,7 +768,7 @@ def initialize_git(tree: Path, source: Path) -> None:
         stage = tree / f"{scratch.CLONE_STAGE}-{uuid4().hex}"
     stage.mkdir()
     try:
-        _ = (stage / scratch.CLONE_STAGE_OWNER).write_bytes(scratch.clone_stage_identity(stage.stat()))
+        _ = (stage / scratch.CLONE_STAGE_OWNER).write_bytes(scratch.clone_stage_identity(stage, stage.stat()))
         checkout = stage / "checkout"
         if clones_without_alternates(source):
             _ = git(source, "clone", "--no-local", "--no-checkout", "--quiet", "--", str(source), str(checkout))

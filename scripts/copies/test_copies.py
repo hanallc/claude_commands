@@ -3142,7 +3142,8 @@ with patch.object(subprocess, 'run', pause_clone):
                 old_alternates = old_stage / "template/objects/info/alternates"
                 old_alternates.parent.mkdir(parents=True)
                 _ = old_alternates.write_text(str(self.source / ".git/objects") + "\n")
-                _ = (old_stage / scratch.CLONE_STAGE_OWNER).write_bytes(scratch.clone_stage_identity(old_stage.stat()))
+                identity = scratch.clone_stage_identity(old_stage, old_stage.stat())
+                _ = (old_stage / scratch.CLONE_STAGE_OWNER).write_bytes(identity)
                 with copies.workspace(self.owner_id, source, commit, name=stop, branch="worker") as tree:
                     self.assertEqual(tree, path)
                     self.assertEqual(self.git(tree, "rev-parse", "HEAD"), commit)
