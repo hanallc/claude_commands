@@ -49,6 +49,7 @@ from scripts.production.gate_rename_deploy import move_gate_state
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 RENAMES = {"merge-gate": "gate", "targeted-test": "test-affected"}
+CLOUD_REQUEST_FILES = frozenset({"current.json", "request.json"})
 MONTH = re.compile(r"\d{4}-\d{2}\.jsonl\Z")
 SYSTEM_UNITS = ("build-admission.service", "build-admission.socket", "build-memory-feed.service")
 
@@ -113,6 +114,7 @@ class RecordChange:
 
     path: Path
     fields: frozenset[str]
+    names: Mapping[str, str]
     count: int
     version: RecordVersion
 
@@ -400,13 +402,11 @@ def record_paths(roots: RecordRoots) -> dict[Path, frozenset[str]]:
     for directory in roots.buildlog.iterdir():
         if directory.is_dir() and not directory.is_symlink() and directory.name not in ("admission", "pending-steps"):
             paths.update((path, frozenset({"step"})) for path in directory.iterdir() if MONTH.fullmatch(path.name))
-    cloud_fields = frozenset({"mode", "step"})
-    launches = roots.aws / "cloud-gate-launches.jsonl"
-    if os.path.lexists(launches):
-        paths[launches] = cloud_fields
-    costs = roots.aws / "cost-ledger.json"
-    if os.path.lexists(costs):
-        paths[costs] = frozenset({"mode"})
+    mode_fields = frozenset({"mode"})
+    # Both cloud writers use the same StepJob values.
+    for name in ("cloud-gate-launches.jsonl", "cost-ledger.json"):
+        if os.path.lexists(roots.aws / name):
+            paths[roots.aws / name] = mode_fields
     for directory in roots.buildlog.iterdir():
         if directory.is_dir() and not directory.is_symlink():
             paths.update((path, frozenset({"step"})) for path in directory.glob("results/????-??/*.json.gz"))
@@ -416,8 +416,10 @@ def record_paths(roots: RecordRoots) -> dict[Path, frozenset[str]]:
         for directory, names, files in os.walk(root, followlinks=False):
             names[:] = sorted(name for name in names if not (Path(directory) / name).is_symlink())
             for name in files:
-                if name in {"current.json", "request.json", "remote-result.json", "outcome.json"}:
-                    paths[Path(directory) / name] = cloud_fields
+                if name in CLOUD_REQUEST_FILES:
+                    paths[Path(directory) / name] = mode_fields
+                elif name in {"remote-result.json", "outcome.json"}:
+                    paths[Path(directory) / name] = frozenset({"mode", "step"})
     paths.update((path, steps) for path in wait_files(roots))
     return paths
 
@@ -425,18 +427,21 @@ def record_paths(roots: RecordRoots) -> dict[Path, frozenset[str]]:
 def inspect_records(roots: RecordRoots, names: Mapping[str, str]) -> tuple[list[RecordChange], set[str]]:
     changes: list[RecordChange] = []
     hosts = {store.host_name(), *(path.name for path in roots.buildlog.iterdir() if path.is_dir())}
+    wire_modes = Direction.REVERSE.names()
     for path, fields in sorted(record_paths(roots).items()):
         started = time.monotonic()
         version = RecordVersion.read(path)
+        # Both controllers write legacy modes to cloud request files.
+        record_names = wire_modes if path.name in CLOUD_REQUEST_FILES else names
         count = 0
         for _raw, value in records(path):
             if isinstance(value, dict) and isinstance(value.get("host"), str):
                 hosts.add(cast(str, value["host"]))
-            count += convert(value, fields, names)
+            count += convert(value, fields, record_names)
         if RecordVersion.read(path) != version:
             raise Refused(f"record changed during inspection: {path}")
         if count:
-            changes.append(RecordChange(path, fields, count, version))
+            changes.append(RecordChange(path, fields, record_names, count, version))
         report(f"Inspected {path}", started, count)
     return changes, hosts
 
@@ -482,7 +487,7 @@ def inspect_indexes(roots: RecordRoots) -> list[Path]:
     return paths
 
 
-def write_record(change: RecordChange, names: Mapping[str, str], writes: ConversionWrites) -> None:
+def write_record(change: RecordChange, writes: ConversionWrites) -> None:
     started = time.monotonic()
     if RecordVersion.read(change.path) != change.version:
         raise Refused(f"record changed before conversion: {change.path}")
@@ -493,7 +498,7 @@ def write_record(change: RecordChange, names: Mapping[str, str], writes: Convers
         count = 0
         with os.fdopen(descriptor, "wb") as output:
             for raw, value in records(change.path):
-                changed = convert(value, change.fields, names)
+                changed = convert(value, change.fields, change.names)
                 count += changed
                 data = (json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n" if changed else raw)
                 _ = output.write(gzip.compress(data, mtime=0) if change.path.suffix == ".gz" else data)
@@ -584,7 +589,7 @@ def migrate(roots: RecordRoots, writes: ConversionWrites) -> int:
     count = 0
     names = roots.direction.names()
     for change in changes:
-        write_record(change, names, writes)
+        write_record(change, writes)
         count += change.count
     for rename in renames:
         began = time.monotonic()
