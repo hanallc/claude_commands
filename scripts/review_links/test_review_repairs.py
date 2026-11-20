@@ -586,7 +586,7 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   for(const [id,selected] of [['C1','all'],['C2','Validating']]){
    await show('open');const before=count('open'),all=count('all');
    const key='page-owner/'+id,row=document.querySelector('[data-key="'+key+'"]');
-   row.querySelector('.list-toggle').click();await readyReviewCard(row);await save(row.querySelector('form'));
+   row.querySelector('.list-toggle').click();await save(await readyReviewCard(row));
    await show(selected);await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
    check(count('open')===before && count('all')===all,
     'F005: the fresh index restores the counts after an owner answer in '+selected);
@@ -662,12 +662,12 @@ window.fetch=async(url,options={})=>{
   chip.click();await new Promise(resolve=>requestAnimationFrame(resolve));
  };
  try{
-  row('C1').querySelector('.list-toggle').click();await readyReviewCard(row('C1'));
+  row('C1').querySelector('.list-toggle').click();
   const counts=()=>['open','Validating','all'].map(value=>
    Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent));
   check(!document.querySelector('[data-show-chip="Done"]'),'Review has no Done chip.');
   const before=counts();
-  const form=row('C1').querySelector('form');await save(form,'validate');
+  const form=await readyReviewCard(row('C1'));await save(form,'validate');
   check(JSON.stringify(counts())===JSON.stringify([before[0]-1,before[1]+1,before[2]]),
    'A save moves the entry from Open to Validating without changing All.');
   check(!row('C1') || row('C1').hidden,'the saved check leaves Open');
@@ -683,8 +683,8 @@ window.fetch=async(url,options={})=>{
    'All shows the elapsed time and a button to open the active check.');
   await show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
-  row('C2').querySelector('.list-toggle').click();await readyReviewCard(row('C2'));
-  const second=row('C2').querySelector('form');await save(second,'validate');
+  row('C2').querySelector('.list-toggle').click();
+  const second=await readyReviewCard(row('C2'));await save(second,'validate');
   const [openBeforePass,validatingBeforePass,allBeforePass]=counts();
   await nativeFetch('/passed');await refresh();check(!row('C2') || row('C2').hidden,'a passed check stays out of Open');
   const [openAfterPass,validatingAfterPass,allAfterPass]=counts();
@@ -692,12 +692,13 @@ window.fetch=async(url,options={})=>{
    'A passed check leaves the Validating and All counts.');
   await show('all');
   check(!row('C2') || row('C2').hidden,'A passed check stays out of All.');
-  row('C3').querySelector('.list-toggle').click();await readyReviewCard(row('C3'));
+  row('C3').querySelector('.list-toggle').click();
+  const third=await readyReviewCard(row('C3'));
   const [openBeforeWorks,validatingBeforeWorks,allBeforeWorks]=counts();
   let resumeRefresh;
   allowReviewRefresh=new Promise(resolve=>{resumeRefresh=resolve;});
   try{
-   const third=row('C3').querySelector('form');await save(third,'works');
+   await save(third,'works');
    check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
    const [open,validating,all]=counts();
    check(open===openBeforeWorks-1 && validating===validatingBeforeWorks && all===allBeforeWorks-1,
@@ -718,8 +719,8 @@ window.fetch=async(url,options={})=>{
   for(const key of keys){
    await show('open');
    const asked=()=>document.querySelector('[data-key="'+key+'"]');
-   asked().querySelector('.list-toggle').click();await readyReviewCard(asked());
-   const asking=asked().querySelector('form');asking.elements.feedback.value='Check the next case.';
+   asked().querySelector('.list-toggle').click();
+   const asking=await readyReviewCard(asked());asking.elements.feedback.value='Check the next case.';
    await save(asking,'question');
    check(!asked() || asked().hidden,'F021: Ask question leaves Open for '+key);
    for(let pass=0;pass<2;pass++){
@@ -735,7 +736,7 @@ window.fetch=async(url,options={})=>{
   const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
   const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
   check(selectedOwner()===ownerChip(UNIT_OWNER),'The investigation owner starts selected.');
-  investigation.querySelector('.list-toggle').click();await readyReviewCard(investigation);await save(investigation.querySelector('form'),'read');
+  investigation.querySelector('.list-toggle').click();await save(await readyReviewCard(investigation),'read');
   await refresh();
   check(selectedOwner().dataset.ownerChip===UNIT_OWNER && selectedOwner().textContent===UNIT_NAME+' 0' &&
     ownerChip('').textContent==='All 0' && counts()[0]===0,
@@ -795,7 +796,11 @@ window.fetch=async(url,options={})=>{
     visible.every(row=>row.dataset.sourceOwner===entry.owner),'F012: the legacy link keeps its owner.');
    if(entry.type==='investigation') check(!page.querySelector('[data-show-chip="Done"],[data-state="Done"]'),
     'F012: the legacy link shows only active states.');
-   if(entry.item) check(!page.querySelector('[data-key="'+entry.item+'"] [data-detail]').hidden,'F012: legacy row opens its card');
+   if(entry.item){
+    const summary=page.querySelector('[data-key="'+entry.item+'"] .list-toggle');
+    const dialog=page.getElementById(summary?.getAttribute('aria-controls'));
+    check(summary?.getAttribute('aria-expanded')==='true' && dialog?.open,'F012: the legacy row opens its dialog.');
+   }
    legacy.remove();
   }
  }catch(error){failures.push(String(error));}

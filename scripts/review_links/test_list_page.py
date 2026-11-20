@@ -238,7 +238,7 @@ window.fetch=async (path,options={})=>{
  check(document.querySelectorAll('#review-new-item').length===1,'The List mounts one shared dialog.');
  const existing=document.querySelector('[data-list-item]');
  existing.querySelector('.list-toggle').click();
- const tell=existing.querySelector('button[value="tell"]'),form=tell.form;
+ const tell=recordDetails(existing).querySelector('button[value="tell"]'),form=tell.form;
  form.elements.words.value='Check the existing item.';
  form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
  form.requestSubmit(tell);
@@ -262,7 +262,7 @@ window.fetch=async (path,options={})=>{
  const reply=__ROW_REPLY__;
  finishRowSave(Response.json(reply.body,{status:reply.status}));
  const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(created)+'"]');
- await until(document.body,()=>row() && !row().hidden && !row().querySelector('[data-detail]').hidden);
+ await until(document.body,()=>row() && !row().hidden && recordIsOpen(row()));
  check(reads===1,'The New item save refreshes the List once after the row save ends.');
  check(!dialog.open,'Send closes the dialog.');
  const saved=requests.find(([,body])=>body?.words);
@@ -322,11 +322,11 @@ window.fetch=async (path,options={})=>{
  check(!document.querySelector('[data-list-expansion], [aria-label="Expand all"], [aria-label="Collapse all"]'),
   'The List uses individual row controls.');
  for(const row of rows){
-  const button=toggle(row),detail=row.querySelector('[data-detail]');
+  const button=toggle(row),dialog=document.querySelector('#record-item-dialog');
   check(button.tagName==='BUTTON' && button.getAttribute('aria-label')==='Show item '+row.dataset.number,
    'The button names its item.');
-  check(button.getAttribute('aria-controls')===detail.id && isExpanded(row,false),
-   'The button points to its closed details.');
+  check(button.getAttribute('aria-controls')===dialog.id && button.getAttribute('aria-haspopup')==='dialog' && isExpanded(row,false),
+   'The button points to the closed item dialog.');
   check(button.querySelector('.list-chevron')?.getAttribute('aria-hidden')==='true',
    'The chevron is decorative.');
  }
@@ -399,8 +399,7 @@ const rows=[...document.querySelectorAll('[data-list-item]')];
 const chip=(group,value)=>document.querySelector('[data-filter-row="'+group+'"] [data-filter-value="'+value+'"]');
 const selectOwner=value=>chip('owner',value ? 'staff:'+value : 'all').click();
 const toggle=row=>row.querySelector('.list-toggle');
-const isExpanded=(row,expanded)=>row.querySelector('[data-detail]').hidden===!expanded &&
- toggle(row).getAttribute('aria-expanded')===String(expanded);
+const isExpanded=(row,expanded)=>recordIsOpen(row)===expanded && row.querySelector('[data-detail]').hidden;
 try{
 ''' + steps + '''
 }catch(error){failures.push(String(error));}
@@ -449,7 +448,7 @@ async function inspect(){
  const doc=listFrame?.contentDocument || document,win=doc.defaultView;
  const dialog=doc.querySelector('[data-list-review-dialog]');
  const row=()=>doc.querySelector('[data-number="111"]');
- const link=key=>[...row().querySelectorAll('a[data-list-review-card]')].find(link=>
+ const link=key=>[...win.recordDetails(row()).querySelectorAll('a[data-list-review-card]')].find(link=>
   new URL(link.href).searchParams.get('body')===key);
  const changed=(node,ready,description)=>new Promise((resolve,reject)=>{
   const observer=new win.MutationObserver(checkReady);
@@ -493,7 +492,8 @@ async function inspect(){
  const doneLink=link('sdlc/C2'),done=await readCard(doneLink);
  check(dialog.open && done.querySelector('[data-state="Done"]'),'Done opens in the dialog.');
  check(!done.querySelector('[data-review-form] textarea'),'The Done card has no action.');
- check(!done.querySelector('[data-review-index]'),'The dialog loads one card.');
+ check(!done.querySelector('[data-review-index]') &&
+  !doc.querySelector('#record-item-dialog').open,'The dialog loads one card and hides the List item.');
  const close=dialog.querySelector('button');
  done.body.tabIndex=-1;done.body.focus();
  done.body.dispatchEvent(new done.defaultView.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
@@ -640,7 +640,7 @@ async function inspect(){
    }
    return fetchList(url,options);
   };
-  const listWords=row().querySelector('textarea[name="words"]');
+  const listWords=win.recordDetails(row()).querySelector('textarea[name="words"]');
   listWords.value='A List action is pending.';listWords.dispatchEvent(new win.Event('input',{bubbles:true}));
   const listForm=listWords.form;
   listForm.querySelector('[value="tell"]').click();
@@ -713,7 +713,7 @@ async function inspect(){
   await animationFrames(win);
   check(dialog.open && listReads===0 && row()===before,'The Review save waits for the pending List action.');
   releaseList(new win.Response(JSON.stringify({reason:'The test List action was refused.'}),{status:400}));
-  await changed(doc.body,()=>!row().querySelector('textarea[name="words"]').form.dataset.sending,
+  await changed(doc.body,()=>!win.recordDetails(row()).querySelector('textarea[name="words"]').form.dataset.sending,
    'the refused List action ends');
   check(listReads===1 && dialog.open && !close.disabled && button('works').disabled,
    'A refused List action starts one refresh and keeps the saved form disabled.');
@@ -732,7 +732,7 @@ async function inspect(){
  const filters=new URLSearchParams(win.location.hash.slice(1));
  check(new URL(listURL).pathname===win.location.pathname && filters.get('show')==='working' &&
   filters.get('q')==='linked reviews' && doc.querySelector('#list-search').value==='linked reviews' &&
-  !row().querySelector('[data-detail]').hidden,'The List keeps the filters, search, and open row.');
+  win.recordIsOpen(row()),'The List keeps the filters, search, and open row.');
  await report();
 }
 (listFrame || window).addEventListener('load',()=>{void inspect().catch(error=>{failures.push(String(error));void report();});},{once:true});
@@ -750,10 +750,11 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
 
                 class Probe(serve.ReviewLinksHandler):
                     @override
-                    def html_response(self, status: int, content: bytes) -> None:
+                    def html_response(self, status: int, content: bytes, *,
+                                      delivery_pending: bool | None = None) -> None:
                         if self.path == list_page.PAGE_PATH + "?direct=1":
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
-                        super().html_response(status, content)
+                        super().html_response(status, content, delivery_pending=delivery_pending)
 
                     @override
                     def send_head(self) -> BinaryIO | None:
@@ -857,7 +858,7 @@ addEventListener('message',event=>{
   const search=document.querySelector('#list-search');
   search.value=event.data.pendingWords;search.dispatchEvent(new Event('input'));
  }
- const links=document.querySelectorAll('[data-number="1"] [data-detail] a');
+ const links=recordDetails(document.querySelector('[data-number="1"]')).querySelectorAll('a');
  [...links].find(link=>link.textContent==='#'+event.data.clickListLink).click();
 });
 </script></body>''')
@@ -883,7 +884,12 @@ frame.addEventListener('load',async()=>{
   const pendingWords=scenario==='pending-words' ? 'item' : '';
   const originalFilters=filters();
   if(pendingWords) originalFilters[2]=pendingWords;
-  const link=[...source.querySelectorAll('a')].find(a=>a.textContent==='#'+number);
+  const link=[...win.recordDetails(source).querySelectorAll('a')].find(a=>a.textContent==='#'+number);
+  const sourceForm=win.recordDetails(source).querySelector('[data-feedback-form]');
+  if(scenario==='closed'){
+   sourceForm.elements.words.value='Keep the source draft.';
+   sourceForm.elements.words.dispatchEvent(new win.Event('input',{bubbles:true}));
+  }
   const expanded=item=>item.querySelector('.list-toggle').getAttribute('aria-expanded')==='true';
   const inView=element=>{
    const rect=element.getBoundingClientRect();
@@ -928,12 +934,19 @@ frame.addEventListener('load',async()=>{
    await debounced;
    check(!target.hidden && expanded(target) && search.value==='','the target stays open after the pending input settles');
   }
-  const missing=doc.querySelector('[data-missing-item]');
+  const pageNotice=doc.querySelector('[data-missing-item]');
+  const sourceNotice=()=>win.recordDetails(source).closest('dialog[open]')?.querySelector('[data-record-link-notice]');
+  const missing=()=>sourceNotice() ?? pageNotice;
+  const keptSource=()=>expanded(source) && win.recordDetails(source).contains(sourceForm) &&
+   sourceForm.elements.words.value==='Keep the source draft.';
   check(doc===frame.contentDocument,'the click stays inside the same console frame');
   check(consolePlace()===win.location.href,'the console recorded '+consolePlace()+' instead of '+win.location.href);
   if(number==='99' || number==='29'){
    const message=number==='29' ? 'Item #29 is closed' : 'Item #99 is not on the List';
-   check(!target && !missing.hidden && missing.textContent===message && inView(missing),'the item notice is in view');
+   const notice=missing();
+   check(!target && pageNotice.hidden && notice===sourceNotice() && !notice.hidden &&
+    notice.textContent===message && inView(notice),'The dialog shows the target notice.');
+   if(scenario==='closed') check(keptSource(),'A closed target keeps the source form and draft.');
   }else{
    const title=target.querySelector('.list-row');
    const fallback=['producer','open','pending-words','unread-words'].includes(scenario);
@@ -965,13 +978,13 @@ frame.addEventListener('load',async()=>{
   }
   if(scenario==='closed'){
    const missingPlace=win.location.href;
-   const valid=[...source.querySelectorAll('[data-record-jump]')].find(link=>link.textContent==='#2');
+   const valid=[...win.recordDetails(source).querySelectorAll('[data-record-jump]')].find(link=>link.textContent==='#2');
    valid.click();
-   check(expanded(row(2)) && !expanded(source) && missing.hidden,'A valid link opens its row and clears the notice.');
+   check(expanded(row(2)) && !expanded(source) && missing().hidden,'A valid link opens its row and clears the notice.');
    const backToMissing=changed(win);
    history.back();await backToMissing;await frames(win);
-   check(win.location.href===missingPlace && expanded(source) && !expanded(row(2)) &&
-    !missing.hidden && missing.textContent==='Item #29 is closed',
+   check(win.location.href===missingPlace && keptSource() && !expanded(row(2)) &&
+    !missing().hidden && missing().textContent==='Item #29 is closed',
     'Back restores the open source and the notice for the closed item.');
   }
   if(!proof){
@@ -994,9 +1007,18 @@ frame.addEventListener('load',async()=>{
   if(scenario==='closed'){
    const navigated=changed(win);
    win.location.hash=link.hash;
-   await navigated;
-   check(!source.hidden && expanded(source) && !missing.hidden && missing.textContent==='Item #29 is closed',
+   await navigated;await frames(win);
+   const targetKey=new URLSearchParams(link.hash.slice(1)).get('item');
+   const hasNotice=()=>sourceNotice()?.textContent==='Item #29 is closed' && !sourceNotice()?.hidden;
+   const records=()=>win.history.state?.recordTable;
+   check(keptSource() && hasNotice() && records()?.opened[0]===source.dataset.key && records()?.linkedItem===targetKey,
     'A direct link to a closed item shows the notice and keeps the source open.');
+   const back=changed(win);history.back();await back;await frames(win);
+   check(keptSource() && missing().hidden && records()?.opened[0]===source.dataset.key,
+    'Back clears the notice and keeps the source draft.');
+   const forward=changed(win);history.forward();await forward;await frames(win);
+   check(keptSource() && hasNotice() && records()?.linkedItem===targetKey,
+    'Forward restores the source draft and the notice for the closed item.');
   }
   if(scenario==='missing'){
    const missingKey=new URLSearchParams(link.hash.slice(1)).get('item');
@@ -1016,10 +1038,10 @@ frame.addEventListener('load',async()=>{
    ];
    for(const [label,select] of changes){
     const restored=changed(win);win.location.hash=String(saved);await restored;
-    check(!missing.hidden && doc.querySelector('[data-missing-keys]').hidden,'the restored missing item shows one notice');
+    check(!missing().hidden && doc.querySelector('[data-missing-keys]').hidden,'the restored missing item shows one notice');
     await select();
     const after=new URLSearchParams(win.location.hash.slice(1));
-    check(missing.hidden && !doc.querySelector('[data-missing-keys]').textContent,label+' clears the missing item notice');
+    check(missing().hidden && !doc.querySelector('[data-missing-keys]').textContent,label+' clears the missing item notice');
     check(after.get('item')!==missingKey && after.getAll('key').join()===source.dataset.key,label+' omits the missing item from the address');
    }
   }
@@ -1353,7 +1375,7 @@ frame.addEventListener('load',async()=>{
         self.assertIn("State</dt><dd>Done</dd>", log)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_list_log_fits_the_left_column_and_keeps_each_scroll_position(self) -> None:
+    def test_browser_list_dialog_log_keeps_each_scroll_position(self) -> None:
         for number in (1, 2):
             item = self.add(f"Log for item {number}", number=number)
             for update in range(18):
@@ -1369,17 +1391,13 @@ window.fetch=async()=>{reads++;return {ok:true,text:async()=>freshList};};
         probe = r'''<script>
 (async()=>{
 const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
-const panel=number=>document.querySelector('[data-number="'+number+'"] .list-panel');
+const panel=number=>recordDetails(document.querySelector('[data-number="'+number+'"]')).querySelector('.list-panel');
 const open=number=>document.querySelector('[data-number="'+number+'"] .list-toggle').click();
 const scrollArea=right=>right.querySelector('.list-log-scroll') ?? right.querySelector('.list-log');
-const height=node=>node.getBoundingClientRect().height;
 try{
  open(1);
  const [left,right]=panel(1).children,log=scrollArea(right),heading=right.querySelector('h3');
- right.style.display='none';
- const naturalHeight=height(left);
- right.style.display='';
- check(height(right)===naturalHeight && height(left)===naturalHeight,'The left column sets the height of a long log.');
+ check(right.getBoundingClientRect().top>=left.getBoundingClientRect().bottom,'The dialog shows the log below the detail.');
  const headingTop=heading.getBoundingClientRect().top;
  log.scrollTop=90;
  check(log.scrollTop===90 && log.scrollHeight>log.clientHeight &&
@@ -1422,7 +1440,13 @@ document.body.append(result);
  const before=firstVisible(log(1));
  check(before.offset<0 && log(1).scrollTop>0,'The first item starts partway through an entry.');
  evidence(1,0).querySelector('summary').focus({preventScroll:true});
+ const displayedLog=log(1);
  await refresh();
+ const updates=document.querySelector('[data-show-record-updates]');
+ check(displayedLog===log(1) && !updates.hidden,'The nested log stays in place while an update is available.');
+ updates.click();
+ check(displayedLog!==log(1) && log(1).textContent.includes('New result for item 1.'),
+  'Show updates adds the new log entry.');
  check(evidence(1,0).open && !evidence(1,1).open && !evidence(2,0).open,
   'Evidence stays open only for the same item and log entry.');
  check(document.activeElement===evidence(1,0).querySelector('summary'),
@@ -1448,7 +1472,7 @@ document.body.append(result);
  await refresh();
  check(row(1).hidden,'The row stays hidden after both refreshes.');
  show('working');
- check(!row(1).hidden && !row(1).querySelector('[data-detail]').hidden,'The filter reveals the expanded row.');
+ check(!row(1).hidden && recordIsOpen(row(1)),'The filter reveals the expanded row.');
  const after=firstVisible(log(1));
  check(after.text===before.text && Math.abs(after.offset-before.offset)<=1,
   'The revealed log restores its entry and offset after two hidden refreshes.');
@@ -1475,7 +1499,7 @@ window.fetch=async()=>({ok:true,text:async()=>freshList});
 const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
 const row=number=>document.querySelector('[data-number="'+number+'"]');
 const open=number=>row(number).querySelector('.list-toggle').click();
-const log=number=>row(number).querySelector('.list-log-scroll');
+const log=number=>recordDetails(row(number)).querySelector('.list-log-scroll');
 function firstVisible(log){
  const top=log.getBoundingClientRect().top;
  const entry=[...log.querySelector('.list-log').children].find(entry=>entry.getBoundingClientRect().bottom>top);
@@ -1602,7 +1626,7 @@ document.body.append(result);
             self.assertIn(text, body)
         self.assertNotIn('<h3>Evidence</h3>', body)
         self.assertEqual(the_list.load(MORTY.id, items[0].id).evidence, items[0].evidence)
-        self.assertEqual(body.count('<form method="post" data-feedback-form>'), 5)
+        self.assertEqual(body.count('<form method="post" data-feedback-form'), 5)
         self.assertEqual(body.count('value="read">Mark read</button>'), 5)
         self.assertEqual([entry.item.number for entry in list_page.records()],
                          [item.number for item in sorted(the_list.records(MORTY.id), key=the_list.order)])
@@ -1871,9 +1895,9 @@ const failures=[];
 const row=document.querySelector('[data-number="1"]');
 document.getElementById('filter-show-parked').click();
 row.querySelector('.list-toggle').click();
-const unpark=row.querySelector('[value="unpark"]');
+const unpark=recordDetails(row).querySelector('[value="unpark"]');
 if(row.hidden || !unpark?.getClientRects().length) failures.push('The waiting row shows Unpark in Parked');
-if(!row.querySelector('[data-list-review-card]')) failures.push('The waiting row shows its change link');
+if(!recordDetails(row).querySelector('[data-list-review-card]')) failures.push('The waiting row shows its change link');
 const result=document.createElement('p');result.id='probe-results';
 result.textContent=JSON.stringify(failures);document.body.append(result);
 </script>""", reduced_motion=True)
@@ -1883,7 +1907,7 @@ const row=document.querySelector('[data-number="1"]');
 document.getElementById('filter-show-needs-me').click();
 if(row.hidden || !row.querySelector('.list-dot')) failures.push('Needs me shows the unread delivery');
 row.querySelector('.list-toggle').click();
-if(!row.querySelector('[value="read"]') || !row.querySelector('[data-list-review-card]'))
+if(!recordDetails(row).querySelector('[value="read"]') || !recordDetails(row).querySelector('[data-list-review-card]'))
  failures.push('The waiting row shows Mark read and its change link');
 document.getElementById('filter-show-morty-answering').click();
 if(!row.hidden) failures.push('Morty answering excludes the unread delivery');
@@ -2103,7 +2127,7 @@ for(const onlyUnread of [false,true]){
 }
 const row=number=>document.querySelector('[data-number="'+number+'"]');
 const expand=number=>row(number).querySelector('.list-toggle').click();
-const detail=number=>row(number).querySelector('[data-detail]:not([hidden])');
+const detail=number=>(recordIsOpen(row(number)) ? recordDetails(row(number)) : null);
 unread.click();
 chips[2].click();
 expand(17);
@@ -2169,29 +2193,42 @@ document.body.append(result);
                 self.assertIn("Show this row first", markup)
                 self.assertEqual("Checking linked reviews…" in markup, bool(expected))
                 setup = """<script>
-let countRequests=[];
+let countRequests=[],sendCounts;
 window.fetch=async (url,options)=>{
  countRequests.push([url,options.cache]);
- return {ok:true,text:async()=>MARKUP};
+ return new Promise(resolve=>{sendCounts=()=>resolve({ok:true,text:async()=>MARKUP});});
 };
 </script>""".replace("MARKUP", json.dumps(response))
                 probe = """
 <script>
 (async()=>{
  const footer=document.querySelector('[data-list-counts-url]');
+ const failures=[];
+ const open=EXPECTED==='1 change for you';
+ const row=document.querySelector('[data-list-item]');
+ if(open) row.querySelector('.list-toggle').click();
+ const detail=recordDetails(row);
+ const words=detail.querySelector('textarea');
+ if(open){words.value='Keep these words.';words.dispatchEvent(new Event('input'));}
+ sendCounts();
  if(!footer.firstChild) await new Promise(resolve=>{
   const observer=new MutationObserver(()=>{observer.disconnect();resolve();});
   observer.observe(footer,{childList:true});
  });
- const failures=[];
  if(countRequests.length!==1 || countRequests[0].join()!==REQUEST)
   failures.push('The footer uses one independent request.');
  if(!document.querySelector('[data-list-item]') || footer.querySelector('a')?.textContent!=='2 changes')
   failures.push('The counts appear without replacing the List rows.');
  if(EXPECTED && document.querySelector('[data-list-review-summary]')?.textContent!==EXPECTED)
   failures.push('The same request settles the linked review status.');
- if(EXPECTED==='1 change for you' && document.querySelector('[data-list-review-links] a')?.textContent!=='sdlc/C1')
-  failures.push('The same request fills the linked review fields.');
+ if(open){
+  const updates=document.querySelector('[data-show-record-updates]');
+  if(updates.hidden || detail.querySelector('[data-list-review-links] a') || detail.querySelector('textarea')!==words)
+   failures.push('The linked details wait for Show updates and keep the displayed form.');
+  updates.click();
+  if(detail.querySelector('[data-list-review-links] a')?.textContent!=='sdlc/C1' || words.value!=='Keep these words.')
+   failures.push('Show updates fills the linked details and keeps the draft.');
+ }
  const result=document.createElement('p');
  result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
@@ -2627,7 +2664,7 @@ window.fetch=async(_path,options={})=>{
   const field=document.getElementById('list-search');
   field.addEventListener('filterchange',done,{once:true});field.value=query;field.dispatchEvent(new Event('input'));
  });
- const submit=(number,action)=>{const form=row(number).querySelector('form');form.requestSubmit(form.querySelector('[value="'+action+'"]'));return form;};
+ const submit=(number,action)=>{const form=recordDetails(row(number)).querySelector('form');form.requestSubmit(form.querySelector('[value="'+action+'"]'));return form;};
  try{
   for(const [query,expected] of [['105','105'],['L105','105'],['#105','105'],['BUILDS','105'],
     ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed','']]){
@@ -2637,7 +2674,7 @@ window.fetch=async(_path,options={})=>{
   const removed=submit('106','remove');
   check(row('106').hidden,'Remove hides the row before the response');
   check(row('106').dataset.unread==='false' && !row('106').querySelector('.list-dot') &&
-   !removed.querySelector('[value="read"]'),'Remove clears the unread controls before the response');
+   !recordDetails(removed).querySelector('[value="read"]'),'Remove clears the unread controls before the response');
   check([...row('106').querySelectorAll('button')].every(button=>button.disabled),'Remove disables the row buttons');
   submit('106','remove');check(requests.length===1,'a second Remove press sends nothing');
   finishPost({item_state:'Closed',parked:'false'});await flush();await flush();
@@ -2649,12 +2686,12 @@ window.fetch=async(_path,options={})=>{
   finishPost({ok:false,reason:'The fixture refuses this close.'});await flush();await flush();
   check(!row('105').hidden && row('105').dataset.state==='Working','a refused Remove restores the row');
   check(row('105').dataset.unread==='true' && row('105').querySelector('.list-dot') &&
-   refused.querySelector('[value="read"]'),'a refused Remove restores the unread controls');
-  check(refused.querySelector('[data-send-status]').textContent==='Not saved: The fixture refuses this close.','a refused Remove shows its reason');
+   recordDetails(refused).querySelector('[value="read"]'),'a refused Remove restores the unread controls');
+  check(recordDetails(refused).querySelector('[data-send-status]').textContent==='Not saved: The fixture refuses this close.','a refused Remove shows its reason');
   const restore=document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}) ?? [];
   for(const animation of restore) animation.finish();
   await Promise.allSettled(restore.map(animation=>animation.finished));
-  check(!refused.querySelector('[value="remove"]').disabled,'a refused Remove enables another attempt');
+  check(!recordDetails(refused).querySelector('[value="remove"]').disabled,'a refused Remove enables another attempt');
   refused.elements.until.value='2026-12-03';const parked=submit('105','park');
   check(row('105').hidden,'Park hides the row before the response');
   check(document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}).length,
@@ -2663,9 +2700,9 @@ window.fetch=async(_path,options={})=>{
   finishPost({item_state:'Working',parked:'true'});await flush();await flush();
   check(row('105').hidden,'Park stays outside Working after success');
   await choose('parked','105');check(visible()==='105','Park updates the Parked view');
-  check(parked.querySelector('[data-send-status]').textContent==='Parked','Park shows its result');
+  check(recordDetails(parked).querySelector('[data-send-status]').textContent==='Parked','Park shows its result');
   await choose('all','58');row('58').querySelector('.list-toggle').click();
-  const form=row('58').querySelector('form');
+  const form=recordDetails(row('58')).querySelector('form');
   check(row('58').dataset.unread==='false' && !form.querySelector('[value="read"]'),'the unread sync case starts read');
   form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
   submit('58','tell');finishPost({item_state:'Waiting for nate',parked:'false',unread:'true'});await flush();await flush();
@@ -2731,14 +2768,17 @@ window.fetch=async(_path,options={})=>{
   'All keeps the server order until a refresh.');
  check(document.querySelector('#filter-show-all b').textContent==='2' &&
   document.querySelector('#filter-show-parked b').textContent==='1','All and Parked count the parked item.');
- check(form.querySelector('[data-send-status]').textContent==='Parked until delivered',
-  'All confirms the parking action in the row.');
+ const dialog=document.getElementById('record-item-dialog');
+ const status=document.querySelector('[data-hidden-action-status]');
+ check(!dialog.open && status.hidden && !form.querySelector('[data-send-status]').textContent &&
+  dialog.querySelector('[data-record-missing]').hidden,'Park closes the dialog without a status message.');
  show('working');
  check(row.hidden,'Working hides the item until delivery');
  show('parked');
  check(!row.hidden && !form.querySelector('[value="unpark"]').hidden,'Parked shows the item and Unpark');
  check(form.querySelector('[data-parked-detail]').textContent==='Parked until delivered','The panel shows the condition');
  check(row.querySelector('[data-parked-note]').textContent==='Parked until delivered','The state cell has the condition');
+ row.querySelector('.list-toggle').click();
  submit('unpark');
  finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
  await flush();
@@ -2901,7 +2941,7 @@ window.fetch=async(_path,options={})=>{
         probe = '''<script>
 (async()=>{
  const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
- const row=document.querySelector('[data-list-item]'),form=row.querySelector('form');
+ const row=document.querySelector('[data-list-item]'),form=recordDetails(row).querySelector('form');
  const submit=action=>{
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
   return requests.at(-1).get('request');
@@ -2947,7 +2987,7 @@ window.fetch=async(_path,options={})=>{
  for(const item of [row,other]){
   show(item===row ? 'parked' : 'all');
   if(item===other) other.querySelector('.list-toggle').click();
-  const pick=selector=>item.querySelector(selector);
+  const pick=selector=>recordDetails(item).querySelector(selector);
   const box=rectangle(pick('textarea'));
   const remove=rectangle(pick('[value=remove]')),park=rectangle(pick('[data-later-toggle]'));
   check(pick('textarea').rows===4 && remove.bottom<box.top,'four lines below the controls');
@@ -2956,7 +2996,8 @@ window.fetch=async(_path,options={})=>{
   check(pick('[data-parked-detail]').hidden===(item===other),'parking line only shows on the parked item');
   if(item===row){
    check(near(park.left-rectangle(pick('[value=unpark]')).right,8),'parking controls are adjacent');
-   check(getComputedStyle(pick('[data-parked-note]')).display==='none','the expanded row shows one parking line');
+   check(recordDetails(item).querySelectorAll('[data-parked-detail]:not([hidden])').length===1,
+    'The dialog shows one parking line.');
    pick('[data-later-toggle]').click();
    check(near(rectangle(pick('[data-later-menu]')).right,box.right),'picker aligns with the text box');
    pick('[data-later-toggle]').click();
@@ -2964,7 +3005,7 @@ window.fetch=async(_path,options={})=>{
  }
  const unpark=form.querySelector('[value=unpark]');
  show('parked');
- row.querySelector('.list-toggle').click();
+ if(!recordIsOpen(row)) row.querySelector('.list-toggle').click();
  check(!row.querySelector('[data-list-check]'),'The parked row omits the future check.');
  unpark.focus();
  const first=submit('unpark');
@@ -2989,24 +3030,35 @@ window.fetch=async(_path,options={})=>{
  check(!nextCheck.getClientRects().length,'The row hides the check while Park is pending.');
  finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST',check_html:''});await flush();
  show('parked');
- check(!row.querySelector('[data-list-check]'),'The Park response removes the check before a refresh.');
+ check(!recordIsOpen(row) && !row.querySelector('[data-list-check]'),
+  'The Park response closes the dialog and removes the check before a refresh.');
  document.querySelector('[data-sort="3"]').click();
+ row.querySelector('.list-toggle').click();
  unpark.focus();
  submit('unpark');
  show('all');
  finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});await flush();
- check(!row.hidden && !row.querySelector('[data-detail]').hidden,'Unpark in All keeps the row open');
+ check(!row.hidden && recordIsOpen(row),'Unpark in All keeps the row open');
  check(document.querySelector('[data-list-item]')===row,'Unpark preserves the item order by title');
- check(document.activeElement===row.querySelector('.list-toggle'),'focus moves to the item number');
+ check(document.activeElement===document.querySelector('#record-item-dialog [data-close]'),'Focus stays in the item dialog.');
  check(unpark.hidden && form.querySelector('[data-parked-detail]').hidden,'the parking controls update');
  check(form.elements.until.value==='' && form.elements.words.value==='Keep these words.',
        'Unpark clears the parking draft and keeps the words');
  show('working');
- check(!row.hidden && !row.querySelector('[data-detail]').hidden,'Working shows the expanded unparked row');
+ check(!row.hidden && recordIsOpen(row),'Working shows the expanded unparked row');
 """.replace("SAVED_UNPARK", saved), reduced_motion=True, add_item=False, window_size=(1440, 1120), markup=markup)
         self.browser_waiting_parking_refresh(unpark=True)
 
-    def browser_waiting_parking_refresh(self, *, unpark: bool) -> None:
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_park_closes_the_active_waiting_dialog_and_keeps_unsent_words(self) -> None:
+        self.browser_waiting_parking_refresh(unpark=False, active_park=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_park_readback_closes_the_active_waiting_dialog_and_keeps_unsent_words(self) -> None:
+        self.browser_waiting_parking_refresh(unpark=False, active_park=True, lost=True)
+
+    def browser_waiting_parking_refresh(self, *, unpark: bool, active_park: bool = False,
+                                        lost: bool = False) -> None:
         item = self.add("Keep a draft while waiting", the_list.ItemState.WAITING_FOR_NATE, number=3)
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
@@ -3030,7 +3082,39 @@ window.fetch=async(_path,options={})=>{
         answered = list_page.render(root, include_counts=False, status=status).decode()
         fixture = json.dumps({
             "waiting": waiting, "action": action, "response": response, "saved": saved, "answered": answered,
+            "lost": lost,
         }).replace("</", "<\\/")
+        if active_park:
+            self.browser_action_sequence(r"""
+ const fixture=FIXTURE,dialog=document.getElementById('record-item-dialog');
+ const item=()=>document.querySelector('[data-number="3"]');
+ const refresh=async markup=>{
+  refreshMarkup=markup;
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await flush();
+ };
+ form.elements.words.value='Keep these unsent words.';
+ form.elements.words.dispatchEvent(new Event('input'));
+ refreshMarkup=fixture.saved;
+ submit('park-until-delivered');
+ check(dialog.open && recordIsOpen(item()),'The item stays active while Park waits for its result.');
+ check(!requests[0].get('words'),'Park does not send the draft.');
+ if(fixture.lost){readback=()=>({...fixture.response,park_request_saved:true});losePost();}
+ else finishPost(fixture.response);
+ await flush();
+ check(!dialog.open && !recordIsOpen(item()),'Park closes the active dialog when the saved item is waiting.');
+ show('parked');
+ check(!item().hidden && item().dataset.waitingForAnswer==='true','The waiting item appears in Parked.');
+ item().querySelector('.list-toggle').click();
+ check(dialog.open && recordDetails(item()).querySelector('[data-waiting-actions]'),
+  'Reopening the item shows the waiting form.');
+ dialog.querySelector('[data-close]').click();
+ await refresh(fixture.answered);
+ show('all');item().querySelector('.list-toggle').click();
+ check(dialog.open && recordDetails(item()).querySelector('textarea[name="words"]').value==='Keep these unsent words.',
+  'The dialog retains the unsent text through Park, waiting, closure and the answer.');
+""".replace("FIXTURE", fixture), reduced_motion=True, add_item=False, markup=before, open_number=3)
+            return
         self.browser_action_sequence(r"""
  const fixture=FIXTURE;
  const parks=fixture.action==='park';
@@ -3043,12 +3127,15 @@ window.fetch=async(_path,options={})=>{
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
   await flush();
  };
- const input=current().querySelector('textarea');
+ const input=recordDetails(current()).querySelector('textarea');
  input.value='Keep the words for this item.';
  input.dispatchEvent(new Event('input'));
- if(fixture.waiting) await refresh(fixture.waiting);
+ if(fixture.waiting){
+  await refresh(fixture.waiting);
+  document.querySelector('[data-show-record-updates]').click();
+ }
  const prior=current(),beforeOrder=numbers(),otherRow=other();
- const draft=otherRow.querySelector('textarea');
+ const draft=recordDetails(otherRow).querySelector('textarea');
  const editOther=()=>{
   otherRow.querySelector('.list-toggle').click();
   draft.value='Keep the words for the other item.';
@@ -3061,30 +3148,36 @@ window.fetch=async(_path,options={})=>{
   methods.push(args[1]?.method || 'GET');return Reflect.apply(fetch,receiver,args);
  }});
  refreshMarkup=fixture.saved;
- submit(parks ? 'park-until-delivered' : 'unpark',prior.querySelector('form'));
+ submit(parks ? 'park-until-delivered' : 'unpark',recordDetails(prior).querySelector('form'));
  if(parks) editOther();
- else prior.querySelector('.list-log-scroll').focus();
+ else recordDetails(prior).querySelector('.list-log-scroll').focus();
  finishPost(fixture.response);
  await flush();
  check(methods.join()==='POST,GET','The save makes one List GET while the item waits.');
- const refreshed=current(),freshDraft=other().querySelector('textarea');
+ const refreshed=current(),freshDraft=recordDetails(other()).querySelector('textarea');
  check(refreshed!==prior && beforeOrder===(parks ? '3,2' : '2,3') &&
   numbers()===(parks ? '2,3' : '3,2'),'The server moves the waiting row to its new group.');
- check(freshDraft.value==='Keep the words for the other item.','Refresh keeps the other draft.');
  if(parks){
-  check(refreshed.querySelector('[data-detail]').hidden,'Refresh keeps the row closed after the user opens another row.');
+  check(freshDraft.value==='Keep the words for the other item.','Refresh keeps the other draft.');
+  check(!recordIsOpen(refreshed),'Refresh keeps the row closed after the user opens another row.');
   check(document.activeElement===freshDraft && freshDraft.selectionStart===5 &&
    freshDraft.selectionEnd===14 && freshDraft.selectionDirection==='backward',
    'Park keeps focus and the selection in the other draft.');
   refreshed.querySelector('.list-toggle').click();
- }else check(document.activeElement===refreshed.querySelector('.list-log-scroll'),
+ }else check(document.activeElement===recordDetails(refreshed).querySelector('.list-log-scroll'),
   'Unpark keeps focus on the log in the waiting row.');
- check(!refreshed.querySelector('[data-detail]').hidden &&
-  refreshed.querySelector('[data-waiting-questions]').textContent.includes('Which check passed?'),
+ check(recordIsOpen(refreshed) &&
+  recordDetails(refreshed).querySelector('[data-waiting-questions]').textContent.includes('Which check passed?'),
   'The open row shows the waiting question.');
  await refresh(fixture.answered);
- check(current().querySelector('textarea').value==='Keep the words for this item.',
+ document.querySelector('[data-show-record-updates]').click();
+ check(recordDetails(current()).querySelector('textarea').value==='Keep the words for this item.',
   'The item draft returns after the producer answers.');
+ if(!parks){
+  other().querySelector('.list-toggle').click();
+  check(recordDetails(other()).querySelector('textarea').value==='Keep the words for the other item.',
+   'The other draft returns when its item reopens.');
+ }
 """.replace("FIXTURE", fixture), reduced_motion=True, add_item=False, markup=before, open_number=3)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -3158,7 +3251,7 @@ window.fetch=async(_path,options={})=>{
  submit('unpark');
  const finishFirst=finishPost;
  second.querySelector('.list-toggle').click();
- submit('unpark',second.querySelector('form'));
+ submit('unpark',recordDetails(second).querySelector('form'));
  const result={item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'};
  const status=document.querySelector('[data-hidden-action-status]');
  finishFirst(result);await flush();
@@ -3169,8 +3262,8 @@ window.fetch=async(_path,options={})=>{
        'Both results stay visible after both rows leave Parked.');
  show('all');
  check(!status.hidden && status.textContent==='Item #1 unparked.' &&
-       !second.hidden && !second.querySelector('[data-detail]').hidden &&
-       second.querySelector('[data-send-status]').textContent==='Unparked',
+       !second.hidden && recordIsOpen(second) &&
+       recordDetails(second).querySelector('[data-send-status]').textContent==='Unparked',
        'All shows the first result above the table and the second result in the visible details.');
  show('parked');
  check(!status.hidden && status.textContent==='Item #1 unparked. Item #2 unparked.',
@@ -3246,6 +3339,112 @@ window.fetch=async(_path,options={})=>{
 ''', add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_list_dialog_keeps_its_body_and_scroll_across_refreshes(self) -> None:
+        root = self.root / 'reviews'
+        for number in range(7, 28):
+            _ = self.add(f'List item {number}', number=number)
+
+        def page() -> str:
+            return list_page.render(root, include_counts=False).decode().replace(
+                'data-feedback-form>', 'data-feedback-form style="min-height:1100px">')
+
+        initial = page()
+        for number in range(1, 6):
+            _ = self.add(f'New List item {number}', number=number)
+        _ = the_list.update(MORTY.id, 'L15', {
+            'latest_status': 'The fresh List result.\n\nThe build report has another paragraph.',
+        }, source='morty')
+        fresh = page()
+        for number in (*range(1, 6), *range(7, 15), *range(16, 28)):
+            _ = the_list.close(MORTY.id, f'L{number}', 'The work has finished.', source='nate')
+        shorter = page()
+        _ = the_list.close(MORTY.id, 'L15', 'The work has finished.', source='nate')
+        removed = page()
+        steps = r'''
+ const findRow=()=>document.querySelector('[data-number="15"]');
+ const toggle=()=>findRow().querySelector('.list-toggle');
+ const dialog=document.querySelector('#record-item-dialog'),body=dialog.querySelector('.console-dialog-body');
+ const detail=dialog.querySelector('[data-record-dialog-detail]');
+ const refreshList=async markup=>{
+  refreshMarkup=markup;
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await flush();
+ };
+ check(dialog.open && toggle().getAttribute('aria-expanded')==='true' && findRow().querySelector('[data-detail]').hidden &&
+  detail.contains(form),'The List row opens its form in the dialog.');
+ dialog.querySelector('[data-close]').click();
+ check(!dialog.open && document.activeElement===toggle(),'Close returns focus to the List item.');
+ toggle().click();
+ dialog.dispatchEvent(new Event('cancel',{cancelable:true}));
+ check(!dialog.open && document.activeElement===toggle(),'Esc returns focus to the List item.');
+ document.querySelector('[data-sort="0"]').click();
+ show('working');
+ window.scrollTo({top:180,behavior:'instant'});
+ const pageTop=scrollY;
+ toggle().click();
+ check(dialog.open && new URLSearchParams(location.hash.slice(1)).get('item')===findRow().dataset.key,
+  'The address identifies the open item.');
+ dialog.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
+ dialog.dispatchEvent(new MouseEvent('click',{bubbles:true}));
+ const place=new URLSearchParams(location.hash.slice(1));
+ check(!dialog.open && !place.has('item') && place.get('show')==='working' && place.get('sort')==='#' &&
+  scrollY===pageTop,'Clicking outside retains the table filters, sort and scroll.');
+ toggle().click();
+ const second=document.querySelector('[data-number="16"]');
+ const follow=async key=>{
+  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=new URLSearchParams({...Object.fromEntries(place),item:key}).toString();
+  await changed;
+ };
+ await follow(second.dataset.key);
+ check(dialog.open && recordIsOpen(second) && !recordIsOpen(findRow()) &&
+  detail.querySelectorAll('form').length===1 && dialog.querySelector('h2').textContent==='#16 List item 16',
+  'The address switches the dialog to just the linked item.');
+ await follow(findRow().dataset.key);
+ check(dialog.open && detail.contains(form) && !recordIsOpen(second),'The first link restores its item.');
+ for(const label of ['State','Latest status','Next step','Done when','ETA','Log · newest first']){
+  check([...detail.querySelectorAll('h3')].some(heading=>heading.textContent.startsWith(label)),
+   'The item dialog shows '+label+'.');
+ }
+ form.elements.words.value='Keep these words.';
+ form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
+ const formTop=()=>detail.querySelector('form').getBoundingClientRect().top-body.getBoundingClientRect().top;
+ body.scrollTop=formTop()+90;
+ const offset=formTop(),height=()=>document.scrollingElement.scrollHeight;
+ const before=height();
+ await refreshList(FRESH_PAGE);
+ const updates=dialog.querySelector('[data-show-record-updates]');
+ check(height()>before && document.querySelector('[data-number="1"]') &&
+  dialog.open && Math.abs(formTop()-offset)<1 && detail.querySelector('textarea').value==='Keep these words.' &&
+  !detail.textContent.includes('The fresh List result.') && !updates.hidden,
+  'A longer status and more rows keep the displayed form and draft in place.');
+ const taller=height();
+ await refreshList(SHORTER_PAGE);
+ check(height()<taller && dialog.open && Math.abs(formTop()-offset)<1 &&
+  detail.querySelector('textarea').value==='Keep these words.',
+  'Shortening The List preserves the dialog and its scroll.');
+ form.requestSubmit(form.querySelector('[value="tell"]'));
+ check(!requests.length,'The old List form cannot submit after the record changes.');
+ updates.click();
+ check(updates.hidden && detail.textContent.includes('The fresh List result.') &&
+  detail.querySelector('textarea').value==='Keep these words.',
+  'Show updates applies the current List body and retains the draft.');
+ const previous=detail.firstElementChild;
+ await refreshList(REMOVED_PAGE);
+ check(dialog.open && !findRow() && detail.firstElementChild===previous &&
+  detail.querySelector('textarea').value==='Keep these words.',
+  'A removed List item keeps its last detail in the dialog.');
+ const status=dialog.querySelector('[data-record-missing]');
+ check(!status.hidden && status.textContent==='This item is no longer in the list.' &&
+  [...detail.querySelectorAll('form button')].every(button=>button.disabled),
+  'The removed item shows one status and disables its actions.');
+'''
+        for key, value in (('FRESH_PAGE', fresh), ('SHORTER_PAGE', shorter), ('REMOVED_PAGE', removed)):
+            steps = steps.replace(key, json.dumps(value).replace('</', '<\\/'))
+        self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial,
+                                     open_number=15, window_size=(1280, 720))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_preserves_unpark_focus_during_periodic_refresh(self) -> None:
         item = self.add("Parked item", number=1)
         _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
@@ -3261,16 +3460,17 @@ window.fetch=async()=>new Response(FRESH);
 const original=document.querySelector('[data-list]');
 original.querySelector('#filter-show-parked').click();
 original.querySelector('.list-toggle').click();
-const button=original.querySelector('[value=unpark]');
+const button=document.querySelector('#record-item-dialog[open] [value=unpark]');
 button.focus();
 const focusedBefore=document.activeElement===button;
 const observer=new MutationObserver(()=>{
  if(original.isConnected) return;
  observer.disconnect();
- const fresh=document.querySelector('[data-list]');
- const unpark=fresh.querySelector('[value=unpark]');
+ const unpark=document.querySelector('#record-item-dialog[open] [value=unpark]');
  const failures=[];
- if(!fresh.textContent.includes('The refreshed status.')) failures.push('The page renders the refreshed status.');
+ if(unpark?.closest('dialog').textContent.includes('The refreshed status.') ||
+  document.querySelector('[data-show-record-updates]').hidden)
+  failures.push('The dialog retains the status and offers the update.');
  if(!focusedBefore || document.activeElement!==unpark || !button.id || unpark.id!==button.id)
   failures.push('The refresh restores focus to Unpark with the same ID.');
  const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
@@ -3337,7 +3537,7 @@ observer.observe(original.parentNode,{childList:true});
  check(!row.hidden && row.dataset.unread==='true' && row.querySelector('.list-dot'),
   'a lost Remove restores the row and unread mark');
  row.querySelector('.list-row').click();
- check(row.querySelector('[data-detail]').hidden,'the user can close the details after a lost response');
+ check(!recordIsOpen(row),'the user can close the details after a lost response');
  const hiddenStatus=document.querySelector('[data-hidden-action-status]');
  check(!hiddenStatus.hidden && hiddenStatus.textContent==='Item 1: Save not confirmed: Fixture lost response',
   'the table shows the lost response while the details are closed');
@@ -3379,8 +3579,8 @@ observer.observe(original.parentNode,{childList:true});
  show('all');
  const second=document.querySelector('[data-number="2"]');
  for(const item of [row,second]){
-  if(item.querySelector('[data-detail]').hidden) item.querySelector('.list-toggle').click();
-  submit('remove',item.querySelector('form'));
+  if(!recordIsOpen(item)) item.querySelector('.list-toggle').click();
+  submit('remove',recordDetails(item).querySelector('form'));
   losePost();await flush();
   item.querySelector('.list-row').click();
  }
@@ -4114,9 +4314,9 @@ observer.observe(original.parentNode,{childList:true});
  }
  location.hash=new URLSearchParams({show:'working',item:row.dataset.key}).toString();
  await flush();
- check(!row.hidden && row.closest('[data-linked-item]:not([hidden])') && !row.querySelector('[data-detail]').hidden &&
-  row.querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
-  !row.querySelector('[value="question"]'),'A direct link opens only the waiting row without Ask');
+ check(!row.hidden && row.closest('[data-linked-item]:not([hidden])') && recordIsOpen(row) &&
+  recordDetails(row).querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
+  !recordDetails(row).querySelector('[value="question"]'),'A direct link opens only the waiting row without Ask');
  check(count.textContent.startsWith('1 of 2'),'The linked row counts in All and stays outside Working.');
  show('morty-answering');
  input.value='Only this row';input.dispatchEvent(new Event('input'));
@@ -4137,7 +4337,7 @@ observer.observe(original.parentNode,{childList:true});
   open_question:'true',unpark_outcome:'cleared_newer_parking_active'});
  await flush();
  check(!row.hidden && chip.dataset.filterCount==='1','The newer parking keeps the waiting item in Parked.');
- check(row.querySelector('[data-waiting-note]') && row.dataset.waitingForAnswer==='true',
+ check(recordDetails(row).querySelector('[data-waiting-note]') && row.dataset.waitingForAnswer==='true',
   'The parked row shows that the producer will answer.');
  check(row.querySelector('[data-parked-note]').textContent==='Parked until Nov 26 00:00 EST',
   'The parked row shows the newer time.');
@@ -4160,9 +4360,9 @@ observer.observe(original.parentNode,{childList:true});
   'Show keeps the Unpark confirmation for the waiting item.');
  location.hash=new URLSearchParams({show:'parked',item:row.dataset.key}).toString();
  await flush();
- check(!row.hidden && !row.querySelector('[data-detail]').hidden &&
-  row.querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
-  !row.querySelector('form'),'The direct link opens the item with only the waiting line.');
+ check(!row.hidden && recordIsOpen(row) &&
+  recordDetails(row).querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
+  !recordDetails(row).querySelector('form'),'The direct link opens the item with only the waiting line.');
  check(chip.dataset.filterCount==='0' && !status.hidden,
   'The direct link leaves the item out of the count and keeps the Unpark confirmation.');
  show('morty-answering');
@@ -4211,6 +4411,7 @@ observer.observe(original.parentNode,{childList:true});
   'Parked shows the saved parking time.');
  check(submit('park').id===park.id,'The exact Park retry uses the original request ID.');
  finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST'});await flush();
+ row.querySelector('.list-toggle').click();
  submit('remove');losePost();await flush();
  finishReadback({item_state:'Closed',unread:'false',parked:'true',parked_until:'Dec 3 00:00 EST'});
  await flush();
@@ -4246,7 +4447,7 @@ observer.observe(original.parentNode,{childList:true});
  location.hash=new URLSearchParams({show:'parked',unread:'1',item:row.dataset.key}).toString();
  await flush();
  const linked=document.querySelector('[data-linked-item]');
- const isLinked=()=>!linked.hidden && linked.contains(row) && !row.querySelector('[data-detail]').hidden;
+ const isLinked=()=>!linked.hidden && linked.contains(row) && recordIsOpen(row);
  check(isLinked(),'The read item starts linked under Parked with Unread only on.');
  const saved=PARK_RECEIPT;
  const action=PARK_ACTION;
@@ -4400,7 +4601,7 @@ observer.observe(original.parentNode,{childList:true});
  submit('remove');
  check(row.hidden && requests.length===1,'Remove starts the POST and hides the record in the same turn');
  const leaving=motion();
- check(leaving?.querySelector('[data-detail]:not([hidden])'),'the open details leave with the row');
+ check(leaving && !leaving.querySelector('[data-detail]:not([hidden])'),'Only the summary fades behind the dialog.');
  const exit=leaving?.getAnimations({subtree:true})[0];
  check(exit,'Remove starts the shared animation');
  if(!exit) throw new Error('No exit animation');
@@ -4495,7 +4696,7 @@ observer.observe(original.parentNode,{childList:true});
    await follow();
    check(!linked.hidden && linked.contains(row),'The read item opens through its link outside Unread only.');
   }
-  check(!row.hidden && !row.querySelector('[data-detail]').hidden,'The action starts with open details.');
+  check(!row.hidden && recordIsOpen(row),'The action starts with open details.');
   const section=row.closest('[data-linked-item]');
   const staysVisible=action==='park' && row.dataset.unread==='true';
   form.elements.until.value='2026-12-03';
@@ -4523,7 +4724,7 @@ observer.observe(original.parentNode,{childList:true});
    check(row.hidden,'The parked row is absent from '+view+'.');
   }
   show('parked');
-  const note=row.querySelector('[data-detail]').hidden ?
+  const note=!recordIsOpen(row) ?
    row.querySelector('[data-parked-note]') : form.querySelector('[data-parked-detail]');
   check(!row.hidden && note.textContent==='Parked until Dec 3 00:00 EST' && note.getClientRects().length>0,
    'Parked shows the row and its parking note.');
@@ -4593,11 +4794,11 @@ observer.observe(original.parentNode,{childList:true});
  row.querySelector('a[data-record-jump]').click();
  const place=new URLSearchParams(location.hash.slice(1));
  check(!target.hidden && target.closest('[data-linked-item]:not([hidden])') &&
-  !target.querySelector('[data-detail]').hidden,'The related link opens the waiting item outside the results.');
+  recordIsOpen(target),'The related link opens the waiting item outside the results.');
  check(place.get('show')==='working' && place.get('owner')===row.dataset.owner && search.value==='check',
   'The related link keeps Show, Owner and the search');
  staffChip('producer',row.dataset.producer).click();
- check(!target.hidden && !target.querySelector('[data-detail]').hidden &&
+ check(!target.hidden && recordIsOpen(target) &&
   target.closest('[data-linked-item]:not([hidden])'),'Clicking the selected Producer keeps the linked item open.');
  check(location.hash==='#'+place,'Clicking the selected Producer keeps the address.');
  const results=document.querySelector('table[aria-label="The List"]');
@@ -4621,7 +4822,7 @@ observer.observe(original.parentNode,{childList:true});
  await flush();
  check(unread.checked && results.querySelectorAll('[data-list-item]:not([hidden])').length===1 &&
   count.textContent.startsWith('1 of 2'),'Unread only keeps one row in the results.');
- check(!section.hidden && section.contains(target) && !target.hidden && !target.querySelector('[data-detail]').hidden,
+ check(!section.hidden && section.contains(target) && !target.hidden && recordIsOpen(target),
   'The direct link opens the read item outside the results.');
  onlyUnread(false);
  check(section.hidden && results.contains(target) && !target.hidden && count.textContent.startsWith('2 of 2'),
@@ -4666,7 +4867,7 @@ window.fetch=async(_url,options)=>{
   const row=()=>document.querySelector('[data-number="2"]');
   const section=()=>document.querySelector('[data-linked-item]');
   const chip=name=>document.getElementById('filter-show-'+name);
-  const expanded=item=>!item.querySelector('[data-detail]').hidden;
+  const expanded=item=>recordIsOpen(item);
   const linked=item=>!section().hidden && section().contains(item) && !item.hidden && expanded(item);
   const framePlace=()=>location.pathname+location.search+location.hash;
   const consolePlace=()=>new URL(parent.location.href).searchParams.get('at.list');
@@ -4710,7 +4911,7 @@ window.fetch=async(_url,options)=>{
   document.dispatchEvent(new Event('visibilitychange'));
   await replaced;
   const answered=row();
-  check(linked(answered) && answered.querySelector('[data-question="Q1"]').textContent.includes('The gate passed.'),
+  check(linked(answered) && recordDetails(answered).querySelector('[data-question="Q1"]').textContent.includes('The gate passed.'),
    'Refresh keeps the linked details open and shows the answer.');
   check(chip('working').getAttribute('aria-pressed')==='true' &&
    chip('needs-me').dataset.filterCount==='1' && chip('morty-answering').dataset.filterCount==='0' &&
@@ -4729,6 +4930,259 @@ window.fetch=async(_url,options)=>{
             with self.subTest(reload_console=reload_console):
                 self.browser_answer_visibility(before, setup, probe.replace("RELOAD_CONSOLE", json.dumps(reload_console)),
                                                reload_markup=answered, reload_console=reload_console)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_save_keeps_later_edits_and_ignores_a_response_after_reopen(self) -> None:
+        self.browser_action_sequence(r'''
+ const dialog=document.querySelector('#record-item-dialog');
+ const close=dialog.querySelector('[data-close]');
+ const open=()=>row.querySelector('.list-toggle').click();
+ const details=()=>recordDetails(row);
+ const edit=(field,value)=>{field.value=value;field.dispatchEvent(new Event('input'));};
+ const words=form.elements.words;
+ edit(words,'Check the logs.');submit('tell');
+ edit(words,'Check the logs again.');edit(words,'Check the logs.');
+ words.focus();words.setSelectionRange(2,5);
+ finishPost({item_state:'Working',unread:'false'});await flush();
+ check(words.value==='Check the logs.' && document.activeElement===words &&
+  words.selectionStart===2 && words.selectionEnd===5,
+  'A saved Tell keeps words edited during the save and keeps their selection.');
+ submit('tell');close.click();open();
+ const reopened=details().querySelector('[data-feedback-form]');
+ edit(reopened.elements.words,'Keep these later words.');
+ finishPost({item_state:'Closed',unread:'false'});await flush();
+ check(dialog.open && details().querySelector('[data-feedback-form]')===reopened &&
+  reopened.elements.words.value==='Keep these later words.',
+  'A response from before Close leaves the reopened item and its draft in place.');
+ submit('tell',reopened);
+ edit(reopened.elements.words,'Keep the words after Tell.');
+ failPostBody();await flush();
+ const error=dialog.querySelector('[data-record-error]');
+ check(!error.hidden && error.textContent==='Saved; the item could not refresh.' &&
+  reopened.elements.words.value==='Keep the words after Tell.',
+  'An unreadable successful response reports a display error and keeps the draft.');
+''', reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_shows_saved_actions_and_refreshes_until_delivery_ends(self) -> None:
+        steps = r'''
+ const dialog=document.querySelector('#record-item-dialog');
+ const pending=dialog.querySelector('[data-record-updates]');
+ const detail=()=>dialog.querySelector('[data-record-dialog-detail]');
+ const list=()=>document.querySelector('[data-list]');
+ const afterReplace=()=>new Promise(resolve=>{
+  const previous=list();
+  const observer=new MutationObserver(()=>{
+   if(!previous.isConnected){observer.disconnect();resolve();}
+  });
+  observer.observe(previous.parentNode,{childList:true});
+ });
+ const refresh=async()=>{
+  const replaced=afterReplace();
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await replaced;await flush();
+ };
+ const expires=EXPIRES;
+ if(expires) list().dataset.deliveryWindowSeconds='0.001';
+ const html=detail().innerHTML;
+ form.elements.words.value='Check the logs.';
+ form.elements.words.dispatchEvent(new Event('input'));
+ submit(ACTION);
+ const body=words=>'<p>'+words+'</p>'+html;
+ const fresh=(revision,words)=>{
+  const page=document.createElement('template');
+  page.innerHTML=list().outerHTML;
+  const fresh=page.content.querySelector('[data-list-item]');
+  fresh.dataset.detailRevision=revision;
+  recordDetails(fresh).innerHTML=body(words);
+  return page.innerHTML;
+ };
+ const ask=ACTION==='question';
+ const savedBody='Saved '+(ask ? 'question' : 'feedback')+'.';
+ refreshMarkup=fresh('saved',savedBody);
+ deliveryPending=true;
+ const result={item_state:'Working',unread:'false',detail_revision:'saved',delivery_pending:true,delivery:'fixture-delivery'};
+ if(!ask) result.detail_html=body(savedBody);
+ const replaced=afterReplace();
+ finishPost(result);await replaced;await flush();
+ check(detail().textContent.includes(savedBody) && pending.hidden,
+  'The saved body appears immediately.');
+ refreshMarkup=fresh('during','Delivery in progress.');
+ await refresh();
+ if(expires){
+  check(detail().textContent.includes(savedBody) && !pending.hidden,
+   'After the cap, a pending delivery waits for Show updates.');
+ }else{
+ check(detail().textContent.includes('Delivery in progress.') && pending.hidden,
+  'A pending delivery refresh shows immediately.');
+ refreshMarkup=fresh('after','Delivery ended.');
+ deliveryPending=false;
+ await refresh();
+ check(detail().textContent.includes('Delivery ended.') && pending.hidden,
+  'The settled delivery shows immediately.');
+ refreshMarkup=fresh('foreign','A new owner update.');
+ await refresh();
+ check(detail().textContent.includes('Delivery ended.') && !pending.hidden,
+  'The owner update waits for Show updates.');
+ dialog.querySelector('[data-show-record-updates]').click();
+ check(detail().textContent.includes('A new owner update.') && pending.hidden,
+  'Show updates installs the owner update.');
+ }
+'''
+        _ = self.add("Own actions", number=1)
+        for action, expires in (("tell", False), ("question", False), ("tell", True)):
+            with self.subTest(action=action, expires=expires):
+                script = steps.replace("ACTION", json.dumps(action)).replace("EXPIRES", json.dumps(expires))
+                self.browser_action_sequence(script, reduced_motion=True, add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_ask_compares_inline_and_deferred_review_links(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Keep the linked Review in place", number=1)
+        _ = the_list.link(MORTY.id, item.id, ("sdlc/C1",), source="morty")
+        change = review_items.ReviewItem("sdlc/C1", "sdlc/C1", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Check the change", review_items.ReviewState.OPEN,
+            review_items.ReviewTimes(NOW, NOW), (), (), review_items.ProposalLedgerSource(self.root / "review.md"))
+        published: list_page.ReviewRecords = {change.key: change}
+        initial = list_page.render(root, include_counts=False, review_records=published).decode()
+        _ = the_list.update(MORTY.id, item.id, {"latest_status": "The question was saved."}, source="morty")
+        saved = list_page.render(root, include_counts=False, review_records=published).decode()
+        deferred = list_page.render(root, defer_counts=True, review_records={}).decode()
+        updates = list_page.render_review_updates(root, staff.snapshot(), published)
+        changed = list_page.render(root, include_counts=False, review_records={
+            change.key: replace(change, state=review_items.ReviewState.DONE)}).decode()
+        steps = r'''
+ const dialog=document.querySelector('#record-item-dialog');
+ const detail=dialog.querySelector('[data-record-dialog-detail]');
+ const notice=dialog.querySelector('[data-record-updates]');
+ const links=()=>detail.querySelector('[data-list-review-links]');
+ const fetchPage=window.fetch;
+ let countReads=0,lastPageQuery;
+ window.fetch=(url,options)=>{
+  const query=new URL(url,location.href).searchParams;
+  if(query.has('counts')){countReads++;return Promise.resolve(new Response(DEFERRED_LINKS));}
+  if(options?.method!=='POST') lastPageQuery=query;
+  return fetchPage(url,options);
+ };
+ const afterReplace=()=>new Promise(resolve=>{
+  const previous=document.querySelector('[data-list]');
+  const observer=new MutationObserver(()=>{
+   if(!previous.isConnected){observer.disconnect();resolve();}
+  });
+  observer.observe(previous.parentNode,{childList:true});
+ });
+ const refresh=async markup=>{
+  refreshMarkup=markup;
+  const replaced=afterReplace();
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await replaced;await flush();
+ };
+ const savedPage=new DOMParser().parseFromString(SAVED_PAGE,'text/html');
+ const savedRow=savedPage.querySelector('[data-list-item]');
+ form.elements.words.value='Did the review change?';
+ form.elements.words.dispatchEvent(new Event('input'));
+ submit('question');
+ refreshMarkup=DEFERRED_PAGE;deliveryPending=false;
+ const settled=afterReplace();
+ finishPost({item_state:'Working',unread:'false',detail_html:recordDetails(savedRow).innerHTML,
+  detail_revision:savedRow.dataset.detailRevision,delivery_pending:true,delivery:'fixture-delivery'});
+ await settled;await flush();
+ check(countReads===1 && lastPageQuery.has('delivery') && links().textContent.includes('1 change for you') && notice.hidden,
+  'The settled Ask keeps the same links when the page defers them.');
+ const shownForm=detail.querySelector('form');
+ await refresh(SAVED_PAGE);
+ check(!lastPageQuery.has('delivery') && notice.hidden && detail.querySelector('form')===shownForm,
+  'The same inline links leave the notice hidden after delivery ends.');
+ await refresh(CHANGED_PAGE);
+ check(!notice.hidden && links().textContent.includes('1 change for you'),
+  'A Review status change alone offers an update and keeps the shown links.');
+ dialog.querySelector('[data-show-record-updates]').click();
+ check(links().textContent.includes('Reviews done') && notice.hidden && detail.querySelector('form')===shownForm,
+  'Show updates changes only the Review links.');
+'''
+        for key, value in (("SAVED_PAGE", saved), ("DEFERRED_PAGE", deferred),
+                           ("DEFERRED_LINKS", updates), ("CHANGED_PAGE", changed)):
+            steps = steps.replace(key, json.dumps(value).replace("</", "<\\/"))
+        self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_save_readbacks_time_out_before_headers_and_during_the_body(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\n")
+        _ = self.add("Keep the List usable after a timeout", number=1)
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        steps = r'''
+ const action=ACTION,headerStall=HEADER_STALL;
+ const dialog=document.querySelector('#record-item-dialog');
+ const error=dialog.querySelector('[data-record-error]');
+ const fetchPage=window.fetch,deadlines=new Map();
+ AbortSignal.timeout=milliseconds=>{
+  const timer=new AbortController();
+  deadlines.set(timer.signal,{timer,milliseconds});
+  return timer.signal;
+ };
+ let stalled,reads=0,followUps=0;
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST') return fetchPage(url,options);
+  if(stalled){followUps++;return fetchPage(url,options);}
+  const query=new URL(url,location.href).searchParams;
+  const readback=action!=='question';
+  check(query.has('item-state')===readback,'The save starts the expected readback request.');
+  stalled=options?.signal;
+  if(!stalled) throw new Error('The readback has no timeout signal.');
+  if(headerStall) return new Promise((resolve,reject)=>{
+   stalled.addEventListener('abort',()=>reject(stalled.reason),{once:true});
+  });
+  const stream=new ReadableStream({start(controller){
+   stalled.addEventListener('abort',()=>controller.error(stalled.reason),{once:true});
+  }});
+  const response=new Response(stream);
+  const method=readback ? 'json' : 'text';
+  const read=response[method].bind(response);
+  response[method]=()=>{reads++;return read();};
+  return Promise.resolve(response);
+ };
+ form.elements.until.value='2026-12-03';
+ form.elements.words.value='Did the check pass?';
+ form.elements.words.dispatchEvent(new Event('input'));
+ submit(action);
+ if(action==='question') finishPost({delivery_pending:false,detail_unavailable:true});
+ else losePost();
+ await flush();
+ check(reads===(headerStall ? 0 : 1),'The request stalls at the selected stage.');
+ const deadline=deadlines.get(stalled);
+ check(deadline?.milliseconds===4000,'The readback uses the configured timeout.');
+ deadline.timer.abort(new DOMException('The fixture timed out.','TimeoutError'));
+ await flush();
+ if(action==='question')
+  check(!error.hidden && error.textContent==='Saved; the item could not refresh.',
+   'The confirmed save reports a display error.');
+ else
+  check((form.querySelector('[data-send-status]').textContent+
+   document.querySelector('[data-hidden-action-status]').textContent).includes('Save not confirmed: Fixture lost response'),
+   'The closing save stays unconfirmed.');
+ check(!form.dataset.sending && followUps>0,'The timeout releases the save and lets a List refresh start.');
+'''
+        for action in ("question", "park", "remove"):
+            for header_stall in (True, False):
+                with self.subTest(action=action, header_stall=header_stall):
+                    script = steps.replace("ACTION", json.dumps(action)).replace("HEADER_STALL", json.dumps(header_stall))
+                    self.browser_action_sequence(script, reduced_motion=True, add_item=False, markup=markup)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_closing_action_closes_when_the_saved_detail_is_unavailable(self) -> None:
+        steps = r'''
+ const dialog=document.querySelector('#record-item-dialog');
+ form.elements.until.value='2026-12-03';
+ submit(ACTION);
+ finishPost({detail_unavailable:true,delivery_pending:true});
+ await flush();
+ const error=document.querySelector('[data-hidden-action-status]');
+ check(!dialog.open && !error.hidden && error.textContent.includes('Saved; the item could not refresh.'),
+  'A confirmed closing action closes the dialog and reports the display failure.');
+'''
+        for action in ("park", "remove"):
+            with self.subTest(action=action):
+                self.browser_action_sequence(steps.replace("ACTION", json.dumps(action)), reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_restores_ask_focus_after_a_failed_post(self) -> None:
@@ -4829,7 +5283,7 @@ window.fetch=async(_url,options)=>{
         _ = self.add("The next open item", number=2)
         self.browser_action_sequence(r"""
  const other=document.querySelector('[data-number="2"]');
- const remove=other.querySelector('button[value="remove"]');
+ const remove=recordDetails(other).querySelector('button[value="remove"]');
  refreshMarkup=document.documentElement.outerHTML;
  const ask=form.querySelector('[value="question"]'),input=form.elements.words;
  input.value='Which check is next?';input.dispatchEvent(new Event('input'));
@@ -4841,7 +5295,7 @@ window.fetch=async(_url,options)=>{
  finishPost({unread:'false',waiting_for_answer:'false'});await flush();
  const refreshed=document.querySelector('[data-number="2"]');
  check(refreshed!==other && !refreshed.hidden,'The List refreshes the other item');
- check(document.activeElement===refreshed.querySelector('button[value="remove"]'),
+ check(document.activeElement===recordDetails(refreshed).querySelector('button[value="remove"]'),
   'Remove on the same item keeps focus through refresh');
 """, reduced_motion=True, add_item=False)
 
@@ -4870,7 +5324,7 @@ window.fetch=async(_url,options)=>{
  const second=document.querySelector('[data-number="2"]');
  function ask(target){
   target.elements.words.value='Which check passed?';target.elements.words.dispatchEvent(new Event('input'));
-  const button=target.querySelector('[value="question"]');
+  const button=recordDetails(target).querySelector('[value="question"]');
   button.focus();
   check(button.getClientRects().length && document.activeElement===button,'Ask is visible and has focus.');
   submit('question',target);
@@ -4878,7 +5332,7 @@ window.fetch=async(_url,options)=>{
  ask(form);
  const failFirst=finishPost;
  second.querySelector('.list-toggle').click();
- ask(second.querySelector('form'));
+ ask(recordDetails(second).querySelector('form'));
  failFirst({reason:'The save failed'});await flush();
  const returning=row.nextElementSibling.getAnimations({subtree:true})[0];
  check(!row.hidden && !row.querySelector('.list-toggle').getClientRects().length,
@@ -4946,8 +5400,8 @@ window.fetch=async(_url,options)=>{
         probe = """<script>
 (async()=>{
  const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
- const row=document.querySelector('[data-list-item]'),detail=row.querySelector('[data-detail]');
- const panel=detail.querySelector('.list-panel');
+ const row=document.querySelector('[data-list-item]');
+ const panel=recordDetails(row).querySelector('.list-panel');
  const unread=()=>row.dataset.unread==='true' && panel.querySelector('.question-unread');
  const showTab=()=>{visibility='visible';document.dispatchEvent(new Event('visibilitychange'));};
  const showFrame=()=>{
@@ -4956,7 +5410,7 @@ window.fetch=async(_url,options)=>{
  };
  const paint=()=>new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
  try{
-  check(!row.hidden && !detail.hidden,'The direct link opens the unread row');
+  check(!row.hidden && recordIsOpen(row),'The direct link opens the unread row');
   check(!reads.length && unread(),'A hidden tab keeps the answer unread');
   if(CLOSE_ROW) row.querySelector('.list-toggle').click();
   REVEAL_FIRST();
@@ -4996,14 +5450,14 @@ window.fetch=async(_url,options)=>{
 (async()=>{
  const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
  try{
-  const row=document.querySelector('[data-list-item]'),detail=row.querySelector('[data-detail]');
-  const panel=detail.querySelector('.list-panel');
+  const row=document.querySelector('[data-list-item]');
+  const panel=recordDetails(row).querySelector('.list-panel');
   const answer=[...panel.querySelectorAll('[data-question="Q1"] p')].find(p=>p.textContent==='The gate passed.');
   const sample=()=>new Promise(resolve=>{
    const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
    observer.observe(answer);
   });
-  check(!row.hidden && !detail.hidden && row.querySelector('.list-row').getBoundingClientRect().bottom<innerHeight,
+  check(!row.hidden && recordIsOpen(row) && row.querySelector('.list-row').getBoundingClientRect().bottom<innerHeight,
    'The direct link opens a row within the viewport');
   check(!(await sample()).isIntersecting && answer.getBoundingClientRect().top>innerHeight,
    'The answer starts below the viewport');
@@ -5040,7 +5494,7 @@ window.fetch=async(_url,options)=>{
 (async()=>{
  const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
  try{
-  const panel=document.querySelector('[data-detail]:not([hidden]) .list-panel');
+  const panel=document.querySelector('#record-item-dialog[open] .list-panel');
   const answer=panel.querySelector('[data-question="Q1"] p:last-child');
   const spacer=document.getElementById('answer-spacer');
   spacer.style.height=(spacer.offsetHeight+1800-answer.getBoundingClientRect().top)+'px';
@@ -5055,7 +5509,7 @@ window.fetch=async(_url,options)=>{
   check((await sample()).intersectionRect.height>0 && reads.length===1 &&
    reads[0].get('action')==='read' && reads[0].get('token')===panel.dataset.openReadToken,
    'Scrolling to the answer sends one signed read.');
-  scrollTo({top:0,behavior:'instant'});
+  panel.closest('.console-dialog-body').scrollTop=0;
   await sample();
   answer.scrollIntoView({block:'center',behavior:'instant'});
   check((await sample()).intersectionRect.height>0 && reads.length===1,
@@ -5104,16 +5558,17 @@ window.fetch=async(_url,options)=>{
 (async()=>{
  const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
  try{
-  const row=document.querySelector('[data-list-item]'),detail=row.querySelector('[data-detail]');
+  const row=document.querySelector('[data-list-item]');
   if(!LINK_ON_LOAD){
-   check(detail.hidden && !reads.length,'The loaded List starts with a closed and unread row');
+   check(!recordIsOpen(row) && !reads.length,'The loaded List starts with a closed and unread row');
    const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
    const link=document.createElement('a');
    link.href=fragment;document.body.append(link);link.click();
    await changed;
   }
   await new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
-  const panel=detail.querySelector('.list-panel');
+  const panel=recordDetails(row).querySelector('.list-panel');
+  const dialogBody=panel.closest('.console-dialog-body');
   const first=panel.querySelector('[data-question="Q1"] p:last-child');
   const second=panel.querySelector('[data-question="Q2"] p:last-child');
   const sample=target=>new Promise(resolve=>{
@@ -5122,7 +5577,8 @@ window.fetch=async(_url,options)=>{
   });
   const paint=()=>new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
   const showAnswer=async answer=>{
-   scrollTo({top:scrollY+answer.getBoundingClientRect().top-16,behavior:'instant'});
+   dialogBody.scrollBy({top:answer.getBoundingClientRect().top-dialogBody.getBoundingClientRect().top-16,
+    behavior:'instant'});
    await paint();
   };
   const requireEvent=(event,message)=>{
@@ -5132,8 +5588,7 @@ window.fetch=async(_url,options)=>{
    });
    return Promise.race([event,deadline]).finally(()=>clearTimeout(timer));
   };
-  check(!row.hidden && !detail.hidden,'The item link opens the row');
-  document.body.style.paddingBottom='100vh';
+  check(!row.hidden && recordIsOpen(row),'The item link opens the row');
   await paint();
   await showAnswer(first);
   check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
@@ -5143,7 +5598,7 @@ window.fetch=async(_url,options)=>{
   check(!reads.length && panel.querySelectorAll('.question-unread').length===2,
    'The first answer alone leaves both answers unread');
   await showAnswer(second);
-  check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<0,
+  check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<dialogBody.getBoundingClientRect().top,
    'The second answer enters the viewport after the first leaves it');
   await requireEvent(postedRead,'The List did not send the signed read within 20 seconds.');
   check(reads.length===1 && reads[0].get('action')==='read' &&
@@ -5257,10 +5712,12 @@ const open=(show,key='',unread='')=>new Promise(resolve=>{
  frame.src='LIST_PATH?fixture='+show+unread+'#'+new URLSearchParams({show,unread,...(key ? {item:key} : {})});
 });
 const row=()=>frame.contentDocument.querySelector('[data-number="1"]');
+const recordDetails=item=>frame.contentWindow.recordDetails(item);
+const recordIsOpen=item=>frame.contentWindow.recordIsOpen(item);
 const hasDot=()=>Boolean(row().querySelector('.list-dot'));
 const act=async (action,words='')=>{
  const win=frame.contentWindow, current=row();
- const form=current.querySelector('form'), input=form.elements.words;
+ const form=recordDetails(current).querySelector('form'), input=form.elements.words;
  const fetch=win.fetch.bind(win);
  let post, observer;
  const settled=new Promise(resolve=>{
@@ -5271,7 +5728,7 @@ const act=async (action,words='')=>{
   ? (post=fetch(url,options))
   : Promise.resolve(new win.Response('',{status:503}));
  try{
-  if(current.querySelector('[data-detail]').hidden) current.querySelector('.list-toggle').click();
+  if(!recordIsOpen(current)) current.querySelector('.list-toggle').click();
   input.value=words;input.dispatchEvent(new win.Event('input'));
   form.querySelector('[value="'+action+'"]').click();
   if(!post || !(await post).ok) throw new Error('The List POST must succeed.');
@@ -5288,36 +5745,36 @@ const change=async path=>{
  try{
   await open('all','','1');
   check(!row().hidden && hasDot(),'the item starts in Unread');
-  check(await act('question','Which check passed?')==='Question saved','the first question saves');
+  check(await act('question','Which check passed?')==='','the first question saves without a status message');
   check(row().hidden && !hasDot(),'the saved question leaves Unread and clears the dot');
-  check(row().querySelector('[data-waiting-questions] time[datetime]'),
+  check(recordDetails(row()).querySelector('[data-waiting-questions] time[datetime]'),
    'the save response supplies the asked time for the waiting row');
   const key=row().dataset.key;
   await open('working');
   check(row().hidden && !row().querySelector('[data-open-question-note]').hidden,
    'The saved question has its note and stays out of Working.');
   await open('all',key);
-  check(!row().hidden && !row().querySelector('[data-detail]').hidden &&
-   row().querySelector('[data-waiting-note]')?.textContent==='The producer will answer.' &&
-   !row().querySelector('[value="question"]'),'a direct link shows the waiting line without Ask');
-  const waitingQuestion=row().querySelector('[data-waiting-questions] [data-question="Q1"]');
+  check(!row().hidden && recordIsOpen(row()) &&
+   recordDetails(row()).querySelector('[data-waiting-note]')?.textContent==='The producer will answer.' &&
+   !recordDetails(row()).querySelector('[value="question"]'),'a direct link shows the waiting line without Ask');
+  const waitingQuestion=recordDetails(row()).querySelector('[data-waiting-questions] [data-question="Q1"]');
   check(/(?:EST|EDT)$/.test(waitingQuestion?.querySelector('time[datetime]')?.textContent),
    'the waiting question shows the asked time in the user zone');
   await change('/answer');
   await open('working','','1');
-  const unreadQuestion=row().querySelector('.list-panel [data-question="Q1"]');
+  const unreadQuestion=recordDetails(row()).querySelector('.list-panel [data-question="Q1"]');
   check(!row().hidden && hasDot() && unreadQuestion?.textContent.includes('Which check passed?') &&
    unreadQuestion.textContent.includes('The gate passed.') && !row().querySelector('[data-open-question-note]'),
    'Working with Unread only shows the answer in the panel and clears the question note.');
   check(unreadQuestion?.querySelectorAll('time[datetime]').length===2 &&
    unreadQuestion.querySelector('.question-unread')?.textContent==='Unread',
    'the unread answer shows both times and the Unread mark');
-  check(!row().querySelector('.list-log').textContent.includes('The gate passed.'),
+  check(!recordDetails(row()).querySelector('.list-log').textContent.includes('The gate passed.'),
    'the log has no unread answer');
-  check(await act('read')==='Marked read','Mark read saves the existing read action');
+  check(await act('read')==='','Mark read saves without a status message');
   await open('working',key);
-  const log=row().querySelector('.list-log');
-  check(!hasDot() && !row().querySelector('[data-question="Q1"]'),
+  const log=recordDetails(row()).querySelector('.list-log');
+  check(!hasDot() && !recordDetails(row()).querySelector('[data-question="Q1"]'),
    'the read question leaves the panel');
   check(log.querySelector('[data-log-index="Q1-answered"]').textContent.includes('Answer — morty') &&
    log.querySelector('[data-log-index="Q1-asked"]').textContent.includes('Question Q1 — nate'),
@@ -5325,28 +5782,28 @@ const change=async path=>{
   await change('/update');
   await open('working','','1');
   await change('/newer');
-  check(await act('question','Which check is next?')==='Question saved; update remains unread',
-   'the notice says the newer update remains unread');
+  check(await act('question','Which check is next?')==='',
+   'the saved question shows no status message for a newer unread update');
   check(hasDot() && row().hidden,'The unread item leaves Working after the question saves.');
   frame.contentDocument.getElementById('filter-show-morty-answering').click();
   check(hasDot() && !row().hidden,'Morty answering shows the unread item.');
-  const nextQuestion=(current)=>current.querySelector('[data-waiting-questions] [data-question="Q2"]');
-  const firstAnswer=(current)=>current.querySelector('[data-log-index="Q1-answered"]');
+  const nextQuestion=(current)=>recordDetails(current).querySelector('[data-waiting-questions] [data-question="Q2"]');
+  const firstAnswer=(current)=>recordDetails(current).querySelector('[data-log-index="Q1-answered"]');
   check(nextQuestion(row()) && firstAnswer(row())?.textContent.includes('The gate passed.'),
    'the Ask response keeps the first answer in the log beside the new waiting question');
   await open('all',key);
-  check(!row().querySelector('[data-detail]').hidden && nextQuestion(row()) && firstAnswer(row()),
+  check(recordIsOpen(row()) && nextQuestion(row()) && firstAnswer(row()),
    'a direct link shows both the waiting question and the first answer in the log');
   const {loggedAt}=await change('/second-answer');
   await open('working','','1');
   const original=row(), doc=frame.contentDocument;
-  const panelQuestion=original.querySelector('[data-question="Q2"]');
+  const panelQuestion=recordDetails(original).querySelector('[data-question="Q2"]');
   const askedAt=Date.parse(panelQuestion.querySelector('time').dateTime);
-  check(hasDot() && original.querySelector('[data-question="Q2"] .question-unread'),
+  check(hasDot() && recordDetails(original).querySelector('[data-question="Q2"] .question-unread'),
    'the second answer stays unread before the row opens');
   const refreshed=new Promise(resolve=>{
    const observer=new frame.contentWindow.MutationObserver(()=>{
-    if(row()!==original && row().querySelector('[data-log-index="Q2-answered"]')){
+    if(row()!==original && recordDetails(row()).querySelector('[data-log-index="Q2-answered"]')){
      observer.disconnect();resolve();
     }
    });
@@ -5354,14 +5811,14 @@ const change=async path=>{
   });
   original.querySelector('.list-toggle').click();
   await refreshed;
-  check(!hasDot() && !row().hidden && !row().querySelector('[data-detail]').hidden,
+  check(!hasDot() && !row().hidden && recordIsOpen(row()),
    'opening the row marks the answer read and keeps the row open in Unread');
-  check(row().querySelector('[data-log-index="Q2-answered"]').textContent.includes('The next check passed.'),
+  check(recordDetails(row()).querySelector('[data-log-index="Q2-answered"]').textContent.includes('The next check passed.'),
    'opening the row moves the answer to the log');
-  const asked=row().querySelector('[data-log-index="Q2-asked"]');
-  const answered=row().querySelector('[data-log-index="Q2-answered"]');
+  const asked=recordDetails(row()).querySelector('[data-log-index="Q2-asked"]');
+  const answered=recordDetails(row()).querySelector('[data-log-index="Q2-answered"]');
   check(asked?.textContent.includes('Which check is next?') && Date.parse(asked.querySelector('time').dateTime)===askedAt &&
-   Date.parse(answered.querySelector('time').dateTime)===Date.parse(loggedAt) && !row().querySelector('[data-question="Q2"]'),
+   Date.parse(answered.querySelector('time').dateTime)===Date.parse(loggedAt) && !recordDetails(row()).querySelector('[data-question="Q2"]'),
    'The log shows the question and answer with their recorded times after the panel clears.');
   const chip=(filter,value)=>doc.querySelector('[data-filter-row="'+filter+'"] [data-filter-value="'+value+'"]');
   const count=(filter,value)=>Number(chip(filter,value).dataset.filterCount);
@@ -5449,7 +5906,7 @@ const change=async path=>{
                 markup = list_page.render(self.root / "reviews").decode()
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
         setup = '''<script>
-const requests=[],itemSnapshots=new Map();let finishPost,losePost,refreshMarkup,readback;
+const requests=[],itemSnapshots=new Map();let finishPost,losePost,failPostBody,refreshMarkup,readback,deliveryPending;
 window.fetch=async(path,options={})=>{
  if(options.method!=='POST'){
   const query=new URL(path,location.href).searchParams;
@@ -5459,11 +5916,14 @@ window.fetch=async(path,options={})=>{
     ...itemSnapshots.get(key),park_request_saved:false}};
   }
   if(refreshMarkup===undefined) throw new Error('Fixture refresh refused');
-  return {ok:true,text:async()=>refreshMarkup};
+  const headers=new Headers();
+  if(typeof deliveryPending==='boolean') headers.set('X-Item-Delivery-Pending',String(deliveryPending));
+  return {ok:true,headers,text:async()=>refreshMarkup};
  }
  requests.push(new URLSearchParams(options.body));
  return new Promise((resolve,reject)=>{
   losePost=()=>reject(new Error('Fixture lost response'));
+  failPostBody=()=>resolve({ok:true,status:200,json:async()=>{throw new Error('The response is unreadable.');}});
   finishPost=result=>resolve({ok:!result.reason,status:result.status ?? (result.reason ? 400 : 200),
    json:async()=>({unread:'true',...result})});
  });
@@ -5472,7 +5932,7 @@ window.fetch=async(path,options={})=>{
         probe = '''<script>
 (async()=>{
  const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
- const row=document.querySelector('[data-number="OPEN_NUMBER"]'),form=row.querySelector('form');
+ const row=document.querySelector('[data-number="OPEN_NUMBER"]'),form=recordDetails(row).querySelector('form');
  const submit=(action,target=form)=>{
   const count=requests.length;
   target.requestSubmit(target.querySelector('[value="'+action+'"]'));
@@ -5733,7 +6193,7 @@ window.fetch=async(_path,options={})=>{
 </script>'''
         probe = '''<script>
 (async()=>{
- const row=document.querySelector('[data-list-item]'),form=row.querySelector('form');
+ const row=document.querySelector('[data-list-item]'),form=recordDetails(row).querySelector('form');
  document.getElementById('list-unread').click();
  const before=row.dataset.unread==='true' && row.querySelector('.list-dot') && form.querySelector('[value="read"]') && !row.hidden;
  form.elements.words.value='Keep this result.';form.elements.words.dispatchEvent(new Event('input'));
@@ -5744,16 +6204,14 @@ window.fetch=async(_path,options={})=>{
  const after=EXPECTED_UNREAD ? retained : cleared;
  const notice=form.querySelector('[data-send-status]').textContent;
  const result=document.createElement('p');result.id='probe-result';
- result.textContent=before && after && notice==='NOTICE' ? 'PASS' : 'FAIL';document.body.append(result);
+ result.textContent=before && after && notice==='' ? 'PASS' : 'FAIL';document.body.append(result);
 })();
 </script>'''
-        for action, unread, notice in (("read", "false", "Marked read"), ("read", "true", "Update remains unread"),
-                                      ("tell", "false", "sent to morty"),
-                                      ("tell", "true", "sent to morty; update remains unread")):
+        for action, unread in (("read", "false"), ("read", "true"), ("tell", "false"), ("tell", "true")):
             with self.subTest(action=action, unread=unread):
                 page = self.root / f"{action}-{unread}.html"
                 _ = page.write_text(markup.replace('<head>', '<head>' + setup.replace('UNREAD', unread), 1).replace('</body>',
-                    probe.replace('ACTION', action).replace('NOTICE', notice).replace('EXPECTED_UNREAD', unread) + '</body>'))
+                    probe.replace('ACTION', action).replace('EXPECTED_UNREAD', unread) + '</body>'))
                 result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
                     '--user-data-dir=' + str(self.root / f'chrome-{action}-{unread}'), '--virtual-time-budget=1000',
                     '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
@@ -6033,7 +6491,7 @@ window.fetch=async(_path,options={})=>{
   if(fields.get('action')==='read'){
    const page=new DOMParser().parseFromString(original,'text/html');
    const row=[...page.querySelectorAll('[data-list-item]')].find(row=>row.dataset.number==='106');
-   row.dataset.unread='false';row.querySelector('.list-dot')?.remove();row.querySelector('[value="read"]')?.remove();
+   row.dataset.unread='false';row.querySelector('.list-dot')?.remove();recordDetails(row).querySelector('[value="read"]')?.remove();
    original=page.documentElement.outerHTML;
   }
   const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false',
@@ -6277,8 +6735,8 @@ try{
  }
  await search('console');
  const selected=visible().find(row=>row.dataset.number==='106');selected.querySelector('.list-toggle').click();
- check(!selected.querySelector('[data-detail]').hidden,'a row opens');
- const words=selected.querySelector('textarea'),tell=selected.querySelector('[value="tell"]');
+ check(recordIsOpen(selected),'a row opens');
+ const words=recordDetails(selected).querySelector('textarea'),tell=recordDetails(selected).querySelector('[value="tell"]');
  check(tell.textContent==='Tell morty','the button names its recipient');
  check(words.placeholder==='Your words for morty about this item' && words.getAttribute('aria-label')===words.placeholder,'the words box has its accessible name');
  check(!selected.querySelector('label[for="'+words.id+'"]'),'the words box has no repeated visible label');
@@ -6300,12 +6758,12 @@ try{
  check(document.querySelector('#list-search').value==='console','refresh keeps the query');
  check(document.activeElement.id==='list-search','refresh keeps focus');
  check(document.activeElement.selectionStart===1 && document.activeElement.selectionEnd===3,'refresh keeps the selection');
- check(!refreshed.querySelector('[data-detail]').hidden,'Refresh keeps the open row.');
- check(refreshed.querySelector('textarea').value==='Keep my draft','refresh keeps feedback words');
- check(!refreshed.querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
+ check(recordIsOpen(refreshed),'Refresh keeps the open row.');
+ check(recordDetails(refreshed).querySelector('textarea').value==='Keep my draft','refresh keeps feedback words');
+ check(!recordDetails(refreshed).querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
  check(refreshed!==selected,'refresh replaces the row');
- const refusedForm=refreshed.querySelector('form');
+ const refusedForm=recordDetails(refreshed).querySelector('form');
  holdPost=true;
  const refused=submitted(refusedForm,refusedForm.querySelector('[value="tell"]'));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
@@ -6319,29 +6777,31 @@ try{
        'A refusal restores the unread state and shows the reason beside the draft.');
  realFeedback=true;loseResponse=true;
  const tellRow=rows().find(row=>row.dataset.number==='105');tellRow.querySelector('.list-toggle').click();
- check(visible().length===2 && refreshed.querySelector('[data-detail]').hidden &&
-  !tellRow.querySelector('[data-detail]').hidden,'Opening the second List row closes the first row.');
- check(refreshed.querySelector('textarea').value==='Keep my draft','Closing the first row keeps its draft.');
- check(tellRow.dataset.unread==='true' && tellRow.querySelector('[value="read"]'),'Tell starts with a fresh unread row');
- let retryForm=tellRow.querySelector('form');
+ check(visible().length===2 && !recordIsOpen(refreshed) &&
+  recordIsOpen(tellRow),'Opening the second List row closes the first row.');
+ check(recordDetails(refreshed).querySelector('textarea').value==='Keep my draft','Closing the first row keeps its draft.');
+ check(tellRow.dataset.unread==='true' && recordDetails(tellRow).querySelector('[value="read"]'),'Tell starts with a fresh unread row');
+ let retryForm=recordDetails(tellRow).querySelector('form');
  retryForm.elements.words.value='Deliver this feedback once';retryForm.elements.words.dispatchEvent(new Event('input'));
  const retryId=retryForm.elements.request.value,retryToken=retryForm.elements.token.value,startPosts=posts.length;
  await submitted(retryForm,retryForm.querySelector('[value="tell"]'));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await flush();await flush();
- retryForm=rows().find(row=>row.dataset.number==='105').querySelector('form');
+ retryForm=recordDetails(rows().find(row=>row.dataset.number==='105')).querySelector('form');
  check(retryForm.elements.request.value===retryId && retryForm.elements.token.value===retryToken,'refresh keeps the failed request identity');
  await submitted(retryForm,retryForm.querySelector('[value="tell"]'));
  check(posts.length===startPosts+2,'the lost response has one retry');
  check(posts.at(-1).get('request')===retryId && posts.at(-1).get('token')===retryToken,'the retry uses its original signature');
- retryForm=rows().find(row=>row.dataset.number==='105').querySelector('form');
+ retryForm=recordDetails(rows().find(row=>row.dataset.number==='105')).querySelector('form');
  check(retryForm.elements.request.value!==retryId,'success clears the saved retry identity');
  check(retryForm.elements.words.value==='' && retryForm.querySelector('[value="tell"]').disabled,'a successful send clears the box and disables Tell morty');
  realFeedback=false;failRefresh=true;
  rows().find(row=>row.dataset.number==='106').querySelector('.list-toggle').click();
  const requestIds=[];
  for(const action of ['read','park','tell','remove']){
-  const row=rows().find(row=>row.dataset.number==='106'),form=row.querySelector('form');
+  const row=rows().find(row=>row.dataset.number==='106');
+  if(!recordIsOpen(row)) row.querySelector('.list-toggle').click();
+  const form=recordDetails(row).querySelector('form');
   form.elements.until.value='2026-12-03';form.elements.words.value='Explain this simply';
   requestIds.push(form.elements.request.value);
   holdPost=action==='tell';
@@ -6349,7 +6809,8 @@ try{
   if(holdPost){await until(()=>typeof finishPost==='function','the held response');
    form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));
    check(form.querySelector('[value="tell"]').disabled,'editing words during delivery keeps Tell morty disabled');finishPost();}
-  check(form.querySelector('[data-send-status]').textContent===(action==='read' ? 'Saving…' : 'Sending…'),'immediate response '+action);
+  check(form.dataset.sending && !form.querySelector('[data-send-status]').textContent,
+   'The pending action disables submission without a status message: '+action);
   await until(()=>!form.dataset.sending,'the '+action+' response');
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
@@ -6360,10 +6821,16 @@ try{
    check(form.elements.words.value==='New draft during send','a newer draft survives the send');
    check(!form.querySelector('[value="tell"]').disabled,'the newer draft enables Tell morty after delivery');
   }
-  if(action==='remove') check(row.hidden,'Remove hides the item after the save');
-  else check(!row.querySelector('[data-detail]').hidden &&
-   rows().find(row=>row.dataset.number==='105').querySelector('[data-detail]').hidden,
+  check(!form.querySelector('[data-send-status]').textContent,'The saved action shows no status message: '+action);
+  if(action==='remove' || action==='park'){
+   const dialog=document.getElementById('record-item-dialog');
+   check(!dialog.open && dialog.querySelector('[data-record-missing]').hidden,
+    'The saved action closes the dialog: '+action);
+   if(action==='remove') check(row.hidden,'Remove hides the item after the save.');
+  }else check(recordIsOpen(row) &&
+   !recordIsOpen(rows().find(row=>row.dataset.number==='105')),
    'Feedback keeps item 106 open and item 105 closed.');
+
  }
  check(new Set(requestIds).size===4,'each new action uses a fresh request');
  realFeedback=true;failRefresh=false;
@@ -6397,7 +6864,7 @@ try{
 
  for(const target of rows().filter(row=>row.dataset.state==='Done' || row.dataset.parked==='true')){
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
-  check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
+  check(!target.hidden && recordIsOpen(target),'an item link shows '+target.dataset.state);
   check(selectedShow()==='all' &&
     selectedFilter('owner')==='all' && !unread().checked && selectedFilter('producer')==='all' &&
     document.getElementById('list-search').value==='','An item link selects Show and clears the other filters.');
@@ -6406,7 +6873,7 @@ try{
  location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'working',q:'106',sort:'#',dir:'desc'});await flush();
  check(selectedFilter('owner')==='staff:'+retained.dataset.owner && selectedShow()==='working' &&
    document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
- check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
+ check(!retained.hidden && recordIsOpen(retained),'an address restores its open item');
  check(document.querySelectorAll('[data-feedback-form]').length===5,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
  if(innerWidth<960){

@@ -2401,6 +2401,37 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(cache.get().records[key].state, review_items.ReviewState.VALIDATING)
         self.assertEqual(list(case.root.glob('.review-link-scratch-*')), [])
 
+    def test_validating_ask_returns_the_saved_body_and_delivery_state(self) -> None:
+        case = self.review_fixture(changes=1)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        key = 'page-owner/C1'
+        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
+        started, release = threading.Event(), threading.Event()
+
+        def send(_delivery: change_page.MessageDelivery, _status: change_page.DeliveryStatus) -> None:
+            started.set()
+            self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
+
+        request = case.card_body(cache.get(), key, 'question', 'Which check passed?')
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(change_page, 'deliver', side_effect=send)):
+            try:
+                code, body = self.post(review_page.PAGE_PATH, request)
+                self.assertEqual(code, 200, body)
+                result = cast(dict[str, object], json.loads(body))
+                self.assertIn('Which check passed?', cast(str, result['detail_html']))
+                self.assertIs(result['delivery_pending'], True)
+                version_path = review_page.PAGE_PATH + '?' + urlencode({'version': '1', 'delivery': result['delivery']})
+                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
+                pending = cast(dict[str, object], json.loads(self.request(version_path).body))
+                self.assertIs(pending['delivery_pending'], True)
+            finally:
+                release.set()
+                self.assertTrue(self.review_post_done.wait(TEST_HANG_GUARD_SECS))
+            settled = cast(dict[str, object], json.loads(self.request(version_path).body))
+            self.assertIs(settled['delivery_pending'], False)
+
     def test_review_body_serves_the_validating_question_in_both_card_views(self) -> None:
         case = self.review_fixture(changes=1)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -3401,6 +3432,11 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertNotIn("request", response)
                     self.assertNotIn("token", response)
                     fields["request"] = f"{request}.{uuid4().hex}"
+                    if action == "remove":
+                        self.assertIs(cast(dict[str, object], json.loads(body)).get("detail_closed"), True)
+                    else:
+                        self.assertIn("detail_revision", response)
+                        self.assertIn("detail_html", response)
                     if action == "read":
                         delivery.assert_not_called()
                         self.assertEqual(response["unread"], "false")
@@ -3679,8 +3715,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(json.loads(body)["state"], "saved")
                 self.assertEqual(json.loads(body)["waiting_for_answer"], "true")
                 self.assertEqual(json.loads(body)["open_question"], "true")
+                result = cast(list_page.SavedActionState, json.loads(body))
+                self.assertIn(words, result.get("detail_html", ""))
+                reply_delivery = cast(dict[str, object], json.loads(body))
+                self.assertIs(reply_delivery["delivery_pending"], True)
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
                 self.assertFalse(finished.is_set())
+                path = list_page.PAGE_PATH + "?" + urlencode({"delivery": reply_delivery["delivery"]})
+                response, headers, _ = self.head(path)
+                self.assertEqual(response, 200)
+                self.assertEqual(headers.get("x-item-delivery-pending"), "true")
                 opened = saved_at_send[0]
                 self.assertEqual([(question.question_id, question.words) for question in opened.questions], [("Q1", words)])
                 self.assertEqual(len(deliveries), 1)

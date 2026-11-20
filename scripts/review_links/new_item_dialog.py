@@ -573,11 +573,7 @@ def render() -> str:
                          "imageBytes": MAX_IMAGE_BYTES,
                          "totalImageBytes": MAX_TOTAL_IMAGE_BYTES, "pageDataBytes": MAX_PAGE_DATA_BYTES,
                          "pageUrlLength": MAX_PAGE_URL_LENGTH})
-    return f'''<style>{STYLE}{PAGE_STATE_STYLE}</style>
-<dialog id="review-new-item" aria-labelledby="new-item-title">
- <form>
-  <header><h2 id="new-item-title">New item</h2><button type="button" data-close aria-label="Close">×</button></header>
-  <div class="new-item-body">
+    body = f'''
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
    <fieldset><legend>To</legend><p data-recipients-status role="status" hidden></p>
     <div class="new-item-chips" data-recipients></div>
@@ -595,15 +591,18 @@ def render() -> str:
     <h4 id="bug-page-state-title">Page state to send</h4><dl class="page-state"></dl>
    </section>
    <div class="new-item-previews" data-previews hidden></div>
-  </div>
+'''
+    footer = '''
   <footer>
    <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
    <div><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
   </footer>
- </form>
-</dialog>
-<script>{SCRIPT.replace("__LIMITS__", limits)}</script>'''
+'''
+    dialog = page_frame.console_dialog('review-new-item', 'new-item-title', 'New item', body,
+                                       footer=footer, form=True, body_class='new-item-body')
+    return (f'<style>{page_frame.CONSOLE_DIALOG_STYLE}{STYLE}{PAGE_STATE_STYLE}</style>{dialog}'
+            f'<script>{page_frame.CONSOLE_DIALOG_SCRIPT}{SCRIPT.replace("__LIMITS__", limits)}</script>')
 
 
 PAGE_STATE_STYLE = '''
@@ -631,37 +630,12 @@ padding:5px 14px;margin:0;flex:none;white-space:nowrap}
  .page-heading-actions>.review-new{justify-content:center;min-width:36px;padding:5px}
  .review-new-label{display:none}
 }
-#review-new-item {
- position: fixed; inset: 0; box-sizing: border-box; margin: auto; padding: 0;
- width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px);
- color: var(--ink, #f0efec); background: var(--card, #1a1a19); border: 1px solid var(--line, #34332f);
- border-radius: 12px; box-shadow: 0 20px 60px #0006; overflow: hidden;
- font: 15px/1.45 system-ui, sans-serif;
-}
-#review-new-item *, #review-new-item *::before, #review-new-item *::after { box-sizing: border-box; }
-#review-new-item [hidden] { display: none; }
-#review-new-item::backdrop { background: #0009; }
-#review-new-item form {
- display: grid; grid-template-rows: auto minmax(0, 1fr) auto; margin: 0;
- max-height: calc(100dvh - 34px);
-}
-#review-new-item header, #review-new-item footer { padding-inline: 24px; }
-#review-new-item header {
- display: flex; align-items: center; justify-content: space-between; padding-block: 20px 16px;
-}
-#review-new-item h2 { margin: 0; font-size: 22px; line-height: 1.2; }
-#review-new-item button { font: inherit; cursor: pointer; }
+#review-new-item button:not([data-close]) { font: inherit; cursor: pointer; }
 #review-new-item button:disabled { opacity: .55; cursor: default; }
 #review-new-item button:focus-visible, #review-new-item textarea:focus-visible,
 #review-new-item input:focus-visible + span { outline: 2px solid var(--accent, #3987e5); outline-offset: 2px; }
-#review-new-item [data-close] {
- border: 0; border-radius: 6px; background: transparent; width: 30px; height: 30px;
- color: var(--ink-2, #c3c2b7); font-size: 22px; line-height: 1;
-}
 #review-new-item .new-item-body {
- display: grid; align-content: start; gap: 18px; min-width: 0; padding: 4px 24px 20px;
- overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin;
- scrollbar-color: var(--ink-3, #9a988f) var(--card, #1a1a19);
+ display: grid; align-content: start; gap: 18px;
 }
 #review-new-item fieldset { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
 #review-new-item legend, #review-new-item h3 {
@@ -759,8 +733,6 @@ padding:5px 14px;margin:0;flex:none;white-space:nowrap}
 #review-new-item [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
 #review-new-item .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
 @media (max-width: 480px) {
- #review-new-item header, #review-new-item footer, #review-new-item .new-item-body { padding-inline: 16px; }
- #review-new-item header { padding-block: 14px 12px; }
  #review-new-item footer { padding-bottom: 14px; }
  #review-new-item .new-item-body { gap: 14px; }
  #review-new-item .new-item-cells { display: grid; grid-template-columns: repeat(auto-fit, minmax(42px, 1fr)); }
@@ -1166,10 +1138,8 @@ SCRIPT = r'''(() => {
  form.addEventListener('input', editDraft);
  includePage.addEventListener('change', startCapture);
  window.addEventListener('pagehide', () => { if (!sending) discardCapture(); });
- dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
- for (const control of dialog.querySelectorAll('[data-close], [data-cancel]')) {
-  control.addEventListener('click', () => close());
- }
+ bindConsoleDialog(dialog,close);
+ dialog.querySelector('[data-cancel]').addEventListener('click',()=>close());
  form.addEventListener('submit', async event => {
   event.preventDefault();
   if (send.disabled) return;

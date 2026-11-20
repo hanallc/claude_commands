@@ -50,7 +50,7 @@ window.fetch=(path,options={})=>{
   const liveRow=row=>document.querySelector('[data-list-item][data-key="'+CSS.escape(row.dataset.key)+'"]');
   const open=row=>{
    row=liveRow(row);
-   if(row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
+   if(!recordIsOpen(row)) row.querySelector('.list-toggle').click();
    return row;
   };
   const startSave=async row=>{
@@ -58,7 +58,7 @@ window.fetch=(path,options={})=>{
    for(const animation of animations) animation.finish();
    await Promise.allSettled(animations.map(animation=>animation.finished));
    row=open(row);
-   const form=action==='works' ? await readyReviewCard(row) : row.querySelector('form');
+   const form=action==='works' ? await readyReviewCard(row) : recordDetails(row).querySelector('form');
    const settled=new Promise(resolve=>{
     const observe=new MutationObserver(()=>{
      if(!form.dataset.sending){observe.disconnect();resolve();}
@@ -87,7 +87,7 @@ window.fetch=(path,options={})=>{
   };
   const failure=(row,reason)=>{
    // A lost Remove restores the row. Collapse it to check the table notice.
-   if(action==='remove' && !row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
+   if(action==='remove' && recordIsOpen(row)) row.querySelector('.list-toggle').click();
    const label=action==='works' ? row.dataset.key : 'Item '+row.dataset.number;
    const prefix=action==='works' ? 'Not saved: ' : 'Save not confirmed: ';
    check(!status.hidden && status.textContent===label+': '+prefix+reason,
@@ -191,7 +191,7 @@ class LinkedTableTests(unittest.TestCase):
                   + 'const closedItem=' + json.dumps(closed_item) + ';\n'
                   + 'const parkOpenCard=' + json.dumps(park_open_card) + ';\n') + r'''
 const element=()=>({hidden:false,textContent:'',dataset:{},value:'',
- setAttribute(key,value){this[key]=value;},
+ setAttribute(key,value){this[key]=value;},getAttribute(key){return this[key] ?? null;},
  toggleAttribute(key,present){if(present)this[key]='';else delete this[key];return present;},
  classList:{toggle(){}},
  addEventListener(type,listener){this[type]=listener;}});
@@ -227,7 +227,7 @@ const content={
   '[data-empty]':empty,'table':table,'[data-missing-keys]':notice})[selector],
  querySelectorAll:selector=>({'[data-list-item]':rows,'[data-owner-chip]':owners,'[data-type-chip]':chips,'[data-show-chip]':shows})[selector] || [],
 };
-const document={createElement:element};
+const document={createElement:element,getElementById:()=>null};
 const location={search:'',hash:fragment,pathname:'/console/review.html'};
 const history={replaceState(_state,_title,url){this.url=url;}};
 const window={},parent=window,pendingSaves=new Map(),saved=new Map();
@@ -250,7 +250,7 @@ if(closedItem){
 console.log(JSON.stringify({
  itemInUrl:new URLSearchParams(history.url?.split('#')[1]).get('item'),
  shown:rows.filter(row=>!row.hidden).map(row=>row.dataset.key),
- expanded:rows.filter(row=>!row.querySelector('[data-detail]').hidden).map(row=>row.dataset.key),
+ expanded:rows.filter(recordIsOpen).map(row=>row.dataset.key),
  missing:notice && !notice.hidden ? notice.textContent : '',
  counts:Object.fromEntries(shows.map(chip=>[chip.dataset.showChip,chip.querySelector('b').textContent])),
  chips:Object.fromEntries(chips.map(chip=>[chip.dataset.typeChip,chip.querySelector('b').textContent])),

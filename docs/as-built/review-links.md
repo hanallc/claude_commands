@@ -85,6 +85,12 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 
 ### Hana console
 
+Review and The List open an item in a dialog.
+Both pages use the New item frame.
+Close or Esc closes the dialog.
+A click on the backdrop also closes the dialog.
+The item stays in the table while its dialog is open.
+
 Staff names use the current role colors from the Accounts reader.
 `staff_names.StaffNames` shares one staff snapshot and one color reading across each server render.
 It resolves fixed IDs, session IDs, and unambiguous staff names.
@@ -333,6 +339,26 @@ That folder includes the version, source, and ISC license.
 The console inlines the icons and makes no CDN, font, script, or stylesheet request.
 
 ### Review page
+
+An open item shows its detail and actions in the item dialog.
+A refresh updates the table and stores the latest detail for the open item.
+Outside the delivery window, the detail and its signed form stay in place until the user selects **Show updates**.
+The dialog keeps edits made during a save, including the field selection.
+A save response from before the dialog closed cannot replace the reopened detail.
+The dialog reserves space for the update notice outside the scrolling body.
+Actions on a changed record require the latest detail.
+The draft stays editable during the refresh and is available when the new detail opens.
+The next open shows the latest detail.
+The dialog shows its own saved result immediately.
+If the response has no detail, the page requests the detail immediately.
+A confirmed Park or Close closes the dialog, even if the detail cannot refresh.
+The response reports whether message delivery is pending.
+The dialog applies refreshes automatically through the first refresh that reports delivery ended.
+The setting page_delivery_window_seconds limits the time for automatic refreshes.
+Later refreshes offer **Show updates** when the detail changes.
+The dialog shows a refresh error outside the body and keeps the shown detail and draft.
+If the item leaves the list, the dialog keeps the last detail and disables the actions.
+Close returns focus to the item when its row is present.
 
 `/console/review.html` replaces the Changes, Questions and Investigations navigation pages.
 The old addresses redirect to Review with the corresponding type filter.
@@ -658,7 +684,8 @@ After a save, the page shows its result.
 A change with the showrunner appears in All as soon as the page reads the saved request.
 The page does not open another card automatically.
 The shared status component refreshes the page every `page_refresh_seconds`, initially 15 seconds.
-Refresh retains the open row, scroll position and typed text.
+Refresh retains the open item and its draft.
+The dialog keeps the reading position when new text or log entries appear above it.
 The Review navigation entry marks new Open items.
 Every type can set this mark.
 Approved and declined proposals become Done in the shared reader.
@@ -775,10 +802,17 @@ The render value's hover text shows the median of at most 10 successful renders.
 
 ### The List page
 
+An open List item uses the same dialog as Review.
+A refresh updates the rows behind the dialog.
+The dialog keeps its reading position until the user selects **Show updates**.
+New linked Review details use the same control.
+The List log keeps its own scroll position.
+If the item leaves The List, the dialog keeps the last detail and disables the actions.
+
 `/console/list.html` reads the producer's numbered List records on each request.
 The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
-The **+ New item** button beside the title opens the shared Review dialog.
+The **+ New item** button beside the title opens the shared New item dialog.
 The **To** field selects the List page owner from `page.list.owner` in `config/console.conf`.
 **Send** saves the native Review item and a linked List row for the recipient shown in **To**.
 The dialog keeps the draft key when it reopens after a failed send.
@@ -830,8 +864,15 @@ The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
 The chip rows wrap when the available width decreases.
 
-Opening a row closes the previous row on both List and Review.
-The two pages use the same code to open a row.
+Review and The List use the same item dialog.
+The dialog shows the saved state, status, next step, ETA, and done condition.
+It also shows the questions, answers, actions, and log.
+Open Details in a log row to see its evidence.
+The address identifies the open item or the target of its link.
+Back and Forward can open an item that the table filters hide.
+Close the dialog with Escape, the Close button, or a click outside.
+Opening and closing the dialog preserves the table filters, sort, and scroll position.
+A linked Review card hides the List item until the card closes.
 The List shows the item count above the table.
 
 A link under Links opens the target item in the console.
@@ -841,8 +882,10 @@ The table clears each filter that excludes the target and keeps each filter that
 The table scrolls to the target and highlights it briefly.
 The table leaves a gap below the sticky status banner when it shows.
 A missing target shows “Item #N is not on the List”.
+A closed target shows “Item #N is closed”.
+The source dialog keeps its form and draft while it shows the target notice.
 Changing a filter or the sort order clears this notice.
-Back restores the previous filters, open row, and scroll position even when the address stays the same.
+Back restores the previous filters, open item, and table scroll position.
 
 Each List record stores unique `ReviewItem.key` values in link order, without duplicates.
 `the_list.py link L<n> --review <id> [--review <id> ...] --source <who>` adds links.
@@ -877,7 +920,7 @@ A count of 1 takes the singular, for example “1 change for you”.
 When every linked review is Done, it shows “Reviews done — decide: close, keep or park”.
 A missing review key counts as Done.
 An item without links shows no review line.
-The open row repeats the line above its actions and shows each review's shown ID.
+The item dialog repeats the line above its actions and shows each review's shown ID.
 Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
 A review ID opens one card in a dialog on the List.
@@ -938,7 +981,7 @@ Parked items also match the word `Parked`.
 The address retains the owner, producer, status chip, unread switch, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
-The record keeps Evidence, and the open row has no separate Evidence section.
+The record keeps Evidence, and the dialog has no separate Evidence section.
 The log shows its newest entry first.
 On a wide page, the log column fits the height of the left column, including the feedback controls.
 The log entries scroll below the heading when they exceed the available height.
@@ -981,7 +1024,7 @@ The Answer event includes the question ID.
 Link and Unlink events include the review keys.
 Evidence cleanup events name the copy that was removed.
 Request receipts stay in the record and are hidden from the log display.
-Each expanded row with actions has Remove, Park until, and a text box for Ask question and Tell morty.
+The dialog shows Remove, Park until, and a text box for Ask question and Tell morty when those actions are available.
 The text box shows “Your words for morty about this item” as its placeholder and accessible name.
 Ask question and Tell morty sit below the box at its right edge, beside the send status.
 Both buttons stay disabled until the box contains words.
@@ -1013,7 +1056,6 @@ Mark read, Park until, and Remove release the link to the item.
 If the item stops matching the filters, it starts to fade as soon as the user submits the action.
 If the read write fails, the question or feedback remains saved and the sender can deliver it.
 The store keeps the unread update if the read write fails or a newer update exists.
-Tell morty shows “sent to morty; update remains unread” in both cases.
 Tell morty applies the current filters. A read item leaves the view when Unread only is on.
 Tell morty with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
@@ -1103,13 +1145,16 @@ Recovery claims unsent work only after the shared question reader verifies the d
 Recovery leaves uncertain outcomes for the user.
 An older pending attempt with no live sender appears as uncertain.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
-Remove sits at the left edge of the row above the four-line text box.
+Remove sits at the left edge of the dialog above the four-line text box.
+Park and Remove close the dialog after the save.
+The table applies the saved state before the next refresh.
+Park, Remove, Tell morty, Ask question, and Mark read show a message if the page cannot confirm the save.
 **Unpark** and **Park until** sit at the right edge of the row.
-An expanded parked item shows its parking condition above the buttons.
+The dialog shows a parked item's parking condition above the buttons.
 **Unpark** appears in the form when the item has active parking and its state is outside Closed.
 **Park until** opens the picker.
 **Until delivered** sits above the shared calendar and 24-hour time field.
-One click saves this choice and shows “Parked until delivered” in the row.
+Click Until delivered to save this choice and move the item to Parked.
 The picker aligns with the right edge of the text box.
 The page refresh waits while the picker is open.
 **Save** sends the chosen time in UTC.
@@ -1134,7 +1179,7 @@ When Unpark clears parking and removes the row from Parked, the page shows “It
 The page shows confirmations for hidden rows next to the Show filter.
 It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
-If All is active when Unpark saves, the row stays expanded and its item number can receive focus.
+If All is active when Unpark saves, the item dialog stays open.
 After Unpark, the item's saved state sets its status chip.
 After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
@@ -1170,7 +1215,7 @@ The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
-The page uses the saved parking condition to update the labels for the expanded and collapsed row.
+The page uses the saved parking condition to update the labels in the row and dialog.
 A refusal restores the last confirmed item state, parking status, and unread state together.
 The unread state includes the Update sort key.
 If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
@@ -1224,7 +1269,8 @@ It shows a save or send notice as soon as the user submits a form.
 An unread update shows a dot and marks the navigation entry as new.
 The navigation key includes the record ID and update time.
 The page uses `page_refresh_seconds` and the shared refresh helper.
-A refresh retains the search text, selection, focus, scroll position, open row, and filters.
+A refresh retains the search text, selection, focus, open item, and filters.
+The dialog keeps its own scroll position.
 An older response cannot replace a newer response.
 Phone layouts show each row as a card.
 The List uses the published Review snapshot for rows with all their linked records.

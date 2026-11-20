@@ -328,6 +328,66 @@ class ReturningActionHeading(StrEnum):
     SENDS_TO_SHOWRUNNER = "Sends to showrunner"
 
 
+def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
+                   before_body: str = '', footer: str = '', form: bool = False, body_class: str = '') -> str:
+    """Render the frame and the scrollable body of a console dialog."""
+    wrapper = 'form' if form else 'div'
+    return (f'<dialog id="{dialog_id}" aria-labelledby="{title_id}" data-console-dialog>'
+            f'<{wrapper} class="console-dialog-frame"><header><h2 id="{title_id}">{title}</h2>'
+            '<button type="button" data-close aria-label="Close">×</button></header>'
+            f'{before_body}'
+            f'<div class="console-dialog-body{(" " + body_class) if body_class else ""}">'
+            f'{body}</div>{footer}</{wrapper}></dialog>')
+
+
+CONSOLE_DIALOG_STYLE = '''
+[data-console-dialog] {
+ position: fixed; inset: 0; box-sizing: border-box; margin: auto; padding: 0;
+ width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px);
+ color: var(--ink, #f0efec); background: var(--card, #1a1a19); border: 1px solid var(--line, #34332f);
+ border-radius: 12px; box-shadow: 0 20px 60px #0006; overflow: hidden;
+ font: 15px/1.45 system-ui, sans-serif;
+}
+[data-console-dialog] *, [data-console-dialog] *::before, [data-console-dialog] *::after { box-sizing: border-box; }
+[data-console-dialog] [hidden] { display: none; }
+[data-console-dialog]::backdrop { background: #0009; }
+.console-dialog-frame { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; margin: 0;
+ max-height: calc(100dvh - 34px); }
+.console-dialog-frame > :is(header, footer) { padding-inline: 24px; }
+.console-dialog-frame > header {
+ display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-block: 20px 16px;
+}
+.console-dialog-frame > header h2 { margin: 0; font-size: 22px; line-height: 1.2; }
+.console-dialog-frame > header [data-close] {
+ flex: none; min-height: 30px; margin: 0; padding: 0; cursor: pointer;
+ border: 0; border-radius: 6px; background: transparent; width: 30px; height: 30px;
+ color: var(--ink-2, #c3c2b7); font-size: 22px; line-height: 1;
+}
+.console-dialog-body {
+ min-width: 0; padding: 4px 24px 20px; overflow-y: auto; overscroll-behavior: contain;
+ scrollbar-width: thin; scrollbar-color: var(--ink-3, #9a988f) var(--card, #1a1a19);
+}
+@media (max-width: 480px) {
+ .console-dialog-frame > :is(header, footer), .console-dialog-body { padding-inline: 16px; }
+ .console-dialog-frame > header { padding-block: 14px 12px; }
+}
+'''
+
+
+CONSOLE_DIALOG_SCRIPT = '''
+function bindConsoleDialog(dialog,close){
+ dialog.querySelector('[data-close]').addEventListener('click',()=>close());
+ dialog.addEventListener('cancel',event=>{event.preventDefault();close();});
+ let pressedBackdrop=false;
+ dialog.addEventListener('pointerdown',event=>{pressedBackdrop=event.target===dialog;});
+ dialog.addEventListener('click',event=>{
+  if(pressedBackdrop && event.target===dialog) close();
+  pressedBackdrop=false;
+ });
+}
+'''
+
+
 def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "", *,
                          returning_heading: ReturningActionHeading = ReturningActionHeading.ITEM_RETURNS) -> str:
     """Render the Review action groups that have controls."""
