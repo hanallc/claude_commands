@@ -1151,8 +1151,12 @@ def _stop(session: str, kind: str = "", *,
         return StopFailed(identity, reason)
 
 
+NO_WORKERS_TO_KEEP_RUNNING: frozenset[StaffId] = frozenset()
+
+
 def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
-                      codex: herdr.CodexConversations | None = None) -> list[str]:
+                      codex: herdr.CodexConversations | None = None,
+                      keep_running: frozenset[StaffId] = NO_WORKERS_TO_KEEP_RUNNING) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
     from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
@@ -1162,7 +1166,7 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
         return []
     try:
         deadline = worker_lifecycle.effective_deadline()
-        states = worker_panes.observe(unit, record)
+        states = [state for state in worker_panes.observe(unit, record) if state.row.id not in keep_running]
         unresolved = [f"{item.row.name}: {item.reason}" for item in states
                       if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker))]
         live = [item for item in states if isinstance(item, worker_panes.OpenWorker)]
@@ -1196,10 +1200,10 @@ def resume_arguments(entry: pane_launch.NativePaneLaunch) -> list[str]:
         def claude_role_fallback() -> pane_record.ClaudeResumeSettings:
             from scripts.herdr import worker_panes
 
-            try:
-                settings = worker_panes.launch_policy(role, "claude").settings
-            except (OSError, ValueError, subprocess.SubprocessError):
+            policy = worker_panes.checked_role_policy(role, "claude")
+            if isinstance(policy, worker_panes.StartRefused):
                 return pane_record.NO_CLAUDE_RESUME_SETTINGS
+            settings = policy.launch.settings
             return pane_record.ClaudeResumeSettings(settings.model, settings.effort)
 
         return pane_record.resume_arguments(current, claude_role_fallback=claude_role_fallback)
@@ -2534,7 +2538,8 @@ def _run_moves(selected: list[str], target: str, *, why: str, warn_seconds: int,
                         locks = {session: locks[session] for session in (*held, *ready)}
                         continue
                     moved = _move_now(list(ready), account, why=why, requester=requester,
-                                      cause=cause, source_accounts=source_accounts, plans=ready, locks=locks)
+                                      cause=cause, source_accounts=source_accounts, plans=ready, locks=locks,
+                                      admitted_record=record)
                     results.update(zip(ready, moved))
             if not held:
                 break
@@ -2566,8 +2571,10 @@ def _stop_move(plan: MoveStopTarget) -> StopResult:
 
 def _move_now(selected: list[str], target: str, *, why: str, requester: str,
               cause: moves.MoveCause, source_accounts: Mapping[str, str], plans: Mapping[str, MoveStopTarget],
-              locks: Mapping[str, LockedMoveRow]) -> list[MoveResult]:
+              locks: Mapping[str, LockedMoveRow], admitted_record: StaffSnapshot) -> list[MoveResult]:
     """Stop the selected rows before resuming any of them."""
+    from scripts.herdr import worker_panes
+
     began = monotonic()
     sources = dict(source_accounts)
     sources.update((session, plan.source) for session, plan in plans.items() if plan.source)
@@ -2580,6 +2587,33 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
             checked = accounts.check_move_target(target, datetime.now(timezone.utc))
             if isinstance(checked, accounts.MoveRefused):
                 failures.update((session, StopFailed(plan.identity, checked.reason)) for session, plan in plans.items())
+        worker_policies: dict[StaffId, worker_panes.CheckedRolePolicy] = {}
+        needs_role: dict[str, MoveStopTarget] = {}
+        for session, plan in plans.items():
+            row = plan.member.staff_row(admitted_record)
+            if session in failures or row is None or row.kind != "worker":
+                continue
+            try:
+                if pane_record.publication_for_session(plan.identity, record=admitted_record) is None:
+                    needs_role[session] = plan
+            except (OSError, ValueError) as error:
+                failures[session] = StopFailed(plan.identity, str(error))
+        if needs_role:
+            try:
+                record = staff.initial_snapshot()
+            except (OSError, ValueError) as error:
+                for session, plan in needs_role.items():
+                    failures[session] = StopFailed(plan.identity, f"anomaly: cannot read worker role: {error}")
+            else:
+                for session, plan in needs_role.items():
+                    row = plan.member.staff_row(record)
+                    if row is None or row.kind != "worker":
+                        continue
+                    policy = worker_panes.checked_role_policy(worker_panes.dispatch_role(row))
+                    if isinstance(policy, worker_panes.StartRefused):
+                        failures[session] = StopFailed(plan.identity, f"{policy.reason.value}: {policy.detail}")
+                    else:
+                        worker_policies[row.current_session] = policy
         stops = [pool.submit(failures.__getitem__, session) if session in failures
                  else pool.submit(_stop_move, plans[session]) for session in selected]
         stopped: list[StopResult] = []
@@ -2593,7 +2627,12 @@ def _move_now(selected: list[str], target: str, *, why: str, requester: str,
                 stopped.append(StopFailed(session, str(error)))
 
         client = herdr.Herdr(herdr.shared_session())
-        resumes = {pool.submit(_resume_move, result.session_id, target, requester, why, began, client): (index, result.session_id)
+
+        def resume_stopped(identity: str) -> ResumeResult:
+            with worker_panes.use_checked_resume_policies(worker_policies):
+                return _resume_move(identity, target, requester, why, began, client)
+
+        resumes = {pool.submit(resume_stopped, result.session_id): (index, result.session_id)
                    for index, result in enumerate(stopped) if isinstance(result, (Stopped, NotRunning))}
         outcomes: dict[int, ClaudeUp | StopFailed | SessionNotFound | ResumePending] = {}
         for index, result in enumerate(stopped):

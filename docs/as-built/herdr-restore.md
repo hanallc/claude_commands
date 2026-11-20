@@ -69,6 +69,8 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
   A worker account move uses the role model if the saved model is empty.
   A same-role worker restore uses the role model when there is no usable turn.
   Worker account moves and same-role restores use the role effort when the turn has no effort.
+  A restart checks the assigned role before stopping the worker and uses that policy for restore.
+  A direct resume with saved launch data can proceed when the Claude role is missing or unreadable.
   Without a launch record, `restart.session_launch` supplies the model and effort that the turn records.
   The launch-name reader supplies the current display name.
 - A replacement closes its source only after resume publication proves the new conversation.
