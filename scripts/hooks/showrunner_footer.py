@@ -18,7 +18,7 @@ from scripts.lib.user_zone import user_zone_name  # noqa: E402
 
 from scripts.production.update_registration import ReportItem as ReportItem, reports_path as reports_path
 from scripts.production.update_registration import QuestionStaff
-from scripts.production import showrunners, staff
+from scripts.production import record_store, showrunners, staff
 from scripts.agents.remote import local_machine
 
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
@@ -67,16 +67,15 @@ def targeted_instances(session_id: str) -> list[Path]:
 def production_doc(instance_dir: Path) -> Path | None:
     """Read the timer owner's document from staff."""
     owner = showrunners.owner_for_timer(instance_dir)
-    return owner.doc.path if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) else None
+    return record_store.local_document(owner)
 
 
 def read_production(instance_dir: Path) -> Production | None:
     """Return a running production, or report a failed read with FooterError."""
     try:
         owner = showrunners.owner_for_timer(instance_dir)
-        if not isinstance(owner.doc, staff.LiveDoc):
+        if not isinstance(owner.doc, staff.LiveDoc) or (doc := record_store.local_document(owner)) is None:
             return None
-        doc = owner.doc.path
         lines = doc.read_text().splitlines()
         status = next((match.group(1) for line in lines if (match := STATUS.search(line))), None)
         if status != "running":

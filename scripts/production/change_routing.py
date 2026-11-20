@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import cast
 
 from scripts.lib import conf
-from scripts.production import delivery_state, staff, unrouted_alert
+from scripts.production import delivery_state, record_store, staff, unrouted_alert
 from scripts.production.issues import source_paths
 from scripts.production.production_doc import Refusal, production_field
 
@@ -180,11 +180,12 @@ class StaffRouting:
         """Check only documents that can supply this production."""
         runner = self.runners_by_name.get(name)
         candidates: list[Path] = []
-        if runner is not None and isinstance(runner.doc, (staff.LiveDoc, staff.WrappedDoc)):
-            candidates.append(runner.doc.path)
-        if name in self.supplied_documents:
-            candidates.append(self.supplied_documents[name])
-        candidates.extend(self.list_documents.get(name, ()))
+        if (document := record_store.local_document(runner)) is not None:
+            candidates.append(document)
+        if runner is None or not isinstance(runner.doc, staff.LiveDoc):
+            if name in self.supplied_documents:
+                candidates.append(self.supplied_documents[name])
+            candidates.extend(self.list_documents.get(name, ()))
         for path in dict.fromkeys(candidates):
             if path not in self.checked_paths:
                 if self.sources is not None:
