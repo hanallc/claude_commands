@@ -3271,7 +3271,7 @@ Tests: one row in `test_end_reports_held_work_and_continues_after_a_removal_erro
 ### Phase 44dr — Placement sees every held coordinator lease  · status: todo
 **From the 44dm closure (pass 2), 2026-11-19:** the builds landing rule moves this gap out of 44dm. After 44dm merges.
 
-1. The coordinator lease lookup reads the kernel lock table once (scripts/mac_test/eligibility.py:272). The lock helper documents that the kernel can omit a holder line (scripts/lib/file_lock.py:99). Then placement can assign a run that offload at once refuses as `busy` (offload.py:3181); the retry recovers, and the exclusive lease still protects the mirror. Fix: read the lease as the lock helper documents, in one place that both readers use, with no extra read in the common case.
+1. The coordinator lease lookup reads the kernel lock table once (scripts/mac_test/eligibility.py:272). The lock helper documents that the kernel can omit a holder line (scripts/lib/file_lock.py:99). Then placement can assign a run that offload at once refuses as `busy` (offload.py:3181); the retry recovers, and the exclusive lease still protects the mirror. Fix: drop the `reads=1` override in `mac_mirror_holder`, so the lookup uses the helper's repeat count (`PROC_LOCKS_READS`). The cost is up to two more local reads of `/proc/locks` when no run holds the lease; correctness ranks first.
 
 Tests: one row in the existing coordinator lease rows (scripts/mac_test/test_mac_test.py:1342) for an omitted holder line, failing first.
 
