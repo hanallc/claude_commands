@@ -69,7 +69,8 @@ class HanaReceiverSettingsTests(unittest.TestCase):
             arguments = cast(list[str], launch.call_args.args[0])
             self.assertIn('--property=RuntimeMaxSec=23', arguments)
             self.assertIn('--property=EnvironmentFile=/etc/hana-aws/runner-environment', arguments)
-            self.assertIn('--property=ExitType=cgroup', arguments)
+            self.assertIn('--property=ExitType=main', arguments)
+            self.assertNotIn('--property=ExitType=cgroup', arguments)
             self.assertIn('--uid=hana-runner', arguments)
             self.assertIn('--property=TemporaryFileSystem=/run/hana-payload:mode=1777,nodev,nosuid,size=1048576', arguments)
             self.assertEqual(arguments[arguments.index('--') + 1:],

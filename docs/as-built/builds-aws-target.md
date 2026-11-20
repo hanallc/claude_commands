@@ -1488,7 +1488,23 @@ The runner retains inherited slot locks through command execution.
 
 ## Hana result transport
 
+The command runs in a transient systemd service with `ExitType=main`.
+The runner detects Cargo exit even when a descendant keeps an output pipe open.
+When the runner observes Cargo exit, it measures the bytes pending on each pipe.
+It reads those bytes within the transport size limit, closes both pipes, and returns the Cargo status.
+The payload exits after the runner returns and the payload cleans up its temporary files.
+When the payload exits, systemd stops the service and kills remaining processes with `KillMode=control-group`.
+The receiver requires launcher exit, an empty command cgroup, and a free maker lease before it uploads the result.
+It also requires this evidence before it confirms a fence for a running command.
+The execution journal stores the systemd exit time, first free lease probe, and upload start under `observation.timing`.
+The receiver also records when it first confirms unit exit.
+After a restart, the receiver can read the journal without the original launcher object.
+The receiver retries a missing journal entry on each pass until it records the exit time or confirms departure.
+The systemd exit time is absent if the guest cannot read the matching journal entry.
+Each time uses Unix seconds on the guest.
+
 The guest sends `result.json` with both compiler output streams and the command status.
+A unit timeout takes precedence over a complete result because cleanup can still be in progress.
 The JSON limit is 32 MiB.
 The guest and sender use `result_transfer_timeout_s` for the upload and download.
 The guest uses curl for the upload and keeps the signed URL out of process arguments.
@@ -1500,6 +1516,7 @@ The receiver reads and processes the fence before the permit in every pass.
 A control step can fail during a read, a write, decoding, or validation.
 The receiver continues to process the other control requests in the same pass.
 A fence sends SIGKILL to the upload process and reaps it before the receiver acknowledges the fence.
+The fence observation includes the recorded upload start time, and the controller saves the observation during settlement.
 The receiver records an upload attempt before the PUT and records its result before it publishes the observation.
 After a restart, the receiver records an unconfirmed upload as `HanaResultUploadFailed` and reports the loss.
 Command and fence documents and execution observations have a 64 KiB protocol limit.
