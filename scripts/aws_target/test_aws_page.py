@@ -6,10 +6,12 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from html import unescape
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 from typing import cast, override
 import unittest
 from unittest import mock
@@ -291,6 +293,114 @@ class AwsPageSettledAmountsTests(ledger_test_support.CostFixture):
             'Settled AWS amounts: 8 of 9 did not change after they settled (checked Nov 19).',
             '2026-11-12 changed from USD 7.73 to USD 7.81 (+0.08).',
         ])
+
+
+@unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+class AwsHoursColorTests(unittest.TestCase):
+    def test_hours_color_marks_rounded_differences_and_the_filtered_total(self) -> None:
+        limit = Decimal('.20')
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        ledger_test_support.install_aws_fixture_settings(root)
+        settings = root / 'aws_target.conf'
+        ledger_test_support.override_fixture_settings(settings, f"""
+billed_hours_gap_max_ratio={limit}
+hours_table_open_row_limit=5
+""")
+        _ = (root / 'console.conf').write_text("""\
+# range: 0..
+status.round_trip_limit_seconds=1
+# range: 0..
+status.render_limit_seconds=1
+# range: 0..
+status.reading_delay_seconds=1
+# range: 0..
+status.aws.age_limit_seconds=3900
+""")
+        state = root / 'state'
+        state.mkdir()
+        readings = (
+            ('us-east-1', '2.0', '1.0', 'difference', '+1.0'),
+            ('us-east-2', '1.0', '2.0', 'difference', '-1.0'),
+            ('eu-west-1', '1.0', '1.0', 'no-difference', '0.0'),
+            ('us-west-1', '1.049', '1.0', 'no-difference', '0.0'),
+            ('us-west-2', '1.2', '1.0', 'difference', '+0.2'),
+        )
+        checks = {('c7a.4xlarge', region, '2026-01-14'): run_cost.hours_check(Decimal(billed), Decimal(box), limit)
+                  for region, billed, box, _kind, _text in readings}
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        with (mock.patch.dict(os.environ, {'CONF_DIR': str(root), 'USER_ZONE': 'UTC'}),
+              mock.patch.object(run_cost, 'day_hours_checks', return_value=checks)):
+            page = aws_page.publish(state, now, root / 'page', settings_path=settings).read_text()
+        payload = page.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
+        hours = cast(aws_page.PageData, json.loads(payload))['hours']
+        assert hours['kind'] == 'comparison'
+        self.assertEqual({row['region']: row['difference_kind'] for row in hours['rows']},
+                         {region: kind for region, _billed, _box, kind, _text in readings})
+
+        expected = json.dumps([(region, kind, value) for region, _billed, _box, kind, value in readings])
+        probe = '<script>\n(async () => {\nconst expected = ' + expected + r''';
+const failures = [];
+const realFetch = window.fetch;
+const section = document.getElementById("hours");
+const check = (condition, message) => { if (!condition) throw new Error(message); };
+const total = () => section.querySelector("tfoot tr").cells[3];
+const expectedColor = value => {
+  const reference = document.body.appendChild(document.createElement("span"));
+  reference.style.color = value;
+  const color = getComputedStyle(reference).color;
+  reference.remove();
+  return color;
+};
+try {
+  for (const theme of ["dark", "light"]) {
+    document.documentElement.dataset.theme = theme;
+    const yellow = expectedColor("var(--warning)");
+    const blue = expectedColor("color-mix(in srgb, var(--accent) 80%, var(--ink))");
+    check(yellow !== blue, `${theme}: both colors are distinct`);
+    for (const [region, kind, text] of expected) {
+      const row = [...section.querySelectorAll("tbody tr")].find(row => row.cells[1].textContent === region);
+      const cell = row.cells[4];
+      const color = kind === "difference" ? yellow : blue;
+      check(cell.classList.contains(`hours-${kind}`) && cell.textContent === text, `${theme}: ${region} class and value`);
+      check(getComputedStyle(cell).color === color, `${theme}: ${region} computed color`);
+    }
+    const legend = section.querySelector(".hours-legend");
+    check(legend.textContent === "Yellow: AWS and our records differ. Blue: they agree.", `${theme}: legend text`);
+    check(getComputedStyle(legend.children[0]).color === yellow && getComputedStyle(legend.children[1]).color === blue,
+          `${theme}: legend colors`);
+    check(total().classList.contains("hours-difference") && total().textContent === "+0.2"
+          && getComputedStyle(total()).color === yellow, `${theme}: total differs`);
+    const extra = document.querySelector("#regions [data-region='us-west-2']");
+    extra.click();
+    check(total().classList.contains("hours-no-difference") && total().textContent === "0.0"
+          && getComputedStyle(total()).color === blue, `${theme}: the filtered total agrees`);
+    extra.click();
+  }
+  const tableValues = () => [...section.querySelectorAll("table tr")].map(row =>
+    [...row.cells].map(cell => cell.textContent));
+  const before = JSON.stringify(tableValues());
+  const olderData = document.getElementById("aws-prices-data").cloneNode(true);
+  const olderPayload = JSON.parse(olderData.textContent);
+  delete olderPayload.hours.difference_kinds;
+  for (const row of olderPayload.hours.rows) delete row.difference_kind;
+  olderData.textContent = JSON.stringify(olderPayload);
+  const gateData = document.getElementById("aws-gate-time-data");
+  window.fetch = async () => ({ok: true, text: async () => olderData.outerHTML + gateData.outerHTML});
+  try {
+    await loadAws();
+  } finally {
+    window.fetch = realFetch;
+  }
+  check(JSON.stringify(tableValues()) === before, "The older refresh keeps every table value");
+  check(!section.querySelector(".hours-difference, .hours-no-difference, .hours-legend"),
+        "The older refresh uses the default text color");
+} catch (error) {
+  failures.push(String(error));
+}
+await realFetch("/probe", {method: "POST", body: JSON.stringify(failures)});
+})();
+</script>'''
+        self.assertEqual(firefox_probe_results(page.replace('</body>', probe + '</body>', 1).encode()), [[]])
 
 
 @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the AWS table checks")
@@ -761,73 +871,6 @@ class AwsCombinedTableTests(PageCostFixture):
           + "3 rows are more than 4% above their recorded hours plus the hours reserved for Hana.",
           "The summary uses 3.0 against 3.0 and the limits use full precision");
 """)
-
-    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_hours_color_marks_rounded_differences_and_the_filtered_total(self) -> None:
-        limit = Decimal('.20')
-        self.costs({'billed_hours_gap_max_ratio': str(limit)})
-        self.configure('hours_table_open_row_limit=5')
-        readings = (
-            ('us-east-1', '2.0', '1.0', 'difference', '+1.0'),
-            ('us-east-2', '1.0', '2.0', 'difference', '-1.0'),
-            ('eu-west-1', '1.0', '1.0', 'no-difference', '0.0'),
-            ('us-west-1', '1.049', '1.0', 'no-difference', '0.0'),
-            ('us-west-2', '1.2', '1.0', 'difference', '+0.2'),
-        )
-        checks = {('c7a.4xlarge', region, '2026-01-14'): run_cost.hours_check(Decimal(billed), Decimal(box), limit)
-                  for region, billed, box, _kind, _text in readings}
-        with mock.patch.object(run_cost, 'day_hours_checks', return_value=checks):
-            page = self.fixture_page().read_text()
-        payload = page.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
-        hours = cast(aws_page.PageData, json.loads(payload))['hours']
-        assert hours['kind'] == 'comparison'
-        self.assertEqual({row['region']: row['difference_kind'] for row in hours['rows']},
-                         {region: kind for region, _billed, _box, kind, _text in readings})
-
-        expected = json.dumps([(region, kind, value) for region, _billed, _box, kind, value in readings])
-        probe = '<script>\nconst expected = ' + expected + r''';
-const failures = [];
-const section = document.getElementById("hours");
-const check = (condition, message) => { if (!condition) throw new Error(message); };
-const total = () => section.querySelector("tfoot tr").cells[3];
-const expectedColor = value => {
-  const reference = document.body.appendChild(document.createElement("span"));
-  reference.style.color = value;
-  const color = getComputedStyle(reference).color;
-  reference.remove();
-  return color;
-};
-try {
-  for (const theme of ["dark", "light"]) {
-    document.documentElement.dataset.theme = theme;
-    const yellow = expectedColor("var(--warning)");
-    const blue = expectedColor("color-mix(in srgb, var(--accent) 80%, var(--ink))");
-    check(yellow !== blue, `${theme}: both colors are distinct`);
-    for (const [region, kind, text] of expected) {
-      const row = [...section.querySelectorAll("tbody tr")].find(row => row.cells[1].textContent === region);
-      const cell = row.cells[4];
-      const color = kind === "difference" ? yellow : blue;
-      check(cell.classList.contains(`hours-${kind}`) && cell.textContent === text, `${theme}: ${region} class and value`);
-      check(getComputedStyle(cell).color === color, `${theme}: ${region} computed color`);
-    }
-    const legend = section.querySelector(".hours-legend");
-    check(legend.textContent === "Yellow: AWS and our records differ. Blue: they agree.", `${theme}: legend text`);
-    check(getComputedStyle(legend.children[0]).color === yellow && getComputedStyle(legend.children[1]).color === blue,
-          `${theme}: legend colors`);
-    check(total().classList.contains("hours-difference") && total().textContent === "+0.2"
-          && getComputedStyle(total()).color === yellow, `${theme}: total differs`);
-    const extra = document.querySelector("#regions [data-region='us-west-2']");
-    extra.click();
-    check(total().classList.contains("hours-no-difference") && total().textContent === "0.0"
-          && getComputedStyle(total()).color === blue, `${theme}: the filtered total agrees`);
-    extra.click();
-  }
-} catch (error) {
-  failures.push(String(error));
-}
-fetch("/probe", {method: "POST", body: JSON.stringify(failures)});
-</script>'''
-        self.assertEqual(firefox_probe_results(page.replace('</body>', probe + '</body>', 1).encode()), [[]])
 
     def test_hours_exclude_unbilled_rows_and_keep_their_regions_in_the_filter(self) -> None:
         limit = Decimal('.2')
