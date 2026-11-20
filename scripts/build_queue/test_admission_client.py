@@ -1325,12 +1325,13 @@ class ClientTests(unittest.TestCase):
                 return client.step_request(argv, seed.cwd, seed.owner, seed.since, "", seed.episode)
 
             with mock.patch.object(client, "CLOCK", fixture.clock), \
+                    mock.patch.object(client, "DefaultSelector", side_effect=partial(PrivateSocketSelector, fixture)), \
                     mock.patch.object(fixture.server, "handle_request", side_effect=observe), \
                     mock.patch.object(fixture.server, "reply_filter", side_effect=record_expiry_order), \
                     mock.patch.object(client, "_line", new=receive_reply), \
                     mock.patch.object(step_estimator, "git_identity",
                                       return_value=(records.UnknownRepository(), "tree")), \
-                    mock.patch.object(step_estimator, "expected_peak", side_effect=estimate):
+                    mock.patch.object(step_estimator, "expected_peak", side_effect=estimate), exchange.protect():
                 reply = shell_place.request_place(shell_place.RefreshedRequest(refresh), client.WaitOutput())
             self.assertIsInstance(reply, wire.Admitted)
             self.assertEqual(estimates, 3)
