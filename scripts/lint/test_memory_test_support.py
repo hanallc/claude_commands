@@ -42,10 +42,10 @@ class ConfigFixtureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "private-mac.conf"
             _ = path.write_text("host=private-host\n")
-            _ = write_config_fixture(path, "offload=on\n", template="mac_test")
+            _ = write_config_fixture(path, "free_floor_gib=90\n", template="mac_test")
             text = path.read_text()
         self.assertIn("host=private-host\n", text)
-        self.assertIn("offload=on\n", text)
+        self.assertIn("free_floor_gib=90\n", text)
         self.assertIn("leftover_timeout_s=", text)
 
     def test_existing_and_explicit_limits_follow_their_values(self) -> None:
@@ -53,7 +53,7 @@ class ConfigFixtureTests(unittest.TestCase):
             path = Path(directory) / "aws_target.conf"
             _ = path.write_text("# range: 0..\nfixed_usd_per_month=0\n")
             _ = write_config_fixture(path, "kinds=test,doc\n# whole: 0..\nslots=0\n")
-            _ = write_config_fixture(path, "offload=on\n")
+            _ = write_config_fixture(path, "build_budget_gib=4\n")
             text = path.read_text()
         self.assertIn("# range: 0..\nfixed_usd_per_month=0\n", text)
         self.assertIn("# whole: 0..\nslots=0\n", text)

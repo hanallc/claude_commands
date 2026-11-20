@@ -2763,7 +2763,7 @@ mac_only_refuse() {
         unreachable) text="the Mac cannot be reached (/build:status --probe)" ;;
         backoff) text="the Mac was unreachable a short time ago (retry backoff)" ;;
         disk) text="the Mac is below its free-space floor" ;;
-        off) text="Mac offload is off" ;;
+        off) text="enabled.mac is off" ;;
         repo) text="this repository has no Mac setting" ;;
         linux_only) text="the step covers a package that is Linux only on the Mac" ;;
         state) text="the Mac claim state cannot be read" ;;

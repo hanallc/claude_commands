@@ -118,7 +118,7 @@ class MacRouteTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (root / "mac.conf").touch()
         _ = (root / "build_targets.conf").write_text(
-            "targets=mac,natedev\n"
+            "enabled.mac=on\ntargets=mac,natedev\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n",
             encoding="utf-8",

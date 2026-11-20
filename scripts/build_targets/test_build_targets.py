@@ -381,7 +381,7 @@ class StatusTests(IsolatedBuildTargetTest):
             claim["holder_session"] = holder_session
             _ = path.write_text(json.dumps(claim))
         config = self.write_config(
-            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
@@ -415,7 +415,7 @@ class StatusTests(IsolatedBuildTargetTest):
             claim = cast(dict[str, object], json.loads(path.read_text()))
             claim.update(holder_session=holder, proc_start=started)
             _ = path.write_text(json.dumps(claim))
-        config = self.write_config("targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        config = self.write_config("enabled.mac=on\ntargets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         labels = {
             "live-session": roster.UnitLabels("report", "builds", "report"),
             "stale-session": roster.UnitLabels("inspectors", "hana", "inspectors"),
@@ -458,7 +458,7 @@ class StatusTests(IsolatedBuildTargetTest):
     def test_named_mac_hold_uses_current_labels_and_keeps_expiry(self) -> None:
         self.write_block()
         config = self.write_config(
-            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n",
+            "enabled.mac=on\ntargets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n",
         )
         labels = {"hana-session": roster.UnitLabels("inspectors", "hana", "inspectors")}
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
@@ -476,7 +476,7 @@ class StatusTests(IsolatedBuildTargetTest):
         _ = path.write_text(json.dumps(record))
         before = path.read_bytes()
         config = self.write_config(
-            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n")
         for start in (process_identity.Gone(), process_identity.Started("reused-pid-start")):
             with self.subTest(start=start), mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
@@ -485,7 +485,7 @@ class StatusTests(IsolatedBuildTargetTest):
             self.assertEqual(path.read_bytes(), before)
 
     def test_free_status_counts_kept_claims_without_changing_them(self) -> None:
-        config = self.write_config("targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        config = self.write_config("enabled.mac=on\ntargets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         before: dict[Path, bytes] = {}
         (self.mac_state / "claims").mkdir(parents=True, exist_ok=True)
         for count in (1, 2):
@@ -509,7 +509,7 @@ class StatusTests(IsolatedBuildTargetTest):
         record["idle_since"] = "2026-10-11T20:20:00+00:00"
         _ = path.write_text(json.dumps(record))
         config = self.write_config(
-            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
@@ -527,7 +527,7 @@ class StatusTests(IsolatedBuildTargetTest):
         _ = liner.write_text(json.dumps(record))
         self.write_claim("claims/hana.json")
         config = self.write_config(
-            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}), \
@@ -712,7 +712,7 @@ class StatusTests(IsolatedBuildTargetTest):
             return offload.UnreachableHost(f"SSH probe failed for {config.host}")
 
         config = self.write_config(
-            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
@@ -786,9 +786,9 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
     def setUp(self) -> None:
         super().setUp()
         config = self.write_config(
-            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            "enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n")
-        _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=linux-part\nfree_floor_gib=60\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "linux_only.hana=linux-part\nfree_floor_gib=60\n", template="mac_test")
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\nexclude=["crates/excluded"]\n')
         for directory, name in (("portable", "portable"), ("excluded", "linux-part")):
             member = self.root / "crates" / directory
@@ -850,18 +850,18 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
 
     def test_kind_table_keeps_target_order_settings_and_each_mac_decision(self) -> None:
         other_settings = self.settings.with_name("other.conf")
-        _ = write_config_fixture(other_settings, "offload=off\nlinux_only.hana=\n", template="mac_test")
+        _ = write_config_fixture(other_settings, "linux_only.hana=\n", template="mac_test")
         _ = self.write_config(
-            "targets=natedev,other,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            "enabled.mac=off\ntargets=natedev,other,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.other=ssh\nplatform.other=macos\nsettings.other=other.conf\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         self.assertEqual(self.kind_output("check"),
                          "any_target\nnatedev\teligible\t-\t-\t-\n"
-                         + f"other\texcluded\toff\t{other_settings}\tmacos\nmac\teligible\t-\t{self.settings}\tmacos\n")
+                         + f"other\texcluded\toff\t{other_settings}\tmacos\nmac\texcluded\toff\t{self.settings}\tmacos\n")
         self.assertEqual(self.kind_output("build", "portable"),
                          "any_target\nnatedev\teligible\t-\t-\t-\n"
                          + f"other\texcluded\toff\t{other_settings}\tmacos\n"
-                         + f"mac\teligible\t-\t{self.settings}\tmacos\n")
+                         + f"mac\texcluded\toff\t{self.settings}\tmacos\n")
 
     def test_local_only_configuration_keeps_build_and_gate_routes(self) -> None:
         _ = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
@@ -945,7 +945,7 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(self.kind_answer("check", free_gib=59), "any_target\n")
         offload.write_backoff(time.time() + 60)
         self.assertEqual(self.kind_answer("doc"), "any_target\n")
-        _ = write_config_fixture(self.settings, "offload=off\nlinux_only.hana=\n", template="mac_test")
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
         self.assertEqual(self.kind_answer("lint"), "any_target\n")
 
     def test_temporary_mac_exclusions_keep_the_leave_route_available(self) -> None:

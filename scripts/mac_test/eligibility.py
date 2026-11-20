@@ -12,7 +12,7 @@ import time
 from typing import Literal, NewType, cast
 from urllib.parse import quote
 
-from scripts.build_targets import target_config
+from scripts.build_targets import machine_switch, target_config
 from scripts.buildlog import repository, store
 from scripts.lib import conf
 from scripts.mac_test import cargo_manifest
@@ -222,14 +222,15 @@ def connection_settings(config: conf.ConfigRead) -> SshConnectionSettings:
                                  config.number("leftover_timeout_s"))
 
 
-def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
+def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS, *, enabled: bool = True) -> OffloadConfig:
+    """Read SSH execution settings without reading placement policy."""
     settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
     config = conf.read(settings)
     values = config.values()
     values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
     values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
     return OffloadConfig(
-        enabled=config.text("offload") == "on",
+        enabled=enabled,
         connection=connection_settings(config),
         probe_timeout_s=config.number("probe_timeout_s"),
         unreachable_backoff_s=config.number("unreachable_backoff_s"),
@@ -239,6 +240,18 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
         source=settings,
         settings=config,
     )
+
+
+def read_placement_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS, *,
+                          platform: target_config.Platform = "macos") -> OffloadConfig:
+    """Read SSH execution settings with the switch for a Mac placement."""
+    return read_config(path, enabled=placement_enabled(platform))
+
+
+def placement_enabled(platform: target_config.Platform) -> bool:
+    """Read the Mac switch only for placements that use macOS."""
+    return (platform != "macos"
+            or machine_switch.read(machine_switch.Machine.MAC) is machine_switch.MachineSwitch.ON)
 
 
 def repository_identity(repo_root: Path) -> RepositoryIdentity:
@@ -447,13 +460,13 @@ def mac_step_eligibility(config: OffloadConfig | conf.ConfigRead, repo_root: Pat
                          verb: MacVerb, target: str = "", *, kind: str = "",
                          backoff: BackoffState | ReadBackoff = READ_BACKOFF) -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
-    enabled = config.enabled if isinstance(config, OffloadConfig) else config.value("offload", conf.on_off)
+    platform = configured_ssh_target(target).platform if target else "macos"
+    enabled = config.enabled if isinstance(config, OffloadConfig) else placement_enabled(platform)
     if not enabled:
         return IneligibleMacStep("off")
     repository = repository_identity(repo_root)
     if isinstance(repository, UnknownRepository):
         return IneligibleMacStep("repo")
-    platform = configured_ssh_target(target).platform if target else "macos"
     policy = configured_step_policy(config, platform, repository, repo_root, package, kind or verb_kind(verb))
     if isinstance(policy, IneligibleMacStep):
         return policy

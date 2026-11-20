@@ -26,7 +26,7 @@ from scripts.lib.checkout_test_support import fixture_shim_source
 from scripts.lib import conf, test_hang_guard
 
 
-MAC_TARGET_CONFIG = "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+MAC_TARGET_CONFIG = "enabled.mac=on\ntargets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
 DOC_INDEX_MIB = "250"
 LINT_TRIM_CONFIG = f"""\
 # range: 0..

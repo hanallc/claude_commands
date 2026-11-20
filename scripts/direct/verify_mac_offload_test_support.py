@@ -1087,7 +1087,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                 settings = self.root / configured.get("settings." + destination.target, "mac_test.conf")
                 values = dict(line.split("=", 1) for line in settings.read_text().splitlines()
                               if "=" in line and not line.lstrip().startswith("#"))
-                if values.get("offload") == "off":
+                if destination.provider == "mac" and configured.get("enabled.mac") == "off":
                     eligibility = placement.TemporaryExclusion("off")
                 elif ((backoff := provider_directory / "unreachable_until").exists()
                       and float(backoff.read_text()) > time.time()):
@@ -1217,9 +1217,9 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         _ = write_config_fixture(self.root / "lint.conf")
         _ = write_config_fixture(self.root / "mac_test.conf")
         settings = self.root / "mac settings.conf"
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
+        _ = write_config_fixture(settings, f"linux_only.{self.root.name}=\n", template="mac_test")
         config = self.root / "build_targets.conf"
-        _ = config.write_text("targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
+        _ = config.write_text("enabled.mac=on\ntargets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
         metadata: CargoMetadata = {
             "workspace_root": str(self.root),

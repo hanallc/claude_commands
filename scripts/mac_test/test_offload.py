@@ -496,10 +496,10 @@ class OffloadSettingsTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.settings = self.root / "mac_test.conf"
         _ = write_config_fixture(self.settings,
-            "offload=on\nhost=mac\nmirror_root=~/.local/state/mac-test/test-mirror\n"
+            "host=mac\nmirror_root=~/.local/state/mac-test/test-mirror\n"
             + "linux_only.cargo-liner=\nmac_budget_gib=24\nconnect_timeout_s=6\n"
             + "probe_timeout_s=15\nleftover_timeout_s=10\nunreachable_backoff_s=300\nfree_floor_gib=100\n")
-        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=on\nplatform.mac=macos\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **config_environment(self.root),
             **copies_environment(self.root),
@@ -584,7 +584,7 @@ class OffloadSettingsTests(unittest.TestCase):
                                      ("linux.conf", "target_budget_gib")):
             with self.subTest(settings=filename):
                 settings = self.root / filename
-                _ = write_config_fixture(settings, "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
+                _ = write_config_fixture(settings, "host=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
                     + f"unreachable_backoff_s=4\nfree_floor_gib=5\n{budget_key}=6\n"
                     + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\nmirror_busy_backoff_s=91\n", template="mac_test")
                 config = eligibility.read_config(settings)
@@ -680,7 +680,7 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertIn("free_floor_gib", warning.getvalue())
         # An explicit new file with no good revision cannot recover.
         unknown = self.root / "uncommitted.conf"
-        _ = unknown.write_text("offload=on\n")
+        _ = unknown.write_text("")
         with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
             _ = eligibility.read_config(unknown)
 
@@ -810,7 +810,7 @@ class OffloadSettingsTests(unittest.TestCase):
         from scripts.build_queue import admission_records as records
         from scripts.build_hold.owning_session import NoOwningSession
 
-        _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n", template="mac_test")
+        _ = write_config_fixture(self.settings, "linux_only.hana=\nprobe_timeout_s=2.5\n", template="mac_test")
         fixture = self.enterContext(AdmissionFixture(root=self.root))
         start = records.process_start_time(os.getpid())
         assert start is not None
@@ -961,12 +961,11 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertIn("build_target_directory=/remote/cargo output\n", self.result_path.read_text())
 
     def test_configuration_declines_before_claiming(self) -> None:
-        self.config["offload"] = "off"
-        self.sync_config()
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
         self.assert_declined(self.command(), "off")
         self.assertEqual(self.events(), [])
 
-        self.config["offload"] = "on"
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=on\n")
         _ = self.config.pop("linux_only.hana")
         self.sync_config()
         self.assert_declined(self.command(), "repo")
@@ -1084,12 +1083,10 @@ class OffloadCommandTests(OffloadCommandFixture):
         values = {**self.config, "host": "alternate-mac", "mac_budget_gib.hana": "8"}
         _ = write_config_fixture(alternate, "".join(f"{key}={value}\n" for key, value in values.items()),
                                  template="mac_test")
-        self.config["offload"] = "off"
-        self.sync_config()
         linux_settings = self.root / "linux.conf"
-        _ = write_config_fixture(linux_settings, "offload=on\nhost=fixture-linux\nkinds=test\n", template="mac_test")
+        _ = write_config_fixture(linux_settings, "host=fixture-linux\nkinds=test\n", template="mac_test")
         registry = self.root / "build_targets.conf"
-        _ = registry.write_text("targets=mac,builder\nkind.mac=ssh\nplatform.mac=macos\n"
+        _ = registry.write_text("enabled.mac=on\ntargets=mac,builder\nkind.mac=ssh\nplatform.mac=macos\n"
             + f"settings.mac={alternate}\nkind.builder=ssh\nplatform.builder=linux\nsettings.builder={linux_settings}\n")
         self.environment["BUILD_TARGETS_CONFIG"] = str(registry)
         request_placement = admission_client.request_placement
@@ -1840,8 +1837,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertNotIn(FILTER, remote_words)
 
     def test_unwritable_result_destination_returns_internal_error(self) -> None:
-        self.config["offload"] = "off"
-        self.sync_config()
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
         self.result_path: Path = self.root / "missing" / "result"
         result = self.command()
         self.assertEqual(result.returncode, 75, result.stdout)

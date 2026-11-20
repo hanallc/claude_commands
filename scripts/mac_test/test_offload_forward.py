@@ -17,6 +17,7 @@ from scripts.build_queue import placement
 from scripts.mac_test import eligibility, nextest_log, offload
 from scripts.mac_test.claim_state import RepositoryScope
 from scripts.buildlog import sync as buildlog_sync
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
 from scripts.lib import test_hang_guard
 
@@ -319,8 +320,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertEqual(answer.returncode, 75, answer.stdout + answer.stderr)
         self.assert_fetch_wire("not_run", "lost")
         self.assertFalse((self.stub_directory / "pull-started").exists())
-        self.config["offload"] = "off"
-        self.sync_config()
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
         self.clear_events()
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",

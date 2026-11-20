@@ -49,7 +49,7 @@ def hana_fallback_request(fixture: PlacementFixture, *, include_mac: bool = Fals
     _ = write_config_fixture(fixture.root / 'mac_test.conf', 'host=fixture-mac\n')
     _ = write_config_fixture(fixture.root / 'build_targets.conf',
         f'targets={target.name},mac,natedev\nkind.{target.name}=ssh\nplatform.{target.name}=linux\n'
-        + f'settings.{target.name}={target.settings.name}\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n'
+        + f'settings.{target.name}={target.settings.name}\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\nenabled.mac=on\n'
         + 'kind.natedev=local\n')
     request = placement_request(fixture)
     mac = request.constraints.candidates[0]

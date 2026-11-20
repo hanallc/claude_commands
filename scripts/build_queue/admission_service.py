@@ -3062,7 +3062,9 @@ class AdmissionServer:
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
-        if kind in placement.MAC_RUN_KINDS and isinstance(target, target_config.SshTarget) and target.platform == "macos":
+        manual_mac_command = (kind in placement.MAC_RUN_KINDS and isinstance(target, target_config.SshTarget)
+                              and target.platform == "macos")
+        if manual_mac_command:
             # A Mac run has no repository step policy. The busy check and the claims below still apply.
             eligibility = placement.AllowedHost()
         elif kind not in placement.STEP_COMMAND_KINDS:
@@ -3085,7 +3087,9 @@ class AdmissionServer:
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
                 and target.platform == "macos"
                 and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session, configuration=configuration) == "busy"):
+                                      session=key.session, configuration=configuration,
+                                      purpose=(mac_test.CapacityPurpose.MANUAL_MAC_COMMAND if manual_mac_command
+                                               else mac_test.CapacityPurpose.PLACEMENT)) == "busy"):
             eligibility = placement.TemporaryExclusion("busy")
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []

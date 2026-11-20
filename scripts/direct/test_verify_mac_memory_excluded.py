@@ -14,7 +14,7 @@ class VerifyMacMemoryExcludedTests(VerifyMacMemoryRetryFixture):
     def test_excluded_mac_is_never_tried_while_local_memory_waits(self) -> None:
         meminfo = self.hold_memory()
         settings = Path(self.environment["MAC_TEST_CONFIG"])
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=sample\n", template="mac_test")
+        _ = write_config_fixture(settings, f"linux_only.{self.root.name}=sample\n", template="mac_test")
         self.environment["TEST_FREE_NOW_FREE"] = "1"
         process = self.start_verify("test", "sample", "--no-cache")
         self.addCleanup(self.stop_verify, process)

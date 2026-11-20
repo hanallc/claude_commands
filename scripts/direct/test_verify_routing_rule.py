@@ -221,7 +221,7 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
         self.environment.update({"NO_COLOR": "1", "RUST_LOG": "sample=trace",
                                  **{name: "caller" for name in FIXED_ENVIRONMENT},
                                  "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
-        _ = write_config_fixture(self.root / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\nkinds=test,check,doc\n",
+        _ = write_config_fixture(self.root / "linux.conf", "host=fake-linux\nslots=1\nkinds=test,check,doc\n",
                                  template="mac_test")
         targets_file = self.root / "build_targets.conf"
         _ = targets_file.write_text(targets_file.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")

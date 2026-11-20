@@ -50,7 +50,7 @@ WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
 
 def write_mac_target_registry(directory: Path, settings_name: str) -> None:
     _ = (directory / "build_targets.conf").write_text(
-        "targets=mac\n"
+        "enabled.mac=on\ntargets=mac\n"
         + "kind.mac=ssh\n"
         + "platform.mac=macos\n"
         + f"settings.mac={settings_name}\n",
@@ -62,7 +62,9 @@ def assigned_adapter_main() -> int:
     """Run the adapter after placement, with the current provider state."""
     arguments = offload.parser().parse_args(namespace=offload.CliArguments())
     request = offload.request_from_arguments(arguments)
-    config = eligibility.read_config(Path(arguments.settings)) if arguments.settings else eligibility.read_config()
+    target = eligibility.configured_ssh_target(request.target or "mac")
+    settings = Path(arguments.settings) if arguments.settings else eligibility.DEFAULT_MAC_SETTINGS
+    config = eligibility.read_placement_config(settings, platform=target.platform)
     controller = offload.ProcessController()
     started = time.monotonic()
     with offload.interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
@@ -328,7 +330,6 @@ class OffloadCommandFixture(unittest.TestCase):
         self.config = {
             "mirror_root": "~/" + FIXTURE_MIRROR_ROOT,
             "mirror_busy_backoff_s": "120",
-            "offload": "on",
             "host": "mac",
             "connect_timeout_s": "6",
             "probe_timeout_s": "300",

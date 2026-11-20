@@ -1047,7 +1047,7 @@ placement_once
         remote_tmp = self.root / "remote-tmp"
         remote_tmp.mkdir()
         config = Path(environment["CONF_DIR"])
-        _ = write_config_fixture(config / "linux.conf", "offload=on\nhost=fake-linux\nslots=1\nkinds=check,doc\n",
+        _ = write_config_fixture(config / "linux.conf", "host=fake-linux\nslots=1\nkinds=check,doc\n",
                                  template="mac_test")
         targets = config / "build_targets.conf"
         _ = targets.write_text(targets.read_text().replace("targets=mac,natedev", "targets=mac,peer,natedev")

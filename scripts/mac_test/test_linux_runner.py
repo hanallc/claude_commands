@@ -199,7 +199,7 @@ class LinuxShellTests(unittest.TestCase):
         self.settings = self.root / "linux.conf"
         _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
         _ = write_config_fixture(self.settings,
-            "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\n"
+            "host=fake-linux\nkinds=test,check,doc\nslots=2\n"
             + "free_floor_gib=10\nbuild_budget_gib=32\ntarget_budget_gib=24\n"
             + "target_budget_gib.hana=31\ntarget_budget_gib.phase-copy=2\n"
             + "devshell.hana=ci\ndevshell.phase-copy=wrong\nskip.hana=test(gpu)\n"
@@ -211,7 +211,7 @@ class LinuxShellTests(unittest.TestCase):
             "targets=linux,mac\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
         )
-        _ = (self.root / "mac.conf").write_text("offload=on\nhost=fake-mac\nlinux_only.phase-copy=\n")
+        _ = (self.root / "mac.conf").write_text("host=fake-mac\nlinux_only.phase-copy=\n")
         _ = write_config_fixture(self.root / "lint.conf", "recent_minutes=60\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
@@ -1740,7 +1740,7 @@ class LinuxCopyTests(unittest.TestCase):
         registry = self.root / "build_targets.conf"
         _ = registry.write_text("targets=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n")
         _ = write_config_fixture(self.root / "mac_test.conf", template="mac_test")
-        _ = write_config_fixture(self.root / "linux.conf", "host=fake-linux\noffload=on\n", template="mac_test")
+        _ = write_config_fixture(self.root / "linux.conf", "host=fake-linux\n", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
         })))

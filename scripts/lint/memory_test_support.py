@@ -37,7 +37,10 @@ def _template(name: str) -> Path:
 
 
 # Test clocks move only when a test moves them, so a test configuration has no pass gap unless the test sets one.
-TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
+TEST_CONFIG_DEFAULTS = {
+    "build_admission.conf": "min_pass_gap_seconds=0\n",
+    "build_targets.conf": "enabled.mac=on\n",
+}
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:

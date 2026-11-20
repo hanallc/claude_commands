@@ -12,6 +12,7 @@ from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 import fcntl
 import json
 import math
@@ -2005,7 +2006,7 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
     from scripts.mac_test import eligibility
 
     settings = Path(args.settings) if args.settings else config_path(args.target)
-    config = eligibility.read_config(settings)
+    config = eligibility.read_placement_config(settings, platform=paths.platform)
     if isinstance(eligibility.mac_step_eligibility(config, Path(args.repo_root), args.package,
                                              args.verb, args.target, kind=kind), eligibility.IneligibleMacStep):
         return 1
@@ -2168,10 +2169,18 @@ def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held
     return 0
 
 
+class CapacityPurpose(Enum):
+    """Select which work the capacity check serves."""
+
+    PLACEMENT = "placed build or test"
+    MANUAL_MAC_COMMAND = "manual Mac command"
+
+
 def free_now(
     paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+    purpose: CapacityPurpose = CapacityPurpose.PLACEMENT,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -2191,7 +2200,7 @@ def free_now(
     else:
         path = eligibility.config_path() if isinstance(settings, eligibility.DefaultMacSettings) else settings
         capacity_settings = conf.read(path)
-    if not capacity_settings.value("offload", conf.on_off):
+    if purpose is CapacityPurpose.PLACEMENT and not eligibility.placement_enabled(paths.platform):
         return "off"
     backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
                else eligibility.read_backoff(time.time(), paths.target))

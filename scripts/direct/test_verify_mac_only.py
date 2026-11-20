@@ -57,7 +57,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
             encoding="utf-8",
         )
         mac_settings = (
-            "offload=on\nhost=mac\n"
+            "host=mac\n"
             + "# range: 5e-324..\nconnect_timeout_s=6\n"
             + "# range: 5e-324..\nleftover_timeout_s=10\n"
             + "# range: 5e-324..\nprobe_timeout_s=15\n"
@@ -411,7 +411,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
             "blocked": "the Mac is blocked (/build:status names the holder and when it lifts)",
             "unreachable": "the Mac cannot be reached (/build:status --probe)",
             "backoff": "the Mac was unreachable a short time ago (retry backoff)",
-            "disk": "the Mac is below its free-space floor", "off": "Mac offload is off",
+            "disk": "the Mac is below its free-space floor", "off": "enabled.mac is off",
             "repo": "this repository has no Mac setting", "linux_only": "the step covers a package that is Linux only on the Mac",
             "state": "the Mac claim state cannot be read", "copy": "the tree copy to the Mac failed",
             "no_tests": "no test matched on the Mac", "lost": "the link to the Mac dropped during the run",

@@ -576,7 +576,8 @@ def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, 
     from scripts.mac_test import eligibility
 
     config = (configuration if isinstance(configuration, conf.ConfigRead)
-              else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
+              else eligibility.read_placement_config(target.settings, platform=target.platform)
+              if isinstance(target, SshTarget) else eligibility.read_placement_config())
     name = target.name if isinstance(target, SshTarget) else "mac"
     first, *rest = eligibility.remote_step_kinds(kind)
     repository = eligibility.mac_step_eligibility(config, repo_root, package,
@@ -726,7 +727,7 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
         if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
             raise
         return ExcludedTarget(target, f"state unreadable: {error}")
-    if answer in ("blocked", "backoff"):
+    if answer in ("off", "blocked", "backoff"):
         return ExcludedTarget(target, answer)
     if answer == "bad":
         return EligibleTarget(target)
@@ -852,7 +853,7 @@ def ssh_target_config(target: SshTarget) -> eligibility.OffloadConfig | Excluded
     if isinstance(hana_placement.read_execution_transport(target), (hana_placement.HanaControlTransport, HanaGpuNextestTransport)):
         return ExcludedTarget(target, 'Hana requires an exact queue assignment')
 
-    return eligibility.read_config(target.settings)
+    return eligibility.read_placement_config(target.settings, platform=target.platform)
 
 
 def command_pinned_eligible(args: CliArguments, routing: Routing) -> int:

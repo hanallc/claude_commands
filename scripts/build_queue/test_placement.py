@@ -1193,14 +1193,16 @@ class PlacementTests(unittest.TestCase):
     def test_enabling_the_route_before_the_refusal_report_permits_a_retry(self) -> None:
         with PlacementFixture() as fixture:
             settings = fixture.root / "provider.conf"
-            _ = write_config_fixture(settings, "offload=off\n", template="mac_test")
+            _ = write_config_fixture(settings, template="mac_test")
+            registry = fixture.root / "build_targets.conf"
+            _ = write_config_fixture(registry, "enabled.mac=off\n")
             request = placement_request(fixture)
             candidate = replace(request.constraints.candidates[0], settings=placement.ExplicitProviderSettings(settings))
             request = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
             original = publish_candidate(fixture, request)
             assigned = assignment_for(fixture, request)
             fixture.restart()
-            _ = write_config_fixture(settings, "offload=on\n", template="mac_test")
+            _ = write_config_fixture(registry, "enabled.mac=on\n")
             self.assertIsInstance(fixture.server.handle_request(
                 wire.ClaimFailure("delayed-off-refusal", assigned, "off"))[0], wire.DispatchStatus)
             enabled = publish_candidate(fixture, request)
@@ -1454,7 +1456,7 @@ class PlacementTests(unittest.TestCase):
                             capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                         settings = fixture.root / "mac_test.conf"
                         _ = write_config_fixture(settings,
-                            "offload=on\nlinux_only.hana=\nmac_skip.hana=\n", template="mac_test")
+                            "linux_only.hana=\nmac_skip.hana=\n", template="mac_test")
                         args = mac_test.CliArguments()
                         args.pid, args.worktree, args.what = coordinator.pid, str(repository), "nextest hana"
                         args.repo_root, args.package, args.settings = str(repository), "hana", str(settings)
@@ -1610,7 +1612,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 _ = (fixture.root / "build_targets.conf").write_text(
                     "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
                 _ = write_config_fixture(fixture.root / "box.conf",
-                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+                    "host=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
                 request = placement_request(fixture)
                 assert isinstance(request.profile, records.StepProfile)
                 destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
@@ -2246,7 +2248,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 _ = (fixture.root / "build_targets.conf").write_text(
                     f"targets=box\nkind.box=ssh\nplatform.box={platform}\nsettings.box=box.conf\n")
                 _ = write_config_fixture(fixture.root / "box.conf",
-                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+                    "host=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
                 request = placement_request(fixture)
                 assert isinstance(request.profile, records.StepProfile)
                 destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
@@ -2305,7 +2307,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             _ = (fixture.root / "build_targets.conf").write_text(
                 "targets=box\nkind.box=ssh\nplatform.box=macos\nsettings.box=box.conf\n")
             _ = write_config_fixture(fixture.root / "box.conf",
-                "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
+                "host=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
             request = placement_request(fixture)
             destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
             request = replace(request, constraints=replace(request.constraints, repository=str(repository),

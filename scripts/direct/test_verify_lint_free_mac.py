@@ -193,7 +193,7 @@ if arguments[:1] == ["mend"]:
     def test_linux_only_workspace_lint_leaves_memory_for_the_mac(self) -> None:
         # Only the Mac compiles macOS code, so a lint ignores linux_only and the Mac judges the whole workspace.
         settings = Path(self.environment["MAC_TEST_CONFIG"])
-        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=sample\n", template="mac_test")
+        _ = write_config_fixture(settings, f"linux_only.{self.root.name}=sample\n", template="mac_test")
         process = self.queued_lint()
         output = self.finish_lint(process)
         self.assertIn("another machine is free after", output)

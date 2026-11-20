@@ -393,14 +393,13 @@ source() {
 
     def configure(self, order: str) -> None:
         _ = (self.root / "build_targets.conf").write_text(
-            f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            f"enabled.mac=off\ntargets={order}\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
             + "kind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
             + "kind.spare=ssh\nplatform.spare=linux\nsettings.spare=spare.conf\n")
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
         for name in ("linux_target", "spare"):
             _ = write_config_fixture(self.root / f"{name}.conf",
-                "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc\nslots=1\nslots.hana=1\n"
+                "host=fake-linux\nci_repo=\nkinds=test,check,doc\nslots=1\nslots.hana=1\n"
                 + "devshell=default\nshell_cache=fixture-shells\nshell_timeout_s=2\n"
                 + "build_budget_gib=32\ntarget_budget_gib=24\nversion_pin_file=nixos hosts/linux-build.nix\n"
                 + "parity.rustc=rustc fixture\nparity.nextest=nextest fixture\n"
@@ -420,7 +419,7 @@ source() {
         return sorted(rows, key=lambda row: cast(str, row["at"]))
 
     def enable_mac(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.hana=\nlinux_only.case=\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=on\n")        _ = write_config_fixture(self.root / "mac_test.conf", "linux_only.hana=\nlinux_only.case=\n")
 
     def release_memory_after_hook(self, observe: Callable[[CompletedMemoryHook], bool] | ReleaseMemoryAtWait = RELEASE_MEMORY_AT_WAIT,
                                   *, after_attempts: int = 0) -> None:

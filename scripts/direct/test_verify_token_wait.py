@@ -101,9 +101,9 @@ trap observe_admission DEBUG
         _ = targets.write_text(routes.TARGETS)
         _ = runner.write_text(routes.RUNNER)
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            "enabled.mac=on\ntargets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac-settings\n")
-        _ = write_config_fixture(self.root / "mac-settings", f"offload=on\nlinux_only.{self.root.name}=\n",
+        _ = write_config_fixture(self.root / "mac-settings", f"linux_only.{self.root.name}=\n",
                                  template="mac_test")
         self.environment.update({
             "BUILD_TARGETS_SCRIPT": str(targets), "VERIFY_MAC_RUNNER": str(runner),

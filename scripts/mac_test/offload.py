@@ -3612,9 +3612,11 @@ def main() -> int:
         settings = str(target_settings)
     from scripts.aws_target import hana_placement as hana
 
-    transport = hana.read_execution_transport(eligibility.configured_ssh_target(request.target or 'mac'))
+    target = eligibility.configured_ssh_target(request.target or 'mac')
+    transport = hana.read_execution_transport(target)
     config: OffloadConfig | hana.HanaControlTransport = (transport if isinstance(transport, hana.HanaControlTransport)
-        else eligibility.read_config(Path(settings)) if settings else eligibility.read_config())
+        else eligibility.read_placement_config(Path(settings) if settings else eligibility.DEFAULT_MAC_SETTINGS,
+                                               platform=target.platform))
     if isinstance(request.placement, AssignedOffloadRequest):
         request = replace(request, slot=request.placement.assignment.destination.slot or 1)
     controller = ProcessController()
@@ -3623,7 +3625,7 @@ def main() -> int:
     direct = isinstance(request.placement, DirectOffloadRequest)
     since = time.time()
     try:
-        if direct:
+        if direct and (not isinstance(config, OffloadConfig) or config.enabled):
             request = submit_direct_placement(request, since, config)
         while True:
             with interrupt_handlers(controller), transfer_bytes.measure_transfers(controller.attempt_evidence.traffic):

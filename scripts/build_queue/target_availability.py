@@ -92,7 +92,7 @@ def unavailable_row(target: str, reason: str) -> TargetRow:
 
 DYNAMIC_REASONS = frozenset({"backoff", "state"})
 # Plain words for the static Mac exclusions; other reasons show as recorded.
-EXCLUSION_TEXT = {"off": "Mac offload is off", "repo": "this repository does not run on the Mac"}
+EXCLUSION_TEXT = {"off": "enabled.mac is off", "repo": "this repository does not run on the Mac"}
 
 
 @dataclass(frozen=True)
