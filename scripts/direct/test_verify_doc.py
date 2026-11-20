@@ -4,14 +4,48 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 from typing import cast
 import unittest
 
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.verify_doc_test_support import DocPassRecord, VerifyDocFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyDocTests(VerifyDocFixture):
+    def test_installed_verify_reads_the_staged_tree_with_the_working_checkout(self) -> None:
+        installed_scripts = Path(self.environment["HOME"]) / ".claude/scripts"
+        scripts = self.repo / "scripts"
+        (scripts / "lib").mkdir(parents=True)
+        (scripts / "lib/py").touch()
+        (scripts / "copies").mkdir()
+        _ = (scripts / "__init__.py").write_text(f"__path__.append({str(installed_scripts)!r})\n")
+        selected = self.root / "staged-tree-checkout"
+        _ = (scripts / "copies/__init__.py").write_text(f"""\
+from pathlib import Path
+__path__.append({str(installed_scripts / 'copies')!r})
+from . import copies
+
+read_tree = copies.staged_tree
+
+def staged_tree(repo, **options):
+    with Path({str(selected)!r}).open("a") as log:
+        print(repo, file=log)
+    return read_tree(repo, **options)
+
+copies.staged_tree = staged_tree
+""")
+        result = subprocess.run(["bash", str(installed_scripts / "direct/verify.sh"), "doc"],
+                                cwd=self.repo, env=self.environment, capture_output=True, text=True,
+                                timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(selected.exists(), result.stdout + result.stderr)
+        self.assertEqual(selected.read_text().splitlines(), [str(self.repo)] * 3)
+        record, = self.pass_records()
+        row = cast(DocPassRecord, json.loads(record.read_text()))
+        self.assertEqual(row["tree_id"], self.git("write-tree"))
+
     def test_doc_records_the_complete_judged_tree_and_preserves_the_index(self) -> None:
         source = self.repo / "alpha/src/lib.rs"
         _ = source.write_text("pub fn staged() {}\n", encoding="utf-8")

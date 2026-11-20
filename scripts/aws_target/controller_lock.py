@@ -20,9 +20,10 @@ def account_stack_lock(directory: Path) -> Generator[LockResult]:
 
 
 @contextmanager
-def control_lock(directory: Path) -> Generator[None, None, None]:
-    directory.mkdir(parents=True, exist_ok=True)
-    with (directory / 'controller.lock').open('a') as lock:
+def control_lock(directory: Path, *, existing: bool = False) -> Generator[None, None, None]:
+    if not existing:
+        directory.mkdir(parents=True, exist_ok=True)
+    with (directory / 'controller.lock').open('r' if existing else 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             yield
@@ -47,9 +48,9 @@ def _hana_resource_hold(directory: Path) -> Generator[LockResult]:
 
 
 @contextmanager
-def hana_work_lock(directory: Path) -> Generator[LockResult]:
+def hana_work_lock(directory: Path, *, existing: bool = False) -> Generator[LockResult]:
     """Wait for controller work and check for a resource hold."""
-    with control_lock(directory):
+    with control_lock(directory, existing=existing):
         # A resource command needs the controller lock to take the hold.
         with _hana_resource_hold(directory) as result:
             pass

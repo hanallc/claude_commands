@@ -18,6 +18,7 @@ import threading
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, tzinfo
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1247,9 +1248,11 @@ window.fetch=(url,options)=>{
             _ = snapshot.body('missing/key')
 
     def test_snapshot_changes_outside_requests_and_retains_the_current_version(self) -> None:
-        cache = review_page.ReviewSnapshotCache(self.root)
+        members = staff.snapshot()
+        cache = review_page.ReviewSnapshotCache(self.root, staff_scope=partial(staff.supplied_snapshot, members))
         self.addCleanup(cache.close)
         previous = cache.get()
+        self.assertIs(previous.members, members)
         entered, release, completed = threading.Event(), threading.Event(), threading.Event()
         original = review_page.build_snapshot
 
@@ -1273,6 +1276,7 @@ window.fetch=(url,options)=>{
             self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))
         cache.synchronize()
         fresh = cache.get()
+        self.assertIs(fresh.members, members)
         self.assertNotEqual(fresh.version, previous.version)
         self.assertIn('A newly filed question?', fresh.render().decode())
 
@@ -1442,6 +1446,7 @@ window.fetch=(url,options)=>{
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_windowed_rows_keep_open_cards_and_drafts_across_scroll_and_refresh(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'page_request_timeout_seconds=3\n')
         key = self.question()
         records = review_items.read(self.root)
         question = next(item for item in records if item.key == key)
@@ -1487,6 +1492,11 @@ window.fetch=(url,options)=>{
    row('page-owner/C399').querySelector('.list-toggle').getAttribute('aria-expanded')==='true',
    'An Open item opens directly from its key.');
   check(document.querySelectorAll('[data-list-item]').length<=100,'The first window mounts at most 100 summaries.');
+  const firstToggle=row('page-owner/C399').querySelector('.list-toggle');
+  const secondToggle=row('page-owner/C381').querySelector('.list-toggle');
+  secondToggle.click();
+  check(firstToggle.getAttribute('aria-expanded')==='false' && secondToggle.getAttribute('aria-expanded')==='true',
+   'Opening the second Review row closes the first row.');
   await open(DRAFT_KEY);
   const draft=form(DRAFT_KEY),choice=row(DRAFT_KEY).querySelector('input[name=choice]');
   choice.checked=true;choice.dispatchEvent(new Event('change'));
@@ -1532,17 +1542,32 @@ window.fetch=(url,options)=>{
   check(document.documentElement.scrollWidth<=innerWidth,'The row window fits the viewport.');
   document.activeElement.blur();
   const originalFetch=window.fetch;
-  let releaseBody,releaseSave,posts=0,conflict='';
+  let releaseBody,releaseSave,posts=0,conflict='',holdVersion=false,timeoutVersion=false,stalled=false;
+  let releaseVersion;
   const delayedBody=new Promise(resolve=>{releaseBody=resolve;});
   const delayedSave=new Promise(resolve=>{releaseSave=resolve;});
   window.fetch=async(url,options)=>{
    if(options?.method==='POST' && url===location.pathname){
     if(conflict){
      await originalFetch(conflict);
-     const reason=conflict==='/remove-conflict' ? 'This item is no longer on the list.' : 'This item is already Done.';
+     const reason=conflict==='/remove-conflict' ? 'This item is no longer on the list.' :
+      conflict.startsWith('/revise-conflict') ? 'This item changed.' : 'This item is already Done.';
      return new Response(JSON.stringify({reason}),{status:409});
     }
     posts++;await delayedSave;return new Response(JSON.stringify({reason:'Retry the save.'}),{status:400});
+   }
+   if(new URL(url,location.href).searchParams.get('version')==='1'){
+    if(holdVersion){
+     holdVersion=false;
+     await new Promise(resolve=>{releaseVersion=resolve;});
+    }
+    if(timeoutVersion){
+     timeoutVersion=false;stalled=true;
+     if(!options?.signal) throw new Error('The reload has no deadline.');
+     return new Promise((_,reject)=>{
+      options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true});
+     });
+    }
    }
    const response=await originalFetch(url,options);
    if(new URL(url,location.href).searchParams.get('body')==='page-owner/C2') await delayedBody;
@@ -1605,6 +1630,79 @@ window.fetch=(url,options)=>{
   check(document.querySelector('[data-review]').dataset.show==='open' &&
    !conflictNotice.hidden && conflictNotice.textContent.includes('This item is already Done.'),
    'F015: HTTP 409 keeps the reason when the completed item leaves Review.');
+  await open(DRAFT_KEY);
+  conflict='/revise-conflict';
+  const oldQuestion=form(DRAFT_KEY),questionRevision=oldQuestion.elements.revision.value;
+  check(row(DRAFT_KEY).querySelector('input[name=choice]:checked')?.value===choiceValue,
+   'The question has a selected choice before the save.');
+  oldQuestion.requestSubmit(oldQuestion.querySelector('button[value=answer]'));
+  await until(()=>form(DRAFT_KEY)?.elements.revision.value===REVISED_QUESTION &&
+   !form(DRAFT_KEY).querySelector('button[value=answer]').disabled,'the revised question form');
+  const newQuestion=form(DRAFT_KEY);
+  check(newQuestion.elements.revision.value!==questionRevision,'Revision recovery loads a different revision.');
+  check(newQuestion.elements.feedback.value==='Keep these draft words.','Revision recovery keeps the feedback.');
+  check(newQuestion.elements.later.value==='2030-12-01T18:30','Revision recovery keeps the Later time.');
+  check(row(DRAFT_KEY).querySelector('input[name=choice]:checked')?.value===choiceValue,
+   'Revision recovery keeps the selected choice.');
+  check(newQuestion.querySelector('[data-send-status]').textContent.includes('This item changed.'),
+   'Revision recovery shows the reason for refusal.');
+  conflict='/revise-conflict-again';holdVersion=true;
+  newQuestion.requestSubmit(newQuestion.querySelector('button[value=answer]'));
+  await until(()=>releaseVersion,'the first recovery reload');
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await until(()=>form(DRAFT_KEY)?.elements.revision.value===REVISED_AGAIN,'the revision from the second refresh');
+  const latestQuestion=form(DRAFT_KEY);
+  check(!latestQuestion.querySelector('button[value=answer]').disabled,
+   'A newer revision has usable actions while the first reload is pending.');
+  latestQuestion.elements.feedback.value='Keep these newer words.';
+  latestQuestion.elements.feedback.dispatchEvent(new Event('input'));
+  releaseVersion();
+  await frame();await frame();
+  check(latestQuestion.elements.feedback.value==='Keep these newer words.',
+   'The first recovery preserves words typed into the newer revision.');
+  conflict='/stall-conflict';timeoutVersion=true;
+  latestQuestion.requestSubmit(latestQuestion.querySelector('button[value=answer]'));
+  await until(()=>stalled,'the stalled recovery request');
+  check(form(DRAFT_KEY).querySelector('button[value=answer]').disabled,
+   'The stale revision is locked during its reload.');
+  await until(()=>!form(DRAFT_KEY).querySelector('button[value=answer]').disabled,'the reload deadline');
+  check(document.querySelector('[data-page-status]').dataset.state==='Failed' &&
+   document.querySelector('[data-review]').dataset.requestTimeoutSeconds==='3',
+   'The configured recovery deadline releases the stale revision.');
+  check(form(DRAFT_KEY).elements.feedback.value==='Keep these newer words.',
+   'A timed-out reload keeps the current words.');
+  const remountDraft=async()=>{
+   const previous=form(DRAFT_KEY);
+   document.activeElement.blur();
+   scrollTo(0,document.documentElement.scrollHeight);
+   await until(()=>!row(DRAFT_KEY),'the unfocused question to leave the window');
+   await open(DRAFT_KEY);
+   check(form(DRAFT_KEY)!==previous,'Review mounts a replacement form.');
+   return form(DRAFT_KEY);
+  };
+  for(const [route,revision,words] of [
+   ['/revise-conflict',REVISED_QUESTION,''],
+   ['/revise-conflict-again',REVISED_AGAIN,'Words typed into the replacement form.']
+  ]){
+   conflict=route;holdVersion=true;releaseVersion=null;
+   const staleQuestion=form(DRAFT_KEY);
+   staleQuestion.requestSubmit(staleQuestion.querySelector('button[value=answer]'));
+   await until(()=>releaseVersion,'the held recovery reload');
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+   await until(()=>form(DRAFT_KEY)?.elements.revision.value===revision,'the newer question form');
+   const edited=words ? await remountDraft() : form(DRAFT_KEY);
+   edited.elements.feedback.focus();
+   edited.elements.feedback.value=words;
+   edited.elements.feedback.dispatchEvent(new Event('input'));
+   const replacement=await remountDraft();
+   check(replacement.elements.feedback.value===words,'The replacement starts with the current words.');
+   const status=replacement.querySelector('[data-send-status]');
+   status.textContent='';
+   releaseVersion();
+   await until(()=>status.textContent.includes('This item changed.'),'the first recovery to finish');
+   check(replacement.elements.feedback.value===words,'The first recovery keeps the current words.');
+   check((await remountDraft()).elements.feedback.value===words,'The stored draft keeps the current words.');
+  }
   conflict='/remove-conflict';
   await open('page-owner/C6');
   const removed=form('page-owner/C6');
@@ -1619,8 +1717,6 @@ window.fetch=(url,options)=>{
  }catch(error){failures.push(String(error), ...window.coldErrors);}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
-        probe = (probe.replace('DRAFT_KEY', json.dumps(key)).replace('EXPECTED_TOKEN', json.dumps(expected_token))
-                 .replace('EXPECTED_REVISION', json.dumps(expected_revision)))
         results: list[list[str]] = []
         requested_bodies: list[str] = []
         complete = threading.Event()
@@ -1633,8 +1729,20 @@ window.fetch=(url,options)=>{
                 item for item in newer.records.values() if item.key != 'page-owner/C4']):
             accepted = review_page.build_snapshot(self.root)
         with patch.object(review_items, 'read', return_value=[
-                item for item in accepted.records.values() if item.key != 'page-owner/C6']):
+                replace(item, title='Which layout fits the release?') if item.key == key else item
+                for item in accepted.records.values()]):
+            revised = review_page.build_snapshot(self.root)
+        with patch.object(review_items, 'read', return_value=[
+                replace(item, title='Which layout fits the next release?') if item.key == key else item
+                for item in revised.records.values()]):
+            revised_again = review_page.build_snapshot(self.root)
+        with patch.object(review_items, 'read', return_value=[
+                item for item in revised_again.records.values() if item.key != 'page-owner/C6']):
             deleted = review_page.build_snapshot(self.root)
+        probe = (probe.replace('DRAFT_KEY', json.dumps(key)).replace('EXPECTED_TOKEN', json.dumps(expected_token))
+                 .replace('EXPECTED_REVISION', json.dumps(expected_revision))
+                 .replace('REVISED_QUESTION', json.dumps(review_page.record_revision(revised.records[key], revised.assets)))
+                 .replace('REVISED_AGAIN', json.dumps(review_page.record_revision(revised_again.records[key], revised_again.assets))))
         counts = {'version':0,'index':0}
         spy = """<script>window.coldErrors=[];
 addEventListener('error',event=>window.coldErrors.push(event.message));
@@ -1668,6 +1776,14 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
                     body=b''
                 elif route.path=='/resolve-conflict':
                     current[0]=accepted
+                    body=b''
+                elif route.path=='/revise-conflict':
+                    current[0]=revised
+                    body=b''
+                elif route.path=='/revise-conflict-again':
+                    current[0]=revised_again
+                    body=b''
+                elif route.path=='/stall-conflict':
                     body=b''
                 elif route.path=='/remove-conflict':
                     current[0]=deleted
@@ -1723,8 +1839,11 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
                 server.shutdown()
                 thread.join(5)
         self.assertEqual(results,[[]])
-        self.assertEqual(set(requested_bodies), {'page-owner/C399', key, 'page-owner/C2', 'page-owner/C4', 'page-owner/C6'},
-                         'Only opened keys request a body.')
+        self.assertEqual(
+            set(requested_bodies),
+            {'page-owner/C399', 'page-owner/C381', key, 'page-owner/C2', 'page-owner/C4', 'page-owner/C6'},
+            'Only opened keys request a body.',
+        )
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_tab_reaches_adjacent_rows_after_a_distant_scroll(self) -> None:
@@ -4316,7 +4435,7 @@ window.fetch=async(url)=>{
   const button=document.querySelector('[data-review-new]');
   const bounds=element=>element.getBoundingClientRect(), center=box=>(box.top+box.bottom)/2;
   await document.fonts.ready;
-  for(const width of [1280,390]){
+  for(const width of [1280,390,320]){
    frameElement.style.width=width+'px';
    const t=bounds(title), n=bounds(name), o=bounds(owner), b=bounds(button), r=bounds(row);
    const beside=Math.abs(center(t)-center(b))<=1;
@@ -4326,6 +4445,13 @@ window.fetch=async(url)=>{
       n.left<r.left-1 || Math.abs(b.right-r.right)>1 ||
       (beside ? n.left<t.right+4 : width===1280 || b.top<t.bottom+4)){
     failures.push('The title and both controls must fit at '+width+' px.');
+   }
+   if(width===320 && Math.abs(t.height-parseFloat(getComputedStyle(title).lineHeight))>1){
+    failures.push('The Review title fits on one line at 320 px.');
+   }
+   if(width===320 && (button.innerText.trim()!=='+' || button.getAttribute('aria-label')!=='New item' ||
+                     button.title!=='New item')){
+    failures.push('The narrow New item button shows only + and keeps its name.');
    }
   }
  }catch(error){failures.push(String(error));}
@@ -4771,8 +4897,9 @@ window.fetch=(url,options)=>{
    await refreshIndex(index=>{index.r=index.r.filter(entry=>entry[0]!==key);});
    check(!row() && !sessionStorage.getItem(savedKey),
     'The new snapshot confirms the removal and clears the saved verdict marker.');
-   await follow(otherKey);
-   check(expanded(otherKey) && notice.hidden,'An open card hides the missing item notice.');
+   await follow('BUILDS/c2');
+   check(expanded(otherKey) && notice.hidden && addressItem()===otherKey,
+    'A new link resolves the shown ID and clears the missing item notice.');
    await follow('unknown/C1');
    check(!notice.hidden && notice.textContent==='This review is no longer on the Review page.',
     'An unknown ID shows the missing item notice.');
@@ -4792,7 +4919,7 @@ window.fetch=(url,options)=>{
                 if case == 'show':
                     _ = change_review.record_verdict(self.fixture.review_list, 'C1', 'works',
                                                      datetime.now(user_zone()).date(), self.fixture.production)
-                shown_ids = {'page-owner/C1': 'builds/C1'} if case == 'verdict' else {}
+                shown_ids = {'page-owner/C1': 'builds/C1', 'page-owner/C2': 'builds/C2'} if case == 'verdict' else {}
                 if case == 'restored':
                     shown_ids = {'page-owner/C2': 'page-owner/C1'}
                 if shown_ids:
@@ -5094,6 +5221,20 @@ window.fetch=(url,options={})=>{
   if(selectedOwner()!==owner) document.querySelector('[data-owner-chip="'+CSS.escape(owner)+'"]').click();
   check(expanded(await follow({}),'Open') && review.dataset.show==='open' && selectedOwner()===owner,
    'F003: A bare link preserves the matching Show and Owner filters.');
+  const jump=document.createElement('a');
+  jump.dataset.recordJump='';
+  review.append(jump);
+  jump.href='#item=page-owner%2FC99';jump.click();
+  const missing=review.querySelector('[data-missing-item]'),missingHash=location.hash;
+  jump.href='#item=page-owner%2FC2';jump.click();
+  jump.remove();
+  check(expanded(change('page-owner/C2'),'Open') && missing.hidden,'A valid review link clears the notice.');
+  const restored=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  history.back();await restored;
+  check(location.hash===missingHash && expanded(change('page-owner/C1'),'Open') &&
+   !expanded(change('page-owner/C2'),'Open') && !missing.hidden &&
+   missing.textContent==='This review is no longer on the Review page.',
+   'Back restores the open review and the notice for the missing review.');
   change('page-owner/C1').querySelector('.list-toggle').click();
 
   for(const key of ['page-owner/C2','page-owner/C1']){
@@ -5748,6 +5889,32 @@ window.fetch=async()=>({ok:true,text:async()=>MARKUP});
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_review_draws_the_same_body_as_the_single_card(self) -> None:
+        key = 'page-owner/C1'
+        snapshot = review_page.build_snapshot(self.root)
+        single = snapshot.body(key, view=review_page.ReviewBodyView.CARD).decode()
+        expected = single.split('<template data-card-body>', 1)[1].split('</template>', 1)[0]
+        probe = r"""<script>
+(async()=>{
+ const failures=[];
+ try{
+  const row=document.querySelector('[data-key="page-owner/C1"]');
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row);
+  const template=document.createElement('template');
+  template.innerHTML=EXPECTED;
+  for(const selector of ['[data-review-body]','.list-log','.review-actions']){
+   if(row.querySelector(selector).innerHTML!==template.content.querySelector(selector).innerHTML)
+    failures.push('Review and the single card draw different '+selector+'.');
+  }
+  if(!form.elements.revision.value) failures.push('The Review action has no revision.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>""".replace("EXPECTED", json.dumps(expected).replace('</', '<\\/'))
+        markup = browser_markup(self.root).replace('</body>', probe + '</body>')
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')

@@ -1,4 +1,4 @@
-"""Render the New item dialog shared by Review and Builds."""
+"""Render the shared New item dialog."""
 from __future__ import annotations
 
 import hashlib
@@ -43,10 +43,6 @@ class SubmissionScreenshotExpired(SubmissionConflict):
 
     def __init__(self) -> None:
         super().__init__("The screenshot expired.")
-
-
-class SubmissionTokenExpired(SubmissionError):
-    """The request can recover a filed item only."""
 
 
 class SubmissionScreenshotReload(SubmissionConflict):
@@ -616,6 +612,13 @@ KINDS = ((SubmissionKind.QUESTION, "Question", "circle-help"),
          (SubmissionKind.BUG, "Bug", "bug"))
 
 
+def title_button(page: Literal["list", "review"]) -> str:
+    """Place the New item button beside the page title."""
+    label = "New item" if page == "list" else "New"
+    return (f'<button class="review-new" type="button" aria-label="New item" title="New item" data-{page}-new>'
+            + f'<span aria-hidden="true">+</span><span class="review-new-label">{label}</span></button>')
+
+
 def render() -> str:
     """Mount once and open with window.reviewNewItem.open({trigger, kind, evidence})."""
     chips = "".join(
@@ -664,6 +667,7 @@ def render() -> str:
    <div class="new-item-previews" data-previews hidden></div>
   </div>
   <footer>
+   <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
    <p id="new-item-saved" role="status" hidden></p>
    <div data-send-controls><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
@@ -691,6 +695,14 @@ PAGE_STATE_STYLE = '''
 
 
 STYLE = '''
+.page-heading-actions>.review-new{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;
+min-height:36px;background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--accent);
+padding:5px 14px;margin:0;flex:none;white-space:nowrap}
+.review-new>[aria-hidden]{font-size:1.2em;line-height:1}
+@media(max-width:360px){
+ .page-heading-actions>.review-new{justify-content:center;min-width:36px;padding:5px}
+ .review-new-label{display:none}
+}
 #review-new-item {
  position: fixed; inset: 0; box-sizing: border-box; margin: auto; padding: 0;
  width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px);
@@ -843,6 +855,7 @@ STYLE = '''
  min-height: 38px; padding: 6px 14px; border: 1px solid var(--ink-3, #9a988f); border-radius: 8px;
  background: transparent; color: inherit;
 }
+#review-new-item [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
 #review-new-item .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
 #review-new-item #new-item-saved { margin: 0 0 12px; }
 @media (max-width: 480px) {
@@ -872,12 +885,13 @@ SCRIPT = r'''(() => {
  const fallbackText = fallback.textContent;
  const expired = sentDetails.querySelector('[data-capture-expired]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
+ const sendNotice = dialog.querySelector('[data-send-disabled]');
  const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
  const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, evidence, token, recipients, images = [], sending = false;
- let draftId, keepDraft = false, ownerPage = '', pageOwnerId = '';
+ let draftNonce, keepDraft = false, ownerPage = '', pageOwnerId = '';
  let captureSession, pageContext, savedItem;
 
  function node(tag, text = '', css = '') {
@@ -1050,10 +1064,20 @@ SCRIPT = r'''(() => {
   const path = ownerPage ? endpoint + '?' + new URLSearchParams({page: ownerPage}) : endpoint;
   const response = await fetch(path, {cache: 'no-store', signal});
   const data = await responseData(response, 'Could not load recipients.');
-  if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || !data.token) {
+  if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || (!data.token && !data.send_disabled)) {
    throw new Error('Could not load recipients.');
   }
   return data;
+ }
+
+ function setOptions(data) {
+  token = data.token;
+  sendNotice.textContent = data.send_disabled || '';
+  sendNotice.hidden = !data.send_disabled;
+  includePage.closest('label').hidden = !sendNotice.hidden;
+  recipients = data.recipients;
+  pageOwnerId = ownerPage ? data.page_owner ?? (recipients.length === 1 ? recipients[0].id : '') : '';
+  showRecipients();
  }
 
  async function post(payload, keepalive = false) {
@@ -1163,7 +1187,7 @@ SCRIPT = r'''(() => {
 
  function showSentDetails() {
   const image = captureSession?.image;
-  const include = !!ownerPage && includePage.checked;
+  const include = !!ownerPage && includePage.checked && sendNotice.hidden;
   const unavailable = include && (image === null || !hasCaptureSpace(image));
   slot.hidden = !include || unavailable;
   taking.hidden = !!image;
@@ -1256,15 +1280,13 @@ SCRIPT = r'''(() => {
   if (saved) done.focus();
  }
 
- function close() {
+ function close({sent = false} = {}) {
   if (!dialog.open || sending) return;
   const result = savedItem;
   discardCapture();
-  setError('');
-  updateSend();
   opening.abort();
   dialog.close();
-  keepDraft = !result && Boolean(words.value || images.length);
+  keepDraft = !sent && !result && Boolean(words.value || images.length);
   if (!keepDraft) {
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
@@ -1295,6 +1317,8 @@ SCRIPT = r'''(() => {
   setPageMode(page);
   launcher = trigger || document.activeElement;
   token = '';
+  sendNotice.hidden = true;
+  includePage.closest('label').hidden = false;
   if (!keepDraft) form.reset();
   if (!keepDraft || changedMode) {
    evidence = structuredClone(capture);
@@ -1322,12 +1346,9 @@ SCRIPT = r'''(() => {
   try {
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
-   token = data.token;
-   recipients = data.recipients;
-   pageOwnerId = ownerPage ? data.page_owner ?? (recipients.length === 1 ? recipients[0].id : '') : '';
-   showRecipients();
+   setOptions(data);
    startCapture();
-   updateSend();
+   showSentDetails();
   } catch (failure) {
    if (!controller.signal.aborted) recipientStatus.textContent = failure.message;
   }
@@ -1345,16 +1366,16 @@ SCRIPT = r'''(() => {
  form.addEventListener('submit', async event => {
   event.preventDefault();
   if (send.disabled) return;
+  const onList = ownerPage === 'list';
   let saved, key = '';
   try {
    const kind = form.elements.kind.value, recipient = recipientChips.querySelector('input:checked');
    if (!recipient) throw new Error('Select a recipient.');
-   if (!draftId) {
-    const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)),
-                             byte => byte.toString(16).padStart(2, '0')).join('');
-    draftId = 'r6-' + nonce;
+   if (!draftNonce) {
+    draftNonce = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+                            byte => byte.toString(16).padStart(2, '0')).join('');
    }
-   const payload = {request_id: draftId, kind, recipient_id: recipient.value,
+   const payload = {request_id: (onList ? 'r2-' : 'r6-') + draftNonce, kind, recipient_id: recipient.value,
                     words: words.value, ...(ownerPage && {page: ownerPage,
                      ...(recipient.value !== pageOwnerId && {page_recipient: 'list-owner'})})};
    if (!slot.hidden && !shot.hidden) {
@@ -1374,7 +1395,7 @@ SCRIPT = r'''(() => {
    try {
     result = await sendItem();
    } catch (failure) {
-    if (!failure?.staleToken) throw failure;
+    if (onList || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
     token = fresh.token;
     result = await sendItem();
@@ -1384,9 +1405,20 @@ SCRIPT = r'''(() => {
    }
    saved = result;
   } catch (failure) {
-   if (failure?.filedId) {
+   if (onList) {
+    setError(failure?.message || 'Could not send this item.');
+    if (failure?.staleToken || failure?.screenshotExpired || failure instanceof TypeError) {
+     discardCapture();
+     const signal = opening.signal;
+     const fresh = await loadOptions(signal).catch(() => null);
+     if (!signal.aborted && fresh) {
+      setOptions(fresh);
+      startCapture(true);
+     }
+    }
+   } else if (failure?.filedId) {
     setError('This item was already filed as ' + failure.filedId + '. Any change after that Send was not sent.');
-    draftId = undefined;
+    draftNonce = undefined;
     discardCapture();
     void renewCapture();
    } else if (failure?.screenshotExpired && includePage.checked) {
@@ -1399,10 +1431,15 @@ SCRIPT = r'''(() => {
    setSending(false);
   }
   if (saved) {
-   draftId = undefined;
+   draftNonce = undefined;
    discardCapture(Boolean(key));
-   showConfirmation(saved);
-   dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+   if (onList) {
+    close({sent: true});
+    dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
+   } else {
+    showConfirmation(saved);
+    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+   }
   } else {
    send.focus();
   }
@@ -1410,6 +1447,11 @@ SCRIPT = r'''(() => {
 
  window.reviewNewItem = {open};
  document.addEventListener('click', event => {
+  const listButton = event.target.closest('[data-list-new]');
+  if (listButton) {
+   void open({trigger: listButton, page: 'list'});
+   return;
+  }
   const trigger = event.target.closest('[data-owner-new]');
   const page = trigger?.closest('[data-page-owner]')?.dataset.pageOwner;
   if (page) void open({trigger, page, kind: 'bug'});

@@ -701,26 +701,37 @@ send._bound_relay(message, 2, [], {}, attempt)
             _ = write_registry(home / ".claude/config/models.conf")
             _ = (home / ".claude.json").write_text(json.dumps({
                 "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
-            for delivered, outcome in ((displayed, "sent"), (original, "failed")):
+            for label, code, events, outcome, detail in (
+                ("approved", 0, stream(INIT, call(displayed), answer(OK)), "sent", "; verbatim;"),
+                ("changed", 0, stream(INIT, call(original), answer(OK)), "failed", "different target or payload"),
+                ("timeout", None, stream(INIT, call(displayed)), "failed",
+                 "relay timed out after 10 s; delivery unconfirmed"),
+                ("second call approved", 0,
+                 stream(INIT, call(original, "refused"), answer("unexpected SendMessage input", "refused", error=True),
+                        call(displayed), answer(OK)),
+                 "sent", "queued there (msg_id m1); forwarded 1 of 2 SendMessage calls"),
+            ):
                 with (
-                    self.subTest(outcome=outcome),
+                    self.subTest(label=label),
                     mock.patch.dict(os.environ, {"HOME": str(home), "PATH": os.environ["PATH"], "USER_ZONE": "America/New_York"}, clear=True),
                     mock.patch.object(send, "now", return_value=datetime(2026, 11, 19, 6, 12, tzinfo=timezone.utc)),
                     scratch_accounts_config() as config,
                     mock.patch.object(send, "_bound_relay", side_effect=run_bound_fixture),
                     mock.patch.object(send, "claude_binary", return_value="claude"),
                     mock.patch.object(send, "STATE", home / "message-state"),
-                    mock.patch.object(send, "run", return_value=(0, stream(INIT, call(delivered), answer(OK)), "")) as launch,
+                    mock.patch.object(send, "run", return_value=(code, events, "")) as launch,
                 ):
                     _ = write_send_config(config / "send.conf", "")
                     result = send.relay(fixture_bound_message("uds:/recipient", "sender-address", "Preview", original,
                                                              "sdlc · roles · worker test"), 10)
-                self.assertEqual(result.outcome, outcome)
-                self.assertIn("; verbatim;" if outcome == "sent" else "different target or payload", result.detail)
-                command = cast(list[str], launch.call_args.args[0])
-                self.assertEqual(command[command.index("-n") + 1], "relay/sender-address")
-                self.assertEqual(command[4], "sender-address")
-                self.assertIn(displayed, cast(str, launch.call_args.args[1]))
+                    self.assertEqual(result.outcome, outcome, result.detail)
+                    self.assertIn(detail, result.detail)
+                    if code is None:
+                        self.assertIsInstance(result, send.UncertainRelayDelivery)
+                    command = cast(list[str], launch.call_args.args[0])
+                    self.assertEqual(command[command.index("-n") + 1], "relay/sender-address")
+                    self.assertEqual(command[4], "sender-address")
+                    self.assertIn(displayed, cast(str, launch.call_args.args[1]))
 
     def test_relay_names_a_plain_sender_in_the_payload(self) -> None:
         message = send.Message("uds:/recipient", "shutdown", "Stop", "Stop now.\nKeep the record.", None)
@@ -7379,6 +7390,14 @@ class ReadRelayTests(ShutdownTestCase):
         result = self.read_relay(stream(INIT, call("hello"), refused), no_write)
         self.assertEqual(result, send.Result("queued", "No agent named bogus is reachable. Use ListAgents."))
 
+    def test_recipient_refusal_after_the_write_is_unconfirmed(self) -> None:
+        for refused in (answer("recipient refused", error=True),
+                        answer('{"success":false,"message":"recipient refused"}')):
+            with self.subTest(result=refused):
+                result = self.read_relay(stream(INIT, call("hello"), refused))
+                self.assertIsInstance(result, send.UncertainRelayDelivery)
+                self.assertEqual(result, send.Result("failed", "recipient refused; delivery unconfirmed"))
+
     def test_review_relay_preserves_an_explicit_rejection_after_forwarding(self) -> None:
         refusal = answer('{"success":false,"message":"No agent named bogus is reachable."}')
         events = stream(INIT, call("hello"), refusal)
@@ -7388,10 +7407,10 @@ class ReadRelayTests(ShutdownTestCase):
         result = send.read_relay(observed, "hello", review_delivery=True)
         self.assertEqual(result, send.Result("failed", "No agent named bogus is reachable."))
 
-    def test_multiple_calls_cannot_confirm_delivery(self) -> None:
+    def test_multiple_calls_without_the_forwarded_call_cannot_confirm_delivery(self) -> None:
         events = stream(INIT, call("hello"), answer("matched two sessions", error=True),
                         call("hello", "t2"), answer(OK, "t2"))
-        result = self.read_relay(events)
+        result = self.read_relay(events, send.RelayRequestForwarded("t3", "hello"))
         self.assertIsInstance(result, send.UncertainRelayDelivery)
         self.assertIn("2 SendMessage calls", result.detail)
 
@@ -8080,6 +8099,21 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertIn("Run result 42.", retained)
         self.assertEqual(self.fixture.world.commands, [])
 
+    def test_transcript_read_failure_after_input_keeps_the_worker_result_unconfirmed(self) -> None:
+        marker = "Detached run: fixture"
+        pane = "w1:p1"
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        receipt = send.WorkerResultReceipt(marker)
+        with mock.patch.object(send.WorkerResultReceipt, "received", side_effect=OSError("fixture read failure")):
+            result = send.deliver_worker_text(self.row, staff.snapshot(), marker,
+                sender="detached-runs", timeout=send.delivery_timeout(), receipt=receipt)
+        self.assertIsInstance(result, send.WorkerResultUnconfirmed)
+        self.assertEqual((result.outcome, result.detail),
+                         ("retry", "worker transcript is unavailable: fixture read failure"))
+        prompts = [command[:3] for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertEqual(prompts, [("agent", "prompt", pane)])
+        self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
+
     def test_unavailable_workers_route_the_original_message_and_one_reason_to_the_holder(self) -> None:
         for state in ("blocked", "stopped", "closed", "unknown", "uncertain", "unknown-status"):
             with self.subTest(state=state):
@@ -8109,11 +8143,29 @@ class PaneWorkerMessageTests(unittest.TestCase):
                     notes = [line for line in errors.getvalue().splitlines() if "process read unavailable" in line]
                     self.assertEqual(len(notes), 1, errors.getvalue())
                     self.assertIn("process read unavailable", retained)
-                    del self.fixture.world.unknown[pane]
                 elif state == "uncertain":
                     self.assertIn("terminal identity", retained)
                 elif state == "unknown-status":
                     self.assertIn("Worker unknown-status: worker is unknown", retained)
+                with mock.patch.object(send, "_send") as fallback, redirect_stderr(io.StringIO()):
+                    receipt = send.WorkerResultReceipt("Detached run: fixture", worker_only=True)
+                    result = send.deliver_worker_text(row, staff.snapshot(), "Detached run: fixture",
+                        sender="detached-runs", timeout=send.delivery_timeout(), receipt=receipt)
+                self.assertEqual(result.outcome, "retry", result.detail)
+                self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
+                fallback.assert_not_called()
+                if state == "unknown":
+                    del self.fixture.world.unknown[pane]
+
+        with self.subTest(state="holder row unavailable"):
+            row = self.fixture.worker("no-holder")
+            receipt = send.WorkerResultReceipt("Detached run: fixture", worker_only=True)
+            with mock.patch.object(send, "_send") as fallback:
+                result = send.deliver_worker_text(row, staff.StaffSnapshot(()), "Detached run: fixture",
+                    sender="detached-runs", timeout=send.delivery_timeout(), receipt=receipt)
+            self.assertEqual(result.outcome, "retry")
+            self.assertIn("worker holder is unavailable", result.detail)
+            fallback.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -164,9 +164,9 @@ The gate bucket blocks public access, requires HTTPS, encrypts objects, and remo
 | `expiry_memory_mib` | `128` | Size the expiry function. |
 | `shared_usd_per_month` | `1` | Price shared gate resources before creation. |
 | `credential_file` | `~/.config/aws-build/credentials` | Select the service's private scaler file. |
-| `packages` | See the configured list below. | Prepare the common trial and production tools. |
+| `packages` | List in `config/cloud_gate.conf`. | Prepare tools for cloud gates and paired trials. |
 
-The package list contains `git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq gcc pkg-config tmux taplo zsh bash gh sqlite chromium util-linux awscli2`.
+The list includes bubblewrap for tests that need a sandbox.
 The existing `aws_target.conf` supplies the profile, region, placement, accounting settings, and shared limits.
 
 Fake AWS tests cover launch order, lost replies, restart recovery, expiry, termination, result validation, fallback, and concurrent cap reservations.

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
+from scripts.direct import recorder_state
 from scripts.direct.findings_test_support import FindingsLedgerFixture, findings
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.staff_test_support import isolated_staff_file
@@ -16,9 +17,11 @@ class SimplifyFindingTests(FindingsLedgerFixture):
     def complete_held_phase(self) -> str:
         self.write_progress_state("simplify-instance", "simplify")
         finding_id = self.open_simplify("Remove retry behavior", held=True)
-        path = self.session_dir / "progress_history_state.json"
+        path = self.session_dir / recorder_state.STATE_FILENAME
         progress = cast(dict[str, object], json.loads(path.read_text()))
-        cast(dict[str, object], progress["phase"])["status"] = "completed"
+        phase = recorder_state.open_phases(progress)[0]
+        progress["phase"] = {**phase, "status": "completed"}
+        progress[recorder_state.OPEN_PHASES_KEY] = []
         _ = path.write_text(json.dumps(progress))
         return finding_id
 
