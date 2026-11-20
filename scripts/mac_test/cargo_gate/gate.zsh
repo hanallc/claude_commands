@@ -21,7 +21,7 @@ real_program=$(whence -p "$program")
 agent_call=0
 [[ ! -v CLAUDECODE && ! -v CODEX_HOME && ! -v SSH_CONNECTION && ! -v SSH_CLIENT ]] || agent_call=1
 umask 077
-root_record='' fifo=''
+fifo=''
 label=user
 if (( agent_call )); then
     source ${gate_source:h}/../../lib/conf.sh
@@ -30,7 +30,6 @@ if (( agent_call )); then
         local refusal=$(conf_value mac_gate refusal_exit_code) || exit 2
         print -u2 -r -- "mac cargo gate refused: $1${2-; run it through mac_queue_run.py}"
         [[ -z $fifo ]] || rm -f -- "$fifo"
-        [[ -z $root_record ]] || rm -f -- "$root_record"
         exit $refusal
     }
     placement=${MAC_PLACEMENT:-}
@@ -198,7 +197,6 @@ if [[ $registration == *$'\n'* || $state != /* || $root_key != <->-<-> || $role 
     exit 2
 fi
 if [[ $role == root ]]; then
-    root_record=$state/records/$root_key
     export MAC_GATE_RECORD=$root_key
 fi
 if (( agent_call )); then

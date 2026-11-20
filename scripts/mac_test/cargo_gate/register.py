@@ -1,10 +1,11 @@
-"""Publish a Mac build root before checking for overlapping roots."""
+"""Register a Mac build root under the record lock."""
 
 import os
 from pathlib import Path
 import re
 import sys
 
+from scripts.lib.file_lock import exclusive
 from scripts.mac_test.mac_gate_records import (
     LiveMacProcess, MacGateRecord, MacProcessEvidence, MacProcessIdentity, mac_gate_state,
     observe_mac_process, pid_has_ended, read_mac_gate_record,
@@ -44,10 +45,12 @@ def inherits_root(process: LiveMacProcess, root: MacGateRecord) -> bool:
 
 def check_existing_roots(state: Path, own_record: Path, label: str) -> None:
     try:
-        with os.scandir(own_record.parent) as records, os.scandir(state) as state_entries:
-            record_paths = {entry.name: Path(entry.path) for entry in records if entry.name != own_record.name}
+        # The gate publishes a root record before it creates the jobserver pipe.
+        with os.scandir(state) as state_entries:
             pipe_paths = {entry.name.removeprefix(JOBSERVER_PREFIX): Path(entry.path)
                           for entry in state_entries if entry.name.startswith(JOBSERVER_PREFIX)}
+        with os.scandir(own_record.parent) as records:
+            record_paths = {entry.name: Path(entry.path) for entry in records if entry.name != own_record.name}
     except OSError as error:
         raise RootRefusal("cannot enumerate the build root records and jobserver names") from error
 
@@ -82,28 +85,32 @@ def register(pid: int, ancestor: str, label: str) -> None:
     if not state.is_absolute() or any(character in str(state) for character in "\t\r\n"):
         raise RootRefusal("cannot use the Mac account state directory")
     records = state / "records"
-    records.mkdir(parents=True, exist_ok=True)
-    process = observe_mac_process(pid)
-    if not isinstance(process, LiveMacProcess):
-        raise RootRefusal("cannot verify this build root")
-    if OWNER_NAME.fullmatch(ancestor):
-        root = read_mac_gate_record(records / ancestor)
-        if isinstance(root, MacGateRecord) and root.label == label and inherits_root(process, root):
-            print(state, ancestor, "nested", sep="\t")
-            return
-    own = MacGateRecord(process.identity, label)
-    path = records / own.identity.key
-    # Publish before checking other records. Two roots for one placement cannot both pass.
-    stream = path.open("x")
-    try:
-        with stream:
-            _ = stream.write(own.line())
-        if label != "user":
-            check_existing_roots(state, path, label)
-    except (OSError, RootRefusal):
-        path.unlink(missing_ok=True)
-        raise
-    print(state, own.identity.key, "root", sep="\t")
+    state.mkdir(parents=True, exist_ok=True)
+    # All record writes and removals hold this lock.
+    # The helper holds it only for kernel probes and small file operations.
+    with exclusive(state / "registration.lock"):
+        records.mkdir(exist_ok=True)
+        process = observe_mac_process(pid)
+        if not isinstance(process, LiveMacProcess):
+            raise RootRefusal("cannot verify this build root")
+        key, role = process.identity.key, "root"
+        if OWNER_NAME.fullmatch(ancestor):
+            root = read_mac_gate_record(records / ancestor)
+            if isinstance(root, MacGateRecord) and root.label == label and inherits_root(process, root):
+                key, role = ancestor, "nested"
+        if role == "root":
+            own = MacGateRecord(process.identity, label)
+            path = records / key
+            stream = path.open("x")
+            try:
+                with stream:
+                    _ = stream.write(own.line())
+                if label != "user":
+                    check_existing_roots(state, path, label)
+            except (OSError, RootRefusal):
+                path.unlink(missing_ok=True)
+                raise
+    print(state, key, role, sep="\t")
 
 
 def main() -> int:

@@ -25,8 +25,8 @@ from scripts.mac_test.mac_gate_records import MacGateRecord, MacProcessIdentity
 GATE = Path(__file__).with_name("cargo_gate") / "bin"
 FIXTURE_WORKER_BUDGET = "3"
 FIXTURE_STARTED_US = 1_793_280_000_123_456
-REGISTER_PYTHON = '''import errno, json, os, subprocess, sys
-from contextlib import contextmanager
+REGISTER_PYTHON = '''import errno, fcntl, io, json, os, subprocess, sys
+from contextlib import closing, contextmanager, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,8 +43,58 @@ if sys.argv[1] == "-B" and Path(sys.argv[2]).name == "register.py":
     from scripts.mac_test.mac_gate_records import MacGateRecord, MacProcessIdentity
 
     failures = json.loads(os.environ.get("GATE_TEST_PROBE_FAILURES", "{}"))
+    peer_entries = json.loads(os.environ.get("GATE_TEST_PEER_ENTRIES", "[]"))
+    record_race = os.environ.get("GATE_TEST_RECORD_RACE", "")
+    peer_pid = os.environ.get("GATE_TEST_RACE_PEER_PID")
+    original_flock = fcntl.flock
     original_kill = os.kill
+    original_open = Path.open
     original_scandir = os.scandir
+
+    def register_contender():
+        # Try the competing registration once at this exact point in the race.
+        def try_flock(descriptor, operation):
+            if operation == fcntl.LOCK_EX:
+                operation |= fcntl.LOCK_NB
+            original_flock(descriptor, operation)
+
+        with patch.object(fcntl, "flock", try_flock), redirect_stdout(io.StringIO()):
+            try:
+                register.register(os.getpid(), "", "placement episode/contender")
+            except BlockingIOError:
+                outcome = "deferred"
+            except register.RootRefusal as error:
+                outcome = str(error)
+            else:
+                outcome = "registered"
+        (root / "contender").write_text(outcome)
+
+    def open_record(file, mode="r", *args, **kwargs):
+        global record_race
+        stream = original_open(file, mode, *args, **kwargs)
+        if record_race == "publish" and mode == "x":
+            record_race = ""
+            try:
+                register_contender()
+            except BaseException:
+                stream.close()
+                raise
+        return stream
+
+    def refuse_peer(identity):
+        from scripts.lib.shell_test_support import shell_function
+
+        source = path.with_name("gate.zsh").read_text().replace("\\n    ", "\\n")
+        refuse = shell_function(source, "refuse")
+        state = mac_gate_records.mac_gate_state()
+        record = state / "records" / identity.key
+        pipe = state / (register.JOBSERVER_PREFIX + identity.key)
+        result = subprocess.run([
+            "/bin/zsh", "-f", "-c",
+            'source "$3"\\nroot_record=$1 fifo=$2\\n' + refuse + "\\nrefuse 'fixture peer refused' ''",
+            "refuse-peer", str(record), str(pipe), str(path.parents[2] / "lib/conf.sh"),
+        ], capture_output=True, text=True)
+        assert result.returncode and result.stderr == "mac cargo gate refused: fixture peer refused\\n", result
 
     def read(pid, flavor, argument, buffer, size):
         assert (flavor, argument) == (darwin_process.PROC_PIDTBSDINFO, 1)
@@ -59,6 +109,13 @@ if sys.argv[1] == "-B" and Path(sys.argv[2]).name == "register.py":
         parent, state = result.stdout.split()
         status = darwin_process.SZOMB if state.startswith("Z") else 2
         info = darwin_process.DarwinProcessInfo(pid, int(parent), FIXTURE_STARTED_US, status, 0)
+        if str(pid) == peer_pid:
+            if record_race == "withdraw":
+                refuse_peer(MacProcessIdentity(pid, FIXTURE_STARTED_US))
+            if record_race == "cleanup":
+                # The contender sees the owner end after this probe found it alive.
+                failures[str(pid)] = "ended"
+                register_contender()
         return write_process_info(buffer, size, info)
 
     def check_pid(pid, signal):
@@ -81,24 +138,34 @@ if sys.argv[1] == "-B" and Path(sys.argv[2]).name == "register.py":
         selected = relative and Path(directory) == mac_gate_records.mac_gate_state() / relative
         if selected and failure == "open":
             raise OSError("cannot open the directory")
-        with original_scandir(directory) as entries:
-            if selected and failure == "iterate":
-                def interrupted():
+
+        # Open the directory at iteration so the next read sees the published peer.
+        def read_entries():
+            with original_scandir(directory) as entries:
+                if selected and failure == "iterate":
                     for entry in entries:
                         if entry.name == os.environ["GATE_TEST_ENDED_ENTRY"]:
                             yield entry
                             raise OSError("cannot continue reading the directory")
                     raise AssertionError("the scan fixture has no ended entry")
-                yield interrupted()
-            else:
-                yield entries
+                yield from entries
+            if peer_entries:
+                record, pipe = map(Path, peer_entries)
+                state = mac_gate_records.mac_gate_state()
+                record.rename(state / "records" / record.name)
+                pipe.rename(state / pipe.name)
+                peer_entries.clear()
+
+        with closing(read_entries()) as entries:
+            yield entries
 
     with (root / "registrations").open("a") as stream:
         stream.write("register\\n")
     sys.argv = sys.argv[2:]
     with (patch.object(mac_gate_records.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(root))),
           patch.object(sys, "platform", "darwin"), native_process_read(read),
-          patch.object(os, "kill", check_pid), patch.object(os, "scandir", scan)):
+          patch.object(os, "kill", check_pid), patch.object(os, "scandir", scan),
+          patch.object(Path, "open", open_record)):
         raise SystemExit(register.main())
 if sys.argv[1:3] != ["-I", "-c"]:
     with (root / "parsers").open("a") as stream:
@@ -573,6 +640,59 @@ class CargoGateTests(unittest.TestCase):
             self.assertEqual(list(record.parent.iterdir()), [])
             self.assertTrue(pipe.exists())
             self.assertFalse((root / "runs").exists())
+
+    def test_peer_can_publish_its_record_and_pipe_between_scans(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            record, pipe = self.owner_entries(root / "peer", os.getpid())
+            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/other-attempt",
+                               GATE_TEST_PEER_ENTRIES=json.dumps([str(record), str(pipe)]))
+            result = self.run_gate(environment, "build")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            state = root / ".local/state/mac-gate"
+            self.assertTrue((state / "records" / record.name).exists())
+            self.assertTrue((state / pipe.name).exists())
+            self.assertEqual(len(self.runs(root)), 1)
+
+    def test_record_races_allow_a_root_in_another_placement(self) -> None:
+        for race in ("withdraw", "cleanup", "publish"):
+            with self.subTest(race=race), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = self.fixture(root)
+                pid = os.getpid()
+                record, pipe = self.owner_entries(root, pid)
+                environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/other-attempt")
+                result = self.run_gate({
+                    **environment, "GATE_TEST_RECORD_RACE": race, "GATE_TEST_RACE_PEER_PID": str(pid),
+                }, "build")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(record.exists())
+                if race == "withdraw":
+                    self.assertFalse(pipe.exists())
+                else:
+                    self.assertEqual((root / "contender").read_text(), "deferred")
+                if race == "cleanup":
+                    result = self.run_gate({**environment, "GATE_TEST_PROBE_FAILURES": json.dumps({pid: "ended"})},
+                                           "build")
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertFalse(record.exists())
+                    self.assertFalse(pipe.exists())
+
+    def test_shell_refusal_leaves_its_record_for_the_next_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
+            refusal = self.run_gate({**environment, "CHECK_MODE": "closed"}, "build")
+            self.assertEqual(refusal.returncode, 125, refusal.stdout + refusal.stderr)
+            self.assertIn("placement episode/attempt closed", refusal.stderr)
+            records = root / ".local/state/mac-gate/records"
+            refused, = records.iterdir()
+            result = self.run_gate(environment, "build")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(refused.exists())
+            self.assertEqual(len(self.runs(root)), 1)
 
     def test_legacy_cleanup_preserves_live_or_unknown_pids_and_stamped_replacements(self) -> None:
         for evidence in ("live", "denied", "reused"):

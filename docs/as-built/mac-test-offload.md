@@ -43,15 +43,20 @@ The Mac Cargo gate at `scripts/mac_test/cargo_gate/gate.zsh` checks placement fo
 The `cargo`, `cargo-nextest`, and `rustc` links use this gate.
 For a placed call, `worker_budget` in `config/mac_gate.conf` sets the jobserver slots and caps nextest test threads.
 The initial budget is four slots per build root.
-The gate permits one independent build root per placement and refuses an overlap without waiting.
-If two roots start at the same time, both can receive a refusal.
+The gate permits one independent build root per placement and refuses a second live root.
 The gate stores state in the Mac account's home directory, independent of the caller's `HOME`.
 The gate and Builds page identify each root by its PID and kernel start time in microseconds.
+The registration helper holds an exclusive lock for each admission scan and for every record write and removal.
+A registration can wait for the helper that holds the lock.
+That helper performs only kernel probes and small file operations while it holds the lock.
+It releases the lock before the gate starts its placement check or launches Cargo.
 The gate removes old records and pipe names only after it confirms that their owners ended.
 A placed root receives a refusal if the gate cannot verify an existing root or pipe owner.
 The gate deletes nothing from existing records and pipe names if it cannot collect complete evidence.
 After the evidence check, a cleanup error can occur after the gate deletes some entries.
-A refused root removes its own record.
+The helper removes its own record if registration fails after publication.
+If the shell refuses a registered root, it removes any pipe name it created and leaves the record.
+A later registration for a placed root removes that record when it confirms that the owner ended.
 Mac launches use the installed gate. Installing the new gate stops launches that create bare PID records.
 An old root can still overlap a new root during the install window, as it could before the one-root rule.
 The new gate ignores bare PID records for admission. It removes one only when the kernel confirms that the PID is absent.
