@@ -767,12 +767,19 @@ class Deployment:
     def _load(self, notification: BudgetNotificationAddress
               ) -> tuple[DeploymentSettings, dict[str, str]]:
         settings = read_deployment_settings(self.settings_path)
-        _ = self._guard()
+        vpc = ledger.text(self._prepared_parameters(), 'VpcId')
+        parameters = self._parameters(settings, notification, vpc)
+        self._before_request(settings, parameters)
         network = self._deployment_network(settings, self._api(settings))
+        if network.vpc != vpc:
+            raise DeploymentRefused('the deployment VPC changed; run prepare again')
         _ = network.subnet_in(settings.availability_zone)
-        parameters = self._parameters(settings, notification, network.vpc)
-        self._confirm_preparation(settings, parameters)
         return settings, parameters
+
+    def _prepared_parameters(self) -> dict[str, object]:
+        prepared = cast(object, json.loads((self.output / 'parameters.json').read_text()))
+        return {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
+                for row in ledger.rows({'parameters': prepared}, 'parameters')}
 
     def _before_request(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
         _ = self._guard()
@@ -829,10 +836,7 @@ class Deployment:
                 return self._update_stack_owned_hana(path, saved, workload, limits)
             settings, parameters, template = self._hana_inputs(workload)
             if not saved:
-                prepared = cast(object, json.loads((child.output / 'parameters.json').read_text()))
-                prepared_parameters = {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
-                                       for row in ledger.rows({'parameters': prepared}, 'parameters')}
-                parameters['DeploymentId'] = ledger.text(prepared_parameters, 'DeploymentId')
+                parameters['DeploymentId'] = ledger.text(child._prepared_parameters(), 'DeploymentId')
             resume_stop = saved.get('requested') is True and saved.get('stop_pending') is True and bool(saved.get('instance'))
             child.confirm_preparation_evidence(settings, parameters, template, allow_expired=resume_stop)
             book = ledger.CostLedger(self.directory)

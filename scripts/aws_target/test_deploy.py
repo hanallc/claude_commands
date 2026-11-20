@@ -5396,10 +5396,10 @@ else: raise AssertionError(args)
         subject = self.deployment()
         _ = subject.prepare()
         self.replace('daily_limit_usd', '1')
+        before_apply = self.commands()
         with self.assertRaises(deploy.DeploymentRefused):
             _ = subject.apply(approve_resources=True)
-        self.assertEqual(self.commands('create-change-set'), [])
-        self.assertEqual(self.commands('deploy'), [])
+        self.assertEqual(self.commands(), before_apply)
 
     def test_a_limit_change_during_the_foundation_deploy_refuses_the_next_change(self) -> None:
         subject = self.deployment()
@@ -5422,10 +5422,10 @@ else: raise AssertionError(args)
     def test_apply_requires_explicit_user_gate_and_private_credentials(self) -> None:
         subject = self.deployment()
         _ = subject.prepare()
+        before_apply = self.commands()
         with self.assertRaises(deploy.DeploymentRefused):
             _ = subject.apply()
         self.credentials.chmod(0o644)
-        before_apply = self.commands()
         with self.assertRaises(deploy.DeploymentRefused):
             _ = subject.apply(approve_resources=True)
         self.assertEqual(self.commands(), before_apply)
