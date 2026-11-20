@@ -365,12 +365,64 @@ class AwsCombinedTableTests(PageCostFixture):
         assert marker is not None, 'The browser must finish the table checks.'
         self.assertEqual(unescape(marker[1]), 'passed')
 
+    def test_disabled_cloud_gates_replace_the_launch_status(self) -> None:
+        self.configure_gate('enabled=off')
+        self.run_browser_checks('', """
+    const block = document.getElementById("launch-state");
+    check(block.dataset.kind === "off", "Disabled cloud gate state");
+    check(block.innerText === "Cloud gates are off (cloud_gate.conf enabled=off). Gates run on natedev.",
+          "The disabled state explains where gates run");
+""", blocked=True)
+
+    def test_invalid_cloud_gate_switch_keeps_the_other_page_blocks(self) -> None:
+        self.configure_gate('enabled=invalid')
+        at = ledger_test_support.instant('2026-01-15T11:59:00Z')
+        with ledger.CostLedger(self.state).transaction() as evidence:
+            evidence.observations.append(ledger.InstanceObservation(at, 'stopped', 'fixture'))
+            evidence.inventories.append(ledger.ResourceInventory(at, (), 'fixture', builder_removed=True))
+        self.run_browser_checks('?show=quota', """
+    const block = document.getElementById("launch-state");
+    check(block.innerText === "cloud_gate.conf enabled is not valid. Gates run on natedev.",
+          "The invalid switch explains where gates run");
+    check(document.querySelectorAll("#spend-tiles .tile").length === 3, "Spend still renders");
+    check(document.querySelector("#price-table tbody tr"), "Quotas still render");
+    check(document.querySelector("#hours h2").textContent === "Billed hours / box hours", "Hours still render");
+""", blocked=True)
+
+    def test_billed_hours_filters_sizes_by_activity_in_the_selected_regions(self) -> None:
+        start = ledger_test_support.instant('2026-01-14T00:00:00Z')
+        end = start + 86400
+        with ledger.CostLedger(self.state).transaction() as evidence:
+            evidence.hana_compute.append(ledger.HanaComputeExposure(
+                start, start + 3600, 1, Decimal('.25'), ledger.HanaExposureClosed(start + 3600),
+                'm7a.2xlarge', region='us-east-2'))
+        charges = self.state / 'charges'
+        charges.mkdir()
+        charge = ledger.ChargeRead(
+            '2026-01-14', end, start, end, Decimal(1), Decimal(0), Decimal(0),
+            (ledger.UsageTypeCost('USE1-SpotUsage:c7a.4xlarge', Decimal('.75'), Decimal(1), 'Hrs'),
+             ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.25'), Decimal('.01'), 'Hrs')))
+        _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(charge)))
+        self.run_browser_checks('', """
+    const sizes = () => [...document.querySelectorAll("#hours tbody tr")].map(row => row.cells[0].textContent);
+    check(sizes().includes("c7a.4xlarge") && sizes().includes("m7a.8xlarge"), "Both active sizes show");
+    const east = document.querySelector("#regions [data-region='us-east-1']");
+    document.querySelector("#regions .all:last-child").click();
+    document.querySelector("#regions [data-region='us-east-2']").click();
+    check(sizes().join() === "m7a.8xlarge", "The hidden region's size row is absent");
+    check(document.querySelector("#hours tbody tr").cells[1].textContent.startsWith("0.0/0.0"),
+          "A small billed amount keeps its row even when the cell rounds to zero");
+    east.click();
+    check(sizes().includes("c7a.4xlarge"), "The row returns when its region is selected");
+""")
+
     def test_launch_state_sits_above_spend_and_updates_after_a_good_launch(self) -> None:
         self.run_browser_checks('', """
     const block = document.getElementById("launch-state");
     const message = () => block.querySelector("[role='status']").textContent;
     check(block.nextElementSibling.id === "spend", "Launch state sits above spend");
     check(block.dataset.kind === "refused", "Refusal style");
+    check(!block.innerText.includes("Cloud gates are off"), "The notice is absent when gates are on");
     check(message().includes("AWS refuses launches (Blocked). The account is blocked."),
           "Refusal includes the code and plain reason");
     const {first_at, last_good_at, latest_attempt_at} = data.launch_state;
@@ -520,6 +572,22 @@ class AwsCombinedTableTests(PageCostFixture):
             {'region': 'eu-west-1', 'standard': {'state': 'no_request'},
              'gpu': {**gpu, 'status': 'PENDING', 'created_at': None}},
         ))
+
+    def test_summary_omits_unknown_counts_before_the_first_request_history(self) -> None:
+        self.run_browser_checks('?types=gpu&show=quota', """
+    const summary = document.querySelector("#gpu-quota-summary");
+    const prefix = "G and VT quota (32 vCPUs): ";
+    check(summary.textContent === prefix + "3 granted · request history not measured yet",
+          "The summary keeps known grants and omits unknown counts");
+    const requests = [...document.querySelectorAll("#price-table .quota-request")];
+    check(requests.length === 3 && requests.every(cell => cell.textContent === "not measured"),
+          "All three request cells show that history is missing");
+    const note = document.querySelector("#quota-request-note");
+    check(!note.hidden && note.textContent === "The snapshot has no quota request history.", "One history note");
+    document.querySelector("#regions .all:last-child").click();
+    check(summary.textContent === prefix + "request history not measured yet",
+          "The summary omits the grant count when no grant is visible");
+""")
 
     def test_missing_history_note_requires_every_visible_row_to_lack_history(self) -> None:
         self.run_browser_checks('?types=gpu&show=quota', """

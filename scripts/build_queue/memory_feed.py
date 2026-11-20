@@ -19,6 +19,7 @@ import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, assert_never, overload
 
@@ -2073,6 +2074,8 @@ class RamBlocks(TypedDict):
     build_tools_bytes: int
     rust_analyzer_bytes: int
     sccache_bytes: int
+    python_tests_bytes: int
+    waiting_runs_bytes: int
     other_build_tools_bytes: int
     # The CI use that the queue cap counts: swap-backed use.
     ci_bytes: int
@@ -2280,19 +2283,324 @@ class BuildToolRam:
     rust_analyzer: int
     sccache: int
     other: int
+    python_tests: int = 0
+    waiting_runs: int = 0
 
 
-def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], queued_use: int) -> BuildToolRam:
-    """Read the builds.slice program RAM that no queued build holds, on the same basis as the queued builds.
+def python_test_command(command: tuple[str, ...]) -> bool:
+    """Identify a Python test runner from its command line."""
+    if not command:
+        return False
+    program = Path(command[0])
+    if program.parts[-2:] != ("lib", "py") and not re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", program.name):
+        return False
+    for index, arg in enumerate(command[1:], 1):
+        if arg == "-m":
+            return command[index + 1:index + 2] in (("unittest",), ("pytest",))
+        if arg in ("-c", "-"):
+            return False
+        if not arg.startswith("-"):
+            name = Path(arg).name
+            return name in ("pytest", "py.test") or name.startswith("test_") and name.endswith(".py")
+    return False
 
-    rust-analyzer and the compiler cache have their own lines. Other build tools is the rest of builds.slice
-    (the slice reading minus the queued use and the groups that another line or block counts), plus each
-    recorded tool group outside builds.slice.
-    """
+
+class ToolProcessReader:
+    """Read process evidence only for candidate tools and their ancestors."""
+    def __init__(self) -> None:
+        self.identities: dict[int, gate.ProcessIdentity | None] = {}
+        self.commands: dict[int, tuple[str, ...]] = {}
+
+    def identity(self, pid: int) -> gate.ProcessIdentity | None:
+        if pid not in self.identities:
+            self.identities[pid] = None
+            try:
+                fields = (PROC / str(pid) / "stat").read_bytes().rsplit(b") ", 1)[1].split()
+                if fields[0] not in (b"Z", b"X"):
+                    self.identities[pid] = gate.ProcessIdentity(int(fields[1]), fields[19].decode())
+            except (OSError, ValueError, IndexError):
+                pass
+        return self.identities[pid]
+
+    def command(self, pid: int) -> tuple[str, ...]:
+        if pid not in self.commands:
+            try:
+                command = (PROC / str(pid) / "cmdline").read_bytes().decode(errors="replace")
+                self.commands[pid] = tuple(command.removesuffix("\0").split("\0"))
+            except OSError:
+                self.commands[pid] = ()
+        return self.commands[pid]
+
+    def verify_shell(self, pid: int) -> bool:
+        command = self.command(pid)
+        if not command:
+            return False
+        program = Path(command[0]).name.lstrip("-")
+        return program == "verify.sh" or (
+            program in {"sh", "bash", "dash", "zsh", "ksh"}
+            and any(Path(arg).name == "verify.sh" for arg in command[1:]))
+
+    def verify_chain(self, pid: int) -> list[int]:
+        """Find the chain from the queue owner to its Verify shell."""
+        chain: list[int] = []
+        seen: set[int] = set()
+        while pid > 1 and pid not in seen:
+            identity = self.identity(pid)
+            if identity is None:
+                break
+            chain.append(pid)
+            if self.verify_shell(pid):
+                return chain
+            seen.add(pid)
+            pid = identity.parent
+        return []
+
+    def verify_helper(self, pid: int) -> bool:
+        return any(Path(arg).name in {"local_release_wait.py", "tree_watch.py", "verify_helper.py"}
+                   for arg in self.command(pid)[:2])
+
+
+def tool_children(pid: int) -> set[int]:
+    """Read the children of each thread in one queued process."""
+    try:
+        tasks = list((PROC / str(pid) / "task").iterdir())
+    except OSError:
+        return set()
+    children: set[int] = set()
+    for task in tasks:
+        try:
+            children.update(int(value) for value in (task / "children").read_text().split() if value.isdecimal())
+        except OSError:
+            continue
+    return children
+
+
+@dataclass(frozen=True)
+class WaitingToolProcesses:
+    """Hold the queued process trees and their Verify wrappers."""
+    queued: set[int]
+    wrappers: set[int]
+
+
+def waiting_tool_processes(waiters: Sequence[admission_records.RankedWaiter],
+                           reader: ToolProcessReader) -> WaitingToolProcesses:
+    roots: dict[int, bool] = {}
+    wrappers: set[int] = set()
+    for row in waiters:
+        pid = row["pid"]
+        owner = reader.identity(pid)
+        if owner is None or owner.start != row["start_time"]:
+            continue
+        chain = reader.verify_chain(pid)
+        roots[pid] = bool(chain)
+        if not chain:
+            continue
+        shell = chain[-1]
+        wrappers.add(shell)
+        wrappers.update(parent for parent in chain[1:-1] if reader.verify_helper(parent))
+        roots[shell] = True
+
+    queued: set[int] = set()
+    pending = list(roots.items())
+    while pending:
+        pid, verify = pending.pop()
+        if pid in queued:
+            continue
+        queued.add(pid)
+        if verify and reader.verify_helper(pid):
+            wrappers.add(pid)
+        for child in tool_children(pid) - queued:
+            identity = reader.identity(child)
+            if identity is not None and identity.parent == pid:
+                pending.append((child, verify))
+    return WaitingToolProcesses(queued, wrappers)
+
+
+def tool_group_members(path: Path) -> set[int]:
+    procs = path / "cgroup.procs"
+    gate.check_memory_reading(procs)
+    try:
+        return {int(pid) for pid in procs.read_text().split()}
+    except (OSError, ValueError):
+        return set()
+
+
+def tool_group_children(path: Path) -> list[Path]:
+    try:
+        return [child for child in path.iterdir() if child.is_dir()]
+    except OSError:
+        return []
+
+
+class ToolGroupKind(Enum):
+    PYTHON_TESTS = auto()
+    OTHER = auto()
+    UNMARKED = auto()
+
+
+@dataclass(frozen=True)
+class ToolGroup:
+    members: set[int]
+    children: list[Path]
+    kind: ToolGroupKind = ToolGroupKind.OTHER
+
+
+def detached_tool_groups(detached: Path, excluded: set[Path]) -> dict[Path, ToolGroup]:
+    groups: dict[Path, ToolGroup] = {}
+    pending = [(detached, ToolGroupKind.UNMARKED)]
+    while pending:
+        path, kind = pending.pop()
+        if path in excluded:
+            continue
+        # The detached launcher sets the scope name before the command starts.
+        if path.suffix == ".scope":
+            if path.stem.startswith("detached-python-tests-"):
+                kind = ToolGroupKind.PYTHON_TESTS
+            elif path.stem.startswith("detached-other-"):
+                kind = ToolGroupKind.OTHER
+        children = tool_group_children(path)
+        groups[path] = ToolGroup(tool_group_members(path), children, kind)
+        pending.extend((child, kind) for child in children)
+    return groups
+
+
+def waiting_tool_group(pid: int, builds: Path, outside: set[Path], excluded: set[Path]) -> Path | None:
+    try:
+        membership = (PROC / str(pid) / "cgroup").read_text().splitlines()
+    except OSError:
+        return None
+    for line in membership:
+        if line.startswith("0::/"):
+            path = CGROUP / line[4:]
+            if (path.is_relative_to(builds) or any(path.is_relative_to(root) for root in outside)
+                    ) and excluded.isdisjoint((*path.parents, path)):
+                return path
+    return None
+
+
+def detached_test_processes(members: set[int], reader: ToolProcessReader) -> set[int]:
+    """Inherit a test runner's classification within the detached cgroups."""
+    classified: dict[int, bool] = {}
+    for member in members:
+        chain: list[int] = []
+        seen: set[int] = set()
+        pid = member
+        while pid in members and pid not in classified and pid not in seen:
+            if python_test_command(reader.command(pid)):
+                classified[pid] = True
+                break
+            seen.add(pid)
+            chain.append(pid)
+            identity = reader.identity(pid)
+            if identity is None:
+                break
+            pid = identity.parent
+        classified.update(dict.fromkeys(chain, classified.get(pid, False)))
+    return {pid for pid, is_test in classified.items() if is_test}
+
+
+def proportional_tool_bytes(pid: int) -> int:
+    """Read the process's proportional anonymous and shared memory."""
+    try:
+        lines = (PROC / str(pid) / "smaps_rollup").read_text().splitlines()
+    except OSError:
+        return 0
+    counters: dict[str, int] = {}
+    for line in lines:
+        if line.startswith(("Pss_Anon:", "Pss_Shmem:")):
+            counters.update(gate.kib_fields(line.split()))
+    if "Pss_Anon" in counters and "Pss_Shmem" in counters:
+        return counters["Pss_Anon"] + counters["Pss_Shmem"]
+    return 0
+
+
+@dataclass(frozen=True)
+class ToolGroupRam:
+    python_tests_bytes: int = 0
+    waiting_runs_bytes: int = 0
+
+
+def shares_within_budget(budget: int, shares: ToolGroupRam, measured: int) -> ToolGroupRam:
+    # Process shares and cgroup charges can differ across scopes or when processes move.
+    # Divide the charge by all measured shares if they exceed the charge.
+    if measured > budget:
+        return ToolGroupRam(
+            python_tests_bytes=shares.python_tests_bytes * budget // measured,
+            waiting_runs_bytes=shares.waiting_runs_bytes * budget // measured)
+    return shares
+
+
+def split_tool_groups(builds: Path, outside: set[Path], excluded: set[Path], charged: set[int],
+                      waiters: Sequence[admission_records.RankedWaiter]) -> dict[Path, ToolGroupRam]:
+    """Read detached scopes and the specific cgroups of waiting wrappers."""
+    reader = ToolProcessReader()
+    waiting = waiting_tool_processes(waiters, reader)
+    detached = builds / "builds-detached.slice"
+    groups = detached_tool_groups(detached, excluded)
+    members = {pid for group in groups.values() for pid in group.members}
+    non_tests = waiting.queued | waiting.wrappers | charged
+    unmarked_members = {pid for group in groups.values() if group.kind is ToolGroupKind.UNMARKED for pid in group.members}
+    tests = detached_test_processes(unmarked_members - non_tests, reader)
+    for pid in waiting.wrappers - charged - members:
+        path = waiting_tool_group(pid, builds, outside, excluded)
+        if path is not None and path not in groups:
+            groups[path] = ToolGroup(tool_group_members(path), tool_group_children(path))
+
+    charges: dict[Path, int] = {}
+
+    def charge(path: Path) -> int:
+        if path not in charges:
+            charges[path] = swap_backed_bytes(path)
+        return charges[path]
+
+    result: dict[Path, ToolGroupRam] = {}
+    for path, group in groups.items():
+        members = group.members
+        group_tests: set[int] = set()
+        if group.kind is ToolGroupKind.PYTHON_TESTS:
+            group_tests = members - non_tests
+        elif group.kind is ToolGroupKind.UNMARKED:
+            group_tests = members & tests
+        group_wrappers = (members & waiting.wrappers) - charged
+        # For an unmarked group, estimate that all direct memory belongs to tests only if every live member qualifies.
+        whole_test_scope = group_tests == members and (bool(members) or group.kind is ToolGroupKind.PYTHON_TESTS)
+        if not (whole_test_scope or group_tests or group_wrappers):
+            continue
+        try:
+            direct = charge(path) - sum(charge(child) for child in group.children)
+        except (OSError, ValueError, KeyError):
+            continue
+        if direct <= 0:
+            continue
+        if whole_test_scope:
+            result[path] = ToolGroupRam(python_tests_bytes=direct)
+        elif group_wrappers == members:
+            result[path] = ToolGroupRam(waiting_runs_bytes=direct)
+        else:
+            use = {pid: proportional_tool_bytes(pid) for pid in members}
+            shares = ToolGroupRam(python_tests_bytes=sum(use[pid] for pid in group_tests),
+                                  waiting_runs_bytes=sum(use[pid] for pid in group_wrappers))
+            result[path] = shares_within_budget(direct, shares, sum(use.values()))
+    return result
+
+
+def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], queued_use: int,
+                   waiters: Sequence[admission_records.RankedWaiter] = ()) -> BuildToolRam:
+    """Split the existing tool budget after the queue and service charges."""
     builds = gate.builds_slice_cgroup()
-    rust_analyzer = sccache = outside_tools = named_inside = 0
+    rust_analyzer = sccache = named_inside = 0
+    outside: dict[Path, int] = {}
+    excluded = {builds / "sccache.service"}
+    charged: set[int] = set()
     for entry in running:
         memory = entry.step.measured
+        if isinstance(memory, admission_records.MeasuredMemory) and gate.running_has_reservation(entry.step):
+            source = memory.anonymous_source
+            if isinstance(source, admission_records.ScopeSource):
+                excluded.add(source.directory)
+                charged.update(source.members)
+            elif isinstance(source, admission_records.ProcessSource):
+                charged.update(item.pid for item in source.processes)
         if isinstance(memory, admission_records.CompilerServiceMemory):
             path = builds / "sccache.service"
         elif isinstance(memory, admission_records.UnownedSliceMemory) and memory.cgroup and not memory.diagnostic:
@@ -2313,11 +2621,12 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
         elif (not isinstance(admission_records.recorded_service_state(memory), NotServiceSlice)
               or entry.step.step == SWAP_NAMES["between"]):
             # A CI service counts in hana CI, and a run between steps counts in its queued hold.
-            pass
+            excluded.add(path)
         elif isinstance(memory.activity, ScopeProcesses) and memory.activity.program == RUST_ANALYZER:
             rust_analyzer += amount
+            excluded.add(path)
         elif not inside:
-            outside_tools += amount
+            outside[path] = outside.get(path, 0) + amount
             continue
         else:
             continue
@@ -2326,7 +2635,22 @@ def build_tool_ram(running: Sequence[admission_records.ExplainedRunningStep], qu
         slice_bytes = swap_backed_bytes(builds)
     except (OSError, ValueError, KeyError):
         slice_bytes = queued_use + named_inside
-    return BuildToolRam(rust_analyzer, sccache, max(0, slice_bytes - queued_use - named_inside) + outside_tools)
+    inside_tools = max(0, slice_bytes - queued_use - named_inside)
+    other = inside_tools + sum(outside.values())
+    if not other:
+        return BuildToolRam(rust_analyzer, sccache, other)
+    outward_roots = gate.owned_scope_roots(outside, Path("/"))
+    groups = split_tool_groups(builds, outward_roots, excluded, charged, waiters)
+    inside = [amount for path, amount in groups.items() if path.is_relative_to(builds)]
+    tests = sum(amount.python_tests_bytes for amount in inside)
+    wrappers = sum(amount.waiting_runs_bytes for amount in inside)
+    shares = shares_within_budget(inside_tools, ToolGroupRam(tests, wrappers), tests + wrappers)
+    python_tests, waiting_runs = shares.python_tests_bytes, shares.waiting_runs_bytes
+    for root in outward_roots:
+        wrappers = sum(amount.waiting_runs_bytes for path, amount in groups.items() if path.is_relative_to(root))
+        shares = shares_within_budget(outside[root], ToolGroupRam(waiting_runs_bytes=wrappers), wrappers)
+        waiting_runs += shares.waiting_runs_bytes
+    return BuildToolRam(rust_analyzer, sccache, other - python_tests - waiting_runs, python_tests, waiting_runs)
 
 
 def known_bytes(value: RamReading) -> int:
@@ -2351,7 +2675,7 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
                     key=lambda item: item[1], reverse=True)
     smaller = ranked[program_rows:]
     other_programs_bytes = sum(amount for _, amount in ranked)
-    build_tools = tools.rust_analyzer + tools.sccache + tools.other
+    build_tools = tools.rust_analyzer + tools.sccache + tools.python_tests + tools.waiting_runs + tools.other
     total: RamReading = (room.total if isinstance(room.total, int)
                          else admission_records.ReadingUnavailable("total RAM is not recorded"))
     named = (room.used + build_tools + room.ci_use + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
@@ -2370,7 +2694,8 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
         "safety_missing_bytes": safety - safety_covered, "swap_missing_bytes": swap - swap_covered,
         "build_missing_bytes": build - build_covered,
         "queued_builds_bytes": room.used, "build_tools_bytes": build_tools, "rust_analyzer_bytes": tools.rust_analyzer,
-        "sccache_bytes": tools.sccache, "other_build_tools_bytes": tools.other, "ci_bytes": room.ci_use,
+        "sccache_bytes": tools.sccache, "python_tests_bytes": tools.python_tests, "waiting_runs_bytes": tools.waiting_runs,
+        "other_build_tools_bytes": tools.other, "ci_bytes": room.ci_use,
         "cap_bytes": room.used + build_tools + room.ci_use + build_covered + room.room,
         "agents_bytes": agents, "desktop_bytes": desktop, "desktop_protection_bytes": gate.desktop_guarantee(),
         "programs": [{"id": name.lower(), "name": name, "bytes": amount} for name, amount in ranked[:program_rows]],
@@ -2488,7 +2813,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                           if activity.started_at else "not recorded", "used": gib(memory.bytes), "members": scope_members})
     tokens = token_pool(captured.available, configuration.stevie_program)
     token_stage = token_wait_stage(tokens)
-    ram = ram_blocks(captured, build_tool_ram(explanation.running, captured.used),
+    ram = ram_blocks(captured, build_tool_ram(explanation.running, captured.used, explanation.ordered),
                      explanation.now, configuration.other_rows)
     cap = gib(ram["cap_bytes"]) if isinstance(captured.cap, int) else captured.cap
     safety = gib(captured.safety)
