@@ -17,7 +17,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib.git_test_support import git_fixture_environment
+from scripts.lib.git_test_support import git_fixture_environment, write_fixture_git_config
 from scripts.lib import conf, live_settings, main_publish, main_sync, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -36,9 +36,10 @@ class WaitingRowsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="waiting-rows-")))
+        _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(self.root)))
         environment = git_fixture_environment()
-        environment.update(HOME=str(self.root), XDG_STATE_HOME=str(self.root / "state"),
-                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+        environment.update(HOME=str(self.root), XDG_STATE_HOME=str(self.root / "state"), TMPDIR=str(self.root),
+                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=str(write_fixture_git_config(self.root)),
                            GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="Rows Test", GIT_AUTHOR_EMAIL="rows@example.invalid",
                            GIT_COMMITTER_NAME="Rows Test", GIT_COMMITTER_EMAIL="rows@example.invalid")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))

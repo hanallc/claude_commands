@@ -96,11 +96,11 @@ It never waits for main, so a landing that holds main never delays the caller.
 The quota alert's `edit_registry` uses this mode for its role routing.
 `sync_codex_catalog.sh` uses this mode on Linux.
 The Mac forwards its edits to natedev and records the acceptance of each edit.
-`publish_pending(registry)` commits and pushes the rows that HEAD does not have.
-It returns `False` when another process holds the main push lock or a land runs.
-The notes timer starts a detached publisher through `live_settings.publish_waiting()`.
-One detached publisher handles all pending saves.
-Exhaustion reports that the file is edited but not shared.
+The notes timer starts one detached publisher through `live_settings.publish_waiting()`.
+The publisher waits until it can confirm that no land runs.
+`publish_pending(registry)` then commits and pushes the rows that HEAD does not have.
+The publisher records errors in `~/.local/state/merge-gate/settings-publisher.log`.
+If set, `MERGE_GATE_STATE_DIR` sets the log directory.
 Local integration uses fast-forward only.
 A successful push with failed local reconciliation reports both facts.
 Catalog publication adds models and efforts and advances family targets.

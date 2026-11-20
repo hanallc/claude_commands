@@ -16,7 +16,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import override
 
-from scripts.lib.git_test_support import git_fixture_environment
+from scripts.lib.git_test_support import git_fixture_environment, write_fixture_git_config
 from scripts.lib import live_settings, main_sync, waiting_rows
 from scripts.message import session_send
 
@@ -34,10 +34,18 @@ class MainSyncTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.enterContext(unittest.mock.patch.dict(os.environ, git_fixture_environment(), clear=True))
         _ = self.enterContext(redirect_stdout(io.StringIO()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(unittest.mock.patch.dict(os.environ, {main_sync.STATE_ENV: str(self.root / "state")}))
+        _ = self.enterContext(unittest.mock.patch.object(tempfile, "tempdir", str(self.root)))
+        environment = git_fixture_environment()
+        environment.update({
+            main_sync.STATE_ENV: str(self.root / "state"),
+            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / "xdg-config"), "TMPDIR": str(self.root),
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root)),
+            "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "Sync Test", "GIT_AUTHOR_EMAIL": "sync@example.invalid",
+            "GIT_COMMITTER_NAME": "Sync Test", "GIT_COMMITTER_EMAIL": "sync@example.invalid",
+        })
+        self.enterContext(unittest.mock.patch.dict(os.environ, environment, clear=True))
         config = self.root / "config"
         config.mkdir()
         _ = (config / "send.conf").write_text("# range: 0.001..\nmain_sync_repeat_minutes=17\n")

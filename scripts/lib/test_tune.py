@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 
 from scripts.direct.wait_for_test_state import wait_for_pid
-from scripts.lib import conf, live_settings, main_publish, models_registry, tune, user_zone, waiting_rows, zone
+from scripts.lib import conf, live_settings, main_publish, main_push_lock, models_registry, tune, user_zone, waiting_rows, zone
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import PublicationTestCase, pending_rows
@@ -348,7 +348,7 @@ class TuneTests(PublicationTestCase):
             _ = repo.git(peer, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                          "commit", "-qam", "Add the Mac model color")
             _ = repo.git(peer, "push", "-q", "origin", "main")
-            self.assertEqual(live_settings.publish(repo.checkout, wait=True), ["main: pushed", "mac: pulled"])
+            self.assertEqual(live_settings.publish(repo.checkout), ["main: pushed", "mac: pulled"])
 
         expected = base + override + f"{key}={value}\n"
         self.assertEqual((repo.checkout / colors).read_text(), expected)
@@ -581,8 +581,28 @@ class TuneTests(PublicationTestCase):
         broadcast = repo.root / "broadcast.py"
         _ = broadcast.write_text("print('fixture - sent')\n")
 
+        probe = repo.root / "publisher-probe"
+        probe.mkdir()
+        guarded = probe / "guarded"
+        _ = (probe / "sitecustomize.py").write_text(
+            "from pathlib import Path\n"
+            + "import sys\n"
+            + "if sys.argv[1:2] == ['publish-waiting']:\n"
+            + "    from scripts.lib.atomic_file import write_text_atomic\n"
+            + "    from scripts.production import land_queue, land_runs\n"
+            + f"    root = Path({str(repo.root)!r}).resolve()\n"
+            + "    def private_write(path, text, **options):\n"
+            + "        if not path.resolve().is_relative_to(root):\n"
+            + "            raise AssertionError(f'write outside the fixture: {path}')\n"
+            + "        write_text_atomic(path, text, **options)\n"
+            + "    land_queue.write_text_atomic = private_write\n"
+            + "    land_runs.write_text_atomic = private_write\n"
+            + f"    Path({str(guarded)!r}).touch()\n"
+        )
+        source = Path(__file__).resolve().parents[2]
         environment = {**repo.env, "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "1",
-                       "USER_ZONE_CONF": str(zone_file), "ZONE_BROADCAST": str(broadcast), "TMPDIR": str(repo.root)}
+                       "USER_ZONE_CONF": str(zone_file), "ZONE_BROADCAST": str(broadcast), "TMPDIR": str(repo.root),
+                       "PYTHONPATH": os.pathsep.join((str(probe), str(source))), "PYTHONDONTWRITEBYTECODE": "1"}
         with (mock.patch.dict(os.environ, environment, clear=True),
               mock.patch.object(user_zone, "CONF", str(zone_file)),
               mock.patch.object(land_queue, "write_text_atomic", private_write),
@@ -603,6 +623,7 @@ class TuneTests(PublicationTestCase):
                 self.assertEqual(repo.remote_tip(), base)
 
             repo.finish_waiter()
+            self.assertTrue(guarded.exists(), "the detached publisher must install the write guard")
             self.assertEqual(land_queue.take_next(), "fixture phase", errors.getvalue())
             self.assertEqual(land_queue.listing(), "the land line is empty")
 
@@ -686,6 +707,12 @@ class TuneTests(PublicationTestCase):
         self.assertIn("amount=3 stays live; main does not have it", result.stderr)
         self.assertIn("amount=3", repo.config.read_text())
         self.assertEqual([change.value for change in self.waiting()], ["3"])
+        with mock.patch.dict(os.environ, repo.env, clear=True):
+            self.assertEqual(live_settings.publish_waiting(), [land_queue.SETTINGS_WAIT_NOTICE])
+            repo.finish_waiter()
+            log = land_runs.state_dir() / main_push_lock.SETTINGS_PUBLISH_LOG
+            self.assertIn("live_settings: main holds other commit", log.read_text())
+        self.assertEqual([change.value for change in self.waiting()], ["3"])
         _ = repo.git(repo.checkout, "reset", "-q", "--keep", "HEAD^")
         with mock.patch.dict(os.environ, repo.env, clear=True), \
                 mock.patch.object(models_registry, "publish_pending", return_value=False):
@@ -704,7 +731,7 @@ class TuneTests(PublicationTestCase):
             for value in ("3", "4"):
                 _ = live_settings.stage_save(live_settings.WaitingChange(
                     "example", "amount", value, f"tune(example): amount -> {value}"))
-            lines = live_settings.publish(repo.checkout, wait=True)
+            lines = live_settings.publish(repo.checkout)
         self.assertEqual(lines, ["main: amount=3 has a newer live value; no commit", "main: pushed", "mac: pulled"])
         self.assertEqual(repo.git(repo.origin, "log", "--format=%s", "-1", "main"), "tune(example): amount -> 4")
         self.assertIn("amount=4", repo.git(repo.origin, "show", "main:config/example.conf"))

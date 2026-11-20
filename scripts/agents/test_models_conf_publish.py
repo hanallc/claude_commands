@@ -483,9 +483,14 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         self.assert_published(before)
 
     def publish_pending(self) -> str:
-        program = ("from scripts.lib import models_registry; "
-                   + "print(models_registry.publish_pending(models_registry.registry_path()))")
-        result = self.command(sys.executable, "-c", program)
+        program = """
+from pathlib import Path
+from scripts.lib import main_push_lock, models_registry
+from scripts.production import land_queue
+with main_push_lock.settings_push(Path.cwd()) as gap:
+    print(isinstance(gap, land_queue.SettingsGap) and models_registry.publish_pending(models_registry.registry_path()))
+"""
+        result = self.command(sys.executable, "-c", program, cwd=self.checkout)
         self.assert_ok(result)
         return result.stdout.strip()
 

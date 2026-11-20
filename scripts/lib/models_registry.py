@@ -19,7 +19,7 @@ from typing import Literal, NamedTuple, TypedDict, cast, final
 from uuid import uuid4
 
 from scripts.lib import build_folders, file_lock
-from scripts.lib import conf_reads, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
+from scripts.lib import conf, conf_reads, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
 from scripts.lib.registry_rows import parse_registry as parse_registry
 from scripts.lib.operation_environment import OPERATION_ENVIRONMENT as OPERATION_ENVIRONMENT
 from scripts.lib.operation_environment import agent_environment as agent_environment
@@ -348,6 +348,7 @@ def _publish(repo: Path, path: Path, description: str) -> bool:
         raise OSError(f"registry publication refused: HEAD has {len(foreign)} commits that are not on "
                       + f"origin/{branch}: {' '.join(foreign[:5])}")
     last_error = ""
+    time_limit = land_main.CommandTimeLimit(conf.read_or_repository("live_settings").whole("push_seconds"))
     for attempt in range(3):
         with waiting_rows.locked_checkout(repo):
             waiting_rows.restore_checkout(repo, "HEAD")
@@ -358,7 +359,7 @@ def _publish(repo: Path, path: Path, description: str) -> bool:
             return False
         commit = _registry_commit(repo, base, contents, description)
         try:
-            landed = land_main.land(repo, commit, branch)
+            landed = land_main.land(repo, commit, branch, time_limit=time_limit)
         except (OSError, land_main.LandError) as error:
             last_error = str(error)
             try:
@@ -458,7 +459,7 @@ def _publish_when_ready(target: SharedRegistry, path: Path, description: str) ->
     if platform.system() == "Darwin":
         _forward_main_rows(target, path, wait=False)
         return False
-    with main_push_lock.settings_push(target.repository, wait=False) as gap, ExitStack() as locks:
+    with main_push_lock.settings_push(target.repository) as gap, ExitStack() as locks:
         if isinstance(gap, land_queue.SettingsGap):
             try:
                 locks.enter_context(waiting_rows.locked_checkout(target.repository, wait=False))
@@ -483,8 +484,8 @@ def has_pending(registry: Path) -> bool:
     return waiting_rows.move_marker(target.repository).exists() or bool(registry_rows.changes(head, registry_text(path)))
 
 
-def publish_pending(registry: Path, *, in_gap: bool = False) -> bool:
-    """Publish registry edits or leave them for the detached waiter."""
+def publish_pending(registry: Path) -> bool:
+    """Publish pending registry edits while the caller holds a confirmed gap."""
     path = registry.resolve()
     target = _publish_repository(path)
     if (not isinstance(target, SharedRegistry) or path != DEFAULT_PATH.resolve()
@@ -496,14 +497,8 @@ def publish_pending(registry: Path, *, in_gap: bool = False) -> bool:
     head = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
     if not waiting_rows.move_marker(target.repository).exists() and not registry_rows.changes(head, registry_text(path)):
         return False
-    description = "rows written while main was busy"
-    if in_gap:
-        with main_push_lock.main_push_lock(target.repository):
-            return _publish(target.repository, path, description)
-    with main_push_lock.settings_push(target.repository, wait=False) as gap:
-        if isinstance(gap, land_queue.SettingsGap):
-            return _publish(target.repository, path, description)
-    return False
+    with main_push_lock.main_push_lock(target.repository):
+        return _publish(target.repository, path, "rows written while main was busy")
 
 
 def store_registry(registry: Path, before: str, after: str, description: str, *,

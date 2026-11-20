@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import NamedTuple, cast
+from typing import Literal, NamedTuple, cast
 
 from scripts.lib import conf, land_main, mac_wake, main_publish, main_push_lock, models_registry
 from scripts.lib.atomic_file import write_text_atomic
@@ -210,10 +210,11 @@ def _publish_main(checkout: Path) -> PublishedSettings:
     return PublishedSettings(checkout, label, lines)
 
 
-def publish(checkout: Path, *, wait: bool) -> list[str] | None:
-    """Publish in the current gap or start the detached waiter."""
+def publish(checkout: Path, *, wait: Literal[True] = True) -> list[str]:
+    """Publish in a confirmed gap or start the detached waiter."""
+    _ = wait  # Keep the keyword for the tune and zone callers.
     result = None
-    with main_push_lock.settings_push(checkout, wait=False) as gap, ExitStack() as locks:
+    with main_push_lock.settings_push(checkout) as gap, ExitStack() as locks:
         if isinstance(gap, land_queue.SettingsGap):
             try:
                 locks.enter_context(locked_checkout(checkout, wait=False))
@@ -223,7 +224,7 @@ def publish(checkout: Path, *, wait: bool) -> list[str] | None:
                 result = _publish_main(checkout)
     if result is not None:
         return result.with_mac_pull()
-    return [request_publication()] if wait else None
+    return [request_publication()]
 
 
 def _waiting_checkout() -> Path | None:
@@ -275,12 +276,15 @@ def _publish_waiting(descriptor: int) -> int:
         if waiting_rows_for_main() or models_registry.has_pending(models_registry.registry_path()):
             while True:
                 with land_queue.gap_lock() as gap:
-                    if isinstance(gap, land_queue.SettingsGap) and not land_runs.running_lands():
+                    if isinstance(gap, land_queue.SettingsGap) and land_runs.has_gap():
                         result = _publish_in_gap()
                         break
                 time.sleep(0.25)
             if result is not None:
                 _ = result.with_mac_pull()
+    except (OSError, ValueError, main_publish.Refusal) as error:
+        print(f"live_settings: {error}", file=sys.stderr, flush=True)
+        return 1
     finally:
         os.close(descriptor)
     if delivered and _publication_pending():
@@ -295,7 +299,7 @@ def _publish_in_gap() -> PublishedSettings | None:
             with main_push_lock.main_push_lock(checkout), locked_checkout(checkout):
                 result = _publish_main(checkout)
     finally:
-        _ = models_registry.publish_pending(models_registry.registry_path(), in_gap=True)
+        _ = models_registry.publish_pending(models_registry.registry_path())
     return result
 
 
@@ -460,7 +464,7 @@ def _publish_settings_json(arguments: list[str]) -> int:
         return 0
     print(f"live now: {SETTINGS_JSON}")
     print(_write_settings_json_mac(saved))
-    for line in publish(checkout, wait=True) or []:
+    for line in publish(checkout):
         print(line)
     return 0
 

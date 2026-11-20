@@ -23,6 +23,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import land_queue
 
 FIXTURE = Path(__file__).with_name("test_models_registry.conf")
 
@@ -226,6 +227,20 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         self.assertEqual(text, "account.claude1=#445566\n")
         self.assertEqual(pending, ["#445566"])
 
+    def test_registry_publication_uses_the_settings_push_time_limit(self) -> None:
+        before = "[fixture]\nmodel=old\n"
+        registry = self.write(self.repo / "config/models.conf", before)
+        _ = self.write(registry.parent / "live_settings.conf", "# whole: 1..\npush_seconds=7\n")
+        self.seed()
+        after = before.replace("model=old", "model=new")
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "1", "TMPDIR": str(self.root)}
+        with (patch.dict(os.environ, environment, clear=True),
+              patch.object(models_registry, "DEFAULT_PATH", registry),
+              patch.object(land_main, "land", wraps=land_main.land) as land):
+            self.assertEqual(models_registry.store_registry(registry, before, after, "fixture"), after)
+        self.assertEqual(land.call_count, 1)
+        self.assertEqual(cast(object, land.call_args.kwargs.get("time_limit")), land_main.CommandTimeLimit(7))
+
     def test_registry_publication_finishes_a_failed_write_at_the_same_tip(self) -> None:
         before = "[fixture]\nmodel=old\nsecond=old\n"
         registry = self.write(self.repo / "config/models.conf", before)
@@ -252,7 +267,9 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
             self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), target)
             self.assertEqual(registry.read_text(), local)
             self.assertIn(json.dumps(expected), waiting_rows.move_marker(self.repo).read_text())
-            self.assertTrue(models_registry.publish_pending(registry))
+            with main_push_lock.settings_push(self.repo) as gap:
+                self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertTrue(models_registry.publish_pending(registry))
         self.assertEqual(self.git("rev-parse", "HEAD^").stdout.strip(), target)
         self.assertEqual(registry.read_text(), expected)
         self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, expected)
@@ -281,11 +298,11 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         land = land_main.land
         attempts: list[str] = []
 
-        def advance_peer(repo: Path, commit: str, branch: str) -> land_main.Landed:
+        def advance_peer(repo: Path, commit: str, branch: str, *, time_limit: land_main.CommandTimeLimit) -> land_main.Landed:
             attempts.append(self.git("show", f"{commit}:config/models.conf").stdout)
             if peer_tip and len(attempts) == 1:
                 _ = self.git("push", "-q", "origin", f"{peer_tip}:main")
-            return land(repo, commit, branch)
+            return land(repo, commit, branch, time_limit=time_limit)
 
         expected = catalog.replace("custom=gpt-6.1-sol", "custom=gpt-6.3-sol") if peer_advances else catalog
         with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry), \
@@ -316,7 +333,9 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry):
             self.assertEqual(models_registry.store_registry(registry, before, older, "catalog", additive_catalog=True),
                              older)
-            self.assertFalse(models_registry.publish_pending(registry))
+            with main_push_lock.settings_push(self.repo) as gap:
+                self.assertIsInstance(gap, land_queue.SettingsGap)
+                self.assertFalse(models_registry.publish_pending(registry))
         self.assertEqual(registry.read_text(), newest)
         self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, newest)
 

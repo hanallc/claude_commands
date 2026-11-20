@@ -227,13 +227,13 @@ class MainPublishTests(PublicationTestCase):
             return git(checkout, *arguments, input_text=input_text, environment=environment)
 
         with mock.patch.object(live_settings, "git", git_with_save):
-            self.assertIn("main: pushed", live_settings.publish(repo.checkout, wait=True) or [])
+            self.assertIn("main: pushed", live_settings.publish(repo.checkout))
         self.assertEqual(len(during_commit), 1)
         remote = repo.git(repo.origin, "show", "main:config/example.conf")
         self.assertIn("amount=3", remote)
         self.assertIn("mode=fast", remote)
         self.assertIn("mode=slow", repo.config.read_text())
-        self.assertIn("main: pushed", live_settings.publish(repo.checkout, wait=True) or [])
+        self.assertIn("main: pushed", live_settings.publish(repo.checkout))
         self.assertIn("mode=slow", repo.git(repo.origin, "show", "main:config/example.conf"))
 
     def test_push_refuses_to_publish_unrelated_local_commits(self) -> None:

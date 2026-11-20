@@ -48,19 +48,22 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         _ = self.alert(notes, self.now + timedelta(minutes=60))
         self.assertEqual(self.assignments()["design_roles"], "codex")
 
-    def test_notes_queue_registry_publication_for_the_runner(self) -> None:
+    def test_notes_request_the_detached_publisher_without_a_land_row(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         fixture = {"HOME": str(root), "CONF_DIR": str(root / "config"),
                    "MODELS_CONFIG_FILE": str(root / "config/models.conf"),
                    "MERGE_GATE_STATE_DIR": str(root / "land"),
                    "XDG_STATE_HOME": str(root / "state")}
-        with mock.patch.dict(os.environ, fixture), mock.patch.object(
-                models_registry, "publish_pending", side_effect=AssertionError("notes ran the publisher")):
+        with (mock.patch.dict(os.environ, fixture),
+              mock.patch.object(models_registry, "publish_pending", side_effect=AssertionError("notes ran the publisher")),
+              mock.patch.object(live_settings, "request_publication", return_value=land_queue.SETTINGS_WAIT_NOTICE) as start):
             with mock.patch.object(models_registry, "has_pending", return_value=False):
                 self.assertEqual(live_settings.publish_waiting(), [])
+            start.assert_not_called()
             with mock.patch.object(models_registry, "has_pending", return_value=True):
-                self.assertIn("main: waits", "\n".join(live_settings.publish_waiting()))
-                self.assertEqual(land_queue.listing(), "1. settings publish: waiting changes")
+                self.assertEqual(live_settings.publish_waiting(), [land_queue.SETTINGS_WAIT_NOTICE])
+                self.assertEqual(land_queue.listing(), "the land line is empty")
+            start.assert_called_once_with()
             with mock.patch.object(models_registry, "has_pending", side_effect=OSError("git fetch:\n offline")):
                 self.assertEqual(live_settings.publish_waiting(), ["settings not on main yet: git fetch: offline"])
 

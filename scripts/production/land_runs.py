@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from collections.abc import Collection, Generator, Sequence
+from collections.abc import Collection, Generator, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -63,8 +63,7 @@ def landing(commits: Sequence[str], owners: Sequence[str] = ()) -> Generator[Non
     """Record the commits of this land, and the "unit phase" that owns each, while the caller runs it."""
     identity = process_start(os.getpid())
     if not isinstance(identity, Started):
-        yield
-        return
+        raise OSError("cannot record the land process identity")
     path = lands_dir() / f"{os.getpid()}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     record: LandRecord = {"pid": os.getpid(), "start": identity.start, "commits": list(commits), "owners": list(owners)}
@@ -75,27 +74,61 @@ def landing(commits: Sequence[str], owners: Sequence[str] = ()) -> Generator[Non
         path.unlink(missing_ok=True)
 
 
-def running_lands() -> dict[str, str]:
-    """The commits of every land whose process still runs, each with its "unit phase" or "".
+def _read_land(path: Path) -> LandRecord:
+    value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    if isinstance(value, dict):
+        record = cast(dict[str, object], value)
+        pid, start, commits, owners = (record.get("pid"), record.get("start"),
+                                       record.get("commits"), record.get("owners", []))
+        if (type(pid) is int and pid > 0 and isinstance(start, str) and start
+                and isinstance(commits, list) and all(isinstance(commit, str) for commit in cast(list[object], commits))
+                and isinstance(owners, list) and all(isinstance(owner, str) for owner in cast(list[object], owners))):
+            return LandRecord(pid=pid, start=start, commits=cast(list[str], commits), owners=cast(list[str], owners))
+    raise ValueError("invalid land record")
 
-    It removes the record of a land that ended.
-    """
-    commits: dict[str, str] = {}
+
+def _active_lands() -> Iterator[LandRecord | Unreadable]:
     try:
-        paths = sorted(lands_dir().glob("*.json"))
-    except OSError:
-        return {}
+        paths = sorted(path for path in lands_dir().iterdir() if path.suffix == ".json")
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        yield Unreadable(str(error))
+        return
     for path in paths:
         try:
-            record = cast(LandRecord, json.loads(path.read_text()))
-            pid, start, listed, owners = record["pid"], record["start"], record["commits"], record.get("owners", [])
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            record = _read_land(path)
+        except FileNotFoundError:
             continue
-        owner = process_start(pid)
-        if owner == Started(start):
-            commits.update((commit, owners[index] if index < len(owners) else "") for index, commit in enumerate(listed))
-        elif not isinstance(owner, Unreadable):
-            path.unlink(missing_ok=True)
+        except (OSError, ValueError) as error:
+            yield Unreadable(f"{path}: {error}")
+            continue
+        owner = process_start(record["pid"])
+        if owner == Started(record["start"]):
+            yield record
+        elif isinstance(owner, Unreadable):
+            yield owner
+        else:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def has_gap() -> bool:
+    """Check that every recorded land has ended while registration is locked."""
+    return not any(_active_lands())
+
+
+def running_lands() -> dict[str, str]:
+    """Show the commits and owners of the lands with a confirmed process identity."""
+    commits: dict[str, str] = {}
+    for record in _active_lands():
+        if isinstance(record, Unreadable):
+            continue
+        owners = record.get("owners", [])
+        commits.update((commit, owners[index] if index < len(owners) else "")
+                       for index, commit in enumerate(record["commits"]))
     return commits
 
 

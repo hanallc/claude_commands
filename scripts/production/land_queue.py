@@ -37,9 +37,7 @@ SETTINGS_WAIT_NOTICE = "main: waits for the land that runs now"
 
 
 class SettingsGap(NamedTuple):
-    """The publisher holds an open descriptor for the gap."""
-
-    descriptor: int
+    """The caller holds the lock that excludes new lands."""
 
 
 class SettingsGapBusy(NamedTuple):
@@ -65,7 +63,7 @@ def gap_lock(*, wait: bool = True) -> Generator[SettingsGap | SettingsGapBusy]:
             return
         token = _gap_descriptors.set((lock.fileno(),))
         try:
-            yield SettingsGap(lock.fileno())
+            yield SettingsGap()
         finally:
             _gap_descriptors.reset(token)
 

@@ -26,6 +26,7 @@ from scripts.production import land_queue, land_runs
 _HELD_LOCKS: set[str] = set()
 _INHERITED_LOCK = os.environ.get("MAIN_PUSH_LOCK_HELD", "")
 RECORD_NAME = "main-push-lock.jsonl"
+SETTINGS_PUBLISH_LOG = "settings-publisher.log"
 
 
 def _lock_path(checkout: Path) -> str:
@@ -108,12 +109,12 @@ def main_push_lock(checkout: Path, holder: str = "", *, wait: bool = True) -> Ge
 
 
 @contextmanager
-def settings_push(checkout: Path, *, wait: bool) -> Generator[land_queue.SettingsGap | land_queue.SettingsGapBusy]:
+def settings_push(checkout: Path) -> Generator[land_queue.SettingsGap | land_queue.SettingsGapBusy]:
     """Hold the gap and main push locks while no land runs."""
-    with land_queue.gap_lock(wait=wait) as gap, ExitStack() as locks:
-        if isinstance(gap, land_queue.SettingsGap) and not land_runs.running_lands():
+    with land_queue.gap_lock(wait=False) as gap, ExitStack() as locks:
+        if isinstance(gap, land_queue.SettingsGap) and land_runs.has_gap():
             try:
-                locks.enter_context(main_push_lock(checkout, wait=wait))
+                locks.enter_context(main_push_lock(checkout, wait=False))
             except BlockingIOError:
                 pass
             else:
@@ -122,21 +123,18 @@ def settings_push(checkout: Path, *, wait: bool) -> Generator[land_queue.Setting
         yield land_queue.SettingsGapBusy()
 
 
-def _waiter_lock_path() -> Path:
-    directory = land_runs.state_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / "settings-waiter.lock"
-
-
 def request_publication() -> str:
     """Start one detached publisher for all pending changes."""
-    lock = file_lock.take_exclusive(_waiter_lock_path())
+    directory = land_runs.state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    lock = file_lock.take_exclusive(directory / "settings-waiter.lock")
     if isinstance(lock, file_lock.ExclusiveLock):
         try:
-            _ = subprocess.Popen([sys.executable, str(Path(__file__).with_name("live_settings.py").resolve()),
-                                  "publish-waiting", str(lock.descriptor)],
-                                 pass_fds=(lock.descriptor,), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            with (directory / SETTINGS_PUBLISH_LOG).open("a", encoding="utf-8") as log:
+                _ = subprocess.Popen([sys.executable, str(Path(__file__).with_name("live_settings.py").resolve()),
+                                      "publish-waiting", str(lock.descriptor)],
+                                     pass_fds=(lock.descriptor,), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=log, start_new_session=True)
         finally:
             lock.close()
     return land_queue.SETTINGS_WAIT_NOTICE
