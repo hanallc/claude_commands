@@ -270,7 +270,9 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
         if owner is not None:
             if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc):
                 from scripts.production.production_doc import read_production
-                return read_production(owner).checkout
+
+                production = read_production(owner)
+                return production_session_directory(production.doc, production.checkout)
             tree = RowResolver(record).unit_worktree(row)
             if isinstance(tree, PresentWorktree):
                 return tree.path
@@ -278,6 +280,26 @@ def worker_directory(record: staff.StaffSnapshot, reference: staff.StaffId) -> P
                 return Path.cwd()
     report_anomaly(f"{reference}: staff worktree is unavailable")
     return Path.cwd()
+
+
+def enrolled_launch_directory(lines: list[str], legacy: Path) -> Path:
+    if not staff.declares_merge_checkout(lines):
+        return legacy
+    from scripts.production.production_doc import Refusal, production_field
+
+    try:
+        directory = Path(production_field(lines, "Repository"))
+        if not directory.is_absolute():
+            raise Refusal("Repository must name the absolute main checkout path")
+        return directory
+    except Refusal as error:
+        raise ValueError(str(error)) from error
+
+
+def production_session_directory(document: Path, legacy: Path) -> Path:
+    """Use the main checkout for an enrolled showrunner."""
+    lines = document.read_text(encoding="utf-8").splitlines()
+    return enrolled_launch_directory(lines, legacy)
 
 
 @dataclass(frozen=True)
@@ -384,9 +406,21 @@ def _read_facts(requests: list[tuple[str, str]]) -> dict[str, tuple[str, str]]:
     for kind, path in requests:
         key = kind + ":" + path
         try:
-            if kind == "git":
+            if kind in ("git", "merge-branch"):
+                folder = Path(path)
+                if kind == "merge-branch":
+                    from scripts.production.production_doc import Refusal, read_new_production
+
+                    lines = folder.read_text(encoding="utf-8").splitlines()
+                    if staff.declares_merge_checkout(lines):
+                        try:
+                            folder = read_new_production(folder, folder.stem).checkout
+                        except Refusal as error:
+                            raise OSError(str(error)) from error
+                    else:
+                        folder = folder.parent
                 result = subprocess.run(
-                    ["git", "--no-optional-locks", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+                    ["git", "--no-optional-locks", "-C", str(folder), "rev-parse", "--abbrev-ref", "HEAD"],
                     capture_output=True, text=True, check=False,
                 )
                 if result.returncode or not result.stdout.strip():
@@ -444,7 +478,7 @@ class RowResolver:
             if isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc)) and owner.doc.machine == machine:
                 requests.add(("file", str(owner.doc.path)))
                 if not production_documents_only:
-                    requests.add(("git", str(owner.doc.path.parent)))
+                    requests.update((("git", str(owner.doc.path.parent)), ("merge-branch", str(owner.doc.path))))
         return sorted(requests)
 
     def production_document_facts(self) -> ProductionDocumentFacts:
@@ -565,7 +599,9 @@ class RowResolver:
         doc = self.production_doc(row)
         if not isinstance(doc, ProductionDoc):
             return BranchUnreadable(doc.reason)
-        state, text = self._fact(doc.machine, "git", doc.path.parent)
+        state, text = (self._fact(doc.machine, "merge-branch", doc.path)
+                       if staff.declares_merge_checkout(doc.text.splitlines())
+                       else self._fact(doc.machine, "git", doc.path.parent))
         return Branch(text) if state == "value" else BranchUnreadable(text)
 
     def unit_state(self, row: staff.StaffRow) -> ActiveUnit | RetiredUnit | LocationUnfilled:

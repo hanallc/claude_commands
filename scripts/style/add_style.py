@@ -24,6 +24,7 @@ from scripts.production import showrunners, staff
 from scripts.lib import build_folders
 from scripts.lib.git_exclude import ensure_excluded
 from scripts.production import showrunner_tree
+from scripts.production import production_doc
 from scripts.production.add_showrunner import NoEndingTab, herdr_tab_open
 from scripts.herdr import herdr
 from scripts.production.production_doc import Production, Refusal, production_field, read_production, read_new_production, optional_field, FieldPresent
@@ -99,12 +100,8 @@ class NoStyleProduction:
     name: str
 
     @property
-    def checkout(self) -> Path:
-        return self.repository.parent / self.name
-
-    @property
     def doc(self) -> Path:
-        return self.checkout / "docs" / f"{self.name}-production.md"
+        return self.repository / "docs" / f"{self.name}-production{production_doc.LIVE_DOCUMENT_SUFFIX}"
 
 
 @dataclass(frozen=True)
@@ -157,10 +154,12 @@ def _style_production(repo_dir: Path, *, include_direct: bool) -> StandingStyleP
         lines = doc.read_text().splitlines()
         if optional_field(lines, "Kind") == FieldPresent("style"):
             branch_point = production_field(lines, "Branch point").removeprefix("refs/heads/")
+            if staff.declares_merge_checkout(lines):
+                checkout = read_production(row).checkout
             return StandingStyleProduction(repository, row.name, checkout, doc, branch_point)
         if include_direct and style_config.has_style_units(lines):
             config = style_config.read_config(doc)
-            return StandingStyleProduction(repository, row.name, checkout, doc, config.route.branch_point)
+            return StandingStyleProduction(repository, row.name, config.route.checkout, doc, config.route.branch_point)
     return NoStyleProduction(repository, f"{repository.name}-style")
 
 
@@ -174,10 +173,22 @@ def _request(name: str) -> StyleProduction:
     branch_point = parent.merge_branch.removeprefix("refs/heads/")
     _ = _git(repository, "check-ref-format", f"refs/heads/{branch_point}")
     branch_tip = _git(repository, "rev-parse", "--verify", f"refs/heads/{branch_point}^{{commit}}")
+    if isinstance(standing, StandingStyleProduction):
+        checkout = standing.checkout
+        branch = read_production(standing.name).merge_branch
+    else:
+        from scripts.production.production_lifecycle import require_guard_ready
+
+        require_guard_ready()
+        merge_unit = staff.serving_merge_unit(parent.owner.id)
+        if merge_unit is None:
+            raise Refusal(f"{parent.name}: add a serving merge unit before creating the style production")
+        suffix = f"integration-{name}"
+        checkout = Path.home() / "worktrees" / repository.name / merge_unit.name / suffix
+        branch = f"{merge_unit.name}-{suffix}"
     return StyleProduction(
         parent, repository, name, branch_point, branch_tip,
-        "style/" + branch_point.replace("/", "-"), standing.checkout,
-        standing.doc, proposals,
+        branch, checkout, standing.doc, proposals,
         tuple(line for line in lines if line.startswith("- **Merge tests:** ")),
     )
 
@@ -216,6 +227,7 @@ def _production_text(style: StyleProduction) -> str:
         "- **Kind:** style",
         f"- **Branch point:** {style.branch_point}",
         f"- **Showrunner checkout:** {style.checkout}",
+        f"- **{production_doc.MERGE_CHECKOUT_FIELD}:** {style.repository}",
         f"- **Log:** {style.log}",
         f"- **Proposals:** {style.proposals}",
         "- **Updates:** on demand", "- **Push:** git", *style.merge_tests, "",
@@ -303,7 +315,8 @@ def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits, name
 
 
 def _exclude(style: StyleProduction) -> None:
-    patterns = ("/docs/style-production/", f"/docs/{style.doc.name}", f"/{style.log.as_posix()}")
+    relative_doc = style.doc.relative_to(style.repository if style.doc.is_relative_to(style.repository) else style.checkout)
+    patterns = ("/docs/style-production/", f"/{relative_doc.as_posix()}", f"/{style.log.as_posix()}")
     for pattern in patterns:
         ensure_excluded(style.repository, pattern)
 
@@ -374,7 +387,7 @@ def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
         (f"set Proposals in existing production doc {style.doc}"
          if style.doc.exists() else f"write missing production doc {style.doc}"),
         f"write missing standing plans for the configured units under {style.checkout / PLAN_DIRECTORY}",
-        f"exclude docs/style-production/, {style.doc.relative_to(style.checkout)} and {style.log} in shared info/exclude",
+        f"exclude docs/style-production/, {style.doc} and {style.log} in shared info/exclude",
         f"initialize ledger at {style.branch_tip} with {style.merge_branch}; launch via add_showrunner.py",
     )
 
@@ -390,6 +403,10 @@ def main(argv: list[str]) -> int:
     try:
         style = _request(cast(str, args.production))
         existing = _check_existing(style)
+        standing = standing_style_production(style.repository)
+        if isinstance(standing, NoStyleProduction):
+            if not (style.checkout / ".git").exists():
+                raise Refusal(f"the serving merge unit must prepare {style.checkout} on {style.merge_branch}")
         pilot_arguments = cast(list[str], args.pilot)
         if existing and pilot_arguments:
             raise Refusal(f"--pilot applies only while creating {style.name}")
@@ -426,6 +443,7 @@ def main(argv: list[str]) -> int:
                 style.checkout, style.repository, branch))
             if checkout_mode is not None:
                 style.checkout.chmod(checkout_mode)
+        _exclude(style)
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
         config = style_config.read_config(style.doc)
@@ -433,7 +451,6 @@ def main(argv: list[str]) -> int:
             _write_missing(style.checkout / PLAN_DIRECTORY / f"{assignment.unit}-unit.md", _plan_text(style, assignment, catalog))
         if isinstance(pilot, PilotUnits):
             _configure_pilot(style, pilot)
-        _exclude(style)
         style_tip = _git(style.repository, "rev-parse", "--verify", f"refs/heads/{style.merge_branch}^{{commit}}")
         with style_ledger.open_ledger(style.checkout) as ledger:
             ledger.ensure_synced_tip(style_tip, style.merge_branch)

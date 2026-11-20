@@ -217,7 +217,8 @@ def unit_document(request: Demotion) -> None:
     text = "\n".join(lines) + "\n"
     if text != parent.doc.read_text(encoding="utf-8"):
         write_text_atomic(parent.doc, text)
-    _ = add_unit.commit_paths(parent, [parent.doc], f"production({parent.name}): add unit {request.child.name}")
+    if not staff.declares_merge_checkout(lines):
+        _ = add_unit.commit_paths(parent, [parent.doc], f"production({parent.name}): add unit {request.child.name}")
 
 
 def launch(request: Demotion) -> int:
@@ -290,7 +291,8 @@ def finish_demotion(child: staff.StaffRow, doc: Path, parent: Production, plan: 
         else:
             lines[1:1] = ["", status]
         write_text_atomic(doc, "\n".join(lines) + "\n")
-    _ = add_unit.commit_paths(production, [doc], f"production({child.name}): record the completed demotion")
+    if not staff.declares_merge_checkout(lines):
+        _ = add_unit.commit_paths(production, [doc], f"production({child.name}): record the completed demotion")
     update_registration.remove_updates(child)
 
 

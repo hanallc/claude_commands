@@ -542,7 +542,27 @@ def move_session_state(production_name: str, scratch: Path) -> None:
            + (f"; copied {', '.join(copied)} from {scratch}" if copied else ""))
 
 
+def require_guard_ready() -> None:
+    """Require the installed guard proof before a production starts."""
+    if production_doc.read_guard_ready() is None:
+        raise Refusal("new production creation requires a valid guard-ready.json")
+
+
+def require_new_document(document: production_doc.ProductionDocument) -> None:
+    require_guard_ready()
+    if not staff.declares_merge_checkout(document.doc.read_text(encoding="utf-8").splitlines()):
+        raise Refusal(f"{document.doc}: new productions require {production_doc.MERGE_CHECKOUT_FIELD}")
+    main = session_staff.production_session_directory(document.doc, document.checkout)
+    for path in (document.doc, document.log):
+        try:
+            require_untracked_ignored(main, path.relative_to(main).as_posix())
+        except (ExcludeRefused, ValueError) as error:
+            raise Refusal(str(error)) from error
+
+
 def load(production: Production, lines: list[str], resume: bool, scratch: Path | None) -> None:
+    if not resume and isinstance(doc_status(lines), ProductionPlanned):
+        require_new_document(production)
     state = checkout_ready(production)
     report("load", "ok", "production doc read")
     if scratch is not None:
@@ -591,6 +611,13 @@ def open_production(production: Production, lines: list[str]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
+    enrolled = production_doc.resolve_production_paths(production.doc)
+    if isinstance(status, ProductionPlanned) and isinstance(enrolled, production_doc.EnrolledPaths):
+        require_new_document(production)
+    main = enrolled.main if isinstance(enrolled, production_doc.EnrolledPaths) else production.checkout
+    if isinstance(enrolled, production_doc.EnrolledPaths):
+        for path in (enrolled.live_doc, enrolled.log):
+            require_untracked_ignored(main, path.relative_to(main).as_posix())
     record = staff.snapshot()
     rows = tuple(record.find(kind="unit", parent=production.owner.id))
     resolver = session_staff.RowResolver(record)
@@ -607,7 +634,7 @@ def open_production(production: Production, lines: list[str]) -> None:
     if updated != lines:
         write_text_atomic(production.doc, "\n".join(updated) + "\n")
     report("doc", "ok", "running")
-    paths = [doc_path_in_checkout(production, production.doc)]
+    paths = [doc_path_in_checkout(production, production.doc)] if isinstance(enrolled, production_doc.LegacyProduction) else []
     for row in rows:
         name = row.name
         match resolver.unit_config(row):
@@ -623,15 +650,17 @@ def open_production(production: Production, lines: list[str]) -> None:
                 report("plan", "ok", f"{name}: no .unit.toml yet; no plan committed")
     subject = f"production({production.name}): plans for {len(rows)} units"
     subjects = checked(production.checkout, "commit", "log", "--format=%s", production.merge_branch)
-    committed_paths = checked(production.checkout, "commit", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths)
-    if subject in subjects.splitlines() and set(paths).issubset(committed_paths.splitlines()):
+    committed_paths = checked(production.checkout, "commit", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths) if paths else ""
+    if not paths or subject in subjects.splitlines() and set(paths).issubset(committed_paths.splitlines()):
         report("commit", "ok", "plans already committed")
     else:
         _ = checked(production.checkout, "commit", "add", "--", *paths)
-        pending = git(production.checkout, "diff", "--cached", "--quiet")
+        enrolled_paths = ["--", *paths] if isinstance(enrolled, production_doc.EnrolledPaths) else []
+        pending = git(production.checkout, "diff", "--cached", "--quiet", *enrolled_paths)
         if pending.returncode == 1:
-            _ = checked(production.checkout, "commit", "commit", "-m", subject)
-            report("commit", "ok", "production doc and unit plans committed")
+            options = ["--only"] if enrolled_paths else []
+            _ = checked(production.checkout, "commit", "commit", *options, "-m", subject, *enrolled_paths)
+            report("commit", "ok", "unit plans committed" if enrolled_paths else "production doc and unit plans committed")
         elif pending.returncode == 0:
             report("commit", "ok", "plans already committed")
         else:
@@ -645,9 +674,10 @@ def open_production(production: Production, lines: list[str]) -> None:
         report("push", "ok", f"{production.merge_branch} at {tip}")
     else:
         report("push", "ok", f"already at {tip}")
-    log_name = production.log.relative_to(production.checkout).as_posix()
+    log_name = production.log.relative_to(main).as_posix()
     try:
-        ensure_excluded(production.checkout, log_name)
+        if isinstance(enrolled, production_doc.LegacyProduction):
+            ensure_excluded(main, log_name)
     except ExcludeRefused as error:
         raise LifecycleStop("log", "failed", str(error)) from error
     if not production.log.exists():
@@ -966,6 +996,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
          smoke_passed: CommitVerdict | VerdictMissing, done: tuple[str, ...]) -> int:
     held = False
     status = doc_status(lines)
+    enrolled = staff.declares_merge_checkout(lines)
     if isinstance(status, ProductionPlanned):
         raise LifecycleStop("wrap", "held", "production must be running")
     record = staff.snapshot()
@@ -1062,14 +1093,14 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
                    for line in lines]
         with investigation.recipient_locks(runner.id):
             write_text_atomic(production.doc, "\n".join(updated) + "\n")
-    doc_paths = [doc_path_in_checkout(production, production.doc)]
-    archive = archived_doc(production)
+    doc_paths = [] if enrolled else [doc_path_in_checkout(production, production.doc)]
+    archive = None if enrolled else archived_doc(production)
     if archive is not None:
         archive.parent.mkdir(parents=True, exist_ok=True)
         doc_paths.append(doc_path_in_checkout(production, archive))
         _ = checked(production.checkout, "wrap", "mv", "--", *doc_paths)
         report("wrap", "ok", f"moved the doc out of productions/ to {doc_paths[1]}")
-    else:
+    elif doc_paths:
         renames = checked(production.checkout, "wrap", "diff", "--cached", "--name-status",
                           "--diff-filter=R", "--find-renames", "-z").split("\0")
         doc_paths[:0] = [source for source, destination in zip(renames[1::3], renames[2::3])
@@ -1081,12 +1112,12 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     record = replace(record, rows=tuple(wrapped_runner if row.id == wrapped_runner.id else row for row in record.rows))
     if record.pending_retire:
         _ = staff.retire_pending()
-    if git(production.checkout, "diff", "--quiet", "HEAD", "--", *doc_paths).returncode == 1:
+    if doc_paths and git(production.checkout, "diff", "--quiet", "HEAD", "--", *doc_paths).returncode == 1:
         _ = checked(production.checkout, "wrap", "add", "--", doc_paths[-1])
         _ = checked(production.checkout, "wrap", "commit", "--only", "-m",
                     f"production({production.name}): wrapped", "--", *doc_paths)
         report("wrap", "ok", "production doc committed")
-    else:
+    elif doc_paths:
         report("wrap", "ok", "production doc already committed")
     current_tip = checked(production.checkout, "wrap", "rev-parse", "HEAD")
     remote_tip = git(production.checkout, "ls-remote", "origin", f"refs/heads/{production.merge_branch}")

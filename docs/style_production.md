@@ -278,12 +278,14 @@ Standing plans carry `> **Standing:** style_plan.py` and live under
 and checkpoint and shrink never commit or shrink them. Keep production
 instructions and plans out of `docs/style/` and `docs/<member>/style/`, which
 `rules.load_rules` reads as local rules.
-`add_unit.py` launches a standing plan from the showrunner checkout and copies
-it into the unit worktree, where the unit's copy is its own. Refill, ticket
-phases and pinned rule files live in that unit copy; the showrunner copy is
-only the first-launch template. Edit a launched unit's copy for changes meant
-for it. Checkpoint stages only code paths and never the plan or anything under
-`docs/style-production/`; standing plans skip shrink and every closing gate.
+`add_unit.py` copies the standing plan from the integration checkout into the unit worktree.
+The unit owns its copy. Refill, ticket phases, and pinned rule files use that copy.
+Edit that copy to change a launched unit's plan.
+Read production policy from the live staff document.
+Publish code through the integration checkout.
+Use item 143 test copies for verification.
+Checkpoint stages only code paths. It excludes the plan and `docs/style-production/`.
+Standing plans skip shrink and the closing gates.
 Run refill at startup, after restart or compaction, and after each ticket.
 Use `style_plan.py checkpoint` under <StyleCheckpoint/> in `docs/direct/style_unit.md`.
 It gates and publishes one ticket, records its checkpoint and confirms reservation release before another publication.

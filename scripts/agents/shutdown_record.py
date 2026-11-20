@@ -28,6 +28,15 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     if row.kind == "unit":
         raise ValueError(f"{row.name}: the staff worktree is unavailable")
     if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+        if row.kind == "showrunner" and isinstance(row.doc, staff.LiveDoc):
+            document = facts.production_doc(row)
+            if isinstance(document, session_staff.ProductionDoc):
+                return document.machine, session_staff.enrolled_launch_directory(
+                    document.text.splitlines(), document.path.parent)
+            from scripts.production.production_doc import LIVE_DOCUMENT_SUFFIX
+
+            if row.doc.path.name.endswith(LIVE_DOCUMENT_SUFFIX):
+                raise ValueError(f"{row.name}: {document.reason}")
         return row.doc.machine, row.doc.path.parent
     if row.kind == "producer":
         from scripts.agents import remote
@@ -35,7 +44,7 @@ def row_folder(row: staff.StaffRow, record: staff.StaffSnapshot, *,
         return remote.local_machine(), Path.home()
     document = facts.production_doc(row)
     if isinstance(document, session_staff.ProductionDoc):
-        return document.machine, document.path.parent
+        return document.machine, session_staff.enrolled_launch_directory(document.text.splitlines(), document.path.parent)
     raise ValueError(f"{row.name}: {document.reason}")
 
 
