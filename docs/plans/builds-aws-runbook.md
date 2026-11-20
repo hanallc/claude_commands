@@ -484,8 +484,10 @@ The registration applies the cost tag only to the image.
 It finds a public subnet in `availability_zone` with the deployment network resolver.
 It saves the image, owner, VPC, and subnet in the local `hana/image.json` record.
 An empty `ami_id` or `ami_owner_id` in `config/hana_aws.conf` uses the saved image record.
-Hana setup also uses the saved network from that record.
-Without the record, setup resolves the network in the configured zone.
+Hana setup keeps the network of an existing Hana stack.
+For a direct stack with only a VPC parameter, setup keeps the subnet in the saved preparation.
+For a new setup, the image record supplies the network when available.
+Otherwise, setup resolves the network in the configured zone.
 A rerun with the same image build finds the registered image by name and does not upload again.
 If AWS has no image with that name, a rerun waits for the saved pending snapshot and registers it.
 Without a matching pending record, the command checks snapshots owned by the account with a description equal to the image name.

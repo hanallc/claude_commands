@@ -689,7 +689,7 @@ class HanaSetupTests(CostFixture):
 
     def setup_api(self, fake: FakeAws, calls: list[str], spot_price: Callable[[], Decimal], *, stop_state: str = '',
                   launch: Callable[[tuple[str, ...]], None] = lambda _arguments: None,
-                  volume_ready: Callable[[], None] = lambda: None
+                  volume_ready: Callable[[], None] = lambda: None, stack_subnet: str = ''
                   ) -> Callable[..., dict[str, object]]:
         workload = conf.read(self.workload)
         limits = hana_spend.read_settings(workload)
@@ -742,7 +742,10 @@ class HanaSetupTests(CostFixture):
                     raise aws_cli.AwsUnavailable('ValidationError: Stack does not exist')
                 outputs = {'ControlBucket': 'fixture-bucket', 'LaunchTemplate': 'fixture-template',
                            'LaunchTemplateVersion': str(version), 'SecurityGroup': 'fixture-group'}
-                return {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'Outputs': [
+                parameters = [{'ParameterKey': 'VpcId', 'ParameterValue': 'fixture-vpc'}]
+                if stack_subnet:
+                    parameters.append({'ParameterKey': 'SubnetId', 'ParameterValue': stack_subnet})
+                return {'Stacks': [{'StackStatus': 'CREATE_COMPLETE', 'Parameters': parameters, 'Outputs': [
                     {'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]}]}
             if operation == 'describe-stack-resources':
                 return {'StackResources': []}
@@ -888,11 +891,12 @@ class HanaSetupTests(CostFixture):
         self.assertEqual(prepared.parameters['InstanceType'], conf.read(self.workload).text('instance_type'))
 
     @contextmanager
-    def prepared_stop_setup(self, fake: FakeAws, calls: list[str]) -> Generator[tuple[deploy.Deployment, StringIO]]:
+    def prepared_stop_setup(self, fake: FakeAws, calls: list[str], *, stack_subnet: str = ''
+                            ) -> Generator[tuple[deploy.Deployment, StringIO]]:
         _ = self.register_fixture_image()
         subject = self.subject(fake)
         ceiling = hana_spend.read_settings(conf.read(self.workload)).spot_max_usd_per_hour
-        api_call = self.setup_api(fake, calls, lambda: ceiling, stop_state='stopping')
+        api_call = self.setup_api(fake, calls, lambda: ceiling, stop_state='stopping', stack_subnet=stack_subnet)
         output = StringIO()
         with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
                 mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs'), \
@@ -938,6 +942,38 @@ class HanaSetupTests(CostFixture):
         self.assertNotIn('stop-instances', calls)
         del saved['stop_pending']
         self.assertEqual(remote.read_record(saved_path), saved)
+
+    def test_resume_preserves_the_hana_stack_network_and_approved_hash(self) -> None:
+        text_setting(self.workload, 'stop_wait_timeout_s', '25')
+        fake = FakeAws(self.clock, state='running')
+        calls: list[str] = []
+        alternative = deploy.DeploymentNetwork('us-east-2', 'discovered-vpc', [
+            {'zone': 'us-east-2b', 'id': 'discovered-subnet'}])
+        with self.prepared_stop_setup(fake, calls, stack_subnet='fixture-subnet') as (subject, _):
+            subject.pause = lambda seconds: self.clock.advance(int(seconds))
+            with self.assertRaisesRegex(deploy.DeploymentRefused, 'The Hana box is not yet stopped'):
+                _ = subject.hana_setup(approve_resources=True)
+            saved_path = self.state / 'hana/setup.json'
+            approved_hash = remote.read_record(saved_path)['parameters_sha256']
+            alternative_image = hana_image.RegisteredImage(
+                'fixture-name', 'fixture-image', 'fixture-owner', 'image-vpc', 'image-subnet',
+                hana_render.guest_digest(self.workload))
+            image_path = hana_image.save(self.state, alternative_image)
+            with mock.patch.object(subject, '_deployment_network', return_value=alternative) as discover:
+                from_image = subject.prepare_hana()
+                image_path.unlink()
+                without_image = subject.prepare_hana()
+                _ = hana_image.save(self.state, alternative_image)
+                fake.state = 'stopped'
+                calls.clear()
+                self.assertTrue(subject.hana_setup(approve_resources=True))
+                discover.assert_not_called()
+            for prepared in (from_image, without_image):
+                self.assertEqual((prepared.parameters['VpcId'], prepared.parameters['SubnetId']),
+                                 ('fixture-vpc', 'fixture-subnet'))
+            self.assertEqual(remote.read_record(saved_path)['parameters_sha256'], approved_hash)
+            self.assertNotIn('create-change-set', calls)
+            self.assertNotIn('run-instances', calls)
 
     def test_setup_polls_an_already_stopped_box_once(self) -> None:
         fake = FakeAws(self.clock, state='stopped')
