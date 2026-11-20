@@ -223,15 +223,14 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
     paid_hourly = run_cost.paid_per_hour(bills)
     allocations = run_cost.billed_allocations(bills, runs)
     values = conf.read_or_repository('cloud_gate')
-    wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
-    unmeasured = run_cost.region_numbers(values, 'unmeasured_region_extra_seconds')
-    default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
     counts = ('type', *regions)
     scopes: list[RunCosts] = []
     for scope in run_cost.SCOPES:
-        explanation = (f'USD per {scope.noun}, last {days} days. Estimate: lowest zone Spot price x median box '
-                       + f'time (boot included), plus refusal wait at {wait_cost} USD/min '
-                       + f'({evidence.refusal_wait_s:.0f} s each). Paid: the AWS bill for the type and region, '
+        pricing = run_cost.GateRunPricing.from_config(values, evidence, home, scope.modes)
+        explanation = (f'USD per {scope.noun}, last {days} days. The estimate uses the lowest zone Spot price '
+                       + 'and the median box time, including boot. It adds transfer charges outside the home region. '
+                       + f'Refusal wait ({evidence.refusal_wait_s:.0f} s each) and extra regional wait cost '
+                       + f'{pricing.wait_usd_per_minute} USD/min. Paid: the AWS bill for the type and region, '
                        + 'split between runs by box time. Runs elsewhere: the type has no runs in the region, '
                        + 'so the time comes from the other regions. Runs same vCPUs: the type has no runs, '
                        + 'so the time comes from the types with its vCPU count.')
@@ -242,8 +241,7 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
                 price = minimum.get((region, size))
                 seconds, _source = evidence.box_seconds(size, region, scope.modes)
                 if price is not None and seconds:
-                    grid[region, size] = evidence.expected_usd(price, size, region, scope.modes, wait_cost, default_seconds,
-                                                               unmeasured_extra_s=unmeasured.get(region, Decimal(0)))
+                    grid[region, size] = pricing.expected_usd(price, size, region)
         headers = ('region', SPOT_HEADER, f'{scope.noun} (minutes)', 'runs', ESTIMATE_HEADER, 'paid USD/h', 'paid USD/run',
                    'paid runs')
         tables: list[Table] = []

@@ -4,10 +4,11 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 import json
+from pathlib import Path
 from statistics import median
 from typing import cast
 
@@ -26,6 +27,34 @@ _NO_RESERVED_HOURS = Decimal(0)
 
 def _run_kind(mode: str) -> str:
     return _MODE_ALIASES.get(mode, mode)
+
+
+@dataclass(frozen=True)
+class GateLaunchVariant:
+    region: str
+    instance_type: str
+    subnet_id: str
+    zone: str
+
+
+@dataclass(frozen=True)
+class DeployedGateVariants:
+    variants: tuple[GateLaunchVariant, ...]
+    unsupported_types: tuple[str, ...]
+
+
+def deployed_gate_variants(deployment: dict[str, object], types: tuple[str, ...]) -> DeployedGateVariants:
+    """List each configured type that the stack allows in each deployed subnet."""
+    allowed = cast(list[str], deployment['instance_types']) if 'instance_types' in deployment else types
+    unsupported = tuple(size for size in types if size not in allowed)
+    sizes = tuple(size for size in types if size in allowed)
+    if not sizes:
+        return DeployedGateVariants((), unsupported)
+    variants = tuple(
+        GateLaunchVariant(ledger.text(regional, 'region'), size, ledger.text(subnet, 'id'), ledger.text(subnet, 'zone'))
+        for regional in ledger.rows(deployment, 'regions') for size in sizes for subnet in ledger.rows(regional, 'subnets')
+    )
+    return DeployedGateVariants(variants, unsupported)
 
 
 @dataclass(frozen=True)
@@ -321,6 +350,10 @@ class RunEvidence:
         return [time for (other, mode), times in self.by_type.items()
                 if vcpus and mode in kinds and gate_vcpus(other) == vcpus for time in times], BoxTimeSource.SAME_VCPUS
 
+    def median_box_seconds(self, size: str, region: str, modes: tuple[str, ...]) -> Decimal | NoBoxTimeMeasurement:
+        seconds, _source = self.box_seconds(size, region, modes)
+        return median(seconds) if seconds else NoBoxTimeMeasurement()
+
     def refusals_per_launch(self, size: str, region: str, modes: tuple[str, ...]) -> tuple[Decimal | None, int, int]:
         """Refused requests for each launched box, with the counts it comes from.
 
@@ -346,6 +379,180 @@ class RunEvidence:
         # Capacity refusals do not depend on the run kind, so every request counts.
         refusals = self.refusals_per_launch(size, region, EVERY_KIND)[0] or Decimal(0)
         return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60
+
+
+@dataclass(frozen=True)
+class NoBoxTimeMeasurement:
+    """The run evidence has no box time for this choice."""
+
+
+@dataclass(frozen=True)
+class GateRunEstimate:
+    instance_type: str
+    spot_usd_per_hour: Decimal
+    median_minutes: Decimal | NoBoxTimeMeasurement
+    usd_per_run: Decimal
+
+
+@dataclass(frozen=True)
+class NoPricedGateVariant:
+    """The snapshot has no current price for this vCPU count in the region."""
+
+
+@dataclass(frozen=True)
+class GateTimeComparison:
+    region: str
+    small: GateRunEstimate | NoPricedGateVariant
+    large: GateRunEstimate | NoPricedGateVariant
+
+
+class BreakEvenCondition(Enum):
+    ALWAYS = 'always'
+    NEVER = 'never'
+    NO_MEASUREMENT = 'no measurement'
+    NO_CURRENT_PRICE = 'no current price'
+
+
+@dataclass(frozen=True)
+class BreakEvenRate:
+    usd_per_minute: Decimal
+    faster_32_vcpu: bool
+
+
+def gate_break_even(
+    small: GateRunEstimate | NoPricedGateVariant,
+    large: GateRunEstimate | NoPricedGateVariant,
+) -> BreakEvenRate | BreakEvenCondition:
+    """Find the time price at which the two estimates have the same total cost."""
+    if isinstance(small, NoPricedGateVariant) or isinstance(large, NoPricedGateVariant):
+        return BreakEvenCondition.NO_CURRENT_PRICE
+    if isinstance(small.median_minutes, NoBoxTimeMeasurement) or isinstance(large.median_minutes, NoBoxTimeMeasurement):
+        return BreakEvenCondition.NO_MEASUREMENT
+    minutes_saved = small.median_minutes - large.median_minutes
+    extra_usd = large.usd_per_run - small.usd_per_run
+    if minutes_saved >= 0 and extra_usd <= 0:
+        return BreakEvenCondition.ALWAYS
+    if minutes_saved <= 0 and extra_usd > 0:
+        return BreakEvenCondition.NEVER
+    return BreakEvenRate((extra_usd / minutes_saved).copy_abs(), minutes_saved > 0)
+
+
+@dataclass(frozen=True)
+class GateRunPricing:
+    """The policy and run evidence that rank priced gate variants."""
+    evidence: RunEvidence
+    home: str
+    modes: tuple[str, ...]
+    default_seconds: Decimal
+    remote_transfer_usd: Decimal
+    region_transfer_usd: dict[str, Decimal]
+    wait_usd_per_minute: Decimal
+    region_extra_seconds: dict[str, Decimal]
+    unmeasured_extra_seconds: dict[str, Decimal]
+
+    @classmethod
+    def from_config(cls, values: conf.ConfigRead, evidence: RunEvidence, home: str,
+                    modes: tuple[str, ...]) -> GateRunPricing:
+        return cls(evidence, home, modes,
+                   Decimal(values.whole('lifetime_minutes') * 60),
+                   conf.decimal(values.text('remote_region_transfer_usd')),
+                   region_numbers(values, 'region_transfer_usd'),
+                   conf.decimal(values.text('gate_wait_usd_per_minute')),
+                   region_numbers(values, 'region_extra_gate_seconds'),
+                   region_numbers(values, 'unmeasured_region_extra_seconds'))
+
+    def expected_usd(self, price: Decimal, size: str, region: str) -> Decimal:
+        box_and_refusals = self.evidence.expected_usd(
+            price, size, region, self.modes, self.wait_usd_per_minute, self.default_seconds,
+            unmeasured_extra_s=self.unmeasured_extra_seconds.get(region, Decimal(0)),
+        )
+        transfer = self.region_transfer_usd.get(region, self.remote_transfer_usd) if region != self.home else Decimal(0)
+        wait = self.region_extra_seconds.get(region, Decimal(0)) * self.wait_usd_per_minute / 60
+        return box_and_refusals + transfer + wait
+
+    def estimate(self, price: Decimal, size: str, region: str) -> GateRunEstimate:
+        seconds = self.evidence.median_box_seconds(size, region, self.modes)
+        minutes = seconds / 60 if isinstance(seconds, Decimal) else seconds
+        return GateRunEstimate(size, price, minutes, self.expected_usd(price, size, region))
+
+
+def current_zone_prices(directory: Path, now: float, max_age: int) -> dict[tuple[str, str, str], Decimal]:
+    """Use the latest current Spot price for each region, type, and zone."""
+    try:
+        return {(row.region, row.instance_type, row.zone): row.usd_per_hour
+                for row in sorted(ledger.read_spot_prices(directory), key=lambda row: row.read_at)
+                if 0 <= now - row.read_at <= max_age}
+    except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+        return {}
+
+
+def gate_launch_history(directory: Path, now: float, window_seconds: int) -> tuple[dict[str, object], ...]:
+    """Read launch rows in the window through the current time."""
+    try:
+        history = ledger.recent_gate_launches(directory, now - window_seconds)
+    except OSError:
+        return ()
+    return tuple(row for row in history if float(str(row['time'])) <= now)
+
+
+@dataclass(frozen=True)
+class GateVariantEligibility:
+    variants: tuple[GateLaunchVariant, ...]
+    prices: dict[GateLaunchVariant, Decimal]
+    slow_box_seconds: dict[tuple[str, str], Decimal]
+
+
+def gate_variant_eligibility(
+    deployed: Sequence[GateLaunchVariant], directory: Path, evidence: RunEvidence, mode: str,
+    *, now: float, max_age: int, max_gate_minutes: int, live_prices: Sequence[ledger.RegionalSpotPrice] = (),
+) -> GateVariantEligibility:
+    """Filter deployed variants by median time and match prices by region, type, and zone."""
+    zone_prices = current_zone_prices(directory, now, max_age)
+    zone_prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
+    sizes = dict.fromkeys((variant.instance_type, variant.region) for variant in deployed)
+    slow = {(size, region): seconds for size, region in sizes
+            if isinstance(seconds := evidence.median_box_seconds(size, region, (mode,)), Decimal)
+            and seconds > max_gate_minutes * 60}
+    variants = tuple(variant for variant in deployed if (variant.instance_type, variant.region) not in slow)
+    prices = {variant: zone_prices[key] for variant in variants
+              if (key := (variant.region, variant.instance_type, variant.zone)) in zone_prices}
+    return GateVariantEligibility(variants, prices, slow)
+
+
+def merge_gate_comparisons(directory: Path, now: int, values: conf.ConfigRead,
+                           policy: conf.ConfigRead) -> tuple[GateTimeComparison, ...]:
+    """Compare the cheapest priced 16-vCPU and 32-vCPU merge gates in each region."""
+    regions = tuple(dict.fromkeys(values.words('regions')))
+    home = policy.text('region')
+    missing = NoPricedGateVariant()
+    try:
+        deployment = ledger.mapping(cast(object, json.loads((directory / 'gate-deployment.json').read_text())))
+        if 'regions' not in deployment:
+            deployment = {**deployment, 'regions': [{**deployment, 'region': deployment.get('region', home)}]}
+        deployed = deployed_gate_variants(deployment, values.words('instance_types'))
+    except (OSError, ValueError, TypeError):
+        return tuple(GateTimeComparison(region, missing, missing) for region in regions)
+
+    end = datetime.fromtimestamp(now, UTC)
+    days = policy.whole('run_cost_days')
+    max_age = policy.whole('price_max_age_seconds')
+    cooldown = values.whole('capacity_cooldown_seconds')
+    rows = gate_launch_history(directory, now, max(max_age, cooldown, days * 86400))
+    evidence = run_evidence(rows, end - timedelta(days=days), end, home)
+    eligibility = gate_variant_eligibility(deployed.variants, directory, evidence, 'merge-gate',
+                                           now=now, max_age=max_age, max_gate_minutes=values.whole('max_gate_minutes'))
+    if not eligibility.prices:
+        return tuple(GateTimeComparison(region, missing, missing) for region in regions)
+    pricing = GateRunPricing.from_config(values, evidence, home, ('merge-gate',))
+    estimates: dict[tuple[str, int], list[GateRunEstimate]] = defaultdict(list)
+    for variant, price in eligibility.prices.items():
+        vcpus = gate_vcpus(variant.instance_type)
+        if vcpus in (16, 32) and variant.region in regions:
+            estimates[variant.region, vcpus].append(pricing.estimate(price, variant.instance_type, variant.region))
+    return tuple(GateTimeComparison(
+        region, min(estimates[region, 16], key=lambda row: row.usd_per_run, default=missing),
+        min(estimates[region, 32], key=lambda row: row.usd_per_run, default=missing),
+    ) for region in regions)
 
 
 def region_numbers(values: conf.ConfigRead, key: str) -> dict[str, Decimal]:

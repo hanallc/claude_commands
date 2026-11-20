@@ -93,8 +93,8 @@ def director_wait_fixture(*, execution: Literal["direct", "process"] = "direct")
         phase: dict[str, object] = {"id": "6", "instance_id": "original-six", "title": "Wait hooks",
                                     "status": "active", "started_at": 1000}
         state: dict[str, object] = {"run_id": "run", "history_file": str(history), "working_dir": str(root),
-                                    "worktree": "fixture-unit", "phase": phase,
-                                    "main_agent": {"session_id": SESSION}, "pass": {}, "open_phases": [],
+                                    "worktree": "fixture-unit", "open_phases": [phase],
+                                    "main_agent": {"session_id": SESSION}, "pass": {},
                                     "unit": "fixture-unit", "project_plan_doc": "plan.md"}
         _ = (root / "plan.md").write_text('> **Production: wait-production** — unit `fixture-unit`; production doc `production.md`\n')
         _ = (run / "progress_history_state.json").write_text(json.dumps(state))
@@ -437,7 +437,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             fixture.call(STOP, {"last_assistant_message": "decision: approve?"}, 1010)
             path = fixture.run / "progress_history_state.json"
             state = cast(dict[str, object], json.loads(path.read_text()))
-            state["phase"] = {"id": "7", "instance_id": "new-seven", "status": "active"}
+            state["open_phases"] = [{"id": "7", "instance_id": "new-seven", "status": "active"}]
             _ = path.write_text(json.dumps(state))
             # Even a marker older than active_run's liveness window retains
             # the exact wait to close when the user finally answers.

@@ -1,6 +1,8 @@
 """Check the published AWS table and quota case instructions."""
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from html import unescape
 import json
 from pathlib import Path
@@ -11,8 +13,11 @@ from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_page, console_help, ledger, ledger_test_support
+from scripts.aws_target import aws_page, console_help, ledger, ledger_test_support, run_cost, spot_table
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.review_links import page_frame
 
 
 class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
@@ -164,9 +169,12 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
     check(innerWidth === 760 && scroller().scrollWidth > scroller().clientWidth, "Narrow scroll container");
     scroller().scrollLeft = 150;
     check(scroller().scrollLeft === 150, "Set scroll position before refresh");
-    const refreshed = JSON.stringify({...data, render_seconds: 12});
+    const prices = JSON.parse(document.getElementById("aws-prices-data").textContent);
+    const refreshed = JSON.stringify({...prices, render_seconds: 12});
+    const gateTime = document.getElementById("aws-gate-time-data").textContent;
     window.fetch = async () => ({ok: true, text: async () =>
-      `<script type="application/json" id="aws-prices-data">${refreshed}</scr` + "ipt>"});
+      `<script type="application/json" id="aws-prices-data">${refreshed}</scr` + "ipt>"
+      + `<script type="application/json" id="aws-gate-time-data">${gateTime}</scr` + "ipt>"});
     const status = await loadAws();
     check(status.renderSeconds === 12 && scroller().scrollLeft === 150, "Refresh keeps scroll position");
     check(params().get("show") === "spot,cost" && params().get("types") === "standard"
@@ -240,3 +248,143 @@ class AwsPagePlacementScoresTests(ledger_test_support.CostFixture):
         self.assertIn('data.placement_scores', source)
         self.assertIn('AWS scores a request with fewer than three instance types lower. '
                       + 'Compare the 32-vCPU column with recorded launch results.', source)
+
+
+class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
+    def test_page_compares_the_lowest_run_cost_for_each_size_in_each_region(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        east, west, north = 'us-east-2', 'us-west-2', 'eu-north-1'
+        candidate_only = 'eu-south-2'
+        self.text_setting('region', east)
+        config = self.root / 'cloud_gate.conf'
+        _ = write_config_fixture(config,
+            f'regions={east} {west} {north}\nspot_candidate_regions={west} {east} {candidate_only}\n'
+            + 'instance_types=c7a.4xlarge c7a.8xlarge m7a.4xlarge m7a.8xlarge\n'
+            + 'gate_wait_usd_per_minute=0.02\nmax_gate_minutes=12\n'
+            + f'region_transfer_usd={json.dumps({east: 0.30, west: 0.08})}\n'
+            + f'region_extra_gate_seconds={json.dumps({west: 30})}\n')
+        _ = (self.state / 'gate-deployment.json').write_text(json.dumps({'regions': [
+            {'region': east, 'subnets': [{'id': 'subnet-east', 'zone': east + 'a'}]},
+            {'region': west, 'subnets': [{'id': 'subnet-west', 'zone': west + 'a'}]},
+        ]}))
+        history: list[dict[str, object]] = []
+        prices: list[ledger.RegionalSpotPrice] = []
+        for size, rate, seconds in (('c7a.4xlarge', '0.6', 600), ('m7a.4xlarge', '0.05', 780),
+                                    ('c7a.8xlarge', '2.4', 360), ('m7a.8xlarge', '1.8', 300)):
+            base = {'attempt': size, 'instance_type': size, 'region': east, 'mode': 'merge-gate'}
+            history.extend(({**base, 'result': 'launched', 'time': now - 1000},
+                            {**base, 'result': 'finished', 'time': now - 1000 + seconds, 'gate_s': seconds - 60}))
+            prices.append(ledger.RegionalSpotPrice(east, east + 'a', size, Decimal(rate), now))
+        prices.extend((
+            ledger.RegionalSpotPrice(east, east + 'b', 'm7a.4xlarge', Decimal('0.01'), now - 99999),
+            ledger.RegionalSpotPrice(east, east + 'b', 'c7a.8xlarge', Decimal('0.01'), now),
+            ledger.RegionalSpotPrice(east, east + 'b', 'm7a.8xlarge', Decimal('2'), now),
+            ledger.RegionalSpotPrice(west, west + 'a', 'c7a.4xlarge', Decimal('0.6'), now),
+            ledger.RegionalSpotPrice(west, west + 'a', 'm7a.8xlarge', Decimal('0.01'), now - 99999),
+            ledger.RegionalSpotPrice(north, north + 'a', 'c7a.4xlarge', Decimal('0.01'), now),
+        ))
+        ledger.write_spot_prices(self.state, prices)
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(
+            ''.join(json.dumps(row) + '\n' for row in sorted(history, key=lambda row: int(str(row['time'])))))
+        source = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings).read_text()
+        payload = source.split('<script id="aws-gate-time-data" type="application/json">', 1)[1].split('</script>', 1)[0]
+        data = ledger.mapping(cast(object, json.loads(payload)))
+        table = cast(aws_page.TableData, data['table'])
+        self.assertEqual(table['region_axis'], 'rows')
+        self.assertEqual(data['regions'], [east, west, north, candidate_only])
+        self.assertEqual([row[0] for row in table['rows']], [east, west, north])
+        self.assertEqual(table['rows'][0], [east, 'c7a.4xlarge', '0.6000', '10.0', '0.1000',
+                                           'm7a.8xlarge', '1.8000', '5.0', '0.1500', '0.0100 or more'])
+        self.assertEqual(table['rows'][1], [west, 'c7a.4xlarge', '0.6000', '10.0', '0.1900',
+                                           *(['—'] * 4), 'no current price'])
+        self.assertEqual(table['rows'][2], [north, *(['—'] * 8), 'no current price'])
+
+        payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
+        page = cast(aws_page.PageData, json.loads(payload))
+        merge_gates = next(costs for costs in page['runs'] if costs['scope'] == 'merge-gate')
+        gate_prices = merge_gates['prices'][0]
+        size = 'c7a.4xlarge'
+        column = gate_prices['headers'].index(size)
+        prices_by_region = {row[0]: row[column] for row in gate_prices['rows']}
+        end = datetime.fromtimestamp(now, UTC)
+        days = conf.read(self.settings).whole('run_cost_days')
+        evidence = run_cost.run_evidence(history, end - timedelta(days=days), end, east)
+        pricing = run_cost.GateRunPricing.from_config(conf.read(config), evidence, east, ('merge-gate',))
+        for row in table['rows'][:2]:
+            region = row[0]
+            with self.subTest(region=region):
+                self.assertEqual(prices_by_region[region], row[4])
+                self.assertEqual(prices_by_region[region], f'{pricing.expected_usd(Decimal("0.6"), size, region):.4f}')
+        self.assertLess(source.index('id="placement-scores"'), source.index('id="gate-time-price"'))
+        self.assertIn('fill(document.getElementById("gate-time-price"), data.gateTimePrice,', source)
+
+    def test_page_refresh_redraws_the_break_even_table_and_region_filter(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        before = spot_table.Table('Break-even', ('Region', 'USD/min'), frozenset({1}),
+                                  (('us-east-2', '0.0100'),), 'rows')
+        after = replace(before, rows=(('us-east-2', '0.0900'), ('test-new-region', 'no current price')))
+        with mock.patch.object(aws_page, 'gate_time_price_table', side_effect=(before, after)):
+            first = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings).read_text()
+            second = aws_page.publish(self.state, now + 1, self.root / 'page', settings_path=self.settings).read_text()
+        script = first.rsplit('<script>', 1)[1].split('</script>', 1)[0].replace(page_frame.REFRESH_SCRIPT, '')
+        fixture = r'''
+const assert = require("node:assert/strict");
+const ids = new Map();
+class Element {
+  children = [];
+  dataset = {};
+  classList = {add() {}, toggle() {}};
+  style = {};
+  textContent = "";
+  append(...children) { this.children.push(...children); }
+  appendChild(child) { this.append(child); return child; }
+  replaceChildren(...children) { this.children = children; }
+  createTHead() { return this.appendChild(new Element()); }
+  createTBody() { return this.appendChild(new Element()); }
+  insertRow() { return this.appendChild(new Element()); }
+  querySelector() { return null; }
+  setAttribute() {}
+  addEventListener() {}
+}
+function parse(html) {
+  return {getElementById(id) {
+    const start = '<script id="' + id + '" type="application/json">';
+    return {textContent: html.split(start)[1].split("</script>")[0]};
+  }};
+}
+const document = {
+  getElementById(id) {
+    if (id.endsWith("-data")) return parse(first).getElementById(id);
+    if (!ids.has(id)) ids.set(id, new Element());
+    return ids.get(id);
+  },
+  createElement: () => new Element(),
+  createElementNS: () => new Element(),
+  querySelectorAll: () => [],
+};
+const location = {pathname: "/", search: ""};
+const fetch = async () => ({ok: true, text: async () => second});
+class DOMParser { parseFromString(html) { return parse(html); } }
+function addEventListener() {}
+let reload;
+function createPageRefresh(load) { reload = load; }
+function words(node) {
+  return typeof node === "string" ? node : [node.textContent, ...node.children.map(words)].join(" ");
+}
+'''
+        check = r'''
+(async () => {
+  const table = ids.get("gate-time-price");
+  assert.match(words(table), /0\.0100/);
+  const result = await reload();
+  assert.equal(result.readAt, data.read_at);
+  assert.doesNotMatch(words(table), /0\.0100/);
+  assert.match(words(table), /0\.0900/);
+  assert.match(words(table), /test-new-region/);
+  assert.match(words(ids.get("regions")), /test-new-region/);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
+        source = f'const first = {json.dumps(first)};\nconst second = {json.dumps(second)};\n' + fixture + script + check
+        result = subprocess.run([node, '-'], input=source, capture_output=True, text=True, timeout=20, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

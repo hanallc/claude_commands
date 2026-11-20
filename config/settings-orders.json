@@ -3,7 +3,7 @@
     "accounting_zone": 8
   },
   "build_admission": {
-    "head_stall_alert_minutes": 2
+    "head_stall_alert_minutes": 9
   },
   "cloud_gate": {
     "hana_gpu_route_enabled": 3
