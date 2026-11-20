@@ -11,7 +11,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import ClassVar, cast, override
 import unittest
@@ -20,9 +19,8 @@ from unittest import mock
 from scripts.direct import phase_wait_holder
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY, VerifyTokenWaitFixture
-from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, recorded_holders, wait_rows
+from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, recorded_holders, wait_for_verify_state, wait_rows
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
-from scripts.direct.wait_for_test_state import wait_until
 from scripts.build_queue.admission_test_support import PrivateHostEvidence, caller_admission, caller_provider_controls
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
@@ -654,11 +652,6 @@ if __name__ == "__main__":
 
 
 class VerifyTargetWaitHolderTests(_RecordedHoldWaitFixture):
-    def wait_for_verify_state(self, ready: Callable[[], bool], directory: Path,
-                              process: ManagedProcess[str], what: str) -> None:
-        wait_until(lambda: ready() or process.poll() is not None, directory, processes=(process,))
-        self.assertTrue(ready(), f"verify exited {process.returncode} before {what}")
-
     @override
     def prepare_recorded_seed(self) -> None:
         root = self.fixture.root
@@ -718,8 +711,8 @@ if "--assignment-file" in arguments:''', 1)
         marker = self.fixture.root / f"target-holder-{number}"
         session = Path(self.fixture.environment["UNIT_RUN_DIR"])
         try:
-            # A repeated holder does not make a new record, so the wait expires.
-            self.wait_for_verify_state(marker.exists, marker.parent, process, marker.name)
+            # verify suppresses duplicates before the recorder (verify.sh:1676), so a wrong repeated holder reaches the guard.
+            wait_for_verify_state(marker.exists, marker.parent, process, marker.name)
         except (TimeoutError, FixtureHang):
             recorded = recorded_holders(wait_rows(session))
             raise self.failureException(
@@ -781,8 +774,7 @@ if "--assignment-file" in arguments:''', 1)
                                for key, reader in admission.server.host_readers.items()
                                if key.destination.target == "linux-box")
 
-            self.wait_for_verify_state(claim_observed, admission.state_dir, process,
-                                       "the provider reading for the new claim")
+            wait_for_verify_state(claim_observed, admission.state_dir, process, "the provider reading for the new claim")
             (root / "reservation-observed").touch()
             expected = named_holder("slot", "linux-box", NEXT_SESSION)
             rows = self.pause(process, 1, expected)

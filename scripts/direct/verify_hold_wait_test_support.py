@@ -93,7 +93,7 @@ def recorded_holders(rows: list[dict[str, object]]) -> list[object]:
     return [row["holder"] for row in rows if row["event_type"] in ("wait_started", "wait_holder_seen")]
 
 
-def wait_for_verify_state(ready: Callable[[], bool], directory: Path, process: subprocess.Popen[str],
+def wait_for_verify_state(ready: Callable[[], bool], directory: Path, process: ManagedProcess[str],
                           what: str) -> None:
     """Wait for the fixture state or the caller's exit."""
     wait_until(lambda: ready() or process.poll() is not None, directory, processes=(process,))
