@@ -158,7 +158,9 @@ def short_list_time(moment: datetime, zone: tzinfo | None) -> str:
     return f"{local:%b} {local.day} {local:%H:%M %Z}"
 
 
-def check_row_html(check: the_list.NextCheck, today: datetime) -> str:
+def check_row_html(check: the_list.NextCheck, today: datetime, *, parked: bool) -> str:
+    if parked:
+        return ""
     if isinstance(check, datetime):
         value = html.escape(short_list_time(check, today.tzinfo))
         if check < today:
@@ -642,7 +644,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if open_question:
         state += '<small data-open-question-note>Morty answering</small>'
-    state += check_row_html(item.next_check, today)
+    state += check_row_html(item.next_check, today, parked=parked)
     parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
     if parking_label:
         state += '<small data-parked-note>Parked until ' + parking_label + '</small>'
@@ -742,6 +744,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     parking = item.parked_until
     parked_until = (parked_label(parking, zone)
                     if parking is not the_list.NoTimestamp.UNSET and the_list.parking_active(parking, today) else "")
+    parked = bool(parked_until)
     unread = item.unread_since
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
     open_question = item.state != the_list.ItemState.CLOSED and has_open_question(item)
@@ -749,8 +752,8 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
-                               "parked": str(bool(parked_until)).lower(), "parked_until": parked_until,
-                               "check_html": check_row_html(item.next_check, local_today),
+                               "parked": str(parked).lower(), "parked_until": parked_until,
+                               "check_html": check_row_html(item.next_check, local_today, parked=parked),
                                "waiting_for_answer": str(waiting).lower(),
                                "open_question": str(open_question).lower(),
                                "unread_delivery": str(the_list.unread_delivery(item)).lower()}
