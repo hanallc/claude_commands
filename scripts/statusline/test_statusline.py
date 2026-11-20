@@ -92,12 +92,15 @@ def fixture_command(root: Path, *, rebuild_cache: str = "~/.local/state/showrunn
     folder = root / "scripts/statusline"
     folder.mkdir(parents=True, exist_ok=True)
     configuration = fixture_colors(root / "config/statusline.conf")
-    _ = write_config_fixture(configuration,
-        f"rebuild.cache={rebuild_cache}\nrebuild.repo=/etc/nixos\nrebuild.ref=main\n"
-        + "rebuild.natedev=natedev\nrebuild.mac=MacBook-Pro\nrebuild.ssh=mac\n"
-        + "rebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.eval_retry_seconds=600\n"
-        + "rebuild.cwd.natedev=/etc/nixos\nrebuild.cwd.mac=~/nixos\n")
-    _ = write_config_fixture(configuration.with_name("user_zone.conf"), f"zone={USER_ZONE.key}\n")
+    with configuration.open("a", encoding="utf-8") as settings:
+        _ = settings.write(
+            "# whole: 1..\ncounts.retry_seconds=7\n"
+            + f"rebuild.cache={rebuild_cache}\nrebuild.repo=/etc/nixos\nrebuild.ref=main\n"
+            + "rebuild.natedev=natedev\nrebuild.mac=MacBook-Pro\nrebuild.ssh=mac\n"
+            + "rebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.eval_retry_seconds=600\n"
+            + "rebuild.cwd.natedev=/etc/nixos\nrebuild.cwd.mac=~/nixos\n"
+            + "rebuild.generations=~/.local/state/rebuild/generations.log\n")
+    _ = configuration.with_name("user_zone.conf").write_text(f"zone={USER_ZONE.key}\n", encoding="utf-8")
     for name in ("statusline.sh", "statusline.jq", "assignment.py", "rebuild_row.py"):
         _ = shutil.copyfile(PROGRAM.parent / name, folder / name)
     for source in PROGRAM.parent.iterdir():
@@ -320,7 +323,7 @@ class ColorTests(unittest.TestCase):
         for index, key in enumerate(conf.read(self.colors).values()):
             if key.startswith(("account.", "role.")):
                 overrides.append(f"{key}=#{index + 1:02x}8050")
-        _ = write_config_fixture(self.colors, "\n".join(overrides))
+        _ = self.colors.write_text("\n".join(overrides) + "\n", encoding="utf-8")
         accounts: list[str] = []
         for key, value in conf.read(self.colors).values().items():
             if not key.startswith(("account.", "role.")):
@@ -572,6 +575,41 @@ class ForYouStatusTests(unittest.TestCase):
             render.assert_called_once()
             arguments = cast(list[str], render.call_args.args[1])
             self.assertEqual(arguments[arguments.index("for_you") + 1], "3")
+
+    def test_linux_rejects_a_cache_that_expires_during_the_action_store_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config/statusline.conf"
+            cache = root / "rebuild-cache"
+            _ = fixture_command(root, rebuild_cache=str(cache))
+            environment = {"HOME": directory, "STAFF_FILE": os.devnull, "STATUSLINE_SYSTEM": "Linux",
+                           "REBUILD_NEEDS_DIR": str(root / "needs"), "FOR_YOU_ACTIONS_DIR": str(fixture_actions(root))}
+            for expire, expected in ((False, "0"), (True, "unavailable")):
+                seed_rebuild_cache(root, config, cache=cache)
+
+                def actions() -> tuple[()]:
+                    if expire:
+                        lines = cache.read_text(encoding="utf-8").splitlines()
+                        lines[1] = "0"
+                        _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    return ()
+
+                with (self.subTest(expire=expire), patch.dict(os.environ, environment, clear=True),
+                      patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
+                      patch.object(sys, "argv", ["assignment.py", "-r"]),
+                      patch.object(sys, "stdin", io.StringIO("{}")),
+                      patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+                      patch.object(ActionStore, "list", side_effect=actions) as read,
+                      patch.object(need, "read_needs", wraps=need.read_needs) as needs,
+                      patch.object(subprocess, "Popen") as refresh,
+                      patch.object(os, "execvp") as render):
+                    assignment.main()
+                read.assert_called_once_with()
+                needs.assert_called_once_with()
+                self.assertEqual(refresh.call_count, int(expire))
+                render.assert_called_once()
+                arguments = cast(list[str], render.call_args.args[1])
+                self.assertEqual(arguments[arguments.index("for_you") + 1], expected)
 
     def test_review_and_action_rows_have_separate_counts(self) -> None:
         lines = status_lines({"session_id": "sid"}, counts="sid Review: 1 question, 2 changes, 1 investigation",
@@ -1196,7 +1234,8 @@ class CountsRowTests(ConfiguredShellTests):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.configuration = self.home / "counts-config"
         self.configure_review_sources(self.configuration)
-        _ = write_config_fixture(self.configuration / "statusline.conf", "counts.retry_seconds=7\n")
+        _ = (self.configuration / "statusline.conf").write_text(
+            "# whole: 1..\ncounts.retry_seconds=7\n", encoding="utf-8")
         environment = {"CONF_DIR": str(self.configuration), "USER_ZONE": USER_ZONE.key}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         seed_rebuild_cache(self.home, self.runtime / "config/statusline.conf")

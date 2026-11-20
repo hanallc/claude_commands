@@ -58,6 +58,15 @@ OTHER = staff.StaffRow(staff.StaffId("f5636030-6745-4ff4-aeda-4c2773d18da8"), "s
 DWIGHT = staff.StaffRow(staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"), "producer", "dwight", staff.StaffRoot(),
                         current_session=staff.StaffId("920b0a64-6eee-479e-8c07-e03e4dcd4ef6"))
 NOW = datetime(2026, 11, 16, 18, tzinfo=UTC)
+FIREFOX_MIN_SHARED_WIDTH = 500
+
+
+def _private_firefox_command(profile: Path, width: int, height: int, *, dark: bool) -> tuple[list[str], dict[str, str]]:
+    profile.mkdir()
+    if dark:
+        _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+    command = ["firefox", "--headless", "--no-remote", "--profile", str(profile), "--window-size", f"{width},{height}"]
+    return command, {**os.environ, "MOZ_HEADLESS_WIDTH": str(width), "MOZ_HEADLESS_HEIGHT": str(height)}
 
 
 def _stop_browser(process: subprocess.Popen[bytes]) -> None:
@@ -396,6 +405,13 @@ class ListPageTests(unittest.TestCase):
     def firefox_view(self, destination: str, path: Path | None, width: int, height: int,
                      complete: threading.Event | None = None, *, dark: bool = False
                      ) -> subprocess.CompletedProcess[str]:
+        if width < FIREFOX_MIN_SHARED_WIDTH:
+            with tempfile.TemporaryDirectory(dir=self.root, prefix="firefox-view-") as temporary:
+                root = Path(temporary)
+                command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
+                screenshot = path if path is not None else root / "page.png"
+                return subprocess.run([*command, "--screenshot", str(screenshot), destination],
+                                      capture_output=True, text=True, timeout=45, env=environment)
         try:
             browser = self.firefox()
             with browser.page(destination, width, height, dark=dark):
@@ -836,6 +852,7 @@ async function inspect(){
   !!form.querySelector('[data-later-toggle]'),'The card shows the Review actions.');
  const phone=direct || document.querySelector('.mobile-header').getClientRects().length>0;
  check(phone===(direct || new URLSearchParams(location.search).has('phone')),'The List uses the expected layout.');
+ if(direct) check(innerWidth===430,'The direct overlay uses the 430 px viewport.');
  if(phone){
   const box=dialog.getBoundingClientRect();
   const top=listFrame?.getBoundingClientRect().top ?? box.top;
@@ -1140,6 +1157,15 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                             assert proof is not None
                             result = self.firefox_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
+                        elif width < FIREFOX_MIN_SHARED_WIDTH:
+                            command, environment = _private_firefox_command(
+                                self.root / "overlay-profile", width, height, dark=True)
+                            browser = subprocess.Popen([*command, url], stdout=subprocess.DEVNULL,
+                                                       stderr=subprocess.DEVNULL, env=environment, start_new_session=True)
+                            try:
+                                self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
+                            finally:
+                                _stop_browser(browser)
                         else:
                             with self.firefox().page(url, width, height, dark=True):
                                 self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
@@ -6526,6 +6552,7 @@ try{
  check(document.querySelectorAll('[data-feedback-form]').length===5,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
  check((innerWidth<960)===(FIXTURE_WIDTH<960),'the browser uses the requested layout');
+ if(FIXTURE_WIDTH===390) check(innerWidth===390,'The phone cards use the 390 px viewport.');
  if(FIXTURE_WIDTH<960){
   check(getComputedStyle(visible()[0]).display==='block','a phone row is a card');
   const card=number=>rows().find(row=>row.dataset.number===number);
