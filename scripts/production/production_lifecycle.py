@@ -7,9 +7,13 @@ except FileNotFoundError:
     pass
 
 import argparse
+import fcntl
 import json
-from dataclasses import replace
-from datetime import datetime
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import Enum
 import re
 import subprocess
@@ -19,9 +23,9 @@ from typing import NamedTuple, cast
 
 
 from scripts.production import ci_points, investigation, session_staff, staff, unit_config
-from scripts.agents import stop_resume
-from scripts.lib import land_main, main_publish, main_push_lock, main_sync
-from scripts.herdr import worker_panes
+from scripts.agents import pane_record, stop_resume
+from scripts.lib import git_files, land_main, main_publish, main_push_lock, main_sync
+from scripts.herdr import herdr, worker_panes
 from scripts.agents.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
@@ -39,12 +43,16 @@ from scripts.production.merge_checkpoint import (
 from scripts.production import production_doc
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure, judgment_state
 
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import berth_board
 from scripts.worktree.worktrees import main_checkout, release_worktree_pair
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
+MOVE_RECORD = Path("item154/move.json")
+MOVE_VERSION = 1
+OFFSET_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+                         r"(?:\.[0-9]+)?[+-](?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
 
 class PlanLanded(NamedTuple):
@@ -103,6 +111,337 @@ def command(step: str, cwd: Path, *args: str) -> str:
 
 def doc_lines(production: Production) -> list[str]:
     return production.doc.read_text(encoding="utf-8").splitlines()
+
+
+@dataclass(frozen=True)
+class MoveDestinations:
+    live_doc: Path
+    log: Path
+
+
+@dataclass(frozen=True)
+class MovePlan:
+    main: Path
+    integration: Path
+    merge_branch: str
+    destinations: MoveDestinations
+
+
+@dataclass(frozen=True)
+class MoveOpen:
+    """The approved window can still grant a move."""
+
+
+@dataclass(frozen=True)
+class MoveClosed:
+    closed_at: datetime
+
+
+@dataclass(frozen=True)
+class MoveApproval:
+    production: str
+    target_staff_id: staff.StaffId
+    executor_staff_id: staff.StaffId
+    approved_at: datetime
+    window_start: datetime
+    window_end: datetime
+    destinations: MoveDestinations
+    status: MoveOpen | MoveClosed
+
+    def encode(self) -> str:
+        status = ({"kind": "open"} if isinstance(self.status, MoveOpen)
+                  else {"kind": "closed", "closed_at": self.status.closed_at.isoformat()})
+        return json.dumps({
+            "version": MOVE_VERSION, "production": self.production,
+            "target_staff_id": self.target_staff_id, "executor_staff_id": self.executor_staff_id,
+            "approved_at": self.approved_at.isoformat(),
+            "window_start": self.window_start.isoformat(), "window_end": self.window_end.isoformat(),
+            "destinations": {"live_doc": str(self.destinations.live_doc), "log": str(self.destinations.log)},
+            "status": status,
+        }, indent=2) + "\n"
+
+
+@dataclass(frozen=True)
+class NoMoveApproval:
+    """The record has never been written."""
+
+
+def offset_time(text: str) -> datetime:
+    if not OFFSET_TIME.fullmatch(text):
+        raise ValueError("use an RFC 3339 time with a numeric offset")
+    return datetime.fromisoformat(text).astimezone(UTC)
+
+
+def saved_move_time(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("the saved time must be UTC")
+    normalized = value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value
+    if not normalized.endswith("+00:00"):
+        raise ValueError("the saved time must be UTC")
+    return offset_time(normalized)
+
+
+def move_fields(value: object, keys: set[str]) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("the move record must contain an object")
+    fields = cast(dict[str, object], value)
+    if set(fields) != keys:
+        raise ValueError("the move record has incorrect fields")
+    return fields
+
+
+def move_text(value: object) -> str:
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise ValueError("the move record has invalid text")
+    return value
+
+
+def move_destination(value: object) -> Path:
+    text = move_text(value)
+    destination = Path(text)
+    if not destination.is_absolute() or str(destination.resolve()) != text:
+        raise ValueError(f"{text}: the move destination must be canonical and absolute")
+    return destination
+
+
+def read_move_approval(path: Path) -> MoveApproval | NoMoveApproval:
+    try:
+        original = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return NoMoveApproval()
+    try:
+        fields = move_fields(cast(object, json.loads(original)),
+                             {"version", "production", "target_staff_id", "executor_staff_id",
+                              "approved_at", "window_start", "window_end", "destinations", "status"})
+        if type(fields["version"]) is not int or fields["version"] != MOVE_VERSION:
+            raise ValueError("the move record version is unsupported")
+        start = saved_move_time(fields["window_start"])
+        end = saved_move_time(fields["window_end"])
+        approved = saved_move_time(fields["approved_at"])
+        if start >= end or approved >= end:
+            raise ValueError("the move record has an invalid window")
+        targets = move_fields(fields["destinations"], {"live_doc", "log"})
+        destinations = MoveDestinations(move_destination(targets["live_doc"]), move_destination(targets["log"]))
+        if destinations.live_doc == destinations.log:
+            raise ValueError("the move destinations must be different")
+        status: MoveOpen | MoveClosed
+        match fields["status"]:
+            case {"kind": "open"} if fields["status"] == {"kind": "open"}:
+                status = MoveOpen()
+            case {"kind": "closed", "closed_at": closed}:
+                _ = move_fields(fields["status"], {"kind", "closed_at"})
+                closed_at = saved_move_time(cast(object, closed))
+                if not max(start, approved) <= closed_at < end:
+                    raise ValueError("the move record has an invalid close time")
+                status = MoveClosed(closed_at)
+            case _:
+                raise ValueError("the move record has an invalid status")
+        return MoveApproval(move_text(fields["production"]), staff.native_id(move_text(fields["target_staff_id"])),
+                            staff.native_id(move_text(fields["executor_staff_id"])), approved, start, end,
+                            destinations, status)
+    except (OSError, ValueError, OverflowError, staff.StaffRefused) as error:
+        raise Refusal(f"{path}: {error}") from error
+
+
+@contextmanager
+def locked_move(owner: staff.StaffRow) -> Iterator[Path]:
+    path = showrunners.SHOWRUNNER_STATE_DIR / staff.native_id(owner.id) / MOVE_RECORD
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield path
+
+
+def require_approval_terminal() -> None:
+    if (staff.caller_identity() or os.environ.get("CLAUDECODE")
+            or not all(stream.isatty() for stream in (sys.stdin, sys.stdout, sys.stderr))):
+        raise Refusal("approve-move requires a regular interactive terminal outside an agent session")
+    pid = os.getpid()
+    try:
+        while pid > 1:
+            arguments = pane_record.process_arguments(pid)
+            if herdr.is_claude_process(arguments) or herdr.is_codex_process(arguments):
+                raise Refusal("approve-move cannot run from an agent process")
+            parent = pane_record.process_parent(pid)
+            if parent < 0 or parent == pid:
+                raise ValueError("invalid process parent")
+            pid = parent
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as error:
+        raise Refusal(f"approve-move cannot verify process ancestry: {error}") from error
+
+
+def move_member(reference: str, record: staff.StaffSnapshot) -> staff.StaffRow:
+    matches = [row for row in record.rows if reference in (row.id, row.name, record.qualified_name(row))]
+    if len(matches) != 1:
+        raise Refusal(f"{reference}: expected one staff row")
+    return matches[0]
+
+
+def move_caller(record: staff.StaffSnapshot) -> staff.StaffRow:
+    identity = staff.caller_identity() or staff.runtime_id()
+    row = record.by_current_session(identity)
+    if row is None:
+        raise Refusal("the caller has no current staff session")
+    return row
+
+
+def move_plan(production: Production, lines: list[str]) -> MovePlan:
+    owner = production.owner
+    if not isinstance(owner.doc, staff.LiveDoc) or owner.doc.machine != local_machine():
+        raise Refusal(f"{production.name}: the live staff document must be on this machine")
+    if staff.declares_merge_checkout(lines):
+        raise Refusal(f"{production.name}: the live staff document is already enrolled")
+    main = Path(production_field(lines, "Repository")).expanduser().resolve(strict=True)
+    main_git = git_files.at(main)
+    if main_git.git_dir != main_git.common_dir or git_files.head(main_git) != git_files.OnBranch("main"):
+        raise Refusal(f"{main}: expected the main checkout on main")
+    source = git_files.locate(production.doc.parent)
+    if source.common_dir != main_git.common_dir:
+        raise Refusal(f"{production.doc}: document belongs to a different repository")
+    integration, branch = production.checkout, production.merge_branch
+    if production.name == staff.CARGO_LINER_PRODUCTION:
+        merge_unit = staff.serving_merge_unit(owner.id)
+        if (merge_unit is None or merge_unit.name != f"{production.name}-merges"
+                or not isinstance(merge_unit.worktree, staff.PresentWorktree)
+                or merge_unit.worktree.machine != local_machine()):
+            raise Refusal(f"{production.name}: record its local merge unit staging worktree first")
+        integration = (merge_unit.worktree.path.parent / "integration").resolve(strict=True)
+        branch = f"{merge_unit.name}-integration"
+    merge_git = git_files.at(integration)
+    if (merge_git == main_git or merge_git.common_dir != main_git.common_dir
+            or git_files.head(merge_git) != git_files.OnBranch(branch)):
+        raise Refusal(f"{integration}: expected a separate worktree of {main} on {branch}")
+    relative_doc = production.doc.relative_to(source.toplevel)
+    relative_live = relative_doc.with_name(relative_doc.stem + production_doc.LIVE_DOCUMENT_SUFFIX)
+    relative_log = Path(production_field(lines, "Log"))
+    live_doc, log = main / relative_live, main / relative_log
+    for path in (live_doc, log):
+        if path != path.resolve() or not path.is_relative_to(main) or path == main:
+            raise Refusal(f"{path}: destination must be a canonical path under {main}")
+    if live_doc == log:
+        raise Refusal("the move destinations must be different")
+    return MovePlan(main, integration, branch, MoveDestinations(live_doc, log))
+
+
+def approve_move(production: Production, executor: staff.StaffRow, start: datetime, end: datetime,
+                 lines: list[str]) -> None:
+    if start >= end:
+        raise Refusal("the move window start must be before its end")
+    plan = move_plan(production, lines)
+    with locked_move(production.owner) as path:
+        at = datetime.now(UTC)
+        if end <= at:
+            raise Refusal("the move window has already ended")
+        previous = read_move_approval(path)
+        if isinstance(previous, MoveApproval) and isinstance(previous.status, MoveOpen) and at < previous.window_end:
+            raise Refusal(f"{path}: an unexpired move approval is already open")
+        approval = MoveApproval(production.name, staff.native_id(production.owner.id), staff.native_id(executor.id),
+                                at, start, end, plan.destinations, MoveOpen())
+        write_text_atomic(path, approval.encode(), new_file_mode=0o600)
+        print(path.read_text(encoding="utf-8"), end="")
+
+
+def require_move_window(approval: MoveApproval) -> datetime:
+    at = datetime.now(UTC)
+    if not isinstance(approval.status, MoveOpen) or not approval.window_start <= at < approval.window_end:
+        raise Refusal("move-files requires an open approval within its window")
+    return at
+
+
+def migrated_document(production: Production, lines: list[str], plan: MovePlan) -> bytes:
+    fields = {
+        "Repository": f"- **Repository:** `{plan.main}`",
+        "Merge branch": f"- **Merge branch:** `{plan.merge_branch}`",
+        "Showrunner checkout": (f"- **Showrunner checkout:** `{plan.integration}`\n"
+                                + f"- **{production_doc.MERGE_CHECKOUT_FIELD}:** `{plan.main}`"),
+    }
+    result: list[str] = []
+    merge_tests = False
+    for line in lines:
+        if line.startswith(("- **", "## ")):
+            merge_tests = line.startswith("- **Merge tests:**")
+        if merge_tests:
+            line = line.replace(str(production.checkout), str(plan.integration))
+            line = re.sub(r"showrunner checkout", "integration checkout", line, flags=re.IGNORECASE)
+        result.append(next((value for field, value in fields.items() if line.startswith(f"- **{field}:**")), line))
+    return ("\n".join(result) + "\n").encode("utf-8")
+
+
+def check_copy_target(path: Path, data: bytes) -> None:
+    if path != path.resolve():
+        raise Refusal(f"{path}: cannot copy through a symlink")
+    if path.exists() and path.read_bytes() != data:
+        raise Refusal(f"{path}: the destination already has different bytes")
+
+
+def write_move_copy(path: Path, data: bytes, mode: int) -> None:
+    check_copy_target(path, data)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_bytes_atomic(path, data, mode=mode)
+
+
+def move_files(production: Production, lines: list[str], record: staff.StaffSnapshot) -> None:
+    caller = move_caller(record)
+    plan = move_plan(production, lines)
+    targets = plan.destinations
+    with locked_move(production.owner) as path:
+        approval = read_move_approval(path)
+        if isinstance(approval, NoMoveApproval):
+            raise Refusal(f"{path}: move approval is missing")
+        if (approval.production != production.name or approval.target_staff_id != production.owner.id
+                or approval.executor_staff_id != caller.id or approval.destinations != targets):
+            raise Refusal(f"{path}: approval must name this production, executor, and both destinations")
+        _ = require_move_window(approval)
+        for destination in (targets.live_doc, targets.log):
+            require_untracked_ignored(plan.main, destination.relative_to(plan.main).as_posix())
+        document = migrated_document(production, lines, plan)
+        log = production.log.read_bytes()
+        same_log = targets.log.exists() and production.log.samefile(targets.log)
+        check_copy_target(targets.live_doc, document)
+        if not same_log:
+            check_copy_target(targets.log, log)
+        _ = require_move_window(approval)
+        write_move_copy(targets.live_doc, document, production.doc.stat().st_mode & 0o777)
+        if not same_log:
+            _ = require_move_window(approval)
+            write_move_copy(targets.log, log, production.log.stat().st_mode & 0o777)
+        if targets.live_doc.read_bytes() != document or targets.log.read_bytes() != production.log.read_bytes():
+            raise Refusal("the live document or LOG differs after the move")
+        verified = production_doc.resolve_production_paths(targets.live_doc)
+        if (not isinstance(verified, production_doc.EnrolledPaths) or verified.live_doc != targets.live_doc
+                or verified.log != targets.log or verified.integration != plan.integration):
+            raise Refusal("the moved document does not resolve to the approved destinations")
+        closed = replace(approval, status=MoveClosed(require_move_window(approval)))
+        write_text_atomic(path, closed.encode())
+        print(f"Moved {targets.live_doc} and {targets.log}.")
+
+
+def stage_notes(production: Production, lines: list[str], record: staff.StaffSnapshot) -> None:
+    if move_caller(record).id != production.owner.id:
+        raise Refusal("only the owning showrunner can stage its notes")
+    plan = move_plan(production, lines)
+    relative = Path(production_doc.NOTES_DIRECTORY) / staff.native_id(production.owner.id)
+    source = production.checkout / relative
+    destination = plan.main / relative
+    if source != source.resolve() or destination != destination.resolve():
+        raise Refusal("notes must use canonical paths")
+    ensure_excluded(plan.main, "/" + relative.as_posix())
+    if not source.exists() or source == destination:
+        return
+    copies: list[tuple[Path, bytes, int]] = []
+    for entry in sorted(source.rglob("*")):
+        if entry.is_symlink() or not (entry.is_file() or entry.is_dir()):
+            raise Refusal(f"{entry}: the notes folder must contain regular files and directories")
+        if entry.is_file():
+            target = destination / entry.relative_to(source)
+            require_untracked_ignored(plan.main, target.relative_to(plan.main).as_posix())
+            data = entry.read_bytes()
+            check_copy_target(target, data)
+            copies.append((target, data, entry.stat().st_mode & 0o777))
+    for target, data, mode in copies:
+        write_move_copy(target, data, mode)
+    print(f"Staged {len(copies)} notes in {destination}.")
 
 
 def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | ProductionWrapped:
@@ -549,7 +888,7 @@ def require_retirable_worktrees(production: Production, rows: tuple[UnitRow, ...
         protected = production_doc.protected_checkouts()
     except production_doc.ProductionPathsError as error:
         raise LifecycleStop("retire", "held", str(error)) from error
-    repository = main_checkout(production.checkout)
+    repository = git_files.at(production.checkout).common_dir
     for unit in rows:
         path = unit.worktree.resolve()
         for checkout in protected:
@@ -782,8 +1121,12 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("action", choices=("load", "open", "promote-main", "wrap"))
+    _ = parser.add_argument("action", choices=("load", "open", "promote-main", "wrap",
+                                               "approve-move", "move-files", "stage-notes"))
     _ = parser.add_argument("--production", required=True, type=str)
+    _ = parser.add_argument("--executor")
+    _ = parser.add_argument("--window-start")
+    _ = parser.add_argument("--window-end")
     _ = parser.add_argument("--no-ci", action="store_true")
     _ = parser.add_argument("--resume", action="store_true")
     _ = parser.add_argument("--scratch", type=Path, help="load: the scratchpad whose state moves to the state directory")
@@ -795,6 +1138,33 @@ def main() -> int:
     args = parser.parse_args()
     try:
         action = cast(str, args.action)
+        name = cast(str, args.production)
+        executor = cast(str | None, args.executor)
+        start = cast(str | None, args.window_start)
+        end = cast(str | None, args.window_end)
+        if action == "approve-move":
+            require_approval_terminal()
+            if executor is None or start is None or end is None:
+                raise Refusal("approve-move requires --executor, --window-start and --window-end")
+            record = staff.snapshot()
+            owner = move_member(name, record)
+            if owner.kind != "showrunner":
+                raise Refusal(f"{name}: the target must be a showrunner")
+            production = read_production(owner, record)
+            approve_move(production, move_member(executor, record), offset_time(start), offset_time(end),
+                         doc_lines(production))
+            return 0
+        if executor is not None or start is not None or end is not None:
+            raise Refusal("only approve-move accepts the executor and window options")
+        if action in ("move-files", "stage-notes"):
+            record = staff.snapshot()
+            production = read_production(name, record)
+            lines = doc_lines(production)
+            if action == "move-files":
+                move_files(production, lines, record)
+            else:
+                stage_notes(production, lines, record)
+            return 0
         no_ci = cast(bool, args.no_ci)
         ci_sha = cast(str | None, args.ci_green)
         smoke_sha = cast(str | None, args.smoke_passed)
@@ -802,7 +1172,6 @@ def main() -> int:
             raise LifecycleStop("input", "failed", "--no-ci excludes the verdict flags")
         ci_green = CommitVerdict(ci_sha) if ci_sha is not None else VerdictMissing()
         smoke_passed = CommitVerdict(smoke_sha) if smoke_sha is not None else VerdictMissing()
-        name = cast(str, args.production)
         production = wrap_production(name) if action == "wrap" else read_production(name)
         lines = doc_lines(production)
         if action == "load":
@@ -820,7 +1189,7 @@ def main() -> int:
         report(error.step, error.state, error.detail.replace("\n", "; "))
     except Stop as error:
         report(error.step, error.state, error.detail.replace("\n", "; "))
-    except (staff.StaffRefused, staff.StaffNotFound, Refusal, OSError, ValueError) as error:
+    except (staff.StaffRefused, staff.StaffNotFound, Refusal, OSError, ValueError, OverflowError) as error:
         report("input", "failed", str(error).replace("\n", "; "))
     return 2
 
