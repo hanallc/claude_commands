@@ -174,6 +174,13 @@ class UnparkNoChangeReceipt:
     reason: UnparkNoChangeReason
 
 
+class LegacyFeedbackRecipient(StrEnum):
+    KEEPER = ""
+
+
+type FeedbackRecipient = staff.StaffId | LegacyFeedbackRecipient
+
+
 @dataclass(frozen=True)
 class PageFeedback:
     request: str
@@ -184,9 +191,13 @@ class PageFeedback:
     action: Literal["tell", "remove", "park", "unpark"] = "tell"
     form_words: str = ""
     parked_until: Parking = NoTimestamp.UNSET
+    recipient: FeedbackRecipient = LegacyFeedbackRecipient.KEEPER
 
     def key(self) -> PageRequest:
         return PageRequest(self.request, self.action, self.words, self.form_words, self.parked_until)
+
+    def recipient_id(self, keeper: staff.StaffId) -> staff.StaffId:
+        return keeper if self.recipient is LegacyFeedbackRecipient.KEEPER else self.recipient
 
 
 @dataclass(frozen=True)
@@ -198,6 +209,7 @@ class PageItemNotice:
     action: Literal["remove", "park", "unpark"]
     form_words: str = ""
     parked_until: Parking = NoTimestamp.UNSET
+    recipient: FeedbackRecipient = LegacyFeedbackRecipient.KEEPER
 
 
 PAGE_SOURCE = "nate via List"
@@ -937,6 +949,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
         fields.update(state=content.state, alerted_to=content.alerted_to)
         if isinstance(content.read_update, UnreadUpdate):
             fields["read_update"] = content.read_update.fingerprint
+        if content.recipient is not LegacyFeedbackRecipient.KEEPER:
+            fields["recipient"] = content.recipient
         return {"feedback": fields}
     if isinstance(content, QuestionRequestReceipt):
         return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id)}}
@@ -1264,7 +1278,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         if isinstance(request, PageRequest):
             if entries and isinstance(page_action, PageItemNotice):
                 pending = PageFeedback(page_action.request, page_action.words, action=page_action.action,
-                                       form_words=request.form_words, parked_until=request.parked_until)
+                                       form_words=request.form_words, parked_until=request.parked_until,
+                                       recipient=page_action.recipient)
                 entries.append(ItemChange(moment, pending, PAGE_SOURCE))
             elif request.action == "unpark":
                 reason = (UnparkNoChangeReason.EXPIRED if isinstance(item.parked_until, datetime)
@@ -1445,7 +1460,8 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
 
 
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
-         notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+         notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+         assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
     fields: LogFields = {"parked_until": until}
     event = FieldChange("Parked", fields)
     if isinstance(until, datetime):
@@ -1461,7 +1477,7 @@ def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
         if until is ParkUntilDelivered.DELIVERED and item.state in (ItemState.DELIVERED, ItemState.DONE):
             raise ListError("This item is already delivered.")
         return replace(item, parked_until=until)
-    return _change(keeper, identity, edit, event, source, page_action=notice).item
+    return _change(keeper, identity, edit, event, source, page_action=notice, assigned_to=assigned_to).item
 
 
 def delivery_park_event(item: ListItem) -> DeliveryParkEvent | NoDeliveryPark:
@@ -1526,7 +1542,8 @@ def unpark(keeper: staff.StaffId, identity: str, *, source: str,
 
 
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
-          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
+          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
     _validate_closing_words(words)
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if item.state == ItemState.CLOSED:
@@ -1539,7 +1556,7 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
         return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words,
                        questions=answered, log=(*item.log, *closed_questions))
     return _change(keeper, identity, edit, FieldChange("Closed", {"closing_words": words}), source,
-                   unread=False, page_action=notice).item
+                   unread=False, page_action=notice, assigned_to=assigned_to).item
 
 
 def reopen(keeper: staff.StaffId, identity: str, *, source: str) -> ListItem:
@@ -1638,8 +1655,12 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
         raise ListError("invalid List feedback log")
     if action not in ("tell", "remove", "park", "unpark") or not words.strip():
         raise ListError("invalid List feedback action")
+    recipient = fields.get("recipient", "")
+    if not isinstance(recipient, str) or any(char.isspace() for char in recipient):
+        raise ListError("invalid List feedback recipient")
     return PageFeedback(request, words, state, alerted_to,
-                        UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT, action, form_words, parked_until)
+                        UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT, action, form_words, parked_until,
+                        recipient=staff.StaffId(recipient) if recipient else LegacyFeedbackRecipient.KEEPER)
 
 
 def _page_requests(item: ListItem) -> dict[str, PageActivity]:
@@ -1814,7 +1835,7 @@ def resend_question(keeper: staff.StaffId, identity: str, question_id: str,
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:
     """Save the request identity, words, and pending state in one locked write."""
     if not feedback.words.strip() or feedback.state != "pending":
-        raise ListError("enter a new request and words for morty")
+        raise ListError("Enter a new request with feedback words.")
     store = _store(keeper)
     with store.locked():
         item = load(keeper, identity)
@@ -1862,8 +1883,8 @@ def deliver_feedback(keeper: staff.StaffId, identity: str, request: str,
             feedback_claims.remove(claim)
 
 
-def sent_to_morty(item: ListItem) -> Timestamp:
-    """Keep the sent notice until the next writer adds a log entry."""
+def feedback_notice_time(item: ListItem) -> Timestamp:
+    """Keep the feedback notice until the next writer adds a log entry."""
     for entry in reversed(item.log):
         if entry.source != PAGE_SOURCE:
             break
@@ -2030,7 +2051,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("add", "update", "park", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
-            _ = command.add_argument("--source", required=name != "update")
+            _ = command.add_argument("--source", required=name not in ("update", "park", "close"))
         if name in ("link", "unlink"):
             _ = command.add_argument("id")
             _ = command.add_argument("--review", dest="reviews", action="append", type=ReviewByShownId, default=[])
@@ -2107,7 +2128,7 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper, caller=caller.id)
-        if assigned_to is not AllItems.INCLUDED and name != "add":
+        if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "close"):
             raise ListError(f"only morty can run {name}")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
@@ -2116,6 +2137,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise ListError(result.reason)
             print(f"answered {identity} {question}")
             return 0
+        if name in ("park", "close"):
+            if assigned_to is not AllItems.INCLUDED:
+                source = caller.name
+            elif source is None:
+                parser.error(f"{name} requires --source for morty")
         assert source is not None
         if name == "clean-evidence":
             changed, unchanged = clean_evidence(keeper, source=source)
@@ -2162,9 +2188,9 @@ def main(argv: list[str] | None = None) -> int:
             print(item.id)
             return _notify_producer_assignment(item, keeper, keeper, caller=caller.id)
         elif name == "park":
-            _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source)
+            _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source, assigned_to=assigned_to)
         elif name == "close":
-            _ = close(keeper, cast(str, args.id), cast(str, args.words), source=source)
+            _ = close(keeper, cast(str, args.id), cast(str, args.words), source=source, assigned_to=assigned_to)
         elif name == "reopen":
             _ = reopen(keeper, cast(str, args.id), source=source)
         else:

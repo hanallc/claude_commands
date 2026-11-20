@@ -625,11 +625,28 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(the_list.records(MORTY.id), [])
         self.assertEqual(self.notices, [])
 
+    def test_producer_parks_and_closes_its_own_item(self) -> None:
+        item = self.add(changes={"producer": BOB.id})
+        other = self.add(changes={"producer": OTHER.id})
+        until = START + timedelta(days=1)
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+            for command, options in (("park", ("--until", until.isoformat())), ("close", ("--words", "Accepted"))):
+                with self.subTest(command=command):
+                    self.assertEqual(self.command(command, "--id", other.id, *options),
+                                     (1, "", f"the_list: {other.id} is assigned to another producer\n"))
+            self.assertEqual(self.command("park", "--id", item.id, "--until", until.isoformat()), (0, "", ""))
+            parked = the_list.load(MORTY.id, item.id)
+            self.assertEqual((parked.parked_until, parked.log[-1].source), (until, BOB.name))
+            self.assertEqual(self.command("close", "--id", item.id, "--words", "Accepted", "--source", "nate"),
+                             (0, "", ""))
+        closed = the_list.load(MORTY.id, item.id)
+        self.assertEqual((closed.state, closed.closing_words, closed.log[-1].source),
+                         (the_list.ItemState.CLOSED, "Accepted", BOB.name))
+        self.assertEqual(the_list.load(MORTY.id, other.id), other)
+
     def test_producer_cannot_run_other_commands(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
         commands = (
-            ("park", "--id", item.id, "--until", START.isoformat()),
-            ("close", "--id", item.id, "--words", "Done"),
             ("reopen", "--id", item.id),
             ("mark-read", "--id", item.id),
             ("clean-evidence",),
@@ -973,13 +990,13 @@ class TheListTests(unittest.TestCase):
         sent = the_list.load(MORTY.id, item.id)
         self.assertEqual(replace(sent, log=read.log), read)
         self.assertEqual(sent.log[-1].what, the_list.PageFeedback("request", words))
-        self.assertEqual(the_list.sent_to_morty(sent), START)
+        self.assertEqual(the_list.feedback_notice_time(sent), START)
         self.assertIs(sent.unread_since, the_list.NoTimestamp.UNSET)
         again = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE)
-        self.assertEqual(the_list.sent_to_morty(again), START)
+        self.assertEqual(the_list.feedback_notice_time(again), START)
         with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
             changed = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="owner report")
-        self.assertIs(the_list.sent_to_morty(changed), the_list.NoTimestamp.UNSET)
+        self.assertIs(the_list.feedback_notice_time(changed), the_list.NoTimestamp.UNSET)
 
     def test_answer_refusals_leave_the_record_unchanged(self) -> None:
         item = self.add()

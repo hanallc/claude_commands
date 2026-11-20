@@ -9,6 +9,8 @@ Load `/producer:produce` before this command.
 ## List tracking
 
 morty is the producer of the List page (item 106). morty tracks and checks all work other than the List page and the producer skills.
+The List is shared: each producer adds, parks and closes its own items. morty takes `/recall` and New item requests and picks the producer.
+At each round read every item of every producer. Correct text that is not clear, and send a late check time to the item's producer.
 morty also manages the producer skills: `commands/producer/*.md`, `docs/producer/` and the producer READMEs. Send each change request for them to morty.
 Read the full words in `~/rust/hanadocs/morty/README.md`, section "The List page is morty's product".
 
@@ -32,8 +34,7 @@ Use `--producer <name or staff id>` with `add` or `update` for an item that anot
 When a producer gets an item in a Rust project, tell it to load `~/.claude/docs/producer/rust_design.md`. Ask it to confirm.
 New items that morty adds without `--producer` default to morty.
 The assigned producer writes the latest status, next step, and ETA.
-Morty can add, close, park, and reassign any item.
-Other producers can add their own items with `--producer <their name or staff ID>`.
+Each producer adds, parks and closes its own items. Morty keeps every command for all items, and only morty reassigns an item.
 Closed items retain their records and logs.
 Do not write `current.md`, the `items` or `removed_items` parts of `checkins.json`, or `open-questions.json`.
 Each item has a stable number, showrunner owner, state, next action, ETA, latest report, source time, and unread flag.
@@ -57,6 +58,7 @@ Do not repeat answered questions. Read existing evidence without starting builds
 nate's verdicts and question answers go to the owner, not to morty.
 Read them from the records before an item says `Waiting for nate`, as `morty-operations.md` shows.
 Then correct the item state and ask the owner for nate's answer.
+nate's words on a List page item of another producer go to that producer. Read them from the item log.
 
 ## Low-context status rounds
 

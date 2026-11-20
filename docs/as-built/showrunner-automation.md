@@ -595,6 +595,8 @@ They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check
 Their updates use the caller's staff name as the log source.
 They can add items with `--producer` set to their own name or staff ID.
 The CLI saves these items in morty's store on the machine where it runs. Every producer runs on natedev.
+Producers can park and close their own items. The CLI uses the caller's staff name as the log source.
+The writer checks the assigned producer under the same lock as the save.
 Only morty can use the other commands.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
