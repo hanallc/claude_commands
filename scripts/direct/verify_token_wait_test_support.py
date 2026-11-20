@@ -5,6 +5,7 @@ from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
+from scripts.build_queue import admission_records
 from dataclasses import replace
 
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -368,9 +369,8 @@ esac
                 if str(row["event_type"]).startswith("wait_")]
 
     def records(self) -> list[Record]:
-        return [record for path in (self.root / "buildlog").glob("*/*.jsonl")
-                for line in path.read_text().splitlines()
-                if (record := cast(Record, json.loads(line))).get("kind") == "call"]
+        return [record for record in admission_records.read_buildlog_records(self.root / "buildlog")
+                if record.get("kind") == "call"]
 
     def verify(self, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
         script = (Path(environment["HOME"]) / ".claude/scripts/direct/verify.sh"

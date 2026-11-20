@@ -1330,6 +1330,46 @@ class ProcessUseTests(TmpSweepCase):
         assert isinstance(used, tmp_sweep.ProcessUsesKnown)
         self.assertEqual(used.paths, [(str(self.tmp / "used"), 17, "works in it")])
 
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux cgroup records")
+    def test_removal_guard_checks_system_services_and_user_processes(self) -> None:
+        target = self.tmp / "target"
+        aliases = scratch.MountAliases(target, (target,))
+        uid = os.geteuid()
+        service = "/system.slice/upsmon.service"
+        cases = (
+            ("system service with unreadable cwd", service, False, "cwd", ""),
+            ("system service working in target", service, True, "", "process 42 works in it"),
+            ("unreadable cgroup", "", False, "cwd", "cannot check process 42"),
+            ("user slice", f"/user.slice/user-{uid}.slice/session-1.scope", False, "cwd", "cannot check process 42"),
+            ("user manager", f"/user@{uid}.service/app.slice/tool.service", False, "cwd", "cannot check process 42"),
+            ("system service with unreadable root", service, False, "root", "cannot check process 42"),
+        )
+        readlink = os.readlink
+        for index, (case, cgroup, uses_target, denied_link, refusal) in enumerate(cases):
+            proc = self.proc / str(index)
+            entry = proc / "42"
+            fake_process(proc, 42, cwd=str(target) if uses_target else "/")
+            _ = write(entry / "comm", "upsmon\n")
+            if cgroup:
+                _ = write(entry / "cgroup", f"0::{cgroup}\n")
+
+            def read_fixture_link(path: str) -> str:
+                if path == str(entry / denied_link):
+                    raise PermissionError(path)
+                return readlink(path)
+
+            output = io.StringIO()
+            with (self.subTest(case=case), redirect_stderr(output),
+                  mock.patch.object(tmp_sweep, "PROC_DIR", str(proc)),
+                  mock.patch.object(os, "readlink", side_effect=read_fixture_link)):
+                if refusal:
+                    with self.assertRaisesRegex(scratch.RemovalRefused, refusal):
+                        tmp_sweep.require_quiescent(aliases, frozenset())
+                    self.assertEqual(output.getvalue(), "")
+                else:
+                    tmp_sweep.require_quiescent(aliases, frozenset())
+                    self.assertIn("skipped process 42 (upsmon, upsmon.service)", output.getvalue())
+
     def test_lsof_scan_has_explicit_known_and_unavailable_results(self) -> None:
         for output in ("p17\nfcwd\nn/tmp/used\n", "p17\nfcwd\nn/elsewhere\n"):
             with self.subTest(output=output):

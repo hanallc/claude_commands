@@ -1636,6 +1636,11 @@ The DONE completion hook ends that task before pane closure. Other workers' fold
 `scratch.py list` shows each folder's task and last change.
 The other commands are `adopt`, `hold`, `release`, `renew` and `end`.
 
+On Linux, the removal guard checks readable working directories in every slice.
+If access to a same-UID process's working directory is denied, the guard checks its systemd cgroup.
+It skips that process only when the cgroup is outside the user's slice.
+For each process it skips, it prints the PID, process name, and unit on stderr.
+
 Tasks use these forms:
 
 - `run:<run id>` ends through `end_session.sh`.

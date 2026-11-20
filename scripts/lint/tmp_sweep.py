@@ -607,15 +607,57 @@ def running_session_ids() -> frozenset[str] | None:
 
 
 @dataclass(frozen=True)
+class SkippedProcess:
+    """A process with an unreadable cwd outside the user's slice."""
+    pid: int
+    name: str
+    unit: str
+
+
+@dataclass(frozen=True)
 class ProcessUsesKnown:
     """A completed scan of process paths, including a scan with no matches."""
     paths: list[tuple[str, int, str]]
     unreadable_cwd_pids: tuple[int, ...] = ()
+    skipped_processes: tuple[SkippedProcess, ...] = ()
 
 
 @dataclass(frozen=True)
 class ProcessUsesUnavailable:
     """Process use cannot be checked; candidates must stay."""
+
+
+def unit_outside_user_slice(entry: Path, uid: int) -> str | None:
+    """Read the systemd cgroup after a cwd read fails."""
+    try:
+        lines = (entry / "cgroup").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    user_units = {f"user-{uid}.slice", f"user@{uid}.service"}
+    groups: list[tuple[str, ...]] = []
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            return None
+        hierarchy, controllers, path = fields
+        if (hierarchy, controllers) != ("0", "") and controllers != "name=systemd":
+            continue
+        parts = Path(path).parts
+        if not hierarchy.isdecimal() or not path.startswith("/") or ".." in parts or user_units.intersection(parts):
+            return None
+        groups.append(parts)
+    if not groups:
+        return None
+    return next((part for parts in groups for part in reversed(parts)
+                 if part.endswith((".service", ".scope", ".slice"))), "no systemd unit")
+
+
+def process_name(entry: Path) -> str:
+    try:
+        name = " ".join((entry / "comm").read_text(encoding="utf-8", errors="replace").splitlines()).strip()
+    except OSError:
+        return "unknown name"
+    return name or "unknown name"
 
 
 def process_paths(proc: str, prefix: str | tuple[str, ...], *,
@@ -628,6 +670,8 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
         return ProcessUsesUnavailable()
     found: list[tuple[str, int, str]] = []
     unreadable: set[int] = set()
+    skipped: list[SkippedProcess] = []
+    uid = os.geteuid()
     for entry in processes:
         if not entry.name.isdigit():
             continue
@@ -636,17 +680,25 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
             own = True
         else:
             try:
-                own = entry.stat(follow_symlinks=False).st_uid == os.geteuid()
+                own = entry.stat(follow_symlinks=False).st_uid == uid
             except FileNotFoundError:
                 continue
             except OSError:
                 unreadable.add(pid)
                 continue
         links = (("cwd", WORKS_IN),) if quiesce_fds is None else (("cwd", WORKS_IN), ("root", "uses root"))
+        skip_process = False
         for name, how in links:
             try:
                 target = os.readlink(os.path.join(entry.path, name))
             except PermissionError:
+                if own and quiesce_fds is not None and name == "cwd":
+                    directory = Path(entry.path)
+                    unit = unit_outside_user_slice(directory, uid)
+                    if unit is not None:
+                        skipped.append(SkippedProcess(pid, process_name(directory), unit))
+                        skip_process = True
+                        break
                 if own:
                     unreadable.add(pid)
                 continue
@@ -654,6 +706,8 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
                 continue
             if target.startswith(prefix):
                 found.append((target, pid, how))
+        if skip_process:
+            continue
         if quiesce_fds is None and pid in unreadable:
             continue
         try:
@@ -694,7 +748,7 @@ def process_paths(proc: str, prefix: str | tuple[str, ...], *,
                         found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, MAPS_FILE))
         except OSError:
             continue
-    return ProcessUsesKnown(found, tuple(sorted(unreadable)))
+    return ProcessUsesKnown(found, tuple(sorted(unreadable)), tuple(sorted(skipped, key=lambda process: process.pid)))
 
 
 def require_quiescent(aliases: scratch.MountAliases, lock_fds: frozenset[int]) -> None:
@@ -707,6 +761,9 @@ def require_quiescent(aliases: scratch.MountAliases, lock_fds: frozenset[int]) -
         uses = lsof_paths(prefix, require_complete=True, lock_fds=lock_fds)
     if isinstance(uses, ProcessUsesUnavailable):
         raise scratch.RemovalRefused(f"{path}: cannot check process use")
+    for process in uses.skipped_processes:
+        print(f"{path}: skipped process {process.pid} ({process.name}, {process.unit}): cannot read cwd",
+              file=sys.stderr)
     for target, pid, how in uses.paths:
         if aliases.contains(Path(target.removesuffix(DELETED_SUFFIX))):
             raise scratch.RemovalRefused(f"{path}: process {pid} {how}")
