@@ -2337,6 +2337,147 @@ class PaneRunDeliveryTests(unittest.TestCase):
             progress_history.DispatchDelivery(str(prompt), dispatch, str(reply)))
         return dispatch, reply
 
+    def test_result_from_an_earlier_pass_does_not_reach_the_holder(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        self.assertNotEqual(dispatch, "earlier-pass")
+        for state in ("closed", "blocked"):
+            with self.subTest(state=state):
+                if state == "blocked":
+                    self.fixture.world.add(row, "w1:p1", family="codex")
+                    self.fixture.world.locations["w1:p1"]["agent_status"] = state
+                record = self.record(row, state)
+                record.update(status="finished", pane_dispatch_id="earlier-pass")
+                path = Path(record["log"]).with_suffix(".json")
+                write_text_atomic(path, json.dumps(record))
+
+                self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(0)),
+                                 detached_runs.OTHER_PASS_DELIVERY)
+                self.assertEqual(worker_lifecycle.read_json_object(path).get("delivery"),
+                                 detached_runs.OTHER_PASS_DELIVERY)
+                self.assertEqual(self.inputs, [])
+                self.assertEqual(self.notices, [])
+
+    def test_earlier_self_stop_does_not_block_done_in_a_stopped_pane(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, reply = self.begin_pane_pass(row)
+        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        done = f"DONE {dispatch}"
+        agent.append(pane, "user", delivery.line)
+        agent.append(pane, "assistant", done)
+        self.assertTrue(self.fixture.world.stop(row, self.fixture.world))
+        self.assertIsInstance(worker_panes.observe_worker(self.fixture.parent.id, row, staff.snapshot()),
+                              worker_panes.StoppedWorker)
+        record = self.record(row)
+        record.update(status="finished", exit_code=143, self_stop=True, stop_pass_requested=True,
+                      stop_reason="The check is obsolete.", pane_dispatch_id="earlier-pass",
+                      delivery="deferred: worker is stopped")
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+
+        self.assertIs(turn_end.run_finished(row.id), detached_runs.CompletionReplay.HANDLED)
+        self.assertEqual(worker_lifecycle.read_json_object(path).get("delivery"), detached_runs.OTHER_PASS_DELIVERY)
+        self.assertEqual(reply.read_text().rstrip(), done)
+        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
+        self.assertEqual(self.inputs, [])
+
+    def test_linked_result_defers_when_the_pass_read_fails(self) -> None:
+        row = self.fixture.worker("impl", family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        record = self.record(row)
+        record.update(status="finished", exit_code=0, pane_dispatch_id=dispatch)
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+
+        passed = worker_panes.worker_pass(row, self.run_dir)
+        with patch.object(worker_panes, "worker_pass", side_effect=(passed, OSError("private pass read failure"))):
+            delivery = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(delivery, "deferred: worker pass is unavailable: private pass read failure")
+        self.assertEqual(saved.get("delivery"), delivery)
+        self.assertNotIn("delivered_at", saved)
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.notices, [])
+
+        result = detached_runs.submit_finished_worker_result(self.run_dir, row,
+            worker_input=detached_runs.WorkerResultInput.TYPE)
+        self.assertIs(result, detached_runs.WorkerResultReplay.SUBMITTED)
+        self.assertEqual(len(self.inputs), 1)
+
+    def test_reaped_result_reaches_only_the_pass_that_started_it(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        for case in ("earlier-pass", "current-pass", "current-done"):
+            with self.subTest(case=case):
+                self.inputs.clear()
+                row = self.fixture.worker(case, family="codex")
+                pane = "w1:p1"
+                self.fixture.world.add(row, pane, family="codex")
+                original, reply = self.begin_pane_pass(row)
+                record = self.record(row, case)
+                record.update(pid=DEAD_PID, pane_dispatch_id=original, exit_code=0)
+                path = Path(record["log"]).with_suffix(".json")
+                write_text_atomic(path, json.dumps(record))
+                current = original
+                if case == "earlier-pass":
+                    progress_history.complete_dispatch(self.run_dir, row.name, original)
+                    self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
+                    current, reply = self.begin_pane_pass(row)
+                    self.assertNotEqual(current, original)
+                delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+                agent.append(pane, "user", delivery.line)
+                done = f"DONE {current}"
+                self.fixture.world.locations[pane]["agent_status"] = "idle"
+                if case != "current-pass":
+                    agent.append(pane, "assistant", done)
+                    self.fixture.world.locations[pane]["agent_status"] = "done"
+
+                with patch.object(detached_run_process, "supervises", return_value=False):
+                    self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [record["run_id"]])
+                saved = worker_lifecycle.read_json_object(path)
+                if case == "earlier-pass":
+                    self.assertEqual(saved["delivery"], detached_runs.OTHER_PASS_DELIVERY)
+                    self.assertEqual(self.inputs, [])
+                else:
+                    self.assertEqual(saved["delivery"], f"sent: worker {row.name} at {pane}")
+                    self.assertEqual(len(self.inputs), 1)
+                    self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
+                    self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+                    agent.append(pane, "assistant", done)
+                    self.fixture.world.locations[pane]["agent_status"] = "done"
+                    event = turn_end.WorkerEvent(str(row.current_session), reply=done)
+                    self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.DONE)
+                self.assertEqual(reply.read_text().rstrip(), done)
+                self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
+
+    def test_hook_recovers_done_after_a_result_from_an_earlier_pass(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, reply = self.begin_pane_pass(row)
+        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        record = self.record(row, "earlier-result")
+        record.update(status="finished", pane_dispatch_id="earlier-pass",
+                      delivery=f"sent: worker {row.name} at {pane}")
+        write_text_atomic(Path(record["log"]).with_suffix(".json"), json.dumps(record))
+        done = f"DONE {dispatch}"
+        later = "The earlier check passed."
+        agent.append(pane, "user", delivery.line)
+        agent.append(pane, "assistant", done)
+        agent.append(pane, "user", "Detached run: earlier-result")
+        agent.append(pane, "assistant", later)
+        self.fixture.world.locations[pane]["agent_status"] = "done"
+
+        self.assertEqual(turn_end.handle(turn_end.WorkerEvent(str(row.current_session), reply=later)),
+                         turn_end.TurnOutcome.DONE)
+        self.assertEqual(reply.read_text().rstrip(), done)
+        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
+        self.assertEqual(self.inputs, [])
+
     def test_a_worker_stop_delivers_the_result_and_keeps_its_pass(self) -> None:
         row = self.fixture.worker("impl", family="codex")
         pane = "w1:p1"
@@ -2497,7 +2638,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
                     self.assertEqual(error.getvalue(), "")
                 self.assertEqual((self.run_dir / unit_runs.STATE_FILE).read_bytes(), original)
                 self.assertFalse(reply.exists())
-        self.assertEqual(len(self.inputs), sum(not live for _, _, live, _ in cases))
+        self.assertEqual(len(self.inputs), 1)
+        self.assertIn("Detached run: no-pane-pass", self.inputs[0][1])
         self.assertEqual(self.notices, [])
 
     def create_stopped_run(self, row: staff.StaffRow, dispatch: str) -> Path:
@@ -2507,6 +2649,38 @@ class PaneRunDeliveryTests(unittest.TestCase):
         path = Path(record["log"]).with_suffix(".json")
         write_text_atomic(path, json.dumps(record))
         return path
+
+    def test_canceled_pass_recovers_late_done_after_a_result_from_an_earlier_pass(self) -> None:
+        agent = test_worker.DispatchAgent(self.fixture)
+        row = self.fixture.worker("impl", family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, reply = self.begin_pane_pass(row)
+        line = f'Read the unchanged prompt file "private.txt". End your final reply with DONE {dispatch}.'
+        progress_history.save_dispatch_delivery(self.run_dir, dispatch,
+            progress_history.DispatchDelivery(line, dispatch, str(reply)))
+        agent.append(pane, "user", line)
+        path = self.create_stopped_run(row, dispatch)
+        with patch.object(detached_runs, "_group_is_live", return_value=False):
+            self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
+        self.assertEqual(worker_panes.worker_pass(row, self.run_dir).get("status"), "canceled")
+
+        record = self.record(row, "earlier-result")
+        record.update(status="finished", pane_dispatch_id="earlier-pass",
+                      delivery=f"sent: worker {row.name} at {pane}")
+        write_text_atomic(Path(record["log"]).with_suffix(".json"), json.dumps(record))
+        done = f"DONE {dispatch}"
+        agent.append(pane, "assistant", done)
+        agent.append(pane, "user", "Detached run: earlier-result")
+        agent.append(pane, "assistant", "The earlier check passed.")
+        self.fixture.world.locations[pane]["agent_status"] = "done"
+
+        fallback_line = "An earlier version of the assignment prompt."
+        receipt = progress_history.StoppedPassReceipt(dispatch, fallback_line, dispatch, str(reply))
+        self.assertEqual(worker.dispatch_receipt(row, fallback_line, dispatch, run=self.run_dir, pane_pass=receipt),
+                         worker.DispatchComplete(done))
+        self.assertIs(turn_end.run_finished(row.id), detached_runs.CompletionReplay.HANDLED)
+        self.assertEqual(reply.with_name(f"reply_late_{dispatch}.txt").read_text().rstrip(), done)
 
     def test_stop_and_turn_hook_keep_one_outcome_for_verified_done(self) -> None:
         agent = test_worker.DispatchAgent(self.fixture)
