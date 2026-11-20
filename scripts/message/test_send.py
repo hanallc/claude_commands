@@ -3352,6 +3352,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             ("buffered-timeout", "relay timed out after 3 s"),
             ("confirmed-timeout", "queued there (msg_id m1)"),
             ("forwarded-timeout", "relay timed out after 3 s"),
+            ("review-rejection-timeout", "recipient rejected the review"),
             ("exit", "relay exit 1: the relay made no SendMessage call: no output"),
             ("proxy", "fixture proxy error"),
             ("command", "fixture relay command error"),
@@ -3369,8 +3370,10 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         listener.listen()
         listener.settimeout(3)
         address = f"session:{recipient}"
+        review_rejection = fault == "review-rejection-timeout"
         options = local_options(["--to", address, "--key", fault, "--repeat-minutes", "30", "--timeout", "3",
-                                 "--from", "fixture", "--summary", "Notice", "--text", f"Notice for {fault}"])
+                                 "--from", "fixture", "--summary", "Notice", "--text", f"Notice for {fault}"]
+                                + (["--review-delivery"] if review_rejection else []))
         accepted: list[bytes] = []
         accept, sendall = socket.socket.accept, socket.socket.sendall
 
@@ -3398,16 +3401,19 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(approve_relay_call(command, target, text, "Notice"), 0)
                     client.sendall(wire[:-3] if fault in ("buffered-timeout", "exit", "command") else wire)
                     client.shutdown(socket.SHUT_WR)
-                if fault in ("", "confirmed-timeout", "forwarded-timeout"):
+                if fault in ("", "confirmed-timeout", "forwarded-timeout", "review-rejection-timeout"):
                     peer.settimeout(3)
                     with peer.makefile("rb") as request:
                         accepted.append(request.read())
-                    self.assertEqual(accepted, [wire])
+                    self.assertEqual(accepted[-1], wire)
                     peer.sendall(b"k")
                     self.assertEqual(client.recv(1), b"k")
                     request_call = call(text, target=target)
                     if fault == "forwarded-timeout":
                         return None, stream(INIT, request_call), ""
+                    if fault == "review-rejection-timeout":
+                        refusal = answer('{"success":false,"message":"recipient rejected the review"}')
+                        return None, stream(INIT, request_call, refusal), ""
                     return (None if fault else 0), stream(INIT, request_call, answer(OK)), ""
                 if fault not in ("empty-timeout", "accept"):
                     self.assertEqual(client.recv(1), b"")
@@ -3447,7 +3453,8 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     _ = faults.enter_context(mock.patch.object(socket.socket, "sendall", new=interrupt_recipient_write))
                 first = send.send(options)
             self.assertIn(detail, first.detail)
-            self.assertEqual(len(accepted), 1 if fault in ("confirmed-timeout", "forwarded-timeout") else 0)
+            initial_writes = 1 if review_rejection or fault in ("confirmed-timeout", "forwarded-timeout") else 0
+            self.assertEqual(len(accepted), initial_writes)
             if fault == "confirmed-timeout":
                 self.assertEqual(first.outcome, "sent")
                 self.assertEqual(send.read_queue(queue), [])
@@ -3486,7 +3493,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 self.assertEqual(send.send(options).outcome, "sent")
                 self.assertEqual(send.send(options).outcome, "skipped")
             launched.assert_called_once()
-            self.assertEqual(len(accepted), 1)
+            self.assertEqual(len(accepted), initial_writes + 1)
             self.assertEqual(send.read_queue(queue), [])
 
     def test_postmaster_success_retires_queued_copy_for_key(self) -> None:
@@ -7431,7 +7438,7 @@ class ReadRelayTests(ShutdownTestCase):
         result = send.read_relay(observed, "hello", review_delivery=True)
         self.assertEqual(result, send.Result("failed", "No agent named bogus is reachable."))
 
-    def test_multiple_calls_without_the_forwarded_call_cannot_confirm_delivery(self) -> None:
+    def test_multiple_calls_with_missing_or_failed_forward_evidence_cannot_confirm_delivery(self) -> None:
         events = stream(INIT, call("hello"), answer("matched two sessions", error=True),
                         call("hello", "t2"), answer(OK, "t2"))
         for forward, expected in (

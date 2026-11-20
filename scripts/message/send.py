@@ -4053,6 +4053,8 @@ def relay(message: Message, timeout: float) -> Result:
     if isinstance(result, CheckedRelayAcceptance):
         return Result("sent", result.detail)
     if code is None:
+        if isinstance(observed.forward, RelayRequestForwarded) and not isinstance(result, UncertainRelayDelivery):
+            return result
         return _unaccepted_relay(observed.forward, f"relay timed out after {timeout:g} s")
     if result.outcome == "queued" and code != 0:
         return Result("queued", f"relay exit {code}: {result.detail}; {one_line(err, 200)}")
