@@ -3231,12 +3231,14 @@ Tests: one row in the existing bare copy removal test, failing first.
 
 Tests: one row each in the existing Mac offload busy-mirror test and the existing dispatch test, each failing first.
 
-### Phase 44dn — A FIFO worktree backlink does not stop the sweep  · status: todo
-**From the 44de review (pass 1), 2026-11-19:** the builds landing rule moves this gap out of 44de. After 44de merges.
+### Phase 44dn — The sweep and scratch end keep going past a bad backlink or journal  · status: todo
+**From the 44de reviews (pass 1 and closure pass 2), 2026-11-19:** the builds landing rule moves these gaps out of 44de. After 44de merges.
 
 1. The 44de backlink check reads `gitdir` with `read_text()` (tmp_sweep.py:1107, scratch.py:1617). A FIFO with no writer blocks the read, and the sweep does not reach later folders. Fix: read the backlink only when it is a regular file; any other kind keeps the folder.
 
-Tests: one row in the existing live Git registration sweep test, failing first.
+2. 44de reports an unreadable move journal in the first scan of `scratch end` (scratch.py:3931). Each removal then reads the same journal again (scratch.py:3972, :4055, :2091). With an empty copy pair under a held copies root, that second read raises out of `scratch end` before it returns the report or ends later holds. Fix: read the journal once for each `scratch end`; each removal uses that reading.
+
+Tests: one row in the existing live Git registration sweep test (item 1), and one row in `test_end_reports_held_work_and_continues_after_a_removal_error` (test_scratch.py:1849) with an empty copy pair under a held copies root (item 2). Each fails first.
 
 ### Phase 44do — The Builds page marks no bypassed gate as the next start  · status: todo
 **From the 44dh closure (pass 2), 2026-11-19:** the builds landing rule moves this gap out of 44dh. After 44dh merges.
