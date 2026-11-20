@@ -8,6 +8,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -132,6 +133,35 @@ class StoreTests(unittest.TestCase):
                 _ = path.write_bytes(tail)
                 store.append_line(path, {"id": "next"})
                 self.assertEqual(path.read_bytes(), b'{"id":"next"}\n')
+
+    def test_append_tries_the_lock_at_the_deadline(self) -> None:
+        path = self.root / "history.jsonl"
+        path.parent.mkdir(parents=True)
+        for release_at in (4.995, 5.005):
+            with self.subTest(release_at=release_at), path.open("wb") as holder:
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+                now = 0.0
+
+                def advance(seconds: float) -> None:
+                    nonlocal now
+                    now += seconds
+                    if now >= release_at:
+                        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+
+                def append() -> None:
+                    with store.locked_append(path, lock_timeout_s=5) as handle:
+                        store.append_locked(handle, {"id": "next"})
+
+                with (mock.patch.object(time, "monotonic", side_effect=lambda: now),
+                      mock.patch.object(time, "sleep", side_effect=advance)):
+                    if release_at < 5:
+                        append()
+                        self.assertEqual(path.read_bytes(), b'{"id":"next"}\n')
+                    else:
+                        with self.assertRaises(store.AppendLockWaitExpired):
+                            append()
+                        self.assertEqual(path.read_bytes(), b"")
+                self.assertEqual(now, 5.0)
 
     def test_append_discards_a_failed_short_write_and_keeps_every_line_parseable(self) -> None:
         path = self.root / "natedev" / "2026-10.jsonl"

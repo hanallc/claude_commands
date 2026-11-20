@@ -466,10 +466,17 @@ class GateWorker:
 
     def terminate(self, attempt: str, instance: str, *,
                   result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED) -> None:
+        configuration = settings()
+        self._confirm_termination(instance, timeout_s=configuration.number('termination_timeout_s'),
+                                  poll_s=configuration.number('result_poll_s'))
+        ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
+        self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance))
+
+    def _confirm_termination(self, instance: str, *, timeout_s: float, poll_s: float) -> None:
         api = self.regional_api(self.box_region)
-        deadline = self.clock() + settings().number('termination_timeout_s')
+        deadline = self.clock() + timeout_s
         requested = False
-        while self.clock() < deadline:
+        while True:
             try:
                 if not requested:
                     _ = api.call('terminate-instances', '--instance-ids', instance)
@@ -483,11 +490,26 @@ class GateWorker:
                 if not aws_down(str(error)):
                     raise
                 print(f'Cloud gate termination waits on {self.box_region}: {error}', flush=True)
-            self.pause(settings().number('result_poll_s'))
-        else:
-            raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
-        ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
-        self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance))
+            self.pause(poll_s)
+            if self.clock() >= deadline:
+                raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
+
+    def _recover_accepted_launch(self, attempt: str, instance: str, size: str, *,
+                                 termination_timeout_s: float, poll_s: float, lock_timeout_s: float,
+                                 accounting: ledger.GateLaunchAccounting) -> None:
+        outcome: ledger.GateRunning | ledger.GateTerminated = ledger.GateRunning(instance)
+        try:
+            self._confirm_termination(instance, timeout_s=termination_timeout_s, poll_s=poll_s)
+            outcome = ledger.GateTerminated(int(self.clock()), instance)
+        except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
+            print(f'Cloud gate could not confirm termination after a failed launch step: {error}',
+                  file=sys.stderr, flush=True)
+        try:
+            self.book.record_gate_launch_outcome(attempt, outcome, instance_type=size, lock_timeout_s=lock_timeout_s,
+                                                accounting=accounting)
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+            print(f'Cloud gate did not record {instance} in the cost ledger: {error}',
+                  file=sys.stderr, flush=True)
 
     def termination_call(self, region: str, operation: str, instances: Sequence[str], deadline: float) -> dict[str, object]:
         remaining = deadline - self.clock()
@@ -797,86 +819,87 @@ class GateWorker:
                           'gate_time_limit_s': seconds}
                 save(path, launch)
             api = self.regional_api(self.box_region)
-            self.book.gate_region(ledger.text(request, 'attempt'), self.box_region)
+            attempt = ledger.text(request, 'attempt')
+            self.book.gate_region(attempt, self.box_region)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
-            if self.clock() >= ledger.instant(request, 'expires'):
+            configuration = settings()
+            lock_timeout_s = configuration.number('launch_log_lock_timeout_s')
+            termination_timeout_s = configuration.number('termination_timeout_s')
+            poll_s = configuration.number('result_poll_s')
+            accounting = ledger.GateLaunchAccounting.from_config(configuration)
+            expired = self.clock() >= ledger.instant(request, 'expires')
+            if expired:
                 reply = api.call('describe-instances', '--filters',
                                       'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
                 instances = [instance for group in ledger.rows(reply, 'Reservations')
                              for instance in ledger.rows(group, 'Instances')]
-                if len(instances) == 1:
-                    instance = ledger.text(instances[0], 'InstanceId')
-                    save(path, {**launch, 'instance': instance})
-                    self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
-                    self.box_zone = zone
-                    return instance
-                raise AwsUnavailable('The expired launch remains unconfirmed')
-            launch_json = json.dumps(arguments)
-            log_lock_timeout_s = settings().number('launch_log_lock_timeout_s')
-            try:
-                for retry in range(settings().whole('launch_reply_tries')):
-                    try:
-                        if retry == 0:
-                            cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
-                                'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
-                        reply = api.call('run-instances', '--cli-input-json', launch_json)
-                        accepted_at = self.clock()
-                        break
-                    except AwsUnavailable as error:
-                        self.record_launch(request, size, zone, 'refused', str(error))
-                        if not aws_down(str(error)) or retry + 1 == settings().whole('launch_reply_tries'):
+                if len(instances) != 1:
+                    raise AwsUnavailable('The expired launch remains unconfirmed')
+                accepted_at = self.clock()
+            else:
+                launch_reply_tries = configuration.whole('launch_reply_tries')
+                launch_json = json.dumps(arguments)
+                try:
+                    for retry in range(launch_reply_tries):
+                        try:
+                            if retry == 0:
+                                cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
+                                    'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
+                            reply = api.call('run-instances', '--cli-input-json', launch_json)
+                            accepted_at = self.clock()
+                            break
+                        except AwsUnavailable as error:
+                            self.record_launch(request, size, zone, 'refused', str(error))
+                            if not aws_down(str(error)) or retry + 1 == launch_reply_tries:
+                                raise
+                        except subprocess.SubprocessError as error:
+                            self.record_launch(request, size, zone, 'refused',
+                                               type(error).__name__ + ': ' + str(error))
                             raise
-                    except subprocess.SubprocessError as error:
-                        self.record_launch(request, size, zone, 'refused',
-                                           type(error).__name__ + ': ' + str(error))
+                    else:
+                        raise AssertionError('The launch retry count must be positive')
+                except AwsUnavailable as error:
+                    # A saved request keeps its token and bytes after an uncertain reply.
+                    if capacity_error(str(error)):
+                        launch = {**saved_order, 'variant': offset + 1}
+                        save(path, launch)
+                        continue
+                    if not_sent(str(error)) and any(row.region != self.box_region for row in variants[offset + 1:]):
+                        # No box exists, so the next region can launch; this region's other variants would fail the same way.
+                        print(f'Cloud gate skips {self.box_region}: {launch_error_code(str(error)) or str(error)}', flush=True)
+                        unreachable.add(self.box_region)
+                        launch = {**saved_order, 'variant': offset + 1}
+                        save(path, launch)
+                        continue
+                    if launch_error_code(str(error)) == 'UnauthorizedOperation' and any(
+                            row.instance_type not in (size, *unauthorized) for row in variants[offset + 1:]):
+                        # The stack policy names its types, so another type can still launch.
+                        unauthorized.append(size)
+                        saved_order['unauthorized_types'] = unauthorized
+                        launch = {**saved_order, 'variant': offset + 1}
+                        save(path, launch)
+                        continue
+                    if not definite_refusal(str(error)):
                         raise
-                else:
-                    raise AssertionError('The launch retry count must be positive')
-            except AwsUnavailable as error:
-                # A saved request keeps its token and bytes after an uncertain reply.
-                if capacity_error(str(error)):
-                    launch = {**saved_order, 'variant': offset + 1}
-                    save(path, launch)
-                    continue
-                if not_sent(str(error)) and any(row.region != self.box_region for row in variants[offset + 1:]):
-                    # No box exists, so the next region can launch; this region's other variants would fail the same way.
-                    print(f'Cloud gate skips {self.box_region}: {launch_error_code(str(error)) or str(error)}', flush=True)
-                    unreachable.add(self.box_region)
-                    launch = {**saved_order, 'variant': offset + 1}
-                    save(path, launch)
-                    continue
-                if launch_error_code(str(error)) == 'UnauthorizedOperation' and any(
-                        row.instance_type not in (size, *unauthorized) for row in variants[offset + 1:]):
-                    # The stack policy names its types, so another type can still launch.
-                    unauthorized.append(size)
-                    saved_order['unauthorized_types'] = unauthorized
-                    launch = {**saved_order, 'variant': offset + 1}
-                    save(path, launch)
-                    continue
-                if not definite_refusal(str(error)):
-                    raise
-                self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
-                return LocalFallback(f'{size} in {zone}: {launch_error_code(str(error))}')
-            instances = ledger.rows(reply, 'Instances')
-            if len(instances) != 1:
-                raise AwsUnavailable('The launch reply has no unique instance')
+                    self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
+                    return LocalFallback(f'{size} in {zone}: {launch_error_code(str(error))}')
+                instances = ledger.rows(reply, 'Instances')
+                if len(instances) != 1:
+                    raise AwsUnavailable('The launch reply has no unique instance')
             instance = ledger.text(instances[0], 'InstanceId')
-            attempt = ledger.text(request, 'attempt')
             self.box_zone = zone
             try:
-                try:
-                    save(path, {**launch, 'instance': instance})
-                finally:
-                    self.book.record_gate_launch_identity(attempt, ledger.GateRunning(instance), instance_type=size)
-                self.record_launch(request, size, zone, 'launched', lock_timeout_s=log_lock_timeout_s,
-                                   event_at=accepted_at)
-                self.book.refresh_gate_prices()
-            except (OSError, ValueError, KeyError, TypeError):
-                try:
-                    self.terminate(attempt, instance)
-                except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
-                    print(f'Cloud gate could not confirm termination after a failed launch step: {error}',
-                          file=sys.stderr, flush=True)
+                save(path, {**launch, 'instance': instance})
+                self.book.record_gate_launch_outcome(attempt, ledger.GateRunning(instance),
+                                                    instance_type=size, lock_timeout_s=lock_timeout_s,
+                                                    accounting=accounting)
+                if not expired:
+                    self.record_launch(request, size, zone, 'launched', lock_timeout_s=lock_timeout_s,
+                                       event_at=accepted_at)
+                self.book.refresh_gate_prices(lock_timeout_s=lock_timeout_s, accounting=accounting)
+            except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+                self._recover_accepted_launch(attempt, instance, size, termination_timeout_s=termination_timeout_s,
+                                              poll_s=poll_s, lock_timeout_s=lock_timeout_s, accounting=accounting)
                 raise
             return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))

@@ -22,7 +22,7 @@ from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf
+from scripts.lib import conf, file_lock
 from scripts.aws_target import hana_result
 from scripts.message import send_result, session_send
 from scripts.aws_target.config import (
@@ -86,6 +86,27 @@ class GateAbsent:
 class GateTerminated:
     at: int
     instance_id: str
+
+
+def _gate_quota_cooldown(configuration: conf.ConfigRead) -> float:
+    try:
+        return configuration.whole('capacity_cooldown_seconds')
+    except conf.Unusable:
+        return inf
+
+
+@dataclass(frozen=True)
+class GateLaunchAccounting:
+    """Keep ledger settings available while a new box is running."""
+
+    quota_cooldown_s: float
+    regions: tuple[str, ...]
+    root_gib: int
+
+    @classmethod
+    def from_config(cls, configuration: conf.ConfigRead) -> GateLaunchAccounting:
+        return cls(_gate_quota_cooldown(configuration), configuration.words('regions'),
+                   configuration.whole('root_gib'))
 
 
 @dataclass(frozen=True)
@@ -2066,10 +2087,13 @@ class CostLedger:
             state.hana_attempts.append(charge)
 
     @contextmanager
-    def _locked(self) -> Generator[LedgerEvidence]:
+    def _locked(self, *, lock_timeout_s: float | Literal['blocking'] = 'blocking') -> Generator[LedgerEvidence]:
         self.directory.mkdir(parents=True, exist_ok=True)
         with (self.directory / "cost-ledger.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            if lock_timeout_s == 'blocking':
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            elif not file_lock.acquire_exclusive_with_timeout(lock.fileno(), lock_timeout_s):
+                raise LedgerUnavailable(f"The cost ledger lock wait exceeded {lock_timeout_s:g} s")
             try:
                 state = self._read() if self.path.exists() else LedgerEvidence()
                 yield state
@@ -2121,7 +2145,8 @@ class CostLedger:
         path = self.launch_history_path
         return tuple(mapping(cast(object, json.loads(line))) for line in path.read_text().splitlines()) if path.exists() else ()
 
-    def _price_gates(self, state: LedgerEvidence, readings: Sequence[ChargeRead], now: int) -> None:
+    def _price_gates(self, state: LedgerEvidence, readings: Sequence[ChargeRead], now: int, *,
+                     accounting: GateLaunchAccounting | Literal['current_settings'] = 'current_settings') -> None:
         launch_rows = self.launches()
         launches = {str(row.get('attempt', '')): row for row in reversed(launch_rows) if row.get('result') == 'launched'}
         gate_counts: dict[str, int] = {}
@@ -2132,10 +2157,14 @@ class CostLedger:
         needs_root = (any(isinstance(row.state, GateTerminated) for row in state.gate_reservations)
                       and any(row.usage_type.endswith('EBS:VolumeUsage.gp3') and row.quantity > 0
                               for reading in readings for row in reading.usage_types))
-        configuration = conf.read_or_repository('cloud_gate') if needs_root or any(
-            not row.region for row in state.gate_reservations) else None
-        configured_regions = configuration.words('regions') if configuration is not None else ()
-        root_gib = configuration.whole('root_gib') if configuration is not None and needs_root else 0
+        if isinstance(accounting, GateLaunchAccounting):
+            configured_regions = accounting.regions
+            root_gib = accounting.root_gib if needs_root else 0
+        else:
+            configuration = conf.read_or_repository('cloud_gate') if needs_root or any(
+                not row.region for row in state.gate_reservations) else None
+            configured_regions = configuration.words('regions') if configuration is not None else ()
+            root_gib = configuration.whole('root_gib') if configuration is not None and needs_root else 0
         priced: list[GateReservation] = []
         for reservation in state.gate_reservations:
             launch = launches.get(reservation.attempt)
@@ -2357,17 +2386,14 @@ class CostLedger:
 
     @staticmethod
     def _apply_gate_outcome(state: LedgerEvidence, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated,
-                            instance_type: str, now: int) -> bool:
+                            instance_type: str, now: int, *,
+                            quota_cooldown_s: float | Literal['current_setting'] = 'current_setting') -> bool:
         """Preserve confirmed termination against every later outcome."""
         if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
             return False
-        cooldown = inf
-        if state.gate_quota_refusals:
-            try:
-                cooldown = conf.read_or_repository('cloud_gate').whole('capacity_cooldown_seconds')
-            except conf.Unusable:
-                # Use the live count if the cooldown is unavailable.
-                pass
+        cooldown = quota_cooldown_s
+        if cooldown == 'current_setting':
+            cooldown = _gate_quota_cooldown(conf.read_or_repository('cloud_gate')) if state.gate_quota_refusals else inf
         if isinstance(outcome, GateRunning):
             # Clear expired marks before this launch increases the count.
             state.clear_ended_quota_refusals(now, cooldown)
@@ -2376,16 +2402,21 @@ class CostLedger:
         state.clear_ended_quota_refusals(now, cooldown)
         return True
 
-    def record_gate_launch_identity(self, attempt: str, outcome: GateRunning, *, instance_type: str) -> None:
-        """Save the running instance before the launch log append."""
-        with self._locked() as state:
-            if self._apply_gate_outcome(state, attempt, outcome, instance_type, int(time.time())):
+    def record_gate_launch_outcome(self, attempt: str, outcome: GateRunning | GateTerminated, *,
+                                   instance_type: str, lock_timeout_s: float,
+                                   accounting: GateLaunchAccounting) -> None:
+        """Save the known instance state without reading the launch log."""
+        with self._locked(lock_timeout_s=lock_timeout_s) as state:
+            now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at
+            if self._apply_gate_outcome(state, attempt, outcome, instance_type, now,
+                                        quota_cooldown_s=accounting.quota_cooldown_s):
                 self._save(state)
 
-    def refresh_gate_prices(self) -> None:
+    def refresh_gate_prices(self, *, lock_timeout_s: float, accounting: GateLaunchAccounting) -> None:
         """Save prices from the current launch log and bills."""
-        with self.transaction() as state:
-            self._price_gates(state, self.read_bills(), int(time.time()))
+        with self._locked(lock_timeout_s=lock_timeout_s) as state:
+            self._price_gates(state, self.read_bills(), int(time.time()), accounting=accounting)
+            self._save(state)
 
     def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
         """Save the outcome with current prices."""
