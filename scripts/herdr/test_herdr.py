@@ -3803,7 +3803,11 @@ class TargetCatastropheTests(StaffTestCase):
             {"pane_id": "w1:p1", "terminal_id": "terminal-one", "session_id": self.row.current_session}]
         cast(Mock, self.client.pane_activity).return_value = herdr.PaneRunning(("claude",))
         cast(Mock, self.client.native_session).return_value = self.row.current_session
-        self.client.configure_mock(**{"_visible_screen.return_value": ""})
+        cast(Mock, self.client.run).return_value = ""
+        visible_screen = herdr.Herdr._visible_screen  # pyright: ignore[reportPrivateUsage]
+        def read_visible_screen(pane: str) -> str:
+            return visible_screen(cast(herdr.Herdr, self.client), pane)
+        self.client.configure_mock(**{"_visible_screen.side_effect": read_visible_screen})
         cast(Mock, self.client.result).return_value = {"process_info": {
             "shell_pid": 998042, "foreground_process_group_id": 998043,
             "foreground_processes": [{"pid": 998043, "name": "claude", "argv": ["claude"]}]}}
@@ -3865,7 +3869,7 @@ class TargetCatastropheTests(StaffTestCase):
                                place=herdr.HerdrPlace("fixture", "w1:p1"))
 
     def test_target_check_refuses_overwriting_unsaved_input(self) -> None:
-        self.client.configure_mock(**{"_visible_screen.return_value": "──────────\n❯ keep my draft\n──────────"})
+        cast(Mock, self.client.run).return_value = "──────────\n❯ keep my draft\n──────────"
         with self.assertRaisesRegex(herdr_types.HerdrFailure, "unsaved input"):
             _ = herdr.check_target(self.row.id, action="keys", text="replacement",
                                place=herdr.HerdrPlace("fixture", "w1:p1"))
