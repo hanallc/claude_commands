@@ -389,7 +389,11 @@ class AwsCombinedTableTests(PageCostFixture):
           "The invalid switch explains where gates run");
     check(document.querySelectorAll("#spend-tiles .tile").length === 3, "Spend still renders");
     check(document.querySelector("#price-table tbody tr"), "Quotas still render");
-    check(document.querySelector("#hours h2").textContent === "Billed hours / box hours", "Hours still render");
+    const hours = document.getElementById("hours");
+    check(hours.querySelector("h2").textContent === "Did AWS bill more machine hours than we used?", "Hours still render");
+    check(hours.querySelector("p").textContent === "No AWS bill is available yet for the last 5 days.",
+          "The answer explains that no bill is available");
+    check(!hours.querySelector("table, details"), "No table or disclosure without a bill");
 """, blocked=True)
 
     def test_billed_hours_filters_sizes_by_activity_in_the_selected_regions(self) -> None:
@@ -407,14 +411,15 @@ class AwsCombinedTableTests(PageCostFixture):
              ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.25'), Decimal('.01'), 'Hrs')))
         _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(charge)))
         self.run_browser_checks('', """
-    const sizes = () => [...document.querySelectorAll("#hours tbody tr")].map(row => row.cells[0].textContent);
+    const sizes = () => [...document.querySelectorAll("#hours details tbody tr")].map(row => row.cells[0].textContent);
     check(sizes().includes("c7a.4xlarge") && sizes().includes("m7a.8xlarge"), "Both active sizes show");
     const east = document.querySelector("#regions [data-region='us-east-1']");
     document.querySelector("#regions .all:last-child").click();
     document.querySelector("#regions [data-region='us-east-2']").click();
     check(sizes().join() === "m7a.8xlarge", "The hidden region's size row is absent");
-    check(document.querySelector("#hours tbody tr").cells[1].textContent.startsWith("0.0/0.0"),
-          "A small billed amount keeps its row even when the cell rounds to zero");
+    const cells = [...document.querySelector("#hours details tbody tr").cells];
+    check(cells.slice(1, 5).map(cell => cell.textContent).join("|") === "us-east-2|0.0|0.0|0.0",
+          "A small billed amount keeps its row even when the hours round to zero");
     east.click();
     check(sizes().includes("c7a.4xlarge"), "The row returns when its region is selected");
 """)
@@ -621,6 +626,51 @@ class AwsCombinedTableTests(PageCostFixture):
     check(!gateNote.hidden && gateNote.textContent === "GPU types have no gate runs.", "GPU Gate-only note");
     document.querySelector("#types [data-types='standard']").click();
     check(new URLSearchParams(location.search).get("types") === "standard", "Types URL");
+""")
+
+    def test_hours_answer_and_disclosure_use_the_existing_rule(self) -> None:
+        checks = {
+            ('c7a.4xlarge', 'us-east-1'): run_cost.hours_check(Decimal('1.5'), Decimal('1'), Decimal('.15')),
+            ('c7a.4xlarge', 'us-east-2'): run_cost.hours_check(Decimal('1.5'), Decimal('1'), Decimal('.15'),
+                                                             hana_reserved_hours=Decimal('.5')),
+            ('m7a.8xlarge', 'us-west-1'): run_cost.hours_check(Decimal('0'), Decimal('2.1'), Decimal('.15'),
+                                                             hana_reserved_hours=Decimal('1')),
+            ('c7a.4xlarge', 'eu-west-1'): run_cost.hours_check(Decimal('5.7'), Decimal('2'), Decimal('.15'),
+                                                             hana_reserved_hours=Decimal('1')),
+        }
+        with mock.patch.object(run_cost, 'hours_checks', return_value=checks):
+            self.run_browser_checks('', """
+    const section = document.getElementById("hours");
+    const table = () => section.querySelector(":scope > .scroll table");
+    const rows = () => table() ? [...table().tBodies[0].rows] : [];
+    const answer = () => section.querySelector("p").textContent;
+    const details = () => section.querySelector("details");
+    const cells = row => [...row.cells].map(cell => cell.textContent).join("|");
+    const toggleRegion = region => document.querySelector(`#regions [data-region='${region}']`).click();
+    check(answer() === "Yes. AWS billed 4.2 hours more than our records, in 2 rows.", "Sum marked higher bills");
+    check(cells(table().tHead.rows[0]) === "type|region|AWS billed|our records|difference|Hana reserved", "Hours headings");
+    check(rows().map(cells).join("\\n") === [
+      "c7a.4xlarge|eu-west-1|5.7|2.0|+3.7|1.0",
+      "c7a.4xlarge|us-east-1|1.5|1.0|+0.5|—",
+      "m7a.8xlarge|us-west-1|0.0|2.1|-2.1|—"
+    ].join("\\n"), "Only marked rows are visible. Hana reserved applies to one row.");
+    check([2, 3, 4, 5].every(index => getComputedStyle(rows()[0].cells[index]).textAlign === "right"),
+          "Hours align right");
+    check(!details().open && details().querySelector("summary").textContent === "All rows (4)", "Closed by default");
+    details().querySelector("summary").click();
+    check(details().open && details().querySelectorAll("tbody tr").length === 4, "Open to see all rows");
+    toggleRegion("eu-west-1");
+    check(answer() === "Yes. AWS billed 0.5 hours more than our records, in 1 row.", "One marked higher bill");
+    toggleRegion("us-east-1");
+    toggleRegion("us-west-1");
+    check(answer() === "No. AWS billed 1.5 hours and our records show 1.0 hours.", "An in-limit row uses the totals");
+    check(!table() && details().open, "The region filter leaves only the disclosure open");
+    check(details().querySelector("tbody tr").cells[5].textContent === "0.5", "The in-limit row used Hana reserved");
+    toggleRegion("us-east-2");
+    toggleRegion("us-west-1");
+    check(answer() === "No. AWS billed 2.1 hours less than our records, in 1 row.", "One marked lower bill");
+    check(rows().length === 1 && cells(rows()[0]) === "m7a.8xlarge|us-west-1|0.0|2.1|-2.1",
+          "A marked lower bill has a negative difference and does not use Hana reserved");
 """)
 
 

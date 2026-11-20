@@ -52,10 +52,6 @@ class TableData(TableRowsData):
     title: str
 
 
-class BilledHoursData(TableData):
-    active_regions_by_size: dict[str, list[str]]
-
-
 class EstimateData(TypedDict):
     region: str
     summary: str
@@ -220,6 +216,31 @@ class QuotaHistoryData(TypedDict):
     gpu_summary: GpuQuotaSummary
 
 
+class UnbilledHoursRowData(TypedDict):
+    kind: Literal['unbilled']
+    region: str
+    cells: list[str]
+
+
+class ComparedHoursRowData(TypedDict):
+    kind: Literal['compared']
+    region: str
+    cells: list[str]
+    billed: float
+    recorded: float
+    marked: bool
+
+
+class HoursComparisonData(TypedDict):
+    kind: Literal['comparison']
+    rows: list[ComparedHoursRowData | UnbilledHoursRowData]
+
+
+class HoursComparisonUnavailableData(TypedDict):
+    kind: Literal['unavailable']
+    reason: str
+
+
 class PageData(TypedDict):
     read_at: int
     render_seconds: float
@@ -235,9 +256,7 @@ class PageData(TypedDict):
     quota_history: QuotaHistoryData
     cached_spot_status: dict[str, Literal['read failed', 'old']]
     runs: list[RunCostData]
-    hours: BilledHoursData
-    hours_note: str
-    hours_reserved_by_region: dict[str, str]
+    hours: HoursComparisonData | HoursComparisonUnavailableData
 
 
 def table_rows_data(table: spot_table.Table) -> TableRowsData:
@@ -249,6 +268,22 @@ def table_rows_data(table: spot_table.Table) -> TableRowsData:
 
 def table_data(table: spot_table.Table) -> TableData:
     return {'title': table.title, **table_rows_data(table)}
+
+
+def hours_row_data(row: spot_table.MachineHoursRow) -> ComparedHoursRowData | UnbilledHoursRowData:
+    check = row.check
+    billed = check.billed_hours
+    recorded = round(check.box_hours, 1)
+    if billed is None:
+        return {'kind': 'unbilled', 'region': row.region, 'cells': [row.size, row.region, '—', f'{recorded:.1f}', '—', '—']}
+    displayed_bill = round(billed, 1)
+    difference = displayed_bill - recorded
+    reserved = check.hana_reserved_hours
+    cells = [row.size, row.region, f'{displayed_bill:.1f}', f'{recorded:.1f}',
+             f'{difference:+.1f}' if difference else '0.0',
+             f'{reserved:.1f}' if billed >= check.box_hours and reserved > 0 else '—']
+    return {'kind': 'compared', 'region': row.region, 'cells': cells, 'billed': float(billed),
+            'recorded': float(check.box_hours), 'marked': check.hours_gap_over}
 
 
 def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.SpotPlacementReading],
@@ -509,7 +544,13 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               gate_switch: cloud_gate.CloudGateSetting = cloud_gate.CloudGateSwitch.ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
-    regions = dict.fromkeys((*(row[0] for row in placement.rows), *tables.hours.headers[1:]))
+    regions = {row[0] for row in placement.rows}
+    hours: HoursComparisonData | HoursComparisonUnavailableData
+    if isinstance(tables.hours, spot_table.HoursComparison):
+        regions.update(row.region for row in tables.hours.rows)
+        hours = {'kind': 'comparison', 'rows': [hours_row_data(row) for row in tables.hours.rows]}
+    else:
+        hours = {'kind': 'unavailable', 'reason': tables.hours.reason}
     return {
         'read_at': now,
         'render_seconds': 0.0,
@@ -531,11 +572,7 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
                   'no_estimate': costs.summary_of(None),
                   'refused': table_data(costs.refused), 'launched': table_data(costs.launched)}
                  for costs in tables.runs],
-        'hours': {**table_data(tables.hours), 'active_regions_by_size': {
-            size: sorted(active_regions) for size, active_regions in tables.hours.active_regions_by_size.items()
-        }},
-        'hours_note': tables.hours.note,
-        'hours_reserved_by_region': dict(tables.hours.reserved_by_region),
+        'hours': hours,
     }
 
 

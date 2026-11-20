@@ -1,7 +1,6 @@
 """Read the local Spot snapshot and the run ledger into tables for the AWS page."""
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -16,8 +15,8 @@ from scripts.aws_target.quota_requests import RegionalQuotaRequests, snapshot_qu
 from scripts.lib import conf
 
 
-# Where a table puts its regions: one region in each row (the first column), or in each column after the first.
-RegionAxis = Literal['rows', 'columns']
+# A region is the first cell of a row, a column header, or the second cell after the type.
+RegionAxis = Literal['rows', 'columns', 'type-region-rows']
 # The run table columns that the page shows in its price tables, so the page leaves them out of the run tables.
 SPOT_HEADER = 'Spot USD/h'
 ESTIMATE_HEADER = 'estimate'
@@ -37,11 +36,21 @@ class Table:
     not_sold: frozenset[tuple[int, int]] = frozenset()
 
 
-@dataclass(frozen=True, kw_only=True)
-class BilledHoursTable(Table):
-    active_regions_by_size: Mapping[str, list[str]]
-    note: str
-    reserved_by_region: Mapping[str, str]
+@dataclass(frozen=True)
+class MachineHoursRow:
+    size: str
+    region: str
+    check: run_cost.HoursCheck
+
+
+@dataclass(frozen=True)
+class HoursComparison:
+    rows: tuple[MachineHoursRow, ...]
+
+
+@dataclass(frozen=True)
+class HoursComparisonUnavailable:
+    reason: str
 
 
 NOT_SOLD = '—'
@@ -128,7 +137,7 @@ class SpotTables:
     quotas: tuple[Table, ...]
     # One entry for each scope in run_cost.SCOPES, in that order.
     runs: tuple[RunCosts, ...]
-    hours: BilledHoursTable
+    hours: HoursComparison | HoursComparisonUnavailable
     gpu_quota_needed: int
     quota_requests: tuple[RegionalQuotaRequests, ...]
 
@@ -174,7 +183,7 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None,
     home = configuration.text('region')
     inputs = gate_pricing if gate_pricing is not None else run_cost.read_gate_pricing_inputs(
         directory, now, values, configuration)
-    hours = billed_hours(directory, now, regions, hours_check_scope(values), days, home,
+    hours = billed_hours(directory, now, hours_check_scope(values), days, home,
                          configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
     return SpotTables(
         tuple(reads),
@@ -320,43 +329,25 @@ def paid_run_cell(billed: list[run_cost.FinishedGateRun], due: int, allocations:
     return f'{run_cost.billed_cost_per_run(billed, allocations):.4f}' + (f' ({due} bill due)' if due else '')
 
 
-def billed_hours(directory: Path, now: int, regions: tuple[str, ...], scope: run_cost.SpotHoursScope, days: int, home: str,
-                 builder: str, max_ratio: Decimal) -> BilledHoursTable:
-    """Show the billed Spot hours, box hours and regional Hana allowance."""
-    title = 'Billed hours / box hours'
+def billed_hours(directory: Path, now: int, scope: run_cost.SpotHoursScope, days: int, home: str,
+                 builder: str, max_ratio: Decimal) -> HoursComparison | HoursComparisonUnavailable:
+    """Read the hours of each type and region in the comparison window."""
     end = datetime.fromtimestamp(now, UTC)
+    start = end - timedelta(days=days)
+    book = ledger.CostLedger(directory)
     try:
-        checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, builder, scope,
-                                       max_ratio)
+        checks = run_cost.hours_checks(book, start, end, home, builder, scope, max_ratio)
+        if (all(check.billed_hours is None for check in checks.values())
+                and not run_cost.billed_readings(book, start, end)):
+            return HoursComparisonUnavailable(f'No AWS bill is available yet for the last {days} days.')
     except ledger.LedgerUnavailable:
-        return BilledHoursTable(title, ('type', *regions), frozenset(), (), 'columns',
-                                active_regions_by_size={}, note='No billed hours: the cost ledger is not readable.', reserved_by_region={})
-    # A region that is no longer a candidate keeps its column while it has hours in the window.
-    columns = (*regions, *sorted({region for _size, region in checks} - set(regions)))
-    active_regions_by_size: defaultdict[str, list[str]] = defaultdict(list)
-    for (size, region), check in checks.items():
-        if check.billed_hours or check.box_hours:
-            active_regions_by_size[size].append(region)
-    rows = tuple((size, *(hours_cell(checks.get((size, region))) for region in columns))
-                 for size in scope.sizes if size in active_regions_by_size)
-    # Each eligible size in a region uses the same Hana allowance on billed days.
-    reserved_by_region = {region: f'{check.hana_reserved_hours:.1f}' for (_size, region), check in checks.items()
-                          if check.billed_hours is not None and check.hana_reserved_hours}
-    percentage = format(max_ratio, '%').removesuffix('%')
-    if '.' in percentage:
-        percentage = percentage.rstrip('0').rstrip('.')
-    note = (f'Each cell shows billed Spot hours / recorded box hours on billed days in the last {days} days. '
-            + f'Over marks gaps above {percentage}% after the Hana allowance, which applies only to sizes Hana can use.')
-    return BilledHoursTable(title, ('type', *columns), frozenset(range(1, len(columns) + 1)), rows, 'columns',
-                            active_regions_by_size=active_regions_by_size, note=note, reserved_by_region=reserved_by_region)
-
-
-def hours_cell(check: run_cost.HoursCheck | None) -> str:
-    """For example 9.2/8.8 (4%); 'over' marks a gap above the limit."""
-    if check is None:
-        return '—'
-    if check.billed_hours is None:
-        return 'not billed'
-    gap = f' ({check.hours_gap_ratio:.0%})' if check.hours_gap_ratio is not None else ''
-    return f'{check.billed_hours:.1f}/{check.box_hours:.1f}{gap}' + (' over' if check.hours_gap_over else '')
+        return HoursComparisonUnavailable('The cost ledger is unreadable.')
+    size_order = {size: index for index, size in enumerate(scope.sizes)}
+    active = sorted((key for key, check in checks.items() if check.billed_hours or check.box_hours),
+                    key=lambda key: (size_order[key[0]], key[1]))
+    if not active:
+        return HoursComparisonUnavailable('There are no machine hours to compare.')
+    if all(checks[key].billed_hours is None for key in active):
+        return HoursComparisonUnavailable('No AWS bill is available yet for the recorded hours.')
+    return HoursComparison(tuple(MachineHoursRow(size, region, checks[size, region]) for size, region in active))
 

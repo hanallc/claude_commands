@@ -95,8 +95,8 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 .tile-usd { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .tile-note { color: var(--ink-3); font-size: 0.82rem; }
 #spend .note { margin-top: 12px; }
-#quota-help { margin-top: 10px; font-size: 0.86rem; }
-#quota-help summary { font-weight: 600; cursor: pointer; }
+#quota-help, #hours details { margin-top: 10px; font-size: 0.86rem; }
+#quota-help summary, #hours summary { font-weight: 600; cursor: pointer; }
 #quota-help li + li { margin-top: 4px; }
 #quota-help a { color: var(--ink); overflow-wrap: anywhere; }
 #quota-help p { margin: 0; color: var(--ink-2); }
@@ -215,14 +215,13 @@ function remember(key, value) {
   try { localStorage.setItem(key, value); } catch (error) { /* The choice is kept only for this view. */ }
 }
 
-// The columns and rows of a table in the chosen regions; the first column always shows.
+// Select the columns and rows for the chosen regions.
 function visible(table) {
   const columns = table.headers.map((_header, index) => index)
     .filter(index => index === 0 || table.region_axis !== "columns" || shown.has(table.headers[index]));
+  const regionColumn = table.region_axis === "type-region-rows" ? 1 : 0;
   const rows = table.rows.map((_row, index) => index)
-    .filter(index => table.region_axis !== "rows" || shown.has(table.rows[index][0]))
-    .filter(index => !table.active_regions_by_size
-      || table.active_regions_by_size[table.rows[index][0]].some(region => shown.has(region)));
+    .filter(index => table.region_axis === "columns" || shown.has(table.rows[index][regionColumn]));
   return { columns, rows };
 }
 
@@ -545,19 +544,60 @@ function drawScope() {
   fill(document.getElementById("launched"), costs.launched);
 }
 
+function hoursTable(rows) {
+  const headers = ["type", "region", "AWS billed", "our records", "difference"];
+  if (rows.some(row => row.cells[5] !== "—")) headers.push("Hana reserved");
+  return tableElement([{
+    headers, right: headers.map((_header, index) => index).slice(2),
+    rows: rows.map(row => row.cells), region_axis: "type-region-rows",
+  }], false);
+}
+
+function hoursAnswer(compared, marked) {
+  const more = marked.filter(row => row.billed > row.recorded);
+  const difference = rows => rows.reduce((total, row) => total + row.billed - row.recorded, 0);
+  const rowCount = rows => `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
+  if (more.length) {
+    return `Yes. AWS billed ${difference(more).toFixed(1)} hours more than our records, in ${rowCount(more)}.`;
+  }
+  if (marked.length) {
+    return `No. AWS billed ${Math.abs(difference(marked)).toFixed(1)} hours less than our records, in ${rowCount(marked)}.`;
+  }
+  const total = key => compared.reduce((hours, row) => hours + row[key], 0).toFixed(1);
+  return `No. AWS billed ${total("billed")} hours and our records show ${total("recorded")} hours.`;
+}
+
+function drawHours() {
+  const section = document.getElementById("hours");
+  const wasOpen = section.querySelector("details")?.open ?? false;
+  section.replaceChildren(heading("Did AWS bill more machine hours than we used?"));
+  if (data.hours.kind === "unavailable") {
+    section.appendChild(element("p", data.hours.reason, "answer"));
+    return;
+  }
+  const rows = data.hours.rows.filter(row => shown.has(row.region));
+  const compared = rows.filter(row => row.kind === "compared");
+  if (!rows.length) {
+    section.appendChild(element("p", "There are no machine hours to compare in the selected regions.", "answer"));
+    return;
+  }
+  const marked = compared.filter(row => row.marked);
+  const answer = compared.length ? hoursAnswer(compared, marked) : "No AWS bill is available yet for the recorded hours.";
+  section.appendChild(element("p", answer, "answer"));
+  if (marked.length) section.appendChild(hoursTable(marked));
+  const details = element("details");
+  details.open = wasOpen;
+  details.addEventListener("toggle", markOverflow);
+  details.append(element("summary", `All rows (${rows.length})`), hoursTable(rows));
+  section.appendChild(details);
+}
+
 function draw() {
   drawPrices();
   drawPlacementScores();
   fill(document.getElementById("gate-time-price"), data.gateTimePrice,
     "Compare the lowest estimated run cost for each box size. Box times include boot and can use runs from other regions.");
-  const hours = document.getElementById("hours");
-  fill(hours, data.hours, data.hours_note);
-  for (const region of data.hours.headers.slice(1)) {
-    const reserved = data.hours_reserved_by_region?.[region];
-    if (reserved && shown.has(region)) {
-      hours.appendChild(element("p", `${region}: ${reserved} Hana reserved hours.`, "note"));
-    }
-  }
+  drawHours();
   drawScope();
   markOverflow();
 }
