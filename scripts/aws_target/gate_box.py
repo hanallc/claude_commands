@@ -89,6 +89,12 @@ def paired_trial():
                     stage('warm-up ' + variant if warming else f"round {round_number} of {gate_request['rounds']} {variant}")
                     upload()
                     repo = trees[variant]
+                    expected = root.absolute() / variant
+                    if repo.absolute() != expected or repo.resolve() != expected:
+                        raise ValueError(f"Cannot reset {repo}: expected the checkout at {expected} without links")
+                    top = subprocess.run(['git', '-C', str(repo), 'rev-parse', '--show-toplevel'], capture_output=True)
+                    if top.returncode or os.fsdecode(top.stdout.removesuffix(b'\n')) != str(expected):
+                        raise ValueError(f"Cannot reset {repo}: Git must report {expected} as the working tree root")
                     subprocess.run(['git', '-C', str(repo), 'reset', '--hard'], check=True, capture_output=True)
                     subprocess.run(['git', '-C', str(repo), 'clean', '-fdx', '-e', '__pycache__/'], check=True, capture_output=True)
                     with tempfile.TemporaryDirectory(dir=root) as temporary:
