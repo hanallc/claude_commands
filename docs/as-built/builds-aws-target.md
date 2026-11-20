@@ -926,7 +926,7 @@ The AWS page shows how many recorded days still match their first settled amount
 It shows the date of the newest read in UTC and lists each day with a different current amount.
 The history keeps earlier differences when the newest read returns to the first settled amount.
 The watch sends one message for each read that finds changes that it has yet to report.
-The message goes to the session in `settled_change_recipient=bob`.
+The message goes to the session in `cost_explorer_change_recipient=bob`.
 It uses the page wording and includes one line for each changed day.
 It checks all saved days, including days outside the query range.
 After a successful send, each charge file records the reported amount.

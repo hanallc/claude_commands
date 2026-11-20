@@ -1838,8 +1838,8 @@ class SettledChargeWatchTests(CostFixture):
         with self.assertRaisesRegex(config.SpendingConfigurationUnavailable, 'cost_explorer_watch_days'):
             _ = config.read_settings(self.settings)
         self.replace('cost_explorer_watch_days', '45')
-        self.replace('settled_change_recipient', 'user')
-        with self.assertRaisesRegex(config.SpendingConfigurationUnavailable, 'settled_change_recipient'):
+        self.replace('cost_explorer_change_recipient', 'user')
+        with self.assertRaisesRegex(config.SpendingConfigurationUnavailable, 'cost_explorer_change_recipient'):
             _ = config.read_settings(self.settings)
 
     def test_notice_batches_unsent_changes_and_retries_the_full_message(self) -> None:

@@ -76,7 +76,7 @@ class SpendingSettings:
     cost_explorer_lookback_days: int
     cost_explorer_watch_days: int
     cost_explorer_unchanged_reads: int
-    settled_change_recipient: str
+    cost_explorer_change_recipient: str
     notification_recipient: str
     notification_timeout_s: int
     notification_retry_s: int
@@ -169,13 +169,13 @@ def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
     if watch_days < lookback_days:
         raise SpendingConfigurationUnavailable(
             'cost_explorer_watch_days must be at least cost_explorer_lookback_days', tuple(limits))
-    change_recipient = live_text('settled_change_recipient').strip()
-    if not change_recipient or change_recipient.casefold() == 'user':
-        raise SpendingConfigurationUnavailable('settled_change_recipient must name a session', tuple(limits))
+    cost_explorer_change_recipient = live_text('cost_explorer_change_recipient').strip()
+    if not cost_explorer_change_recipient or cost_explorer_change_recipient.casefold() == 'user':
+        raise SpendingConfigurationUnavailable('cost_explorer_change_recipient must name a session', tuple(limits))
     return SpendingSettings(daily, monthly, reserve, fallback, max(fixed, sum((cost for _, cost in components), Decimal(0))),
                             components, zone, seconds("price_refresh_seconds"), seconds("price_max_age_seconds"),
                             seconds("observation_max_age_seconds"), seconds("cost_explorer_interval_seconds"),
-                            explorer, lookback_days, watch_days, unchanged_reads, change_recipient,
+                            explorer, lookback_days, watch_days, unchanged_reads, cost_explorer_change_recipient,
                             live_text("notification_recipient"), seconds("notification_timeout_s"),
                             seconds("notification_retry_s"), live_text("cost_explorer_tag_key"),
                             live_text("cost_explorer_tag_value"), tuple(limits), seconds('box_minimum_seconds'),
