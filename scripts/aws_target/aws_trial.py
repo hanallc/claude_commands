@@ -23,8 +23,10 @@ import select
 import signal
 import statistics
 import subprocess
+from tempfile import TemporaryFile
 import time
 from typing import Protocol, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from scripts.aws_target.gate_box import (
@@ -49,7 +51,6 @@ from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.build_targets import target_config
 from scripts.lint.memory_admit import process_table
 from scripts.production.gate_modules import GateRefused
-from scripts.production import merge_gate
 
 
 NIXOS_LOCK = Path('/etc/nixos/flake.lock')
@@ -66,8 +67,6 @@ def host_nixpkgs_revision() -> str:
 
 TRIAL_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 PAIRED_TRIAL_JOB = StepJob('test-modules', modules=1)
-# Linux added this pidfd_send_signal flag in version 6.9.
-PIDFD_SIGNAL_PROCESS_GROUP = 4
 
 
 def main(argv: Sequence[str], settings_path: Path, directory: Path) -> int:
@@ -95,120 +94,82 @@ class PairedTrialRequest:
 
 def checked_git(repo: Path, *arguments: str, recovery: Path | None = None) -> str:
     if arguments and arguments[0] in ('push', 'ls-remote'):
+        if recovery is None:
+            raise ValueError('Network Git requires a recovery record')
         return network_git(repo, *arguments, recovery=recovery)
     return subprocess.check_output(['git', '-C', str(repo), *arguments], text=True, stderr=subprocess.PIPE).strip()
-
-
-def network_git(repo: Path, *arguments: str, recovery: Path | None = None) -> str:
-    """Limit Git's network wait and stop Git when the wait fails."""
-    command = ['git', '-C', str(repo), *arguments]
-    timeout = cloud_gate.settings().number('git_network_timeout_s')
-    stop_timeout = conf.read('build_admission').number('program_stop_seconds')
-    if recovery is not None:
-        return supervised_git(command, recovery, timeout, stop_timeout)
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, start_new_session=True)
-    try:
-        identity = process_start(process.pid) if sys.platform == 'linux' else None
-        try:
-            output, errors = process.communicate(timeout=timeout)
-        except BaseException:
-            try:
-                if not isinstance(identity, Started):
-                    raise GateRefused(f'UNRESOLVED: cannot verify the leader of Git group {process.pid}')
-                deadline = time.monotonic() + stop_timeout
-                stop_git_group(process.pid, identity.start, deadline)
-                _ = process.communicate(timeout=max(0, deadline - time.monotonic()))
-            except (GateRefused, subprocess.TimeoutExpired) as error:
-                reason = str(error).removeprefix('UNRESOLVED: ')
-                print(f'UNRESOLVED: paired trial Git stop: {reason}', file=sys.stderr)
-            raise
-        if process.returncode:
-            raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
-        return output.strip()
-    finally:
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
 
 
 GIT_RECOVERY = 'git-recovery.json'
 TRIAL_COST_RECORD = 'trial-cost.json'
 
 
-def supervised_git(command: Sequence[str], recovery: Path, timeout: float, stop_seconds: float) -> str:
-    """Close the supervisor's lifeline if the trial exits or stops waiting."""
+def network_git(repo: Path, *arguments: str, recovery: Path) -> str:
+    """Run a network Git command with a record and one deadline."""
+    timeout = cloud_gate.settings().number('git_network_timeout_s')
     deadline = time.monotonic() + timeout
-    with ExitStack() as resources:
+    stop_seconds = conf.read('build_admission').number('program_stop_seconds')
+    return supervised_git(['git', '-C', str(repo), *arguments], recovery, deadline, stop_seconds)
+
+
+def poll_child(child: subprocess.Popen[bytes], deadline: float, lifeline: int | None = None) -> int | None:
+    """Check for child exit until the deadline or controller exit."""
+    while True:
+        status = child.poll()
+        if status is not None:
+            return status
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        delay = min(0.05, remaining)
+        if lifeline is None:
+            time.sleep(delay)
+        elif select.select([lifeline], [], [], delay)[0]:
+            return None
+
+
+def supervised_git(command: Sequence[str], recovery: Path, deadline: float, stop_seconds: float) -> str:
+    """Close the supervisor's lifeline when the controller stops waiting."""
+    started = time.monotonic()
+    with TemporaryFile() as output, TemporaryFile() as errors:
         reader, writer = os.pipe()
-        _ = resources.callback(os.close, writer)
         try:
-            supervisor = subprocess.Popen([sys.executable, '-m', 'scripts.aws_target.aws_trial',
-                '--supervise-git', str(reader), str(recovery.absolute()), str(deadline), str(stop_seconds),
-                os.getcwd(), *command],
-                cwd=Path(__file__).resolve().parents[2], pass_fds=(reader,), start_new_session=True,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        finally:
-            os.close(reader)
-        for stream in (supervisor.stdout, supervisor.stderr):
-            if stream is not None:
-                _ = resources.enter_context(stream)
-        try:
-            output, errors = supervisor.communicate(timeout=max(0, deadline + stop_seconds - time.monotonic()))
-        except BaseException:
-            resources.pop_all().close()
             try:
-                _ = supervisor.wait(timeout=stop_seconds)
-            except subprocess.TimeoutExpired:
-                print('UNRESOLVED: paired trial Git supervisor did not stop', file=sys.stderr)
-            raise
-    if supervisor.returncode == TIMED_OUT:
-        raise subprocess.TimeoutExpired(command, timeout, output=output, stderr=errors)
-    if supervisor.returncode:
+                supervisor = subprocess.Popen([sys.executable, '-m', 'scripts.aws_target.aws_trial',
+                    '--supervise-git', str(reader), str(recovery.absolute()), str(deadline), str(stop_seconds),
+                    os.getcwd(), *command],
+                    cwd=Path(__file__).resolve().parents[2], pass_fds=(reader,), start_new_session=True,
+                    stdin=subprocess.DEVNULL, stdout=output, stderr=errors)
+            finally:
+                os.close(reader)
+            try:
+                status = poll_child(supervisor, deadline)
+            except BaseException:
+                os.close(writer)
+                writer = -1
+                if poll_child(supervisor, min(deadline, time.monotonic() + stop_seconds)) is None:
+                    print(f'UNRESOLVED: Git supervisor did not exit for {recovery}', file=sys.stderr)
+                raise
+        finally:
+            if writer != -1:
+                os.close(writer)
+        if status is None:
+            raise GateRefused(f'UNRESOLVED: Git supervisor exceeded its deadline for {recovery}')
+        _ = errors.seek(0)
+        error_text = errors.read().decode(errors='replace')
         if recovery.exists():
-            print(f'UNRESOLVED: paired trial Git recovery record {recovery}', file=sys.stderr)
-        raise subprocess.CalledProcessError(supervisor.returncode, command, output=output, stderr=errors)
-    return output.strip()
+            raise GateRefused(f'UNRESOLVED: Git recovery kept {recovery}\n{error_text.strip()}')
+        _ = output.seek(0)
+        result = output.read().decode(errors='replace')
+    if status == TIMED_OUT:
+        raise subprocess.TimeoutExpired(command, max(0, deadline - started), output=result, stderr=error_text)
+    if status:
+        raise subprocess.CalledProcessError(status, command, output=result, stderr=error_text)
+    return result.strip()
 
 
 def git_boot_identity() -> str:
     return boot_identity() if sys.platform == 'linux' else ''
-
-
-def git_group_live(group: int) -> bool:
-    for pid in process_table():
-        with suppress(ProcessLookupError):
-            if os.getpgid(pid) == group:
-                return True
-    return False
-
-
-def stop_git_group(group: int, start: str, deadline: float) -> None:
-    """Signal the Git group through the verified leader's pidfd."""
-    if sys.platform != 'linux' or not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
-        raise GateRefused(f'UNRESOLVED: no pidfd support for Git group {group}')
-    try:
-        descriptor = os.pidfd_open(group)
-        try:
-            fields = Path(f'/proc/self/fdinfo/{descriptor}').read_text().splitlines()
-            if f'Pid:\t{group}' not in fields:
-                raise GateRefused(f'UNRESOLVED: cannot verify the leader of Git group {group}')
-            identity = process_start(group)
-            if (not isinstance(identity, Started) or identity.start != start
-                    or select.select([descriptor], [], [], 0)[0]):
-                raise GateRefused(f'UNRESOLVED: cannot verify the leader of Git group {group}')
-            # TERM can stop the leader while another member stays alive.
-            signal.pidfd_send_signal(descriptor, signal.SIGKILL, None, PIDFD_SIGNAL_PROCESS_GROUP)
-        finally:
-            os.close(descriptor)
-    except OSError as error:
-        raise GateRefused(f'UNRESOLVED: cannot stop Git group {group} through its pidfd: {error}') from error
-    while git_group_live(group):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise GateRefused(f'UNRESOLVED: Git group {group} did not stop')
-        time.sleep(min(0.05, remaining))
 
 
 def stop_git_scope(path: Path, unit: str, deadline: float, sample_seconds: float) -> bool:
@@ -216,7 +177,7 @@ def stop_git_scope(path: Path, unit: str, deadline: float, sample_seconds: float
     if published is None:
         return False
     scope = Path(published.scope)
-    if scope.name != unit or not scope.is_relative_to('/sys/fs/cgroup'):
+    if scope.name != unit or '..' in scope.parts or not scope.is_relative_to('/sys/fs/cgroup'):
         raise GateRefused(f'UNRESOLVED: cannot verify the Git scope in {path}')
     try:
         queue_place.stop_scope(scope, deadline, sample_seconds)
@@ -231,75 +192,66 @@ def clear_git_record(path: Path) -> None:
     path.with_suffix('.cgroup').unlink(missing_ok=True)
 
 
-def git_scope_absent(unit: str, deadline: float) -> bool:
+def bounded_systemctl(arguments: Sequence[str], deadline: float) -> tuple[int, str] | None:
+    """Run systemctl without waiting past the deadline to reap it."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        return False
+        return None
+    kill_at = deadline - min(0.05, remaining / 2)
+    with TemporaryFile() as output:
+        child = subprocess.Popen(['systemctl', '--user', *arguments], stdin=subprocess.DEVNULL,
+                                 stdout=output, stderr=subprocess.DEVNULL)
+        try:
+            status = poll_child(child, kill_at)
+            if status is not None:
+                _ = output.seek(0)
+                return status, output.read().decode()
+            return None
+        finally:
+            if child.poll() is None:
+                child.kill()
+                _ = poll_child(child, deadline)
+
+
+def git_scope_absent(unit: str, deadline: float) -> bool:
     try:
-        result = subprocess.run(['systemctl', '--user', 'show', '--all',
-                                 '--property=LoadState,ActiveState,ControlGroup,Job', '--', unit],
-                                capture_output=True, text=True, timeout=remaining, check=False)
-    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        result = bounded_systemctl(['show', '--all',
+                                    '--property=LoadState,ActiveState,ControlGroup,Job', '--', unit], deadline)
+    except (OSError, UnicodeError):
         return False
-    fields = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
-    return (result.returncode in (0, 1) and fields.get('LoadState') == 'not-found'
+    if result is None:
+        return False
+    status, output = result
+    fields = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+    return (status in (0, 1) and fields.get('LoadState') == 'not-found'
             and fields.get('ActiveState') == 'inactive' and fields.get('ControlGroup') == ''
             and fields.get('Job') in ('', '0'))
 
 
 def recover_git(path: Path, stop_seconds: float, sample_seconds: float) -> None:
-    """Stop recorded Git after its supervisor exits."""
+    """Stop a recorded scope after its supervisor exits."""
     with exclusive(path.with_suffix('.lock'), wait=False) as lock:
         if lock is LockResult.BUSY:
             return
-        recover_git_locked(path, stop_seconds, sample_seconds)
-
-
-def recover_git_locked(path: Path, stop_seconds: float, sample_seconds: float) -> None:
-    try:
-        record = cloud_gate.read(path)
-    except FileNotFoundError:
-        return
-    if record.get('boot') == git_boot_identity():
-        owner = process_start(ledger.instant(record, 'owner'))
-        if isinstance(owner, Unreadable):
-            raise GateRefused(f'UNRESOLVED: cannot verify the Git supervisor in {path}')
-        if isinstance(owner, Started) and owner.start == ledger.text(record, 'owner_start'):
-            return
-        deadline = time.monotonic() + stop_seconds
-        unit = record.get('unit', '')
-        if not isinstance(unit, str):
-            raise GateRefused(f'UNRESOLVED: invalid Git scope in {path}')
-        if unit:
-            stopped = stop_git_scope(path, unit, deadline, sample_seconds)
-            if not stopped and not (record.get('authorized') is False and git_scope_absent(unit, deadline)):
-                raise GateRefused(f'UNRESOLVED: no published Git scope for {path}')
-        else:
-            stop_git_group(ledger.instant(record, 'group'), ledger.text(record, 'group_start'), deadline)
-    clear_git_record(path)
-
-
-def wait_supervised_git(child: subprocess.Popen[bytes], lifeline: int, deadline: float) -> bool:
-    """Check whether Git exits before the trial exits or the deadline passes."""
-    if sys.platform == 'linux' and hasattr(os, 'pidfd_open'):
         try:
-            descriptor = os.pidfd_open(child.pid)
-        except ProcessLookupError:
-            return True
-        except OSError:
-            pass
-        else:
-            try:
-                ready, _, _ = select.select([lifeline, descriptor], [], [], max(0, deadline - time.monotonic()))
-                # Keep the child PID until cleanup checks the group.
-                return descriptor in ready and lifeline not in ready
-            finally:
-                os.close(descriptor)
-    while child.poll() is None:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or select.select([lifeline], [], [], min(0.05, remaining))[0]:
-            return False
-    return True
+            record = cloud_gate.read(path)
+        except FileNotFoundError:
+            return
+        if record.get('boot') == git_boot_identity():
+            owner = process_start(ledger.instant(record, 'owner'))
+            if isinstance(owner, Unreadable):
+                raise GateRefused(f'UNRESOLVED: cannot verify the Git supervisor in {path}')
+            if isinstance(owner, Started) and owner.start == ledger.text(record, 'owner_start'):
+                return
+            unit = record.get('unit', '')
+            if not isinstance(unit, str):
+                raise GateRefused(f'UNRESOLVED: invalid Git scope in {path}')
+            if unit:
+                deadline = time.monotonic() + stop_seconds
+                if not stop_git_scope(path, unit, deadline, sample_seconds) and not (
+                        record.get('authorized') is False and git_scope_absent(unit, deadline)):
+                    raise GateRefused(f'UNRESOLVED: no published Git scope for {path}')
+        clear_git_record(path)
 
 
 def finish_scope_probe(deadline: float) -> None:
@@ -322,11 +274,10 @@ def finish_scope_probe(deadline: float) -> None:
         time.sleep(min(0.005, remaining))
 
 
-def probe_git_scope(lifeline: int, deadline: float, stop_seconds: float) -> list[str] | None:
-    """Run the scope probe with a deadline and watch the controller pipe."""
+def probe_git_scope(lifeline: int, run_deadline: float, deadline: float, stop_seconds: float) -> list[str] | None:
+    """Isolate the queue probe and watch the controller pipe."""
     if not adopt_descendants():
         return []
-    probe_deadline = min(deadline, time.monotonic() + stop_seconds)
     with ExitStack() as resources:
         reader, writer = os.pipe()
         _ = resources.callback(os.close, reader)
@@ -341,93 +292,85 @@ def probe_git_scope(lifeline: int, deadline: float, stop_seconds: float) -> list
                 finally:
                     os._exit(0)
         try:
-            ready, _, _ = select.select([lifeline, reader], [], [], max(0, probe_deadline - time.monotonic()))
+            ready, _, _ = select.select([lifeline, reader], [], [], max(0, run_deadline - time.monotonic()))
             if lifeline in ready:
                 return None
             data = os.read(reader, 4096) if reader in ready else b''
             return cast(list[str], json.loads(data)) if data else []
         finally:
-            finish_scope_probe(time.monotonic() + stop_seconds)
+            finish_scope_probe(min(deadline, time.monotonic() + stop_seconds))
 
 
 def supervise_git(lifeline: int, path: Path, deadline: float, stop_seconds: float, cwd: Path,
                   command: Sequence[str]) -> int:
-    """Keep the recovery record locked while Git runs."""
+    """Keep the recovery record locked through scope cleanup."""
     sample_seconds = conf.read('build_admission').number('program_sample_seconds')
     with exclusive(path.with_suffix('.lock'), wait=False) as lock:
-        if lock is LockResult.BUSY:
+        if lock is LockResult.BUSY or path.exists():
             raise GateRefused(f'UNRESOLVED: Git recovery still owns {path}')
-        recover_git_locked(path, stop_seconds, sample_seconds)
-        if path.exists():
-            raise GateRefused(f'UNRESOLVED: Git recovery still owns {path}')
+        if time.monotonic() >= deadline or select.select([lifeline], [], [], 0)[0]:
+            return TIMED_OUT
         clear_git_record(path)
-        return start_supervised_git(lifeline, path, deadline, stop_seconds, sample_seconds, cwd, command)
+        owner = process_start(os.getpid())
+        if not isinstance(owner, Started):
+            raise GateRefused('UNRESOLVED: Git supervisor has no process identity')
+        unit = f'cloud-trial-git-{uuid4().hex}.scope'
+        record: dict[str, object] = {'boot': git_boot_identity(), 'owner': os.getpid(), 'owner_start': owner.start,
+                                     'unit': unit, 'deadline': deadline, 'authorized': False}
+        cloud_gate.save(path, record)
+        # Reserve time for cleanup within the same deadline.
+        now = time.monotonic()
+        run_deadline = deadline - min(stop_seconds, max(0, deadline - now) / 2)
+        prefix = probe_git_scope(lifeline, run_deadline, deadline, stop_seconds)
+        if prefix is None or select.select([lifeline], [], [], 0)[0]:
+            clear_git_record(path)
+            return TIMED_OUT
+        if not prefix:
+            raise GateRefused(f'UNRESOLVED: cannot create the Git scope for {path}')
+        if time.monotonic() >= run_deadline:
+            raise GateRefused(f'UNRESOLVED: no time remains to start the Git scope for {path}')
+        return start_scoped_git(lifeline, path, record, unit, deadline, run_deadline, stop_seconds,
+                                sample_seconds, cwd, prefix, command)
 
 
-def start_supervised_git(lifeline: int, path: Path, deadline: float, stop_seconds: float,
-                        sample_seconds: float, cwd: Path, command: Sequence[str]) -> int:
-    owner = process_start(os.getpid())
-    if not isinstance(owner, Started):
-        raise GateRefused('UNRESOLVED: Git supervisor has no process identity')
-    prefix = probe_git_scope(lifeline, deadline, stop_seconds) if sys.platform == 'linux' else []
-    if prefix is None or time.monotonic() >= deadline or select.select([lifeline], [], [], 0)[0]:
-        return TIMED_OUT
-    unit = f'cloud-trial-git-{uuid4().hex}.scope' if prefix else ''
+def start_scoped_git(lifeline: int, path: Path, record: dict[str, object], unit: str, deadline: float,
+                     run_deadline: float, stop_seconds: float, sample_seconds: float, cwd: Path,
+                     prefix: Sequence[str], command: Sequence[str]) -> int:
     child: subprocess.Popen[bytes] | None = None
-    group_start: str | None = None
-    finished = False
+    status = None
     try:
         with ExitStack() as barrier:
             reader, writer = os.pipe()
             _ = barrier.callback(os.close, reader)
             _ = barrier.callback(os.close, writer)
-            environment = dict(os.environ)
-            if prefix:
-                wrapper = Path(queue_place.__file__).resolve()
-                argv = [*prefix[:-1], '--unit=' + unit, prefix[-1], sys.executable, str(wrapper),
-                        '--scope-start', str(path.with_suffix('.cgroup')), str(os.getpid()), owner.start,
-                        str(path.with_suffix('.scope.json')), str(reader), str(stop_seconds), *command]
-            else:
-                environment.update(MERGE_GATE_START_FD=str(reader), MERGE_GATE_START_SECONDS=str(stop_seconds))
-                argv = [sys.executable, '-I', '-S', '-c', merge_gate.GATE_START_PERMISSION
-                        + 'os.execvp(sys.argv[1], sys.argv[1:])', *command]
-            child = subprocess.Popen(argv, env=environment, cwd=cwd, pass_fds=(reader,),
-                                     start_new_session=True, stdin=subprocess.DEVNULL)
-            identity = process_start(child.pid)
-            if not isinstance(identity, Started):
-                raise GateRefused('UNRESOLVED: Git has no process identity')
-            record: dict[str, object] = {'boot': git_boot_identity(), 'owner': os.getpid(), 'owner_start': owner.start,
-                                         'group': child.pid, 'group_start': identity.start, 'unit': unit,
-                                         'deadline': deadline, 'authorized': False}
-            cloud_gate.save(path, record)
-            if time.monotonic() >= deadline or select.select([lifeline], [], [], 0)[0]:
-                return TIMED_OUT
-            record['authorized'] = True
-            cloud_gate.save(path, record)
-            _ = os.write(writer, b'1')
-            group_start = identity.start
-        finished = wait_supervised_git(child, lifeline, deadline)
+            wrapper = Path(queue_place.__file__).resolve()
+            argv = [*prefix[:-1], '--unit=' + unit, prefix[-1], sys.executable, str(wrapper),
+                    '--scope-start', str(path.with_suffix('.cgroup')), str(os.getpid()),
+                    ledger.text(record, 'owner_start'), str(path.with_suffix('.scope.json')), str(reader),
+                    str(max(0, run_deadline - time.monotonic())), *command]
+            child = subprocess.Popen(argv, cwd=cwd, pass_fds=(reader,), stdin=subprocess.DEVNULL)
+            if time.monotonic() < run_deadline and not select.select([lifeline], [], [], 0)[0]:
+                record['authorized'] = True
+                cloud_gate.save(path, record)
+                _ = os.write(writer, b'1')
+        status = poll_child(child, run_deadline, lifeline)
     finally:
         if child is not None:
-            stop_deadline = time.monotonic() + stop_seconds
-            if unit:
-                if not stop_git_scope(path, unit, stop_deadline, sample_seconds) and not finished:
-                    child.kill()
-                    _ = child.wait(timeout=max(0, stop_deadline - time.monotonic()))
-                    _ = stop_git_scope(path, unit, stop_deadline, sample_seconds)
-            elif group_start is not None:
-                pending = git_group_live(child.pid) if sys.platform == 'linux' else not finished
-                if pending:
-                    stop_git_group(child.pid, group_start, stop_deadline)
-            _ = child.wait(timeout=max(0, stop_deadline - time.monotonic()))
+            stop_deadline = min(deadline, time.monotonic() + stop_seconds)
+            stopped = stop_git_scope(path, unit, stop_deadline, sample_seconds)
+            if status is None and not stopped:
+                child.kill()
+            if poll_child(child, stop_deadline) is None:
+                raise GateRefused(f'UNRESOLVED: Git scope launcher did not exit for {path}')
+            # The launcher can publish its scope while it receives the stop.
+            if not stopped and not stop_git_scope(path, unit, stop_deadline, sample_seconds):
+                raise GateRefused(f'UNRESOLVED: no published Git scope for {path}')
             clear_git_record(path)
-    assert child is not None and child.returncode is not None
-    return child.returncode if finished else TIMED_OUT
+    return status if status is not None else TIMED_OUT
 
 
 def trial_request(repo: Path, base: str, changed: str, modules: Sequence[str], rounds: int) -> PairedTrialRequest:
     """Resolve local commits without changing the source checkout."""
-    from urllib.parse import urlsplit
     if rounds <= 0 or not modules or len(set(modules)) != len(modules):
         raise ValueError('Use positive rounds and distinct modules')
     for module in modules:
@@ -454,8 +397,13 @@ def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int,
     trial_id = folder.name
     namespace = f'refs/heads/{prefix}-{expires}-{trial_id}-'
     recovery = folder / GIT_RECOVERY
+    if recovery.exists():
+        return
     try:
         remote = checked_git(repo, 'ls-remote', '--heads', clone_url, namespace + '*', recovery=recovery)
+    except GateRefused as error:
+        print(error, file=sys.stderr)
+        return
     except (OSError, ValueError, subprocess.SubprocessError):
         print(f'paired trial: could not list branches for trial {trial_id}', file=sys.stderr)
         return
@@ -466,6 +414,9 @@ def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int,
         branch = fields[1]
         try:
             _ = checked_git(repo, 'push', clone_url, '--delete', branch, recovery=recovery)
+        except GateRefused as error:
+            print(error, file=sys.stderr)
+            return
         except (OSError, ValueError, subprocess.SubprocessError):
             print(f'paired trial: could not delete branch {branch.removeprefix("refs/heads/")}', file=sys.stderr)
 
@@ -831,7 +782,9 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path, *, repo
         print(json.dumps(summary), flush=True)
     cost, cleanup = trial_cost(book, {ledger.text(row, 'attempt') for row in requests}, settings_path, int(time.time()))
     cost += query_fee
-    summary: dict[str, object] = {'total_cost_usd': float(cost), 'cost_basis': 'estimate', 'cleanup_complete': cleanup}
+    git_cleanup = not ((folder / GIT_RECOVERY).exists() or pending_git_recovery(directory))
+    summary: dict[str, object] = {'total_cost_usd': float(cost), 'cost_basis': 'estimate',
+                                  'cleanup_complete': cleanup and git_cleanup}
     if report_cost:
         print(json.dumps(summary), flush=True)
     else:
@@ -865,12 +818,16 @@ def paired_service(command: Sequence[str], unit: str) -> int:
     finally:
         if not completed:
             try:
-                stopped = subprocess.run(['systemctl', '--user', 'stop', unit], check=False,
-                                         timeout=cloud_gate.cleanup_timeout_s())
-                if stopped.returncode:
-                    print(f'paired trial: service stop unresolved for {unit}', file=sys.stderr)
-            except (OSError, subprocess.TimeoutExpired) as error:
-                print(f'paired trial: service stop unresolved for {unit}: {error}', file=sys.stderr)
+                deadline = time.monotonic() + cloud_gate.cleanup_timeout_s()
+                stopped = bounded_systemctl(['stop', unit], deadline)
+                if stopped is None or stopped[0]:
+                    print(f'UNRESOLVED: paired trial service stop for {unit}', file=sys.stderr)
+            except OSError as error:
+                print(f'UNRESOLVED: paired trial service stop for {unit}: {error}', file=sys.stderr)
+
+
+def pending_git_recovery(directory: Path) -> bool:
+    return any((directory / 'paired-trials').glob(f'*/{GIT_RECOVERY}'))
 
 
 def paired_main(argv: Sequence[str], directory: Path) -> int:
@@ -921,7 +878,8 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         for variant, revision in (('base', trial.base), ('changed', trial.changed)):
             branch = f'{prefix}-{expires}-{folder.name}-{variant}'
             _ = checked_git(args.repo, 'check-ref-format', 'refs/heads/' + branch)
-            _ = checked_git(args.repo, 'push', clone_url, revision.commit + ':refs/heads/' + branch)
+            _ = checked_git(args.repo, 'push', clone_url, revision.commit + ':refs/heads/' + branch,
+                            recovery=folder / GIT_RECOVERY)
         for module in trial.modules:
             path = folder / uuid4().hex
             path.mkdir()
@@ -940,7 +898,7 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
     finally:
         if folder is not None and expires:
             delete_trial_branches(args.repo, clone_url, prefix, expires, folder)
-        if any(trials.glob(f'*/{GIT_RECOVERY}')):
+        if pending_git_recovery(directory):
             cost['cleanup_complete'] = False
         print(json.dumps(cost), flush=True)
 
