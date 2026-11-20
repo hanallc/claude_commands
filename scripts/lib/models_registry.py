@@ -16,9 +16,10 @@ import sys
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Literal, NamedTuple, cast, final
+from typing import Literal, NamedTuple, TypedDict, cast, final
+from uuid import uuid4
 
-from scripts.lib import build_folders
+from scripts.lib import build_folders, file_lock
 from scripts.lib import conf_reads, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
 from scripts.lib.registry_rows import parse_registry as parse_registry
 from scripts.lib.operation_environment import OPERATION_ENVIRONMENT as OPERATION_ENVIRONMENT
@@ -412,30 +413,67 @@ def _on_main(target: SharedRegistry) -> bool:
     return _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main"
 
 
-def _forward_main_rows(target: SharedRegistry, path: Path, description: str, *, additive_catalog: bool) -> None:
-    """Send the Mac's live rows to the natedev publisher."""
-    before = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
-    after = registry_text(path)
-    if not registry_rows.changes(before, after):
-        return
-    arguments = ["receive", "--description", description, "--rows", json.dumps([before, after])]
-    if additive_catalog:
-        arguments.append("--additive-catalog")
-    command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/models_registry.py" '
-               + shlex.join(arguments))
-    done = main_publish.ssh(command, ssh_program=os.environ.get("ZONE_SSH") or "ssh", host="natedev")
-    if isinstance(done, str) or done.returncode:
-        raise OSError(done if isinstance(done, str) else main_publish.first_line(done))
-    if done.stderr:
-        print(done.stderr, end="", file=sys.stderr)
+class WaitingMacEdit(TypedDict):
+    receipt: str
+    before: str
+    after: str
+    description: str
+    additive_catalog: bool
+
+
+def _mac_edits_path(target: SharedRegistry) -> Path:
+    return target.git_directory / "models-config.forward.json"
+
+
+def _read_mac_edits(target: SharedRegistry) -> list[WaitingMacEdit]:
+    try:
+        return cast(list[WaitingMacEdit], json.loads(_mac_edits_path(target).read_text()))
+    except FileNotFoundError:
+        return []
+
+
+def _save_mac_edits(target: SharedRegistry, edits: list[WaitingMacEdit]) -> None:
+    write_text_atomic(_mac_edits_path(target), json.dumps(edits) + "\n", new_file_mode=0o600)
+
+
+def _forward_main_rows(target: SharedRegistry, path: Path, *, wait: bool) -> None:
+    """Send only the Mac edits that natedev has yet to accept."""
+    registry_lock = _publish_lock_path(target, path)
+    with file_lock.exclusive(target.git_directory / "models-config.forward.lock", wait=wait) as forwarding:
+        if forwarding is file_lock.LockResult.BUSY:
+            return
+        with file_lock.exclusive(registry_lock, wait=wait) as reading:
+            if reading is file_lock.LockResult.BUSY:
+                return
+            edits = _read_mac_edits(target)
+        for edit in edits:
+            arguments = ["receive", "--description", edit["description"], "--receipt", edit["receipt"],
+                         "--rows", json.dumps([edit["before"], edit["after"]])]
+            if edit["additive_catalog"]:
+                arguments.append("--additive-catalog")
+            command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/models_registry.py" '
+                       + shlex.join(arguments))
+            done = main_publish.ssh(command, ssh_program=os.environ.get("ZONE_SSH") or "ssh", host="natedev")
+            if not isinstance(done, str) and f'accepted {edit["receipt"]}' in done.stdout.splitlines():
+                with file_lock.exclusive(registry_lock):
+                    _save_mac_edits(target, [row for row in _read_mac_edits(target) if row["receipt"] != edit["receipt"]])
+            if isinstance(done, str) or done.returncode:
+                raise OSError(done if isinstance(done, str) else main_publish.first_line(done))
+            if done.stderr:
+                print(done.stderr, end="", file=sys.stderr)
+
+
+def _receipt_path(target: SharedRegistry, receipt: str) -> Path:
+    if len(receipt) != 32 or any(character not in "0123456789abcdef" for character in receipt):
+        raise ValueError("invalid Mac registry receipt")
+    return target.git_directory / "models-config.receipts" / receipt
 
 
 def _publish_in_gap(target: SharedRegistry, path: Path, description: str, replay: waiting_rows.RegistryReplay,
-                    *, wait: bool, gap: land_queue.SettingsGap | main_push_lock.CheckLandLine,
-                    additive_catalog: bool = False) -> bool:
+                    *, wait: bool, gap: land_queue.SettingsGap | main_push_lock.CheckLandLine) -> bool:
     on_main = _on_main(target)
     if on_main and platform.system() == "Darwin":
-        _forward_main_rows(target, path, description, additive_catalog=additive_catalog)
+        _forward_main_rows(target, path, wait=wait)
         return False
     with ExitStack() as locks:
         if on_main:
@@ -445,7 +483,10 @@ def _publish_in_gap(target: SharedRegistry, path: Path, description: str, replay
             if not isinstance(admission, main_push_lock.MainPushReady):
                 return False
         lock = locks.enter_context(_publish_lock_path(target, path).open("a"))
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            return False
         return _publish(target.repository, path, description, replay)
 
 
@@ -457,6 +498,9 @@ def publish_pending(registry: Path, *, gap: land_queue.SettingsGap | main_push_l
     if (not isinstance(target, SharedRegistry) or path != DEFAULT_PATH.resolve()
             or os.environ.get("MODELS_CONFIG_PUBLISH") == "0"):
         return False
+    if platform.system() == "Darwin" and _on_main(target):
+        _forward_main_rows(target, path, wait=False)
+        return False
     head = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
     if not waiting_rows.move_marker(target.repository).exists() and not registry_rows.changes(head, registry_text(path)):
         return False
@@ -465,7 +509,7 @@ def publish_pending(registry: Path, *, gap: land_queue.SettingsGap | main_push_l
 
 
 def store_registry(registry: Path, before: str, after: str, description: str, *,
-                   additive_catalog: bool = False) -> str:
+                   additive_catalog: bool = False, receipt: str = "") -> str:
     """Write the registry live before waiting for publication. Keep the live rows if publication fails."""
     path = registry.resolve()
     changes = [row for row in registry_rows.changes(before, after)
@@ -473,9 +517,16 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     replay = registry_rows.replay_pending
     target = _publish_repository(path)
     lock_path = _publish_lock_path(target, path)
+    shared = isinstance(target, SharedRegistry) and path == DEFAULT_PATH.resolve()
+    forwards = (shared and isinstance(target, SharedRegistry) and platform.system() == "Darwin"
+                and _on_main(target) and os.environ.get("MODELS_CONFIG_PUBLISH") != "0")
+    receipt_path = _receipt_path(target, receipt) if receipt and isinstance(target, SharedRegistry) else None
     with ExitStack() as locks:
         lock = locks.enter_context(lock_path.open("a"))
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if receipt_path is not None and receipt_path.exists():
+            print(f"accepted {receipt}", flush=True)
+            return registry_text(path)
         if isinstance(target, SharedRegistry):
             journal = locks.enter_context(waiting_rows.locked_journal(waiting_rows.journal_path()))
             journal.restore(target.repository, "HEAD")
@@ -485,12 +536,20 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
             if additive_catalog:
                 replay = _catalog_replay(latest, result, changes)
             if registry_rows.values(latest) != registry_rows.values(result):
+                if forwards and isinstance(target, SharedRegistry):
+                    edits = _read_mac_edits(target)
+                    edits.append({"receipt": uuid4().hex, "before": latest, "after": result,
+                                  "description": description, "additive_catalog": additive_catalog})
+                    _save_mac_edits(target, edits)
                 write_text_atomic(path, after if latest == before and not additive_catalog else result)
-    if (isinstance(target, SharedRegistry) and path == DEFAULT_PATH.resolve()
+        if receipt_path is not None:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(receipt_path, "\n")
+            print(f"accepted {receipt}", flush=True)
+    if (shared and isinstance(target, SharedRegistry)
             and os.environ.get("MODELS_CONFIG_PUBLISH") not in ("0", "later")):
         try:
-            _ = _publish_in_gap(target, path, description, replay, wait=True, gap=main_push_lock.CHECK_LAND_LINE,
-                                additive_catalog=additive_catalog)
+            _ = _publish_in_gap(target, path, description, replay, wait=True, gap=main_push_lock.CHECK_LAND_LINE)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise OSError(f"the rows are live; main does not have them yet: {' '.join(str(error).split())}; "
                           + "the notes timer tries again") from error
@@ -550,6 +609,7 @@ class Arguments(argparse.Namespace):
     description: str = "update registry"
     additive_catalog: bool = False
     rows: str = ""
+    receipt: str = ""
     launch: bool = False
     edit: bool = False
 
@@ -568,6 +628,7 @@ def main() -> int:
     _ = parser.add_argument("--after", type=Path, default=Path())
     _ = parser.add_argument("--description", default="update registry")
     _ = parser.add_argument("--rows", default="")
+    _ = parser.add_argument("--receipt", default="")
     _ = parser.add_argument("--additive-catalog", action="store_true")
     arguments = parser.parse_args(namespace=Arguments())
     try:
@@ -586,7 +647,7 @@ def main() -> int:
         if arguments.command == "receive":
             before, after = cast(tuple[str, str], json.loads(arguments.rows))
             _ = store_registry(arguments.registry, before, after, arguments.description,
-                               additive_catalog=arguments.additive_catalog)
+                               additive_catalog=arguments.additive_catalog, receipt=arguments.receipt)
             return 0
         before = arguments.before.read_text(encoding="utf-8")
         after = arguments.after.read_text(encoding="utf-8")

@@ -130,10 +130,11 @@ class AcceptedSaveRecord(TypedDict):
 
 
 class SettingsJsonEdits(TypedDict):
-    """The shared keys that one Save sets or removes."""
+    """The shared JSON paths that one Save sets or removes."""
 
     values: dict[str, object]
     removed: list[str]
+    objects: NotRequired[dict[str, SettingsJsonEdits]]
 
 
 class SettingsJsonSave(TypedDict):
@@ -261,11 +262,11 @@ def _read_journal(path: Path) -> LockedJournal:
 
 
 @contextmanager
-def locked_journal(path: Path) -> Generator[LockedJournal]:
+def locked_journal(path: Path, *, wait: bool = True) -> Generator[LockedJournal]:
     """Share one lock between live Saves and checkout moves."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         yield _read_journal(path)
 
 
@@ -358,20 +359,48 @@ def _settings_object(text: str) -> dict[str, object]:
     return cast(dict[str, object], values)
 
 
+def has_settings_json_edits(edits: SettingsJsonEdits) -> bool:
+    return bool(edits["values"] or edits["removed"] or edits.get("objects"))
+
+
+def _json_changes(old: dict[str, object], new: dict[str, object]) -> SettingsJsonEdits:
+    values: dict[str, object] = {}
+    objects: dict[str, SettingsJsonEdits] = {}
+    for key, value in new.items():
+        prior = old.get(key)
+        if isinstance(value, dict) and (isinstance(prior, dict) or (key not in old and value)):
+            child = _json_changes(cast(dict[str, object], prior) if isinstance(prior, dict) else {},
+                                  cast(dict[str, object], value))
+            if has_settings_json_edits(child):
+                objects[key] = child
+        elif key not in old or json.dumps(prior, sort_keys=True) != json.dumps(value, sort_keys=True):
+            values[key] = value
+    edits: SettingsJsonEdits = {"values": values, "removed": [key for key in old if key not in new]}
+    if objects:
+        edits["objects"] = objects
+    return edits
+
+
 def settings_json_edits(before: str, after: str) -> SettingsJsonEdits:
-    old, new = _settings_object(before), _settings_object(after)
-    return {"values": {key: value for key, value in new.items()
-                       if key not in old or json.dumps(old[key], sort_keys=True) != json.dumps(value, sort_keys=True)},
-            "removed": [key for key in old if key not in new]}
+    return _json_changes(_settings_object(before), _settings_object(after))
 
 
-def apply_settings_json_edits(text: str, edits: SettingsJsonEdits) -> str:
-    if not edits["values"] and not edits["removed"]:
-        return text
-    settings = _settings_object(text)
+def _apply_json_changes(settings: dict[str, object], edits: SettingsJsonEdits) -> None:
     for key in edits["removed"]:
         _ = settings.pop(key, None)
     settings.update(edits["values"])
+    for key, child in edits.get("objects", {}).items():
+        current = settings.get(key)
+        target = cast(dict[str, object], current) if isinstance(current, dict) else {}
+        _apply_json_changes(target, child)
+        settings[key] = target
+
+
+def apply_settings_json_edits(text: str, edits: SettingsJsonEdits) -> str:
+    if not has_settings_json_edits(edits):
+        return text
+    settings = _settings_object(text)
+    _apply_json_changes(settings, edits)
     return json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -452,7 +481,7 @@ def _hold_settings_json(checkout: Path, plan: MovePlan) -> None:
     head = tree_text(checkout, plan["source"], SETTINGS_JSON)
     incoming = tree_text(checkout, plan["target"], SETTINGS_JSON)
     edits = settings_json_edits(head or "{}\n", clean_settings_json(checkout))
-    if not edits["values"] and not edits["removed"]:
+    if not has_settings_json_edits(edits):
         return
     plan["before"][SETTINGS_JSON] = local
     if incoming is None:

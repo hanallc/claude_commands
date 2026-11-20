@@ -129,21 +129,21 @@ def ready(checkout: Path, *, fetch_limit: CommandTimeLimit | NoTimeLimit = UNLIM
                 raise Refusal(f"main holds other commit {short} {subject} that origin does not have; main is unchanged")
         if not git(checkout, "merge-base", "--is-ancestor", "origin/main", head).returncode:
             return
-        target = _rebuilt(checkout, commits)
+        target = _rebuilt(checkout, commits, "origin/main")
         try:
             waiting_rows.move_to(checkout, target, fast_forward=not commits, expected_head=head)
         except (OSError, UnicodeError) as error:
             raise Refusal(f"main is unchanged: {' '.join(str(error).split())}") from error
 
 
-def _rebuilt(checkout: Path, commits: list[tuple[str, str, str]]) -> str:
+def _rebuilt(checkout: Path, commits: list[tuple[str, str, str]], onto: str) -> str:
     """Copy each publisher commit onto origin/main without the worktree; drop a commit that origin has."""
     def run(*arguments: str, input_text: str | None = None,
             environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["git", "-C", str(checkout), *arguments], input=input_text, text=True,
                               capture_output=True, env=environment, check=False)
 
-    tip = run("rev-parse", "origin/main").stdout.strip()
+    tip = run("rev-parse", onto).stdout.strip()
     for commit_id, short, subject in commits:
         parents = run("rev-list", "--parents", "-n", "1", commit_id).stdout.split()[1:]
         if len(parents) != 1:
@@ -166,6 +166,24 @@ def _rebuilt(checkout: Path, commits: list[tuple[str, str, str]]) -> str:
             raise Refusal(f"cannot copy {short} {subject}: {first_line(made)}; main is unchanged")
         tip = made.stdout.strip()
     return tip
+
+
+def prepare_deferred_commit(checkout: Path, commit: str, base: str, branch: str, *, validated_base: str = "") -> str:
+    """Reapply the saved settings commits to the current origin tip."""
+    fetched = git(checkout, "fetch", "origin", branch)
+    if fetched.returncode:
+        raise Refusal(first_line(fetched))
+    origin = waiting_rows.git(checkout, "rev-parse", "FETCH_HEAD").strip()
+    if validated_base and git(checkout, "merge-base", "--is-ancestor", validated_base, commit).returncode:
+        raise Refusal("merge branch moved during validation")
+    if (not git(checkout, "merge-base", "--is-ancestor", commit, origin).returncode
+            or not git(checkout, "merge-base", "--is-ancestor", origin, commit).returncode):
+        return commit
+    if validated_base:
+        raise Refusal("merge branch moved during validation")
+    listed = waiting_rows.git(checkout, "log", "--format=%H %h %s", "--reverse", f"{base}..{commit}")
+    commits = [cast(tuple[str, str, str], tuple(line.split(" ", 2))) for line in listed.splitlines()]
+    return _rebuilt(checkout, commits, origin)
 
 
 def commit(checkout: Path, conf: Path, message: str, before: ExistingFile | MissingFile,

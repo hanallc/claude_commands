@@ -19,6 +19,7 @@ from unittest import mock
 from scripts.lib import land_main, main_publish, main_sync, waiting_rows
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import land_queue, land_runs
 
 
 @contextmanager
@@ -57,7 +58,7 @@ class PublicationRepository:
             **os.environ, "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
             "ZONE_SSH": str(self.ssh), "ZONE_STATE": str(root / "state"),
             "SSH_LOG": str(self.ssh_log), "OFFLINE": str(root / "OFFLINE"),
-            "XDG_STATE_HOME": str(root / "xdg"),
+            "XDG_STATE_HOME": str(root / "xdg"), "MERGE_GATE_STATE_DIR": str(root / "land-state"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "PATH": str(self.programs) + os.pathsep + os.environ.get("PATH", os.defpath),
@@ -173,6 +174,27 @@ class MainPublishTests(PublicationTestCase):
                     capture_output=True, text=True, check=False, timeout=min(TEST_HANG_GUARD_SECS, 15),
                 )
                 self.assertEqual(child.returncode, 23, child.stdout + child.stderr)
+
+    def test_direct_settings_commit_waits_until_the_current_land_ends(self) -> None:
+        repo = self.repository
+        environment = {**repo.env, "PUSH_TARGET_BRANCH": "main", "MODELS_CONFIG_PUBLISH": "0"}
+        origin = repo.remote_tip()
+        settings = repo.checkout / "settings.json"
+        _ = settings.write_text('{"autoCompactWindow": 308800}\n')
+        _ = repo.git(repo.checkout, "add", settings.name)
+        _ = repo.git(repo.checkout, "commit", "-qm", "Approve the window")
+        candidate = repo.head()
+        script = Path(__file__).resolve().parents[1] / "validate_and_push/push_direct.sh"
+        with mock.patch.dict(os.environ, environment, clear=True), land_runs.landing([origin]):
+            result = subprocess.run(["bash", str(script), "--publish-only", candidate], cwd=repo.checkout,
+                                    env=environment, capture_output=True, text=True, check=False,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("main: waits for the land that runs now", result.stdout)
+            self.assertEqual(repo.remote_tip(), origin)
+        with mock.patch.dict(os.environ, environment, clear=True), redirect_stderr(io.StringIO()):
+            self.assertEqual(land_queue.take_next(), "")
+        self.assertEqual(repo.remote_tip(), candidate)
 
     def test_push_refuses_to_publish_unrelated_local_commits(self) -> None:
         repo = self.repository

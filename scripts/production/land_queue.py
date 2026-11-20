@@ -23,7 +23,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
@@ -35,7 +35,7 @@ SETTINGS_WAIT_NOTICE = "main: waits for the land that runs now"
 
 
 class SettingsGap(NamedTuple):
-    """The line lock protects this publication until the gap ends."""
+    """The gap lock protects this publication until it ends."""
 
 
 class SettingsWaiting(NamedTuple):
@@ -45,8 +45,33 @@ class SettingsWaiting(NamedTuple):
         return SETTINGS_WAIT_NOTICE
 
 
-class NoQueuedSettings(NamedTuple):
-    """A different runner already removed the settings item."""
+class SettingsGapBusy(NamedTuple):
+    """Another process holds the gap lock or edits the line."""
+
+
+class DirectSettingsPush(TypedDict):
+    kind: Literal["direct"]
+    checkout: str
+    commit: str
+    base: str
+    branch: str
+    validated_base: str
+
+
+class FastTrackSettingsPush(TypedDict):
+    kind: Literal["fast-track"]
+    attempt: str
+
+
+type DeferredSettingsPush = DirectSettingsPush | FastTrackSettingsPush
+
+
+def settings_only(paths: Sequence[str]) -> bool:
+    def settings_path(name: str) -> bool:
+        path = Path(name)
+        return name == "settings.json" or (path.parent == Path("config") and path.suffix == ".conf")
+
+    return bool(paths) and all(settings_path(name) for name in paths)
 
 
 class LineItem(TypedDict):
@@ -142,19 +167,27 @@ def read_items() -> list[LineItem] | NoLine:
     return cast(list[LineItem], json.loads(text))
 
 
+def _lock_path(name: str) -> Path:
+    folder = line_path().parent
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / name
+
+
 @contextmanager
-def line_lock() -> Generator[None]:
-    path = line_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock.exclusive(path.with_name(path.name + ".lock")):
-        yield
+def line_lock(*, wait: bool = True) -> Generator[file_lock.LockResult]:
+    with file_lock.exclusive(_lock_path("land_queue.json.lock"), wait=wait) as result:
+        yield result
+
+
+def _gap_lock_path() -> Path:
+    return _lock_path("settings-gap.lock")
 
 
 @contextmanager
 def landing(commits: Sequence[str], owners: Sequence[str]) -> Generator[None]:
-    """Register a land between settings pushes and release the line lock."""
+    """Register a land after the current settings push ends."""
     with ExitStack() as record:
-        with line_lock():
+        with file_lock.exclusive(_gap_lock_path()), line_lock():
             record.enter_context(land_runs.landing(commits, owners))
         yield
 
@@ -177,26 +210,53 @@ def _settings_item(item: LineItem) -> bool:
     return item["label"] == SETTINGS_LABEL and not item["batch"] and not item["commits"]
 
 
-@contextmanager
-def settings_gap(*, queued: bool = False) -> Generator[SettingsGap | SettingsWaiting | NoQueuedSettings]:
-    """Protect an immediate push or reserve the next gap for all waiting changes."""
+def _pushes_path() -> Path:
+    return line_path().with_name("settings-pushes.json")
+
+
+def deferred_pushes() -> list[DeferredSettingsPush]:
+    try:
+        return cast(list[DeferredSettingsPush], json.loads(_pushes_path().read_bytes()))
+    except FileNotFoundError:
+        return []
+
+
+def _save_pushes(requests: list[DeferredSettingsPush]) -> None:
+    write_text_atomic(_pushes_path(), json.dumps(requests) + "\n", new_file_mode=0o600)
+
+
+def finish_push(request: DeferredSettingsPush) -> None:
     with line_lock():
-        found = read_items()
-        items = [] if isinstance(found, NoLine) else found
-        scheduled = next((item for item in items if _settings_item(item)), None)
-        if queued and scheduled is None:
-            yield NoQueuedSettings()
-        elif land_runs.running_lands():
-            if scheduled is None:
-                items.insert(0, {"label": SETTINGS_LABEL, "batch": "", "commits": [],
-                                 "added": datetime.now(timezone.utc).isoformat(timespec="seconds")})
-                write_items(items)
-            yield SettingsWaiting()
-        else:
-            yield SettingsGap()
-            if queued and scheduled is not None:
-                items.remove(scheduled)
-                write_items(items)
+        _save_pushes([pending for pending in deferred_pushes() if pending != request])
+
+
+@contextmanager
+def settings_gap(*, wait: bool = True, request: DeferredSettingsPush | None = None) -> Generator[SettingsGap | SettingsWaiting | SettingsGapBusy]:
+    """Reserve the next gap or hold the current gap without holding the line."""
+    # Take the gap, line, main push, and journal locks in this order.
+    # Release the line lock before Git runs.
+    with file_lock.exclusive(_gap_lock_path(), wait=wait) as gap:
+        if gap is file_lock.LockResult.BUSY:
+            yield SettingsGapBusy()
+            return
+        with line_lock(wait=wait) as line:
+            if line is file_lock.LockResult.BUSY:
+                admission = SettingsGapBusy()
+            elif land_runs.running_lands():
+                if request is not None:
+                    requests = deferred_pushes()
+                    if request not in requests:
+                        _save_pushes([*requests, request])
+                found = read_items()
+                items = [] if isinstance(found, NoLine) else found
+                if not any(_settings_item(item) for item in items):
+                    items.insert(0, {"label": SETTINGS_LABEL, "batch": "", "commits": [],
+                                     "added": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+                    write_items(items)
+                admission = SettingsWaiting()
+            else:
+                admission = SettingsGap()
+        yield admission
 
 
 def batch_commits(batch: str) -> tuple[BatchCommit, ...]:
@@ -345,14 +405,21 @@ def take_next() -> str:
     with edited() as items:
         if not items or not _settings_item(items[0]):
             return _take_land_item(items)
+        if land_runs.running_lands():
+            return ""
+        _ = items.pop(0)
     script = Path(__file__).resolve().parents[1] / "lib/live_settings.py"
-    result = subprocess.run([sys.executable, str(script), "publish-queued"],
-                            capture_output=True, text=True, check=False)
-    for output in (result.stderr, result.stdout):
-        if output:
-            print(output, end="", file=sys.stderr)
-    if result.returncode:
-        raise Refusal(f"settings publication stopped with exit {result.returncode}")
+    try:
+        result = subprocess.run([sys.executable, str(script), "publish-queued"],
+                                capture_output=True, text=True, check=False)
+    except OSError as error:
+        print(f"settings publication could not start: {error}", file=sys.stderr)
+    else:
+        for output in (result.stderr, result.stdout):
+            if output:
+                print(output, end="", file=sys.stderr)
+        if result.returncode:
+            print(f"settings publication stopped with exit {result.returncode}", file=sys.stderr)
     with edited() as items:
         return _take_land_item(items)
 

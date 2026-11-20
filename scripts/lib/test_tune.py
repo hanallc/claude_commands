@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import json
 import os
 from pathlib import Path
 import fcntl
@@ -11,7 +12,7 @@ import socket
 import subprocess
 import sys
 import time
-from typing import override
+from typing import cast, override
 import unittest
 from unittest import mock
 
@@ -26,7 +27,6 @@ SCRIPT = Path(__file__).with_name("tune.py")
 class TuneTests(PublicationTestCase):
     @override
     def setUp(self) -> None:
-        self.repository.env["MERGE_GATE_STATE_DIR"] = str(self.repository.root / "land-state")
         (self.repository.home / ".claude").symlink_to(self.repository.checkout, target_is_directory=True)
         for name in ("basedpyright", "pytest", "cargo"):
             program = self.repository.programs / name
@@ -148,6 +148,49 @@ class TuneTests(PublicationTestCase):
         self.assertEqual(repo.git(repo.checkout, "log", "-1", "--format=%s"),
                          "tune(settings.json): Approved window")
         self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
+
+    def seed_settings(self, text: str) -> Path:
+        repo = self.repository
+        settings = repo.checkout / "settings.json"
+        _ = settings.write_text(text)
+        _ = repo.git(repo.checkout, "add", settings.name)
+        _ = repo.git(repo.checkout, "commit", "-qm", "settings fixture")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
+        return settings
+
+    def test_waiting_json_keeps_a_landed_sibling_path(self) -> None:
+        repo = self.repository
+        settings = self.seed_settings('{"permissions": {"allow": [], "deny": []}}\n')
+        with mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with land_runs.landing([repo.head()]):
+                _ = settings.write_text('{"permissions": {"allow": ["Read"], "deny": []}}\n')
+                self.assertEqual(live_settings.main(["publish-json", "--message", "Allow Read"]), 0)
+                peer = repo.root / "peer"
+                _ = repo.git(repo.root, "clone", "-q", "-b", "main", str(repo.origin), str(peer))
+                _ = (peer / "settings.json").write_text('{"permissions": {"allow": [], "deny": ["Write"]}}\n')
+                _ = repo.git(peer, "-c", "user.name=Land fixture", "-c", "user.email=land@example.invalid",
+                             "commit", "-qam", "Deny Write")
+                _ = repo.git(peer, "push", "-q", "origin", "main")
+            self.assertEqual(land_queue.take_next(), "")
+        expected = {"permissions": {"allow": ["Read"], "deny": ["Write"]}}
+        self.assertEqual(cast(object, json.loads(repo.git(repo.origin, "show", "main:settings.json"))), expected)
+        self.assertEqual(cast(object, json.loads(settings.read_text())), expected)
+
+    def test_reversing_a_waiting_json_save_cancels_publication_and_restores_the_mac_value(self) -> None:
+        repo = self.repository
+        settings = self.seed_settings('{"autoCompactWindow": 283800}\n')
+        base = repo.head()
+        with mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with land_runs.landing([base]):
+                for value in (308800, 283800):
+                    _ = settings.write_text(json.dumps({"autoCompactWindow": value}) + "\n")
+                    self.assertEqual(live_settings.main(["publish-json", "--message", "Set the window"]), 0)
+            self.assertEqual(land_queue.take_next(), "")
+        self.assertEqual(repo.remote_tip(), base)
+        deliveries = [shlex.split(line)[-1] for line in repo.ssh_log.read_text().splitlines() if "apply-json" in line]
+        self.assertEqual(len(deliveries), 2)
+        edits = cast(waiting_rows.SettingsJsonEdits, json.loads(deliveries[-1]))
+        self.assertEqual(edits["values"], {"autoCompactWindow": 283800})
 
     def test_only_a_saved_guest_key_prints_the_hana_image_notice(self) -> None:
         source = self.repository.checkout / 'hana_aws.conf'

@@ -108,7 +108,7 @@ def main_push_lock(checkout: Path, holder: str = "", *, wait: bool = True) -> Ge
 
 
 class MainPushReady(NamedTuple):
-    """The settings publisher holds the line and main push locks."""
+    """The settings publisher holds the gap and main push locks."""
 
 
 class MainPushBusy(NamedTuple):
@@ -124,12 +124,12 @@ CHECK_LAND_LINE = CheckLandLine()
 
 @contextmanager
 def settings_push(checkout: Path, *, wait: bool,
-                  gap: land_queue.SettingsGap | CheckLandLine = CHECK_LAND_LINE) -> Generator[
-                      MainPushReady | MainPushBusy | land_queue.SettingsWaiting | land_queue.NoQueuedSettings]:
+                  gap: land_queue.SettingsGap | CheckLandLine = CHECK_LAND_LINE,
+                  request: land_queue.DeferredSettingsPush | None = None) -> Generator[
+                      MainPushReady | MainPushBusy | land_queue.SettingsWaiting | land_queue.SettingsGapBusy]:
     """Get a publication gap and hold main while the caller publishes settings."""
-    # Lock order: land line, main push, settings journal.
     with ExitStack() as locks:
-        admission = locks.enter_context(land_queue.settings_gap()) if isinstance(gap, CheckLandLine) else gap
+        admission = locks.enter_context(land_queue.settings_gap(wait=wait, request=request)) if isinstance(gap, CheckLandLine) else gap
         if not isinstance(admission, land_queue.SettingsGap):
             yield admission
             return
@@ -139,6 +139,24 @@ def settings_push(checkout: Path, *, wait: bool,
             yield MainPushBusy()
         else:
             yield MainPushReady()
+
+
+def _settings_candidate(checkout: Path) -> land_queue.DirectSettingsPush | None:
+    commit = os.environ.get("SETTINGS_PUSH_COMMIT", "")
+    branch = os.environ.get("SETTINGS_PUSH_BRANCH", "")
+    if not commit or branch != "main":
+        return None
+    result = subprocess.run(["git", "-C", str(checkout), "merge-base", "origin/main", commit],
+                            capture_output=True, text=True, check=False)
+    base = result.stdout.strip()
+    if result.returncode:
+        return None
+    result = subprocess.run(["git", "-C", str(checkout), "log", "-m", "--format=", "--name-only",
+                             "--no-renames", "-z", f"{base}..{commit}"], capture_output=True, text=True, check=False)
+    if result.returncode or not land_queue.settings_only([name for name in result.stdout.split("\0") if name]):
+        return None
+    return {"kind": "direct", "checkout": str(checkout.resolve()), "commit": commit, "base": base, "branch": branch,
+            "validated_base": os.environ.get("CI_VALIDATED_BASE", "")}
 
 
 class LockCommand(argparse.Namespace):
@@ -156,7 +174,16 @@ def main() -> int:
         command = command[1:]
     if not command:
         parser.error("supply a command after --")
-    with main_push_lock(args.checkout, Path(command[0]).name):
+    with ExitStack() as locks:
+        request = _settings_candidate(args.checkout)
+        if request is None:
+            locks.enter_context(main_push_lock(args.checkout, Path(command[0]).name))
+        else:
+            admission = locks.enter_context(settings_push(args.checkout, wait=True, request=request))
+            if isinstance(admission, land_queue.SettingsWaiting):
+                print(admission.report())
+                print(f"{request['commit']} queued")
+                return 0
         result = subprocess.run(command, check=False, env=held_environment(args.checkout))
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 

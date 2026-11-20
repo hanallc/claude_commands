@@ -80,7 +80,8 @@ The shared writer fetches origin and checks fast-forward safety with a temporary
 `models_registry._fetch(repo, branch)` fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` and reads that ref, never `FETCH_HEAD`.
 Every fetch in the checkout writes `FETCH_HEAD`, so another fetch between the fetch and the read cannot change the target.
 With `fetch.prune=true`, this one-ref refspec prunes no other `origin/*` ref.
-Main publication takes the land line lock, then the shared main push lock, then the registry writer lock.
+Main publication checks the line under its lock and releases it before Git runs.
+The gap lock, main push lock, and registry writer lock protect publication.
 The hold covers fetch, row replay, commit, push retries, and local reconciliation.
 Other target branches retain only the registry writer lock.
 An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
@@ -96,7 +97,8 @@ Pending rows replay onto the fetched registry, so a registry commit from another
 `MODELS_CONFIG_PUBLISH=later` writes the shared registry live and skips the publication.
 It never waits for main, so a landing that holds main never delays the caller.
 The quota alert's `edit_registry` uses this mode for its role routing.
-`sync_codex_catalog.sh` uses it on Linux; the Mac runs no notes timer and publishes its catalog rows in place.
+`sync_codex_catalog.sh` uses this mode on Linux.
+The Mac forwards its edits to natedev and records the acceptance of each edit.
 `publish_pending(registry)` commits and pushes the rows that HEAD does not have.
 It returns `False` when another process holds the main push lock or a land runs.
 Each quota part of the notes timer calls it through `live_settings.publish_waiting()`.

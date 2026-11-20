@@ -10,7 +10,7 @@ except FileNotFoundError:
 import argparse
 import ast
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import fcntl
@@ -30,11 +30,11 @@ import time
 from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
-from scripts.lib import land_main, main_push_lock
+from scripts.lib import land_main, main_publish, main_push_lock
 from scripts.lib import process_group
 
 from scripts.copies import copies
-from scripts.production import checkpoint_gate
+from scripts.production import checkpoint_gate, land_queue
 from scripts.lib import build_folders, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
@@ -760,7 +760,8 @@ def commit_identity(runner: GitRunner, repo: Path) -> list[str]:
 
 
 def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: str, paths: list[str],
-               selection: SelectedPatch, config: FastTrackLimits, settings_read: conf.ConfigRead) -> str:
+               selection: SelectedPatch, config: FastTrackLimits, settings_read: conf.ConfigRead
+               ) -> str | land_queue.SettingsWaiting:
     patch = selection.patch
     digest = hashlib.sha256(patch).hexdigest()
     with build_folders.tool_folder("fast-track") as temporary:
@@ -784,9 +785,16 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
                 row = PushRecord(patch_sha256=digest, unit=unit, commit=commit, why=why,
                                  time=datetime.now(UTC).isoformat(), review="pending", repo=str(repo),
                                  paths=paths, review_pass="")
-                _ = prepare_attempt(runner, repo, row, selection, base, production, copy)
+                attempt = prepare_attempt(runner, repo, row, selection, base, production, copy)
                 try:
-                    with main_push_lock.main_push_lock(repo):
+                    with ExitStack() as locks:
+                        if land_queue.settings_only(paths):
+                            request: land_queue.FastTrackSettingsPush = {"kind": "fast-track", "attempt": str(attempt)}
+                            admission = locks.enter_context(main_push_lock.settings_push(repo, wait=True, request=request))
+                            if isinstance(admission, land_queue.SettingsWaiting):
+                                return admission
+                        else:
+                            locks.enter_context(main_push_lock.main_push_lock(repo))
                         _ = runner.git(copy, "fetch", "origin", "main")
                         if runner.git(copy, "rev-parse", "origin/main").strip() != base:
                             continue
@@ -809,6 +817,31 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
                 return commit
     _ = reconcile(runner, repo, unit, settings_read=settings_read)
     raise Refused("max_push_attempts exceeded; use the normal path")
+
+
+def resume_settings_push(path: Path, gap: land_queue.SettingsGap, *, wait: bool) -> bool:
+    """Publish the checked candidate and finish its existing fast-track attempt."""
+    runner = GitRunner()
+    with record_lock():
+        attempt = read_attempt(path)
+    row = attempt["restore"]["record"]
+    repo = Path(row["repo"])
+    with main_push_lock.settings_push(repo, wait=wait, gap=gap) as admission:
+        if not isinstance(admission, main_push_lock.MainPushReady):
+            return False
+        commit = main_publish.prepare_deferred_commit(repo, row["commit"], attempt["base"], "main")
+        if commit != row["commit"]:
+            with record_lock():
+                attempt = read_attempt(path)
+                attempt["restore"]["record"]["commit"] = commit
+                attempt["base"] = runner.git(repo, "rev-parse", "FETCH_HEAD").strip()
+                _ = runner.git(repo, "update-ref", f"refs/fast-track/attempts/{path.stem}/commit", commit)
+                save_attempt(path, attempt)
+        landed = land_main.land(repo, commit)
+        print(land_main.hook_report(landed.hook), flush=True)
+    _ = reconcile(runner, repo, row["unit"], finish=True, paths=tuple(row["paths"]), published_commit=commit,
+                  settings_read=conf.read("fast_track"))
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -856,7 +889,10 @@ def main(argv: list[str] | None = None) -> int:
             paths = [path for path, _, _ in counts]
             check_size(runner, repo, counts, config)
             commit = push_patch(runner, repo, args.production, args.unit, args.why.strip(), paths, selection, config, settings_read)
-        print(f"fast-track {args.unit} pushed main at {commit[:12]}")
+        if isinstance(commit, land_queue.SettingsWaiting):
+            print(commit.report())
+        else:
+            print(f"fast-track {args.unit} pushed main at {commit[:12]}")
         return 0
     except (Refused, PublishedFailure, copies.CopyError, OSError, ValueError, KeyError) as error:
         print(f"fast-track: {error}", file=sys.stderr)

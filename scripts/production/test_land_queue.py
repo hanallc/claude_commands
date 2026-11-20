@@ -4,13 +4,14 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-from scripts.production import land_queue, unit_phases
+from scripts.production import land_queue, land_runs, unit_phases
 from zoneinfo import ZoneInfo
 
 
@@ -55,6 +56,19 @@ class LandQueueTests(unittest.TestCase):
         self.assertEqual(taken, ["builds batch590\n", "sdlc urgent\n", f"sdlc first {Path(first).resolve()}\n", ""])
         self.assertEqual(self.run_line("list")[1], "the land line is empty\n")
         self.assertEqual(land_queue.places(), {})
+
+    def test_stopped_settings_worker_does_not_block_the_next_land(self) -> None:
+        land_queue.add("builds next", batch="", commits=["a" * 40], first=False, before=None)
+        with land_runs.landing(["b" * 40]), land_queue.settings_gap() as admission:
+            self.assertIsInstance(admission, land_queue.SettingsWaiting)
+
+        def stopped(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(land_queue.listing(), "1. builds next: aaaaaaaaa")
+            return subprocess.CompletedProcess(command, -15, "", "")
+
+        with patch.object(subprocess, "run", stopped):
+            self.assertEqual(self.run_line("next"), (0, "builds next\n", "settings publication stopped with exit -15\n"))
+        self.assertEqual(land_queue.listing(), "the land line is empty")
 
     def test_next_prints_the_batch_path_stored_for_the_label(self) -> None:
         batch = self.batch("setupwait2", "aws hana-setup-wait " + "a" * 40)

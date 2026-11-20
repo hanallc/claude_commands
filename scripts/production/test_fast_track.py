@@ -9,6 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 import errno
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -26,6 +27,7 @@ from scripts.lib import build_folders, user_zone, zone
 from scripts.lint.memory_test_support import config_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.production import land_queue, land_runs
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture
 from scripts.production import fast_track, merge_checkpoint
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
@@ -439,6 +441,21 @@ class FastTrackTests(MergeCheckpointFixture):
     def director_fetches(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line))
                 for line in (self.control / "fetch-events.jsonl").read_text().splitlines()]
+
+    def test_fast_track_config_waits_and_publishes_its_saved_patch_in_the_gap(self) -> None:
+        path = "config/example.conf"
+        self.write(self.unit, path, "amount=3\n")
+        self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "land-line")
+        with patch.dict(os.environ, self.env, clear=True), land_runs.landing([self.initial]):
+            result = self.fast_track(path)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("main: waits for the land that runs now", result.stdout)
+            self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), self.initial)
+            self.assertEqual((self.unit / path).read_text(), "amount=3\n")
+        with patch.dict(os.environ, self.env, clear=True), redirect_stderr(io.StringIO()):
+            self.assertEqual(land_queue.take_next(), "")
+        self.assertEqual(self.git("show", f"main:{path}", cwd=self.origin), "amount=3")
+        self.assertEqual(len(self.records()), 1)
 
     def test_post_push_ref_lock_retries_then_restores_and_promotes(self) -> None:
         self.change_module()
