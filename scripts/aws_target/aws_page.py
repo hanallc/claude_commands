@@ -210,6 +210,7 @@ class PageData(TypedDict):
     render_seconds: float
     launch_state: LaunchState
     spend: SpendData
+    settled_notes: list[str]
     # Every region a table shows, for the region filter.
     regions: list[str]
     snapshot: list[SnapshotLine]
@@ -478,7 +479,7 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
 
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
-              launch_records: Sequence[dict[str, object]] = ()) -> PageData:
+              launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = ()) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
     regions = dict.fromkeys((*(row[0] for row in placement.rows), *tables.hours.headers[1:]))
@@ -487,6 +488,7 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
         'render_seconds': 0.0,
         'launch_state': launch_state(launch_records),
         'spend': spend,
+        'settled_notes': list(settled_notes),
         'regions': sorted(regions, key=region_filter_key),
         'snapshot': [{'region': region, 'text': text} for region, text in tables.snapshot_rows],
         'prices': [table_rows_data(table) for table in tables.prices],
@@ -521,6 +523,24 @@ def quota_help() -> str:
     return '<ol>' + ''.join(steps) + f'</ol>\n<p>{escape(console_help.WRONG_ACCOUNT)}</p>'
 
 
+def settled_amount_notes(watched: Sequence[ledger.WatchedChargeDay]) -> tuple[str, ...]:
+    unchanged = 0
+    changes: list[str] = []
+    for day in watched:
+        settlement = day.settlement
+        if isinstance(settlement, ledger.SettledChargeUnchanged):
+            unchanged += 1
+        elif isinstance(settlement, ledger.SettledChargeChanged):
+            changes.append(settlement.display_line(day.day))
+    settled = unchanged + len(changes)
+    if not settled:
+        return ()
+    checked = datetime.fromtimestamp(max(day.checked_at for day in watched), UTC)
+    summary = (f'Settled AWS amounts: {unchanged} of {settled} did not change after they settled '
+               + f'(checked {checked:%b} {checked.day}).')
+    return (summary, *changes)
+
+
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
     """Write the page with the tables of the local snapshot and run ledger."""
     started = time.perf_counter()
@@ -529,6 +549,10 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     read = aws_spend.read_spend(settings_path or conf.path('aws_target'), directory, now, today)
     spend = spend_data(read, now, configuration.whole('spend_pace_days'))
     try:
+        watched = ledger.CostLedger(directory).read_charge_watch(aws_config.read_settings(configuration), now)
+    except (OSError, ValueError):
+        watched = ()
+    try:
         placement = ledger.read_spot_placement_scores(directory)
     except (OSError, ValueError, KeyError) as error:
         print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
@@ -536,7 +560,8 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     values = conf.read_or_repository('cloud_gate')
     gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
     tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
-    data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches())
+    data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches(),
+                     settled_notes=settled_amount_notes(watched))
     comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)

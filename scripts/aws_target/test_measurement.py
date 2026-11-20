@@ -393,9 +393,30 @@ class MeasurementTests(MeasurementFixture):
         self.assertEqual(result.period_end - result.period_start, 24 * 3600)
 
 
+    def test_45_day_watch_uses_one_request_and_fee_for_one_page(self) -> None:
+        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_watch_days': '45',
+                    'cost_explorer_read_usd': '0.01'})
+        calls: list[list[str]] = []
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            calls.append(list(arguments))
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(account_reply(arguments, '2')), '')
+
+        controller = aws_target.AccountRefresh(self.settings, self.state, execute=execute)
+        api = aws_target.AwsCli('build-scaler', 'us-east-1', 30, execute)
+        at = NOW + 86400
+        first = narrow(self, controller.refresh_charges(api, at), measurement.ChargeRead)
+        self.assertEqual(controller.refresh_charges(api, at + 1), first)
+        arguments, = calls
+        self.assertEqual(arguments[arguments.index('--time-period') + 1], 'Start=2025-12-02,End=2026-01-16')
+        self.assertIn('--no-paginate', arguments)
+        self.assertEqual(first.query_usd, Decimal('0.01'))
+        self.assertEqual(len(self.book().bill_paths()), 45)
+        self.assertEqual(sum(row.query_usd for row in self.book().read_snapshot().reconciliations), Decimal('0.01'))
+
     def test_controller_schedules_one_account_charge_query_and_local_reports_never_repeat_it(self) -> None:
         self.seed_cost()
-        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_read_usd': '0.01'})
+        self.costs({'cost_explorer_lookback_days': '7', 'cost_explorer_watch_days': '7', 'cost_explorer_read_usd': '0.01'})
         calls: list[list[str]] = []
         amount = '0'
 

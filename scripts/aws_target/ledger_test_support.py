@@ -47,7 +47,8 @@ def numeric_settings(path: Path, values: dict[str, str]) -> None:
         else:
             lines.append(line)
     for key, value in values.items():
-        form = "whole" if key.endswith(("_seconds", "_timeout_s", "_days")) else "range"
+        whole = key == "cost_explorer_unchanged_reads" or key.endswith(("_seconds", "_timeout_s", "_days"))
+        form = "whole" if whole else "range"
         if key in ("connect_timeout_s", "leftover_timeout_s"):
             form = "range"
         lines.extend((f"# {form}: 0..", f"{key}={value}"))
@@ -231,6 +232,8 @@ class CostFixture(unittest.TestCase):
         self.state = self.root / "state"
         self.state.mkdir()
         install_aws_fixture_settings(self.root)
+        # The cost fixtures use one day unless a test needs a longer query.
+        self.replace('cost_explorer_watch_days', '1')
         environment = config_environment(self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment, "HOME": str(self.root),

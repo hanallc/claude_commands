@@ -917,13 +917,40 @@ Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
 Reports keep the existing reconciliation floors.
-The account checks adjust the existing total for each complete UTC day inside the limit window.
-They subtract that day's existing usage and add the newest complete AWS amount.
+The account checks adjust the existing total for each qualifying UTC day inside the limit window.
+They subtract that day's existing usage and add the newest qualifying AWS amount.
 An account bill qualifies when the name, day label, and bounds match one full UTC day.
 The bill must exclude credits and give at least USD 0.01 before rounding.
-The read time must be valid and at least `bill_complete_after_seconds` after the day ends.
-The read time cannot be in the future.
+The newest read time must be valid and cannot be in the future.
+The charge file keeps each read time and amount. A legacy file without a list supplies one read.
+Known limit. Concurrent refreshes can record one USD 0.01 fee for two Cost Explorer reads.
+Within the lookback, the last `cost_explorer_unchanged_reads` reads after the UTC day ends must report the same amount.
+Reads less than `cost_explorer_interval_seconds` apart count once.
+A different amount starts a new count. The AWS service logs the day and both amounts when the day becomes unsettled.
+Outside the lookback, the latest valid amount qualifies.
 The adjustment preserves query fees and any open gate allowances or reservations already in the total.
+
+Each scheduled Cost Explorer read requests the last `cost_explorer_watch_days=45` completed UTC days.
+The watch must cover at least `cost_explorer_lookback_days=7`.
+The reader makes one scheduled query each day.
+It saves the lookback days before it saves the older days.
+It logs a save error for an older day and continues with the other days.
+The query groups costs and quantities by usage type.
+AWS charges USD 0.01 for each page of the answer.
+The 45-day answer can take more than one page.
+The ledger records the actual fee for each read.
+The watch derives the first settled amount from the first sequence of equal counted reads.
+The AWS page shows how many recorded days still match their first settled amount.
+It shows the date of the newest read in UTC and lists each day with a different current amount.
+The history keeps earlier differences when the newest read returns to the first settled amount.
+The watch sends one message for each read that finds changes that it has yet to report.
+The message goes to the session in `cost_explorer_change_recipient=bob`.
+It uses the page wording and includes one line for each changed day.
+It checks all saved days, including days outside the query range.
+After a successful send, each charge file records the reported amount.
+A write error after delivery can cause the next message to repeat that day's line.
+After a failed send, the next read collects and tries all pending changes again.
+
 The report's costs pane must call `CostLedger.accrued_cost` for the current day or month to date.
 The function returns `cost`, `limit_count`, and the cost and bill state for each UTC day in the window.
 `cost` is the ledger estimate plus the same complete-day adjustment that the guard uses.
@@ -933,7 +960,7 @@ The per-day costs add up to `cost` and include separately named query fees and a
 The pane displays a counted bill as “Billed, final” only when the bill sets `provisional` to JSON `false`.
 The pane displays all other counted bills as “Billed, not final”.
 The pane displays other days as “Estimate”.
-An estimate can show `aws_amount_so_far` when a valid saved bill has yet to meet the age requirement.
+An estimate can show the newest valid AWS amount in `aws_amount_so_far` while the day remains unsettled.
 The tooltip labels this value “AWS amount so far”.
 The pane's “Time on AWS” row reads `run_cost.hana_billed_hours` for one UTC day.
 The reader returns billed Spot hours for Hana's configured region and machine types.
