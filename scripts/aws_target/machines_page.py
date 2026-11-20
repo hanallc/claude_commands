@@ -208,17 +208,21 @@ def _controls(data: machines_data.MachinesPageData, workload: machines_data.Meas
 def render(data: machines_data.MachinesPageData, now: int) -> str:
     """Render the page using one saved projection."""
     started = time.perf_counter()
-    merge = next(workload for workload in data.workloads if workload.mode == 'merge-gate')
-    others = ''.join(f'<p><strong>{escape(workload.name)}</strong> · {escape(workload.sentence)}</p>'
-                     for workload in data.workloads if workload.mode != 'merge-gate')
-    control_section = f'<section class="card"><h2>{escape(merge.name)}</h2>'
-    if isinstance(merge, machines_data.MeasuredWorkload):
-        control_section += _controls(data, merge) + '</section>' + _where_checks_run(merge) + _measurements(merge, data)
-    else:
-        control_section += f'<p class="note">{escape(merge.sentence)}</p></section>'
+    control_section = ''
+    other_workloads: list[str] = []
+    for workload in data.workloads:
+        if workload.mode == 'merge-gate' and isinstance(workload, machines_data.MeasuredWorkload):
+            control_section = (
+                '<p class="rule">The limit compares the cost of one run with the lowest-cost measured machine. '
+                + 'A run uses the cheapest allowed faster machine that is free. At 1.00, the faster machine rule is off.</p>'
+                + f'<section class="card"><h2>{escape(workload.name)}</h2>'
+                + _controls(data, workload) + '</section>' + _where_checks_run(workload) + _measurements(workload, data))
+        else:
+            other_workloads.append(f'<p>{escape(workload.sentence)}</p>')
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     body = page_frame.template(source, 'AWS Machines', console_tune.AWS_MACHINES_PAGE, action=_price_pill(data.price_read))
-    page = body.replace('__PRIMARY_WORKLOAD__', control_section, 1).replace('__OTHER_WORKLOADS__', others, 1)
+    page = body.replace('__PRIMARY_WORKLOAD__', control_section, 1).replace(
+        '__OTHER_WORKLOADS__', ''.join(other_workloads), 1)
     return page_frame.rendered(page.encode(), started, now).decode()
 
 

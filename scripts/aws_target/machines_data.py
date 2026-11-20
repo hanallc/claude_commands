@@ -14,7 +14,7 @@ from typing import Literal, cast
 
 from scripts.aws_target import cloud_gate, ledger, price_days, run_cost
 from scripts.aws_target.aws_target import read_snapshot, snapshot_failures
-from scripts.lib import conf
+from scripts.lib import build_steps, conf
 
 
 _WEEKS_PER_YEAR = 52
@@ -22,7 +22,7 @@ _MONTHS_PER_YEAR = 12
 _HOURS_IN_SECONDS = 3600
 _DAYS_PER_WEEK = 7
 _RULE_OFF = Decimal(1)
-_WORKLOADS = (('merge-gate', 'Merge checks'), ('targeted-test', 'Named tests'), ('test-affected', 'Affected tests'))
+_WORKLOADS = ('merge-gate', 'targeted-test', 'test-affected')
 _SAVED_PRICE_AUTH_FAILURE = re.compile(
     r'\b(?:AuthFailure|ExpiredToken(?:Exception)?|InvalidClientTokenId|UnrecognizedClientException)\b'
     + r'|unable to locate credentials', re.IGNORECASE)
@@ -33,6 +33,7 @@ class MachinesConfiguration:
     page: conf.ConfigRead
     gate: conf.ConfigRead
     account: conf.ConfigRead
+    names: build_steps.StepNames
 
 
 @dataclass(frozen=True)
@@ -117,7 +118,7 @@ class MeasuredWorkload:
     @property
     def sentence(self) -> str:
         sizes = len({choice.vcpus for choice in self.choices if choice.checks})
-        return _measurement_sentence(self.checks, sizes)
+        return _measurement_sentence(self.name, self.checks, sizes)
 
 
 @dataclass(frozen=True)
@@ -154,18 +155,15 @@ class _SavedPrices:
 
 
 def _workload(row: dict[str, object]) -> str:
+    job = row.get('gate_job')
+    if isinstance(job, dict):
+        step = cast(dict[str, object], job).get('step')
+        if isinstance(step, str) and step:
+            return step
     mode = row.get('mode')
     if mode == 'gate':
         return 'merge-gate'
-    if mode == 'targeted-test':
-        job = row.get('gate_job')
-        if isinstance(job, dict):
-            step = cast(dict[str, object], job).get('step')
-            if step == 'test-affected':
-                return 'test-affected'
-            if step in ('test-all', 'test-nightly'):
-                return ''
-    return mode if isinstance(mode, str) else ''
+    return mode if isinstance(mode, str) and mode in _WORKLOADS else ''
 
 
 def _saved_prices(directory: Path, now: int, days: int) -> _SavedPrices:
@@ -288,10 +286,10 @@ def _steps(rows: Sequence[cloud_gate.GateRankedChoice], types: tuple[str, ...], 
     return tuple(steps)
 
 
-def _measurement_sentence(checks: int, sizes: int) -> str:
-    check_word = 'check' if checks == 1 else 'checks'
+def _measurement_sentence(name: str, runs: int, sizes: int) -> str:
+    run_word = 'run' if runs == 1 else 'runs'
     size_word = 'size' if sizes == 1 else 'sizes'
-    return f'The records hold {checks} completed {check_word} on {sizes} machine {size_word} in this period.'
+    return f'The records for {name} hold {runs} completed {run_word} on {sizes} machine {size_word} in this period.'
 
 
 def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], intervals: Sequence[_GateInterval],
@@ -300,7 +298,7 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
                       ) -> MeasuredWorkload | WorkloadWithoutComparison:
     checks = len(intervals)
     if not checks:
-        return WorkloadWithoutComparison(name, mode, 'The records hold 0 completed checks in this period.')
+        return WorkloadWithoutComparison(name, mode, f'The records for {name} hold 0 completed runs in this period.')
     home = configuration.account.text('region')
     gate = configuration.gate
     types = gate.words('instance_types')
@@ -324,11 +322,11 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
     ranked_rows: list[cloud_gate.GateRankedChoice] = []
     assumptions = [
         'A month has 52 weeks divided by 12.',
-        'The measured check rate, overlap, and share of Spot refusals repeat.',
-        'This workload has the quota for itself. Other workloads can reduce its available quota.',
+        f'The measured run rate, overlap, and share of Spot refusals repeat for {name}.',
+        f'The estimate gives {name} the full quota. Other jobs can reduce its available quota.',
         'Each successful launch and each capacity refusal counts as one Spot request.',
         'Prices use the median of saved daily means, or the lowest saved zone price when daily means are absent.',
-        'The projection uses deployed choices with measurements within the gate time limit.',
+        f'The projection uses deployed choices with measurements within the time limit for {name}.',
         'The projection includes configured transfer cost.',
     ]
     for machine in sorted(samples.keys() | launched.keys() | refused.keys(),
@@ -366,15 +364,15 @@ def _project_workload(name: str, mode: str, rows: Sequence[dict[str, object]], i
             fits, granted, fits * granted)
     measured_sizes = {choice.vcpus for choice in choices.values() if choice.checks}
     if len(measured_sizes) == 1:
-        return WorkloadWithoutComparison(name, mode, _measurement_sentence(checks, 1), tuple(choices.values()))
+        return WorkloadWithoutComparison(name, mode, _measurement_sentence(name, checks, 1), tuple(choices.values()))
     if not ranked_rows:
         return WorkloadWithoutComparison(name, mode,
-            'No deployed choice has a measurement within the gate time limit.', tuple(choices.values()))
+            f'No deployed choice has a measurement for {name} within the time limit.', tuple(choices.values()))
     ranking = cloud_gate.rank_gate_choices(ranked_rows, types, _RULE_OFF)
     reference = ranking.reference
     if not isinstance(reference, cloud_gate.GateRankedChoice):
         return WorkloadWithoutComparison(name, mode,
-            'No eligible measured choice has a saved price.', tuple(choices.values()))
+            f'No eligible measured choice for {name} has a saved price.', tuple(choices.values()))
     assert isinstance(reference.estimate, run_cost.GatePlacementEstimate)
     monthly_checks = Decimal(checks * _DAYS_PER_WEEK * _WEEKS_PER_YEAR) / (_MONTHS_PER_YEAR * (end - start).days)
     steps = _steps(ranked_rows, types, ratios, reference, choices, monthly_checks)
@@ -394,7 +392,7 @@ def read_machines_data(directory: Path, now: int,
     """Read the last complete UTC days and project every slider value."""
     if configuration == 'live_settings':
         configuration = MachinesConfiguration(conf.read_or_repository('aws_page'), cloud_gate.settings(),
-                                               conf.read_or_repository('aws_target'))
+                                               conf.read_or_repository('aws_target'), build_steps.read_step_names())
     page = configuration.page
     days = page.whole('machines.window_days')
     ratio_max = page.value('machines.ratio_max', conf.decimal)
@@ -409,16 +407,22 @@ def read_machines_data(directory: Path, now: int,
     try:
         reservations = {row.attempt: row for row in ledger.CostLedger(directory).read_snapshot().gate_reservations}
     except ledger.LedgerUnavailable:
+        names = configuration.names
         return MachinesPageData(start, end, ratio_max, ratio_step, prices.read, tuple(
-            WorkloadWithoutComparison(name, mode, 'The cost ledger is unavailable.') for mode, name in _WORKLOADS))
-    launches = ledger.recent_gate_launches(directory, start.timestamp())
+            WorkloadWithoutComparison(names.shown(mode), mode, f'The cost ledger for {names.shown(mode)} is unavailable.')
+            for mode in _WORKLOADS))
+    rows_by_workload: dict[str, list[dict[str, object]]] = defaultdict(list)
+    window_end = end.timestamp()
+    for row in ledger.recent_gate_launches(directory, start.timestamp()):
+        if float(str(row['time'])) < window_end and (mode := _workload(row)):
+            rows_by_workload[mode].append(row)
     home = configuration.account.text('region')
     deployed: dict[ledger.GateRateCandidate, run_cost.GateLaunchVariant] = {}
     for variant in run_cost.read_deployed_gate_variants(directory, configuration.gate.words('instance_types'), home):
         _ = deployed.setdefault(ledger.GateRateCandidate(variant.instance_type, variant.region), variant)
     workloads: list[MeasuredWorkload | WorkloadWithoutComparison] = []
-    for mode, name in _WORKLOADS:
-        rows = tuple(row for row in launches if _workload(row) == mode)
-        workloads.append(_project_workload(name, mode, rows, _intervals(rows, reservations, home, start, end),
-                                           prices, start, end, configuration, ratios, deployed))
+    for mode in dict.fromkeys((*_WORKLOADS, *sorted(rows_by_workload))):
+        rows = rows_by_workload[mode]
+        workloads.append(_project_workload(configuration.names.shown(mode), mode, rows,
+            _intervals(rows, reservations, home, start, end), prices, start, end, configuration, ratios, deployed))
     return MachinesPageData(start, end, ratio_max, ratio_step, prices.read, tuple(workloads))

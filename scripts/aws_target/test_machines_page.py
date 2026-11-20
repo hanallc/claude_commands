@@ -25,7 +25,7 @@ END = datetime(2026, 11, 20, tzinfo=UTC)
 NOW = int(END.timestamp()) + 12 * 3600
 PRICE_READ = NOW - 3600
 RATIO_KEY = 'faster_box_max_cost_ratio'
-WORKLOAD_NAME = 'Landing validation'
+WORKLOAD_NAME = 'gate'
 PAGE_SETTINGS = """# range: 1..10
 machines.ratio_max=3.00
 # range: 0.01..1
@@ -49,7 +49,7 @@ def fixture_data(*, aws_closed: bool = False) -> machines_data.MachinesPageData:
     large = ledger.GateRateCandidate('c7a.8xlarge', 'eu-north-1')
     reserve = ledger.GateRateCandidate('m7a.8xlarge', 'us-east-2')
     choices = (
-        machines_data.MachineChoice(small, 16, 721, D(445), D('.1092'), D('.0135'), True, 0, 721,
+        machines_data.MachineChoice(small, 16, 980, D(445), D('.1092'), D('.0135'), True, 0, 980,
                                     False, D(136), False, D(1), D(1), D(1)),
         machines_data.MachineChoice(large, 32, 30, D(248), D('.2424'), D('.0167'), True, 0, 30,
                                     True, D(136), True, D('.978'), D(1), D('.978')),
@@ -71,14 +71,15 @@ def fixture_data(*, aws_closed: bool = False) -> machines_data.MachinesPageData:
     )
     workload = machines_data.MeasuredWorkload(WORKLOAD_NAME, 'merge-gate', choices, small, 1075, D(4658),
         D('62.72'), ((1, 611), (2, 272), (3, 125), (4, 43), (5, 19), (6, 5)), D('1.50'), D('14.14'), steps,
-        ('A month has 52 weeks divided by 12.', 'The measured check rate and share of Spot refusals repeat.',
+        ('A month has 52 weeks divided by 12.',
+         f'The measured run rate, overlap, and share of Spot refusals repeat for {WORKLOAD_NAME}.',
          'The estimate uses a quota of 136 vCPUs for Sweden.'))
     return machines_data.MachinesPageData(START, END, D('3.00'), D('.05'),
         machines_data.SavedSpotPriceRead(PRICE_READ, aws_closed), (workload,
-        machines_data.WorkloadWithoutComparison('Named tests', 'targeted-test',
-            'The records hold 608 completed checks on 1 machine size in this period.'),
-        machines_data.WorkloadWithoutComparison('Affected tests', 'test-affected',
-            'The records hold 38 completed checks on 1 machine size in this period.')))
+        machines_data.WorkloadWithoutComparison('targeted test', 'targeted-test',
+            'The records for targeted test hold 608 completed runs on 1 machine size in this period.'),
+        machines_data.WorkloadWithoutComparison('test affected', 'test-affected',
+            'The records for test affected hold 38 completed runs on 1 machine size in this period.')))
 
 
 class _PageServer(ThreadingHTTPServer):
@@ -110,10 +111,11 @@ class MachinesPageTests(unittest.TestCase):
     def test_page_with_no_comparison_shows_the_recorded_reason(self) -> None:
         data = fixture_data()
         unavailable = machines_data.WorkloadWithoutComparison(WORKLOAD_NAME, 'merge-gate',
-            'No eligible measured choice has a saved price.')
+            'The records for gate hold 1 completed run on 1 machine size in this period.')
         page = machines_page.render(replace(data, workloads=(unavailable, *data.workloads[1:]),
             price_read=machines_data.NoSavedSpotPriceRead()), NOW)
-        self.assertIn(unavailable.sentence, page)
+        self.assertIn(f'<h2>Other workloads</h2>\n<p>{unavailable.sentence}</p>', page)
+        self.assertEqual(page.count(unavailable.sentence), 1)
         self.assertIn('No saved Spot prices', page)
         self.assertNotIn('id="machine-controls"', page)
 
@@ -125,6 +127,16 @@ class MachinesPageTests(unittest.TestCase):
         self.assertIn('Set the limit for Landing &amp; validation</button>', page)
         self.assertIn('1,075 completed runs for Landing &amp; validation', page)
         self.assertNotRegex(page.lower(), r'merge[- ](?:check|gate)')
+
+    def test_page_shows_an_additional_measured_job_without_controls(self) -> None:
+        data = fixture_data()
+        primary = data.workloads[0]
+        assert isinstance(primary, machines_data.MeasuredWorkload)
+        other = replace(primary, name='test named', mode='test-modules')
+        page = machines_page.render(replace(data, workloads=(*data.workloads, other)), NOW)
+        self.assertIn('<p>The records for test named hold 1075 completed runs on 2 machine sizes in this period.</p>', page)
+        self.assertEqual(page.count('id="machine-controls"'), 1)
+        self.assertNotIn('<select', page)
 
     def test_registry_reads_the_limits_from_private_settings(self) -> None:
         _ = (self.root / 'aws_page.conf').write_text("""# range: 1..10
@@ -180,11 +192,13 @@ machines.ratio_step=0.25
  try {
   check(document.querySelector('.price-pill').innerText.includes('AWS is closed. Last saved prices'), 'Closed AWS price');
   check(document.querySelector('.price-pill time').dateTime === '2026-11-20T11:00:00+00:00', 'Saved price time');
-  check(document.querySelector('.other-workloads').innerText.includes('608 completed checks on 1 machine size'), 'Named tests');
-  check(document.querySelector('.other-workloads').innerText.includes('38 completed checks on 1 machine size'), 'Affected tests');
+  const otherWorkloads = document.querySelector('.other-workloads').innerText;
+  check(otherWorkloads.includes('targeted test hold 608 completed runs on 1 machine size'), 'Targeted test');
+  check(otherWorkloads.includes('test affected hold 38 completed runs on 1 machine size'), 'Test affected');
+  check(!/\bmerge\b/i.test(document.querySelector('main').innerText), 'No old name in the visible page');
   check(document.querySelectorAll('.sample').length === 2, 'Small samples');
   check(slider.valueAsNumber === 1.5 && amount.value === '31.36', 'Live ratio and ceiling');
-  check(go.textContent === 'Set the limit to 1.50 for Landing validation', 'Go uses the workload name');
+  check(go.textContent === 'Set the limit to 1.50 for gate', 'Go uses the workload name');
   go.dispatchEvent(new Event('click'));
   document.querySelector('[data-setting-save]').click();
   check(document.querySelector('[data-setting-confirm]').hidden, 'An unchanged value has no confirmation');
