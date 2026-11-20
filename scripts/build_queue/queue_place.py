@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
+import errno
 import os
 from pathlib import Path
 import re
@@ -220,19 +221,20 @@ class ProgramStart:
 
 def read_program_start(record: Path) -> ProgramStart | None:
     try:
-        return wire.parse_record(record.read_text(), ProgramStart)
+        return wire.parse_record(build_folders.read_program_record(record), ProgramStart)
     except FileNotFoundError:
         return None
     except snapshot_codec.SnapshotParseError:
         raise
-    except (ValueError, RecursionError) as error:
+    except (OSError, ValueError, RecursionError) as error:
         raise snapshot_codec.SnapshotParseError(str(error)) from error
 
 
 def _recorded_sidecar(path: Path) -> str:
     """Read a complete sidecar field from a damaged record for retention."""
     with suppress(OSError, ValueError):
-        if match := re.search(r'(?:^|[,{])\s*"sidecar"\s*:\s*("(?:[^"\\]|\\.)*")', path.read_text()):
+        text = build_folders.read_program_record(path)
+        if match := re.search(r'(?:^|[,{])\s*"sidecar"\s*:\s*("(?:[^"\\]|\\.)*")', text):
             return wire.parse_record(match[1], str)
     return ""
 
@@ -343,6 +345,7 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
             else:
                 start = admission_records.process_start_time(record.program.pid)
                 if start is None or start == record.program.start_time:
+                    # Linux publishes the scope before Cargo starts. Mac recovery uses the process tree.
                     tree = ProgramTree(record.program.pid)
                     tree.observed[record.program.pid] = record.program.start_time
                     stop_members(lambda: tree.live_members(set()), deadline, configuration.program_sample_seconds)
@@ -382,6 +385,22 @@ def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequenc
     program_start(record, wire.Owner(holder_pid, holder_start), argv, sidecar=sidecar, scope=str(scope))
 
 
+def _scope_is_empty(scope: Path) -> bool:
+    events = scope / "cgroup.events"
+    memory_admit.check_memory_reading(events)
+    try:
+        populated = [line for line in events.read_text().splitlines() if line.startswith("populated ")]
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.ENODEV):
+            raise
+        try:
+            _ = scope.lstat()
+        except FileNotFoundError:
+            return True
+        raise CleanupUnresolved(f"scope {scope} has no readable cgroup.events") from error
+    return populated == ["populated 0"]
+
+
 def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
     """Stop scope members until the scope is empty."""
     kill_at = (time.monotonic() + deadline) / 2
@@ -390,14 +409,14 @@ def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
             members = memory_admit.scope_members(scope)
         except ValueError as error:
             raise CleanupUnresolved(f"could not read the members of {scope}: {error}") from error
-        if not members:
+        if not members and _scope_is_empty(scope):
             return
         now = time.monotonic()
         if now >= deadline:
             raise CleanupUnresolved(f"scope {scope} still has live processes")
         number = signal.SIGKILL if now >= kill_at else signal.SIGTERM
         killed_scope = False
-        if number == signal.SIGKILL:
+        if members and number == signal.SIGKILL:
             try:
                 _ = (scope / "cgroup.kill").write_text("1\n")
                 killed_scope = True

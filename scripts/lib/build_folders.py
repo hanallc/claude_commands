@@ -50,19 +50,24 @@ def removal_mark(path: Path) -> Path:
     return path.parent / f"{REMOVAL_RECORD_PREFIX}{path.name}{REMOVAL_RECORD_SUFFIX}"
 
 
-def open_busy_mark(mark: Path, *, create: bool, exclusive: bool = False) -> int:
-    """Return a descriptor for a regular busy mark. The caller closes it."""
+def _open_regular_file(path: Path, *, create: bool, exclusive: bool = False) -> int:
+    """Open a regular file without following links or blocking on a FIFO."""
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     if create:
         flags |= os.O_CREAT | (os.O_EXCL if exclusive else 0)
-    descriptor = os.open(mark, flags, 0o600)
+    descriptor = os.open(path, flags, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise OSError(errno.EINVAL, "busy mark must be a regular file", str(mark))
+            raise OSError(errno.EINVAL, "expected a regular file", str(path))
     except BaseException:
         os.close(descriptor)
         raise
     return descriptor
+
+
+def open_busy_mark(mark: Path, *, create: bool, exclusive: bool = False) -> int:
+    """Return a descriptor for a regular busy mark. The caller closes it."""
+    return _open_regular_file(mark, create=create, exclusive=exclusive)
 
 
 def require_no_removal_mark(path: Path) -> None:
@@ -803,6 +808,12 @@ def program_starts() -> Path:
     return root / "program-starts"
 
 
+def read_program_record(path: Path) -> str:
+    """Read a regular program recovery record."""
+    with os.fdopen(_open_regular_file(path, create=False), encoding="utf-8") as record:
+        return record.read()
+
+
 def _legacy_program_recovery_pending() -> bool:
     """Keep queue sidecars when a scoped record cannot identify its sidecar."""
     records = program_starts()
@@ -816,7 +827,7 @@ def _legacy_program_recovery_pending() -> bool:
         if not name.endswith(".json"):
             continue
         try:
-            record = cast(object, json.loads((records / name).read_text()))
+            record = cast(object, json.loads(read_program_record(records / name)))
         except FileNotFoundError:
             continue
         except (OSError, ValueError, RecursionError):

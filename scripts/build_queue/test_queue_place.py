@@ -394,7 +394,8 @@ class QueuePlaceFixture(ExitStack):
             return read_text(path, *args, **kwargs)  # pyright: ignore[reportArgumentType]
 
         def membership_or_private_sample(path: Path) -> None:
-            if path.is_relative_to("/sys/fs/cgroup") and (path.name in readings or path.name == "cgroup.procs"):
+            if path.is_relative_to("/sys/fs/cgroup") and (path.name in readings
+                                                         or path.name in ("cgroup.procs", "cgroup.events")):
                 return
             guard(path)
 
@@ -1343,6 +1344,31 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
     def test_program_record_with_a_400_digit_pid_keeps_its_folder_and_allows_admission(self) -> None:
         self.assert_damaged_program_record_keeps_folder(truncated=False)
 
+    def test_fifo_program_record_is_refused_and_keeps_the_queue_sidecar(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            holder = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True, timeout=3)
+            spec = build_folders.BuildFolderSpec(kind="tool", parent=fixture.root, purpose="queue-place",
+                                                suffix_length=0, owner_pid=int(holder.stdout))
+            with build_folders.leased_build_folder(spec) as old:
+                sidecar = old / build_folders.QUEUE_PROGRAM_SIDECAR
+                _ = sidecar.write_text("")
+
+            fifo = queue.program_starts() / "fifo.json"
+            fifo.parent.mkdir(parents=True, exist_ok=True)
+            os.mkfifo(fifo)
+            with self.assertRaises(snapshot_codec.SnapshotParseError):
+                _ = queue.read_program_start(fifo)
+
+            timing = wire.RunnerExecutionTiming(program_sample_seconds=0.1, program_stop_seconds=0,
+                                                peak_wave_seconds=1)
+            output = io.StringIO()
+            with redirect_stderr(output):
+                self.assertEqual(queue.cleanup_program_starts(timing), set())
+            self.assertIn(f"UNRESOLVED: recovery kept {fifo}", output.getvalue())
+            self.assertTrue(fifo.is_fifo())
+            self.assertFalse(build_folders.reclaim_build_folder(old, wait=False))
+            self.assertTrue(sidecar.is_file())
+
     def assert_damaged_program_record_keeps_folder(self, *, truncated: bool) -> None:
         with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {"TMPDIR": str(fixture.root)}):
             holder = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True, timeout=3)
@@ -1368,6 +1394,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             empty_scope = fixture.root / "empty-scope"
             empty_scope.mkdir()
             _ = (empty_scope / "cgroup.procs").write_text("")
+            _ = (empty_scope / "cgroup.events").write_text("populated 0\n")
             _ = recoverable.write_text(wire.encode_record(queue.ProgramStart(owner, owner, str(empty_scope))))
 
             output = io.StringIO()
@@ -1414,6 +1441,24 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
     def test_allocation_keeps_a_legacy_sidecar_until_recovery_checks_the_scope(self) -> None:
         self.assert_pending_scope_keeps_folder(legacy=True)
 
+    def test_stop_scope_waits_for_an_empty_scope_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            scope = Path(temporary)
+            _ = (scope / "cgroup.procs").write_text("")
+            events = scope / "cgroup.events"
+            _ = events.write_text("populated 1\n")
+            clock = FakeClock()
+            with mock.patch.object(queue, "time", clock):
+                with self.assertRaisesRegex(queue.CleanupUnresolved, "still has live processes"):
+                    queue.stop_scope(scope, 2, 0.5)
+                self.assertEqual(clock.sleeps, [0.5] * 4)
+                _ = events.write_text("populated 0\n")
+                queue.stop_scope(scope, 2, 0.5)
+                queue.stop_scope(scope / "missing", 2, 0.5)
+                events.unlink()
+                with self.assertRaisesRegex(queue.CleanupUnresolved, "no readable cgroup.events"):
+                    queue.stop_scope(scope, 2, 0.5)
+
     def assert_pending_scope_keeps_folder(self, *, legacy: bool) -> None:
         with QueuePlaceFixture() as fixture:
             with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
@@ -1428,6 +1473,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             scope.mkdir()
             members = scope / "cgroup.procs"
             _ = members.write_text(f"{owner.pid}\n")
+            events = scope / "cgroup.events"
+            _ = events.write_text("populated 1\n")
             parent = fixture.root / "tools"
             spec = build_folders.BuildFolderSpec(kind="tool", parent=parent, purpose="queue-place",
                                                 suffix_length=0, owner_pid=owner.pid)
@@ -1465,6 +1512,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertTrue(sidecar.is_file())
             self.assertTrue(record.is_file())
             _ = members.write_text("")
+            _ = events.write_text("populated 0\n")
             with build_folders.tool_folder("queue-place", parent) as current:
                 self.assertNotEqual(current, old)
             self.assertEqual(queue.cleanup_program_starts(expired), set())
