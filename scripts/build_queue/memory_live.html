@@ -126,7 +126,11 @@ __PAGE_FRAME_STYLE__
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
 #tip > .tip { max-width: min(24rem, calc(100vw - 16px)); }
 .tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
-.tip:has(dd.call) :is(dt, dd) { white-space: normal; overflow-wrap: anywhere; }
+.tip:has(dd.call) :is(dt, dd):not(.call) { white-space: normal; overflow-wrap: anywhere; }
+.tip dd.call > div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; white-space: normal; }
+.tip dd.call span { display: inline-block; width: max-content; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 /* shared:step-tip:end */
 .seg-remote { background: var(--remote-memory); }
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
@@ -809,14 +813,17 @@ function stepTooltip(key, data) {
   const verify = row.verify;
   const stepFields = verify ? [field('Step', verify.total > 1
     ? `${verify.step} (${verify.position} of ${verify.total})` : verify.step)] : [];
-  const callFields = verify ? [field('Call', verify.call, 'call', true)] : [];
+  const call = verify?.call || row.call;
+  const callFields = call ? [field('Call', call, 'call', true)] : [];
   const unavailable = row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used))
     || (waiting && !['cloud', 'repository-slot'].includes(row.kind) && row.head_room?.unavailable);
-  if (unavailable) return [stepTitle(row, 'unavailable'), ...stepFields, ...callFields];
-  const rows = [stepTitle(row, [state, duration].filter(Boolean).join(' '))];
-  // A gate job says what it does and what it changes (#109).
-  if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts}, field('Changes', row.changes));
-  if (row.group) return [field(row.name, ramAmount(row.used * GIB), 'title'), field('Started by', 'not the queue'),
+  const title = row.group ? field(row.name, ramAmount(row.used * GIB), 'title')
+    : stepTitle(row, unavailable ? 'unavailable' : [state, duration].filter(Boolean).join(' '));
+  const rows = [title];
+  if (row.about) rows.push(field('', row.about, 'caption'));
+  if (row.changes) rows.push(field('Changes', row.changes));
+  if (unavailable) return [...rows, ...stepFields, ...callFields];
+  if (row.group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
       const suffix = [recorded(part.pid) ? part.pid : '', part.started_at > 0 ? ago(part.started_at, data.read_at) : '']
         .filter(Boolean).join(' · ');
@@ -908,9 +915,11 @@ function tipRowsHtml(rows) {
   return '<dl class="tip">'+rows.map(row => {
     const classes=[row.kind === 'field' ? '' : row.kind, row.group ? 'group' : ''].filter(Boolean).join(' ');
     const attr=classes ? ` class="${classes}"` : '';
-    return ['caption','long'].includes(row.kind) ? `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : esc(row.value)}</dd>`
-      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` +
-        `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value)}</dd>`;
+    const value = row.kind === 'call' ? `<div>${esc(row.value).replace(/\S+/g, '<span>$&</span>')}</div>`
+      : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value);
+    const cell = `<dd${attr}>${value}</dd>`;
+    return ['caption','long'].includes(row.kind) ? cell
+      : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` + cell;
   }).join('')+'</dl>';
 }
 function tipText(key, data) {
@@ -1744,7 +1753,7 @@ addEventListener("keydown", event => {
 });
 async function tick(supersede=false,current=()=>true) {
   if (consoleHidden() || paused) return;
-  const r = await fetch(`memory.json?t=${Date.now()}`, { cache: "no-store" });
+  const r = await fetch("memory.json", { cache: "no-cache" });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const d = await r.json();
   if (!current() || paused) return;

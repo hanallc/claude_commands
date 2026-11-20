@@ -98,6 +98,9 @@ The history counts an older file of cloud gate runs under a box name as `aws` to
 Git's `cloud-gates/<attempt>` directory retains each request, bundle, launch, result, log, and import marker.
 The AWS state folder retains `cloud-gate-launches.jsonl`.
 Each launch call records its time, attempt, instance type, vCPUs, zone, result, error code, and reason.
+Launch, refusal, fallback, and finish rows record the queue's tagged job record in `gate_job`.
+The field contains `{"kind":"GateJobNotRecorded"}` when the job is unknown.
+Older rows can omit the field.
 A refusal prints `Cloud gate refused: <type> in <zone>: <code>`.
 Local fallback prints `Cloud gate uses natedev: <reason>`.
 These lines contain no account, instance, or subnet identifier.
@@ -164,9 +167,9 @@ The gate bucket blocks public access, requires HTTPS, encrypts objects, and remo
 | `expiry_memory_mib` | `128` | Size the expiry function. |
 | `shared_usd_per_month` | `1` | Price shared gate resources before creation. |
 | `credential_file` | `~/.config/aws-build/credentials` | Select the service's private scaler file. |
-| `packages` | See the configured list below. | Prepare the common trial and production tools. |
+| `packages` | List in `config/cloud_gate.conf`. | Prepare tools for cloud gates and paired trials. |
 
-The package list contains `git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq gcc pkg-config tmux taplo zsh bash gh sqlite chromium util-linux awscli2`.
+The list includes bubblewrap for tests that need a sandbox.
 The existing `aws_target.conf` supplies the profile, region, placement, accounting settings, and shared limits.
 
 Fake AWS tests cover launch order, lost replies, restart recovery, expiry, termination, result validation, fallback, and concurrent cap reservations.

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
-from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
+from scripts.build_queue.admission_test_support import (
+    PrivateHostEvidence, caller_admission, caller_provider_controls, private_provider_evidence,
+)
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
 from scripts.lib.berth_test_support import write_unconfigured_berth
@@ -31,7 +33,7 @@ import unittest
 import contextlib
 from contextlib import contextmanager
 from collections.abc import Callable, Generator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, NotRequired, TypedDict, cast, override
@@ -46,6 +48,29 @@ from scripts.lib.shell_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
+
+_REACHABLE_SSH_STUB = b'#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
+
+
+def drop_released_mac_claim(reader: service.HostEvidenceReader, claim: placement.ProviderClaimReference) -> None:
+    worker, key = reader.worker, reader.key
+    with worker.lock:
+        cached = worker.observations.get(key)
+        if isinstance(cached, placement.FreshHostEvidence):
+            updated = replace(cached,
+                claims=tuple(held for held in cached.claims if held.reference != claim),
+                cleanup_claims=tuple(held for held in cached.cleanup_claims if held.reference != claim),
+                executions=tuple(execution for execution in cached.executions if execution[0] != claim))
+            if isinstance(updated, PrivateHostEvidence) and updated.holder_claim == claim:
+                updated = replace(updated, holder=placement.ResourceHolderUnknown(),
+                    holder_claim=placement.NoProviderClaim(), provider_diagnostic=placement.NO_PROVIDER_DIAGNOSTIC)
+            if updated != cached:
+                worker.observations[key] = updated
+        if key in worker.subscriptions:
+            # Discard probes that started before the claim release.
+            worker.subscriptions[key] = object()
+            worker.due[key] = float("-inf")
+            worker.requested.set()
 
 
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -495,7 +520,7 @@ fi
 '''
 
 
-ASSIGNED_RUNNER_SETUP = r'''
+ASSIGNED_RUNNER_SETUP = rf'''
 if "--assignment-file" in arguments:
     import atexit
     import io
@@ -503,7 +528,7 @@ if "--assignment-file" in arguments:
     from contextlib import redirect_stdout
 
     with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root:
-        exec(package_root.read(), {"__file__": package_root.name})
+        exec(package_root.read(), {{"__file__": package_root.name}})
     from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
     from scripts.mac_test import mac_test as assigned_mac_test, claim_state
     from scripts.lib import process_start
@@ -532,7 +557,7 @@ if "--assignment-file" in arguments:
     start = process_start.process_start(os.getpid())
     assert isinstance(start, process_start.Started)
     holder = placement.ClaimHolderIdentity(assignment.owner.host, os.getpid(), start.start)
-    permission_deadline = time.monotonic() + 10
+    permission_deadline = time.monotonic() + {TEST_HANG_GUARD_SECS}
     while True:
         permission = admission_client.consume_permission(wire.ConsumePermission(uuid.uuid4().hex, assignment, reference, holder))
         if isinstance(permission, wire.FirstAuthorization):
@@ -812,15 +837,20 @@ if __name__ == "__main__":
 SLEEP_STUB = r'''#!/bin/sh
 # Record the requested interval; only explicit routing gates block this fixture.
 root=$TEST_RUNNER_STATE
+count_events() {
+    count=0
+    if [ -s "$1" ]; then
+        while IFS= read -r line; do count=$((count + 1)); done < "$1"
+    fi
+}
 if [ "${TEST_PROVIDER_ROUTE_POLL_GATES:-0}" = 1 ]; then
     if [ "$1" != "${BUILD_TARGETS_POLL_S:-15}" ]; then
         exec "$TEST_REAL_SLEEP" "$@"
     fi
-    attempts=0
-    previous=0
-    if [ -s "$root/runner-events.jsonl" ]; then attempts=$(wc -l < "$root/runner-events.jsonl"); fi
-    if [ -s "$root/sleep-events" ]; then previous=$(wc -l < "$root/sleep-events"); fi
-    if [ "$attempts" -le "$previous" ]; then exit 0; fi
+    count_events "$root/runner-events.jsonl"
+    attempts=$count
+    count_events "$root/sleep-events"
+    if [ "$attempts" -le "$count" ]; then exit 0; fi
 fi
 if [ "${TEST_ROUTE_SLEEP_AFTER_RUNNER:-0}" = 1 ] && [ ! -s "$root/runner-events.jsonl" ]; then
     exit 0
@@ -828,8 +858,8 @@ fi
 printf '%s\n' "$1" >> "$root/sleep-events"
 gate=""
 if [ "${TEST_STEP_ROUTING_SLEEP:-0}" = 1 ]; then
-    step=$(wc -l < "$root/sleep-events")
-    step=$((step + 0))
+    count_events "$root/sleep-events"
+    step=$count
     printf 'sleeping\n' > "$root/routing-sleep"
     printf 'sleeping\n' > "$root/routing-sleep-$step"
     gate="$root/continue-sleep-$step"
@@ -1002,7 +1032,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             self.build_fixture()
         self.addCleanup(self.assert_nothing_outlives)
         admission = caller_admission(self, self.root, self.environment)
-        admission.configure(waiting_pass_seconds=0.05)
+        admission.configure(waiting_pass_seconds=0.25)
 
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
             self.provider_observations.append(key)
@@ -1070,17 +1100,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                     reason = (reason_file.read_text().strip() if reason_file.exists()
                               else self.placement_policy.get("TEST_RUNNER_BUSY_REASON", "busy"))
                     eligibility = placement.TemporaryExclusion(reason)
-                else:
-                    try:
-                        probe = subprocess.run(
-                            [str(self.bin_directory / "ssh"), values.get("host", destination.host), "true"],
-                            env=self.environment, stdin=subprocess.DEVNULL, capture_output=True,
-                            check=False, timeout=1)
-                        unreachable = probe.returncode != 0
-                    except (OSError, subprocess.TimeoutExpired):
-                        unreachable = True
-                    if unreachable:
-                        eligibility = placement.TemporaryExclusion("unreachable")
+                elif not self.ssh_probe_reaches(values.get("host", destination.host)):
+                    eligibility = placement.TemporaryExclusion("unreachable")
             directory = (Path(self.environment["MAC_TEST_STATE_DIR"]) if destination.target == "mac" else
                          self.home / ".local/state/build-targets" / destination.target)
             controller = directory / "controller.json"
@@ -1094,6 +1115,40 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
         admission.server.host_probe = provider
         _ = caller_provider_controls(self, admission)
+        handle_request = admission.server.handle_request
+
+        def refresh_after_release(request: wire.Request,
+                                  connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                                  ) -> list[wire.Reply]:
+            replies = handle_request(request, connection)
+            if (isinstance(request, wire.ExecutionReport)
+                    and request.assignment.destination.provider == "mac"
+                    and isinstance(request.claim, placement.ProviderClaimReference)
+                    and (request.claim.episode, request.claim.attempt) == (request.assignment.episode, request.assignment.attempt)
+                    and isinstance(request.path, placement.DispatchPathSettled)
+                    and isinstance(request.outcome, (placement.PrelaunchRefused, placement.AttemptDeclined))):
+                assignment = request.assignment
+                key = admission.server.placement_host_keys.get((assignment.episode, assignment.destination))
+                reader = admission.server.host_readers.get(key) if key is not None else None
+                if reader is not None:
+                    drop_released_mac_claim(reader, request.claim)
+            return replies
+
+        admission.server.handle_request = refresh_after_release
+
+    def ssh_probe_reaches(self, host: str) -> bool:
+        ssh = self.bin_directory / "ssh"
+        try:
+            if ssh.read_bytes() == _REACHABLE_SSH_STUB and os.access(ssh, os.X_OK):
+                return True
+        except OSError:
+            pass
+        try:
+            probe = subprocess.run([str(ssh), host, "true"], env=self.environment,
+                                   stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return probe.returncode == 0
 
     def fixture_paths(self) -> None:
         self.home = self.root / "home"
@@ -1129,7 +1184,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
         write_unconfigured_berth(self.bin_directory)
-        self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
+        self.write_executable(self.bin_directory / "ssh", _REACHABLE_SSH_STUB.decode("utf-8"))
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
             "lint_config_enabled() { return 1; }\n"
@@ -1241,7 +1296,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
             "MAC_TEST_CONFIG": str(settings),
             "CLAUDE_CODE_SESSION_ID": "", "BUILD_TARGETS_NOW": "",
-            "BUILD_TARGETS_POLL_S": "0.05",
+            "BUILD_TARGETS_POLL_S": "0.25",
             "LINT_CONFIG_READER": str(reader),
             "LINT_CONFIG_FILE": str(reader), "CONF_DIR": str(Path(reader).parent),
             "UNIT_RUN_DIR": str(self.board),
@@ -1262,8 +1317,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
         private = copies_environment(self.root)
         configuration = Path(self.environment["CONF_DIR"])
-        if configuration != Path(private["CONF_DIR"]):
-            _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", configuration / "build_folders.conf")
+        settings_source = Path(private["CONF_DIR"]) / "build_folders.conf"
+        settings_lines = [
+            line for line in settings_source.read_text(encoding="utf-8").splitlines()
+            if (key := line.partition("=")[0].strip()) != "patterns.tool" and not key.startswith("patterns.tool.")
+        ]
+        settings_lines.append("patterns.tool={purpose}{suffix}")
+        _ = (configuration / settings_source.name).write_text("\n".join(settings_lines) + "\n", encoding="utf-8")
         self.environment.update({key: value for key, value in private.items() if key not in ("HOME", "CONF_DIR")})
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
@@ -1737,13 +1797,13 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                                     *, repeat_decline: bool = True) -> None:
         clock = self.control_routing_clock()
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        admission = caller_admission(self, self.root, self.environment)
         if wait_kind == "routing":
             _ = self.routing_fixture()
         elif wait_kind == "first_hold":
             _ = self.routing_fixture()
             record = self.root / "hold-after-routing.json"
             _ = (Path(self.environment["BUILD_HOLD_DIR"]) / "hana").replace(record)
-            admission = caller_admission(self, self.root, self.environment)
             previous = admission.server.handle_request
             published = False
 
@@ -1759,10 +1819,20 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
 
         else:
             meminfo = self.hold_memory()
+        notice = self.runner_state / "mac-retry-notice"
+        reply_filter = admission.server.reply_filter
+
+        def observe_retry(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.PlacementWait) and any(item.target == "mac" for item in reply.retry_notices):
+                notice.touch()
+            return reply_filter(reply)
+
+        admission.server.reply_filter = observe_retry
         self.set_mac_answer(mode, reason, 75)
         self.environment["TEST_FREE_NOW_FREE"] = "1"
         process = self.start_verify("test", "sample", "--no-cache")
         self.addCleanup(self.stop_verify, process)
+        self.wait_for_path(notice, (process,))
         self.wait_for_retry_probe(100, process)
         self.assertEqual(len(self.runner_events()), 1)
 
@@ -1775,7 +1845,6 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                     build_hold.HolderIdentity("hana", "hana"), "render checks",
                     build_hold.NoReleaseEta(), datetime.now().astimezone())
             _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
-        admission = caller_admission(self, self.root, self.environment)
         episode = self.runner_episode()
         if wait_kind in ("hold", "first_hold"):
             self.wait_until(lambda: any(candidate.destination.provider == "local"

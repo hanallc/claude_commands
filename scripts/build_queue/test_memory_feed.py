@@ -660,7 +660,7 @@ process.stdout.write(JSON.stringify({
                     _ = (proc / str(pid) / "cmdline").write_bytes(b"\0".join(part.encode() for part in command) + b"\0")
                     job = memory_feed.step_job("merge-gate", pid, proc)
                     self.assertEqual(job, expected)
-                    notes = memory_feed.job_notes(job, "report", names)
+                    notes = memory_feed.job_notes(job, names)
                     self.assertTrue(notes.get("about"))
                     self.assertEqual(notes.get("changes"), "sdlc branch" if expected.step == "integrate" else "no branch")
             self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
@@ -684,9 +684,9 @@ process.stdout.write(JSON.stringify({
         ):
             with self.subTest(command=command):
                 self.assertEqual(command_job(command), named)
-        about = names.about(StepJob("integrate", unit="handler", branch="sdlc"), "report")
-        self.assertIn("handler", about)
-        self.assertEqual(names.about(StepJob("test-all"), "—"), "")
+        about = "Merges the checkpoint into the sdlc branch, runs every test module, then pushes sdlc"
+        self.assertEqual(names.about(StepJob("integrate", unit="handler", branch="sdlc")), about)
+        self.assertEqual(names.about(StepJob("test-all")), "Runs every test module")
         reading = reservation_reading()
         integrate = StepJob("integrate", unit="handler", branch="sdlc")
         with (mock.patch.object(admission_client, "view", return_value=reading),
@@ -695,8 +695,28 @@ process.stdout.write(JSON.stringify({
         running, = [row for row in page["walk"] if row.get("queued")]
         for row in (running, *page["waiters"]):
             self.assertEqual(row.get("changes"), "sdlc branch")
-            self.assertIn("handler", row.get("about", ""))
+            self.assertEqual(row.get("about"), about)
             self.assertIn("integrate", row["name"])
+
+    def test_step_descriptions_use_the_current_templates_and_recorded_work(self) -> None:
+        path = self.root / "build_steps.conf"
+        _ = write_config_fixture(path, "about.verify-final=Runs the final checks and tests\n")
+        names = read_step_names()
+        verify = admission_records.VerifyCall("final", "verify final hana", 2, 2)
+        notes = memory_feed.job_notes(memory_feed.NotGateStep(), names,
+                                     step="nextest", verify=verify)
+        self.assertEqual(notes.get("about"), "Runs the final checks and tests")
+        self.assertNotIn("changes", notes)
+        for step, ci, kind, expected in (
+            ("bench", True, "build-step", "Runs the selected benchmarks for CI"),
+            ("nextest", True, "build-step", "Runs the selected tests for CI"),
+            ("c", False, "build-step", "Checks that the selected targets compile"),
+            ("", False, "compiler-cache", "This cache stores compiled code for reuse"),
+            ("", False, "unowned-processes", "These processes run outside the queue"),
+        ):
+            with self.subTest(step=step, kind=kind):
+                notes = memory_feed.job_notes(memory_feed.NotGateStep(), names, step=step, ci=ci, kind=kind)
+                self.assertEqual(notes.get("about"), expected)
 
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
@@ -1400,14 +1420,9 @@ process.stdout.write(JSON.stringify({
             {"kind": "text", "text": " · check_rows.py"}])
         self.assertEqual(staff_names.parts_text(part.get("who_parts", [])), part["who"])
 
-    def test_gate_descriptions_and_mac_hold_reasons_keep_staff_parts(self) -> None:
+    def test_mac_hold_reasons_keep_staff_parts(self) -> None:
         from scripts.build_queue.test_target_availability import MAC_BLOCK
 
-        names = read_step_names()
-        notes = memory_feed.job_notes(StepJob("test-all"), "builder", names)
-        self.assertEqual(notes.get("about_parts"), [{"kind": "text", "text": "Tests every module of "},
-            {"kind": "staff", "text": "builder"}, {"kind": "text", "text": "."}])
-        self.assertEqual(staff_names.parts_text(notes.get("about_parts", [])), notes.get("about"))
         routes = target_availability.MacRoutes((snapshot(MAC, MAC_BLOCK),),
             {"mac-session": unit_labels.UnitLabels("helper", "hana", "builder")}, UTC)
         hold = memory_feed.target_notes(target_config.MAC_ONLY, routes, "nextest", "/fixture", "")
@@ -1753,6 +1768,13 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(after["reserved"], before["reserved"])
         self.assertEqual(after["used"], before["used"])
         self.assertEqual(after["waiting"], 1)
+        self.assertEqual(row.get("about"), "Waits for a build slot")
+
+        saved = replace(slot, identity=replace(slot.identity, step="merge-gate", job=StepJob("test-all", unit="widget")))
+        with mock.patch.object(admission_client, "view", return_value=replace(reading, repository_slots=(saved,))):
+            waiting, = memory_feed.reading()["waiters"]
+        self.assertEqual(waiting.get("about"), "Runs every test module")
+        self.assertEqual(waiting.get("changes"), "no branch")
 
     def copies_slot_page(self, command: str, *, source: str, unit: str = "",
                          worktree_owner: str = "", recorded_step: str = "bash",
@@ -1854,24 +1876,51 @@ process.stdout.write(JSON.stringify({
                                current_session=staff.StaffId("runner-session"))
         member = staff.StaffRow(staff.StaffId(owner), "unit", "startup", staff.ReportsTo(runner.id),
                                 current_session=staff.StaffId("startup-session"))
-        command = ["bash", "-c", 'cd . && env MODE=test bash /fixture/verify.sh test --filter "a b" hana']
-        with (mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": runner.current_session}),
-              mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((runner, member))),
-              mock.patch.object(copies, "source_commit", return_value="abc"),
-              mock.patch.object(copies, "slot_source", return_value=source),
-              mock.patch.object(copies, "main_checkout", return_value=source),
-              mock.patch.object(build_slots, "_try_slot", side_effect=build_slots.SlotsFull("hana", "fixture", 1)),
-              mock.patch.object(build_slots, "configured_slot_root", return_value=self.root / "slots"),
-              mock.patch.object(admission_client, "repository_slot", return_value=wire.Refused("fixture refusal")) as send):
-            with self.assertRaisesRegex(RuntimeError, "fixture refusal"):
-                with copies.command_tree(owner, source, copies.CommittedSource("HEAD"), command):
-                    self.fail("The slot is full")
-        send.assert_called_once()
-        request = cast(wire.RepositorySlotRequest, send.call_args.args[0])
-        self.assertEqual(request.identity.step, "test hana")
-        self.assertEqual(request.identity.session_id, owner)
-        self.assertEqual(request.identity.unit, "")
-        self.assertEqual(request.identity.folder, str(source))
+        cases = (
+            ('env MODE=test bash /fixture/verify.sh test --filter "a b" hana', "test hana", GATE_JOB_NOT_RECORDED,
+             admission_records.VerifyCall("test", "verify test --filter 'a b' hana", 1, 1), "Runs the selected tests"),
+            ('env MODE=test bash /fixture/verify.sh --session-dir /fixture/session final hana --local "check local code"',
+             "final hana", GATE_JOB_NOT_RECORDED,
+             admission_records.VerifyCall("final", "verify final hana --local 'check local code'", 1, 1),
+             "Checks the workspace targets and runs the selected tests"),
+            ('python3 /fixture/merge_gate.py --tests-only --full', "test-all", StepJob("test-all"),
+             admission_records.NotVerifyCall(), "Runs every test module"),
+        )
+        for command, step, job, verify, about in cases:
+            with (self.subTest(step=step),
+                  mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": runner.current_session}),
+                  mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((runner, member))),
+                  mock.patch.object(copies, "source_commit", return_value="abc"),
+                  mock.patch.object(copies, "slot_source", return_value=source),
+                  mock.patch.object(copies, "main_checkout", return_value=source),
+                  mock.patch.object(build_slots, "_try_slot", side_effect=build_slots.SlotsFull("hana", "fixture", 1)),
+                  mock.patch.object(build_slots, "configured_slot_root", return_value=self.root / "slots"),
+                  mock.patch.object(admission_client, "repository_slot", return_value=wire.Refused("fixture refusal")) as send):
+                with self.assertRaisesRegex(RuntimeError, "fixture refusal"):
+                    with copies.command_tree(owner, source, copies.CommittedSource("HEAD"),
+                                             ["bash", "-c", f"cd . && {command}"]):
+                        self.fail("The slot is full")
+                send.assert_called_once()
+                request = cast(wire.RepositorySlotRequest, send.call_args.args[0])
+                saved = wire.parse_request(wire.encode_request(request))
+                assert isinstance(saved, wire.RepositorySlotRequest)
+                self.assertEqual(saved.identity.step, step)
+                self.assertEqual(saved.identity.session_id, owner)
+                self.assertEqual(saved.identity.unit, "")
+                self.assertEqual(saved.identity.folder, str(source))
+                self.assertEqual(saved.identity.job, job)
+                self.assertEqual(saved.identity.verify, verify)
+                slot = wire.RepositorySlotRow(saved.owner, saved.identity, saved.since, saved.machine,
+                    wire.RepositorySlotWaiting("hana", (1,), 1, "slots.fixture.hana.max"))
+                reading = replace(cloud_reading(captured_reading()), repository_slots=(slot,), cloud=())
+                with (mock.patch.object(admission_client, "view", return_value=reading),
+                      mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((runner, member)))):
+                    row, = memory_feed.reading()["waiters"]
+                self.assertEqual(row.get("about"), about)
+                if isinstance(verify, admission_records.VerifyCall):
+                    self.assertEqual(row.get("verify"),
+                        {"verb": verify.verb, "call": verify.call, "position": 1, "total": 1, "step": step})
+
 
     def test_queue_row_name_rejects_shell_words_and_ids_inside_names(self) -> None:
         for name in ("startup bash", "startup /bin/env", "exec -a", "startup $UNIT",
@@ -2302,7 +2351,11 @@ process.stdout.write(JSON.stringify({
         placed, unrelated = [row for row in page["walk"] if row.get("kind") == "mac-build"]
         self.assertEqual(placed.get("verify"), {
             "step": "nextest", "verb": "test", "call": "verify test sample --no-cache", "position": 1, "total": 1})
+        self.assertEqual(placed.get("about"), "Runs the selected tests")
+        self.assertEqual(unrelated.get("about"), "Runs the selected tests")
         self.assertNotIn("verify", unrelated)
+        self.assertEqual(unrelated.get("call"), "cargo nextest run")
+        self.assertNotIn("call", placed)
 
     def test_verify_call_reaches_running_and_waiting_feed_rows(self) -> None:
         page = self.verify_call_page()
@@ -2317,6 +2370,72 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(waiting_call["call"], running_call["call"])
         self.assertEqual((running_call["verb"], waiting_call["total"]), ("final", 2))
         self.assertNotIn("verify", direct)
+
+    def test_the_page_shortens_calls_without_changing_the_record(self) -> None:
+        cases = (
+            ("verify test " + " ".join(f"--filter check_{index}" for index in range(14)),
+             "verify test · 14 filters"),
+            ("verify test --filter=first --filter second --no-cache", "verify test --no-cache · 2 filters"),
+            ("verify check /work/project/ --manifest-path='/work/project/Cargo test.toml'",
+             "verify check project '--manifest-path=Cargo test.toml'"),
+            ("verify test --run-id fixture --commit f4ab123 --job 786a38ed-dffe-4fea-b6cf-814fa44aeee5",
+             "verify test --run-id --commit --job"),
+            ("verify final sample --local 'creates a Linux install'", "verify final sample --local 'creates a Linux install'"),
+            ("verify test --filter first --filter second hana", "verify test hana · 2 filters"),
+            ("verify test --filter=first --filter=second hana", "verify test hana · 2 filters"),
+            ("verify test --no-cache --no-cache hana", "verify test hana · --no-cache ×2"),
+            ("verify check --keep-going --keep-going hana", "verify check hana · --keep-going ×2"),
+            ("verify test hana --mac screenshots --fetch target/shots",
+             "verify test hana --mac screenshots --fetch target/shots"),
+            ("verify test --features hana/dynamic_linking", "verify test --features hana/dynamic_linking"),
+        )
+        for original, expected in cases:
+            with self.subTest(call=original):
+                saved = admission_records.VerifyCall("test", original, 1, 1)
+                verify = memory_feed.call_notes(saved, "nextest").get("verify")
+                assert verify is not None
+                self.assertEqual(verify["call"], expected)
+                self.assertEqual(saved.call, original)
+
+    def test_cargo_and_gate_commands_use_the_call_formatter(self) -> None:
+        cases = (
+            (("cargo", "test", "-p", "sample", "--release"), "cargo test -p sample --release"),
+            (("cargo", "test", "-F", "hana/dynamic_linking", "--manifest-path=work/project/Cargo.toml"),
+             "cargo test -F hana/dynamic_linking --manifest-path=work/project/Cargo.toml"),
+            (("cargo", "check", "--manifest-path=~/work/project/Cargo.toml"),
+             "cargo check --manifest-path=Cargo.toml"),
+            (("cargo", "test", "-v", "-v"), "cargo test · -v ×2"),
+            (("cargo", "test", "--", "--skip", "first", "--skip", "second", "hana"), "cargo test -- hana · 2 skips"),
+            (("py", "merge_gate.py", "--tests-only", "--module", "one", "--module=two"),
+             "merge_gate.py --tests-only · 2 modules"),
+            (("py", "merge_gate.py", "--checkout", "/work/project/", "--tests-only", "--module", "suite/module"),
+             "merge_gate.py --checkout project --tests-only --module suite/module"),
+        )
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                self.assertEqual(memory_feed.build_command_call(arguments), expected)
+
+    def test_queued_cargo_keeps_the_command_from_the_admission_child(self) -> None:
+        base = with_wait_reason(reservation_reading(), admission_records.NeedsMemory())
+        waiter, = base.view.waiting
+        current: admission_records.RankedWaiter = {
+            "pid": waiter.pid, "start_time": "waiter", "need": waiter.need, "since": waiter.since,
+            "session_id": waiter.session_id, "session_name": waiter.session_name,
+            "step": waiter.step, "folder": waiter.folder, "order": admission_records.NormalOrder(),
+        }
+        reading = replace(base, ordered=((Path("fixture.waiting"), current),))
+        proc = self.root / "proc"
+        write_process(proc, waiter.pid, start="waiter")
+        child = waiter.pid + 1
+        write_process(proc, child, parent=waiter.pid)
+        _ = (proc / str(child) / "cmdline").write_text(
+            "\0".join(("python3", "queue_place.py", "admit", "--pid", str(waiter.pid), "--",
+                        "cargo", "nextest", "run", "-p", "hana")) + "\0")
+        with mock.patch.object(admission_client, "view", return_value=reading):
+            waiting, = memory_feed.reading()["waiters"]
+        self.assertEqual(waiting.get("call"), "cargo nextest run -p hana")
+        self.assertNotIn("verify", waiting)
+
 
     def test_queued_tooltips_use_the_verify_route_or_the_direct_command_reason(self) -> None:
         page = self.macroute_page()
@@ -2600,7 +2719,7 @@ process.stdout.write(JSON.stringify({
                         self.assertEqual(row["name"], "devtools " + named if named else "devtools")
                         self.assertEqual(row["title"]["step"], named or "devtools")
                         self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
-                        about = names.about(job, "devtools") if isinstance(job, StepJob) else ""
+                        about = names.about(job) if isinstance(job, StepJob) else "Runs a merge or test job"
                         self.assertEqual(row.get("about", ""), about)
                         self.assertEqual(row.get("changes", ""), names.changes(job) if isinstance(job, StepJob) and about else "")
 
@@ -2612,14 +2731,14 @@ process.stdout.write(JSON.stringify({
         for row in (local, waiting):
             self.assertIn(row["title"]["step"], approved)
             self.assertEqual(row["name"], "devtools test all")
-            self.assertEqual(row.get("about"), "Tests every module of devtools.")
+            self.assertEqual(row.get("about"), "Runs every test module")
 
         page = self.gate_job_page("merge-gate", (), job=StepJob("test-all"))
         local, = [row for row in page["walk"] if row.get("queued")]
         waiting, = [row for row in page["waiters"] if not row.get("kind")]
         for row in (local, waiting):
             self.assertEqual(row["name"], "devtools test all")
-            self.assertEqual(row.get("about"), "Tests every module of devtools.")
+            self.assertEqual(row.get("about"), "Runs every test module")
 
         source = Path("/repo/devtools")
         caller = SlotCaller("director", "sdlc", source, copied[6:], "test-all")
@@ -2651,18 +2770,14 @@ process.stdout.write(JSON.stringify({
 
         from scripts.aws_target.aws_trial import PAIRED_TRIAL_JOB
 
-        for unit_known, name, about in (
-            (True, "devtools test named", "Tests 1 named modules of devtools."),
-            (False, "test named", "Tests 1 named modules."),
-        ):
+        for unit_known, name in ((True, "devtools test named"), (False, "test named")):
             with self.subTest(paired_trial_unit_known=unit_known):
                 trial = self.gate_job_page(PAIRED_TRIAL_JOB.step, (), unit_known=unit_known, job=PAIRED_TRIAL_JOB)
                 for rows in (trial["walk"], trial["waiters"]):
                     row, = [row for row in rows if row.get("kind") == "cloud"]
                     self.assertIn(row["title"]["step"], approved)
                     self.assertEqual(row["name"], name)
-                    self.assertEqual(row.get("about"), about)
-                    self.assertEqual(staff_names.parts_text(row.get("about_parts", [])), about)
+                    self.assertEqual(row.get("about"), "Runs 1 named test modules")
                     self.assertEqual(row.get("changes"), "no branch")
 
         integration = self.gate_job_page("merge-gate", ("python3", "merge_gate.py"), showrunner=True)
@@ -2674,8 +2789,9 @@ process.stdout.write(JSON.stringify({
         page = self.gate_job_page("merge-gate", ("python3", "scripts/production/merge_gate.py", "--tests-only", "--full"))
         row, = [row for row in page["walk"] if row.get("kind") == "cloud"]
         self.assertEqual(row["name"], "devtools test all")
-        self.assertEqual(row.get("about"), "Tests every module of devtools.")
+        self.assertEqual(row.get("about"), "Runs every test module")
         self.assertEqual(row.get("changes"), "no branch")
+        self.assertEqual(row.get("call"), "merge_gate.py --tests-only --full")
 
     def owner_machine_page(self, owner: unit_labels.UnitLabels, *, ci: bool = False) -> memory_feed.MemoryPage:
         """Use the same owner across the local, Mac, and cloud rows."""

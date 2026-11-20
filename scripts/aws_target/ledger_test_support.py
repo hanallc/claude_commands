@@ -13,7 +13,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.aws_target import ledger
@@ -71,6 +71,27 @@ def write_gate_config(path: Path) -> None:
     """Install fixed settings for gate and GPU trial tests."""
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = path.write_bytes((FIXTURES / 'cloud_gate.conf').read_bytes())
+
+
+def override_fixture_settings(path: Path, overrides: str) -> None:
+    """Apply values to the private file and keep its limits unless overrides supply limits."""
+    source = path.read_text()
+    lines = source.splitlines()
+    existing = conf.settings(source)
+    limit_prefixes = ('# whole:', '# range:', '# one of:')
+    for key, override in conf.settings(overrides).items():
+        line = f'{key}={override.value}'
+        current = existing.get(key)
+        if override.limit.startswith(limit_prefixes):
+            if current is not None and current.limit.startswith(limit_prefixes):
+                lines[current.line - 1] = override.limit
+            else:
+                line = f'{override.limit}\n{line}'
+        if current is None:
+            lines.append(line)
+        else:
+            lines[current.line] = line
+    _ = path.write_text('\n'.join(lines) + '\n')
 
 
 HANA_GUEST_RUNTIME_SETTINGS = """\
@@ -160,6 +181,13 @@ image_wait_interval_s=10
     return path
 
 
+def install_aws_fixture_settings(folder: Path) -> None:
+    """Install the private AWS settings before a fixture copies other files."""
+    install_cost_settings(folder / 'aws_target.conf')
+    write_gate_config(folder / 'cloud_gate.conf')
+    _ = write_hana_config(folder / 'hana_aws.conf')
+
+
 def install_hana_spending_settings(path: Path) -> None:
     """Enable private Hana spending at the test price."""
     _ = write_hana_config(path)
@@ -203,11 +231,9 @@ class CostFixture(unittest.TestCase):
         self.settings = self.root / "aws_target.conf"
         self.state = self.root / "state"
         self.state.mkdir()
-        install_cost_settings(self.settings)
+        install_aws_fixture_settings(self.root)
         # The cost fixtures use one day unless a test needs a longer query.
         self.replace('cost_explorer_watch_days', '1')
-        write_gate_config(self.root / 'cloud_gate.conf')
-        _ = write_hana_config(self.root / 'hana_aws.conf')
         environment = config_environment(self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment, "HOME": str(self.root),
@@ -220,7 +246,10 @@ class CostFixture(unittest.TestCase):
             del os.environ[name]
 
     def configure(self, overrides: str) -> None:
-        _ = write_config_fixture(self.settings, overrides)
+        override_fixture_settings(self.settings, overrides)
+
+    def configure_gate(self, overrides: str) -> None:
+        override_fixture_settings(self.root / 'cloud_gate.conf', overrides)
 
     def costs(self, values: dict[str, str]) -> None:
         numeric_settings(self.settings, values)
