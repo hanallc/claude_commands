@@ -613,12 +613,12 @@ placement_once
         self.assertFalse(snapshot.exists())
 
     def test_snapshot_command_inherits_the_runner_session(self) -> None:
-        program = ("import json, os\n"
-                   f"print(json.dumps({{key: os.getenv(key, '') for key in {tuple(self.build_sessions)!r}}}))")
+        keys = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+        program = "import json, os\n" + f"print(json.dumps({{key: os.getenv(key, '') for key in {keys!r}}}))"
         process = self.start((sys.executable, "-c", program))
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
-        self.assertEqual(output.strip(), json.dumps(self.build_sessions))
+        self.assertEqual(output.strip(), json.dumps({key: self.build_sessions[key] for key in keys}))
 
     def verify_source(self) -> VerifyMacOffloadFixture:
         tools = VerifyMacOffloadFixture()
@@ -879,8 +879,11 @@ placement_once
                 command = ("bash", "-c", remote + " && exec " + shlex.join(capacity_command))
                 options = ()
             else:
-                command = ("env", "MODE=ci", "bash", verify, "test", "sample", "--local", "fixture", "--no-cache")
-                options = ("--publish", "report.txt")
+                command = ("bash", verify, "test", "sample", "--local", "fixture", "--no-cache")
+                options = ()
+                if variant == "env":
+                    command = ("env", "MODE=ci", *command)
+                    options = ("--publish", "report.txt")
             with locked_environment(caller_environment, self.queue.loop_access):
                 return self.start(command, *options)
 
@@ -941,9 +944,9 @@ placement_once
                 with self.subTest(wait="Mac", wrapper="bash -c"):
                     self.assertNotIn(Path(mac_request.constraints.repository), held_folders(),
                                      "the bash -c caller holds a folder during its Mac wait")
-                for _ in range(4):
+                for _ in range(2):
                     _ = start_caller("capacity")
-                wait_for_callers(hold_waiters, 7)
+                wait_for_callers(hold_waiters, maximum - 2)
                 waiting_folders = held_folders()
                 print(f"Waiting: {len(waiting_folders)} of {maximum} held; {len(slot_requests)} slot waiters.", flush=True)
                 self.assertEqual(len(waiting_folders), 0)
@@ -960,6 +963,20 @@ placement_once
             self.assertEqual(len(running), maximum)
             self.assertEqual(set(running), held_folders())
             print(f"Running: {len(running)} of {maximum} held.", flush=True)
+
+            verify_board = self.root / f"board-{len(self.processes)}"
+            verify_token = verify_board / "locks/cargo.d"
+            self.slot_waiting.clear()
+            verify_waiter = start_caller("verify")
+            if not self.slot_waiting.wait(TEST_HANG_GUARD_SECS):
+                self.fail("Verify did not wait for a full pool. " + caller_diagnostics())
+            with self.queue.loop_turn():
+                first_waiter, = self.queue.server.repository_slot_waiters.values()
+                verify_episode = first_waiter.request.episode
+                placement_request = next(request for request in self.requests
+                    if isinstance(request, wire.PlacementRequest) and request.episode == verify_episode)
+                self.assertEqual(placement_request.owner.pid, first_waiter.request.owner.pid)
+            _ = start_caller("capacity")
 
             deadline = time.monotonic() + 60
             while True:
@@ -991,6 +1008,9 @@ placement_once
                 if process is token_caller:
                     self.assertIn("published: ", output)
                     self.assertNotIn("report.txt not built", errors)
+                if process is verify_waiter:
+                    self.assertFalse(verify_token.exists())
+                    self.assertNotIn(verify_episode, self.queue.caller_reservations())
 
             released: set[Path] = set()
             for folder in tuple(running)[-2:]:
@@ -998,10 +1018,15 @@ placement_once
                 connection.sendall(b"x")
                 finish_caller(process)
                 released.add(folder)
+            replacements: list[subprocess.Popen[str]] = []
             for _ in range(2):
                 replacement, step = next_running_step()
                 self.assertIn(replacement, released)
                 running[replacement] = step
+                replacements.append(step[1])
+            self.assertIn(verify_waiter, replacements)
+            self.assertTrue(verify_token.is_dir(), "Verify did not take the Cargo token")
+            self.assertIn(verify_episode, self.queue.caller_reservations())
             self.assertEqual(len(running), maximum)
             self.assertEqual(set(running), held_folders())
 
@@ -1044,11 +1069,7 @@ placement_once
                     ready.recv(1)
             ''').strip()
         _ = cargo.write_text(cargo.read_text().replace('if arguments[:2] == ["nextest", "run"]:', pause))
-        tree = copies.staged_tree(tools.root)
-        copies_path = CHECKOUT / "scripts/copies/copies.py"
-        hold_command = (sys.executable, str(copies_path), "hold", "--repo", "{tree}", "--tree", tree,
-                        "--step", "test", "--capacity-file", str(self.root / "capacity"),
-                        "--", "cargo", "nextest", "run")
+        tree = copies.git(tools.root, "rev-parse", "HEAD^{tree}").decode().strip()
         verify_command = ("bash", str(CHECKOUT / "scripts/direct/verify.sh"), "test", "sample", "--local", "fixture")
         with (mock.patch.dict(os.environ, environment),
               socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener):
@@ -1057,8 +1078,9 @@ placement_once
             listener.settimeout(TEST_HANG_GUARD_SECS)
             for stop in ("launcher SIGKILL", "copies TERM"):
                 with self.subTest(stop=stop):
+                    first_request = len(self.requests)
                     with mock.patch.dict(os.environ, {"TEST_COPY_STOP": stop}):
-                        process = self.start(hold_command if stop == "launcher SIGKILL" else verify_command)
+                        process = self.start(verify_command)
                     with listener.accept()[0] as connection:
                         connection.settimeout(TEST_HANG_GUARD_SECS)
                         with connection.makefile("r") as data:
@@ -1071,7 +1093,15 @@ placement_once
                         checkout = Path(folder)
                         self.assertEqual(build_folders.build_folder_state(checkout), "held")
                         if stop == "launcher SIGKILL":
-                            self.assertIn(b"copies.py", (Path("/proc") / launcher / "cmdline").read_bytes())
+                            request = next(request for request in self.requests[first_request:]
+                                           if isinstance(request, wire.PlacementRequest))
+                            arguments = (Path("/proc") / launcher / "cmdline").read_text().split("\0")
+                            hold = arguments.index("hold")
+                            self.assertEqual(Path(arguments[hold - 1]).name, "copies.py")
+                            self.assertEqual(arguments[hold:hold + 8], [
+                                "hold", "--repo", request.constraints.repository, "--tree", tree,
+                                "--step", "test", "--capacity-file",
+                            ])
                             lease = cast(dict[str, object], json.loads(build_slots.lease_path(checkout).read_text()))
                             self.assertEqual(lease["pid"], pid)
                             os.kill(pid, signal.SIGKILL)
@@ -1176,32 +1206,23 @@ placement_once
             self.assertFalse((source / "src/merged.rs").exists())
             if scenario != "clean-linux":
                 _ = (snapshot / "src/main.rs").write_text("fn main() { let _ = 1; }\n")
-            if scenario == "source-record":
-                _ = (snapshot / copy_record.RECORD).write_text("{}")
-                _ = copies.git(snapshot, "add", "-f", copy_record.RECORD)
             tree = copies.staged_tree(snapshot, include_worktree=True)
             trust = copies.SshSourceTrust(offload.trusted_linux_source, nix_env.trusted_root, nix_env.registered_worktree)
-            if scenario == "source-record":
-                with self.assertRaisesRegex(copies.CopyError, r"the admitted tree contains \.scratch\.json") as refused:
-                    with copies.remote_step_source(snapshot, tree, caller, trust):
-                        self.fail("the admitted source record reached the runner")
-                self.assertEqual(refused.exception.exit_code, 2)
-            else:
-                trusted = scenario in ("clean-linux", "trusted-linux", "trusted-envrc")
-                self.assertEqual(offload.trusted_linux_source(caller), trusted or scenario == "mismatched-linux")
-                with copies.remote_step_source(snapshot, tree, caller, trust) as checkout:
-                    self.assertEqual(checkout.parent, copy_record.root().resolve())
-                    record = copy_record.read_record(checkout / copy_record.RECORD)
-                    self.assertIsInstance(record, copy_record.Registered)
-                    assert isinstance(record, copy_record.Registered)
-                    self.assertEqual("generated_source" in record.fields, trusted)
-                    self.assertEqual(offload.trusted_linux_source(checkout), trusted)
-                    if scenario in ("trusted-envrc", "untrusted-envrc"):
-                        self.assertIsNotNone(copy_record.record_path(checkout))
-                        self.assertEqual(record.fields.get("source_commit"), copies.commit_at(source, "HEAD") if trusted else None)
-                    self.assertEqual((checkout / "src/lib.rs").read_text(), "pub fn changed() {}\n")
-                    self.assertEqual((checkout / "src/merged.rs").read_text(), "pub fn merged() {}\n")
-                    self.assertEqual(treekey.tree_key(str(checkout)), treekey.committed_tree_key(tree.encode("ascii")))
+            trusted = scenario in ("clean-linux", "trusted-linux", "trusted-envrc")
+            self.assertEqual(offload.trusted_linux_source(caller), trusted or scenario == "mismatched-linux")
+            with copies.remote_step_source(snapshot, tree, caller, trust) as checkout:
+                self.assertEqual(checkout.parent, copy_record.root().resolve())
+                record = copy_record.read_record(checkout / copy_record.RECORD)
+                self.assertIsInstance(record, copy_record.Registered)
+                assert isinstance(record, copy_record.Registered)
+                self.assertEqual("generated_source" in record.fields, trusted)
+                self.assertEqual(offload.trusted_linux_source(checkout), trusted)
+                if scenario in ("trusted-envrc", "untrusted-envrc"):
+                    self.assertIsNotNone(copy_record.record_path(checkout))
+                    self.assertEqual(record.fields.get("source_commit"), copies.commit_at(source, "HEAD") if trusted else None)
+                self.assertEqual((checkout / "src/lib.rs").read_text(), "pub fn changed() {}\n")
+                self.assertEqual((checkout / "src/merged.rs").read_text(), "pub fn merged() {}\n")
+                self.assertEqual(treekey.tree_key(str(checkout)), treekey.committed_tree_key(tree.encode("ascii")))
             self.assertFalse(self.slot_root.exists())
 
     def test_remote_grant_source_key_matches_the_prepared_slot(self) -> None:
@@ -1269,6 +1290,7 @@ placement_once
                         observed.with_suffix(".doc").write_text(json.dumps([
                             str(repo), isinstance(request.source, offload.StagedDocSnapshot),
                             (root / "src/main.rs").read_text(),
+                            record.fields.get("source_path") if isinstance(record, copy_record.Registered) else None,
                         ]))
                     if not accepted:
                         os.environ.update(TEST_RUNNER_MAC="declined", TEST_RUNNER_STATUS="75", TEST_RUNNER_REASON="repo")
@@ -1316,6 +1338,11 @@ placement_once
                     words = words[:-2]
                 if linux or scenario == "retry":
                     dirty_command = "printf '%s\\n' 'fn main() { let _ = 1; }' > src/main.rs"
+                    if source_record:
+                        admitted = shlex.quote(str(observed.with_suffix(".source")))
+                        dirty_command += (" && printf '{}' > .scratch.json && git add -f .scratch.json"
+                                          + " && git add src/main.rs src/lib.rs && "
+                                          + f"(git rev-parse --show-toplevel && git write-tree) > {admitted}")
                     words = ("bash", "-c", dirty_command + ' && exec "$@"', "verify", *words)
                 case_environment = {**environment, "VERIFY_MAC_RUNNER": str(parser_runner),
                                     "TEST_REMOTE_SOURCE": str(observed), "SLOT_ORDER_CHECK": str(started),
@@ -1328,7 +1355,7 @@ placement_once
                     case_environment.update(HOME=str(self.root), TMPDIR=str(remote_tmp),
                                             TEST_TRUST_CALLER=str(other if mismatch else tools.root))
                     ready.touch()
-                if scenario in ("clean-linux", "trusted-linux", "trusted-envrc", "untrusted-envrc", "mismatched-linux") or source_record:
+                if scenario in ("clean-linux", "trusted-linux", "trusted-envrc", "untrusted-envrc", "mismatched-linux"):
                     with locked_environment({**os.environ, **case_environment}, self.queue.loop_access):
                         self.assert_ssh_source(tools.root, other if mismatch else tools.root, revision, scenario)
                     continue
@@ -1352,6 +1379,22 @@ placement_once
                 with (mock.patch.object(self.queue.server, "host_probe", side_effect=provider),
                       mock.patch.dict(os.environ, case_environment)):
                     process = self.start(words, "--apply-uncommitted", str(tools.root), "--merge", revision)
+                    if source_record:
+                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual(process.returncode, 2, stdout + stderr)
+                        self.assertIn("the admitted tree contains .scratch.json", stderr)
+                        self.assertFalse(observed.exists())
+                        self.assertFalse(self.slot_root.exists())
+                        caller, tree = observed.with_suffix(".source").read_text().splitlines()
+                        request = next(request for request in self.requests[first_request:]
+                                       if isinstance(request, wire.PlacementRequest))
+                        self.assertEqual(request.constraints.repository, caller)
+                        expected = execution_identity.SourceKeyKnown(treekey.committed_tree_key(tree.encode("ascii")))
+                        self.assertEqual(request.constraints.source_key, expected)
+                        grant = next(reply for reply in self.replies[first_reply:] if isinstance(reply, wire.Assignment))
+                        self.assertEqual(grant.assignment.destination.provider, "ssh")
+                        self.assertEqual(grant.assignment.source_key, expected)
+                        continue
                     if scenario == "retry" or linux:
                         wait_until(lambda: observed.exists() or process.poll() is not None, self.root,
                                    timeout=45, processes=(process,))
@@ -1408,11 +1451,12 @@ placement_once
                     if scenario == "retry":
                         self.assertEqual(binary, "fn main() { let _ = 1; }\n")
                     if doc:
-                        repo, staged, main = cast(
-                            tuple[str, bool, str], json.loads(observed.with_suffix(".doc").read_text()))
+                        repo, staged, main, caller = cast(
+                            tuple[str, bool, str, str], json.loads(observed.with_suffix(".doc").read_text()))
                         self.assertTrue(staged)
                         self.assertEqual(repo, supplied_root)
                         self.assertEqual(main, "fn main() {}\n")
+                        self.assertEqual(caller, str(tools.root))
                     self.assertEqual(library, "pub fn changed() {}\n")
                     self.assertEqual(merged, "pub fn merged() {}\n")
                     grant = next(reply for reply in self.replies[first_reply:] if isinstance(reply, wire.Assignment))
