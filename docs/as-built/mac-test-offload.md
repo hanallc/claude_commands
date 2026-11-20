@@ -66,7 +66,7 @@ A PID alone cannot release another attempt.
   It exits 0 only for `free`.
   A live claim blocks only its repository.
   A kept claim, whose holder process is gone, does not answer `busy`: the next claim takes it over and cleans its leftovers.
-  A held mirror lease or an active mirror retry delay answers `busy` for that repository.
+  A coordinator mirror lease or an active mirror retry delay answers `busy` for that repository.
   A failed target probe blocks every repository.
   A version decline blocks only its repository.
   `verify.sh` passes its repository root with `--repo-root`.
@@ -711,7 +711,7 @@ Unknown remote memory remains unknown and creates no local memory charge.
 
 One `mirror_busy_backoff_s` key in `mac_test.conf` serves both Mac and AWS targets.
 Each target stores `mirror-busy-<repository>.until` beside its unreachable backoff record.
-A mirror busy refusal during copy writes this time.
+A held mirror refusal during copy writes this time.
 On the Mac, this refusal also returns `busy` to the caller.
 A Mac-only step uses the same queue episode to wait and try again.
 Movable steps can use natedev during the retry delay.
@@ -720,11 +720,12 @@ A `mirror-use` busy refusal after copy becomes `BusyMacDecline`, without a lost 
 A successful copy removes the repository's refusal time.
 `free-now` reads this local record without SSH or a lock.
 A live time answers `busy` only for its target and repository.
-The coordinator holds the mirror lease through remote cleanup and claim release.
-A placement probe also checks the leases on the Mac before it assigns a run.
+The coordinator holds its mirror lease through remote cleanup and claim release.
+Dispatch checks this lease with one read of the coordinator's kernel lock table per lookup.
 A live speculative copy can still give way to a new step.
 A released lease file supplies no evidence of a holder.
 The claim and mirror lease still make the final decision under their locks.
 Read access alone does not make a mirror busy.
 A working directory, a mapped file, or a file open for writing still makes it busy.
-Unavailable scans and unreadable lease groups keep their protection.
+An unavailable process scan refuses the copy without starting a retry delay.
+A live process in a recorded lease group protects the mirror when the scan cannot read its working directory.

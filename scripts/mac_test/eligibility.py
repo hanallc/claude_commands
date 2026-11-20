@@ -14,8 +14,8 @@ from urllib.parse import quote
 
 from scripts.build_targets import target_config
 from scripts.buildlog import repository, store
-from scripts.lib import conf, file_lock, process_start
-from scripts.mac_test import cargo_manifest, claim_state
+from scripts.lib import conf, file_lock
+from scripts.mac_test import cargo_manifest
 from scripts.mac_test.mirror_root import MacMirrorRoot
 
 
@@ -269,15 +269,7 @@ def mac_mirror_holder(host: str, repository: KnownRepository) -> int | None:
     from scripts.mac_test.floor_claims import MirrorIdentity
 
     mirror = MirrorIdentity(host, mac_mirror_path(repository.legacy_mirror_name))
-    return file_lock.lock_holder(str(copies.remote_mirror_lock_path(mirror)))
-
-
-def mirror_copy_yields(claims: tuple[claim_state.HeldClaim, ...], repository: KnownRepository, holder: int) -> bool:
-    """A new step can stop a speculative copy that holds this Mac mirror."""
-    return any(claim.record["pid"] == holder and claim.record.get("copy") is True
-               and (isinstance(claim.scope, claim_state.WholeMacScope) or claim.scope.name == repository.name)
-               and process_start.process_start(holder) == process_start.Started(claim.record["proc_start"])
-               for claim in claims)
+    return file_lock.lock_holder(str(copies.remote_mirror_lock_path(mirror)), reads=1)
 
 
 def comma_values(value: str) -> set[str]:

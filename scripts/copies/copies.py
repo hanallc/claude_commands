@@ -1973,25 +1973,6 @@ def mirror_probe_setup(path: str) -> str:
             shlex.quote(path) + " || exit 1")
 
 
-def mirror_lease_probe(path: str) -> str:
-    """Report a held lease without creating any mirror files."""
-    program = "\n".join((
-        "import fcntl, sys",
-        "from scripts.mac_test import floor_claims",
-        "tree = floor_claims.mirror_local_path(sys.argv[1])",
-        "for lease in (floor_claims.mirror_parent_lock_path(tree), floor_claims.mirror_lock_path(tree)):",
-        "    try:",
-        "        with lease.open('rb') as handle:",
-        "            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)",
-        "    except FileNotFoundError:",
-        "        continue",
-        "    except BlockingIOError:",
-        "        print('mirror_lease=held')",
-        "        break",
-    ))
-    return '"$HOME"/.claude/scripts/lib/py -c ' + shlex.join([program, path])
-
-
 def mark_mirror(tree: Path, owner: str, repo: str, session: str, **extra: object) -> None:
     """Publish mirror metadata before removal authority can disappear."""
     scratch.exclude_copy_metadata(tree, additional=floor_claims.MIRROR_METADATA)
@@ -2040,26 +2021,43 @@ def scan_mirror_processes(mirrors: Sequence[Path]) -> MirrorProcessScan:
     return MirrorProcessScan(uses, frozenset(unreadable_groups))
 
 
-def mirror_has_process(tree: Path, processes: MirrorProcessScan) -> bool:
-    """Keep a mirror with an active path, unreadable lease group, or unavailable scan."""
+class MirrorProcessState(Enum):
+    IDLE = auto()
+    LIVE = auto()
+    UNAVAILABLE = auto()
+
+
+class MirrorProcessScanUnavailable(CopyError):
+    """The receiver cannot check for processes that use the mirror."""
+
+
+def mirror_process_state(tree: Path, processes: MirrorProcessScan) -> MirrorProcessState:
+    """Read the process evidence for this mirror."""
     from scripts.lint import tmp_sweep
 
     if not tree.exists():
-        return False
+        return MirrorProcessState.IDLE
     tree = tree.resolve()
     root = str(tree)
     descendant_prefix = os.path.join(root, "")
     if isinstance(processes.uses, tmp_sweep.ProcessUsesUnavailable):
-        return True
+        return MirrorProcessState.UNAVAILABLE
     if any(pid != os.getpid() and how in (tmp_sweep.WORKS_IN, tmp_sweep.MAPS_FILE, tmp_sweep.WRITES_FILE)
            and (path == root or path.startswith(descendant_prefix))
            for path, pid, how in processes.uses.paths):
-        return True
+        return MirrorProcessState.LIVE
     try:
         group = floor_claims.read_mirror_record(tree / floor_claims.MIRROR_RECORD).get("process_group")
     except (OSError, ValueError):
-        return False
-    return isinstance(group, int) and group in processes.unreadable_groups
+        return MirrorProcessState.IDLE
+    if isinstance(group, int) and group in processes.unreadable_groups:
+        return MirrorProcessState.LIVE
+    return MirrorProcessState.IDLE
+
+
+def mirror_has_process(tree: Path, processes: MirrorProcessScan) -> bool:
+    """Keep a mirror when a process uses it or the scan cannot check it."""
+    return mirror_process_state(tree, processes) is not MirrorProcessState.IDLE
 
 
 @contextmanager
@@ -2077,21 +2075,27 @@ def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Gene
             lease_files.append(outside)
             fcntl.flock(outside.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             if os.fstat(outside.fileno()).st_ino != parent_lock.stat().st_ino:
-                raise BlockingIOError
+                raise CopyError(f"{tree}: mirror lease changed during acquisition")
             if create:
                 tree.parent.mkdir(parents=True, exist_ok=True)
             lock = leases.enter_context(floor_claims.mirror_lock_path(tree).open("a+"))
             lease_files.append(lock)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            busy = mirror_has_process(tree, scan_mirror_processes((tree,)))
-        except (BlockingIOError, FileNotFoundError):
-            busy = True
-        if busy:
+        except BlockingIOError:
+            held = True
+        except FileNotFoundError as error:
+            raise CopyError(f"{tree}: mirror lease changed during acquisition") from error
+        else:
+            processes = mirror_process_state(tree, scan_mirror_processes((tree,)))
+            if processes is MirrorProcessState.UNAVAILABLE:
+                raise MirrorProcessScanUnavailable(f"{tree}: mirror process scan unavailable")
+            held = processes is MirrorProcessState.LIVE
+        if held:
             try:
-                held = (tree / floor_claims.MIRROR_SESSION).read_text().strip()
+                holder_session = (tree / floor_claims.MIRROR_SESSION).read_text().strip()
             except OSError:
-                held = "unreadable"
-            raise CopyError(f"{tree}: busy; held by session {held}")
+                holder_session = "unreadable"
+            raise CopyError(f"{tree}: busy; held by session {holder_session}")
         if create:
             tree.mkdir(parents=True, exist_ok=True)
             write_text_atomic(tree / floor_claims.MIRROR_SESSION, session + "\n")

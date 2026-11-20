@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.build_queue import execution_identity
+from scripts.lint import tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import eligibility, nextest_log, offload, claim_state
@@ -641,6 +642,15 @@ class OffloadSettingsTests(unittest.TestCase):
         script = offload.probe_script(eligibility.KnownRepository("hana"))
         self.assertNotIn("pgrep", script)
         self.assertNotIn("procs", script)
+        with self.subTest(probe="placement"):
+            config = eligibility.SshProbeSettings(conf.read(self.settings))
+            controller = offload.ProcessController()
+            with mock.patch.object(controller, "capture", return_value=offload.CommandOutput(0, wire, "")) as capture:
+                self.assertEqual(offload.probe_mac(controller, config, eligibility.KnownRepository("hana")), expected)
+            command = cast(list[str], capture.call_args.args[0])[-1]
+            self.assertIn('df -g "$HOME"', command)
+            self.assertNotIn("probe_remote_folder", command)
+            self.assertNotIn("mirror_lease=held", command)
 
     def test_leftover_check_requires_count_and_printed_success_on_the_named_host(self) -> None:
         config = eligibility.read_config(self.settings)
@@ -1337,6 +1347,23 @@ class OffloadCommandTests(OffloadCommandFixture):
             finished = self.command(runner_options=options)
             self.assertEqual(finished.returncode, 0, finished.stdout)
             self.assert_wire("passed", "")
+
+        with self.subTest(receiver_scan="unavailable"):
+            mirror = self.root / "unreadable-mirror"
+            mirror.mkdir()
+            scan = copies.MirrorProcessScan(tmp_sweep.ProcessUsesUnavailable(), frozenset())
+            with mock.patch.object(copies, "scan_mirror_processes", return_value=scan):
+                with self.assertRaises(copies.CopyError) as receiver:
+                    with copies.local_mirror_lease(mirror, "reader"):
+                        self.fail("The receiver used a mirror with an unavailable process scan")
+            self.fixture["rsync_status"] = 23
+            self.sync_fixture()
+            refusal = f"copies: {receiver.exception}"
+            _ = stub.write_text(source.replace("'rsync: destination denied'", shlex.quote(refusal)))
+            result = self.command(runner_options=("--target", "mac"))
+            self.assertEqual(result.returncode, 75, result.stdout)
+            self.assert_wire("declined", f"copy: rsync: copies: {mirror}: mirror process scan unavailable; rsync error: code 23")
+            self.assertFalse(backoff.exists())
 
     def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
         controller = offload.ProcessController()

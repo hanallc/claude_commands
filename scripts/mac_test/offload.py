@@ -819,7 +819,7 @@ class MirrorUseBusy:
 
 @dataclass(frozen=True)
 class UnresolvedSlotStartup:
-    """The provider cannot start while an earlier run holds its mirror or slot."""
+    """The provider cannot start while an earlier run holds its slot."""
 
 
 RemoteRunStatus = (ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
@@ -1397,20 +1397,19 @@ def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
     return f"{remote_mirror(repository, target, slot)}/target"
 
 
+MAC_RESOURCE_PROBE = (
+    "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')\n"
+    + "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' " + '"$free_gib" "$(hostname -s)"'
+)
+
+
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     from scripts.copies import copies
 
     if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
-    return "\n".join(
-        (
-            copies.mirror_probe_setup(remote_mirror(repository, target, slot)),
-            "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
-            "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
-            + '"$free_gib" "$(hostname -s)"',
-        )
-    )
+    return copies.mirror_probe_setup(remote_mirror(repository, target, slot)) + "\n" + MAC_RESOURCE_PROBE
 
 
 def parse_probe(output: str) -> ProbeResult:
@@ -1721,6 +1720,7 @@ def probe_mac(
         record_reachable(target)
         return probe
 
+    identity = controller.claim_identity
     linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform)
     if linux:
         if not isinstance(config, OffloadConfig):
@@ -1732,13 +1732,9 @@ def probe_mac(
             return failed("SSH reachability check failed")
         timeout_s = linux_runner.positive_setting(config.values, "shell_timeout_s") + config.probe_timeout_s
     else:
-        script = probe_script(repository, target, slot)
+        script = (probe_script(repository, target, slot)
+                  if isinstance(identity, claim_state.ClaimIdentity) else MAC_RESOURCE_PROBE)
         timeout_s = config.probe_timeout_s
-        if isinstance(config, eligibility.SshProbeSettings):
-            from scripts.copies import copies
-
-            script = copies.mirror_lease_probe(remote_mirror(repository, target, slot)) + " || exit 1\n" + script
-    identity = controller.claim_identity
     if isinstance(identity, claim_state.ClaimIdentity):
         path = pending_start_path(target, identity)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1751,24 +1747,8 @@ def probe_mac(
         [*ssh_prefix(config), script],
         CommandTimeLimit(timeout_s),
     )
-    if isinstance(result, CommandOutput):
-        if linux and result.stdout.strip() == "linux_startup=unresolved":
-            return UnresolvedSlotStartup()
-        if (isinstance(config, eligibility.SshProbeSettings) and result.status == 0
-                and "mirror_lease=held" in result.stdout.splitlines()):
-            from scripts.copies import copies
-
-            yields = False
-            try:
-                holder = eligibility.mac_mirror_holder(config.host, repository)
-                paths = claim_state.state_paths(target)
-                yields = holder is not None and eligibility.mirror_copy_yields(
-                    claim_state.read_claims(paths), repository, holder)
-            except (OSError, ValueError, copies.CopyError):
-                pass
-            if not yields:
-                record_reachable(target)
-                return UnresolvedSlotStartup()
+    if isinstance(result, CommandOutput) and linux and result.stdout.strip() == "linux_startup=unresolved":
+        return UnresolvedSlotStartup()
     if isinstance(result, CommandTimedOut):
         reason = f"SSH probe timed out after {timeout_s:g} s"
     elif isinstance(result, CommandCouldNotStart):

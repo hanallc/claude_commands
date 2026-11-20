@@ -676,6 +676,11 @@ class RemoteCopiesTests(unittest.TestCase):
                     self.assertIsInstance(result, tmp_sweep.ProcessUsesUnavailable if status == 2 else tmp_sweep.ProcessUsesKnown)
                 with self.subTest(status=status, behavior="mirror protection"):
                     self.assertEqual(copies.mirror_has_process(self.mirror, copies.scan_mirror_processes((self.mirror,))), status == 2)
+                if status == 2:
+                    with self.subTest(status=status, behavior="receiver refusal"):
+                        with self.assertRaisesRegex(copies.MirrorProcessScanUnavailable, "mirror process scan unavailable"):
+                            with copies.local_mirror_lease(self.mirror, "receive"):
+                                self.fail("The receiver used a mirror with an unavailable process scan")
 
     def test_many_mirrors_share_one_process_scan(self) -> None:
         idle = self.mirror.parent / "idle"

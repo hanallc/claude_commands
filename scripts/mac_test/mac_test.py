@@ -671,6 +671,13 @@ def copy_gives_way(run: RunRecord) -> bool:
     return run.get("copy") is True and process_identity.process_start(run["pid"]) == process_identity.Started(run["proc_start"])
 
 
+def mirror_copy_yields(claims: tuple[HeldClaim, ...], repository_name: str, holder: int) -> bool:
+    """A new step can stop a speculative copy that holds this Mac mirror."""
+    return any(claim.record["pid"] == holder
+               and (isinstance(claim.scope, WholeMacScope) or claim.scope.name == repository_name)
+               and copy_gives_way(claim.record) for claim in claims)
+
+
 def claim_scope(worktree: str) -> ClaimScope:
     """The repository a claim covers: the one its worktree is in, else the whole Mac."""
     from scripts.mac_test import eligibility
@@ -2228,7 +2235,7 @@ def free_now(
             holder = eligibility.mac_mirror_holder(capacity_settings.text("host"), known)
         except copies.CopyError:
             return "state"
-        if holder is not None and (copy or not eligibility.mirror_copy_yields(claims, known, holder)):
+        if holder is not None and (copy or not mirror_copy_yields(claims, repository_name, holder)):
             return "busy"
     if isinstance(eligibility.read_failed_probe(paths.target), eligibility.FailedProbe):
         return "bad"
