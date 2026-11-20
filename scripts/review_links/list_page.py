@@ -231,26 +231,44 @@ def time_html(moment: datetime, today: datetime) -> str:
     return f'<time datetime="{moment.isoformat()}">{html.escape(list_time(moment, today))}</time>'
 
 
-def log_row(index: str, moment: datetime, body: str, today: datetime) -> str:
-    return f'<li data-log-index="{index}">' + time_html(moment, today) + '<div>' + body + '</div></li>'
+def log_row(index: str, moment: datetime, body: str, today: datetime, *,
+            question: Literal["Question", "Answer"] | None = None) -> str:
+    color_class = ''
+    if question is not None:
+        color_class = ' class="question"'
+        body = f'<strong>{question}</strong>' + body
+    return f'<li{color_class} data-log-index="{index}">' + time_html(moment, today) + '<div>' + body + '</div></li>'
 
 
-def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames) -> str:
+def log_field_html(field: str, value: object, today: datetime, names: staff_names.StaffNames, evidence_id: str) -> str:
+    if field == "evidence":
+        text = html.escape(cast(str, value)) or "Not recorded"
+        return f'<details class="log-evidence"><summary id="{evidence_id}">Details</summary><div>{text}</div></details>'
+    return field_html(field, value, today, names)
+
+
+def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames,
+                   fields: Mapping[str, object], evidence_id: str) -> str:
     content = change.what
     by = log_source_html(the_list.source_without_clock(change.source), names)
+    question: Literal["Question", "Answer"] | None = None
     if isinstance(content, the_list.FieldChange):
         heading = content.action + by
-        fields = ''.join(f'<dt>{FIELD_LABELS[field]}</dt><dd>{field_html(field, value, today, names)}</dd>'
-                         for field, value in content.fields.items())
-        body = f'<strong>{heading}</strong><dl>{fields}</dl>'
+        body = f'<strong>{heading}</strong>'
+        if fields:
+            body += '<dl>' + ''.join(
+                f'<dt>{FIELD_LABELS[field]}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
+                for field, value in fields.items()) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
         label = {"pending": "Feedback for morty", "sent": "Feedback sent to morty",
                  "alerted": "Feedback could not reach morty"}[content.state]
         body = label + by + change_browser.question_paragraphs(content.words)
     elif isinstance(content, the_list.QuestionAnswered):
-        body = "Answered question " + html.escape(content.question_id) + by
+        question = "Answer"
+        body = " to question " + html.escape(content.question_id) + by
     elif isinstance(content, the_list.QuestionClosed):
-        body = ("Question " + html.escape(content.question.question_id) + " closed with the item" + by
+        question = "Question"
+        body = (" " + html.escape(content.question.question_id) + " closed with the item" + by
                 + change_browser.question_paragraphs(content.question.words))
     elif isinstance(content, the_list.MarkedRead):
         body = "Marked read" + by
@@ -272,35 +290,40 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = html.escape(content) + by
     else:
         return ""
-    return log_row(str(index), change.time, body, today)
+    return log_row(str(index), change.time, body, today, question=question)
 
 
-def item_log_html(item: the_list.ListItem, today: datetime, names: staff_names.StaffNames,
+def item_log_html(record: ListRecord, today: datetime, names: staff_names.StaffNames,
                   unread_answers: frozenset[str]) -> str:
+    item = record.item
+    row_id = html.escape(record.key.replace("/", "-"), quote=True)
     answers = {question.question_id for question in item.questions if question.answer is not None}
     answer_entries: dict[str, the_list.ItemChange] = {}
     rows: list[tuple[datetime, str]] = []
-    for index, change in enumerate(item.log):
+    for index, (change, fields) in enumerate(zip(item.log, the_list.log_field_changes(item), strict=True)):
         content = change.what
         if isinstance(content, the_list.QuestionAnswered) and content.question_id in answers:
             answer_entries[content.question_id] = change
         elif not the_list.is_page_request_receipt(change):
-            rows.append((change.time, log_entry_html(change, index, today, names)))
+            rows.append((change.time, log_entry_html(change, index, today, names, fields,
+                                                    f"list-evidence-{row_id}-{index}")))
     for question in item.questions:
         answer = question.answer
         identity = question.question_id
         if answer is None or identity in unread_answers:
             continue
         asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
-        question_body = "Question " + html.escape(identity) + log_source_html("nate", names)
+        question_body = " " + html.escape(identity) + log_source_html("nate", names)
         entry = answer_entries.get(identity)
         answered = entry.time if entry is not None else datetime.fromisoformat(answer.answered_at).astimezone(UTC)
         source = the_list.source_without_clock(entry.source) if entry is not None else item.producer
-        answer_body = "Answer" + log_source_html(source, names)
+        answer_body = log_source_html(source, names)
         rows.append((asked, log_row(f"{identity}-asked", asked,
-                                   question_body + change_browser.question_paragraphs(question.words), today)))
+                                   question_body + change_browser.question_paragraphs(question.words), today,
+                                   question="Question")))
         rows.append((answered, log_row(f"{identity}-answered", answered,
-                                       answer_body + change_browser.question_paragraphs(answer.text), today)))
+                                       answer_body + change_browser.question_paragraphs(answer.text), today,
+                                       question="Answer")))
     if not answers.difference(unread_answers):
         return ''.join(markup for _, markup in reversed(rows))
     # Use reverse record order for events with the same time.
@@ -462,7 +485,7 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
 
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
                  unread_answers: frozenset[str], secret: str) -> str:
-    log = item_log_html(entry.item, today, names, unread_answers)
+    log = item_log_html(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     read = ''
     keeper = names.members.by_id(entry.keeper)
@@ -1041,7 +1064,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
-STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
+STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
 [data-list-review-dialog]{width:min(1060px,calc(100% - 48px));max-width:none;max-height:none;padding:0;
 border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);overflow:hidden;box-sizing:border-box}
 [data-list-review-dialog]::backdrop{background:#0009}
@@ -1103,6 +1126,10 @@ background:var(--ink-2);border-radius:50%}
 .list-log dt{color:var(--ink-3)}.list-log dd{margin:0;overflow-wrap:anywhere}
 .list-log dd>:last-child{margin-bottom:0}
 .list-log dl li{display:list-item;padding:0;border:0}
+.list-log>li.question{border-inline-start:3px solid var(--type-color);padding-inline-start:6px}
+.list-log .log-evidence{margin:0}
+.list-log .log-evidence summary{min-height:24px}
+.list-log .log-evidence div{white-space:pre-wrap}
 .page-question p{white-space:pre-wrap;overflow-wrap:anywhere}
 .page-question time{color:var(--ink-3);font-size:13px}
 .page-question .question-unread{margin-inline-start:6px;color:var(--accent);text-transform:none}
@@ -1195,6 +1222,21 @@ function restoreLogPositions(){
   if(!position || !log.clientHeight) continue;
   const entry=log.querySelector('[data-log-index="'+position.index+'"]');
   if(entry) log.scrollTop+=entry.getBoundingClientRect().top-log.getBoundingClientRect().top-position.offset;
+ }
+}
+function restoreEvidenceDetails(fresh){
+ const opened=new Map();
+ for(const details of content.querySelectorAll('.log-evidence[open]')){
+  const key=details.closest('[data-list-item]').dataset.key;
+  if(!opened.has(key)) opened.set(key,new Set());
+  opened.get(key).add(details.closest('[data-log-index]').dataset.logIndex);
+ }
+ if(!opened.size) return;
+ for(const row of fresh.querySelectorAll('[data-list-item]')){
+  const entries=opened.get(row.dataset.key);
+  if(!entries) continue;
+  for(const details of row.querySelectorAll('.log-evidence'))
+   details.open=entries.has(details.closest('[data-log-index]').dataset.logIndex);
  }
 }
 function matchesWords(data,search){
@@ -1713,6 +1755,7 @@ async function refresh(_supersede=false,current=()=>true){
  for(const key of priorWatches.keys()) stopWatchingOpenedAnswer(key);
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
  if(footer && nextFooter) nextFooter.replaceChildren(...footer.childNodes);
+ restoreEvidenceDetails(fresh);
  content.replaceWith(fresh);content=fresh;
  void loadListCounts();
  closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
