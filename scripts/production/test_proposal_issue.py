@@ -14,12 +14,14 @@ import os
 import tempfile
 import unittest
 from collections.abc import Generator
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import final, override
 from unittest import mock
 from uuid import uuid4
 
+from scripts.agents.remote import local_machine
 from scripts.production import proposal_issue
 from scripts.production.issues import Issue, frontmatter
 from scripts.production import proposals_folder, record_store, staff, unit_names
@@ -105,6 +107,23 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(saved.path, archived)
         self.assertEqual(proposal_issue.review_submission(saved), details)
 
+    def proposal_folder_history(self, former: Path, current: Path) -> Path:
+        document = self.root / "production.md"
+        unknown = Path(f"~review-test-{uuid4().hex}/proposals")
+
+        def git(*arguments: str) -> None:
+            _ = subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Fixture",
+                                "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+                                *arguments], capture_output=True, check=True)
+
+        self.enterContext(mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}))
+        git("init", "-b", "main")
+        for folder in (former, unknown, current):
+            _ = document.write_text(f"- **Proposals:** {folder}\n")
+            git("add", document.name)
+            git("commit", "-m", "Set the proposals folder.")
+        return document
+
     def test_review_lookup_skips_an_unknown_history_account_and_finds_the_saved_proposal(self) -> None:
         original = self.root / "original"
         former = self.root / "former"
@@ -115,27 +134,35 @@ class ProposalIssueTests(unittest.TestCase):
                                                    "hana answers this", details)
         saved_path = original.rename(former) / sent.path.name
         current.mkdir()
-        document = self.root / "production.md"
-        unknown = Path(f"~review-test-{uuid4().hex}/proposals")
-
-        def git(*arguments: str) -> None:
-            _ = subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Fixture",
-                                "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
-                                *arguments], capture_output=True, check=True)
-
-        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}):
-            git("init", "-b", "main")
-            for folder in (former, unknown, current):
-                _ = document.write_text(f"- **Proposals:** {folder}\n")
-                git("add", document.name)
-                git("commit", "-m", "Set the proposals folder.")
-
-            saved = proposal_issue.find_review_proposal(
-                current, recipient, new_item_dialog.ByRequestId(details.request_id), document=document)
+        document = self.proposal_folder_history(former, current)
+        saved = proposal_issue.find_review_proposal(
+            current, recipient, new_item_dialog.ByRequestId(details.request_id), document=document)
 
         assert saved is not None
         self.assertEqual(saved.path, saved_path.resolve())
         self.assertEqual(proposal_issue.review_submission(saved), details)
+
+    def test_first_review_filing_skips_an_unknown_history_account_and_uses_the_former_folder(self) -> None:
+        former = self.root / "former"
+        current = self.root / "current"
+        former.mkdir()
+        _ = (former / "earlier proposal.md").write_text(VAULT_ISSUE.replace(
+            "stage: backlog", 'proposal_id: "P7"\nstage: backlog'))
+        document = self.proposal_folder_history(former, current)
+        rows = tuple(replace(row, doc=staff.LiveDoc(local_machine(), document)) if row.name == "hana" else row
+                     for row in staff.snapshot().rows)
+        _ = self.enterContext(mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(rows)))
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        for name, folder in (("style", self.root / "style"), ("hana", current)):
+            with self.subTest(recipient=name), mock.patch.dict(
+                    os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / f"{name}-state")}):
+                recipient = next(row.id for row in rows if row.name == name)
+                sent = proposal_issue.file_review_proposal(folder, recipient, "First proposal", "Words",
+                                                           f"{name} answers this", details)
+                self.assertEqual(sent.path, folder / "first proposal.md")
+                saved = Issue(sent.path, frontmatter(sent.path))
+                self.assertEqual(saved.value("proposal_id"), "P8")
+                self.assertEqual(proposal_issue.review_submission(saved), details)
 
     def test_approve_clears_the_waiting_mark_of_a_review_submission(self) -> None:
         folder = self.root / "issues"

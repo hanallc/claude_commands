@@ -329,11 +329,13 @@ def _proposal_owner(folder: Path, proposer: str, members: staff.StaffSnapshot | 
 
 def _proposal_folders(folder: Path, owner: staff.StaffId, *, strict: bool = False,
                       members: staff.StaffSnapshot | None = None,
-                      require_existing_document: bool = False) -> tuple[Path, ...]:
+                      require_existing_document: bool = False,
+                      skip_unknown_history_accounts: bool = False) -> tuple[Path, ...]:
     row = (staff.snapshot() if members is None else members).by_id(owner) if owner else None
     document = record_store.local_document(row)
     return record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, (folder,), document=document,
-                                      strict=strict, require_existing_document=require_existing_document)
+                                      strict=strict, require_existing_document=require_existing_document,
+                                      skip_unknown_history_accounts=skip_unknown_history_accounts)
 
 
 def proposal_store_issues(folder: Path, *, owner: staff.StaffId | None = None) -> Iterator[Issue]:
@@ -449,9 +451,9 @@ def file_review_proposal(folder: Path, recipient: staff.StaffId, title: str, wor
     today = datetime.now(user_zone()).date()
     why = review_events.require_waiting_why(waiting_why)
     with _folder_lock(folder), proposal_numbers() as numbers:
-        folders = _proposal_folders(folder, recipient, strict=True)
+        folders = _proposal_folders(folder, recipient, strict=True, skip_unknown_history_accounts=True)
         names = {path.name for path in record_store.stored_paths(folders, strict=True)}
-        identity = numbers.next_id(*folders, covered_owner=recipient)
+        identity = numbers.next_id(*folders, covered_owner=recipient, skip_unknown_history_accounts=True)
         # An inline JSON object stays one frontmatter value in the issue reader.
         details_text = json.dumps(new_item_dialog.stored_submission(details))
         draft = f"---\ntags: [issue, proposal]\nreview_submission: {details_text}\n---\n\n{words}\n"

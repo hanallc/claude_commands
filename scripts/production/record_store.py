@@ -559,7 +559,8 @@ def local_document(row: staff.StaffRow | None) -> Path | None:
 
 
 def staff_store_folders(kind: RecordKind, *, members: staff.StaffSnapshot | None = None,
-                        covered_owner: staff.StaffId | None = None) -> Iterator[Path]:
+                        covered_owner: staff.StaffId | None = None,
+                        skip_unknown_history_accounts: bool = False) -> Iterator[Path]:
     """Find store roots for owners whose folders the caller still needs."""
     if members is None:
         if kind is RecordKind.INVESTIGATION:
@@ -573,7 +574,8 @@ def staff_store_folders(kind: RecordKind, *, members: staff.StaffSnapshot | None
     owners = store_owners(kind, members, strict=True)
     for owner, row in owners.items():
         if owner != covered_owner:
-            yield from known_folders(kind, owner, document=local_document(row), strict=True)
+            yield from known_folders(kind, owner, document=local_document(row), strict=True,
+                                     skip_unknown_history_accounts=skip_unknown_history_accounts)
 
 
 def _legacy_high_water(kind: RecordKind) -> int:
@@ -629,17 +631,22 @@ class LockedRecordNumbers:
         match = re.fullmatch(self.kind.prefix + r"([1-9][0-9]*)", identity)
         return int(match[1]) if match else 0
 
-    def floor(self, *folders: Path, covered_owner: staff.StaffId | None = None) -> int:
+    def floor(self, *folders: Path, covered_owner: staff.StaffId | None = None,
+              skip_unknown_history_accounts: bool = False) -> int:
         """Read all stores. The supplied folders include the covered owner's roots."""
         if self.scanned_floor < 0:
-            folders += tuple(staff_store_folders(self.kind, covered_owner=covered_owner))
+            folders += tuple(staff_store_folders(self.kind, covered_owner=covered_owner,
+                                                 skip_unknown_history_accounts=skip_unknown_history_accounts))
             self.scanned_floor = max(_legacy_high_water(self.kind),
                                      max((self.number(self.read_id(path))
                                           for path in stored_paths(folders, strict=True)), default=0))
         return max(self.high_water, self.scanned_floor)
 
-    def next_id(self, *folders: Path, covered_owner: staff.StaffId | None = None) -> str:
-        return f"{self.kind.prefix}{self.floor(*folders, covered_owner=covered_owner) + 1}"
+    def next_id(self, *folders: Path, covered_owner: staff.StaffId | None = None,
+                skip_unknown_history_accounts: bool = False) -> str:
+        ceiling = self.floor(*folders, covered_owner=covered_owner,
+                             skip_unknown_history_accounts=skip_unknown_history_accounts)
+        return f"{self.kind.prefix}{ceiling + 1}"
 
     def next_id_after_collision(self, identity: str, path: Path) -> str:
         occupied = self.number(self.read_id(path)) if path.is_file() and not path.is_symlink() else 0
