@@ -8,7 +8,6 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable
-from hashlib import sha256
 from importlib import import_module
 import json
 import os
@@ -35,7 +34,7 @@ from scripts.production import staff, worker_admission
 from scripts.lib import conf, models_registry, unit_runs
 from scripts.herdr import herdr, side_pane, worker_panes
 from scripts.production import worker as staff_worker
-from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lint import style_review
 from scripts.usage.agents_log import PHASE_REVIEW_LENSES
 from scripts.whoami import quota_state
@@ -117,13 +116,16 @@ def with_test_rules(prompt: str) -> str:
     except (OSError, UnicodeError) as error:
         refuse(f"cannot read test rules in {PROMPT_CONTRACT} ({error})")
     for tag in ("TestRules", "WhenYouWriteNoTest"):
-        _, opening, rest = contract.partition(f"<{tag}>")
-        body, closing, _ = rest.partition(f"</{tag}>")
+        opening, closing = f"<{tag}>", f"</{tag}>"
+        _, _, rest = contract.partition(opening)
+        body, closed, _ = rest.partition(closing)
         rules = dedent(body).strip()
-        if not opening or not closing or not rules:
+        if not closed or not rules:
             refuse(f"missing {tag} section in {PROMPT_CONTRACT}")
-        if rules not in prompt:
-            prompt += "\n\n" + rules + "\n"
+        block = f"{opening}\n{rules}\n{closing}"
+        before, _, rest = prompt.partition(opening)
+        _, closed, after = rest.partition(closing)
+        prompt = before + block + after if closed else prompt + f"\n\n{block}\n"
     return prompt
 
 
@@ -504,76 +506,33 @@ def record_worker_launch_exit(run: Path, instance: uuid.UUID, outcome: progress_
         return progress_history.record_assignment_launch_exit(run, instance, outcome)
 
 
-@dataclass(frozen=True)
-class RecordedPromptTarget:
-    run: Path
-    phase: str
-    slot: str
-    role: staff.WorkerRole
-    work: progress_history.DispatchWork
-
-
-class InlineQuestion:
-    """Send the prepared text in the consultation message."""
-
-
-def staff_artifacts(args: Arguments, role: str) -> tuple[str, str]:
-    slot = args.to or args.new_worker or role
-    suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
-    return slot, suffix
-
-
-def save_prompt(directory: Path, content: str, *, artifact: str = "") -> Path:
-    data = content.encode()
-    if artifact:
-        path = directory / artifact
-        if create_text_atomic(path, content) or path.read_bytes() == data:
-            return path
-    path = directory / "prompts" / f"{sha256(data).hexdigest()}.txt"
-    if not create_text_atomic(path, content) and path.read_bytes() != data:
-        refuse(f"saved prompt has different content: {path}")
-    return path
-
-
-def prepare_prompt(args: Arguments, source: Path, target: InlineQuestion | RecordedPromptTarget,
-                   paths: list[str]) -> str | Path:
-    if isinstance(target, RecordedPromptTarget):
-        saved = progress_history.recorded_dispatch_prompt(target.run, slot=target.slot, phase=target.phase,
-            role=target.role, work=target.work, launcher_command=launcher_command())
-        if isinstance(saved, Path):
-            return saved
-    content = source.read_text()
-    if args.role in TEST_RULE_ROLES:
-        content = with_test_rules(content)
-    if isinstance(target, InlineQuestion):
-        return f"Read {source}.\n{content}"
-    directory = phase_reservation.phase_directory(target.run, target.phase)
-    if target.work.kind != "assign":
-        return save_prompt(directory, content)
-    slot, suffix = staff_artifacts(args, target.role)
-    content += "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
-    content += image_note(args.image)
-    if target.role == "review":
-        content += "\nReturn the complete review result in your final reply.\n"
-    message = save_prompt(directory, content, artifact=f"{slot}_prompt{suffix}.txt")
-    if args.style_since:
-        end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
-        style = style_review.start(Path(args.cwd), args.style_since, directory, message, slot, end)
-        return style / "prompt.md"
-    return message
-
-
-def execute_herdr(args: Arguments, run: Path, phase: str, message: Path,
+def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                   role: str, paths: list[str], env: dict[str, str]) -> int:
     """Send the assignment through the shared worker command."""
+    content = prompt.read_text()
+    if args.role in TEST_RULE_ROLES:
+        content = with_test_rules(content)
     directory = phase_reservation.phase_directory(run, phase)
+    directory.mkdir(parents=True, exist_ok=True)
     launcher = launcher_command()
-    slot, suffix = staff_artifacts(args, role)
+    slot = args.to or args.new_worker or role
+    suffix = f"_{args.lens}_{args.pass_number}" if args.lens else f"_{args.pass_number}" if role == "review" else ""
     summary = directory / f"{slot}_summary{suffix}.txt"
     status = directory / f"{slot}_status{suffix}"
+    message = directory / f"{slot}_prompt{suffix}.txt"
     reply = directory / f"{slot}_reply{suffix}.txt"
     log = directory / f"{slot}_agent{suffix}.log"
-    style = StyleAssignment(message.parent, summary) if args.style_since else NoStyleAssignment()
+    content += "\n" + RULES + "\nAuthorized paths:\n" + "\n".join(paths)
+    content += image_note(args.image)
+    if role == "review":
+        content += "\nReturn the complete review result in your final reply.\n"
+    if not message.is_file() or message.read_text() != content:
+        write_text_atomic(message, content)
+    end = style_review.CommitEnd(args.style_until) if args.style_until else style_review.WORKING_TREE
+    style: NoStyleAssignment | StyleAssignment = NoStyleAssignment()
+    if args.style_since:
+        style = StyleAssignment(style_review.start(Path(args.cwd), args.style_since, directory, message, slot, end), summary)
+        message = style.directory / "prompt.md"
     env["UNIT_RUN_DIR"] = str(run)
     env["UNIT_TEAM_ROLE"] = slot
     if role != "review" and not assign_claude.claim_phase(run, phase, Path(args.cwd).expanduser().resolve(),
@@ -708,11 +667,15 @@ def launch(target: worker_panes.PaneTarget, policy: worker_panes.LaunchPolicy, *
     return staff_worker.launch(target, policy, lock=lock)
 
 
-def execute_consultation(args: Arguments, cwd: Path, question: str) -> int:
+def execute_consultation(args: Arguments, cwd: Path) -> int:
     """Start a consultation without a staff row."""
     opened: side_pane.AbsentSidePane | side_pane.OpenSidePane = side_pane.AbsentSidePane()
     result = 1
     try:
+        question = ""
+        if args.prompt:
+            prompt = Path(args.prompt).expanduser().resolve()
+            question = f"Read {prompt}.\n{prompt.read_text()}"
         review = args.operation == AssignmentOperation.ASTRA_REVIEW
         policy = (worker_panes.astra_review_policy(args.model, args.effort) if review else
                   pane_policy(args.policy, model=args.model, effort=args.effort))
@@ -762,7 +725,7 @@ def execute_consultation(args: Arguments, cwd: Path, question: str) -> int:
     return result
 
 
-def execute_durable(args: Arguments, prompt: Path | None = None) -> int:
+def execute_durable(args: Arguments) -> int:
     """Start or dispatch a durable role through its explicit target."""
     name = staff.WorkerName.parse(args.to or args.new_worker)
     role = cast(staff.WorkerRole, args.policy)
@@ -774,12 +737,12 @@ def execute_durable(args: Arguments, prompt: Path | None = None) -> int:
             return staff_worker.startup_result(name, current)
         print(json.dumps(current.row.to_json()))
         return 0
-    source = Path(args.prompt).expanduser().resolve()
-    run = Path(args.session_dir).expanduser().resolve()
-    reply = Path(args.reply_file) if args.reply_file else source.with_name(source.stem + "_reply.txt")
-    result = staff_worker.dispatch(target.parent, name, role, prompt or source, session_dir=run,
+    prompt = Path(args.prompt).expanduser().resolve()
+    if not prompt.is_file() or not args.session_dir or not args.phase:
+        refuse("durable dispatch requires --prompt, --session-dir, and --phase")
+    result = staff_worker.dispatch(target.parent, name, role, prompt, session_dir=Path(args.session_dir),
         slot=name.value, phase=args.phase, kind="astra",
-        reply=reply, policy=policy,
+        reply=Path(args.reply_file) if args.reply_file else staff_worker.REPLY_BESIDE_PROMPT, policy=policy,
         completion_actions=progress_history.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
         launcher_command=launcher_command())
     return result
@@ -872,58 +835,29 @@ def main() -> int:
     if args.role == "simplify":
         return simplify_daily.main(["--session-dir", args.session_dir, "--cwd", args.cwd])
     env = dict(os.environ)
-    cwd = Path(args.cwd).expanduser().resolve()
-    source = Path(args.prompt).expanduser().resolve()
-    paths: list[str] = []
-    target: InlineQuestion | RecordedPromptTarget
     if args.target == "consultation-pane":
+        cwd = Path(args.cwd).expanduser().resolve()
         if not cwd.is_dir():
             refuse("--cwd must be a directory")
-        if not args.prompt:
-            return execute_consultation(args, cwd, "")
-        target = InlineQuestion()
-    elif args.target == "durable-design-role":
-        if not args.prompt:
-            return execute_durable(args)
-        if not source.is_file() or not args.session_dir or not args.phase:
-            refuse("durable dispatch requires --prompt, --session-dir, and --phase")
-        target = RecordedPromptTarget(Path(args.session_dir).expanduser().resolve(), args.phase,
-            args.to or args.new_worker, cast(staff.WorkerRole, args.policy), progress_history.DispatchWork("astra", "", 0))
-    else:
-        if not cwd.is_dir() or not source.is_file():
-            refuse("--cwd must be a directory and --prompt must be a readable file")
-        if args.operation == AssignmentOperation.ASTRA_REVIEW:
-            target = RecordedPromptTarget(Path(args.session_dir).expanduser().resolve(), "astra-review",
-                args.new_worker, "astra-reviewer", progress_history.DispatchWork("astra", "", 0))
-        else:
-            paths = authorized_paths(args, cwd)
-            run, phase = prepare_run(args, cwd, source, env)
-            role = cast(staff.WorkerRole, "impl" if args.role == "implement" else args.role)
-            check = [PYTHON, PROGRESS, "check-launch", "--session-dir", str(run), "--pass-kind", role,
-                     "--phase-id", phase, "--prompt-file", str(source), "--fix-cause", args.fix_cause]
-            if args.lens:
-                check += ["--lens", args.lens]
-            checked = call(check, env, check=False)
-            if checked.returncode:
-                return 3 if checked.returncode == 3 else 2
-            slot, _ = staff_artifacts(args, role)
-            target = RecordedPromptTarget(run, phase, slot, role,
-                progress_history.DispatchWork("assign", args.lens, args.pass_number if role == "fix" else 0))
-    try:
-        prompt = prepare_prompt(args, source, target, paths)
-    except (OSError, ValueError) as error:
-        if not isinstance(target, InlineQuestion):
-            raise
-        print(f"assign.sh: consultation unavailable: {error}", file=sys.stderr)
-        return worker_panes.ExitCode.UNCERTAIN
-    if isinstance(prompt, str):
-        return execute_consultation(args, cwd, prompt)
-    assert isinstance(target, RecordedPromptTarget)
+        return execute_consultation(args, cwd)
     if args.target == "durable-design-role":
-        return submission_result(execute_durable(args, prompt))
+        return submission_result(execute_durable(args))
+    cwd, prompt = Path(args.cwd).expanduser().resolve(), Path(args.prompt).expanduser().resolve()
+    if not cwd.is_dir() or not prompt.is_file():
+        refuse("--cwd must be a directory and --prompt must be a readable file")
     if args.operation == AssignmentOperation.ASTRA_REVIEW:
         return submission_result(execute_astra_review(args, cwd, prompt, env))
-    return submission_result(execute_herdr(args, target.run, target.phase, prompt, target.role, paths, env))
+    paths = authorized_paths(args, cwd)
+    run, phase = prepare_run(args, cwd, prompt, env)
+    role = "impl" if args.role == "implement" else args.role
+    check = [PYTHON, PROGRESS, "check-launch", "--session-dir", str(run), "--pass-kind", role,
+             "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]
+    if args.lens:
+        check += ["--lens", args.lens]
+    checked = call(check, env, check=False)
+    if checked.returncode:
+        return 3 if checked.returncode == 3 else 2
+    return submission_result(execute_herdr(args, run, phase, prompt, role, paths, env))
 
 
 if __name__ == "__main__":
