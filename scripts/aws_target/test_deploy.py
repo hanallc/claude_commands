@@ -2040,14 +2040,6 @@ class DeploymentTests(CostFixture):
         _ = (modules / 'tailscale.nix').write_text(
             '# The module enables Tailscale SSH.\n{ services.tailscale = {\n' +
             '  enable = true;\n  extraSetFlags = [ "--ssh" ];\n  openFirewall = true;\n}; }\n')
-        bootstrap_template = hosts / 'bootstrap.sh.in'
-        _ = bootstrap_template.write_text('\n'.join((
-            '#!/usr/bin/env bash', '# services.amazon-ssm-agent.enable = true',
-            'systemd-run --unit=aws-build-first-boot-stop --on-active=@IDLE_STOP_SECONDS@s systemctl poweroff',
-            '# udevadm wait --timeout=@DATA_VOLUME_WAIT_SECONDS@',
-            '# @SCRIPTS_SOURCE_URL_JSON@ @SCRIPTS_SOURCE_SHA256_JSON@ @SCRIPTS_SOURCE_COMMIT_JSON@',
-            '# @REMOTE_SETTINGS_JSON@ @EXISTING_DATA_VOLUME_JSON@', '# @INPUT@', '',
-        )))
         _ = (hosts / 'aws-build-base.nix').write_text(
             '# The base shares the transport module.\n{ ... }: { imports = [ ../modules/linux/tailscale.nix ]; }')
         self.notification_file = self.root / 'notification-email'
@@ -2059,14 +2051,9 @@ class DeploymentTests(CostFixture):
             'ami_id': 'ami-fixture', 'ami_owner_id': '123456789012', 'nixos_release': '26.05',
             'availability_zone': 'us-east-1a', 'vpc_id': 'vpc-fixture', 'subnet_id': 'subnet-fixture',
             'root_device_name': '/dev/xvda', 'scaler_user_name': 'build-scaler',
-            'bootstrap_template_path': str(bootstrap_template),
-            'scripts_source_url': 'https://example.invalid/public/commit.tar.gz',
-            'scripts_source_sha256': 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
-            'scripts_source_commit': 'a' * 40,
         }
         values.update({
-            'root_volume_gib': '32', 'data_volume_gib': '500', 'data_volume_iops': '6000',
-            'data_volume_throughput': '500', 'spot_max_usd_per_hour': '0.5',
+            'spot_max_usd_per_hour': '0.5',
             'budget_notice_low_percent': '50', 'budget_notice_high_percent': '80', 'budget_stop_percent': '100',
             'deployment_timeout_s': '30', 'preflight_max_age_s': '300', 'fixed_usd_per_month': '0.001',
             'retained_storage_usd_per_month': '0', 'root_storage_usd_per_month': '0',
@@ -5385,10 +5372,7 @@ else: raise AssertionError(args)
 
     def install_reviewed_template(self) -> None:
         hosts = self.root / 'nixos/hosts'
-        template = hosts / 'reviewed-bootstrap.sh.in'
-        _ = template.write_text(self.patch_source('hosts/aws-bootstrap.sh.in'))
         _ = (hosts / 'aws-build-base.nix').write_text(self.patch_source('hosts/aws-build-base.nix'))
-        self.replace('bootstrap_template_path', str(template))
 
     def reviewed_bundle(self) -> str:
         self.install_reviewed_template()
