@@ -2017,14 +2017,13 @@ def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
 
 
 def end_row_scratch(path: Path, row: str) -> list[str]:
-    """Remove the scratch folders of `row` on the list at `path`; return one line per folder.
+    """End the scratch task of `row` and return any error.
 
     A verdict ends the row either way: a row returned to its unit comes back as a new row.
     """
     try:
-        result = scratch.end(f"row:{_owner(path)}-{row}")
-        return ([f"removed {folder}" for folder in result]
-                + [f"kept {folder.path}: {folder.reason}" for folder in result.kept])
+        _ = scratch.end(f"row:{_owner(path)}-{row}")
+        return []
     except (conf.Unusable, scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
 

@@ -1219,19 +1219,15 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
 
 
 def end_phase_scratch(request: MergeRequest) -> None:
-    """Remove the merged phase's scratch folders; a failure warns and never fails the merge."""
+    """End the merged phase's scratch task and report record failures."""
     if not isinstance(request.kind, CodeCheckpoint):
         return
     task = f"phase:{request.unit.name}/{request.phase}"
     try:
-        removed = scratch.end(task)
+        _ = scratch.end(task)
     except (scratch.ScratchError, OSError) as error:
         checkpoint_gate.report("scratch", "warning", f"{task} not removed: {error}")
         return
-    if removed:
-        checkpoint_gate.report("scratch", "ok", f"removed {len(removed)} folder(s) of {task}: " + ", ".join(map(str, removed)))
-    for folder in removed.kept:
-        checkpoint_gate.report("scratch", "warning", f"kept {folder.path}: {folder.reason}")
 
 
 def notify_style(checkout: Path, branch: str, tip: str) -> bool:
