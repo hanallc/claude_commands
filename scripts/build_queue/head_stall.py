@@ -7,7 +7,7 @@ except FileNotFoundError:
     pass
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -19,6 +19,7 @@ from scripts.build_hold import build_hold
 from scripts.build_queue import admission_records as records
 from scripts.build_queue.queue_evidence import gib
 from scripts.build_queue.queue_snapshot import QueueSnapshot, read_queue_snapshot
+from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import store
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -65,13 +66,14 @@ class Holder:
 
 @dataclass(frozen=True)
 class HeadStall:
-    """The head waited at least the limit, steps hold memory, and no step started in that time."""
+    """The head waited at least the limit while reservations held memory and no step started."""
     last_start: float
     step: str
     folder: str
     pid: int
     need: int
     room: records.RoomCheck | records.ReadingUnavailable
+    reason: records.WaitReason
     waited: float
     quiet: float
     holders: tuple[Holder, ...]
@@ -159,30 +161,37 @@ def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
 
 def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: float) -> HeadStall | NoStall:
     inputs = snapshot.inputs
-    running = tuple(step for step in inputs.running if step.promise > 0)
-    if not inputs.ordered or not running:
+    if not inputs.ordered or not (inputs.reservations or inputs.slots):
         return NoStall()
-    _, head = inputs.ordered[0]
-    waited = now - head["since"]
-    last_start = max(admitted, *(step.started_at for step in running))
+    last_running_start = max((step.started_at for step in inputs.running if step.promise > 0), default=0.0)
+    last_start = max(admitted, last_running_start)
     quiet = now - last_start
-    if waited < limit or quiet < limit:
+    if quiet < limit:
         return NoStall()
-    policy = snapshot.policy
-    admission = gate.head_policy(inputs, inputs.now, policy, gate.start_spacing_after(inputs.now, policy))
-    room = admission.room
+
+    result = gate.admission_pass(replace(inputs, blockers_for=frozenset()), inputs.now, snapshot.policy)
+    candidate = result.policy.queued_head
+    if isinstance(candidate, gate.NoQueuedHead):
+        return NoStall()
+    head = candidate.waiter
+    waited = now - head["since"]
+    if waited < limit:
+        return NoStall()
+
     owner = records.waiter_owner(head)
-    head_room = (next(entry.decision.room for entry in admission.walk
-                      if records.waiter_owner(entry.waiter) == owner)
-                 if isinstance(room, records.MemoryRoom) else room)
-    holders = active_holders(inputs, room, now)
+    head_row = next(row for row in result.rows if row.owner == owner)
+    room = result.policy.room
+    head_room = head_row.decision.room if isinstance(room, records.MemoryRoom) else room
+    holders = memory_holders(inputs, result.policy, now)
+    if not holders:
+        return NoStall()
     return HeadStall(last_start, head.get("step", "step"), head.get("folder", ""),
-                     head["pid"], head["need"], head_room, waited, quiet, holders, _compiler_scan(inputs.running))
+                     head["pid"], head["need"], head_room, head_row.reason, waited, quiet, holders,
+                     _compiler_scan(inputs.running))
 
 
-def active_holders(inputs: records.QueueInputs, room: records.MemoryRoom | records.ReadingUnavailable,
-                   now: float) -> tuple[Holder, ...]:
-    """Name the active steps for each run that admission charges."""
+def memory_holders(inputs: records.QueueInputs, policy: gate.HeadPolicy, now: float) -> tuple[Holder, ...]:
+    """List the runs with active reservations or memory held between steps."""
     steps_by_owner: dict[str, list[records.RunningStep]] = {}
     reserved_steps = (step for step in inputs.running if gate.running_has_reservation(step))
     for row, step in zip(inputs.reservations, reserved_steps, strict=True):
@@ -190,15 +199,19 @@ def active_holders(inputs: records.QueueInputs, room: records.MemoryRoom | recor
             continue
         owner = gate.reservation_owner(row, step)
         steps_by_owner.setdefault(owner, []).append(step)
-    charges = (tuple((run.memory, run.bytes) for run in room.runs)
-               if isinstance(room, records.MemoryRoom) else
-               tuple((memory, room) for memory in gate.run_memories(inputs)))
+    room = policy.room
+    if isinstance(room, records.MemoryRoom):
+        charges = tuple((run.memory, run.bytes) for run in room.runs)
+    else:
+        slots = tuple(slot for slot in inputs.slots if not isinstance(slot, records.ContinuationSlot)
+                      or slot.slot.reservation not in policy.returned_claims)
+        charges = tuple((memory, room) for memory in gate.run_memories(replace(inputs, slots=slots)))
     holders: list[Holder] = []
     for memory, keep_aside in charges:
         steps = steps_by_owner.get(memory.owner, [])
-        if not steps:
+        if not steps and not memory.held:
             continue
-        started_at = min(step.started_at for step in steps)
+        started_at = min((step.started_at for step in steps), default=0.0)
         held_for = max(0.0, now - started_at) if started_at > 0 else HolderAdmissionUnavailable()
         holders.append(Holder(tuple(steps), memory, keep_aside, held_for))
     return tuple(holders)
@@ -237,16 +250,25 @@ def builds_text(stall: HeadStall) -> str:
     lines.append("Holders:")
     for holder in stall.holders:
         memory = holder.memory
+        if not holder.steps:
+            run = memory.run
+            name = f"Run pid {run.pid}" if isinstance(run, LiveBuildRun) else memory.owner
+            lines.append(f"- {name}: held between steps, keep-aside {gib(memory.held)}")
+            continue
         used = gib(memory.use.bytes) if isinstance(memory.use, records.AnonymousRunUse) else "unknown"
         keep_aside = gib(holder.keep_aside) if isinstance(holder.keep_aside, int) else "unknown"
         original_grant = sum(step.promise for step in holder.steps)
         duration = f"{holder.held_for / 60:.0f} min" if isinstance(holder.held_for, float) else "unknown"
         steps = " + ".join(_holder_step(step) for step in holder.steps)
+        held = f", {gib(memory.held)} held between steps" if memory.held else ""
         lines.append(f"- {steps}: effective need {gib(memory.need)}, keep-aside {keep_aside}, "
-                     + f"uses {used}, original grant {gib(original_grant)}, held for {duration}")
-    if isinstance(room, records.RoomCheck):
-        shortfall = 0 if room.passes else max(0, room.need - room.room)
-        lines.append(f"Memory shortfall: {gib(shortfall)}.")
+                     + f"uses {used}, original grant {gib(original_grant)}, held for {duration}{held}")
+    reason = stall.reason
+    cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
+    if isinstance(cause, records.NeedsMemory) and isinstance(room, records.RoomCheck):
+        lines.append(f"Memory shortfall: {gib(max(0, room.need - room.room))}.")
+    else:
+        lines.append(f"Reason: {records.reason_phrase(cause, ())}.")
     return "\n".join(lines)
 
 

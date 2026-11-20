@@ -20,6 +20,7 @@ from scripts.build_hold import build_hold
 from scripts.build_queue import admission_records as records, head_stall
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
+from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.buildlog import cli, mac_idle, sample
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.production import staff
@@ -87,6 +88,37 @@ class FindStallTests(unittest.TestCase):
             "- check in devtools-chooserux (pid 706237): effective need 12.0 GiB, keep-aside 11.9 GiB, "
             + "uses 0.1 GiB, original grant 12.0 GiB, held for 180 min",
             "Memory shortfall: 4.9 GiB."])
+
+    def test_pressure_alert_names_the_head_after_an_older_token_waiter(self) -> None:
+        token_waiter = waiter(NOW - 7200)
+        token_waiter.update(token_left_at=NOW - 7100, step="test", folder="/build/token-waiter")
+        head = waiter(NOW - 3600)
+        head.update(pid=1618940, need=4 * GIB, step="check", folder="/build/pressure-head")
+        queue = snapshot([token_waiter, head], STALLED.inputs.running)
+        inputs = replace(queue.inputs, pressure=records.MemoryPressure(3.0, condition="full"))
+
+        stall = head_stall.find_stall(replace(queue, inputs=inputs), 0.0, NOW, LIMIT)
+        assert isinstance(stall, head_stall.HeadStall)
+        report = head_stall.builds_text(stall)
+        self.assertIn("The build queue head has waited 60 min.", report)
+        self.assertIn("Head: check in pressure-head (pid 1618940) needs 4.0 GiB.", report)
+        self.assertIn("Reason: memory pressure.", report)
+        self.assertNotIn("Memory shortfall:", report)
+
+    def test_a_slot_between_steps_is_listed_with_its_memory(self) -> None:
+        run = LiveBuildRun(706239, "19509000", NOW - 3600)
+        slot = records.BetweenStepsSlot(run, "finished", 5 * GIB, NOW + 10, records.HoldPredatesStepFacts())
+        for running, expected_shortfall in ((STALLED.inputs.running, "9.9 GiB"), ((), "2.0 GiB")):
+            with self.subTest(active_step=bool(running)):
+                queue = snapshot([waiter(NOW - 3600)], running)
+                host = queue.inputs.host if running else records.HostMemory(21 * GIB, 60 * GIB)
+                inputs = replace(queue.inputs, slots=(slot,), host=host)
+
+                stall = head_stall.find_stall(replace(queue, inputs=inputs), NOW - 3600, NOW, LIMIT)
+                assert isinstance(stall, head_stall.HeadStall)
+                report = head_stall.builds_text(stall)
+                self.assertIn("- Run pid 706239: held between steps, keep-aside 5.0 GiB", report)
+                self.assertIn(f"Memory shortfall: {expected_shortfall}.", report)
 
     def test_two_compiling_holders_count_their_own_sccache_jobs(self) -> None:
         first_scope = Path("/cgroup/builds.slice/first.scope")
