@@ -3111,7 +3111,7 @@ Work:
 2. Comments only: no key, value or order changes.
 3. Run each file's reader tests; the readers still parse the files.
 
-### Phase 44dc — A test run stops holding a full build's memory promise  · status: next (after 44eb fix round 4; builds 18:49)
+### Phase 44dc — A test run stops holding a full build's memory promise  · status: written; in the group re-tip d94c34b714 and replay tip d4775184d3 (local), waits for natemerge's go
 **From builds (item 78; nate yes 12:12 EST via bob), 2026-11-19:** a test run keeps a full build's memory promise for its whole life. At 09:07 a merge gate using 0.3 GiB still kept 4.6 GiB aside (the 44da read: designed behavior today). Repair it.
 
 Today the need falls only for a progress window or for a nextest step past its build (`reservation_need`, scripts/lint/memory_admit.py). Otherwise the full row need holds until the reservation ends (`step_promise`, `LifetimePromise`).
