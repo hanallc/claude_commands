@@ -15,8 +15,8 @@ from scripts.aws_target.quota_requests import RegionalQuotaRequests, snapshot_qu
 from scripts.lib import conf
 
 
-# Where a table puts its regions: one region in each row (the first column), or in each column after the first.
-RegionAxis = Literal['rows', 'columns']
+# A region is the first cell of a row, a column header, or the second cell after the type.
+RegionAxis = Literal['rows', 'columns', 'type-region-rows']
 # The run table columns that the page shows in its price tables, so the page leaves them out of the run tables.
 SPOT_HEADER = 'Spot USD/h'
 ESTIMATE_HEADER = 'estimate'
@@ -34,6 +34,26 @@ class Table:
     values: tuple[tuple[Decimal | None, ...], ...] = ()
     # The (row, column) cells of a type that the region does not sell; they read NOT_SOLD.
     not_sold: frozenset[tuple[int, int]] = frozenset()
+
+
+@dataclass(frozen=True)
+class MachineHoursRow:
+    size: str
+    region: str
+    check: run_cost.HoursCheck
+
+
+@dataclass(frozen=True)
+class HoursComparison:
+    rows: tuple[MachineHoursRow, ...]
+    checked_regions: frozenset[str]
+    max_gap_ratio: Decimal
+
+
+@dataclass(frozen=True)
+class HoursComparisonUnavailable:
+    reason: str
+    checked_regions: frozenset[str] = frozenset()
 
 
 NOT_SOLD = '—'
@@ -120,8 +140,7 @@ class SpotTables:
     quotas: tuple[Table, ...]
     # One entry for each scope in run_cost.SCOPES, in that order.
     runs: tuple[RunCosts, ...]
-    hours: Table
-    hours_note: str
+    hours: HoursComparison | HoursComparisonUnavailable
     gpu_quota_needed: int
     quota_requests: tuple[RegionalQuotaRequests, ...]
 
@@ -167,15 +186,15 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None,
     home = configuration.text('region')
     inputs = gate_pricing if gate_pricing is not None else run_cost.read_gate_pricing_inputs(
         directory, now, values, configuration)
-    hours, hours_note = billed_hours(directory, now, regions, hours_check_scope(values), days, home,
-                                     configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
+    hours = billed_hours(directory, now, hours_check_scope(values), days, home,
+                         configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
     return SpotTables(
         tuple(reads),
         (price_table(standard, regions, minimum, notes, not_sold), price_table(gpu, regions, minimum, notes, not_sold)),
         (quota_table('Standard quota', 'standard_vcpus', standard, regions, readings, notes),
          quota_table('G and VT quota', 'gpu_vcpus', gpu, regions, readings, notes)),
         run_costs(directory, now, standard, regions, minimum, values, configuration, inputs),
-        hours, hours_note, values.whole('gpu_spot_quota_request_vcpus'), snapshot_quota_requests(document, regions))
+        hours, values.whole('gpu_spot_quota_request_vcpus'), snapshot_quota_requests(document, regions))
 
 
 def price_table(sizes: tuple[str, ...], regions: tuple[str, ...], minimum: Mapping[tuple[str, str], Decimal],
@@ -313,34 +332,24 @@ def paid_run_cell(billed: list[run_cost.FinishedGateRun], due: int, allocations:
     return f'{run_cost.billed_cost_per_run(billed, allocations):.4f}' + (f' ({due} bill due)' if due else '')
 
 
-def billed_hours(directory: Path, now: int, regions: tuple[str, ...], scope: run_cost.SpotHoursScope, days: int, home: str,
-                 builder: str, max_ratio: Decimal) -> tuple[Table, str]:
-    """The billed Spot hours against the recorded box hours of each type and region, and the note under them."""
-    title = 'Billed hours / box hours'
+def billed_hours(directory: Path, now: int, scope: run_cost.SpotHoursScope, days: int, home: str,
+                 builder: str, max_ratio: Decimal) -> HoursComparison | HoursComparisonUnavailable:
+    """Read the hours of each type and region in the comparison window."""
     end = datetime.fromtimestamp(now, UTC)
+    start = end - timedelta(days=days)
+    book = ledger.CostLedger(directory)
     try:
-        checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, builder, scope,
-                                       max_ratio)
+        checks = run_cost.hours_checks(book, start, end, home, builder, scope, max_ratio)
+        checked_regions = frozenset(region for _size, region in checks)
+        size_order = {size: index for index, size in enumerate(scope.sizes)}
+        active = sorted((key for key, check in checks.items() if check.billed_hours or check.box_hours),
+                        key=lambda key: (size_order[key[0]], key[1]))
+        if not active:
+            reason = ('There are no machine hours to compare.' if run_cost.billed_readings(book, start, end)
+                      else f'No AWS bill is available yet for the last {days} days.')
+            return HoursComparisonUnavailable(reason, checked_regions)
     except ledger.LedgerUnavailable:
-        return Table(title, ('type', *regions), frozenset(), (), 'columns'), 'No billed hours: the cost ledger is not readable.'
-    # A region that is no longer a candidate keeps its column while it has hours in the window.
-    columns = (*regions, *sorted({region for _size, region in checks} - set(regions)))
-    rows = tuple((size, *(hours_cell(checks.get((size, region))) for region in columns))
-                 for size in scope.sizes if any(key[0] == size for key in checks))
-    note = (f'AWS billed Spot hours / recorded box hours, last {days} days, on the days with a bill. '
-            + 'The gap in parentheses is the distance outside the range divided by the bound on that side. '
-            + f'Over marks a gap above {max_ratio:.0%}. '
-            + 'Not billed: no day has a bill yet.')
-    return Table(title, ('type', *columns), frozenset(range(1, len(columns) + 1)), rows, 'columns'), note
-
-
-def hours_cell(check: run_cost.HoursCheck | None) -> str:
-    """For example 9.2/8.8 (4%); 'over' marks a gap above the limit."""
-    if check is None:
-        return '—'
-    if check.billed_hours is None:
-        return 'not billed'
-    gap = f' ({check.hours_gap_ratio:.0%})' if check.hours_gap_ratio is not None else ''
-    reserved = f' + {check.hana_reserved_hours:.2f} reserved' if check.hana_reserved_hours else ''
-    return f'{check.billed_hours:.1f}/{check.box_hours:.1f}{reserved}{gap}' + (' over' if check.hours_gap_over else '')
+        return HoursComparisonUnavailable('Our records are unreadable.')
+    rows = tuple(MachineHoursRow(size, region, checks[size, region]) for size, region in active)
+    return HoursComparison(rows, checked_regions, max_ratio)
 

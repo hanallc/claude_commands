@@ -67,7 +67,7 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         admission = caller_admission(self, self.root, self.environment)
         settings = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
         _ = write_config_fixture(settings, f"# whole: 1..\nslots.{admission.server.host}.workspace.max=1\n")
-        with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
+        with mock.patch.dict(os.environ, self.environment, clear=True), build_slots.take_slot(
                 self.repo, "HEAD", showrunner="builds", unit="doc-test", work="competing copy", purpose="doc"):
             yield
 
@@ -343,7 +343,8 @@ else:
         self.assertFalse(call["notes_present"])
         checkout = Path(call["cwd"])
         self.assertTrue(checkout.is_relative_to(self.root / "slots"))
-        key = treekey.tree_key(str(checkout))
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            key = treekey.tree_key(str(checkout))
         assert key is not None
         self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(key))
         rows = (cast(dict[str, object], json.loads(line))
@@ -418,7 +419,7 @@ else:
 
     def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
         original = self.repo
-        with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
+        with mock.patch.dict(os.environ, self.environment, clear=True), build_slots.take_slot(
                 original, "HEAD", showrunner="builds", unit="doc-test", work="prepared copy", purpose="doc") as slot:
             self.repo: Path = slot.path
             self.environment["BUILDLOG_PREPARED_COPY"] = str(slot.path)
@@ -439,6 +440,29 @@ else:
         self.assertTrue(checkout.is_relative_to(self.root / "slots"))
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
         self.assertEqual(len(list((self.root / "slots").glob("*-slot*.lease.json"))), 1)
+
+    def test_doc_with_an_old_copy_call_reports_that_verify_must_run_again(self) -> None:
+        verify = self.root / "home/.claude/scripts/direct/verify.sh"
+        source = verify.read_text(encoding="utf-8")
+        current = r'''set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
+            --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" -- "$@"'''
+        legacy = 'set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE"'
+        self.assertEqual(source.count(current), 1)
+        _ = verify.write_text(source.replace(current, legacy), encoding="utf-8")
+
+        process, log, _ = self.start_doc(command=("bash", str(verify), "doc", "alpha"))
+        status = process.wait(TEST_HANG_GUARD_SECS)
+        output = log.read_text(encoding="utf-8")
+        self.assertIn("copies: hold requires --tree. Run verify.sh again.", output)
+        self.assertNotEqual(status, 0, output)
+        self.assertNotIn("the following arguments are required", output)
+        self.assertFalse(self.events.exists())
+        self.assertEqual(self.pass_records(), [])
+
+        retry = self.verify("alpha")
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        self.assertEqual(len(self.cargo_calls()), 1)
+        self.assertEqual(len(self.pass_records()), 1)
 
     def test_doc_replaces_checkout_and_reuses_target_preserving_unchanged_mtimes(self) -> None:
         stamp = 1_000_000_000_000_000_000
