@@ -184,6 +184,8 @@ assert.deepEqual(changes,['two']);
 class LinkedTableTests(unittest.TestCase):
     def render(self, fragment: str, *, closed_item: str = '', park_open_card: bool = False) -> dict[str, object]:
         node = shutil.which('node') or str(next(Path('/nix/store').glob('*nodejs*/bin/node')))
+        _, start, rest = review_page.SCRIPT.partition('function allEntries(){')
+        table_script = start + rest.partition('\nasync function afterRowAnimations(')[0]
         source = ('const fragment=' + json.dumps(fragment) + ';\n'
                   + 'const closedItem=' + json.dumps(closed_item) + ';\n'
                   + 'const parkOpenCard=' + json.dumps(park_open_card) + ';\n') + r'''
@@ -234,7 +236,7 @@ const reviewPlace=()=>{},loadBodies=()=>{},rememberItem=()=>{};
 const createTable=createRecordTable;
 {
 const createRecordTable=options=>createTable({...options,entries:undefined,mount:undefined});
-''' + review_page.REVIEW_TABLE_SCRIPT + r'''
+''' + table_script + r'''
 view.place();view.apply(false);
 if(parkOpenCard){
  view.opened.add('sdlc/C1830');view.apply(false);
