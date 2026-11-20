@@ -3482,7 +3482,7 @@ class MemoryMacSwitchTests(unittest.TestCase):
                 with self.subTest(route=route, step=step):
                     notes = memory_feed.target_notes(route, routes, step, "/fixture/hana", "hana")
                     self.assertEqual(notes["targets"], list(targets_for_step))
-                    self.assertEqual(notes["because"], "enabled.mac is off")
+                    self.assertEqual(notes.get("because"), "enabled.mac is off")
         notes = memory_feed.target_notes(target_config.PinnedTarget("hana-gpu"), routes, "run", "/fixture/hana", "hana")
         self.assertEqual(notes["targets"], ["hana-gpu"])
 

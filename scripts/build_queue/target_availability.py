@@ -41,6 +41,7 @@ class SnapshotsUnreadable:
 
 
 Snapshots = tuple[targets.TargetSnapshot, ...] | SnapshotsUnreadable
+NO_DISABLED_MAC_TARGETS: frozenset[str] = frozenset()
 
 
 def read_snapshots() -> Snapshots:
@@ -55,14 +56,14 @@ def read_disabled_mac_targets() -> frozenset[str]:
     """Read the Mac switch and target names from the same registry."""
     settings = conf.read("build_targets").settings
     if not isinstance(settings, dict):
-        return frozenset()
+        return NO_DISABLED_MAC_TARGETS
     values = {name: setting.value for name, setting in settings.items()}
     try:
         switch = machine_switch.read(machine_switch.Machine.MAC, values)
     except machine_switch.MachineSwitchError:
-        return frozenset()
+        return NO_DISABLED_MAC_TARGETS
     if switch is machine_switch.MachineSwitch.ON:
-        return frozenset()
+        return NO_DISABLED_MAC_TARGETS
     return frozenset({"mac", *(name.removeprefix("platform.")
                                for name, value in values.items()
                                if name.startswith("platform.") and value == "macos")})
@@ -151,7 +152,7 @@ class MacRoutes:
     """Say, for each natedev step, whether it may run on the Mac, and why not."""
 
     def __init__(self, snapshots: Snapshots, labels: Mapping[str, unit_labels.UnitLabels], zone: tzinfo,
-                 *, disabled_mac_targets: frozenset[str] = frozenset()) -> None:
+                 *, disabled_mac_targets: frozenset[str] = NO_DISABLED_MAC_TARGETS) -> None:
         self.disabled_mac_targets: frozenset[str] = disabled_mac_targets
         self.mac: targets.TargetSnapshot | NoMacTarget | SnapshotsUnreadable = (
             snapshots if isinstance(snapshots, SnapshotsUnreadable)
