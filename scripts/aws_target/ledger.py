@@ -77,6 +77,7 @@ class GateRateCandidate:
 class GateLaunchPending:
     """The launch has no confirmed instance identity."""
     rate_candidates: tuple[GateRateCandidate, ...] = ()
+    booked_day_rates: tuple[tuple[str, BoxRate], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -840,9 +841,11 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
         status = mapping(item['state'])
         kind = text(status, 'kind')
         if kind == 'pending':
-            gate_state = GateLaunchPending(tuple(
-                GateRateCandidate(text(candidate, 'instance_type'), text(candidate, 'region'))
-                for candidate in rows(status, 'rate_candidates')) if 'rate_candidates' in status else ())
+            gate_state = GateLaunchPending(
+                tuple(GateRateCandidate(text(candidate, 'instance_type'), text(candidate, 'region'))
+                      for candidate in rows(status, 'rate_candidates')) if 'rate_candidates' in status else (),
+                tuple((text(rate, 'day'), BoxRate(money(text(rate, 'usd_per_hour')), text(rate, 'source')))
+                      for rate in rows(status, 'booked_day_rates')) if 'booked_day_rates' in status else ())
         elif kind == 'running':
             gate_state = GateRunning(text(status, 'instance_id'))
         elif kind == 'absent':
@@ -960,7 +963,10 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
                            for day, rate in r.day_rates],
              'applied_usd_per_hour': str(r.rate.usd_per_hour), 'rate_source': r.rate.source, 'state':
              {'kind': 'pending', **({'rate_candidates': [asdict(candidate) for candidate in r.state.rate_candidates]}
-                                    if r.state.rate_candidates else {})} if isinstance(r.state, GateLaunchPending) else
+                                    if r.state.rate_candidates else {}),
+              **({'booked_day_rates': [{'day': day, 'usd_per_hour': str(rate.usd_per_hour), 'source': rate.source}
+                                      for day, rate in r.state.booked_day_rates]} if r.state.booked_day_rates else {})}
+             if isinstance(r.state, GateLaunchPending) else
              {'kind': 'running', 'instance_id': r.state.instance_id} if isinstance(r.state, GateRunning) else
              {'kind': 'absent', 'at': r.state.at} if isinstance(r.state, GateAbsent) else
              {'kind': 'terminated', 'at': r.state.at, 'instance_id': r.state.instance_id}}
@@ -1655,6 +1661,44 @@ def gate_rate(readings: Sequence[ChargeRead], instance_type: str, fallback: Deci
                key=lambda rate: rate.usd_per_hour, default=BoxRate(fallback, 'spot_max_usd_per_hour'))
 
 
+
+@dataclass(frozen=True)
+class GateRateWithinReservation:
+    """The saved reservation covers the choice's bill rate."""
+
+
+@dataclass(frozen=True)
+class GateRateAboveReservation:
+    candidate: GateRateCandidate
+    usd_per_hour: Decimal
+    reserved_usd_per_hour: Decimal
+
+    @property
+    def reason(self) -> str:
+        return (f'{self.candidate.instance_type} in {self.candidate.region} costs '
+                f'{self.usd_per_hour:g} USD/h with {self.reserved_usd_per_hour:g} USD/h reserved')
+
+
+def gate_launch_rate(reservation: GateReservation, candidate: GateRateCandidate, readings: Sequence[ChargeRead],
+                     now: int) -> GateRateWithinReservation | GateRateAboveReservation:
+    """Compare the choice with the saved rate for each remaining bill day."""
+    if not isinstance(reservation.state, GateLaunchPending):
+        raise LedgerUnavailable('The gate has no pending reservation')
+    rates = _bill_rates(readings, candidate.instance_type, now, candidate.region)
+    current = dict(reservation.day_rates)
+    booked = dict(reservation.state.booked_day_rates)
+    fallback = reservation.rate.usd_per_hour if reservation.rate.source != 'not priced' else reservation.usd_per_hour
+    zone = ZoneInfo('UTC')
+    for left, _right in _days(now, max(now + 1, reservation.expires), zone):
+        day = datetime.fromtimestamp(left, zone).date().isoformat()
+        usable = current[day].usd_per_hour if day in current else fallback
+        limit = min(usable, booked[day].usd_per_hour) if day in booked else usable
+        rate = rates.for_day(day, reservation.usd_per_hour).usd_per_hour
+        if rate > limit:
+            return GateRateAboveReservation(candidate, rate, limit)
+    return GateRateWithinReservation()
+
+
 def box_cost(rate: BoxRate, running_seconds: int, minimum_seconds: int) -> Decimal:
     """Price one box with the configured minimum running time."""
     return rate.usd_per_hour * Decimal(max(minimum_seconds, running_seconds)) / Decimal(3600)
@@ -2158,9 +2202,7 @@ class CostLedger:
             regions = (reservation.region,) if reservation.region else configured_regions
             candidates = tuple(GateRateCandidate(size, region) for region in regions)
             if launch is None and isinstance(reservation.state, GateLaunchPending) and reservation.state.rate_candidates:
-                # Keep the original reservation as a floor until AWS confirms a launch.
-                floor = (GateRateCandidate(size, region) for region in configured_regions)
-                candidates = tuple(dict.fromkeys((*reservation.state.rate_candidates, *floor)))
+                candidates = reservation.state.rate_candidates
             rates_by_candidate: list[_BillRates] = []
             for candidate in candidates:
                 key = (candidate.instance_type, candidate.region, reservation.root_gib or root_gib)
@@ -2285,8 +2327,12 @@ class CostLedger:
                 state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
                 self._save(state)
                 return GateCapReached(reason)
+            reserved = state.gate_reservations[-1]
+            if isinstance(reserved.state, GateLaunchPending):
+                reserved = replace(reserved, state=replace(reserved.state, booked_day_rates=reserved.day_rates))
+                state.gate_reservations[-1] = reserved
             self._save(state)
-            return GateReserved(state.gate_reservations[-1])
+            return GateReserved(reserved)
 
     @contextmanager
     def locked_snapshot(self) -> Generator[LedgerEvidence]:

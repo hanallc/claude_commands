@@ -591,7 +591,6 @@ def read_gate_pricing_inputs(directory: Path, now: int, values: conf.ConfigRead,
 @dataclass(frozen=True)
 class GateVariantEligibility:
     variants: tuple[GateLaunchVariant, ...]
-    prices: dict[GateLaunchVariant, Decimal]
     slow_box_seconds: dict[tuple[str, str], Decimal]
 
 
@@ -606,15 +605,21 @@ def slow_gate_types(
 
 
 def gate_variant_eligibility(
-    deployed: Sequence[GateLaunchVariant], directory: Path, evidence: RunEvidence, mode: str,
-    *, now: float, max_age: int, max_gate_minutes: int, live_prices: Sequence[ledger.RegionalSpotPrice] = (),
+    deployed: Sequence[GateLaunchVariant], evidence: RunEvidence, mode: str, max_gate_minutes: int,
 ) -> GateVariantEligibility:
-    """Filter deployed variants by median time and match prices by region, type, and zone."""
-    zone_prices = current_zone_prices(directory, now, max_age)
-    zone_prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
+    """Exclude variants whose median box time exceeds the limit."""
     slow = slow_gate_types(deployed, evidence, (mode,), max_gate_minutes)
     variants = tuple(variant for variant in deployed if (variant.instance_type, variant.region) not in slow)
-    return GateVariantEligibility(variants, deployed_gate_prices(variants, zone_prices), slow)
+    return GateVariantEligibility(variants, slow)
+
+
+def gate_variant_prices(
+    eligible: Sequence[GateLaunchVariant], directory: Path, now: float, max_age: int,
+    live_prices: Sequence[ledger.RegionalSpotPrice],
+) -> dict[GateLaunchVariant, Decimal]:
+    zone_prices = current_zone_prices(directory, now, max_age)
+    zone_prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
+    return deployed_gate_prices(eligible, zone_prices)
 
 
 def merge_gate_comparisons(directory: Path, now: int, values: conf.ConfigRead,

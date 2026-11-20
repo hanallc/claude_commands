@@ -226,7 +226,12 @@ def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, ob
         for request in requests:
             attempt = ledger.text(request, 'attempt')
             deployment = cloud_gate.read(cohort / attempt / 'deployment.json')
-            candidates[attempt] = cloud_gate.gate_rate_candidates(run_cost.deployed_gate_variants(deployment, sizes).variants)
+            variants = run_cost.deployed_gate_variants(deployment, sizes).variants
+            ranking = worker.ranking_input(variants, ledger.text(request, 'mode'), values)
+            eligible = cloud_gate.gate_rate_candidates(ranking.eligible.variants)
+            if not eligible:
+                raise GateRefused(f'{attempt}: No gate variant meets the deployment and median-time limits')
+            candidates[attempt] = eligible
     policy = read_settings(worker.settings_path)
     state = worker.book.read_snapshot()
     costs = ledger.costs_from_evidence(state, policy, now)
@@ -238,8 +243,7 @@ def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, ob
                    for variant in dict.fromkeys(variant for variants in candidates.values() for variant in variants)}
 
     def estimate_request(row: dict[str, object]) -> Decimal:
-        highest = max(rate, max((trial_rates[variant] for variant in candidates.get(ledger.text(row, 'attempt'), ())),
-                                default=rate))
+        highest = max((trial_rates[variant] for variant in candidates.get(ledger.text(row, 'attempt'), ())), default=rate)
         return ledger.box_cost(ledger.BoxRate(highest, 'trial reserve'), ledger.instant(row, 'expires') - now,
                                policy.box_minimum_seconds) + allowance
 

@@ -1259,9 +1259,14 @@ If every variant lacks a current price, the worker preserves input order within 
 
 The worker can prefer a faster box within each capacity group.
 Set `faster_box_max_cost_ratio` to 1 to use cost order only.
-The default is 1.5, and the range is 1 to 10.
+Main uses 1. The range is 1 to 10.
+The measured cost ratio in eu-south-2 was 1.32.
+Use /tune to set a higher value only after the user approves it.
 Each fresh rank uses the cheapest eligible priced variant across all capacity groups as its reference.
 The ratio uses Spot compute and transfer costs.
+Each promotion adds at most (ratio − 1) × C in estimated AWS spend, where C is the reference cost.
+The account caps still limit spending. The ratio applies to each promotion.
+A capacity refusal can advance to a box whose cost exceeds the ratio.
 The usual cost order still includes the estimated cost of waiting.
 A speed promotion needs a positive time saving and recent box times for both instance types.
 The worker can use times from other regions for the same type.
@@ -1271,7 +1276,8 @@ The worker reports the preferred box and reports the actual box that AWS accepts
 Live prices affect each fresh rank. Retries use the saved order.
 A capacity refusal advances to the next saved variant.
 The median-time filter can exclude a small box. The expiry can end the scan before the worker reaches that box.
-With the ratio above 1, the ledger reserves the highest bill rate of the eligible launch types and regions.
+With the ratio above 1, the ledger takes the highest bill rate from the same set of choices that ranking uses.
+The worker skips any choice whose bill rate exceeds the rate already booked for the attempt.
 The reservation keeps the usual lifetime and allowance. It uses the accepted type and region after AWS confirms the launch.
 Paired trials use the same rank. The AWS page and build report still use their cost estimates and completed runs.
 
