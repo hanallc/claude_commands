@@ -84,8 +84,13 @@ class MergeGateSuitesTests(GateSuitesFixture):
                 self.assertEqual(sent_term, stop_at_deadline)
                 self.assertEqual(run.passed, not stop_at_deadline, run.time_limit_report)
                 self.assertEqual(run.jobs[0].returncode, int(stop_at_deadline))
-                self.assertEqual(bool(run.jobs[0].killed_for), stop_at_deadline)
-                self.assertEqual(bool(run.time_limit_report), stop_at_deadline)
+                if stop_at_deadline:
+                    self.assertRegex(run.jobs[0].killed_for,
+                                     r"^time limit: limit 10 s; elapsed [\d.]+ s; running modules: hooks/test_first.py$")
+                    self.assertEqual(run.time_limit_report.splitlines()[0], run.jobs[0].killed_for)
+                else:
+                    self.assertEqual(run.jobs[0].killed_for, "")
+                    self.assertEqual(run.time_limit_report, "")
                 names = checkpoint_gate.red_names(["merge_gate.py"], output.getvalue())
                 self.assertEqual(names, {"hooks/test_first.py"} if stop_at_deadline else set())
                 self.assertLess(run.seconds, 20)

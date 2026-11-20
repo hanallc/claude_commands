@@ -9,8 +9,9 @@ import os
 import sqlite3
 import subprocess
 from typing import final
-from contextlib import closing, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stdout
 from unittest import mock
+from scripts.aws_target import cloud_gate
 from scripts.buildlog import index
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
@@ -66,24 +67,43 @@ class MergeGateRerunsTests(GateSuitesFixture):
             ("full", ["--full"], expected_default),
             ("explicit default value", [*named_options, "--module-time-limit-s", "1800"],
              dict.fromkeys(expected_named, merge_gate.ExplicitModuleTimeLimit(1800))),
+            ("explicit full limit", ["--full", "--module-time-limit-s", "27"],
+             dict.fromkeys(expected_named, merge_gate.ExplicitModuleTimeLimit(27))),
+            ("unopenable index lock", named_options, expected_default),
             ("unreadable index", named_options, expected_default),
+            ("full with unreadable index", ["--full"], None),
         )
+        buildlog = Path(self.environment["BUILDLOG_DIR"])
+        warnings_by_case = {"unopenable index lock": "Is a directory", "unreadable index": "file is not a database"}
         for label, options, expected in cases:
-            with self.subTest(label=label), mock.patch.object(merge_gate, "start_gate_job", side_effect=capture_started):
-                if label == "unreadable index":
-                    database = index.index_path_in(Path(self.environment["BUILDLOG_DIR"]))
-                    _ = database.write_bytes(b"invalid SQLite database\n" * 100)
+            with (self.subTest(label=label), ExitStack() as scope,
+                  mock.patch.object(cloud_gate, "route", return_value="fixture fallback") as route,
+                  mock.patch.object(merge_gate, "start_gate_job", side_effect=capture_started)):
+                if label == "unopenable index lock":
+                    blocked_lock = buildlog / "blocked-index-lock"
+                    blocked_lock.mkdir()
+                    _ = scope.enter_context(mock.patch.object(index, "LOCK_NAME", blocked_lock.name))
+                if label in {"unreadable index", "full with unreadable index"}:
+                    _ = index.index_path_in(buildlog).write_bytes(b"invalid SQLite database\n" * 100)
                 jobs.clear()
+                if expected is None:
+                    with self.assertRaisesRegex(sqlite3.DatabaseError, "file is not a database"):
+                        _ = self.run_gate("--tests-only", *options)
+                    self.assertEqual(jobs, [])
+                    continue
                 result = self.run_gate("--tests-only", *options)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 actual = {f"{job.suite}/{job.module}": job.time_limit for job in jobs}
                 self.assertEqual(actual, expected)
                 if label == "named":
                     self.assertEqual(actual["hooks/test_first.py"].seconds, 20.0)
-                if label == "unreadable index":
+                    route.assert_not_called()
+                if label in {"full", "explicit full limit"}:
+                    self.assertEqual(route.call_args.kwargs["module_time_limit_s"], 27 if label == "explicit full limit" else 1800)
+                if label in warnings_by_case:
                     warnings = [line for line in result.stdout.splitlines() if "cannot read the gate index" in line]
                     self.assertEqual(len(warnings), 1, result.stdout)
-                    self.assertIn("file is not a database", warnings[0])
+                    self.assertIn(warnings_by_case[label], warnings[0])
 
     def test_named_module_stops_at_the_fixture_floor(self) -> None:
         self.set_module_time_history({"hooks/test_first.py": (0.5,)})
@@ -140,23 +160,27 @@ class HangingModule(unittest.TestCase):
 
     @gate_suites("lib", "hooks")
     def test_memory_stopped_module_passes_alone_and_messages_name_the_gate(self) -> None:
-        for mode in merge_gate.SuiteMode:
-            with self.subTest(mode=mode):
+        cases = [(mode, True) for mode in merge_gate.SuiteMode] + [(merge_gate.SuiteMode.MERGE_GATE, False)]
+        for mode, use_history in cases:
+            with self.subTest(mode=mode, use_history=use_history):
                 self.restore_fixture(("lib", "hooks"))
                 self.configure_gate("merge_gate_governor_gib=4")
                 self.set_module_time_history({"hooks/test_first.py": (2.0,)})
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
+                        mock.patch.object(cloud_gate, "route", return_value="fixture fallback"), \
                         self.sampling_module_memory({"hooks/test_first.py": (5120.0, 64.0)}) as started, redirect_stdout(output):
-                    run = merge_gate.run_suites(self.checkout, mode=mode, full=True)
+                    run = (merge_gate.run_gate_suites(self.checkout, mode=mode, full=True) if use_history
+                           else merge_gate.run_suites(self.checkout, mode=mode, full=True))
                 self.assertTrue(run.passed, output.getvalue())
                 attempts = [job for job in run.executions if job.suite == "hooks"]
                 self.assertEqual(len(attempts), 2)
                 self.assertNotEqual(attempts[0].returncode, 0)
                 self.assertIn("peak memory 5.000 GiB", attempts[0].killed_for)
                 self.assertEqual(attempts[1].returncode, 0)
-                self.assertEqual([job.time_limit for job in started if job.suite == "hooks"],
-                                 [merge_gate.DEFAULT_MODULE_TIME_LIMIT, merge_gate.MeasuredModuleTimeLimit(4.0, 2.0)])
+                expected_limits = ([merge_gate.DEFAULT_MODULE_TIME_LIMIT, merge_gate.MeasuredModuleTimeLimit(4.0, 2.0)]
+                                   if use_history else [merge_gate.ExplicitModuleTimeLimit(1800)] * 2)
+                self.assertEqual([job.time_limit for job in started if job.suite == "hooks"], expected_limits)
                 self.assertEqual([job for job in run.jobs if job.suite == "hooks"], [attempts[-1]])
                 events = self.module_events()
                 self.assertEqual([event["event"] for event in events[-2:]], ["start", "finish"])

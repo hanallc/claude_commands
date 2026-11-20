@@ -1519,15 +1519,15 @@ def gate_test_parent(tmpfs: Path) -> Path:
 
 
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
-               module_time_limit_s: float | None = None,
+               module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
                source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                mode: SuiteMode = SuiteMode.MERGE_GATE,
                machine: SharedMachine | WholeMachine = SHARED_MACHINE,
                selected: AllModules | SelectedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
-    """Run a suite for callers that supply a timeout in seconds or omit it."""
-    return run_suites_with_policy(repo, type_dirs, suite_module_time_policy(module_time_limit_s),
+    """Run a suite with one limit in seconds for every job."""
+    return run_suites_with_policy(repo, type_dirs, FixedSuiteModuleTimeLimit(module_time_limit_s),
                                   max_running_jobs, source=source, full=full, mode=mode,
                                   machine=machine, selected=selected, time_limit=time_limit)
 
@@ -1610,7 +1610,6 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
         print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
-    history_readable = True
     if isinstance(time_limit, gate_record.ReadGateTimeLimit):
         try:
             time_limit = read_time_limit(
@@ -1618,9 +1617,6 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
                 max_running_jobs, mode is SuiteMode.TARGETED_TEST and not full)
         except conf.Unusable as error:
             raise GateRefused(str(error)) from error
-        except sqlite3.Error as error:
-            history_readable = False
-            time_limit = gate_record.NoGateTimeLimit(f"cannot read the gate index ({error})")
     if isinstance(time_limit, gate_record.NoGateTimeLimit):
         print(f"Gate time limit disabled: {time_limit.reason}", flush=True)
     scope_prefix = suite_scope_prefix() if shared else []
@@ -1648,6 +1644,7 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
     first_runs: dict[tuple[str, str], GateJobResult] = {}
     memory_reruns: dict[tuple[str, str], int] = {}
     rerun_time_limits: dict[str, ModuleTimeLimit] = {}
+    module_history_readable = True
     rerunning = False
     suite_started: dict[str, float] = {}
     suite_finished: dict[str, float] = {}
@@ -1828,7 +1825,7 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
                         break
                     request = pending[0]
                     limit = fixed_limit
-                    if (history_readable and isinstance(module_time_policy, HistorySuiteModuleTimeLimits)
+                    if (module_history_readable and isinstance(module_time_policy, HistorySuiteModuleTimeLimits)
                             and (rerunning or isinstance(selected, NamedModules))
                             and request.kind is GateJobKind.TEST_MODULE):
                         name = f"{request.suite}/{request.module}"
@@ -1838,8 +1835,8 @@ def run_suites_with_policy(repo: Path, type_dirs: Sequence[str], module_time_pol
                             missing = sorted(set(names) - rerun_time_limits.keys())
                             try:
                                 rerun_time_limits.update(read_rerun_module_time_limits(os.cpu_count() or 1, missing))
-                            except sqlite3.Error as error:
-                                history_readable = False
+                            except (sqlite3.Error, OSError) as error:
+                                module_history_readable = False
                                 print(f"Module time limits use the default: cannot read the gate index ({error})",
                                       flush=True)
                         limit = rerun_time_limits.get(name, DEFAULT_MODULE_TIME_LIMIT)
@@ -2298,7 +2295,7 @@ def merge_checkpoint(args: GateArguments) -> int:
         previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
         os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
-            suites = run_gate_suites(repo, args.module_time_limit_s,
+            suites = run_gate_suites(repo, suite_module_time_policy(args.module_time_limit_s),
                                      source="checkpoint", full=args.full, gate_job=args.gate_job)
         finally:
             if previous_unit is None:
@@ -2988,7 +2985,7 @@ class CloudGateRoute(Protocol):
 
 
 def run_gate_suites(repo: Path,
-                    module_time_limit_s: float | None = None, *,
+                    module_time_policy: SuiteModuleTimePolicy = HISTORY_SUITE_MODULE_TIME_LIMITS, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.MERGE_GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
@@ -3014,13 +3011,13 @@ def run_gate_suites(repo: Path,
                             hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
                             max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
             return GateRun((), 0.0, 0.0, selection_certified=True)
-    cloud_limit_seconds = (DEFAULT_MODULE_TIME_LIMIT_S if module_time_limit_s is None
-                           else module_time_limit_s)
+    cloud_limit_seconds = (module_time_policy.seconds if isinstance(module_time_policy, FixedSuiteModuleTimeLimit)
+                           else DEFAULT_MODULE_TIME_LIMIT_S)
     outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=cloud_limit_seconds,
                           selected=selected, gate_job=gate_job)
     if isinstance(outcome, str):
         print('Cloud gate uses natedev: ' + outcome, flush=True)
-        return run_suites(repo, module_time_limit_s=module_time_limit_s, source=source, full=full, mode=mode)
+        return run_suites_with_policy(repo, (), module_time_policy, source=source, full=full, mode=mode)
     return outcome
 
 
@@ -3049,14 +3046,13 @@ def run_named_modules(repo: Path, names: Sequence[str],
 
 
 def run_tests_only(args: GateArguments, mode: SuiteMode) -> int:
+    module_time_policy = suite_module_time_policy(args.module_time_limit_s)
     try:
         with scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             repo = Path(args.repo).resolve()
             with gate_recovery(repo):
-                run = (run_named_modules(repo, args.modules, suite_module_time_policy(args.module_time_limit_s), mode)
-                       if args.modules else
-                       run_gate_suites(repo, module_time_limit_s=args.module_time_limit_s, full=args.full,
-                                       mode=mode, gate_job=args.gate_job))
+                run = (run_named_modules(repo, args.modules, module_time_policy, mode) if args.modules else
+                       run_gate_suites(repo, module_time_policy, full=args.full, mode=mode, gate_job=args.gate_job))
             if run.time_limit_report:
                 tell_time_limit(copies.source_owner(repo), repo, run)
             return 0 if run.passed else 1
