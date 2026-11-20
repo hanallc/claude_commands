@@ -1399,7 +1399,9 @@ class HoursCheckTests(CostFixture):
         assert isinstance(table, spot_table.HoursComparison)
         row = next(row for row in table.rows if row.size == fallback)
         self.assertTrue(row.check.hours_gap_over)
-        self.assertEqual(aws_page.hours_row_data(row)['cells'], [fallback, self.other, '2.0', '0.0', '+2.0', '1.0'])
+        data = aws_page.hours_row_data(row)
+        assert data['kind'] == 'compared'
+        self.assertEqual((data['billed_tenths'], data['recorded_tenths'], data.get('hana_reserved_tenths')), (20, 0, 10))
 
     def test_unusable_hana_size_setting_preserves_gate_notices_and_table(self) -> None:
         text_setting(self.root / 'hana_aws.conf', 'fallback_instance_types', 'm6a.4xlarge,')
@@ -1417,7 +1419,10 @@ class HoursCheckTests(CostFixture):
         assert isinstance(table, spot_table.HoursComparison)
         row, = table.rows
         self.assertTrue(row.check.hours_gap_over)
-        self.assertEqual(aws_page.hours_row_data(row)['cells'], [self.size, self.other, '2.0', '1.0', '+1.0', '—'])
+        data = aws_page.hours_row_data(row)
+        assert data['kind'] == 'compared'
+        self.assertEqual((data['billed_tenths'], data['recorded_tenths']), (20, 10))
+        self.assertNotIn('hana_reserved_tenths', data)
 
     def test_gap_sends_one_staff_message_and_no_user_push(self) -> None:
         one = self.day(1)
@@ -1449,11 +1454,14 @@ class HoursCheckTests(CostFixture):
         self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2})
         hours = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).hours
         assert isinstance(hours, spot_table.HoursComparison)
-        self.assertEqual([aws_page.hours_row_data(row)['cells'] for row in hours.rows], [
-            [self.size, self.home, '1.3', '1.0', '+0.3', '—'],
-            [self.size, self.other, '0.0', '0.5', '-0.5', '—'],
-            [gpu, self.home, '—', '1.0', '—', '—'],
-        ])
+        billed, lower, unbilled = (aws_page.hours_row_data(row) for row in hours.rows)
+        assert billed['kind'] == 'compared' and lower['kind'] == 'compared'
+        self.assertEqual((billed['size'], billed['region'], billed['billed_tenths'], billed['recorded_tenths'],
+                          billed['signed_difference']), (self.size, self.home, 13, 10, '+0.3'))
+        self.assertEqual((lower['size'], lower['region'], lower['billed_tenths'], lower['recorded_tenths'],
+                          lower['signed_difference']), (self.size, self.other, 0, 5, '-0.5'))
+        self.assertEqual(unbilled, {'kind': 'unbilled', 'size': gpu, 'region': self.home, 'recorded_tenths': 10})
+        self.assertEqual((hours.first_utc_day, hours.last_utc_day), (self.day(7).date(), one.date()))
         self.assertEqual([row.check.hours_gap_over for row in hours.rows], [True, True, False])
 
     def test_over_uses_the_full_precision_of_the_hours_and_limit(self) -> None:
@@ -1466,19 +1474,23 @@ class HoursCheckTests(CostFixture):
                 hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
                 assert isinstance(hours, spot_table.HoursComparison)
                 row, = hours.rows
-                self.assertEqual(aws_page.hours_row_data(row)['cells'][4], '+0.2')
+                data = aws_page.hours_row_data(row)
+                assert data['kind'] == 'compared'
+                self.assertEqual(data['signed_difference'], '+0.2')
                 self.assertEqual(row.check.hours_gap_over, mark)
 
     def test_hours_difference_rounds_only_after_subtracting(self) -> None:
-        for billed, recorded, cells in (
-            ('0.96', '1', ['1.0', '1.0', '0.0']),
-            ('4.24', '4.26', ['4.2', '4.3', '0.0']),
-            ('1.24', '1.06', ['1.2', '1.1', '+0.2']),
+        for billed, recorded, expected in (
+            ('0.96', '1', (10, 10, '-0.0')),
+            ('4.24', '4.26', (42, 43, '-0.0')),
+            ('1.24', '1.06', (12, 11, '+0.2')),
         ):
             with self.subTest(billed=billed, recorded=recorded):
                 check = run_cost.hours_check(Decimal(billed), Decimal(recorded), self.limit)
                 row = spot_table.MachineHoursRow(self.size, self.home, check)
-                self.assertEqual(aws_page.hours_row_data(row)['cells'][2:5], cells)
+                data = aws_page.hours_row_data(row)
+                assert data['kind'] == 'compared'
+                self.assertEqual((data['billed_tenths'], data['recorded_tenths'], data['signed_difference']), expected)
 
     def test_billed_hours_empty_states_distinguish_a_missing_bill_from_no_hours(self) -> None:
         def check(note: str) -> None:
@@ -1492,7 +1504,9 @@ class HoursCheckTests(CostFixture):
         hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
         assert isinstance(hours, spot_table.HoursComparison)
         row, = hours.rows
-        self.assertEqual(aws_page.hours_row_data(row)['cells'], [self.size, self.home, '—', '1.0', '—', '—'])
+        self.assertEqual(aws_page.hours_row_data(row), {
+            'kind': 'unbilled', 'size': self.size, 'region': self.home, 'recorded_tenths': 10,
+        })
         self.assertFalse(row.check.hours_gap_over)
 
     def test_spot_table_keeps_gate_hours_and_shows_the_hana_allowance(self) -> None:
@@ -1505,11 +1519,13 @@ class HoursCheckTests(CostFixture):
         self.bill(day, {(self.size, self.other): Decimal(3), (fallback, self.other): Decimal('0.9')})
         table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
         assert isinstance(table, spot_table.HoursComparison)
-        cells = {row.size: aws_page.hours_row_data(row)['cells'][1:] for row in table.rows}
-        self.assertEqual(cells, {
-            self.size: [self.other, '3.0', '1.0', '+2.0', '2.0'],
-            fallback: [self.other, '0.9', '0.0', '+0.9', '2.0'],
-        })
+        readings = {row.size: aws_page.hours_row_data(row) for row in table.rows}
+        for size, billed_hours, recorded_hours in ((self.size, 30, 10), (fallback, 9, 0)):
+            with self.subTest(size=size):
+                data = readings[size]
+                assert data['kind'] == 'compared'
+                self.assertEqual((data['region'], data['billed_tenths'], data['recorded_tenths'],
+                                  data.get('hana_reserved_tenths')), (self.other, billed_hours, recorded_hours, 20))
         self.assertFalse(any(row.check.hours_gap_over for row in table.rows))
 
     def test_failed_notice_stays_pending_and_old_days_leave_the_claims(self) -> None:

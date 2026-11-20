@@ -97,6 +97,10 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 #spend .note { margin-top: 12px; }
 #quota-help, #hours details { margin-top: 10px; font-size: 0.86rem; }
 #quota-help summary, #hours summary { font-weight: 600; cursor: pointer; }
+@media (max-width: 560px) {
+  #hours th, #hours td { padding-inline: 2px; white-space: normal; overflow-wrap: anywhere; }
+  #hours thead th span { white-space: normal; }
+}
 #quota-help li + li { margin-top: 4px; }
 #quota-help a { color: var(--ink); overflow-wrap: anywhere; }
 #quota-help p { margin: 0; color: var(--ink-2); }
@@ -545,18 +549,41 @@ function drawScope() {
 }
 
 function hoursTable(rows) {
-  const headers = ["type", "region", "AWS billed", "our records", "difference"];
-  const hasReserved = rows.some(row => row.cells[5] !== "—");
-  if (hasReserved) headers.push("Hana reserved");
-  const table = tableElement([{
-    headers, right: headers.map((_header, index) => index).slice(2),
-    rows: rows.map(row => row.cells), region_axis: "type-region-rows",
+  const headers = ["Instance type", "Region", "AWS billed (hours)", "Our records (hours)",
+    "AWS minus our records (hours)"];
+  const hasReserved = rows.some(row => row.hana_reserved_tenths !== undefined);
+  if (hasReserved) headers.push("Reserved for Hana (hours)");
+  const hours = tenths => (tenths / 10).toFixed(1);
+  const cells = rows.map(row => {
+    const compared = row.kind === "compared";
+    const line = [row.size, row.region, compared ? hours(row.billed_tenths) : "—",
+      hours(row.recorded_tenths), compared ? row.signed_difference : "—"];
+    if (hasReserved) line.push(row.hana_reserved_tenths === undefined ? "—" : hours(row.hana_reserved_tenths));
+    return line;
+  });
+  const wrap = tableElement([{
+    headers, right: headers.map((_header, index) => index).slice(2), rows: cells, region_axis: "type-region-rows",
   }], false);
+  const table = wrap.querySelector("table");
   if (hasReserved) {
     table.querySelector("thead th:last-child").title =
       "The check adds these hours reserved for Hana in this region to our recorded hours when it checks for a higher bill.";
   }
-  return table;
+  const compared = rows.filter(row => row.kind === "compared");
+  const sum = (group, key) => group.reduce((total, row) => total + (row[key] ?? 0), 0);
+  const difference = sum(compared, "difference_tenths");
+  const totals = [
+    compared.length ? hours(sum(compared, "billed_tenths")) : "—",
+    hours(sum(rows, "recorded_tenths")),
+    compared.length ? (difference > 0 ? "+" : "") + hours(difference) : "—",
+  ];
+  if (hasReserved) totals.push(hours(sum(compared, "hana_reserved_tenths")));
+  const total = table.createTFoot().insertRow();
+  const label = element("th", "Total");
+  label.colSpan = 2;
+  label.scope = "row";
+  total.append(label, ...totals.map(value => element("td", value, "n")));
+  return wrap;
 }
 
 function hoursAnswer(compared, higherBills, limitPercent) {
@@ -599,11 +626,22 @@ function drawHours() {
   const answer = compared.length ? hoursAnswer(compared, higherBills, data.hours.limit_percent)
     : "No AWS bill is available yet for the recorded hours.";
   section.appendChild(element("p", answer, "answer"));
-  if (higherBills.length) section.appendChild(hoursTable(higherBills));
+  const date = new Intl.DateTimeFormat("en-US", {dateStyle: "medium", timeZone: "UTC"});
+  const span = date.formatRange(new Date(data.hours.first_utc_day), new Date(data.hours.last_utc_day));
+  section.appendChild(element("p", `Comparison window ${span} (UTC).`, "note"));
+  const table = hoursTable(rows);
+  const sign = element("p", "A positive difference means AWS billed more than our records.", "note");
+  const content = rows.length > compared.length
+    ? [table, sign, element("p", "A dash in AWS billed means the bill is due.", "note")]
+    : [table, sign];
+  if (rows.length <= 20) {
+    section.append(...content);
+    return;
+  }
   const details = element("details");
   details.open = wasOpen;
   details.addEventListener("toggle", markOverflow);
-  details.append(element("summary", `All rows (${rows.length})`), hoursTable(rows));
+  details.append(element("summary", `All rows (${rows.length})`), ...content);
   section.appendChild(details);
 }
 

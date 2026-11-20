@@ -411,18 +411,18 @@ class AwsCombinedTableTests(PageCostFixture):
              ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.25'), Decimal('.01'), 'Hrs')))
         _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(charge)))
         self.run_browser_checks('', """
-    const sizes = () => [...document.querySelectorAll("#hours details tbody tr")].map(row => row.cells[0].textContent);
+    const sizes = () => [...document.querySelectorAll("#hours tbody tr")].map(row => row.cells[0].textContent);
     check(sizes().includes("c7a.4xlarge") && sizes().includes("m7a.8xlarge"), "Both active sizes show");
     const east = document.querySelector("#regions [data-region='us-east-1']");
     document.querySelector("#regions .all:last-child").click();
     document.querySelector("#regions [data-region='us-east-2']").click();
     check(sizes().join() === "m7a.8xlarge", "The hidden region's size row is absent");
-    const cells = [...document.querySelector("#hours details tbody tr").cells];
-    check(cells.slice(1, 5).map(cell => cell.textContent).join("|") === "us-east-2|0.0|0.0|less than 0.1 hours",
-          "A marked difference still shows when the hours round to zero");
+    const cells = [...document.querySelector("#hours tbody tr").cells];
+    check(cells.slice(1, 5).map(cell => cell.textContent).join("|") === "us-east-2|0.0|0.0|+0.0",
+          "A positive difference keeps its sign when it rounds to zero");
     check(document.querySelector("#hours p").textContent
           === "Yes. AWS billed less than 0.1 hours more than our records, in 1 row.",
-          "The answer and row show the same small difference");
+          "The answer still describes the small difference");
     east.click();
     check(sizes().includes("c7a.4xlarge"), "The row returns when its region is selected");
 """)
@@ -631,7 +631,7 @@ class AwsCombinedTableTests(PageCostFixture):
     check(new URLSearchParams(location.search).get("types") === "standard", "Types URL");
 """)
 
-    def test_hours_answer_and_disclosure_use_the_existing_rule(self) -> None:
+    def test_hours_show_the_sorted_table_and_keep_the_answer(self) -> None:
         self.costs({'billed_hours_gap_max_ratio': '0.15'})
         checks = {
             ('c7a.4xlarge', 'us-east-1'): run_cost.hours_check(Decimal('1.5'), Decimal('1'), Decimal('.15')),
@@ -645,30 +645,33 @@ class AwsCombinedTableTests(PageCostFixture):
         with mock.patch.object(run_cost, 'hours_checks', return_value=checks):
             self.run_browser_checks('', """
     const section = document.getElementById("hours");
-    const table = () => section.querySelector(":scope > .scroll table");
-    const rows = () => table() ? [...table().tBodies[0].rows] : [];
+    const table = () => section.querySelector("table");
+    const rows = () => [...table().tBodies[0].rows];
     const answer = () => section.querySelector("p").textContent;
-    const details = () => section.querySelector("details");
     const cells = row => [...row.cells].map(cell => cell.textContent).join("|");
     const toggleRegion = region => document.querySelector(`#regions [data-region='${region}']`).click();
     check(answer() === "Yes. AWS billed 4.2 hours more than our records, in 2 rows.", "Sum marked higher bills");
-    const reported = answer().match(/billed ([0-9.]+) hours more than our records, in ([0-9]+) rows/);
-    const visibleSum = rows().reduce((sum, row) => sum + Number(row.cells[4].textContent), 0);
-    check(reported && visibleSum.toFixed(1) === reported[1] && rows().length === Number(reported[2]),
-          "The amount and count in the answer match the visible rows");
-    check(cells(table().tHead.rows[0]) === "type|region|AWS billed|our records|difference|Hana reserved", "Hours headings");
+    check(!section.querySelector("details") && table().getBoundingClientRect().height > 0, "The table is visible");
+    const header = cell => [...cell.children].map(part => part.textContent).join(" ");
+    check([...table().tHead.rows[0].cells].map(header).join("|") === "Instance type|Region|AWS billed (hours)|"
+          + "Our records (hours)|AWS minus our records (hours)|Reserved for Hana (hours)", "Hours headings and units");
+    check(section.querySelector(".answer + .note").textContent.includes("Jan 10")
+          && section.querySelector(".answer + .note").textContent.includes("14, 2026 (UTC)"),
+          "The date range covers the five UTC days open to billing");
+    check(table().parentElement.nextElementSibling.textContent
+          === "A positive difference means AWS billed more than our records.", "The note explains the sign");
     check(table().tHead.rows[0].cells[5].title ===
           "The check adds these hours reserved for Hana in this region to our recorded hours when it checks for a higher bill.",
           "Hana reserved has a tooltip");
     check(rows().map(cells).join("\\n") === [
       "c7a.4xlarge|eu-west-1|5.7|2.0|+3.7|1.0",
-      "c7a.4xlarge|us-east-1|1.5|1.0|+0.5|—"
-    ].join("\\n"), "The visible rows are the marked higher bills");
-    check([2, 3, 4, 5].every(index => getComputedStyle(rows()[0].cells[index]).textAlign === "right"),
-          "Hours align right");
-    check(!details().open && details().querySelector("summary").textContent === "All rows (4)", "Closed by default");
-    details().querySelector("summary").click();
-    check(details().open && details().querySelectorAll("tbody tr").length === 4, "Open to see all rows");
+      "c7a.4xlarge|us-east-1|1.5|1.0|+0.5|—",
+      "c7a.4xlarge|us-east-2|1.5|1.0|+0.5|0.5",
+      "m7a.8xlarge|us-west-1|0.0|2.1|-2.1|—"
+    ].join("\\n"), "The rows sort by descending difference");
+    check(cells(table().tFoot.rows[0]) === "Total|8.7|6.1|+2.6|1.5", "The last row sums each column");
+    check([...table().querySelectorAll(".n")].every(cell => getComputedStyle(cell).textAlign === "right"),
+          "Numeric headings, data and totals align right");
     toggleRegion("eu-west-1");
     check(answer() === "Yes. AWS billed 0.5 hours more than our records, in 1 row.", "One marked higher bill");
     toggleRegion("us-east-1");
@@ -676,22 +679,40 @@ class AwsCombinedTableTests(PageCostFixture):
     check(answer() === "No. AWS billed 1.5 hours and our records show 1.0 hours. "
           + "No row is more than 15% above the sum of its recorded hours and the hours reserved for Hana.",
           "An in-limit higher bill explains the configured limit");
-    check(!table() && details().open, "The region filter leaves only the disclosure open");
-    check(details().querySelector("tbody tr").cells[5].textContent === "0.5", "The in-limit row used Hana reserved");
+    check(rows().length === 1 && rows()[0].cells[5].textContent === "0.5", "The in-limit row used Hana reserved");
     toggleRegion("us-east-2");
     toggleRegion("us-west-1");
     check(answer() === "No. AWS billed 2.1 hours less than our records, in 1 row.", "One marked lower bill");
-    check(!table(), "A marked lower bill stays out of the visible table");
-    check(cells(details().querySelector("tbody tr")) === "m7a.8xlarge|us-west-1|0.0|2.1|-2.1",
-          "All rows shows the marked lower bill and its negative difference");
+    check(rows().length === 1 && cells(rows()[0]) === "m7a.8xlarge|us-west-1|0.0|2.1|-2.1",
+          "The lower bill has a negative difference and no Hana column");
+""")
+
+    def test_hours_keep_a_disclosure_only_above_twenty_rows(self) -> None:
+        regions = ('us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'eu-west-1', 'eu-west-2', 'eu-west-3',
+                   'eu-north-1', 'ap-south-1', 'ap-east-1', 'ca-central-1')
+        checks = {
+            (size, region): run_cost.hours_check(Decimal(2), Decimal(1), Decimal('.2'))
+            for size in ('c7a.4xlarge', 'm7a.8xlarge') for region in regions
+            if (size, region) != ('m7a.8xlarge', 'ca-central-1')
+        }
+        with mock.patch.object(run_cost, 'hours_checks', return_value=checks):
+            self.run_browser_checks('', """
+    const section = document.getElementById("hours");
+    const details = section.querySelector("details");
+    check(!details.open && details.querySelector("summary").textContent === "All rows (21)", "Long table starts closed");
+    details.querySelector("summary").click();
+    check(details.open && details.querySelectorAll("tbody tr").length === 21, "The disclosure shows all 21 rows");
+    document.querySelector("#regions [data-region='ca-central-1']").click();
+    check(!section.querySelector("details") && section.querySelectorAll("tbody tr").length === 20,
+          "The table stays visible with 20 rows");
 """)
 
     def test_hours_answer_sums_the_displayed_differences(self) -> None:
         limit = Decimal('.15')
         self.costs({'billed_hours_gap_max_ratio': str(limit)})
         checks = {
-            ('c7a.4xlarge', 'us-east-1'): run_cost.hours_check(Decimal('1.24'), Decimal('1.06'), limit),
-            ('c7a.4xlarge', 'us-east-2'): run_cost.hours_check(Decimal('1.16'), Decimal('1.00'), limit),
+            ('c7a.4xlarge', 'us-east-1'): run_cost.hours_check(Decimal('1.16'), Decimal('1.00'), limit),
+            ('c7a.4xlarge', 'us-east-2'): run_cost.hours_check(Decimal('1.24'), Decimal('1.06'), limit),
         }
         with mock.patch.object(run_cost, 'hours_checks', return_value=checks):
             self.run_browser_checks('', """
@@ -700,7 +721,9 @@ class AwsCombinedTableTests(PageCostFixture):
     const rows = () => [...section.querySelectorAll(":scope > .scroll tbody tr")];
     const amounts = row => [...row.cells].slice(2, 5).map(cell => cell.textContent).join("|");
     check(rows().map(amounts).join(";") === "1.2|1.1|+0.2;1.2|1.0|+0.2",
-          "Each difference rounds after subtraction");
+          "Rows sort by the difference before it rounds");
+    const totals = [...section.querySelector("tfoot tr").cells].map(cell => cell.textContent).join("|");
+    check(totals === "Total|2.4|2.1|+0.4", "The totals sum the displayed values");
     check(answer() === "Yes. AWS billed 0.4 hours more than our records, in 2 rows.",
           "The answer sums the displayed differences");
     document.querySelector("#regions [data-region='us-east-2']").click();
@@ -718,15 +741,13 @@ class AwsCombinedTableTests(PageCostFixture):
         with mock.patch.object(run_cost, 'hours_checks', return_value=checks):
             self.run_browser_checks('', """
     const section = document.getElementById("hours");
-    const details = section.querySelector("details");
     check(section.querySelector("p").textContent === "No AWS bill is available yet for the recorded hours.",
           "The answer explains that every row is unbilled");
-    check(!section.querySelector(":scope > .scroll"), "No unbilled row is marked");
-    check(!details.open && details.querySelector("summary").textContent === "All rows (1)",
-          "The closed disclosure includes the unbilled row");
-    details.querySelector("summary").click();
-    const cells = [...details.querySelector("tbody tr").cells].map(cell => cell.textContent);
+    check(!section.querySelector("details"), "The unbilled row is visible");
+    const cells = [...section.querySelector("tbody tr").cells].map(cell => cell.textContent);
     check(cells.join("|") === "c7a.4xlarge|us-west-2|—|1.2|—", "The unbilled row keeps its recorded hours");
+    const totals = [...section.querySelector("tfoot tr").cells].map(cell => cell.textContent).join("|");
+    check(totals === "Total|—|1.2|—", "The totals preserve missing bills");
     check(document.querySelector("#regions [data-region='us-west-2']"), "The filter includes the unbilled region");
     check(document.querySelector("#regions [data-region='ca-west-1']"),
           "The filter includes a region with a check and no displayed row");

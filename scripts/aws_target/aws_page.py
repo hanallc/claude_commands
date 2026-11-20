@@ -216,19 +216,24 @@ class QuotaHistoryData(TypedDict):
     gpu_summary: GpuQuotaSummary
 
 
-class UnbilledHoursRowData(TypedDict):
+class MachineHoursRowData(TypedDict):
+    size: str
+    region: str
+    recorded_tenths: int
+
+
+class UnbilledHoursRowData(MachineHoursRowData):
     kind: Literal['unbilled']
-    region: str
-    cells: list[str]
 
 
-class ComparedHoursRowData(TypedDict):
+class ComparedHoursRowData(MachineHoursRowData):
     kind: Literal['compared']
-    region: str
-    cells: list[str]
     billed: float
     recorded: float
+    billed_tenths: int
     difference_tenths: int
+    signed_difference: str
+    hana_reserved_tenths: NotRequired[int]
     limit_result: Literal['within_limit', 'higher_bill', 'lower_bill']
 
 
@@ -236,6 +241,8 @@ class HoursComparisonData(TypedDict):
     kind: Literal['comparison']
     rows: list[ComparedHoursRowData | UnbilledHoursRowData]
     limit_percent: str
+    first_utc_day: str
+    last_utc_day: str
 
 
 class HoursComparisonUnavailableData(TypedDict):
@@ -275,22 +282,29 @@ def table_data(table: spot_table.Table) -> TableData:
 def hours_row_data(row: spot_table.MachineHoursRow) -> ComparedHoursRowData | UnbilledHoursRowData:
     check = row.check
     billed = check.billed_hours
-    recorded = round(check.box_hours, 1)
+    record: MachineHoursRowData = {'size': row.size, 'region': row.region,
+                                   'recorded_tenths': round(check.box_hours * 10)}
     if billed is None:
-        return {'kind': 'unbilled', 'region': row.region, 'cells': [row.size, row.region, '—', f'{recorded:.1f}', '—', '—']}
-    difference = round(billed - check.box_hours, 1)
+        return {'kind': 'unbilled', **record}
+    difference = billed - check.box_hours
     limit_result: Literal['within_limit', 'higher_bill', 'lower_bill'] = 'within_limit'
     if check.hours_gap_over:
         limit_result = 'higher_bill' if billed > check.box_hours else 'lower_bill'
-    if difference:
-        shown_difference = f'{difference:+.1f}'
-    else:
-        shown_difference = 'less than 0.1 hours' if check.hours_gap_over else '0.0'
-    reserved = check.hana_reserved_hours
-    cells = [row.size, row.region, f'{billed:.1f}', f'{recorded:.1f}', shown_difference,
-             f'{reserved:.1f}' if billed >= check.box_hours and reserved > 0 else '—']
-    return {'kind': 'compared', 'region': row.region, 'cells': cells, 'billed': float(billed),
-            'recorded': float(check.box_hours), 'difference_tenths': int(difference * 10), 'limit_result': limit_result}
+    compared: ComparedHoursRowData = {
+        'kind': 'compared', **record, 'billed': float(billed), 'recorded': float(check.box_hours),
+        'billed_tenths': round(billed * 10), 'difference_tenths': int(round(difference, 1) * 10),
+        'signed_difference': f'{difference:+.1f}' if difference else '0.0', 'limit_result': limit_result,
+    }
+    if difference >= 0 and check.hana_reserved_hours > 0:
+        compared['hana_reserved_tenths'] = round(check.hana_reserved_hours * 10)
+    return compared
+
+
+def hours_difference_order(row: spot_table.MachineHoursRow) -> tuple[bool, Decimal]:
+    billed = row.check.billed_hours
+    if billed is None:
+        return True, Decimal(0)
+    return False, row.check.box_hours - billed
 
 
 def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.SpotPlacementReading],
@@ -557,8 +571,11 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
         percent = format(tables.hours.max_gap_ratio, '%').removesuffix('%')
         if '.' in percent:
             percent = percent.rstrip('0').rstrip('.')
-        hours = {'kind': 'comparison', 'rows': [hours_row_data(row) for row in tables.hours.rows],
-                 'limit_percent': f'{percent}%'}
+        hours = {
+            'kind': 'comparison', 'limit_percent': f'{percent}%',
+            'rows': [hours_row_data(row) for row in sorted(tables.hours.rows, key=hours_difference_order)],
+            'first_utc_day': tables.hours.first_utc_day.isoformat(), 'last_utc_day': tables.hours.last_utc_day.isoformat(),
+        }
     else:
         hours = {'kind': 'unavailable', 'reason': tables.hours.reason}
     return {

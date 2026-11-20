@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
@@ -48,6 +48,8 @@ class HoursComparison:
     rows: tuple[MachineHoursRow, ...]
     checked_regions: frozenset[str]
     max_gap_ratio: Decimal
+    first_utc_day: date
+    last_utc_day: date
 
 
 @dataclass(frozen=True)
@@ -351,5 +353,5 @@ def billed_hours(directory: Path, now: int, scope: run_cost.SpotHoursScope, days
     except ledger.LedgerUnavailable:
         return HoursComparisonUnavailable('Our records are unreadable.')
     rows = tuple(MachineHoursRow(size, region, checks[size, region]) for size, region in active)
-    return HoursComparison(rows, checked_regions, max_ratio)
+    return HoursComparison(rows, checked_regions, max_ratio, start.date(), end.date() - timedelta(days=1))
 
