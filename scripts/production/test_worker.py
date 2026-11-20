@@ -395,6 +395,17 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent.complete(pane)
         atomic_file.write_text_atomic(self.reply, self.agent.replies[-1] + "\n")
 
+    def assert_pass_confirmed(self, previous: bytes) -> bytes:
+        expected = cast(dict[str, dict[str, dict[str, object]]], json.loads(previous))
+        passed = expected["pass"]["impl"]
+        self.assertNotIn("confirmed_delivery_ids", passed)
+        completion_id = progress_history.dispatch_delivery(passed).completion_id
+        self.assertTrue(completion_id)
+        passed["confirmed_delivery_ids"] = [completion_id]
+        current = (self.run_dir / unit_runs.STATE_FILE).read_bytes()
+        self.assertEqual(cast(object, json.loads(current)), expected)
+        return current
+
     def assert_pass_completed(self, previous: bytes) -> None:
         before = cast(dict[str, dict[str, dict[str, object]]], json.loads(previous))["pass"]["impl"]
         after = cast(dict[str, dict[str, dict[str, object]]],
@@ -1656,10 +1667,10 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent.finish_after = 1
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
         self.assertEqual(len(self.agent.submitted), 1)
-        self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), state)
+        confirmed = self.assert_pass_confirmed(state)
         self.agent.complete(pane)
         self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
-        self.assert_pass_completed(state)
+        self.assert_pass_completed(confirmed)
 
     def test_dispatch_rerun_after_done_restores_the_reply_once(self) -> None:
         self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
@@ -3519,7 +3530,7 @@ class WorkerCommandTests(unittest.TestCase):
         expected_panes = {pane: location for pane, location in before[2].items() if pane != submitted_pane}
         self.assertEqual((self.fixture.staff_state(), len(self.fixture.world.launches),
                           self.fixture.world.locations.copy()), before)
-        self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), pass_state)
+        confirmed_state = self.assert_pass_confirmed(pass_state)
         original_prompt = self.prompt.read_text()
         instance = str(worker_panes.worker_pass(self.agent.row(submitted_pane), self.run_dir)["instance_id"])
         for status in ("working", "idle"):
@@ -3531,7 +3542,7 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertIn(f"active pass {instance}", errors)
                 self.assertIn("no prompt sent", errors)
                 self.assertEqual(len(self.agent.submitted), 1)
-                self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), pass_state)
+                self.assertEqual((self.run_dir / unit_runs.STATE_FILE).read_bytes(), confirmed_state)
                 atomic_file.write_text_atomic(self.prompt, original_prompt)
         for changed_at in ("before lookup", "after lookup"):
             with self.subTest(prompt="changed active content and launcher", changed_at=changed_at):
@@ -3559,12 +3570,12 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertIn(f"active pass {instance}", errors)
                 self.assertIn("no prompt sent", errors)
                 self.assertEqual(len(self.agent.submitted), 1)
-                self.assertEqual((self.run_dir / "progress_history_state.json").read_bytes(), pass_state)
+                self.assertEqual((self.run_dir / unit_runs.STATE_FILE).read_bytes(), confirmed_state)
                 atomic_file.write_text_atomic(self.prompt, original_prompt)
         self.agent.complete(submitted_pane)
         self.assertEqual(self.finish(), turn_end.TurnOutcome.DONE)
         self.assertEqual(self.fixture.world.locations, expected_panes)
-        self.assert_pass_completed(pass_state)
+        self.assert_pass_completed(confirmed_state)
         self.assertIn(self.agent.final, self.reply.read_text())
 
     def test_unnamed_retry_after_completion_returns_the_recorded_reply(self) -> None:
