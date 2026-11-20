@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 
-from scripts.production import investigation, session_staff, staff, unit_config
+from scripts.production import ci_points, investigation, session_staff, staff, unit_config
 from scripts.agents import stop_resume
 from scripts.lib import land_main, main_publish, main_push_lock, main_sync
 from scripts.herdr import worker_panes
@@ -320,6 +320,18 @@ def open_production(production: Production, lines: list[str]) -> None:
 def ci_steps(production: Production, tip: str, no_ci: bool,
              ci_green: CommitVerdict | VerdictMissing,
              smoke_passed: CommitVerdict | VerdictMissing) -> None:
+    if production.name == staff.CARGO_LINER_PRODUCTION and staff.declares_merge_checkout(doc_lines(production)):
+        if no_ci:
+            raise LifecycleStop("ci", "held", "this production requires CI on the integration tip")
+        state_dir = showrunners.session_state_dir(production.owner.id) / "waiting_state"
+        try:
+            ci_points.ci_collect(production, state_dir, no_ci)
+            verdict = ci_points.ci_record(state_dir)
+        except ci_points.PointFailure as error:
+            raise LifecycleStop(error.step, "held", error.detail) from error
+        if not isinstance(verdict, ci_points.CiRecord) or verdict.tip != tip:
+            raise LifecycleStop("ci", "held", f"no collected CI result for integration tip {tip}")
+        return
     if no_ci:
         for step in ("ci", "smoke-launch", "mac-run"):
             report(step, "ok", "skipped: no CI")
