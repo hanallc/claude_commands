@@ -4,22 +4,26 @@ from __future__ import annotations
 
 import unittest
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import io
 import os
 from pathlib import Path
 import select
+import sqlite3
 import sys
 import time
 from types import SimpleNamespace
 from typing import cast, final, override
 from collections.abc import Sequence
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
 from scripts.production import gate, land_runs
-from scripts.lib import build_folders
+from scripts.aws_target import cloud_gate
+from scripts.buildlog import index
+from scripts.direct import progress_history
+from scripts.lib import build_folders, unit_runs
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE
@@ -392,6 +396,60 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertEqual(record["step"], "gate")
         self.assertEqual(record["selection"], "full")
 
+    @gate_suites("lib", "hooks")
+    def test_aws_gate_uses_only_a_certified_base_on_the_candidate_tree(self) -> None:
+        subject, base = self.prepare_affected_subject()
+        self.write(subject, "VALUE = 2\n")
+        candidate = self.commit(self.checkout, "Change the dependency on the candidate")
+        _ = self.git(self.checkout, "update-ref", "refs/remotes/origin/main", candidate)
+        expected = gate.TreeSelection(("scripts/hooks/test_first.py",),
+                                      self.git(self.checkout, "rev-parse", "HEAD^{tree}"))
+        run = gate.GateRun((gate.GateJobResult("hooks", "test_first.py", 0, 0, ""),), 0, 0)
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(cloud_gate, "route", return_value=run) as route,
+              redirect_stdout(io.StringIO())):
+            self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+            self.assertEqual(route.call_args.kwargs["selected"], gate.ALL_MODULES)
+            self.assertTrue(route.call_args.kwargs["full"])
+
+            tree = self.git(self.checkout, "rev-parse", f"{base}^{{tree}}")
+            ledger = gate.PassedTreeLedger(self.checkout, "tests-only",
+                                           gate.CleanTestTree(tree, base), sorted(self.suites))
+            self.write(ledger.path, json.dumps({
+                "kind": "full", "tree": tree, "commit": base, "host": host_name(),
+                "at": datetime.now(UTC).isoformat(), "checkout": str(self.checkout),
+                "suites": sorted(self.suites), "source": "tests-only",
+            }) + "\n")
+            self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+            self.assertEqual(route.call_args.kwargs["selected"], expected)
+            self.assertFalse(route.call_args.kwargs["full"])
+            self.assertIn(base, cast(str, route.call_args.kwargs["selection_reason"]))
+            self.assertEqual(len(self.pass_records()), 1)
+
+            self.assertTrue(gate.run_gate_suites(self.checkout, full=True).passed)
+            self.assertEqual(route.call_args.kwargs["selected"], gate.ALL_MODULES)
+            self.assertTrue(route.call_args.kwargs["full"])
+
+            marker, _ = self.write_nightly_red_marker()
+
+            def replace_marker(*_args: object, **_kwargs: object) -> gate.GateRun:
+                self.write(marker, '{"tree":"new red","at":"2026-11-20T00:00:00+00:00"}\n')
+                return run
+
+            route.side_effect = replace_marker
+            self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+            self.assertEqual(route.call_args.kwargs["selected"], gate.ALL_MODULES)
+            self.assertTrue(marker.exists())
+            route.side_effect = None
+            self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+            self.assertFalse(marker.exists())
+            route.reset_mock()
+            _ = self.git(self.checkout, "reset", "--hard", base)
+            self.assertTrue(gate.run_gate_suites(self.checkout).passed)
+            route.assert_not_called()
+            self.assertEqual(self.gate_run_records()[-1]["selection"], "affected")
+            self.assertEqual(self.gate_run_records()[-1]["modules"], [])
+
     def test_dirty_path_record_keeps_fifty_names_and_the_total(self) -> None:
         paths = [f"dirty-{number:02}.txt" for number in range(51)]
         for path in paths:
@@ -606,8 +664,71 @@ class MergeGateLedgerTests(MergeGateFixture):
                     self.assertEqual(record["failed_modules"], ["hooks/test_first.py"])
                     notice.assert_called_once()
                     self.assertEqual(notice.call_args.args[2], ["hooks/test_first.py"])
+                    saved, = (marker.parent / "nightly-red").glob("*.json")
+                    coverage = gate.read_nightly_red(saved).coverage
+                    assert coverage is not None
+                    self.assertIsNone(coverage["previous"])
+                    self.assertFalse(coverage["history_complete"])
+                    self.assertEqual(coverage["module_selection"], {"scripts/hooks/test_first.py": "unknown"})
                 else:
                     notice.assert_not_called()
+
+    def test_nightly_saves_batch_gate_coverage_before_the_owner_notice(self) -> None:
+        _ = self.git(self.checkout, "merge", "--no-ff", "-m", "First checkpoint", self.checkpoint)
+        first = self.git(self.checkout, "rev-parse", "HEAD")
+        self.write(self.unit / "unit.txt", "second checkpoint\n")
+        checkpoint = self.commit(self.unit, "Second checkpoint")
+        _ = self.git(self.checkout, "merge", "--no-ff", "-m", "Second checkpoint", checkpoint)
+        tip = self.git(self.checkout, "rev-parse", "HEAD")
+        tree = self.git(self.checkout, "rev-parse", "HEAD^{tree}")
+        _ = self.git(self.checkout, "push", "origin", "HEAD:main")
+        failed = gate.GateRun((gate.GateJobResult("hooks", "test_first.py", 1, 0, ""),
+                               gate.GateJobResult("lib", "test_second.py", 1, 0, "")), 0, 0)
+        history = self.root / "history"
+        identity = "a" * 32
+        before = datetime.now(UTC) - timedelta(hours=1)
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(unit_runs, "history_root", return_value=history),
+              mock.patch.object(index, "update", return_value=0),
+              mock.patch.object(gate, "nightly_owner", return_value="quiet"),
+              mock.patch.object(gate, "run_suites", return_value=failed) as runner,
+              redirect_stdout(io.StringIO())):
+            for merge, source in ((first, self.checkpoint), (tip, checkpoint)):
+                _ = progress_history.write_merge_receipt(
+                    project="origin", phase_id="2", merge_commit=merge, source_checkpoint=source,
+                    target_branch="integration", merged_at=before.timestamp(), tested_tip=tip,
+                    tested_tree=tree, merge_test_id=identity)
+            _ = gate.pin_nightly_snapshot("main", self.base)
+            with closing(sqlite3.connect(index.index_path())) as db, db:
+                for result_id, reason, suite, module in (
+                    ("batch", f"Certified base [merge test {identity}]", "hooks", "test_first.py"),
+                    ("ad-hoc", "Manual gate", "lib", "test_second.py"),
+                ):
+                    index.add_gate_run(db, {
+                        "step": "gate", "id": result_id, "sha": tip, "tree": tree, "reason": reason,
+                        "status": 0, "aborted": False, "dirty": False, "ended_at": before.isoformat(),
+                        "selection": "affected",
+                        "modules": [{"suite": suite, "module": module, "attempt": 1, "status": 0, "restart": ""}],
+                    }, "fixture.jsonl")
+
+            def inspect_notice(*_args: object, **_kwargs: object) -> gate.NightlyNoticeUnreceived:
+                record, = (gate.gate_state_dir() / "nightly-red").glob("*.json")
+                saved = gate.read_nightly_red(record)
+                coverage = saved.coverage
+                assert coverage is not None
+                expected = {"scripts/hooks/test_first.py": "selected", "scripts/lib/test_second.py": "omitted"}
+                self.assertEqual(coverage["module_selection"], expected)
+                self.assertCountEqual(cast(list[str], coverage["merges"]), [first, tip])
+                self.assertTrue(coverage["history_complete"])
+                self.assertEqual(cast(dict[str, str], coverage["current"])["commit"], tip)
+                self.assertEqual(cast(dict[str, str], coverage["previous"])["commit"], self.base)
+                return gate.NightlyNoticeUnreceived()
+
+            with mock.patch.object(gate, "tell_nightly_red", side_effect=inspect_notice) as notice:
+                self.assertEqual(gate.nightly(gate.GateArguments(repo=str(self.checkout), merge_branch="main")), 1)
+            notice.assert_called_once()
+            runner.assert_called_once()
+            self.assertTrue(runner.call_args.kwargs["full"])
 
     def test_nightly_without_an_identified_production_runs_in_the_configured_role_pool(self) -> None:
         from scripts.copies import copies

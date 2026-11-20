@@ -5770,7 +5770,8 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
 
 def write_merge_receipt(*, project: str, phase_id: str, merge_commit: str,
                         source_checkpoint: str, target_branch: str, merged_at: float,
-                        issue: str = "") -> dict[str, object]:
+                        issue: str = "", tested_tip: str = "", tested_tree: str = "",
+                        merge_test_id: str = "") -> dict[str, object]:
     """Record a pushed merge once; callers must not call this for a rolled-back merge."""
     if not all((project, merge_commit, source_checkpoint, target_branch)) or not (phase_id or issue):
         raise ValueError("A merge receipt needs its project, phase or issue, both commits, and target branch")
@@ -5788,6 +5789,8 @@ def write_merge_receipt(*, project: str, phase_id: str, merge_commit: str,
                    "merge_commit": merge_commit, "source_checkpoint": source_checkpoint,
                    "target_branch": target_branch, "merged_at": pass_recorder.iso_time(merged_at),
                    "timestamp_epoch": merged_at}
+        if tested_tip and tested_tree and merge_test_id:
+            record.update(tested_tip=tested_tip, tested_tree=tested_tree, merge_test_id=merge_test_id)
         _ = handle.write(json.dumps(record, sort_keys=True) + "\n")
         handle.flush()
         if (os.environ.get("UNIT_SYNC_WRITES") or os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1")) != "0":

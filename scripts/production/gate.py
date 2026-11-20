@@ -12,8 +12,9 @@ After the parallel pass, up to eight failed test modules run once more, alone.
 Time-limited jobs and the type check do not run again. Each test module uses a
 builds.slice scope when its probe succeeds, unless disabled or already in that slice.
 --tests-only runs the same suite runner without changing git refs or files.
-Clean trees reuse full passes on the same host. Merge gates run all modules.
-Targeted tests select affected modules from a certified ancestor. --nightly validates a shared clone.
+Local merge gates can reuse full passes on the same host.
+AWS merge gates select affected modules from a certified ancestor.
+The nightly gate tests the full suite in a shared clone.
 SharedMachine is the default. WholeMachine uses one job per CPU without shared admission or failure reruns.
 Merge and tests-only runs omit type checks.
 The daily --nightly run checks all scripts, including hooks.
@@ -48,7 +49,7 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time as day_time, timedelta
 from enum import Enum, auto
 import fcntl
 import hashlib
@@ -87,7 +88,7 @@ from scripts.production.affected_modules import (  # noqa: E402
 )
 from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
-from scripts.buildlog import store  # noqa: E402
+from scripts.buildlog import index, store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.testing_folders import test_run_folder
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -129,6 +130,8 @@ SLOW_MODULE_FACTOR = 3.0
 SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
+MERGE_TEST_ID = "GATE_MERGE_TEST_ID"
+MERGE_TEST_REASON = " [merge test "
 # Restore dispositions and the mask in every child, including types. The runner
 # defers cancellation until the child is registered for cleanup.
 SUITE_BOOTSTRAP = """import ctypes, os, signal, sys
@@ -1069,8 +1072,6 @@ def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
 def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
                     targeted: bool) -> gate_record.GateTimeLimit | gate_record.NoGateTimeLimit:
     """Read the report index and rebuild an index without the vCPU column."""
-    from scripts.buildlog import index
-
     path = index.index_path()
     if not path.exists() and not any(store.root().glob("*/*.jsonl")):
         with closing(sqlite3.connect(":memory:")) as connection:
@@ -1301,7 +1302,7 @@ class PassedTreeLedger:
             self.report_error(error)
         return False
 
-    def certified_base(self) -> CertifiedBase | NoCertifiedBase:
+    def certified_base(self, *, verify_tree: bool = False) -> CertifiedBase | NoCertifiedBase:
         try:
             records = sorted(self.records(), key=lambda record: datetime.fromisoformat(cast(str, record["at"])), reverse=True)
             for record in records:
@@ -1309,8 +1310,13 @@ class PassedTreeLedger:
                         or record["suites"] != self.suites):
                     continue
                 commit = cast(str, record["commit"])
-                if not git(self.repo, "merge-base", "--is-ancestor", commit, "HEAD").returncode:
-                    return CertifiedBase(commit, cast(str, record["at"]))
+                if git(self.repo, "merge-base", "--is-ancestor", commit, "HEAD").returncode:
+                    continue
+                if verify_tree:
+                    tree = git(self.repo, "rev-parse", "--verify", f"{commit}^{{tree}}")
+                    if tree.returncode or tree.stdout.strip() != record["tree"]:
+                        continue
+                return CertifiedBase(commit, cast(str, record["at"]))
         except (OSError, ValueError) as error:
             self.report_error(error)
         return NoCertifiedBase()
@@ -1344,15 +1350,54 @@ class NoFullRunRequired:
     pass
 
 
-def full_required() -> FullSuite | NoFullRunRequired:
+@dataclass(frozen=True)
+class FullRunRequired:
+    reason: str
+    identity: tuple[int, int, int, int] | None
+
+
+def marker_identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
+
+
+def full_required() -> FullRunRequired | NoFullRunRequired:
     marker = gate_state_dir() / "full-required"
     try:
-        value = cast(dict[str, object], json.loads(marker.read_text()))
-        return FullSuite(f"last nightly run was red ({value['tree']}, {value['at']})")
+        identity = marker_identity(marker.stat())
     except FileNotFoundError:
         return NoFullRunRequired()
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        return FullSuite(f"last nightly run was red (unreadable marker: {error})")
+    except OSError as error:
+        return FullRunRequired(f"last nightly run was red (unreadable marker: {error})", None)
+    try:
+        raw = cast(object, json.loads(marker.read_text()))
+        if not isinstance(raw, dict):
+            raise ValueError("expected a nightly marker record")
+        value = cast(dict[str, object], raw)
+        return FullRunRequired(f"last nightly run was red ({value['tree']}, {value['at']})", identity)
+    except (OSError, ValueError, KeyError) as error:
+        return FullRunRequired(f"last nightly run was red (unreadable marker: {error})", identity)
+
+
+@contextmanager
+def full_required_lock() -> Generator[Path]:
+    directory = gate_state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "full-required.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield directory / "full-required"
+
+
+def clear_full_required(required: FullRunRequired | NoFullRunRequired) -> None:
+    if not isinstance(required, FullRunRequired) or required.identity is None:
+        return
+    try:
+        with full_required_lock() as marker:
+            if marker_identity(marker.stat()) == required.identity:
+                marker.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        print(f"Could not clear the nightly marker: {error}", flush=True)
 
 
 def report_selection(selection: AffectedSelection | FullSuite, total: int) -> None:
@@ -1368,17 +1413,24 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
 
 def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | UnrecordableTestTree,
                             modules: Sequence[tuple[str, Path]], *,
-                            source: Literal["tests-only", "checkpoint"] = "tests-only"
+                            source: Literal["tests-only", "checkpoint"] = "tests-only",
+                            ledger_only: bool = False,
                             ) -> tuple[AffectedSelection | FullSuite, PassedTreeLedger]:
     """Select affected tests against the tree that the caller will test."""
     if not modules:
         raise GateRefused("the test list is empty")
     ledger = PassedTreeLedger(repo, source, tested_tree, sorted({suite for suite, _ in modules}))
     dirty = set(tested_tree.dirty_paths) if isinstance(tested_tree, UnrecordableTestTree) else set[str]()
-    selection = select_affected(repo, ledger.certified_base(), [path for _, path in modules], dirty,
-                                state_dir=gate_state_dir())
+    selection = select_affected(repo, ledger.certified_base(verify_tree=ledger_only),
+                                [path for _, path in modules], dirty, state_dir=gate_state_dir(),
+                                ledger_only=ledger_only)
     report_selection(selection, len(modules))
     return selection, ledger
+
+
+def merge_test_reason(reason: str) -> str:
+    identity = os.environ.get(MERGE_TEST_ID, "")
+    return f"{reason}{MERGE_TEST_REASON}{identity}]" if re.fullmatch(r"[0-9a-f]{32}", identity) else reason
 
 
 def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult],
@@ -1494,7 +1546,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         hold.wait_until_free()
     suites = sorted({suite for suite, _ in modules})
     ledger: PassedTreeLedger | None = None
-    required: FullSuite | NoFullRunRequired = NoFullRunRequired()
+    required: FullRunRequired | NoFullRunRequired = NoFullRunRequired()
     reused = False
     selection: AffectedSelection | FullSuite = FullSuite("whole machine")
     if shared:
@@ -1507,11 +1559,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             print(f"Dirty checkout: {len(tested_tree.dirty_paths)} paths", flush=True)
         ledger = PassedTreeLedger(repo, source, tested_tree, suites)
         required = full_required() if mode is SuiteMode.GATE else NoFullRunRequired()
-        reused = not full and not isinstance(required, FullSuite) and ledger.reuse()
+        reused = not full and isinstance(required, NoFullRunRequired) and ledger.reuse()
         selection = FullSuite("passed tree reused")
         if not reused:
-            if isinstance(required, FullSuite):
-                selection = required
+            if isinstance(required, FullRunRequired):
+                selection = FullSuite(required.reason)
             elif full:
                 selection = FullSuite("--full")
             elif mode is SuiteMode.GATE:
@@ -1530,7 +1582,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         try:
             time_limit = read_time_limit(
                 os.cpu_count() or 1, [str(path.relative_to(repo)) for _, path in modules],
-                max_running_jobs, mode is SuiteMode.TARGETED and not full)
+                max_running_jobs, isinstance(selection, AffectedSelection))
         except conf.Unusable as error:
             raise GateRefused(str(error)) from error
     if isinstance(time_limit, gate_record.NoGateTimeLimit):
@@ -1583,7 +1635,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
         record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
                         wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
-                        reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
+                        reason=merge_test_reason(reason) if mode is SuiteMode.GATE and not type_dirs else reason,
+                        status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
                         cap_mib=admission.governor_mib, aborted=aborted, mode=mode)
 
     @contextmanager
@@ -1862,8 +1915,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if run.passed and not reused and ledger is not None:
         ledger.record_pass(selection)
-        if isinstance(required, FullSuite):
-            (gate_state_dir() / "full-required").unlink(missing_ok=True)
+        if isinstance(selection, FullSuite) and not type_dirs and not isinstance(selected, SelectedModules):
+            clear_full_required(required)
     return run
 
 
@@ -2402,6 +2455,7 @@ class NightlyRedResult:
     assignment: NightlyFixUnassigned | NightlyFixAssigned = NightlyFixUnassigned()
     delivery: NightlyPushPending | NightlyPushAccepted = NightlyPushPending()
     alerted: NightlyAlertUnsent | NightlyAlertSent = NightlyAlertUnsent()
+    coverage: dict[str, object] | None = None
 
 
 @contextmanager
@@ -2448,12 +2502,14 @@ def read_nightly_red(path: Path) -> NightlyRedResult:
     received, assignment, delivery = (fields(saved.get(key)) for key in ("received", "assignment", "delivery"))
     # A result saved before the owner alert existed has no alert table.
     alerted = fields(saved.get("alerted", {}))
+    coverage = saved.get("coverage")
     return NightlyRedResult(identity, text(saved, "branch"), text(saved, "tree"), at(saved, "finished"),
         tuple(cast(list[str], failures)), text(saved, "types"), text(saved, "tests"),
         NightlyNoticeReceived(at(received, "at")) if received else NightlyNoticeUnreceived(),
         NightlyFixAssigned(text(assignment, "unit"), at(assignment, "at")) if assignment else NightlyFixUnassigned(),
         NightlyPushAccepted(at(delivery, "at")) if delivery else NightlyPushPending(),
-        NightlyAlertSent(at(alerted, "at")) if alerted else NightlyAlertUnsent())
+        NightlyAlertSent(at(alerted, "at")) if alerted else NightlyAlertUnsent(),
+        fields(coverage) if coverage is not None else None)
 
 
 def nightly_time(at: str) -> str:
@@ -2564,6 +2620,9 @@ class NightlyMergeReceipt:
     merge: str
     at: float
     issue: str
+    tested_tip: str = ""
+    tested_tree: str = ""
+    merge_test_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -2595,12 +2654,119 @@ def _nightly_merge_receipts() -> list[NightlyMergeReceipt]:
                 source, merge, at = (record.get(key) for key in ("source_checkpoint", "merge_commit", "timestamp_epoch"))
                 issue = record.get("issue")
                 if isinstance(source, str) and isinstance(merge, str) and isinstance(at, (int, float)):
-                    receipts.append(NightlyMergeReceipt(source, merge, at, issue if isinstance(issue, str) else ""))
+                    receipts.append(NightlyMergeReceipt(
+                        source, merge, at, issue if isinstance(issue, str) else "",
+                        *(value if isinstance(value := record.get(key), str) else ""
+                          for key in ("tested_tip", "tested_tree", "merge_test_id"))))
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as error:
         print(f"Nightly merge receipts could not be read: {error}", flush=True)
     return sorted(receipts, key=lambda receipt: receipt.at)
+
+
+@dataclass(frozen=True)
+class NightlySnapshot:
+    commit: str
+    at: str
+
+
+def pin_nightly_snapshot(branch: str, commit: str) -> tuple[NightlySnapshot | None, NightlySnapshot]:
+    key = hashlib.sha256(branch.encode()).hexdigest()
+    path = gate_state_dir() / "nightly-snapshots" / f"{key}.json"
+    current = NightlySnapshot(commit, datetime.now(UTC).isoformat())
+    previous = None
+    try:
+        with nightly_red_lock(wait=True):
+            try:
+                raw = cast(object, json.loads(path.read_text()))
+                if isinstance(raw, dict):
+                    fields = cast(dict[str, object], raw)
+                    old_commit, at = fields.get("commit"), fields.get("at")
+                    if (isinstance(old_commit, str) and isinstance(at, str)
+                            and datetime.fromisoformat(at).tzinfo is not None):
+                        previous = NightlySnapshot(old_commit, at)
+            except FileNotFoundError:
+                pass
+            except (ValueError, OSError) as error:
+                print(f"Could not read the previous nightly snapshot: {error}", flush=True)
+            write_text_atomic(path, json.dumps(asdict(current)) + "\n")
+    except (GateRefused, OSError) as error:
+        print(f"Could not save the nightly snapshot: {error}", flush=True)
+    return previous, current
+
+
+def nightly_interval_merges(repo: Path, previous: NightlySnapshot | None, current: NightlySnapshot,
+                            receipts: Sequence[NightlyMergeReceipt]) -> tuple[set[str], bool]:
+    if previous is not None and not git(repo, "merge-base", "--is-ancestor", previous.commit, current.commit).returncode:
+        outcome = git(repo, "rev-list", "--merges", f"{previous.commit}..{current.commit}")
+        if not outcome.returncode:
+            return set(outcome.stdout.splitlines()), True
+    local_date = datetime.fromisoformat(current.at).astimezone(user_zone()).date()
+    end = datetime.combine(local_date, day_time.min, user_zone())
+    start = end - timedelta(days=1)
+    return {receipt.merge for receipt in receipts if start.timestamp() <= receipt.at < end.timestamp()
+            and not git(repo, "merge-base", "--is-ancestor", receipt.merge, current.commit).returncode}, False
+
+
+def indexed_merge_modules(identities: set[tuple[str, str, str]], before: str,
+                          ) -> dict[tuple[str, str, str], set[str]]:
+    if not identities:
+        return {}
+    _ = index.update()
+    modules: dict[tuple[str, str, str], set[str]] = {}
+    with closing(index.read_only()) as connection:
+        runs = cast(list[tuple[str, str, str, str, int]], connection.execute(
+            """SELECT id, sha, tree, reason, modules_run FROM gate_runs
+               WHERE step = 'gate' AND status = 0 AND aborted = 0 AND dirty = 0
+                 AND selection IN ('full', 'affected') AND julianday(ended_at) <= julianday(?)
+                 AND reason LIKE '% [merge test %]'""",
+            (before,)).fetchall())
+        for run_id, sha, tree, reason, count in runs:
+            key = (sha, tree, reason.rsplit(MERGE_TEST_REASON, 1)[-1].removesuffix("]"))
+            if key not in identities:
+                continue
+            rows = cast(list[tuple[str, str]], connection.execute(
+                """SELECT DISTINCT suite, module FROM gate_modules
+                   WHERE run_id = ? AND status = 0 AND restart = '' AND suite != 'types'""",
+                (run_id,)).fetchall())
+            if len(rows) == count:
+                modules.setdefault(key, set()).update(f"scripts/{suite}/{module}" for suite, module in rows)
+    return modules
+
+
+def nightly_merge_coverage(repo: Path, previous: NightlySnapshot | None, current: NightlySnapshot,
+                           failed_paths: Sequence[str]) -> dict[str, object]:
+    receipts = _nightly_merge_receipts()
+    merges: set[str] = set()
+    complete = False
+    tested: dict[str, set[tuple[str, str, str]]] = {}
+    try:
+        merges, complete = nightly_interval_merges(repo, previous, current, receipts)
+        for receipt in receipts:
+            if receipt.merge not in merges or not all((receipt.tested_tip, receipt.tested_tree, receipt.merge_test_id)):
+                continue
+            if (git(repo, "merge-base", "--is-ancestor", receipt.merge, receipt.tested_tip).returncode
+                    or git(repo, "merge-base", "--is-ancestor", receipt.tested_tip, current.commit).returncode):
+                continue
+            tested.setdefault(receipt.merge, set()).add((receipt.tested_tip, receipt.tested_tree, receipt.merge_test_id))
+        observed = indexed_merge_modules({key for keys in tested.values() for key in keys}, current.at)
+    except (GateRefused, OSError, ValueError, sqlite3.Error, conf.Unusable, subprocess.SubprocessError) as error:
+        print(f"Could not read the merge gate evidence: {error}", flush=True)
+        observed = {}
+        complete = False
+    selected = {path for paths in observed.values() for path in paths}
+    unknown = sorted(merge for merge in merges if not tested.get(merge, set()).intersection(observed))
+    return {
+        "previous": asdict(previous) if previous is not None else None,
+        "current": asdict(current),
+        "history_complete": complete and not unknown,
+        "merges": sorted(merges),
+        "merges_without_gate_evidence": unknown,
+        "failed_test_paths": sorted(set(failed_paths)),
+        "module_selection": {path: "selected" if path in selected else "omitted" if complete and not unknown else "unknown"
+                             for path in sorted(set(failed_paths))},
+    }
 
 
 def _nightly_plan_author(issue: str, production: staff.StaffId,
@@ -2743,7 +2909,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
     requires_full = bool(failed) or not type_failures
     try:
         detail = (f"Failed modules: {', '.join(failed) or '(runner failure)'}. "
-                  + "Every merge gate now requires the full suite until a merge gate passes."
+                  + "Every merge gate now requires the full suite until a verified full gate passes."
                   if requires_full else "Tests passed. A type failure does not require full test runs.")
         if type_failures:
             lines = [line for job in type_failures for line in job.output.splitlines()]
@@ -2792,6 +2958,8 @@ def nightly(args: GateArguments) -> int:
         owner = nightly_owner(args)
         with copies.standing(owner, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
+            previous, snapshot = pin_nightly_snapshot(args.merge_branch, commit)
+            required = full_required()
             try:
                 run = run_suites(clone, NIGHTLY_TYPE_DIRS,
                                  module_time_limit_s=args.module_time_limit_s, full=True)
@@ -2799,9 +2967,9 @@ def nightly(args: GateArguments) -> int:
                 print(f"Nightly suite runner failed: {error}", flush=True)
                 run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error),
                                             kind=GateJobKind.RUNNER_FAILURE),), 0, 0)
-            marker = gate_state_dir() / "full-required"
             if run.passed:
-                marker.unlink(missing_ok=True)
+                if run.jobs and not run.tests_reused:
+                    clear_full_required(required)
                 result_sent = True
                 push_nightly_result(args, run)
                 return 0
@@ -2809,25 +2977,20 @@ def nightly(args: GateArguments) -> int:
             failed = [f"{job.suite}/{job.module}" for job in run.jobs
                       if job.returncode and job.kind is not GateJobKind.TYPE_CHECK]
             if failed or not type_failures:
-                marker.parent.mkdir(parents=True, exist_ok=True)
-                with tempfile.NamedTemporaryFile(mode="w", dir=marker.parent, delete=False) as output:
-                    pending = Path(output.name)
-                    try:
-                        _ = output.write(json.dumps({"tree": tree, "at": datetime.now(UTC).isoformat(),
-                                                      "failed_modules": failed}) + "\n")
-                        output.close()
-                        _ = pending.replace(marker)
-                    finally:
-                        pending.unlink(missing_ok=True)
-            else:
-                marker.unlink(missing_ok=True)
+                with full_required_lock() as marker:
+                    write_text_atomic(marker, json.dumps({"tree": tree, "at": datetime.now(UTC).isoformat(),
+                                                         "failed_modules": failed}) + "\n")
             result_sent = True
             at = datetime.now(UTC).isoformat()
             identity = hashlib.sha256(f"{args.merge_branch}\n{tree}\n{at}".encode()).hexdigest()[:24]
             values = nightly_check_values(run)
             failures = tuple(line for job in run.jobs if job.returncode
                              for line in (f"{job.suite}/{job.module}", *job.output.splitlines()))
-            result = NightlyRedResult(identity, args.merge_branch, tree, at, failures, values["types"], values["tests"])
+            failed_paths = [f"scripts/{job.suite}/{job.module}" for job in run.jobs
+                            if job.returncode and job.kind is GateJobKind.TEST_MODULE]
+            coverage = nightly_merge_coverage(clone, previous, snapshot, failed_paths)
+            result = NightlyRedResult(identity, args.merge_branch, tree, at, failures, values["types"], values["tests"],
+                                      coverage=coverage)
             with nightly_red_lock(wait=True) as directory:
                 save_nightly_red(directory, result)
                 notices = _notify_nightly_type_authors(clone, commit, identity, type_failures,
@@ -2863,6 +3026,7 @@ class CloudGateRoute(Protocol):
     """Define the cloud route boundary without coupling the local runner to AWS."""
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
               module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES,
+              selection_reason: str | None = None,
               gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun | str: ...
 
     def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
@@ -2876,30 +3040,59 @@ def run_gate_suites(repo: Path,
     """Use the scaler service and retain the permitted local fallback."""
     cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
     selected: AllModules | TreeSelection = ALL_MODULES
-    if mode is SuiteMode.TARGETED and not full:
+    required = full_required() if mode is SuiteMode.GATE else NoFullRunRequired()
+    selection: AffectedSelection | FullSuite = FullSuite("--full")
+    ledger: PassedTreeLedger | None = None
+    if isinstance(required, FullRunRequired):
+        selection = FullSuite(required.reason)
+    elif not full:
         try:
             tree, dirty = cloud.working_tree(repo)
-        except affected_modules.GraphError as error:
-            raise GateRefused(str(error)) from error
-        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
-                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
-        modules = discover_test_modules(repo)
-        selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
-        selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
-        if isinstance(selection, AffectedSelection) and not selection.modules:
-            reused = ledger.reuse()
-            if not reused:
-                ledger.record_pass(selection)
-            record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
-                            hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
-                            max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
-            return GateRun((), 0.0, 0.0, selection_certified=True)
-    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                          selected=selected, gate_job=gate_job)
+            tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
+                           else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
+        except (affected_modules.GraphError, GateRefused, OSError, subprocess.SubprocessError) as error:
+            if mode is SuiteMode.TARGETED:
+                raise GateRefused(str(error)) from error
+            selection = FullSuite(f"Could not read the candidate tree: {error}")
+        else:
+            modules = discover_test_modules(repo)
+            selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source,
+                                                        ledger_only=mode is SuiteMode.GATE)
+            if mode is SuiteMode.GATE:
+                required = full_required()
+                if isinstance(required, FullRunRequired):
+                    selection = FullSuite(required.reason)
+            if isinstance(selection, AffectedSelection):
+                selected = TreeSelection(tuple(path.relative_to(repo).as_posix() for path in selection.modules), tree)
+            elif mode is SuiteMode.TARGETED:
+                selected = TreeSelection(tuple(path.relative_to(repo).as_posix() for _, path in modules), tree)
+    reason = (selection.reason if isinstance(selection, FullSuite)
+              else f"Certified base {selection.base.commit} at {selection.base.at}")
+    if ledger is not None and isinstance(selection, AffectedSelection) and not selection.modules:
+        if mode is SuiteMode.GATE:
+            current_tree = cloud.working_tree(repo)[0]
+            if isinstance(selected, TreeSelection) and current_tree != selected.tree:
+                raise GateRefused("The checkout changed after the test selection")
+        reused = mode is SuiteMode.TARGETED and ledger.reuse()
+        if not reused:
+            ledger.record_pass(selection)
+        record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0, hold_wait_s=0.0,
+                        selection=selection, reused=reused,
+                        reason=merge_test_reason(reason) if mode is SuiteMode.GATE else "",
+                        status=0, max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
+        return GateRun((), 0.0, 0.0, selection_certified=True)
+    if mode is SuiteMode.GATE:
+        outcome = cloud.route(repo, mode=mode, full=full or isinstance(selection, FullSuite),
+                              module_time_limit_s=module_time_limit_s, selected=selected,
+                              selection_reason=merge_test_reason(reason), gate_job=gate_job)
+    else:
+        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                              selected=selected, gate_job=gate_job)
     if isinstance(outcome, str):
         print('Cloud gate uses natedev: ' + outcome, flush=True)
         return run_suites(repo, module_time_limit_s=module_time_limit_s, source=source, full=full, mode=mode)
+    if isinstance(selection, FullSuite) and outcome.passed and outcome.jobs and not outcome.tests_reused:
+        clear_full_required(required)
     return outcome
 
 

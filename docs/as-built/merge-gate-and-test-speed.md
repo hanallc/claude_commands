@@ -244,7 +244,9 @@ File tokens can occur in a test or its imported test-support modules.
 A changed shell script (a non-Python file under `scripts/` that ends in `.sh` or has an execute bit) also selects the tests that name any script that calls it, directly or through other scripts.
 A script calls another when it names its path by the test rule, by a token that ends in `/` and the full path, or by a token that ends in `/` and the name in the same folder (`"$SCRIPT_DIR/board.sh"`).
 Python files are not callers in this rule.
-Merge gates and nightly runs use all modules.
+AWS merge gates select affected modules against a certified ancestor of the final candidate.
+The local fallback uses the full-suite path.
+The nightly gate runs all modules on the pinned main snapshot.
 Merge and tests-only runs skip basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
 The queue reservation and the runner governor use separate configuration keys.
@@ -372,6 +374,8 @@ An added or removed test folder changes the ledger suite set and prevents reuse 
 
 **Affected modules for targeted tests** (`scripts/production/affected_modules.py`).
 The certified base is the newest full record on this host with the complete suite set and an ancestor of `HEAD`.
+For an AWS merge gate, the recorded tree must match the base commit in Git.
+The AWS merge gate uses only that base.
 Other candidates are the merge bases of `HEAD` and the origin refs in `landing_branches` in `config/gate.conf`.
 These branches hold commits that passed a merge gate, which runs all modules.
 The selector uses the candidate with the fewest changed paths to `HEAD`.
@@ -405,7 +409,11 @@ The cache holds imports and complete path tokens for each test-module blob.
 The current and base graphs share one cache read and one cache update.
 A warm selection reads base blobs only when the cache lacks their facts.
 Dirty sources never enter the cache or cause cache writes.
-A targeted test runs all modules only for `--full`, no base candidate, or a graph error.
+A targeted test runs all modules for `--full`, no base candidate, or a graph error.
+An AWS merge gate also runs all modules while the nightly red marker exists.
+Natedev sends the selected paths and candidate tree to the box.
+The box records the selection, its reason, and the expected module count.
+An affected run does not count as a full pass or supply a full gate time sample.
 The nightly-red marker widens only a merge gate. It does not block targeted test reuse or selection.
 A targeted test leaves the marker in place, including after `--full`.
 `--full` bypasses reuse in both modes. The marker bypasses reuse only in a merge gate.
@@ -441,11 +449,13 @@ The caller's local branches, HEAD and edits stay unchanged.
 Git disables terminal credential prompts and uses SSH batch mode.
 Promotion stays separate and runs no tests.
 A green nightly records a full pass.
+The existing `claude-nightly.timer` starts this gate at 03:00 local time on natedev.
 A failed test module or runner writes `${GATE_STATE_DIR:-~/.local/state/gate}/full-required` atomically.
 The marker records the tree, UTC time and failed modules.
-While the marker exists, every merge gate runs all modules until a merge gate passes.
+While the marker exists, every merge gate runs all modules.
+A verified full pass clears only the marker it read before the run.
 An unreadable marker also requires all modules in a merge gate.
-A failure of only the type check removes an existing marker and does not require full test runs.
+A failure of only the type check neither creates nor clears the marker.
 Every red nightly waits for the result lock before it saves its result.
 It then notifies the production owner through the existing messaging path.
 `nightly_owner` selects the owner for both the standing checkout and the notice.
@@ -465,6 +475,10 @@ When the file list exceeds 512 bytes, the notice shows part of the list and give
 The notice to the production owner also shows up to 20 lines from the list of author units and their diagnostics.
 `${GATE_STATE_DIR:-~/.local/state/gate}/nightly-red/<id>.json` stores each red result.
 The record holds the branch, tree, finish time, failure lines, receipt time, assignment, push acceptance, and last owner alert.
+It also records the failed test paths and the merges between the two pinned snapshots.
+Each failed test path has coverage marked as selected, omitted, or unknown.
+An omission requires complete evidence from the gates that tested those merges.
+The first nightly uses receipts from the preceding local calendar day and marks its history incomplete.
 The receipt time records successful delivery to the production owner.
 An unconfirmed notice keeps its receipt state empty.
 When a result needs manual assignment, the notice names the failed test files and includes the result ID.

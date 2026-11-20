@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
+from uuid import uuid4
 
 from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
@@ -1297,8 +1298,29 @@ def child_handoff_wait(production: str, checkpoint: str) -> Generator[None, None
         yield
 
 
+@dataclass(frozen=True)
+class TestedMerge:
+    tip: str
+    tree: str
+    identity: str
+
+
+@contextmanager
+def track_merge_test(checkout: Path, tip: str) -> Generator[TestedMerge]:
+    evidence = TestedMerge(tip, good(git(checkout, "rev-parse", f"{tip}^{{tree}}"), "test"), uuid4().hex)
+    previous = os.environ.get(gate.MERGE_TEST_ID)
+    os.environ[gate.MERGE_TEST_ID] = evidence.identity
+    try:
+        yield evidence
+    finally:
+        if previous is None:
+            _ = os.environ.pop(gate.MERGE_TEST_ID, None)
+        else:
+            os.environ[gate.MERGE_TEST_ID] = previous
+
+
 def record_pushed_merges(production: ProductionDocument, merge_head: str, source_checkpoint: str,
-                         tip: str, *, phase_id: str, issue: str = "") -> None:
+                         tip: str, *, phase_id: str, issue: str = "", tested: TestedMerge | None = None) -> None:
     """Receipts survive promotion failures and include origin/main integration merges."""
     repository = production_field(production.doc.read_text(encoding="utf-8").splitlines(), "Repository")
     project = Path(repository).expanduser().name
@@ -1314,6 +1336,9 @@ def record_pushed_merges(production: ProductionDocument, merge_head: str, source
         _ = progress_history.write_merge_receipt(
             project=project, phase_id=phase_id, issue=issue, merge_commit=commit,
             source_checkpoint=source, target_branch=production.merge_branch, merged_at=stamp,
+            tested_tip=tested.tip if tested is not None else "",
+            tested_tree=tested.tree if tested is not None else "",
+            merge_test_id=tested.identity if tested is not None else "",
         )
 
 
@@ -1498,19 +1523,23 @@ def run(request: MergeRequest) -> int:
             paths = prepare_checkpoint(request.production, merge_head)
         test_tip = good(git(request.production.checkout, "rev-parse", "HEAD"), "test")
 
+        tested: TestedMerge | None = None
+
         def retest(paths: tuple[str, ...], test_tip: str) -> None:
-            nonlocal tests_green
+            nonlocal tests_green, tested
             if request.bump:
                 return
             try:
                 if isinstance(request.kind, CodeCheckpoint):
-                    with merge_gate_wait(request.unit.worktree, request.phase, request.unit.name, request.commit):
+                    with (merge_gate_wait(request.unit.worktree, request.phase, request.unit.name, request.commit),
+                          track_merge_test(request.production.checkout, test_tip) as evidence):
                         if isinstance(pushed, PushedTip):
                             tests_green = checkpoint_tests(request.production, paths, request.commit, request.merge_tests,
                                                            request.flakes, request.scratch, test_tip, request.flaky_tests,
                                                            before_merge_tip=pushed.tip, ledger=request.parent_production)
                         else:
                             tests_green = tests(request, paths, merge_head)
+                    tested = evidence
                 else:
                     tests_green = tests(request, paths, merge_head)
             except (OSError, ValueError) as error:
@@ -1561,7 +1590,7 @@ def run(request: MergeRequest) -> int:
         finally:
             if tip:
                 record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
-                                     issue=str(checkpoint_plan(request)))
+                                     issue=str(checkpoint_plan(request)), tested=tested)
                 notify_published_style(request.production, merge_head, tip)
         record_publication_changes(request.production, record=request.staff_record,
                                    review_docs=(request.parent_production.doc,),
@@ -1714,9 +1743,10 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
     test_paths = {path for item in code_items for path in item.paths}
     non_code_paths = {path for item in items if not isinstance(item.request.kind, CodeCheckpoint) for path in item.paths}
     tests_green = "no tests"
+    tested: TestedMerge | None = None
 
     def retest(paths: tuple[str, ...], test_tip: str) -> None:
-        nonlocal tests_green
+        nonlocal tests_green, tested
         test_paths.update(set(paths) - non_code_paths)
         if not code_items and not test_paths:
             tests_green = tests(shared, (), first.merge_head)
@@ -1725,13 +1755,14 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
                       for item in code_items]
         reference = code_items[0].request if code_items else shared
         try:
-            with ExitStack() as waits:
+            with ExitStack() as waits, track_merge_test(shared.production.checkout, test_tip) as evidence:
                 for item in code_items:
                     _ = waits.enter_context(merge_gate_wait(item.request.unit.worktree, item.request.phase,
                                                             item.request.unit.name, item.request.commit))
                 tests_green = run_checkpoint_tests(reference.production, tuple(sorted(test_paths)), reference.merge_tests,
                                                    reference.flakes, reference.flaky_tests, log, test_tip, start_tip,
                                                    base_tip=start_tip, ledger=reference.parent_production)
+            tested = evidence
         except checkpoint_gate.RedCheckpointTests as error:
             red_commands = {(tuple(red.step.command), red.step.folder) for red in error.red}
             affected = tuple(item for item, steps in selections
@@ -1771,7 +1802,8 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
                 for item in items:
                     receipt_tip = tip if item == items[-1] else item.merge_head
                     record_pushed_merges(item.request.production, item.merge_head, item.request.commit, receipt_tip,
-                                         phase_id=item.request.phase, issue=str(checkpoint_plan(item.request)))
+                                         phase_id=item.request.phase, issue=str(checkpoint_plan(item.request)),
+                                         tested=tested)
                 notify_published_style(shared.production, first.merge_head, tip)
         review_docs = tuple(dict.fromkeys(item.request.parent_production.doc for item in items))
         record_publication_changes(shared.production, record=shared.staff_record, review_docs=review_docs)

@@ -22,6 +22,7 @@ import sys
 import tempfile
 from typing import cast
 
+from scripts.buildlog import index
 from scripts.lib import conf
 from scripts.test_times.gate_record import (
     ListedDirectory, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
@@ -720,8 +721,6 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
 
 def latest_module_reads() -> dict[str, ModuleReadRecord]:
     """Read each field from its newest full, non-aborted gate."""
-    from scripts.buildlog import index
-
     _ = index.update()
     with closing(index.read_only()) as connection:
         rows = cast(list[tuple[str, str, str | None, str | None, str | None]], connection.execute(
@@ -948,12 +947,14 @@ def script_callers(repo: Path, candidates: set[str], changed: set[str]) -> set[s
 
 def select_affected(repo: Path, base: CertifiedBase | NoCertifiedBase,
                     modules: Sequence[Path], dirty: set[str], *,
-                    state_dir: Path | None = None) -> AffectedSelection | FullSuite:
+                    state_dir: Path | None = None, ledger_only: bool = False) -> AffectedSelection | FullSuite:
+    if ledger_only and isinstance(base, NoCertifiedBase):
+        return FullSuite("no certified base")
     try:
         settings = conf.read("gate")
         declarations = declared_scan_roots(repo, modules, settings.values().get("scan_roots", "").split())
         candidates = {base.commit: base} if isinstance(base, CertifiedBase) else {}
-        for branch in settings.words("landing_branches"):
+        for branch in () if ledger_only else settings.words("landing_branches"):
             ancestor = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD",
                                        f"refs/remotes/origin/{branch}"],
                                       capture_output=True, text=True, check=False)

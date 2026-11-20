@@ -88,7 +88,7 @@ class MergeGateTypesTests(GateSuitesFixture):
         message = cast(str, arguments.args[2])
         self.assertIn(failing_file, message)
         self.assertNotIn("requires the full suite", message)
-        self.assertFalse((self.state / "runner/full-required").exists())
+        self.assertEqual((self.state / "runner/full-required").read_text(), "older marker\n")
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
     def test_nightly_sends_each_type_diagnostic_to_its_author_unit(self) -> None:
