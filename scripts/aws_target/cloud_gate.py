@@ -268,6 +268,13 @@ class UncertainGateLaunch:
     expires: int
 
 
+@dataclass(frozen=True)
+class _BatchCleanupTimeoutUnavailable:
+    """The worker could not load the batch cleanup time limits."""
+
+    error: OSError | ValueError
+
+
 @final
 class AwsServiceFailure(AwsUnavailable):
     """The AWS CLI reports a service error code for the operation."""
@@ -322,6 +329,9 @@ def cleanup_requests(paths: Sequence[Path], worker: GateWorker) -> bool:
 
 def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker) -> bool:
     """Request terminations before discovery and retain unconfirmed bookings."""
+    started_at = worker.clock()
+    timeout = worker.batch_cleanup_timeout
+    deadline = started_at + (worker.api.timeout_s if isinstance(timeout, _BatchCleanupTimeoutUnavailable) else timeout)
     complete = True
     boxes: list[GateTermination] = []
     uncertain: list[UncertainGateLaunch] = []
@@ -350,13 +360,10 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
                     'Name=tag:GateAttempt,Values=' + reservation.attempt, reservation.expires))
         except (ValueError, KeyError, TypeError) as error:
             errors.append(error)
-    ended = worker.request_terminations(boxes)
-    deadline = worker.clock()
-    if boxes or uncertain:
-        try:
-            deadline += settings().number('termination_timeout_s')
-        except (OSError, ValueError) as error:
-            errors.append(error)
+    ended = worker.request_terminations(boxes, deadline)
+    if (boxes or uncertain) and isinstance(timeout, _BatchCleanupTimeoutUnavailable):
+        errors.append(timeout.error)
+        deadline = started_at
     located: list[tuple[str, str]] = []
     for launch in uncertain:
         try:
@@ -370,7 +377,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
                 instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
                 if instances:
                     discovered = [GateTermination(launch.attempt, ledger.text(row, 'InstanceId'), region) for row in instances]
-                    ended.update(worker.request_terminations(discovered))
+                    ended.update(worker.request_terminations(discovered, deadline))
                     boxes.extend(discovered)
                     located.append((launch.attempt, region))
                     found = True
@@ -456,6 +463,14 @@ class GateWorker:
         self.sidecar = sidecar
         self.clock = clock
         self.pause = pause
+        self.batch_cleanup_timeout: float | _BatchCleanupTimeoutUnavailable
+        try:
+            configuration = settings()
+            self.batch_cleanup_timeout = configuration.number('termination_timeout_s')
+            self.batch_cleanup_api_timeout_s = configuration.number('api_timeout_s')
+        except (OSError, ValueError) as error:
+            self.batch_cleanup_timeout = _BatchCleanupTimeoutUnavailable(error)
+            self.batch_cleanup_api_timeout_s = api.timeout_s
         self.size_vcpus: int = 0
         self.price_read_evidence: tuple[dict[str, object], ...] = ()
 
@@ -557,18 +572,18 @@ class GateWorker:
         for message, error in errors:
             _cleanup_warning(f'{message}: {error}')
 
-    def confirmed_ends(self, region: str, instances: Sequence[str], *,
-                       observation_deadline: float | Literal['send_termination']) -> set[str]:
+    def confirmed_ends(self, region: str, instances: Sequence[str], deadline: float, *,
+                       operation: Literal['terminate-instances', 'describe-instances']) -> set[str]:
         api = self.regional_api(region)
         try:
-            if observation_deadline == 'send_termination':
-                _ = api.call('terminate-instances', '--instance-ids', *instances)
-                return set()
-            remaining = observation_deadline - self.clock()
+            remaining = deadline - self.clock()
             if remaining <= 0:
-                raise AwsUnavailable('The trial cleanup deadline passed')
-            reply = api.call('describe-instances', '--instance-ids', *instances,
-                             timeout_s=min(settings().number('api_timeout_s'), remaining))
+                return set()
+            api_timeout_s = (self.batch_cleanup_api_timeout_s if operation == 'terminate-instances'
+                             else settings().number('api_timeout_s'))
+            reply = api.call(operation, '--instance-ids', *instances, timeout_s=min(api_timeout_s, remaining))
+            if operation == 'terminate-instances':
+                return set()
             return {ledger.text(row, 'InstanceId') for group in ledger.rows(reply, 'Reservations')
                     for row in ledger.rows(group, 'Instances')
                     if ledger.text(ledger.mapping(row['State']), 'Name') == 'terminated'}
@@ -578,7 +593,7 @@ class GateWorker:
                     return set(instances)
                 # A batch refusal does not identify the absent instances.
                 return {ended for instance in instances for ended in self.confirmed_ends(
-                    region, (instance,), observation_deadline=observation_deadline)}
+                    region, (instance,), deadline, operation=operation)}
             _cleanup_warning(f'paired cleanup: {error}')
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
             _cleanup_warning(f'paired cleanup: {error}')
@@ -596,13 +611,13 @@ class GateWorker:
             pending.append(box)
         return pending
 
-    def request_terminations(self, boxes: Sequence[GateTermination]) -> set[GateTermination]:
+    def request_terminations(self, boxes: Sequence[GateTermination], deadline: float) -> set[GateTermination]:
         """Request termination and return boxes that AWS reports as absent."""
         ended: set[GateTermination] = set()
         for region in dict.fromkeys(box.region for box in boxes):
             regional_boxes = [box for box in boxes if box.region == region]
             instances = [box.instance for box in regional_boxes]
-            absent = self.confirmed_ends(region, instances, observation_deadline='send_termination')
+            absent = self.confirmed_ends(region, instances, deadline, operation='terminate-instances')
             ended.update(box for box in regional_boxes if box.instance in absent)
         return ended
 
@@ -615,7 +630,7 @@ class GateWorker:
                 instances = [box.instance for box in pending if box.region == region]
                 if not instances or self.clock() >= deadline:
                     continue
-                ended = self.confirmed_ends(region, instances, observation_deadline=deadline)
+                ended = self.confirmed_ends(region, instances, deadline, operation='describe-instances')
                 if ended:
                     pending = self.record_ends(pending, {box for box in pending
                                                          if box.region == region and box.instance in ended})
