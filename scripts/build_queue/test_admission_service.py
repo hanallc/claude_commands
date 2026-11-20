@@ -103,7 +103,7 @@ class PlacementWaitOwnerTests(unittest.TestCase):
                 records.register_placement_waits("orphan", owner, entered, entered_at=entered)
                 wait = records.PlacementWaitKey("orphan", "step")
                 records.record_placement_wait(wait, records.PlacementWaitReason.MEMORY, entered + 1)
-                journal, = (root / "placement-waits").glob("*.jsonl")
+                journal, = (root / "placement-waits").glob(f"*{records.PLACEMENT_WAIT_JOURNAL_SUFFIX}")
                 initial = journal.read_bytes()
                 clock.advance(40)
                 recorder.sweep_owners()

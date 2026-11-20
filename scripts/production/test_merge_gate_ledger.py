@@ -240,7 +240,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         _ = self.git(self.checkout, "push", "origin", "HEAD:integration")
         self.write(self.state / "red-hooks", "red")
         with mock.patch.object(showrunners, "tell", return_value="sent to quiet") as notice:
-            result = self.run_gate("--nightly")
+            result = self.run_gate("--nightly", "--production", "quiet")
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]

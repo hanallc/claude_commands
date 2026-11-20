@@ -13,6 +13,7 @@ import subprocess
 from unittest import mock
 from typing import Callable, TypedDict, cast, override
 
+from scripts.build_queue import admission_records
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, caller_provider_controls
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB, install_fixed_cargo
@@ -413,10 +414,8 @@ source() {
         return [cast(SshRunnerEvent, json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
 
     def attempts(self) -> list[dict[str, object]]:
-        rows = [cast(dict[str, object], json.loads(line))
-                for path in (self.root / "buildlog").glob("*/*.jsonl")
-                for line in path.read_text().splitlines()
-                if cast(dict[str, object], json.loads(line)).get("kind") == "ssh_attempt"]
+        rows = [row for row in admission_records.read_buildlog_records(self.root / "buildlog")
+                if row.get("kind") == "ssh_attempt"]
         return sorted(rows, key=lambda row: cast(str, row["at"]))
 
     def enable_mac(self) -> None:

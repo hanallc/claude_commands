@@ -10,6 +10,7 @@ import sys
 import unittest
 from typing import cast, override
 
+from scripts.build_queue import admission_records
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -244,9 +245,7 @@ run_once cargo nextest run -E "package(sample) & test(native_rate)"
         _, new_key, _ = self.calculate_build_keys("--filter", "native_rate", target=str(target))
         self.assertNotEqual(new_key, old_key)
         self.assertEqual(admission["key"], new_key)
-        rows = [cast(dict[str, object], json.loads(line))
-                for path in (self.root / "buildlog").glob("*/*.jsonl")
-                for line in path.read_text().splitlines()]
+        rows = list(admission_records.read_buildlog_records(self.root / "buildlog"))
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["test_build_key"], old_key)
         self.assertEqual(rows[1]["test_build_key"], new_key)

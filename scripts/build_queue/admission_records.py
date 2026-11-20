@@ -1,7 +1,7 @@
 """Shared admission records, configuration and wait phrases."""
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -171,10 +171,24 @@ class WaitOwnerStillTracked:
 
 WAIT_OWNER_STILL_TRACKED = WaitOwnerStillTracked()
 WAIT_RECORD_SEPARATOR = b"\x1e"
+PLACEMENT_WAIT_DIRECTORY = "placement-waits"
+PLACEMENT_WAIT_JOURNAL_SUFFIX = ".journal"
 
 
 def _placement_wait_path(root: Path, call_id: str) -> Path:
-    return root / "placement-waits" / sha256(call_id.encode()).hexdigest()
+    return root / PLACEMENT_WAIT_DIRECTORY / sha256(call_id.encode()).hexdigest()
+
+
+def buildlog_record_paths(root: Path) -> Iterator[Path]:
+    """Find build log files. The placement journal has its own reader."""
+    return (path for path in root.glob("*/*.jsonl") if path.parent.name != PLACEMENT_WAIT_DIRECTORY)
+
+
+def read_buildlog_records(root: Path) -> Iterator[dict[str, object]]:
+    """Read the rows from the build log files."""
+    for path in buildlog_record_paths(root):
+        for line in path.read_bytes().splitlines():
+            yield _wait_object(cast(object, json.loads(line)))
 
 
 def _placement_wait_owner_path(path: Path, *, continued: bool = False) -> Path:
@@ -203,6 +217,21 @@ def _wait_object(value: object) -> dict[str, object]:
 
 def _read_wait_object(data: bytes) -> dict[str, object]:
     return _wait_object(cast(object, json.loads(data)))
+
+
+def placement_wait_frames(path: Path) -> Iterator[bytes]:
+    """Read complete frames from a placement wait journal."""
+    with path.open("rb") as source:
+        for line in source:
+            if line.endswith(b"\n") and line != b"\n":
+                # A new frame starts after an incomplete append.
+                yield line.rsplit(WAIT_RECORD_SEPARATOR, 1)[-1]
+
+
+def _call_wait_frames(path: Path) -> Iterator[bytes]:
+    for suffix in (".jsonl", PLACEMENT_WAIT_JOURNAL_SUFFIX):
+        with suppress(FileNotFoundError):
+            yield from placement_wait_frames(path.with_suffix(suffix))
 
 
 def _wait_interval_id(episode: str, reason: PlacementWaitReason, started_at: float) -> str:
@@ -311,45 +340,37 @@ def _read_placement_wait_journal(call_id: str) -> PlacementWaitJournal:
     except (ValueError, TypeError, KeyError) as error:
         note(error)
 
-    try:
-        with path.with_suffix(".jsonl").open("rb") as stream:
-            legacy_snapshot = (last_recorded_at, finished, b"")
-            for line in stream:
-                if not line.endswith(b"\n") or line == b"\n":
-                    continue
-                # A frame starts after any torn append. The newline commits the frame.
-                data = line.rsplit(WAIT_RECORD_SEPARATOR, 1)[-1]
-                try:
-                    value = _read_wait_object(data)
-                    if value.get("kind") == "transition":
-                        event = _decode_transition(value)
-                        saved = events.get(event.interval_id)
-                        if saved is None or event.observed_at > saved.observed_at:
-                            events[event.interval_id] = event
-                    elif value.get("kind") == "orphan":
-                        detached = value.get("continued") is True
-                        seen = value["last_seen_at"]
-                        if seen is not None:
-                            end = OwnerLastSeen(_wait_number(seen))
-                            previous = orphan_ends.get(detached)
-                            if not isinstance(previous, OwnerLastSeen) or end.at > previous.at:
-                                orphan_ends[detached] = end
-                        else:
-                            _ = orphan_ends.setdefault(detached, OrphanWaitEnd.LAST_RECORD)
-                    else:
-                        snapshot_order = (_wait_number(value["at"]), value["finished"] is True, data)
-                        legacy_active = _decode_open_wait(value["active"])
-                        if "closed" in value:
-                            add_legacy(value["closed"])
-                        if snapshot_order > legacy_snapshot:
-                            legacy_snapshot = snapshot_order
-                            snapshot_at, finished, _ = snapshot_order
-                            last_recorded_at = max(last_recorded_at, snapshot_at)
-                            active = legacy_active
-                except (ValueError, TypeError, KeyError) as error:
-                    note(error)
-    except FileNotFoundError:
-        pass
+    legacy_snapshot = (last_recorded_at, finished, b"")
+    for data in _call_wait_frames(path):
+        try:
+            value = _read_wait_object(data)
+            if value.get("kind") == "transition":
+                event = _decode_transition(value)
+                saved = events.get(event.interval_id)
+                if saved is None or event.observed_at > saved.observed_at:
+                    events[event.interval_id] = event
+            elif value.get("kind") == "orphan":
+                detached = value.get("continued") is True
+                seen = value["last_seen_at"]
+                if seen is not None:
+                    end = OwnerLastSeen(_wait_number(seen))
+                    previous = orphan_ends.get(detached)
+                    if not isinstance(previous, OwnerLastSeen) or end.at > previous.at:
+                        orphan_ends[detached] = end
+                else:
+                    _ = orphan_ends.setdefault(detached, OrphanWaitEnd.LAST_RECORD)
+            else:
+                snapshot_order = (_wait_number(value["at"]), value["finished"] is True, data)
+                legacy_active = _decode_open_wait(value["active"])
+                if "closed" in value:
+                    add_legacy(value["closed"])
+                if snapshot_order > legacy_snapshot:
+                    legacy_snapshot = snapshot_order
+                    snapshot_at, finished, _ = snapshot_order
+                    last_recorded_at = max(last_recorded_at, snapshot_at)
+                    active = legacy_active
+        except (ValueError, TypeError, KeyError) as error:
+            note(error)
 
     legacy_at = last_recorded_at
     if finished:
@@ -452,7 +473,7 @@ def placement_wait_totals(call_id: str) -> dict[str, float]:
 def _append_wait_event(path: Path, value: dict[str, object], *, durable: bool = False) -> None:
     data = WAIT_RECORD_SEPARATOR + json.dumps(value, separators=(",", ":"), allow_nan=False).encode() + b"\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path.with_suffix(".jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    descriptor = os.open(path.with_suffix(PLACEMENT_WAIT_JOURNAL_SUFFIX), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         if os.write(descriptor, data) != len(data):
             raise OSError("short placement wait write")

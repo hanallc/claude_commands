@@ -2800,9 +2800,11 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(self.git(child, "cat-file", "-p", self.head), self.git(parent, "cat-file", "-p", self.head))
         for pending in (child, parent):
             with self.subTest(pending=pending):
+                record = scratch.task_of(pending)
+                assert isinstance(record, copy_record.Registered)
                 with mock.patch.object(scratch, "remove", side_effect=RuntimeError("interrupted removal")):
                     with self.assertRaisesRegex(RuntimeError, "interrupted removal"):
-                        scratch.remove_marked(pending)
+                        scratch.remove_marked(pending, ending_task=record.task)
                 with self.assertRaisesRegex(copies.CopyError, "borrowed"):
                     copies.remove_trees(self.owner_id)
                 self.assertTrue(parent.exists())

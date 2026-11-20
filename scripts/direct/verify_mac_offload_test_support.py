@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.build_queue import admission_records
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.build_queue.admission_test_support import (
@@ -1514,10 +1515,9 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
 
     def call_records(self) -> list[CallRecord]:
         return [
-            cast(CallRecord, json.loads(line))
-            for path in (self.root / "buildlog").glob("*/*.jsonl")
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if cast(dict[str, object], json.loads(line)).get("kind") == "call"
+            cast(CallRecord, cast(object, row))
+            for row in admission_records.read_buildlog_records(self.root / "buildlog")
+            if row.get("kind") == "call"
         ]
 
     def last_call(self) -> CallRecord:

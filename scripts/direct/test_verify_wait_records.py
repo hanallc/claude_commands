@@ -24,9 +24,11 @@ from scripts.copies import copies
 from scripts.direct.verify_examples_test_support import ExampleWorkspaceFixture, workspace_metadata
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import build_folders, conf
+from scripts.lib.process_group import send_process_group
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit as gate, nextest_tokens, prebuild
+from scripts.lint.memory_test_support import write_pressure_reading
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -54,9 +56,11 @@ def wait_totals(root: Path, call_id: str) -> dict[str, float]:
 
 
 def read_transitions(directory: Path) -> list[dict[str, object]]:
-    entries = [cast(dict[str, object], json.loads(frame)) for path in directory.glob("*.jsonl")
-               for frame in path.read_bytes().split(b"\n")[:-1] if frame.startswith(records.WAIT_RECORD_SEPARATOR)]
+    entries = [cast(dict[str, object], json.loads(frame))
+               for path in directory.glob(f"*{records.PLACEMENT_WAIT_JOURNAL_SUFFIX}")
+               for frame in records.placement_wait_frames(path)]
     return [entry for entry in entries if entry["kind"] == "transition"]
+
 
 
 class VerifyFinalWaitRecordsTests(ExampleWorkspaceFixture):
@@ -139,7 +143,7 @@ exec "$FIXTURE_PYTHON" "$@"
             actions.append("register")
         wait_until(lambda: len(read_transitions(journal_dir)) >= len(actions), journal_dir, watch_writes=True)
         transitions = read_transitions(journal_dir)
-        self.assertEqual(len(list(journal_dir.glob("*.jsonl"))), 1)
+        self.assertEqual(len(list(journal_dir.glob(f"*{records.PLACEMENT_WAIT_JOURNAL_SUFFIX}"))), 1)
         totals = wait_totals(log, call_id)
         self.assertCountEqual([entry["action"] for entry in transitions], actions)
         times = {entry["action"]: cast(float, entry["at"]) for entry in transitions}
@@ -316,9 +320,9 @@ buildlog_exec "$PWD/cargo"
                 finally:
                     if group:
                         with suppress(ProcessLookupError):
-                            os.killpg(group, signal.SIGKILL)
+                            send_process_group(group, signal.SIGKILL)
                     with suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
+                        send_process_group(process.pid, signal.SIGKILL)
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             _ = records.close_orphaned_placement_waits(root, lambda _owner, _seen: records.OwnerLastSeen(entered + 1))
             totals = records.placement_wait_totals(call_id)
@@ -342,15 +346,15 @@ buildlog_exec "$PWD/cargo"
                 records.stamp_verify_command(call, now, now)
                 self.assertEqual(records.placement_wait_totals(call_id), {"local_setup": 6})
 
-            def run(command: list[str], **_kwargs: object) -> int:
-                self.assertEqual(command[2:6], ["verify-command", "--call-id", call_id, "--"])
-                self.assertEqual(command[6:], ["cargo", "check"])
+            def run(command: list[str], *, on_start: Callable[[int], None], **_kwargs: object) -> int:
+                self.assertEqual(command, ["cargo", "check"])
                 self.assertEqual(records.placement_wait_totals(call_id), {})
                 with mock.patch.object(records, "record_started_verify_command", side_effect=record_start):
-                    return client.main([*command[2:6], sys.executable, "-c", "pass"])
+                    on_start(os.getpid())
+                return 0
 
             with mock.patch.object(copies, "commit_at", return_value="head"), \
-                    mock.patch.object(copies, "git", return_value=b"tree\n"), \
+                    mock.patch.object(copies, "git", return_value=b"head\ntree\n"), \
                     mock.patch.object(copies, "step_owner", return_value="fixture"), \
                     mock.patch.object(copies, "standing", side_effect=prepare_checkout), \
                     mock.patch.object(build_folders, "run_build_command", side_effect=run) as command, \
@@ -385,7 +389,7 @@ with patch.object(admission_records, "stamp_verify_command", side_effect=blocked
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             launcher = root / "launcher.py"
-            _ = launcher.write_text(script)
+            _ = launcher.write_text(f"import sys\nsys.path.insert(0, {str(VERIFY.resolve().parents[2])!r})\n" + script)
             cargo = root / "cargo"
             _ = cargo.write_text("""#!/bin/sh
 case "$2" in
@@ -417,7 +421,10 @@ exit 2
                 ) as launched:
                     assert launched.stdin is not None
                     try:
-                        wait_until(lambda: (root / "writer-waiting").is_file(), root)
+                        waiting = root / "writer-waiting"
+                        wait_until(lambda: waiting.is_file() or launched.poll() is not None, root, processes=(launched,))
+                        _ = log.seek(0)
+                        self.assertTrue(waiting.is_file(), log.read())
                         with self.assertRaises(BlockingIOError):
                             _ = os.read(tokens.fileno(), 1)
                         _ = release.write(b"exit\n")
@@ -429,7 +436,7 @@ exit 2
                         launched.stdin.close()
                         if launched.returncode is None:
                             with suppress(ProcessLookupError):
-                                os.killpg(launched.pid, signal.SIGKILL)
+                                send_process_group(launched.pid, signal.SIGKILL)
 
     def test_valid_prebuild_stamps_its_cargo_build_before_nextest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -447,6 +454,7 @@ import os
 from pathlib import Path
 import sys
 
+sys.path.insert(0, {str(VERIFY.resolve().parents[2])!r})
 from scripts.build_queue import admission_records
 from scripts.direct.wait_for_test_state import wait_until
 
@@ -561,7 +569,8 @@ assert all(os.path.samestat(os.fstat(fd), expected) for fd in (0, 1, 2))
 with open(os.environ['RECORDER_RELEASE']) as gate:
     gate.readline()
 """)
-            shell = shell_functions(VERIFY, "launch_verify_wait_recorder", "transition_verify_wait") + """
+            shell = shell_functions(VERIFY, "run_verify_wait_recorder", "launch_verify_wait_recorder",
+                                    "transition_verify_wait") + """
 transition_verify_wait finish "" 12
 printf 'verify continued\\n'
 """
@@ -800,11 +809,14 @@ run cargo check -p "$PKG"
 
             with mock.patch.object(client, "CLOCK", fixture.clock), mock.patch.object(client, "_call", side_effect=call_service):
                 fixture.free(0)
+                fixture.hold_starts()
+                _ = fixture.run_pass()
                 waiting = client.request_placement(request)
                 self.assertIsInstance(waiting, wire.PlacementWait)
 
                 fixture.clock.advance(4)
                 fixture.free(60 * records.GIB)
+                write_pressure_reading(fixture.root / "pressure")
                 _ = fixture.run_pass()
                 self.assertIsInstance(client.request_placement(request), wire.LocalPlacementGranted)
 

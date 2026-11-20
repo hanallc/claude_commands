@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from contextlib import redirect_stderr
-from typing import override
+from typing import cast, override
 from unittest import mock
 
 from scripts.direct import remove_run_scratch, workers
@@ -30,6 +30,7 @@ class RemoveRunScratchTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {scratch.HOLDS_ENV: str(root / "holds.json")})))
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
         owner = fixture_member("showrunner", name="demo")
         self.owner_id = fixture_member("unit", name="builders", parent=owner.id).id
@@ -246,8 +247,8 @@ class RemoveRunScratchTests(unittest.TestCase):
     def test_a_worktree_the_source_cannot_remove_is_deleted_and_the_source_pruned(self) -> None:
         source, _, gate = self.worktree_run()
         real = remove_run_scratch.git
-        def refuse_remove(common: Path, *arguments: str) -> bool:
-            return False if arguments[0] == "remove" else real(common, *arguments)
+        def refuse_remove(common: Path, operation: str, registration: scratch.WorktreeRegistration | None = None) -> bool:
+            return False if operation == "remove" else real(common, operation, registration)
 
         with mock.patch.object(remove_run_scratch, "git", side_effect=refuse_remove) as git:
             remove_run_scratch.remove(gate)

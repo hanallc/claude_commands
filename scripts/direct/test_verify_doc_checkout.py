@@ -12,10 +12,10 @@ import signal
 from pathlib import Path
 import subprocess
 from threading import Event
-from typing import cast
 import unittest
 from unittest import mock
 
+from scripts.build_queue import admission_records
 from scripts.agents.remote import local_machine
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_protocol as wire, admission_service as service, memory_feed
@@ -346,9 +346,7 @@ else:
         key = treekey.tree_key(str(checkout))
         assert key is not None
         self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(key))
-        rows = (cast(dict[str, object], json.loads(line))
-                for path in (self.root / "buildlog").glob("*/*.jsonl")
-                for line in path.read_text().splitlines())
+        rows = admission_records.read_buildlog_records(self.root / "buildlog")
         row, = (row for row in rows if row.get("kind") == "step" and row.get("step") == "doc")
         self.assertEqual(row["tree_key"], key)
         self.assertIs(row["tree_changed"], False)

@@ -342,21 +342,26 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertNotIn("Rerun alone", output.getvalue())
 
     @gate_suites("lib", "hooks")
-    def test_named_modules_run_alone_with_no_hold_ledger_or_record(self) -> None:
+    def test_named_modules_use_shared_admission_without_a_ledger_or_record(self) -> None:
         self.write(self.checkout / "scripts/hooks/test_first.py", SUITE_MODULE
                    + "\n\nclass Red(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n")
         output = io.StringIO()
         with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(merge_gate, "BuildHoldWait", wraps=merge_gate.BuildHoldWait) as hold,
+              mock.patch.object(merge_gate, "gate_reservation", wraps=merge_gate.gate_reservation) as admission,
               contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
-            for name in ("BuildHoldWait", "gate_reservation", "PassedTreeLedger", "record_gate_run", "run_gate_suites"):
+            for name in ("PassedTreeLedger", "record_gate_run", "run_gate_suites"):
                 _ = blocked.enter_context(mock.patch.object(merge_gate, name, side_effect=AssertionError(name)))
             code = merge_gate.main(["--tests-only", "--repo", str(self.checkout),
                                     "--module", "hooks/test_first.py", "--module", "lib/test_second.py"])
         self.assertEqual(code, 1, output.getvalue())
+        hold.assert_called_once()
+        admission.assert_called_once()
         starts = sorted((event["suite"], event["module"]) for event in self.module_events() if event["event"] == "start")
         # A red module runs once more alone, as in the gate, so a flake is not a red name.
         self.assertEqual(starts, [("hooks", "test_first.py"), ("hooks", "test_first.py"), ("lib", "test_second.py")])
-        self.assertEqual(checkpoint_gate.red_names(["merge_gate.py"], output.getvalue()), frozenset({"hooks/test_first.py"}))
+        self.assertEqual(checkpoint_gate.red_names(["merge_gate.py", "--tests-only"], output.getvalue()),
+                         frozenset({"hooks/test_first.py"}))
 
     def test_a_named_module_needs_tests_only(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):

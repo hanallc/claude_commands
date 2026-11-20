@@ -298,6 +298,7 @@ class SnapshotCodecTests(unittest.TestCase):
             records.BehindHead: records.BehindHead("organon", 900.0, "session"),
             records.GpuSlotWait: records.GpuSlotWait(1, 1),
             placement.CargoFolderWait: placement.CargoFolderWait(),
+            records.LandingWait: records.LandingWait(),
             records.ReadyForAdmission: records.ReadyForAdmission(),
         }
         self.assertEqual(set(causes), set(get_args(records.HeadCause)))
@@ -319,7 +320,8 @@ class SnapshotCodecTests(unittest.TestCase):
                         older_cause = (cast(object, getattr(older_reason, "cause"))
                                        if type(older_reason).__name__ == "HeadAdmissionStatus" else older_reason)
                         self.assertEqual(type(older_cause).__name__,
-                                         "BehindHead" if isinstance(cause, (records.GpuSlotWait, records.NatedevHeld, placement.CargoFolderWait))
+                                         "BehindHead" if isinstance(cause, (records.GpuSlotWait, records.NatedevHeld,
+                                                                            placement.CargoFolderWait, records.LandingWait))
                                          else type(cause).__name__)
 
     def test_the_pinned_ci_client_reads_a_natedev_hold_as_a_wait_and_the_current_client_keeps_it(self) -> None:

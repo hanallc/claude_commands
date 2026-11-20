@@ -66,7 +66,8 @@ class SessionFolderTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.object(session_folder, "member_of", side_effect=self.member_of)))
         _ = cast(object, self.enterContext(patch.object(session_records, "session_liveness", side_effect=self.liveness)))
 
-    def liveness(self, session_id: str) -> session_records.LiveSessionProcess | session_records.SessionNotLive:
+    def liveness(self, session_id: str, _registry: session_records.RegistryRead | None = None
+                 ) -> session_records.LiveSessionProcess | session_records.SessionNotLive:
         return session_records.LiveSessionProcess(1) if session_id in self.live else session_records.SessionNotLive()
 
     def member_of(self, session_id: str) -> Member | None:

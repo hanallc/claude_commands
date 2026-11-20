@@ -880,7 +880,12 @@ def clear_git_identity_cache() -> None:
 def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if not argv:
         return UnknownRepository(), ""
-    directory = os.path.abspath(record.git_directory(argv, cwd))
+    return checkout_identity(record.git_directory(argv, cwd), cwd)
+
+
+def checkout_identity(directory: str, cwd: str) -> tuple[Repository, str]:
+    """Read the identity of a known checkout."""
+    directory = os.path.abspath(directory)
     key = (directory, cwd)
     if key not in _GIT_IDENTITIES:
         _GIT_IDENTITIES[key] = _read_git_identity(directory, cwd)

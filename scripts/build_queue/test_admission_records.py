@@ -239,7 +239,7 @@ class PlacementWaitRecordsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"BUILDLOG_DIR": root}):
             key = records.PlacementWaitKey("fixture", "step")
             records.record_placement_wait(key, records.PlacementWaitReason.ROUTING, 10)
-            path, = (Path(root) / "placement-waits").glob("*.jsonl")
+            path, = (Path(root) / "placement-waits").glob(f"*{records.PLACEMENT_WAIT_JOURNAL_SUFFIX}")
             initial = path.read_bytes()
             records.finish_placement_waits(key.call_id, 12)
             _ = path.write_bytes(path.read_bytes()[:-1])
@@ -254,7 +254,7 @@ class PlacementWaitRecordsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"BUILDLOG_DIR": root}):
             key = records.PlacementWaitKey("fixture", "step")
             records.record_placement_wait(key, records.PlacementWaitReason.ROUTING, 10)
-            path, = (Path(root) / "placement-waits").glob("*.jsonl")
+            path, = (Path(root) / "placement-waits").glob(f"*{records.PLACEMENT_WAIT_JOURNAL_SUFFIX}")
             repeated_open = path.read_bytes()
             records.record_placement_wait(key, records.PlacementWaitReason.SLOT, 12)
             records.finish_placement_waits(key.call_id, 15)
@@ -264,6 +264,21 @@ class PlacementWaitRecordsTests(unittest.TestCase):
             self.assertEqual(records.read_placement_waits(key.call_id), (routing, slot))
             self.assertNotEqual(routing["interval_id"], slot["interval_id"])
             self.assertIn(routing["interval_id"].encode(), repeated_open)
+
+    def test_the_reader_keeps_old_wait_frames_out_of_build_log_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"BUILDLOG_DIR": directory}):
+            root = Path(directory)
+            key = records.PlacementWaitKey("fixture", "step")
+            records.record_placement_wait(key, records.PlacementWaitReason.ROUTING, 10)
+            journal, = (root / records.PLACEMENT_WAIT_DIRECTORY).glob(f"*{records.PLACEMENT_WAIT_JOURNAL_SUFFIX}")
+            _ = journal.rename(journal.with_suffix(".jsonl"))
+            records.finish_placement_waits(key.call_id, 15)
+            row, = records.read_placement_waits(key.call_id)
+            self.assertEqual((row["started_at"], row["ended_at"]), (10, 15))
+            host_log = root / "fixture" / "2026-11.jsonl"
+            host_log.parent.mkdir()
+            _ = host_log.write_text('{"kind":"call"}\n')
+            self.assertEqual(list(records.read_buildlog_records(root)), [{"kind": "call"}])
 
     def test_the_report_replays_out_of_order_recorder_rows(self) -> None:
         with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"BUILDLOG_DIR": root}):
@@ -275,7 +290,7 @@ class PlacementWaitRecordsTests(unittest.TestCase):
             expected = records.read_placement_waits(key.call_id)
             self.assertEqual([(row["reason"], row["placement_wait_s"]) for row in expected],
                              [(reasons.ROUTING, 2), (reasons.MEMORY, 8)])
-            journal, = (Path(root) / "placement-waits").glob("*.jsonl")
+            journal, = (Path(root) / "placement-waits").glob(f"*{records.PLACEMENT_WAIT_JOURNAL_SUFFIX}")
             frames = journal.read_bytes().rstrip(b"\n").split(b"\n")
             for order in permutations(frames):
                 _ = journal.write_bytes(b"\n".join(order) + b"\n")
@@ -293,7 +308,7 @@ class PlacementWaitRecordsTests(unittest.TestCase):
             second = records.PlacementWaitKey("second", "step")
             records.record_placement_wait(first, records.PlacementWaitReason.ROUTING, 10)
             directory = Path(root) / "placement-waits"
-            journal, = directory.glob("*.json*")
+            journal, = directory.glob(f"*{records.PLACEMENT_WAIT_JOURNAL_SUFFIX}")
             flock = fcntl.flock
 
             def lock_without_wait(descriptor: int, operation: int) -> None:
@@ -322,7 +337,7 @@ class PlacementWaitRecordsTests(unittest.TestCase):
             records.record_placement_wait(key, reasons.HOLD, 12)
             records.record_placement_wait(key, reasons.SLOT, 14)
             records.finish_placement_waits(key.call_id, 20)
-            path, = (Path(root) / "placement-waits").glob("*.json*")
+            path, = (Path(root) / "placement-waits").glob(f"*{records.PLACEMENT_WAIT_JOURNAL_SUFFIX}")
             _ = path.write_text(path.read_text().replace('"routing"', '"unknown"').replace('"hold"', '"unknown"'))
             with redirect_stderr(io.StringIO()) as notes:
                 row, = records.read_placement_waits(key.call_id)

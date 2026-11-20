@@ -261,8 +261,7 @@ class VerifyRoutingTests(unittest.TestCase):
             first = self.fixture.verify("test", "sample")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual(self.state(), "Delivered")
-        rows = [cast(dict[str, object], json.loads(line)) for path in (self.fixture.root / "buildlog").rglob("*.jsonl")
-                for line in path.read_text().splitlines()]
+        rows = admission_records.read_buildlog_records(self.fixture.root / "buildlog")
         hold_rows = [row for row in rows if row.get("kind") == "hold_event"]
         self.assertTrue(hold_rows, "The release must write a hold row to the private build log")
         self.assertTrue(all(row["holder"] == "holder" and row["reason"] == "the test" for row in hold_rows))

@@ -1258,10 +1258,10 @@ class WaitOutput:
         self.status(f"{prefix}: " + "; ".join(part for part in parts if part))
 
     def elapsed_seconds(self) -> int:
+        if self.deadline_reached:
+            return int(CLOCK.monotonic() - self.started)
         if isinstance(self.memory_wait, MemoryWaitStarted):
             return int(self.elapsed_memory_seconds + CLOCK.monotonic() - self.memory_wait.monotonic_at)
-        if self.deadline_reached and not self.held:
-            return int(CLOCK.monotonic() - self.started)
         return int(self.elapsed_memory_seconds)
 
     def finished(self, *, left: bool = False, placement_events: bool = False) -> None:

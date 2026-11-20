@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ctypes
 import errno
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -12,9 +11,9 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import cast
 from unittest import mock
 
+from scripts.build_queue import admission_records
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     grant_call,
@@ -36,11 +35,9 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                 with local_hold_environment(environment):
                     grant_call(self.cycle_file)
                 recorded: list[tuple[object, object]] = []
-                for path in (self.fixture.root / "buildlog").rglob("*.jsonl"):
-                    for line in path.read_text().splitlines():
-                        row = cast(dict[str, object], json.loads(line))
-                        if row.get("kind") == "hold_event":
-                            recorded.append((row.get("event"), row.get("holder")))
+                for row in admission_records.read_buildlog_records(self.fixture.root / "buildlog"):
+                    if row.get("kind") == "hold_event":
+                        recorded.append((row.get("event"), row.get("holder")))
                 self.assertEqual(recorded, [("ended", "hana")] * count)
 
     def test_local_admission_waits_for_release_notifications_instead_of_sleeping(self) -> None:

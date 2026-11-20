@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import shutil
 import subprocess
-from typing import cast
 import unittest
 
+from scripts.build_queue import admission_records
 from scripts.direct.verify_final_pass_test_support import FinalPassFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.direct.verify_lint_scope_test_support import VERIFY
@@ -154,9 +153,7 @@ class VerifyVerbTests(VerifyLintCacheFixture):
 
 class VerifyWorkspaceFormTests(FinalPassFixture):
     def recorded_calls(self) -> list[dict[str, object]]:
-        rows = [cast(dict[str, object], json.loads(line))
-                for path in Path(self.environment["BUILDLOG_DIR"]).rglob("*.jsonl")
-                for line in path.read_text().splitlines()]
+        rows = admission_records.read_buildlog_records(Path(self.environment["BUILDLOG_DIR"]))
         return [row for row in rows if row.get("kind") == "call" and row.get("tool") == "verify.sh"]
 
     def test_check_without_package_preserves_features_and_records_workspace(self) -> None:

@@ -192,6 +192,7 @@ class VerifyDocFixture(unittest.TestCase):
             "CARGO_HOME": str(self.root / "cargo-home"), "CARGO_TARGET_DIR": str(self.root / "target"),
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
+            "BUILDLOG_SYNC": "1",
             **memory_environment,
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),

@@ -112,9 +112,7 @@ class SessionMoveTests(unittest.TestCase):
         refused = self.leaf("a-missing-transcript")
         first = self.leaf("b-movable")
         second = self.leaf("c-movable")
-        folder = self.index(first.name, "demo")
-        _ = self.index(second.name, folder.name)
-        target = folder / self.claude / self.project
+        destinations = {source: self.index(source.name, source.name) for source in (first, second)}
 
         status, output, errors = self.invoke()
 
@@ -125,7 +123,8 @@ class SessionMoveTests(unittest.TestCase):
                          "session_move: moved 2 folders (0.00 GiB), kept 0 live, refused 1 other")
         for source in (first, second):
             self.assertFalse(source.exists())
-            self.assertEqual((target / source.name / "draft.md").read_bytes(), b"scratch content\n")
+            target = destinations[source] / self.claude / self.project / source.name
+            self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
 
     def test_unreadable_project_keeps_later_projects_in_the_scan(self) -> None:
         unreadable = self.leaf("unreadable").parent
@@ -189,7 +188,7 @@ class SessionMoveTests(unittest.TestCase):
         source = self.leaf("a-copy")
         waiting = self.leaf("b-waiting")
         folder = self.index(source.name, "demo")
-        _ = self.index(waiting.name, folder.name)
+        waiting_folder = self.index(waiting.name, "waiting")
         target = folder / self.claude / self.project / source.name
         sync = os.fsync
 
@@ -209,14 +208,14 @@ class SessionMoveTests(unittest.TestCase):
         self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
         self.assertTrue((self.root / session_move.JOURNAL / session_move.MOVE_RECORD).is_file())
         self.assertTrue(waiting.is_dir())
-        self.assertFalse((target.parent / waiting.name).exists())
+        self.assertFalse((waiting_folder / self.claude / self.project / waiting.name).exists())
 
     def test_read_error_leaves_dry_and_real_counts_and_order_equal(self) -> None:
         first = self.leaf("a-movable")
         refused = self.leaf("b-unreadable")
         last = self.leaf("c-movable")
         for source in (first, refused, last):
-            _ = self.index(source.name, "demo")
+            _ = self.index(source.name, source.name)
         scan = session_move.read_manifest
         refused_info = refused.stat()
 
@@ -291,7 +290,7 @@ class SessionMoveTests(unittest.TestCase):
         self.assertEqual(dry_errors, real_errors)
         self.assertEqual(dry_output.replace("would move", "moved"), real_output)
         self.assertEqual(list(index.iterdir()), [index / second.name])
-        self.assertEqual(list(folder.iterdir()), [])
+        self.assertEqual(list(folder.iterdir()), [folder / session_folder.RECORD])
         self.assertFalse((self.root / "unindexed").exists())
         self.assertFalse((self.root / session_move.JOURNAL).exists())
         self.assertTrue(first.is_dir())
@@ -300,8 +299,8 @@ class SessionMoveTests(unittest.TestCase):
     def test_source_parent_mount_refuses_the_same_candidate_in_both_modes(self) -> None:
         refused = self.leaf("a-mounted")
         movable = self.leaf("b-movable", shared=True)
-        folder = self.index(refused.name, "demo")
-        _ = self.index(movable.name, folder.name)
+        _ = self.index(refused.name, "refused")
+        folder = self.index(movable.name, "movable")
         target = folder / self.claude / self.project
 
         with self.other_mount(refused.parent):
@@ -500,18 +499,21 @@ class SessionMoveTests(unittest.TestCase):
             self.skipTest("Linux bind mounts require unshare and mount")
         code = """
 import sys
+from types import SimpleNamespace
 from unittest import mock
 from scripts.lib import session_move
+from scripts.lint import tmp_sweep
 from scripts.message import session_records
 from scripts.production import staff
 with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
-      mock.patch.object(session_records, "read_registry", return_value=session_records.RegistryRead((), ()))):
+      mock.patch.object(session_records, "read_registry", return_value=session_records.RegistryRead((), ())),
+      mock.patch.object(tmp_sweep.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=sys.argv[1]))):
     sys.exit(session_move.main([]))
 """
         result = subprocess.run(
             [unshare, "--map-root-user", "--mount", "--propagation", "private",
              shell, "-c", '"$1" --bind "$2" "$3" && shift 3 && exec "$@"', "bind-fixture",
-             mount, str(source), str(mount_point), sys.executable, "-c", code],
+             mount, str(source), str(mount_point), sys.executable, "-c", code, str(Path.home())],
             capture_output=True, text=True,
             check=False, timeout=TEST_HANG_GUARD_SECS,
         )

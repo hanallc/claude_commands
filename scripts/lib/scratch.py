@@ -101,7 +101,7 @@ from functools import cached_property
 from importlib import import_module
 from pathlib import Path, PurePath
 from threading import get_ident
-from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
+from typing import Literal, NotRequired, Protocol, TypedDict, cast
 from urllib.parse import unquote_to_bytes
 
 from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder, time_limit  # noqa: E402
@@ -117,8 +117,7 @@ from scripts.lib.build_folders import (  # noqa: E402
 )
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
-if TYPE_CHECKING:
-    from scripts.disks import measure
+from scripts.lib import proc_text
 
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
 HOLDS_ENV = "SCRATCH_HOLDS"
@@ -210,8 +209,10 @@ def atomic_record(path: Path, fields: object, *, sync: bool = False) -> None:
         sync_folder(path.parent)
 
 
-def write_scratch_text(path: Path, staging: Path, text: str) -> None:
-    with coordinate_removals(wait_for_hold_lock=False) as removal:
+def write_scratch_text(path: Path, staging: Path, text: str, *, owner_task: str | None = None,
+                       scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    with coordinate_removals(wait_for_hold_lock=False, ending_task=owner_task,
+                             scratch_settings=scratch_settings) as removal:
         temporary = staging / f".{path.name}.{secrets.token_hex(8)}"
         removal.check_paths((path, temporary))
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -225,7 +226,8 @@ def write_scratch_text(path: Path, staging: Path, text: str) -> None:
             delete_entry(temporary, RemovalKind.FILE, missing_ok=True)
 
 
-def exclude_copy_metadata(path: Path, *, additional: tuple[str, ...] = ()) -> None:
+def exclude_copy_metadata(path: Path, *, additional: tuple[str, ...] = (),
+                          scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
     """Exclude generated copy metadata from untracked files in Git status."""
     if not (path / ".git").is_dir() or (path / ".git").is_symlink():
         return
@@ -238,7 +240,10 @@ def exclude_copy_metadata(path: Path, *, additional: tuple[str, ...] = ()) -> No
     patterns = [f"/{name}" for name in (copy_record.RECORD, BUSY, *additional) if f"/{name}" not in text.splitlines()]
     if patterns:
         separator = "\n" if text and not text.endswith("\n") else ""
-        write_scratch_text(exclude, exclude.parent, text + separator + "\n".join(patterns) + "\n")
+        record = task_of(path, scratch_settings=scratch_settings)
+        owner = record.task if isinstance(record, copy_record.Registered) else None
+        write_scratch_text(exclude, exclude.parent, text + separator + "\n".join(patterns) + "\n",
+                           owner_task=owner, scratch_settings=scratch_settings)
 
 
 def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, source_commit: str,
@@ -352,7 +357,7 @@ def copy_lock(path: Path, *,
             if isinstance(pending, copy_record.Registered):
                 raise ScratchError(f"{folder}: removal has already started; finish cleanup first")
             require_no_removal_mark(folder.resolve().parent)
-            exclude_copy_metadata(folder)
+            exclude_copy_metadata(folder, scratch_settings=scratch_settings)
         yield
     finally:
         os.close(lock)
@@ -587,7 +592,7 @@ def update_record(path: Path, change: Callable[[copy_record.Registered | copy_re
         with coordinate_removals(scratch_settings=scratch_settings, wait_for_hold_lock=False,
                                  ending_task=ending_task if ending_task is not None else owner):
             if registered_copy and not removal:
-                exclude_copy_metadata(path)
+                exclude_copy_metadata(path, scratch_settings=scratch_settings)
             atomic_record(destination, fields)
         return copy_record.Registered(task, fields)
 
@@ -626,7 +631,7 @@ class FilesystemLocation:
     path: PurePath
 
     @classmethod
-    def at(cls, path: Path, mounts: Sequence[measure.Mount]) -> FilesystemLocation:
+    def at(cls, path: Path, mounts: Sequence[proc_text.Mount]) -> FilesystemLocation:
         mount = next((mount for mount in mounts if path.is_relative_to(mount.point)), None)
         if mount is None:
             raise ScratchHoldsUnreadable(f"cannot identify the mount for {path}")
@@ -637,7 +642,7 @@ class FilesystemLocation:
             self.path.is_relative_to(other.path) or other.path.is_relative_to(self.path))
 
 
-def visible_mounts(mounts: Sequence[measure.Mount]) -> tuple[measure.Mount, ...]:
+def visible_mounts(mounts: Sequence[proc_text.Mount]) -> tuple[proc_text.Mount, ...]:
     """Select the deepest mount first. The last mount at a point is visible."""
     return tuple(sorted(reversed(mounts), key=lambda mount: len(mount.point.parts), reverse=True))
 
@@ -648,7 +653,7 @@ class MountAliases:
     paths: tuple[Path, ...]
 
     @classmethod
-    def of(cls, source: Path, mounts: Sequence[measure.Mount]) -> MountAliases:
+    def of(cls, source: Path, mounts: Sequence[proc_text.Mount]) -> MountAliases:
         if sys.platform != "linux":
             return cls(source, (source,))
         location = FilesystemLocation.at(source, mounts)
@@ -679,7 +684,7 @@ class HeldScratchFolders:
     held: frozenset[tuple[int, int]]
     containers: frozenset[tuple[int, int]]
     locations: tuple[FilesystemLocation, ...]
-    mounts: tuple[measure.Mount, ...]
+    mounts: tuple[proc_text.Mount, ...]
 
     @staticmethod
     def identity(path: Path, *, follow_symlinks: bool = True) -> Collection[tuple[int, int]]:
@@ -693,7 +698,7 @@ class HeldScratchFolders:
 
     @classmethod
     def from_holds(cls, holds: Mapping[str, Hold], *, ending_task: str | None = None,
-                   mounts: Sequence[measure.Mount] | None = None, now: float | None = None) -> HeldScratchFolders:
+                   mounts: Sequence[proc_text.Mount] | None = None, now: float | None = None) -> HeldScratchFolders:
         moment = time.time() if now is None else now
         held: set[tuple[int, int]] = set()
         parents: set[Path] = set()
@@ -707,11 +712,9 @@ class HeldScratchFolders:
                 held.update(identities)
                 parents.update(path.parents)
                 paths.append(path)
-        visible: tuple[measure.Mount, ...] = ()
+        visible: tuple[proc_text.Mount, ...] = ()
         if paths and sys.platform == "linux":
-            from scripts.disks import measure
-
-            entries = measure.read_mounts() if mounts is None else mounts
+            entries = proc_text.read_mounts() if mounts is None else mounts
             if not entries:
                 raise ScratchHoldsUnreadable("cannot read the mount table for scratch holds")
             visible = visible_mounts(entries)
@@ -797,12 +800,10 @@ class CoordinatedRemoval:
     ending_task: str | None
 
     @cached_property
-    def mount_views(self) -> tuple[measure.Mount, ...]:
+    def mount_views(self) -> tuple[proc_text.Mount, ...]:
         if self.folders.mounts or sys.platform != "linux":
             return self.folders.mounts
-        from scripts.disks import measure
-
-        return visible_mounts(measure.read_mounts())
+        return visible_mounts(proc_text.read_mounts())
 
     def aliases(self, path: Path) -> MountAliases:
         return MountAliases.of(path, self.mount_views)
@@ -823,19 +824,17 @@ class CoordinatedRemoval:
             raise RemovalRefused(HELD_FOLDER_REASON)
 
     @staticmethod
-    def check_tree(path: Path, *, mounts: Sequence[measure.Mount] | None = None) -> None:
+    def check_tree(path: Path, *, mounts: Sequence[proc_text.Mount] | None = None) -> None:
         """Refuse a tree with a mount point before removing any entry."""
         if not path.is_symlink() and path.is_dir():
             CoordinatedRemoval.check_mounts(resolved_removal_paths((path,)), mounts=mounts)
 
     @staticmethod
-    def check_mounts(paths: tuple[Path, ...], *, mounts: Sequence[measure.Mount] | None = None) -> None:
+    def check_mounts(paths: tuple[Path, ...], *, mounts: Sequence[proc_text.Mount] | None = None) -> None:
         if not paths:
             return
         if sys.platform == "linux":
-            from scripts.disks import measure
-
-            entries = measure.read_mounts() if mounts is None else mounts
+            entries = proc_text.read_mounts() if mounts is None else mounts
             if not entries:
                 raise MountRemovalRefused(f"{paths[0]}: cannot read the mount table")
             for mount in entries:
@@ -3291,9 +3290,11 @@ def remove(path: Path) -> None:
 
 
 def remove_marked(path: Path, *, source_deletion: SourceDeletion = SourceDeletion.STANDARD,
+                  ending_task: str | None = None,
                   scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
     """Remove one folder through the coordinator or report why the folder stays."""
-    result = remove_folder(path, source_deletion=source_deletion, scratch_settings=scratch_settings)
+    result = remove_folder(path, source_deletion=source_deletion, ending_task=ending_task,
+                           scratch_settings=scratch_settings)
     if isinstance(result, KeptFolder):
         raise ScratchError(f"{path}: kept: {result.reason}")
 

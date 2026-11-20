@@ -29,7 +29,7 @@ from typing import TextIO, cast, override
 from unittest import mock
 
 from scripts.lint import folder_audit, sweep, tmp_sweep
-from scripts.disks import measure
+from scripts.lib import proc_text
 from scripts.mac_test import nextest_log
 from scripts.direct import recorder_state, remove_run_scratch
 from scripts.copies.copies_test_support import copies_environment
@@ -42,6 +42,7 @@ from scripts.herdr import worker_panes
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.testing_folders import RUN_FOLDER_ENV
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 # The staff fixture creates an account folder when it loads.
@@ -411,7 +412,7 @@ class CopyTests(TmpSweepCase):
         entry = tmp_sweep.RemovableEntry(str(source), str(self.tmp), self.now, 0)
         parent = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY)
         self.addCleanup(os.close, parent)
-        with mock.patch.object(measure, "read_mounts", return_value=measure.read_mounts(table)):
+        with mock.patch.object(proc_text, "read_mounts", return_value=proc_text.read_mounts(table)):
             result = tmp_sweep.Sweep()
             self.assertFalse(tmp_sweep.remove_idle_entry(entry, result, False))
             with scratch.coordinate_removals() as removal:
@@ -437,7 +438,7 @@ class CopyTests(TmpSweepCase):
         entry = tmp_sweep.RemovableEntry(str(source), str(self.tmp), self.now, 0)
         result = tmp_sweep.Sweep()
         reason = f"tree contains a mount point at {mounted}"
-        with (mock.patch.object(measure, "read_mounts", return_value=measure.read_mounts(table)),
+        with (mock.patch.object(proc_text, "read_mounts", return_value=proc_text.read_mounts(table)),
               redirect_stdout(io.StringIO()) as log):
             self.assertFalse(tmp_sweep.remove_idle_entry(entry, result, False))
         self.assertEqual(log.getvalue().splitlines(), [f"tmp sweep: keep {source}: {reason}"])
@@ -2093,7 +2094,8 @@ class LogTests(TmpSweepCase):
         unlink = os.unlink
 
         def refuse_payload(path: str | Path, *, dir_fd: int | None = None) -> None:
-            if Path(path) == payload:
+            if Path(path) == payload or (dir_fd is not None and Path(path) == Path(payload.name)
+                                         and os.path.samestat(os.fstat(dir_fd), payload.parent.stat())):
                 raise PermissionError("private removal failed")
             unlink(path, dir_fd=dir_fd)
 
@@ -2435,6 +2437,7 @@ with copies.standing("verify-unit", source, copies.WorktreeSource("HEAD", source
 '''
         environment = {**os.environ, **copies_environment(self.tmp.parent / "fresh-settings"),
                        "SCRATCH_ROOT": str(self.tmp / "scratch"), "TMPDIR": str(self.tmp),
+                       RUN_FOLDER_ENV: str(self.tmp),
                        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup")}
         for cargo in (False, True):
             if cargo:

@@ -131,7 +131,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         repository = admission_records.RepositoryIdentity("fixture-repository", "claude_commands")
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(land_runs, "natemerge_land", return_value=result) as check,
-              mock.patch.object(step_estimator, "git_identity", return_value=(repository, "merge")),
+              mock.patch.object(step_estimator, "checkout_identity", return_value=(repository, "merge")),
               mock.patch.object(merge_gate, "start_gate_job", side_effect=start),
               mock.patch.object(merge_gate, "record_gate_run") as record):
             self.assertEqual(merge_gate.main(args), 0)
@@ -249,7 +249,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         repository = admission_records.RepositoryIdentity("fixture-repository", "claude_commands")
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(client.CLOCK, "now", side_effect=fixture.clock.now),
-              mock.patch.object(step_estimator, "git_identity", return_value=(repository, "merge")),
+              mock.patch.object(step_estimator, "checkout_identity", return_value=(repository, "merge")),
               mock.patch.object(client.WaitOutput, "__call__", new=observe),
               mock.patch.object(cloud_gate, "route", side_effect=route),
               mock.patch.object(merge_gate, "run_suites", side_effect=local)):
@@ -536,6 +536,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             busy = only_admitted(fixture.server.handle_request(fixture.request()))
             fixture.allow_next_start()
         fixture.free(0)
+        _ = fixture.run_pass()
         profiles: list[admission_records.ProgramProfile] = []
         identities: list[tuple[str, float, wire.Identity]] = []
         admit = client.admit
@@ -549,8 +550,10 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                 identities.append((request.episode, request.since, request.identity))
                 if len(profiles) == 1:
                     fixture.clock.advance(admission_policy_fixture().timing.estimate_refresh_seconds + 1)
+                    _ = fixture.run_pass()
                 else:
                     fixture.free(60 * admission_records.GIB)
+                    _ = fixture.run_pass()
             result = admit(request, held, refresh, _attempt=_attempt)
             profiles.append(cast(admission_records.ProgramProfile, request.profile))
             return result

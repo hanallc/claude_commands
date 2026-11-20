@@ -26,7 +26,7 @@ from scripts.build_queue import execution_identity
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import eligibility, nextest_log, offload, claim_state
-from scripts.build_queue import admission_client, admission_protocol as wire, placement, queue_snapshot
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_records, placement, queue_snapshot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_hold.owning_session import NoOwningSession
 if TYPE_CHECKING:
@@ -62,6 +62,7 @@ class GeneratedSourceTests(unittest.TestCase):
                 sessions = Path(session_temporary) / "sessions"
                 other_worker = sessions / "other-worker"
                 (other_worker / "proof").mkdir(parents=True)
+                session_folder.write_record(other_worker, {"owner": "offload-fixture", "session_id": "offload-fixture"})
                 sentinel = other_worker / "proof/source.txt"
                 _ = sentinel.write_text("another worker's source\n")
                 index = sessions / ".id"
@@ -1700,9 +1701,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                     self.assertEqual(outcome.status, 0, captured.getvalue())
                 with mock.patch.dict(os.environ, self.environment, clear=True):
                     offload.persist_attempt(request, offload.PassedOnMac(0), controller.attempt_evidence, time.monotonic())
-                rows = [cast(dict[str, object], json.loads(line))
-                        for path in (self.root / "buildlog").glob("*/*.jsonl")
-                        for line in path.read_text().splitlines()]
+                rows = admission_records.read_buildlog_records(self.root / "buildlog")
                 attempt = [row for row in rows if row.get("kind") == "ssh_attempt"
                            and row.get("call_id") == "byte-record"][-1]
                 transfers = cast(list[buildlog_sync.TransferBytes], attempt["transfers"])

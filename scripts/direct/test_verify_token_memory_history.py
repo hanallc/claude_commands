@@ -42,7 +42,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         board = self.root / "board"
         admission = caller_admission(self, self.root, self.environment)
         _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 0 kB\n")
-        process = self.start_memory_waiter({**self.environment, "UNIT_RUN_DIR": str(board),
+        process = self.start_memory_waiter({**self.environment, "UNIT_RUN_DIR": str(board), "BUILDLOG_SYNC": "1",
             "UNIT_TEAM_ROLE": "impl"}, self.root / "cancel.err")
         os.kill(process.pid, signal.SIGTERM)
         self.assertNotEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)

@@ -2168,7 +2168,7 @@ class AdmissionServer:
             row["legacy_name"] = profile.repository.legacy_name
         elif isinstance(profile, records.ProgramProfile):
             # The program profile records the tools path. Read the repository name from the checkout.
-            repository, _worktree = step_estimator.git_identity([profile.program], profile.worktree)
+            repository, _worktree = step_estimator.checkout_identity(profile.worktree, profile.worktree)
             if isinstance(repository, records.RepositoryIdentity):
                 row["repository_name"] = repository.name
         if isinstance(request, wire.AdmitRequest):
@@ -4107,7 +4107,8 @@ done
             if (attempt.assignment.episode == request.episode and isinstance(attempt.state, placement.ClosedAssignment)
                     and isinstance(attempt.retry, placement.RetryAt) and attempt.retry.deadline > self.clock.now()
                     and isinstance(report, placement.TerminalAttemptReport)
-                    and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                    and isinstance(report.outcome, (placement.PrelaunchRefused, placement.AttemptDeclined,
+                                                   execution_identity.HanaCommandAdmissionRefused))
                     and attempt.retry.deadline > report.received_at):
                 target = attempt.assignment.destination.target
                 delayed[target] = placement.ProviderRetryNotice(target, attempt.state.reason,

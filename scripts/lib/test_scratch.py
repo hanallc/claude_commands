@@ -22,13 +22,13 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, redirect_stdout, redirect_stderr
 from pathlib import Path
 from threading import Event, current_thread
-from typing import cast, override
+from typing import TextIO, cast, override
 from unittest import mock
 
 from scripts.accounts import accounts
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
-from scripts.disks import measure
+from scripts.lib import proc_text
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib import build_folders, cargo_output, copy_record, git_files, process_group, scratch, session_folder, time_limit
 from scripts.lint import folder_audit, sweep, tmp_sweep
@@ -2719,11 +2719,11 @@ print(scratch.target('gate:proof', 'tree', False))
         locked: list[tuple[int, int]] = []
         publish = scratch.atomic_record
 
-        def observed_flock(lock: int, mode: int) -> None:
+        def observed_flock(lock: int | TextIO, mode: int) -> None:
             if current_thread() is caller:
                 flock(lock, mode | fcntl.LOCK_NB)
                 return
-            held = os.fstat(lock)
+            held = os.fstat(lock if isinstance(lock, int) else lock.fileno())
             identity = (held.st_dev, held.st_ino)
             if identity == old_identity:
                 waiting.set()
@@ -2750,7 +2750,10 @@ print(scratch.target('gate:proof', 'tree', False))
                 replacement_identity = (replacement.st_dev, replacement.st_ino)
                 self.assertNotEqual(replacement_identity, old_identity)
                 flock(descriptor, fcntl.LOCK_UN)
-                self.assertTrue(publishing.wait(10), "writer did not reach record publication")
+                published = publishing.wait(10)
+                if not published and writing.done():
+                    writing.result()
+                self.assertTrue(published, "writer did not reach record publication")
                 try:
                     scratch.hand_over(path, "next-unit", "gate:next")
                     transferred = True
@@ -3334,7 +3337,7 @@ print(scratch.target('gate:proof', 'tree', False))
         descriptor.parent.mkdir(parents=True)
         descriptor.symlink_to(alias / source.name / note.name)
 
-        with (mock.patch.object(measure, "read_mounts", return_value=measure.read_mounts(table)),
+        with (mock.patch.object(proc_text, "read_mounts", return_value=proc_text.read_mounts(table)),
               mock.patch.object(tmp_sweep, "PROC_DIR", str(proc)),
               mock.patch.object(scratch, "rename_adoption", return_value=False),
               mock.patch.object(shutil, "copytree") as copy):

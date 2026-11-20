@@ -740,7 +740,7 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
                 token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *descriptors))
                 _ = locks.callback(COMMAND_LOCKS.reset, token)
                 initialize_git(path, source.resolve())
-                scratch.exclude_copy_metadata(path)
+                scratch.exclude_copy_metadata(path, scratch_settings=scratch_settings)
                 _ = git(path, "reset", "--hard", "--quiet")
                 register_scratch_clone(path, CloneSourceCommit(str(source.resolve()), commit_at(path, "HEAD")),
                                        scratch_settings=scratch_settings)
@@ -1030,15 +1030,15 @@ def rescue_workspace(tree: Path, record: copy_record.Registered) -> None:
 def end_workspaces(task: str, paths: list[Path], *,
                    run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK) -> None:
     """End workspace records and remove copies linked to terminal crates."""
-    holds = scratch.holds()
-    changed = False
     selected = {str(path.resolve()) for path in paths}
-    for path, hold in holds.items():
-        if path in selected and hold["task"] == task:
-            hold["ended"] = time.time()
-            changed = True
-    if changed:
-        scratch.write_holds(holds)
+    with scratch.locked_holds() as holds:
+        changed = False
+        for path, hold in holds.items():
+            if path in selected and hold["task"] == task:
+                hold["ended"] = time.time()
+                changed = True
+        if changed:
+            scratch.write_holds(holds)
     for tree in paths:
         record = scratch.task_of(tree)
         if (copy_record.copy_folder(tree) != tree.resolve()
@@ -1055,7 +1055,7 @@ def end_workspaces(task: str, paths: list[Path], *,
                     if not idle:
                         raise CopyError(f"{tree}: workspace is busy during task completion")
                     validate()
-                    scratch.remove_marked(tree)
+                    scratch.remove_marked(tree, ending_task=task)
             hold = scratch.holds().get(str(tree.resolve()))
             if hold is not None and hold["task"] == task:
                 _ = scratch.release(tree)
@@ -1077,7 +1077,7 @@ def end_workspaces(task: str, paths: list[Path], *,
                 _ = scratch.update_record(tree, ended)
             if "crate_run" not in record.fields:
                 continue
-            scratch.remove_marked(tree)
+            scratch.remove_marked(tree, ending_task=task)
         _ = scratch.release(tree)
 
 
@@ -2444,12 +2444,14 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
                     print(f"copies: publish: {error}", file=sys.stderr)
             target = checkout / os.environ.get("CARGO_TARGET_DIR", "target")
             before = publication_candidates(checkout, target, command, paths)
-            if args.verify_call_id:
-                from scripts.build_queue import admission_client
+            def record_start(pid: int) -> None:
+                if args.verify_call_id:
+                    from scripts.build_queue import admission_records
 
-                command = admission_client.verify_command_argv(args.verify_call_id, command)
+                    admission_records.record_started_verify_command(args.verify_call_id, pid)
+
             status = build_folders.run_build_command(command, path=checkout, environment=os.environ,
-                                                     pass_fds=COMMAND_LOCKS.get())
+                                                     pass_fds=COMMAND_LOCKS.get(), on_start=record_start)
             capture_step_files(output, paths, before)
             return status
     except build_slots.SlotsFull:

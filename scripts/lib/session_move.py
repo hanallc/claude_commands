@@ -17,7 +17,7 @@ from enum import Enum
 from pathlib import Path
 from typing import cast
 
-from scripts.disks import measure
+from scripts.lib import proc_text
 from scripts.lib import conf, copy_record, scratch, session_folder, transcripts
 from scripts.lib.scratch import mount_identity
 from scripts.lint import tmp_sweep
@@ -520,7 +520,7 @@ def tree_entries(fd: int, mount: int, relative: Path = TREE_ROOT) -> Iterator[tu
             yield path, fd, info, kind
 
 
-def check_source_mounts(root: Path, mounts: Sequence[measure.Mount]) -> None:
+def check_source_mounts(root: Path, mounts: Sequence[proc_text.Mount]) -> None:
     for mount in mounts:
         if mount.point == root or mount.point.is_relative_to(root):
             raise MoveRefused(f"{mount.point}: entry is on another mount")
@@ -1096,7 +1096,7 @@ class ValidatedCopy:
 
 
 def validate_copy(leaf: ScratchpadLeaf, roots: MoveRoots, root_fd: int, names: DestinationNames,
-                  destinations: set[Path], mounts: Sequence[measure.Mount], uses: SourceProcessUses) -> ValidatedCopy:
+                  destinations: set[Path], mounts: Sequence[proc_text.Mount], uses: SourceProcessUses) -> ValidatedCopy:
     if leaf.source.is_relative_to(roots.sessions):
         raise MoveRefused("source is inside the destination root")
     check_source_idle(leaf.source, names.registry, lambda: uses)
@@ -1136,7 +1136,7 @@ def start_copy(validated: ValidatedCopy, names: DestinationNames,
 
 
 def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, holds: dict[str, scratch.Hold],
-                    mounts: Sequence[measure.Mount], summary: MoveSummary, *, dry_run: bool) -> None:
+                    mounts: Sequence[proc_text.Mount], summary: MoveSummary, *, dry_run: bool) -> None:
     session_pids = frozenset(row["pid"] for row in names.live.values())
     entries = tuple(scratchpad_leaves(roots))
     sources = {entry.source for entry in entries if isinstance(entry, ScratchpadLeaf)}
@@ -1226,7 +1226,7 @@ def moves(roots: MoveRoots, summary: MoveSummary, *, dry_run: bool) -> None:
         holds = {name: hold for name, hold in removal.holds.items() if hold["ended"] == 0}
         move_candidates(
             roots, root, DestinationNames(roots.sessions), holds,
-            measure.read_mounts(), summary, dry_run=dry_run,
+            proc_text.read_mounts(), summary, dry_run=dry_run,
         )
 
 

@@ -530,25 +530,38 @@ if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final && " ${VERIFY_QUERY_ARGS[*]} " == *" 
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
     exec "$PY" "$VERIFY_START_DIR/final_pass.py" query "$VERIFY_START_DIR/verify.sh" "$SAVED_TREE"
 fi
+CMD="${VERIFY_QUERY_ARGS[0]:-}"
+case "$CMD" in
+    check|test|lint|doc|build|example|final|example-test) ;;
+    *) usage; exit 2 ;;
+esac
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
 source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
 build_override_refusal "${BASH_SOURCE[0]}" direct/verify.sh || exit 2
-launch_verify_wait_recorder() {
-    (
-        local log
-        if [[ -n "${UNIT_DETACHED_RECORD:-}" ]]; then
-            log="${UNIT_DETACHED_RECORD%.json}.log"
-        else
-            local root="${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/verify-runs"
-            mkdir -p -- "$root" || exit 0
-            log="$root/${VERIFY_PLACEMENT_CALL_ID:-$BUILDLOG_CALL_ID}.log"
+run_verify_wait_recorder() {
+    local descriptor entry log
+    # The recorder can outlive the build. Release its inherited leases first.
+    for entry in /proc/self/fd/[0-9]*; do
+        descriptor=${entry##*/}
+        if [[ "$descriptor" =~ ^[0-9]+$ ]] && (( descriptor > 2 )); then
+            exec {descriptor}>&-
         fi
-        exec >>"$log" 2>&1 <"$log"
-        exec "$VERIFY_START_DIR/../lib/py" -c '
+    done
+    if [[ -n "${UNIT_DETACHED_RECORD:-}" ]]; then
+        log="${UNIT_DETACHED_RECORD%.json}.log"
+    else
+        local root="${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/verify-runs"
+        mkdir -p -- "$root" || exit 0
+        log="$root/${VERIFY_PLACEMENT_CALL_ID:-$BUILDLOG_CALL_ID}.log"
+    fi
+    exec >>"$log" 2>&1 <"$log"
+    exec "$VERIFY_START_DIR/../lib/py" -c '
+import os
 import subprocess
 import sys
 
+os.closerange(3, os.sysconf("SC_OPEN_MAX"))
 try:
     subprocess.run([sys.executable, *sys.argv[1:]], timeout=10, check=False)
 except subprocess.TimeoutExpired:
@@ -556,7 +569,15 @@ except subprocess.TimeoutExpired:
 except OSError as error:
     print(f"verify.sh: cannot start wait recorder: {error}", file=sys.stderr)
 ' "$VERIFY_START_DIR/../build_queue/admission_client.py" "$@"
-    ) </dev/null >/dev/null 2>&1 9>&- 70>&- 71<&- 72>&- 73<&- &
+}
+
+launch_verify_wait_recorder() {
+    [[ -f "$VERIFY_START_DIR/../build_queue/admission_client.py" ]] || return 0
+    if [[ "${BUILDLOG_SYNC:-0}" == 1 ]]; then
+        (run_verify_wait_recorder "$@") </dev/null >/dev/null 2>&1 9>&- 70>&- 71<&- 72>&- 73<&- || :
+    else
+        run_verify_wait_recorder "$@" </dev/null >/dev/null 2>&1 9>&- 70>&- 71<&- 72>&- 73<&- &
+    fi
 }
 
 transition_verify_wait() {
@@ -1602,12 +1623,6 @@ if [[ "${1:-}" == "--session-dir" ]]; then
         export TMPDIR="$SESSION_TMPDIR"
     fi
 fi
-
-CMD="${1:-}"
-case "$CMD" in
-    check|test|lint|doc|build|example|final|example-test) ;;
-    *) usage; exit 2 ;;
-esac
 
 # A native worker's command dies with its turn, and a worker that waits on
 # one spends a model call per wait. So a worker's call detaches: detached_runs.py

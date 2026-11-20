@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import unittest
 from unittest import mock
 
+from scripts.build_queue import admission_records
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement
 from scripts.buildlog import repository, treekey
@@ -268,7 +269,7 @@ class SlotOrderTests(unittest.TestCase):
 
     def test_remote_adoption_replays_with_the_parent_owner_and_original_queue_time(self) -> None:
         arguments_file = self.root / "placement-arguments"
-        functions = shell_functions(CHECKOUT / "scripts/direct/verify.sh", "placement_once")
+        functions = shell_functions(CHECKOUT / "scripts/direct/verify.sh", "transition_verify_wait", "placement_once")
         script = functions + r'''
 set -eu
 verify_helper() {
@@ -657,8 +658,11 @@ placement_once
         leftover = snapshot.parent
         self.assertTrue(snapshot.is_dir())
         self.assertEqual(build_folders.build_folder_state(leftover), "held")
+        lease = cast(dict[str, object], json.loads(leftover.with_name(leftover.name + ".lease.json").read_text()))
+        self.assertEqual(lease["pid"], process.pid)
         process.kill()
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(build_folders.build_folder_state(leftover), "free")
         with build_folders.tool_folder("copies-source", parent=leftover.parent) as replacement:
             self.assertEqual(replacement, leftover)
             self.assertFalse(snapshot.exists())
@@ -1246,9 +1250,7 @@ placement_once
                         local = next(reply for reply in self.replies[first_reply:]
                                      if isinstance(reply, wire.LocalPlacementGranted))
                         self.assertEqual(local.assignment.source_key, execution_identity.SourceKeyKnown(local_key or ""))
-                        records = [cast(dict[str, object], json.loads(line))
-                                   for path in Path(environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
-                                   for line in path.read_text().splitlines()]
+                        records = list(admission_records.read_buildlog_records(Path(environment["BUILDLOG_DIR"])))
                         self.assertTrue(any(row.get("kind") == "step" and row.get("tree_key") == local_key
                                             for row in records), records)
                     else:

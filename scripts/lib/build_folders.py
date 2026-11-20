@@ -432,7 +432,7 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
         if stable and not name:
             raise ValueError("a stable build folder needs an owner name")
         spec = BuildFolderSpec(kind="legacy-stable" if stable else "legacy-unique", parent=_parent(request.parent),
-                               purpose=name, suffix_length=_settings().whole("names.suffix_length"))
+                               purpose=name, suffix_length=0 if stable else _settings().whole("names.suffix_length"))
         return spec
 
 
@@ -1039,7 +1039,7 @@ OWNER_MARKER = ".build-folder-owner.json"
 
 
 def run_build_command(command: Sequence[str], *, path: Path, environment: Mapping[str, str],
-                      pass_fds: Sequence[int]) -> int:
+                      pass_fds: Sequence[int], on_start: Callable[[int], None] | None = None) -> int:
     """Keep the caller until the command and its descendants stop."""
     import subprocess
     from scripts.lib.descendants import adopt_descendants
@@ -1056,6 +1056,8 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
         child = subprocess.Popen(command, cwd=path, env=environment,
                                  pass_fds=pass_fds, process_group=os.getpgrp())
     try:
+        if on_start is not None:
+            on_start(child.pid)
         status = child.wait()
     finally:
         try:

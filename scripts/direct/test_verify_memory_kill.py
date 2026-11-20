@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from typing import cast
 
+from scripts.build_queue import admission_records
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.memory_kill_test_support import (
@@ -73,7 +74,7 @@ class MemoryKillTests(unittest.TestCase):
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            files = list((root / "buildlog").glob("*/*.jsonl"))
+            files = list(admission_records.buildlog_record_paths(root / "buildlog"))
             self.assertEqual(len(files), 1)
             return cast(dict[str, object], json.loads(files[0].read_text().splitlines()[0]))
 

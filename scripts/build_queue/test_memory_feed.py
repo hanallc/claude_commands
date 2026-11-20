@@ -1894,7 +1894,8 @@ process.stdout.write(JSON.stringify({
         accepted = re.search(r'^case "\$CMD" in\n    ([\w|-]+)\) ;;', script.read_text(), re.MULTILINE)
         assert accepted is not None
         verbs = set(accepted[1].split("|"))
-        jobs = (("merge_gate.py",), ("merge_gate.py", "--tests-only"), ("merge_gate.py", "--nightly"),
+        jobs = (("merge_gate.py", "--tests-only"), ("merge_gate.py", "--tests-only", "--module", "test_sample"),
+                ("merge_gate.py", "--nightly"),
                 ("merge_gate.py", "--promote-only"), ("targeted_test.py",), ("targeted_test.py", "--module", "test_sample"))
         recorded_jobs: list[str] = []
         for command in jobs:
