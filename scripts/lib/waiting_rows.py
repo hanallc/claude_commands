@@ -149,27 +149,12 @@ class NoSettingsJsonSave:
     """No shared settings.json changes wait for publication."""
 
 
-class MacSettingsBaseline(TypedDict):
-    order: int
-    text: str
-    attempt_order: NotRequired[int]
-    unconfirmed: NotRequired[SettingsJsonEdits]
-
-
-@dataclass(frozen=True)
-class MacSettingsUntracked:
-    """The sender has no baseline for Mac settings delivery."""
-
-
 class SettingsJournalRecord(TypedDict):
     last_order: int
     accepted: NotRequired[dict[str, dict[str, AcceptedSaveRecord]]]
     register: NotRequired[dict[str, dict[str, AcceptedSaveRecord]]]
     changes: list[WaitingChangeRecord]
     settings_json: NotRequired[SettingsJsonSave]
-    settings_json_order: NotRequired[int]
-    mac_settings: NotRequired[MacSettingsBaseline]
-    received_settings_json: NotRequired[SettingsJsonEdits]
 
 
 @dataclass
@@ -182,21 +167,12 @@ class LockedJournal:
     changes: list[WaitingChange]
     migrating: bool = False
     settings_json: SettingsJsonSave | NoSettingsJsonSave = NoSettingsJsonSave()
-    settings_json_order: int = 0
-    mac_settings: MacSettingsBaseline | MacSettingsUntracked = MacSettingsUntracked()
-    received_settings_json: SettingsJsonEdits | None = None
 
     def save(self) -> None:
         record: dict[str, object] = {"last_order": self.last_order, "register": self.accepted,
                                      "changes": self.changes}
         if not isinstance(self.settings_json, NoSettingsJsonSave):
             record["settings_json"] = self.settings_json
-        if self.settings_json_order:
-            record["settings_json_order"] = self.settings_json_order
-        if self.received_settings_json is not None:
-            record["received_settings_json"] = self.received_settings_json
-        if not isinstance(self.mac_settings, MacSettingsUntracked):
-            record["mac_settings"] = self.mac_settings
         write_text_atomic(self.path, json.dumps(record, default=asdict, indent=2) + "\n", new_file_mode=0o600)
         self.migrating = False
 
@@ -263,10 +239,7 @@ def read_journal(path: Path) -> LockedJournal:
                            if (value := row.get("value")) is not None else AcceptedOrder(row["order"])
                            for key, row in keys.items()} for stem, keys in register.items()}
         return LockedJournal(path, record["last_order"], accepted, changes, migrating="register" not in record,
-                             settings_json=record.get("settings_json", NoSettingsJsonSave()),
-                             settings_json_order=record.get("settings_json_order", 0),
-                             mac_settings=record.get("mac_settings", MacSettingsUntracked()),
-                             received_settings_json=record.get("received_settings_json"))
+                             settings_json=record.get("settings_json", NoSettingsJsonSave()))
     except FileNotFoundError:
         return LockedJournal(path, 0, {}, [])
     except (ValueError, TypeError, KeyError) as error:
@@ -318,8 +291,8 @@ def show(checkout: Path, commit: str, path: str) -> str:
 
 
 def waiting_paths(checkout: Path) -> tuple[str, ...]:
-    """Include settings.json only for the live configuration checkout."""
-    if (checkout / "config").resolve() == conf.directory().resolve():
+    """Include settings.json for the live configuration checkout on natedev."""
+    if sys.platform != "darwin" and (checkout / "config").resolve() == conf.directory().resolve():
         return WAITING_CONFIG, SETTINGS_JSON
     return (WAITING_CONFIG,)
 
@@ -516,6 +489,13 @@ def replay_registry_rows(checkout: Path, base: str, local: str, target: str) -> 
     return _replay_registry(_registry_git_directory(checkout), base, local, target)
 
 
+def _settled_saves(checkout: Path, target: str, stem: str, saves: dict[str, AcceptedOrder],
+                   published: dict[str, int]) -> dict[str, int]:
+    return {key: order for key, save in saves.items() if isinstance(save, AcceptedSave)
+            and published_save(save, order := published.get(key, 0),
+                               tree_value(checkout, target, stem, key) if not (save.order or order) else None)}
+
+
 def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
          replace_registry: bool, published_registry: str | None) -> MovePlan:
     """Plan writes for paths that Git must leave in place."""
@@ -525,14 +505,18 @@ def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
     orders = published_orders(checkout, target)
     plan = MovePlan(source=move.head, target=target, before={}, after={})
     forced = {REGISTRY_PATH} if replace_registry or REGISTRY_PATH in changed else set[str]()
-    touched = (changed & set(waiting_files(checkout))) | managed.keys() | forced
+    changed_settings = changed - {SETTINGS_JSON}
+    if (checkout / "config").resolve() == conf.directory().resolve():
+        # A Save can arrive after preflight, even for a clean file.
+        old_orders = published_orders(checkout, move.head) if orders else {}
+        changed_settings.update(f"config/{stem}.conf" for stem, keys in orders.items() if keys != old_orders.get(stem))
+    else:
+        changed_settings.intersection_update(waiting_files(checkout))
+    touched = changed_settings | managed.keys() | forced
     for path in sorted(touched):
         stem, saves = Path(path).stem, managed.get(path, {})
-        published = orders.get(stem, {})
-        settled = {key: order for key, save in saves.items() if isinstance(save, AcceptedSave)
-                   and published_save(save, order := published.get(key, 0),
-                                      tree_value(checkout, target, stem, key) if not (save.order or order) else None)}
-        if path not in changed and not settled and path not in forced:
+        settled = _settled_saves(checkout, target, stem, saves, orders.get(stem, {}))
+        if path not in changed_settings and not settled and path not in forced:
             continue
         incoming = tree_text(checkout, target, path)
         head = tree_text(checkout, move.head, path)
@@ -735,6 +719,7 @@ def recover_move(checkout: Path, head: str) -> None:
                 _ = locks.enter_context(file_lock.exclusive(registry_writer_lock(registry_dir)))
             pending = locks.enter_context(locked_journal(journal_path()))
             saves = pending_files(checkout, pending)
+            target_orders: SaveOrders | None = None
             for path, after in restored.items():
                 current = live_text(checkout / path)
                 before = plan["before"][path]
@@ -743,18 +728,23 @@ def recover_move(checkout: Path, head: str) -> None:
                 if path == REGISTRY_PATH and registry_dir is not None and current is not None:
                     restored[path] = _replay_registry(registry_dir, before or "", current, after or "")
                     continue
-                if path == SETTINGS_JSON and current is not None:
-                    settings_save = pending.settings_json
-                    edits = settings_save["edits"] if isinstance(settings_save, dict) else pending.received_settings_json
-                    if edits is not None:
-                        staged = apply_settings_json_edits(before or "{}\n", edits)
-                        if not has_settings_json_edits(settings_json_edits(staged, current)):
-                            restored[path] = apply_settings_json_edits(after or "{}\n", edits)
-                            continue
+                if path == SETTINGS_JSON and current is not None and isinstance(saved := pending.settings_json, dict):
+                    edits = saved["edits"]
+                    staged = apply_settings_json_edits(before or "{}\n", edits)
+                    if not has_settings_json_edits(settings_json_edits(staged, current)):
+                        restored[path] = apply_settings_json_edits(after or "{}\n", edits)
+                        continue
                 keys = saves.get(path)
                 if not keys or current != apply_accepted_values(before or "", keys):
                     raise worktree_edit(path)
-                restored[path] = apply_accepted_values(after or "", keys)
+                if target_orders is None:
+                    target_orders = published_orders(checkout, head)
+                stem = Path(path).stem
+                settled = _settled_saves(checkout, head, stem, keys, target_orders.get(stem, {}))
+                waiting = {key: save for key, save in keys.items()
+                           if isinstance(save, AcceptedSave) and key not in settled}
+                if waiting:
+                    restored[path] = apply_accepted_values(after or "", waiting)
             write_files(checkout, restored)
     marker.unlink()
 
@@ -841,8 +831,16 @@ def rollback_move(checkout: Path, plan: MovePlan, writes: MoveWrites) -> None:
                     raise worktree_edit(path)
             elif path in (REGISTRY_PATH, SETTINGS_JSON) and path in plan["before"]:
                 continue
-            elif current_version != version and (path not in plan["before"]
-                                                 or live_text(checkout / path) != plan["before"][path]):
+            elif current_version != version:
+                if path in plan["before"]:
+                    before_text = plan["before"][path]
+                    current_text = live_text(checkout / path)
+                    if current_text == before_text:
+                        continue
+                    pending = read_journal(journal_path())
+                    keys = pending_files(checkout, pending).get(path)
+                    if keys and current_text == apply_accepted_values(before_text or "", keys):
+                        continue
                 raise worktree_edit(path)
 
         restored_index = write_index_tree(checkout, current, entries, trial) if entries else current

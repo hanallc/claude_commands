@@ -20,15 +20,15 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Literal, NamedTuple, cast
+from typing import Literal, NamedTuple
 
 from scripts.lib import conf, land_main, mac_wake, main_publish, main_push_lock, models_registry
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.main_push_lock import request_publication as request_publication
 from scripts.production import land_queue, land_runs
 from scripts.lib.waiting_rows import (
-    ORDER_PATH, SETTINGS_JSON, AcceptedSave, LockedJournal, MacSettingsBaseline, MacSettingsUntracked, NoSettingsJsonSave, SettingsJsonEdits, SettingsJsonSave,
-    WaitingChange as WaitingChange, apply_settings_json_edits, clean_settings_json, settings_json_edits, smudge_settings_json,
+    ORDER_PATH, SETTINGS_JSON, AcceptedSave, LockedJournal, NoSettingsJsonSave, SettingsJsonSave,
+    WaitingChange as WaitingChange, apply_settings_json_edits, clean_settings_json, settings_json_edits,
     append_setting, apply_accepted_values, apply_move, check_move, checkout_orders, git, has_settings_json_edits,
     journal_path as journal_path, live_text, locked_checkout, locked_journal, model_color_host, model_color_key, model_color_value,
     move_target, published_orders, read_journal, recover_abandoned_move, replace_value,
@@ -238,16 +238,8 @@ def _waiting_checkout() -> Path | None:
     return None
 
 
-def _waiting_mac_delivery() -> MacSettingsDelivery | NoSettingsJsonSave:
-    baseline = read_journal(journal_path()).mac_settings
-    if isinstance(baseline, dict) and (order := baseline.get("attempt_order")) is not None:
-        if (edits := baseline.get("unconfirmed")) is not None:
-            return MacSettingsDelivery(order, edits, apply_settings_json_edits(baseline["text"], edits))
-    return NoSettingsJsonSave()
-
-
 def publish_waiting() -> list[str]:
-    """Start the waiter if a settings or registry change needs delivery."""
+    """Start the waiter if a settings or registry change needs publication."""
     try:
         if _publication_pending():
             return [request_publication()]
@@ -257,8 +249,7 @@ def publish_waiting() -> list[str]:
 
 
 def _publication_pending() -> bool:
-    return (waiting_rows_for_main() or isinstance(_waiting_mac_delivery(), MacSettingsDelivery)
-            or models_registry.has_pending(models_registry.registry_path()))
+    return waiting_rows_for_main() or models_registry.has_pending(models_registry.registry_path())
 
 
 def waiting_rows_for_main() -> bool:
@@ -269,11 +260,8 @@ def waiting_rows_for_main() -> bool:
 
 def _publish_waiting(descriptor: int) -> int:
     """Wait for a gap in this process and publish the saved values."""
-    delivered = True
     try:
-        if isinstance(saved := _waiting_mac_delivery(), MacSettingsDelivery):
-            delivered = _write_settings_json_mac(saved).startswith("mac: live now")
-        if waiting_rows_for_main() or models_registry.has_pending(models_registry.registry_path()):
+        if _publication_pending():
             while True:
                 with land_queue.gap_lock() as gap:
                     if isinstance(gap, land_queue.SettingsGap) and land_runs.has_gap():
@@ -287,7 +275,7 @@ def _publish_waiting(descriptor: int) -> int:
         return 1
     finally:
         os.close(descriptor)
-    if delivered and _publication_pending():
+    if _publication_pending():
         _ = request_publication()
     return 0
 
@@ -309,14 +297,10 @@ def pull_mac(checkout: Path, label: str) -> str:
     if isinstance(outcome, main_publish.MacPulled):
         main_publish.clear_pull_only()
         return "mac: pulled"
-    return _queue_mac_pull(checkout, label, outcome.reason)
-
-
-def _queue_mac_pull(checkout: Path, label: str, reason: str) -> str:
-    main_publish.queue_pull_only(label, reason,
+    main_publish.queue_pull_only(label, outcome.reason,
                                  pulls=(main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), checkout),))
     _ = mac_wake.start()
-    return f"mac: queued ({reason}); it goes out as soon as the Mac answers"
+    return f"mac: queued ({outcome.reason}); it goes out as soon as the Mac answers"
 
 
 class MacWriteSuperseded(StrEnum):
@@ -344,126 +328,44 @@ def _settings_checkout() -> Path:
     return main_publish.checkout_of(conf.directory().parent / SETTINGS_JSON)
 
 
-def _accept_settings_json(checkout: Path, order: int, edits: SettingsJsonEdits) -> None:
+def _stage_settings_json(checkout: Path, message: str) -> bool:
+    """Record the approved shared edits to the local settings file."""
     recover_abandoned_move(checkout)
     path = checkout / SETTINGS_JSON
     while True:
-        snapshot = path.read_text(encoding="utf-8")
-        head = git(checkout, "rev-parse", "HEAD").strip()
-        baseline = tree_text(checkout, head, SETTINGS_JSON) or "{}\n"
-        shared = apply_settings_json_edits(clean_settings_json(checkout, snapshot), edits)
-        rendered = smudge_settings_json(checkout, shared)
-        with locked_journal(journal_path()) as pending:
-            if order < pending.settings_json_order:
-                return
-            if path.read_text(encoding="utf-8") != snapshot:
-                continue
-            pending.settings_json_order = order
-            pending.received_settings_json = settings_json_edits(baseline, shared, unconfirmed=edits)
-            pending.save()
-            if rendered != snapshot:
-                write_text_atomic(path, rendered)
-            return
-
-
-class MacSettingsDelivery(NamedTuple):
-    order: int
-    edits: SettingsJsonEdits
-    text: str
-
-
-def _write_settings_json_mac(saved: MacSettingsDelivery) -> str:
-    command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/live_settings.py" '
-               + shlex.join(["apply-json", str(saved.order), json.dumps(saved.edits)]))
-    done = main_publish.ssh(command, ssh_program=os.environ.get("ZONE_SSH") or "ssh",
-                            time_limit=main_publish.CommandTimeLimit(_seconds("mac_write_seconds")))
-    if isinstance(done, str) or done.returncode:
-        reason = done if isinstance(done, str) else main_publish.first_line(done)
-        return f"mac: not live yet ({reason}); the Mac pull brings it"
-    with locked_journal(journal_path()) as pending:
-        baseline = pending.mac_settings
-        if isinstance(baseline, dict) and baseline.get("attempt_order") == saved.order:
-            pending.mac_settings = {"order": saved.order, "text": saved.text}
-            pending.save()
-    return f"mac: live now: {SETTINGS_JSON}"
-
-
-def _stage_settings_json(checkout: Path, message: str, forwarded: str) -> MacSettingsDelivery | NoSettingsJsonSave:
-    recover_abandoned_move(checkout)
-    path = checkout / SETTINGS_JSON
-    incoming = cast(SettingsJsonEdits, json.loads(forwarded)) if forwarded else None
-    while True:
-        parent = git(checkout, "rev-parse", "HEAD").strip()
-        head = tree_text(checkout, parent, SETTINGS_JSON) or "{}\n"
+        head = tree_text(checkout, "HEAD", SETTINGS_JSON) or "{}\n"
         source = path.read_text(encoding="utf-8")
         shared = clean_settings_json(checkout, source)
-        if incoming is not None:
-            shared = apply_settings_json_edits(shared, incoming)
-            rendered = smudge_settings_json(checkout, shared)
-        else:
-            rendered = source
         with locked_journal(journal_path()) as pending:
             if path.read_text(encoding="utf-8") != source:
                 continue
-            if rendered != source:
-                write_text_atomic(path, rendered)
-            return _record_settings_json(pending, message, head, shared)
-
-
-def _record_settings_json(pending: LockedJournal, message: str, head: str,
-                          shared: str) -> MacSettingsDelivery | NoSettingsJsonSave:
-    previous = pending.settings_json
-    retry = previous["edits"] if isinstance(previous, dict) else None
-    edits = settings_json_edits(head, shared, unconfirmed=retry)
-    baseline: MacSettingsBaseline | MacSettingsUntracked = pending.mac_settings
-    if isinstance(baseline, MacSettingsUntracked):
-        baseline = {"order": 0, "text": head}
-    mac_edits = settings_json_edits(baseline["text"], shared, unconfirmed=baseline.get("unconfirmed"))
-    waits = has_settings_json_edits(edits)
-    if not waits and not has_settings_json_edits(mac_edits) and isinstance(pending.settings_json, NoSettingsJsonSave):
-        return NoSettingsJsonSave()
-    pending.last_order += 1
-    saved: SettingsJsonSave = {"order": pending.last_order, "message": f"tune({SETTINGS_JSON}): {message}",
-                               "edits": edits}
-    pending.settings_json = saved if waits else NoSettingsJsonSave()
-    pending.mac_settings = {**baseline, "attempt_order": saved["order"], "unconfirmed": mac_edits}
-    pending.save()
-    return MacSettingsDelivery(saved["order"], mac_edits, shared)
-
-
-def _forward_settings_json(checkout: Path, message: str) -> int:
-    head = tree_text(checkout, "HEAD", SETTINGS_JSON) or "{}\n"
-    edits = settings_json_edits(head, clean_settings_json(checkout))
-    command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/live_settings.py" '
-               + shlex.join(["publish-json", "--message", message, "--forwarded", json.dumps(edits)]))
-    done = main_publish.ssh(command, ssh_program=os.environ.get("ZONE_SSH") or "ssh", host="natedev",
-                            time_limit=main_publish.CommandTimeLimit(_seconds("mac_write_seconds")))
-    if isinstance(done, str):
-        raise OSError(f"natedev: {done}")
-    print(done.stdout, end="")
-    print(done.stderr, end="", file=sys.stderr)
-    return done.returncode
+            previous = pending.settings_json
+            edits = settings_json_edits(head, shared, unconfirmed=previous["edits"] if isinstance(previous, dict) else None)
+            if not has_settings_json_edits(edits):
+                return False
+            pending.last_order += 1
+            saved: SettingsJsonSave = {"order": pending.last_order,
+                                       "message": f"tune({SETTINGS_JSON}): {message}", "edits": edits}
+            pending.settings_json = saved
+            pending.save()
+            return True
 
 
 class PublishSettingsJsonArgs(argparse.Namespace):
     message: str = ""
-    forwarded: str = ""
 
 
 def _publish_settings_json(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="live_settings.py publish-json")
     _ = parser.add_argument("--message", required=True)
-    _ = parser.add_argument("--forwarded", default="", help=argparse.SUPPRESS)
     args = parser.parse_args(arguments, namespace=PublishSettingsJsonArgs())
-    checkout = _settings_checkout()
     if platform.system() == "Darwin":
-        return _forward_settings_json(checkout, args.message)
-    saved = _stage_settings_json(checkout, args.message, args.forwarded)
-    if isinstance(saved, NoSettingsJsonSave):
+        raise ValueError("publish-json runs on natedev")
+    checkout = _settings_checkout()
+    if not _stage_settings_json(checkout, args.message):
         print(f"main: {SETTINGS_JSON} has no shared changes")
         return 0
     print(f"live now: {SETTINGS_JSON}")
-    print(_write_settings_json_mac(saved))
     for line in publish(checkout):
         print(line)
     return 0
@@ -494,9 +396,6 @@ def main(arguments: list[str] | None = None) -> int:
                 return _publish_waiting(int(descriptor))
             case ["publish-json", *options]:
                 return _publish_settings_json(options)
-            case ["apply-json", order, text]:
-                _accept_settings_json(_settings_checkout(), int(order), cast(SettingsJsonEdits, json.loads(text)))
-                return 0
             case _:
                 pass
     except (OSError, ValueError, main_publish.Refusal) as error:

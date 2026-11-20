@@ -27,3 +27,4 @@ Exit 1 means the Mac forwarding failed. An unchanged value can retry publication
 
 For an approved shared `settings.json` edit, apply it on natedev and run
 `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/live_settings.py" publish-json --message "<approved reason>"`.
+The Mac receives shared JSON changes on its next pull.

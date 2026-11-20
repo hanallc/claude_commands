@@ -714,7 +714,8 @@ Ask natemerge for a gap before you push a hand commit to main during a land.
 
 For an approved edit to the live `settings.json` on natedev, use
 `~/.claude/scripts/lib/py ~/.claude/scripts/lib/live_settings.py publish-json --message "<approved reason>"`.
-The command records the shared edits and sends them to the Mac before it requests publication.
+The command records the shared edits and requests publication.
+The Mac receives the shared edits through its usual pull.
 The Git filter keeps machine settings local.
 
 ### Queued checkpoint batches

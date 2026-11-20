@@ -121,6 +121,7 @@ class TuneTests(PublicationTestCase):
                 self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
             self.assertEqual(repo.head(), base)
 
+    @unittest.skipIf(sys.platform == "darwin", "publish-json runs on natedev")
     def test_settings_json_is_live_before_its_commit_and_uses_the_same_gap(self) -> None:
         repo = self.repository
         settings = repo.checkout / "settings.json"
@@ -133,11 +134,12 @@ class TuneTests(PublicationTestCase):
         with mock.patch.dict(os.environ, repo.env, clear=True):
             with land_runs.landing([base]), redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(live_settings.main(["publish-json", "--message", "Approved window"]), 0)
-            self.assertIn("mac: live now: settings.json", output.getvalue())
-            self.assertIn("main: waits for the land that runs now", output.getvalue())
-            self.assertEqual(repo.head(), base)
-            self.assertEqual(repo.remote_tip(), base)
-            self.assertIn("308800", settings.read_text())
+                self.assertIn("live now: settings.json", output.getvalue())
+                self.assertFalse(repo.ssh_log.exists())
+                self.assertIn("main: waits for the land that runs now", output.getvalue())
+                self.assertEqual(repo.head(), base)
+                self.assertEqual(repo.remote_tip(), base)
+                self.assertIn("308800", settings.read_text())
             repo.finish_waiter()
             self.assertEqual(land_queue.listing(), "the land line is empty")
         self.assertIn("308800", repo.git(repo.origin, "show", "main:settings.json"))
@@ -154,6 +156,7 @@ class TuneTests(PublicationTestCase):
         _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
         return settings
 
+    @unittest.skipIf(sys.platform == "darwin", "publish-json runs on natedev")
     def test_waiting_json_keeps_a_landed_sibling_path(self) -> None:
         repo = self.repository
         settings = self.seed_settings('{"permissions": {"allow": [], "deny": []}}\n')
@@ -560,6 +563,7 @@ class TuneTests(PublicationTestCase):
             repo.finish_waiter()
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
 
+    @unittest.skipIf(sys.platform == "darwin", "publish-json runs on natedev")
     def test_settings_publish_paths_leave_the_live_land_line_unchanged(self) -> None:
         repo = self.repository
 
@@ -631,72 +635,6 @@ class TuneTests(PublicationTestCase):
                                ("config/models.conf", "model=new"), ("settings.json", "308800")):
             with self.subTest(path=path):
                 self.assertIn(expected, repo.git(repo.origin, "show", f"main:{path}"), errors.getvalue())
-
-    def test_mac_delivery_retries_unacknowledged_json_fields(self) -> None:
-        repo = self.repository
-        settings = self.seed_settings('{"x": 1, "y": 1}\n')
-        offline = repo.root / "OFFLINE"
-        with mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()):
-            with land_runs.landing([repo.head()]):
-                offline.touch()
-                _ = settings.write_text('{"x": 2, "y": 1}\n')
-                self.assertEqual(live_settings.main(["publish-json", "--message", "Set x"]), 0)
-                offline.unlink()
-                _ = settings.write_text('{"x": 2, "y": 2}\n')
-                self.assertEqual(live_settings.main(["publish-json", "--message", "Set y"]), 0)
-            repo.finish_waiter()
-        deliveries = [shlex.split(line)[-1] for line in repo.ssh_log.read_text().splitlines() if "apply-json" in line]
-        edits = cast(waiting_rows.SettingsJsonEdits, json.loads(deliveries[-1]))
-        self.assertEqual(edits["values"], {"x": 2, "y": 2})
-
-    def test_notes_retry_a_reversal_without_a_new_main_commit(self) -> None:
-        repo = self.repository
-        settings = self.seed_settings('{"x": 1}\n')
-        base = repo.head()
-        offline = repo.root / "OFFLINE"
-        with mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()):
-            with land_runs.landing([base]):
-                _ = settings.write_text('{"x": 2}\n')
-                self.assertEqual(live_settings.main(["publish-json", "--message", "Set x"]), 0)
-                offline.touch()
-                _ = settings.write_text('{"x": 1}\n')
-                self.assertEqual(live_settings.main(["publish-json", "--message", "Restore x"]), 0)
-            repo.finish_waiter()
-            self.assertEqual(repo.remote_tip(), base)
-            offline.unlink()
-            self.assertIn("main: waits", "\n".join(live_settings.publish_waiting()))
-            repo.finish_waiter()
-            self.assertEqual(live_settings.publish_waiting(), [])
-        self.assertEqual(repo.remote_tip(), base)
-        deliveries = [shlex.split(line)[-1] for line in repo.ssh_log.read_text().splitlines() if "apply-json" in line]
-        edits = cast(waiting_rows.SettingsJsonEdits, json.loads(deliveries[-1]))
-        self.assertEqual(edits["values"], {"x": 1})
-
-    def test_mac_delivery_resends_reversed_fields_after_a_lost_reply(self) -> None:
-        repo = self.repository
-        initial = '{"permissions": {"allow": [], "deny": ["Write"]}}\n'
-        settings = self.seed_settings(initial)
-        mac_text = initial
-        deliveries = 0
-
-        def deliver(command: str, **options: object) -> subprocess.CompletedProcess[str]:
-            nonlocal mac_text, deliveries
-            edits = cast(waiting_rows.SettingsJsonEdits, json.loads(shlex.split(command)[-1]))
-            mac_text = waiting_rows.apply_settings_json_edits(mac_text, edits)
-            deliveries += 1
-            return subprocess.CompletedProcess([str(options["ssh_program"]), command],
-                                               255 if deliveries == 1 else 0, "", "lost reply")
-
-        with (mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()),
-              mock.patch.object(main_publish, "ssh", deliver), land_runs.landing([repo.head()])):
-            _ = settings.write_text(initial.replace('"allow": []', '"allow": ["Read"]'))
-            self.assertEqual(live_settings.main(["publish-json", "--message", "Allow Read"]), 0)
-            self.assertIn('"Read"', mac_text)
-            _ = settings.write_text(initial)
-            self.assertEqual(live_settings.main(["publish-json", "--message", "Restore allow"]), 0)
-        repo.finish_waiter()
-        self.assertEqual(deliveries, 2)
-        self.assertEqual(cast(object, json.loads(mac_text)), cast(object, json.loads(initial)))
 
     def test_a_refused_main_keeps_the_value_live_for_the_waiter(self) -> None:
         repo = self.repository

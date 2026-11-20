@@ -227,6 +227,34 @@ class WaitingRowsTests(unittest.TestCase):
         self.assertEqual((self.checkout / relative).read_text(),
                          SETTINGS.replace("amount=2", "amount=4").replace("limit=5", "limit=7"))
 
+    def test_a_pull_keeps_its_newer_value_if_an_older_save_arrives_after_preflight(self) -> None:
+        relative = "config/example.conf"
+        orders = {"example": {"amount": 2}, "statusline": {"account.claude1": 2}}
+        _ = (self.peer / waiting_rows.ORDER_PATH).write_text(json.dumps(orders) + "\n")
+        self.run_git(self.peer, "add", waiting_rows.ORDER_PATH)
+        target = self.peer_change(relative, "amount=2", "amount=5")
+        give = waiting_rows.give
+
+        def deliver_save(checkout: Path, rows: waiting_rows.WaitingRows,
+                         environment: dict[str, str] | None = None) -> None:
+            if environment is None:
+                with mock.patch.dict(os.environ, {"LIVE_SETTINGS_SAVE_ORDER": "1"}):
+                    self.assertEqual(live_settings.main(["example", "amount", "3"]), 0)
+                    self.assertEqual(live_settings.main(["statusline", "account.claude1", "#112233"]), 0)
+                self.assertIn("amount=3", (self.checkout / relative).read_text())
+                self.assertIn("#112233", (self.checkout / "config/statusline.conf").read_text())
+            give(checkout, rows, environment)
+
+        with mock.patch.object(waiting_rows, "give", deliver_save):
+            waiting_rows.move_to(self.checkout, target)
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
+        self.assertEqual((self.checkout / relative).read_text(), SETTINGS.replace("amount=2", "amount=5"))
+        self.assertEqual((self.checkout / "config/statusline.conf").read_text(), STATUSLINE)
+        with waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
+            self.assertEqual(pending.accepted["example"]["amount"], waiting_rows.AcceptedOrder(2))
+            self.assertEqual(pending.accepted["statusline"]["account.claude1"], waiting_rows.AcceptedOrder(2))
+
+    @unittest.skipIf(sys.platform == "darwin", "publish-json runs on natedev")
     def test_a_json_save_after_preflight_keeps_the_incoming_sibling(self) -> None:
         name = waiting_rows.SETTINGS_JSON
         live = self.checkout / name
@@ -240,8 +268,7 @@ class WaitingRowsTests(unittest.TestCase):
             rows = waiting_rows.check_move(self.checkout, waiting_rows.move_target(
                 self.checkout, target, fast_forward=True))
             _ = live.write_text('{"local": 2, "incoming": 1}\n')
-            with mock.patch.object(live_settings, "publish", return_value=[]), \
-                    mock.patch.object(main_publish, "ssh", return_value=subprocess.CompletedProcess([], 0)):
+            with mock.patch.object(live_settings, "publish", return_value=[]):
                 self.assertEqual(live_settings.main(["publish-json", "--message", "Set local"]), 0)
             waiting_rows.apply_move(self.checkout, rows)
         self.assertEqual(cast(object, json.loads(live.read_text())), {"local": 2, "incoming": 2})
@@ -431,14 +458,16 @@ class WaitingRowsTests(unittest.TestCase):
 
     def test_a_failed_ref_update_leaves_the_move_ready_to_retry(self) -> None:
         path = self.checkout / "config/example.conf"
-        target = self.peer_change("config/example.conf", "amount=2", "amount=3")
+        target = self.peer_change("config/example.conf", "limit=5", "limit=7")
         head = self.output("rev-parse", "HEAD").strip()
         git = waiting_rows.git
 
         def fail_ref(checkout: Path, *arguments: str, input_text: str | None = None,
                      environment: dict[str, str] | None = None) -> str:
             if arguments[0] == "update-ref":
-                self.assertEqual(path.read_text(), SETTINGS.replace("amount=2", "amount=3"))
+                self.assertEqual(path.read_text(), SETTINGS)
+                with mock.patch.dict(os.environ, {"LIVE_SETTINGS_SAVE_ORDER": "1"}):
+                    self.assertEqual(live_settings.main(["example", "amount", "3"]), 0)
                 raise OSError("fixture ref update failed")
             return git(checkout, *arguments, input_text=input_text, environment=environment)
 
@@ -446,10 +475,11 @@ class WaitingRowsTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "fixture ref update failed"):
                 waiting_rows.move_to(self.checkout, target, fast_forward=True)
         self.assertEqual(self.output("rev-parse", "HEAD").strip(), head)
-        self.assertEqual(path.read_text(), SETTINGS)
+        self.assertEqual(path.read_text(), SETTINGS.replace("amount=2", "amount=3"))
+        self.assertFalse(waiting_rows.move_marker(self.checkout).exists())
         waiting_rows.move_to(self.checkout, target, fast_forward=True)
         self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
-        self.assertEqual(path.read_text(), SETTINGS.replace("amount=2", "amount=3"))
+        self.assertEqual(path.read_text(), SETTINGS.replace("amount=2", "amount=3").replace("limit=5", "limit=7"))
 
     def test_a_stopped_move_recovers_the_settings_and_order_file_before_the_next_pull(self) -> None:
         relative = "config/example.conf"
@@ -461,7 +491,7 @@ class WaitingRowsTests(unittest.TestCase):
         stopped = self.stop_move(target, "read-tree")
         self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
         self.assertEqual(self.output("rev-parse", "HEAD").strip(), head)
-        self.assertEqual((self.checkout / relative).read_text(), first)
+        self.assertEqual((self.checkout / relative).read_text(), SETTINGS)
         self.assertIn(waiting_rows.ORDER_PATH, self.output("diff", "--cached", "--name-only"))
         self.peer_order("example", key, 2)
         second = SETTINGS.replace("amount=2", "amount=4")
