@@ -14,7 +14,7 @@ import math
 from scripts.lib.python_startup import sitecustomize as python_startup
 
 if TYPE_CHECKING:
-    from scripts.production.merge_gate import GateRun
+    from scripts.production.gate import GateRun
     from scripts.test_times import gate_record
 
 
@@ -225,9 +225,8 @@ GUEST_TRANSFERS = f'''import json, os, subprocess, tempfile, time
 from collections.abc import Mapping
 {inspect.getsource(signed_urls)}
 gate_record_filter = {GATE_RECORD_FILTER!r}
-transfer_retries = {BOX_CURL_RETRY!r} if (
-    gate_request.get('task') != 'paired' and gate_request.get('mode') in ('merge-gate', 'targeted-test')
-) else ()
+# The controller validates the suite mode before it sends the request.
+transfer_retries = {BOX_CURL_RETRY!r} if gate_request.get('task') != 'paired' and 'mode' in gate_request else ()
 ''' + r'''secret_file = root / 'transfer-secrets'
 try:
     descriptor = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -275,24 +274,26 @@ def busy_cpu_seconds():
     ticks = list(map(int, pathlib.Path('/proc/stat').read_text().splitlines()[0].split()[1:9]))
     return (sum(ticks) - ticks[3] - ticks[4] - ticks[7]) / os.sysconf('SC_CLK_TCK')
 def sample_memory():
+    global memory_peak
     try:
         fields = dict(line.split(':', 1) for line in pathlib.Path('/proc/meminfo').read_text().splitlines())
         used = (int(fields['MemTotal'].split()[0]) - int(fields['MemAvailable'].split()[0])) * 1024
-        result['memory_peak_bytes'] = max(result['memory_peak_bytes'] or 0, used)
+        memory_peak = max(memory_peak or 0, used)
     except (OSError, ValueError, KeyError):
         pass
 def monitor_memory(stop):
     while True:
         sample_memory()
         if stop.wait(2):
+            sample_memory()
             return
+memory_peak = None
 memory_stop = threading.Event()
 memory_thread = None
 cpu_started = None
 try:
     repo = root / 'repo'
     from scripts.production import merge_gate
-    from scripts.lib import cancellation
     timings = {}
     if 'module_seconds' in links:
         get('module_seconds', root / 'module_seconds.json')
@@ -303,7 +304,7 @@ try:
     result['vcpus'] = result['max_running_jobs']
     sample_memory()
     memory_thread = threading.Thread(target=monitor_memory, args=(memory_stop,), daemon=True)
-    cancellation.start_masked_thread(memory_thread)
+    memory_thread.start()
     stage('tests start')
     with log.open('w') as output, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         cpu_started = busy_cpu_seconds()
@@ -321,7 +322,7 @@ try:
                                         module_time_limit_s=links['module_time_limit_s'])
         if links.get('production'):
             result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
-                                                 result['gate_started_at'], time.time(), links['mode'])
+                                                 result['gate_started_at'], time.time(), merge_gate.SuiteMode.step(links['mode']))
             dirty = gate_request['dirty_paths']
             result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
                                     dirty_path_count=len(dirty))
@@ -358,8 +359,8 @@ finally:
         result['cpu_use_percent'] = 100 * result['busy_cpu_s'] / max(0.001, result['vcpus'] * result['gate_s'])
     if memory_thread is not None:
         memory_stop.set()
-        memory_thread.join()
-        sample_memory()
+        memory_thread.join(timeout=float(links.get('program_stop_seconds', 0)))
+    result['memory_peak_bytes'] = memory_peak
 '''
 
 
@@ -373,7 +374,10 @@ def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -
     }
     exec(GUEST_TRANSFERS, namespace)
     if request.get('task') == 'paired':
-        from scripts.production import merge_gate
+        if TYPE_CHECKING:
+            from scripts.production import gate as merge_gate
+        else:
+            from scripts.production import merge_gate
         from scripts.lib.descendants import adopt_descendants
         from scripts.lib.process_group import send_process_group
         namespace.update(
@@ -706,7 +710,7 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
     from scripts.test_times import gate_record
-    from scripts.production.merge_gate import GateRun, GateJobResult
+    from scripts.production.gate import GateRun, GateJobResult
     from dataclasses import asdict
     from typing import cast
     if not isinstance(run, GateRun):
@@ -739,7 +743,7 @@ def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
     from scripts.test_times import gate_record
     from scripts.aws_target.ledger import mapping, rows, text
-    from scripts.production.merge_gate import GateRun, GateJobResult, GateJobKind
+    from scripts.production.gate import GateRun, GateJobResult, GateJobKind
     import math
     from typing import cast
 
@@ -798,7 +802,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     from scripts.test_times import gate_record
     from datetime import UTC
     from scripts.buildlog import record, store
-    from scripts.production.merge_gate import GateRun
+    from scripts.production.gate import GateRun
     import os
     if not isinstance(value, GateRun):
         raise TypeError('expected a completed gate')
@@ -809,7 +813,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     return {'kind': 'gate_run', 'v': record.RECORD_VERSION, 'id': 'gate-' + attempt, 'host': host,
             'started_at': datetime.fromtimestamp(started, UTC).isoformat(),
             'ended_at': datetime.fromtimestamp(ended, UTC).isoformat(), 'wall_s': value.seconds,
-            'hold_wait_s': 0, 'selection': 'affected' if mode == 'targeted-test' else 'full',
+            'hold_wait_s': 0, 'selection': 'affected' if mode == 'test-affected' else 'full',
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',

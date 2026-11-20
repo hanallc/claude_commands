@@ -334,7 +334,7 @@ class CloudFinalizationTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             sidecar = fixture.root / "cloud.cgroup"
             _ = sidecar.write_text("")
-            request = replace(fixture.request(step="merge-gate"),
+            request = replace(fixture.request(step="gate"),
                 place=wire.CloudPlace("aws"), sidecar=str(sidecar))
             grant = only_admitted(fixture.server.handle_request(request))
             cloud_progress.publish(sidecar, cloud_progress.CloudProgress("running", 16, 0, fixture.clock.now()))
@@ -1079,14 +1079,14 @@ class FilteredPromiseTests(unittest.TestCase):
 
     def test_gate_history_remains_saved_without_entering_cargo_estimates(self) -> None:
         self.samples([3 * GIB] * 5, scope="full")
-        self.samples([20 * GIB] * 10, scope="full", step="merge-gate", indexed=False)
+        self.samples([20 * GIB] * 10, scope="full", step="gate", indexed=False)
         path = self.root / "admission/anon_peaks.jsonl"
         before = path.read_bytes()
         peak = step_estimator.expected_peak(HANA, "nextest", self.host, NOW, self.root,
                                   first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
         self.assertEqual(peak, admission_records.ExpectedPeak(3 * GIB, "measured", 5))
         self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(sum(row["step"] == "merge-gate" for row in step_estimator.anonymous_history_rows(path)), 10)
+        self.assertEqual(sum(row["step"] == "gate" for row in step_estimator.anonymous_history_rows(path)), 10)
 
     def promise(self, filters: tuple[str, ...] = ("native_rate",), *,
                 repository: admission_records.RepositoryIdentity = HANA, package: str = "hana",
@@ -2410,15 +2410,15 @@ class TestPhaseChargeTests(MemoryQueueFixture):
 class QueueLifetimeReaderTests(unittest.TestCase):
     def test_overlapping_gates_keep_sampled_unsampled_and_cancelled_lifetimes(self) -> None:
         with AdmissionFixture() as fixture:
-            first = fixture.request(step="merge-gate", need=2 * GIB, since=fixture.clock.now() - 10)
+            first = fixture.request(step="gate", need=2 * GIB, since=fixture.clock.now() - 10)
             first = replace(first, sidecar=str(fixture.scope(first.owner)))
             first_grant = only_admitted(fixture.server.handle_request(first))
             fixture.scoped_peak(first_grant, GIB)
             fixture.clock.advance(5)
-            second = fixture.request(step="merge-gate", need=3 * GIB, since=fixture.clock.now() - 3)
+            second = fixture.request(step="gate", need=3 * GIB, since=fixture.clock.now() - 3)
             second_grant = only_admitted(fixture.server.handle_request(second))
             fixture.free(0)
-            cancelled = fixture.request(step="merge-gate")
+            cancelled = fixture.request(step="gate")
             peer = fixture.connect(cancelled)
             self.assertIsInstance(peer.replies()[0], wire.Wait)
             fixture.clock.advance(4)
@@ -2433,7 +2433,7 @@ class QueueLifetimeReaderTests(unittest.TestCase):
             self.assertEqual(set(lifetimes), {first.owner.pid, second.owner.pid, cancelled.owner.pid})
             sampled, unsampled, left = (lifetimes[request.owner.pid] for request in (first, second, cancelled))
             self.assertEqual((sampled.start_time, sampled.since, sampled.step),
-                             (first.owner.start_time, first.since, "merge-gate"))
+                             (first.owner.start_time, first.since, "gate"))
             self.assertEqual((sampled.memory_wait_s, unsampled.memory_wait_s), (10, 3))
             self.assertEqual(len(sampled.intervals), 1)
             self.assertEqual(len(unsampled.intervals), 1)
@@ -3556,17 +3556,17 @@ class ProgramProfileTests(MemoryQueueFixture):
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
         self.assertFalse(history.exists())
         self.assertEqual(list(step_estimator.anonymous_history_rows(history)), [])
-        self.assertEqual(step_estimator.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB),
+        self.assertEqual(step_estimator.program_peak_estimate("gate", "host", NOW, self.root, 4 * GIB),
                          admission_records.FirstProgramPeak(4 * GIB))
 
     def test_unfinished_rows_do_not_change_the_program_estimate(self) -> None:
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
         _ = history.write_text(json.dumps({
-            "step": "merge-gate", "host": "host", "anon_peak_bytes": 3 * GIB,
+            "step": "gate", "host": "host", "anon_peak_bytes": 3 * GIB,
             "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
         }) + "\n")
         assert_unfinished_history_ignored(
-            self, history, lambda: step_estimator.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB))
+            self, history, lambda: step_estimator.program_peak_estimate("gate", "host", NOW, self.root, 4 * GIB))
 
     @override
     def setUp(self) -> None:
@@ -3579,8 +3579,8 @@ class ProgramProfileTests(MemoryQueueFixture):
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
         excluded = [
             {"step": "nextest", "host": "host", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
-            {"step": "merge-gate", "host": "other", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
-            {"step": "merge-gate", "host": "host", "anon_peak_bytes": 100 * GIB,
+            {"step": "gate", "host": "other", "anon_peak_bytes": 100 * GIB, "ended_at": store.utc_iso(HISTORY_AT.timestamp())},
+            {"step": "gate", "host": "host", "anon_peak_bytes": 100 * GIB,
              "ended_at": store.utc_iso((NOW - timedelta(days=step_estimator.HISTORY_DAYS + 1)).timestamp())},
         ]
         cases: list[tuple[tuple[int, ...], int]] = [
@@ -3591,42 +3591,42 @@ class ProgramProfileTests(MemoryQueueFixture):
         for peaks, expected in cases:
             with self.subTest(peaks=peaks):
                 self.assertEqual(step_estimator.percentile(list(reversed(peaks))), expected)
-                rows = [{"step": "merge-gate", "host": "host", "anon_peak_bytes": peak,
+                rows = [{"step": "gate", "host": "host", "anon_peak_bytes": peak,
                          "ended_at": store.utc_iso((NOW - timedelta(hours=1)).timestamp())}
                         for peak in peaks]
                 _ = history.write_text("".join(json.dumps(row) + "\n" for row in [*rows, *excluded]))
-                self.assertEqual(step_estimator.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB),
+                self.assertEqual(step_estimator.program_peak_estimate("gate", "host", NOW, self.root, 4 * GIB),
                                  admission_records.MeasuredProgramPeak(expected, len(peaks)))
 
     def test_expired_measured_gate_profile_retains_its_original_fallback_cap(self) -> None:
-        profile = admission_records.ProgramProfile("merge-gate", "installed/.claude", "checkout",
+        profile = admission_records.ProgramProfile("gate", "installed/.claude", "checkout",
             admission_records.HistoryPeakSizing(4 * GIB, admission_records.MeasuredProgramPeak(GIB, 1),
                 NOW_EPOCH - admission_policy_fixture().timing.estimate_refresh_seconds))
         with patch.object(step_estimator, "git_identity", side_effect=AssertionError("the program inferred a cargo identity")):
-            result = step_estimator.step_estimate(["merge-gate"], "launcher", profile, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
+            result = step_estimator.step_estimate(["gate"], "launcher", profile, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
         self.assertEqual(result.profile.peak, admission_records.ExpectedPeak(4 * GIB, "fallback", 0))
         assert isinstance(result.profile, admission_records.ProgramProfile)
         self.assertEqual(result.profile.sizing.estimate, admission_records.FirstProgramPeak(4 * GIB))
         self.assertEqual((result.profile.repo, result.profile.step, result.profile.worktree),
-                         ("installed/.claude", "merge-gate", "checkout"))
+                         ("installed/.claude", "gate", "checkout"))
 
     def test_expired_gate_profile_refreshes_outside_lock_without_cargo_inference(self) -> None:
-        profile = admission_records.ProgramProfile("merge-gate", "installed/.claude", "checkout",
+        profile = admission_records.ProgramProfile("gate", "installed/.claude", "checkout",
             admission_records.HistoryPeakSizing(4 * GIB, admission_records.FirstProgramPeak(4 * GIB),
                 NOW_EPOCH - admission_policy_fixture().timing.estimate_refresh_seconds))
         def estimate(program: str, host: str, now: datetime, root: Path, cap: int, *,
                      share_percent: int | progress.ConfiguredPeakShare) -> admission_records.MeasuredProgramPeak:
-            self.assertEqual((program, cap, now, root), ("merge-gate", 4 * GIB, NOW, self.root))
+            self.assertEqual((program, cap, now, root), ("gate", 4 * GIB, NOW, self.root))
             self.assertIs(share_percent, progress.CONFIGURED_PEAK_SHARE)
             self.assertTrue(host)
             return admission_records.MeasuredProgramPeak(6 * GIB, 2)
         with patch.object(step_estimator, "program_peak_estimate", side_effect=estimate) as refreshed, \
              patch.object(step_estimator, "git_identity", side_effect=AssertionError("the program inferred a cargo identity")), \
              patch.object(fcntl, "flock", side_effect=AssertionError("the estimate acquired an admission lock")):
-            result = step_estimator.step_estimate(["merge-gate"], "launcher", profile, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
+            result = step_estimator.step_estimate(["gate"], "launcher", profile, NOW, self.root, admission_policy_fixture(), first_peak_bytes=admission_configuration_fixture().program_first_peaks["cargo"])
         refreshed.assert_called_once()
         self.assertEqual((result.profile.repo, result.profile.step, result.profile.worktree, result.profile.peak.bytes),
-                         ("installed/.claude", "merge-gate", "checkout", 6 * GIB))
+                         ("installed/.claude", "gate", "checkout", 6 * GIB))
         self.assertEqual(result.profile.estimated_at, NOW_EPOCH)
 
 
@@ -3875,6 +3875,25 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         result = gate.queue_read_from(inputs, policy=admission_policy_fixture())
         self.assertEqual(result.explanation.totals.measured, 2 * GIB)
         self.assertEqual(result.explanation.totals.charged, 2 * GIB)
+
+    def test_nested_gate_scope_keeps_a_dead_owners_reservation(self) -> None:
+        path = self.running(100, 1)
+        row = gate.read_reservation(path)
+        sidecar = self.root / "gate.cgroup"
+        scope = self.builds / "builds-gatefixture.slice"
+        module = scope / "module.scope"
+        module.mkdir(parents=True)
+        _ = sidecar.write_text(str(scope) + "\n")
+        row["sidecar"] = str(sidecar)
+        _ = (scope / "cgroup.procs").write_text("")
+        _ = (module / "cgroup.procs").write_text("101\n")
+        events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\nfrozen 0\n")
+        self.assertEqual(gate.reservation_lifetime(row, False), gate.PopulatedStepScope(scope))
+        events.unlink()
+        self.assertEqual(gate.reservation_lifetime(row, False), gate.PopulatedStepScope(scope))
+        _ = (module / "cgroup.procs").write_text("")
+        self.assertEqual(gate.reservation_lifetime(row, False), gate.EndedStep())
 
     def test_scope_counter_disappearing_uses_owner_lifetime(self) -> None:
         reservation = self.running(100, 12)
@@ -4341,7 +4360,7 @@ class QueueApiTests(MemoryQueueFixture):
 
     def test_waiter_identity_reads_the_unit_override_without_changing_the_session(self) -> None:
         with patch.dict(os.environ, {admission_records.BUILDLOG_UNIT: "queue-unit", "CODEX_THREAD_ID": "showrunner"}):
-            identity = admission_records.waiter_identity("merge-gate", "tree")
+            identity = admission_records.waiter_identity("gate", "tree")
             self.assertEqual(identity.get("unit"), "queue-unit")
             self.assertEqual(identity["session_id"], "showrunner")
             self.assertEqual(gate.waiter_unit_name(identity, 123), "queue-unit")
@@ -4547,7 +4566,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
         self.assertEqual(gate.reservation_profile_key(first, "host"), gate.reservation_profile_key(second, "host"))
 
     def test_a_late_merge_gate_profile_lowers_only_the_remaining_keep_aside(self) -> None:
-        row = self.reservation("merge-gate", need=4 * GIB)
+        row = self.reservation("gate", need=4 * GIB)
         reading = admission_records.MeasuredMemory(9 * GIB, swap_bytes=5 * GIB,
             anonymous=admission_records.AnonymousRunUse(GIB))
         adjusted = gate.progress_memory(row, reading, gate.AttributedStepUse(reading.anonymous, True),
@@ -4576,10 +4595,10 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 self.assertIn(f"build:1, {expected} done", gate.progress_text(reading))
 
     def test_gate_profiles_separate_types_and_share_test_only_copies(self) -> None:
-        first = self.reservation("merge-gate")
-        first["shape"] = gate.merge_gate_shape(["merge-gate"])
+        first = self.reservation("gate")
+        first["shape"] = gate.merge_gate_shape(["gate"])
         second: admission_records.Reservation = {**first, "worktree": "/another/gate"}
-        nightly: admission_records.Reservation = {**second, "shape": gate.merge_gate_shape(["merge-gate", "--type-dirs", "scripts"])}
+        nightly: admission_records.Reservation = {**second, "shape": gate.merge_gate_shape(["gate", "--type-dirs", "scripts"])}
 
         self.assertEqual(gate.reservation_profile_key(first, "host"),
                          gate.reservation_profile_key(second, "host"))
@@ -4785,7 +4804,7 @@ class ProcessRunUseTests(unittest.TestCase):
             _ = path.write_text(scope)
             sidecar = str(path)
         row: dict[str, object] = {
-            "pid": pid, "start_time": str(pid), "need": need, "repo": "test", "step": "merge-gate",
+            "pid": pid, "start_time": str(pid), "need": need, "repo": "test", "step": "gate",
             "worktree": "/tmp/fixture", "sidecar": sidecar,
             "admitted_at": store.utc_iso(self.fixture.clock.now() - 180),
             "test_threads": None, "call_id": None, "reservation_id": name,
@@ -5019,12 +5038,12 @@ class ProcessRunUseTests(unittest.TestCase):
     def test_merge_gate_context_holder_without_a_scope_gets_a_cap_value(self) -> None:
         from scripts.build_queue.queue_place import queue_place
 
-        self.fixture.configure(**{"program_first_peak_gib.merge-gate": 6})
+        self.fixture.configure(**{"program_first_peak_gib.gate": 6})
         pid = os.getpid()
         owner = self.fixture.fixture_owner(pid, str(pid))
         self.process(pid, parent=1, resident=4 * GIB, anonymous=2 * GIB, swap=GIB)
         with patch.object(admission_records, "process_start_time", return_value=owner.start_time), self.fixture.serving():
-            with queue_place("merge-gate", self.fixture.root):
+            with queue_place("gate", self.fixture.root):
                 with self.fixture.loop_turn():
                     _ = self.fixture.run_pass()
                     records = list(self.fixture.server.reservations.values())
@@ -5032,7 +5051,7 @@ class ProcessRunUseTests(unittest.TestCase):
                     record = records[0]
                     path, row = Path(record.path), service.reservation_row(record)
                     self.assertEqual(row["pid"], pid)
-                    self.assertEqual(row["step"], "merge-gate")
+                    self.assertEqual(row["step"], "gate")
                     self.assertEqual(Path(row["sidecar"]).read_text(), "")
                     reading = gate.reservation_memory(path, row,
                         datetime.fromtimestamp(self.fixture.clock.now(), UTC),

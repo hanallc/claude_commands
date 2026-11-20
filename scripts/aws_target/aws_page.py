@@ -24,6 +24,7 @@ from typing import Literal, NotRequired, TypedDict
 from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.build_steps import read_step_names
 from scripts.review_links import console_theme, page_frame, review_link
 
 PAGE_NAME = 'aws_prices.html'
@@ -323,7 +324,8 @@ def gate_time_price_table(comparisons: Sequence[run_cost.GateTimeComparison]) ->
                '32 vCPU break-even (USD/min)')
     rows = tuple((row.region, *cells(row.small), *cells(row.large), break_even(row))
                  for row in sorted(comparisons, key=lambda row: region_filter_key(row.region)))
-    return spot_table.Table('32-vCPU merge gate break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
+    gate = read_step_names().shown('gate')
+    return spot_table.Table(f'32-vCPU {gate} break-even', headers, frozenset((2, 3, 4, 6, 7, 8, 9)), rows, 'rows')
 
 
 def without_prices(table: spot_table.Table) -> spot_table.Table:
@@ -583,7 +585,7 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
     data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches(),
                      settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
-    comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
+    comparisons = run_cost.gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
     gate_time_data = {'table': gate_time_price, 'regions': regions}

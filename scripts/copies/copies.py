@@ -45,7 +45,7 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.build_slots import SlotQueuePosition, NewSlotQueuePosition, NEW_SLOT_QUEUE_POSITION
 from scripts.build_queue import first_step, slot_wait
-from scripts.lib.build_steps import StepJob, VerifyCommand, command_job, command_program, read_step_names, verify_command
+from scripts.lib.build_steps import MERGE_GATE_PROGRAMS, StepJob, VerifyCommand, command_job, command_program, read_step_names, verify_command
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
@@ -2238,7 +2238,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
     source = Path(args.repo or "").expanduser().resolve()
     with ExitStack() as scope:
         captured = ""
-        if command_program(command) == "merge_gate.py":
+        if command_program(command) in MERGE_GATE_PROGRAMS:
             tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge))
             environment = dict(os.environ)
             target = tree / "target"

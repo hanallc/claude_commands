@@ -55,7 +55,7 @@ from scripts.production import staff
 from scripts.buildlog import store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import GATE_PROGRAMS, gate_job_from_process
+from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
@@ -391,7 +391,7 @@ def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJ
     if isinstance(request.identity.job, StepJob):
         return request.identity.job
     step = request.profile.step
-    if isinstance(request.place, wire.LocalPlace) and isinstance(request.run, wire.RunIdentity) and step in GATE_PROGRAMS:
+    if isinstance(request.place, wire.LocalPlace) and isinstance(request.run, wire.RunIdentity):
         job = gate_job_from_process(step, proc / str(request.owner.pid), start_time=request.owner.start_time)
         if isinstance(job, StepJob):
             return job
@@ -2108,10 +2108,10 @@ class AdmissionServer:
                 continue
             sidecar = Path(row["sidecar"])
             counter = progress.read_counter(sidecar) if row["sidecar"] else progress.NoCounter()
-            if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "merge-gate":
+            if isinstance(counter, progress.NoCounter) and row["sidecar"] and row["step"] != "gate":
                 counter = self.progress_captures.log_counter(progress.progress_path(sidecar, "log"))
             if (isinstance(counter, progress.NoCounter) and isinstance(counter.token_wait, progress.NoTokenWait)
-                    and row["step"] != "merge-gate" and self.boot_id):
+                    and row["step"] != "gate" and self.boot_id):
                 pids = gate.process_tree({row["pid"]: row["start_time"]}, processes)
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
@@ -2736,7 +2736,7 @@ class AdmissionServer:
             stem = stem.with_name(stem.name + "0")
         if profile.step == "build":
             shape = build_shape(list(request.argv)).key
-        elif profile.step == "merge-gate":
+        elif profile.step in {"gate", "merge-gate"}:
             shape = gate.merge_gate_shape(request.argv)
         else:
             shape = ""
@@ -5046,6 +5046,7 @@ ADMISSION_CALLERS = {
     "invoke.sh": "lint/invoke.sh",
     "pre-tool-use-brp-launch-gate.sh": "hooks/pre-tool-use-brp-launch-gate.sh",
     "merge_gate.py": "production/merge_gate.py",
+    "gate.py": "production/gate.py",
     "targeted_test.py": "production/targeted_test.py",
     "admission_client.py": "build_queue/admission_client.py",
     "queue_place.py": "build_queue/queue_place.py",

@@ -126,7 +126,7 @@ class SpotTables:
     # The standard types, then the GPU types.
     prices: tuple[Table, ...]
     quotas: tuple[Table, ...]
-    # One entry for each scope in run_cost.SCOPES, in that order.
+    # One entry for each scope in run_cost.scopes(), in that order.
     runs: tuple[RunCosts, ...]
     hours: BilledHoursTable
     gpu_quota_needed: int
@@ -242,7 +242,7 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[
     max_gate_minutes = values.whole('max_gate_minutes')
     counts = ('type', *regions)
     scopes: list[RunCosts] = []
-    for scope in run_cost.SCOPES:
+    for scope in run_cost.scopes():
         pricing = run_cost.GateRunPricing.from_config(values, gate_pricing.evidence, home, scope.modes)
         explanation = (f'USD per {scope.noun}, last {days} days. The estimate uses the lowest deployed zone Spot price '
                        + 'and the median box time, including boot. It adds transfer charges outside the home region. '

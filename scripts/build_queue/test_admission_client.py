@@ -7,15 +7,18 @@ from dataclasses import replace
 import errno
 import io
 import json
+import math
 import os
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import time
 import threading
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -27,6 +30,7 @@ from scripts.message.session_send import session_send_argv
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.message.codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, isolated_staff_file
 from typing import cast
@@ -298,7 +302,7 @@ class ClientTests(unittest.TestCase):
     def test_cloud_admit_uses_the_private_service_and_releases_its_slot(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            request = replace(fixture.request(step="merge-gate"), place=wire.CloudPlace("aws"))
+            request = replace(fixture.request(step="gate"), place=wire.CloudPlace("aws"))
             with fixture.serving():
                 result = client.admit(request, lambda _wait: None, lambda: request)
                 assert isinstance(result, wire.Admitted)
@@ -308,7 +312,7 @@ class ClientTests(unittest.TestCase):
 
     def test_cloud_place_survives_client_reconnect_and_estimate_refresh(self) -> None:
         with AdmissionFixture() as fixture:
-            request = replace(fixture.request(step="merge-gate"), place=wire.CloudPlace("aws"))
+            request = replace(fixture.request(step="gate"), place=wire.CloudPlace("aws"))
             transport = self.use_transport(fixture,
                 Exchange(reply_bytes(EXPIRED), TimedChunk(0.1, b"")),
                 Exchange(reply_bytes(GRANTED)))
@@ -1054,14 +1058,14 @@ class ClientTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             original = fixture.request()
             checkout = str(fixture.root / "other-checkout")
-            profile = records.ProgramProfile("merge-gate", "repo", checkout, records.HistoryPeakSizing(6 * GIB, records.FirstProgramPeak(6 * GIB), fixture.clock.now()))
+            profile = records.ProgramProfile("gate", "repo", checkout, records.HistoryPeakSizing(6 * GIB, records.FirstProgramPeak(6 * GIB), fixture.clock.now()))
             with mock.patch.object(step_estimator, "git_identity", side_effect=AssertionError("program inferred cargo")), \
                  mock.patch.object(client, "CLOCK", fixture.clock):
                 request = client.step_request([], str(fixture.root), original.owner, original.since,
                                               "", original.episode, profile)
             self.assertEqual(request.identity.folder, checkout)
             self.assertEqual(request.profile, profile)
-            self.assertEqual(request.identity.step, "merge-gate")
+            self.assertEqual(request.identity.step, "gate")
             self.assertEqual(request.profile.peak, records.ExpectedPeak(6 * GIB, "fallback", 0))
 
     def test_failed_grant_file_write_releases_the_reservation_before_refusing(self) -> None:
@@ -1072,9 +1076,10 @@ class ClientTests(unittest.TestCase):
             _ = self.use_transport(fixture, Exchange(reply_bytes(GRANTED)), Exchange(reply_bytes(wire.Ok())))
             released: list[str] = []
             release = client.release
-            def observe_release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
+            def observe_release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                *, deadline: float = math.inf) -> wire.Ok | wire.Refused:
                 released.append(reservation)
-                return release(reservation, status, configuration)
+                return release(reservation, status, configuration, deadline=deadline)
             with mock.patch.object(client, "step_request", return_value=original), \
                  mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  mock.patch.object(client, "write_shell_grant", side_effect=OSError("grant disk failed")), \
@@ -1513,6 +1518,59 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(errors.getvalue().count("admission service not answering since"), 1)
                 self.assertNotIn("check failed", errors.getvalue())
                 self.doCleanups()
+
+    def test_release_stops_at_its_deadline_or_on_term(self) -> None:
+        program = """
+from scripts.build_queue import admission_client as client, admission_records as records
+configuration = records.read_memory_config()
+deadline = client.CLOCK.monotonic() + configuration.program_stop_seconds
+try:
+    client.release("fixture", 0, configuration, deadline=deadline)
+except client.ReleaseDeadlineExceeded as error:
+    print(error)
+else:
+    raise AssertionError("release succeeded without a reply")
+"""
+        checkout = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, config_environment(Path(directory))):
+            shell = ("from scripts.build_queue import queue_place; "
+                     + "raise SystemExit(queue_place.main(['release', 'fixture', '0']))")
+            for source, code in ((program, 0), (shell, 2)):
+                with self.subTest(shell=source == shell), short_socket_directory() as socket_directory, \
+                        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                    self.assert_release_stops(source, checkout, Path(socket_directory) / "s", listener,
+                                              terminate=False, deadline_status=code)
+            with short_socket_directory() as socket_directory, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                self.assert_release_stops(program, checkout, Path(socket_directory) / "s", listener, terminate=True)
+
+    def assert_release_stops(self, program: str, checkout: Path, path: Path, listener: socket.socket,
+                             *, terminate: bool, deadline_status: int = 0) -> None:
+        directory = os.environ["CONF_DIR"]
+        root = Path(directory)
+        write_memory_config(root / "build_admission.conf", program_stop_seconds="60" if terminate else "1")
+        listener.bind(str(path))
+        listener.listen()
+        listener.settimeout(TEST_HANG_GUARD_SECS)
+        environment = {**os.environ, "ADMISSION_SOCKET": str(path), "HOME": directory, "TMPDIR": directory}
+        with subprocess.Popen([sys.executable, "-c", program], cwd=checkout, env=environment,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+            try:
+                connection = listener.accept()[0]
+                with connection:
+                    connection.settimeout(TEST_HANG_GUARD_SECS)
+                    with connection.makefile("rb") as request_stream:
+                        request = wire.parse_request(request_stream.readline())
+                    self.assertIsInstance(request, wire.ReleaseRequest)
+                    if terminate:
+                        child.terminate()
+                    output, errors = child.communicate(timeout=5)
+                    self.assertEqual(child.returncode, -signal.SIGTERM if terminate else deadline_status, output + errors)
+                    if not terminate:
+                        self.assertIn("did not confirm release of reservation fixture", output + errors)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_standalone_release_succeeds_after_configuration_is_corrupted(self) -> None:
         with AdmissionFixture() as fixture:

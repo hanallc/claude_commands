@@ -7,6 +7,7 @@ except FileNotFoundError:
 
 import sys
 import json
+import math
 import shlex
 import subprocess
 import tomllib
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 from scripts.production import staff
 from scripts.production import unit_config as configuration
 from scripts.agents import remote
+from scripts.lib import operation_deadline
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr.pane_launch import without_staff_labels
@@ -375,9 +377,10 @@ def _read_facts(requests: list[tuple[str, str]]) -> dict[str, tuple[str, str]]:
         key = kind + ":" + path
         try:
             if kind == "git":
+                remaining = operation_deadline.remaining()
                 result = subprocess.run(
                     ["git", "--no-optional-locks", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
-                    capture_output=True, text=True, check=False,
+                    capture_output=True, text=True, check=False, timeout=remaining if math.isfinite(remaining) else None,
                 )
                 if result.returncode or not result.stdout.strip():
                     raise OSError(result.stderr.strip() or "git returned no branch")
@@ -386,7 +389,7 @@ def _read_facts(requests: list[tuple[str, str]]) -> dict[str, tuple[str, str]]:
                 facts[key] = ("value", Path(path).expanduser().read_text(encoding="utf-8"))
         except FileNotFoundError as error:
             facts[key] = ("missing", str(error))
-        except (OSError, UnicodeError) as error:
+        except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
             facts[key] = ("unavailable", str(error))
     return facts
 
