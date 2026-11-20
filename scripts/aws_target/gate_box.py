@@ -63,6 +63,8 @@ def validate_paired_result(row: dict[str, object], request: dict[str, object], i
 # The candidate supplies the supervisor for both tested trees.
 PAIRED_GUEST = r'''from pathlib import Path
 import math, signal, tempfile
+from scripts.production.merge_gate import process_memory_mib, test_module_environment
+
 
 def paired_trial():
     rows = []
@@ -374,15 +376,12 @@ def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -
     }
     exec(GUEST_TRANSFERS, namespace)
     if request.get('task') == 'paired':
-        from scripts.production import merge_gate
         from scripts.lib.descendants import adopt_descendants
         from scripts.lib.process_group import send_process_group
         namespace.update(
             timestamps={key: result[key] for key in ('nix_ready_at', 'user_data_started_at',
                        'kernel_boot_at', 'instance_running_at') if key in result},
-            adopt_descendants=adopt_descendants, send_process_group=send_process_group,
-            test_module_environment=merge_gate.test_module_environment,
-            process_memory_mib=merge_gate.process_memory_mib)
+            adopt_descendants=adopt_descendants, send_process_group=send_process_group)
         exec('import json, os, subprocess, sys, time, traceback\n' + PAIRED_GUEST, namespace)
         return
     exec(CANDIDATE_GUEST, namespace)
@@ -707,7 +706,7 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
     from scripts.test_times import gate_record
-    from scripts.production.merge_gate import GateRun, GateJobResult
+    from scripts.production.gate_routes import GateRun, GateJobResult
     from dataclasses import asdict
     from typing import cast
     if not isinstance(run, GateRun):
@@ -740,7 +739,7 @@ def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
     from scripts.test_times import gate_record
     from scripts.aws_target.ledger import mapping, rows, text
-    from scripts.production.merge_gate import GateRun, GateJobResult, GateJobKind
+    from scripts.production.gate_routes import GateRun, GateJobResult, GateJobKind
     import math
     from typing import cast
 

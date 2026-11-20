@@ -43,7 +43,6 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
-from scripts.production.gate_routes import AssignedModules
 from scripts.production import merge_gate as gate
 from scripts.test_times import gate_record
 
@@ -1265,7 +1264,6 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
     if switch is CloudGateSwitch.OFF:
         return LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')
     directory = attempt.directory
-    split = isinstance(selected, AssignedModules)
     command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
@@ -1286,7 +1284,6 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if same_request and saved_result.get('status') == 'complete' and not _outcome_imported(folder):
             try:
                 request = read(folder / 'request.json')
-                request['split'] = split
                 saved_attempt = request.setdefault('attempt', folder.name)
                 if (request.get('tree') != identity['tree'] or request.get('head') != identity['commit']
                         or saved_attempt != folder.name):
@@ -1367,7 +1364,6 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     if _saved_gate_job(request) != attempt.gate_job:
                         request['gate_job'] = state['gate_job']
                     request['full'] = full
-                    request['split'] = split
                     if retry_launch:
                         request['retry_launch'] = retry_launch
                     save(folder / 'request.json', request)

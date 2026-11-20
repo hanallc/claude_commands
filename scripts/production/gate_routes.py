@@ -7,6 +7,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Literal, Protocol
 
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.test_times import gate_record
 
 
@@ -38,11 +39,6 @@ class TreeSelection:
     """Hold selected paths and the Git tree that the selection read."""
     paths: tuple[str, ...]
     tree: str
-
-
-@dataclass(frozen=True)
-class AssignedModules(TreeSelection):
-    """Require the local fallback to keep the remote assignment."""
 
 
 class ModuleCoverage(Enum):
@@ -90,14 +86,11 @@ class GateRun:
                 and not self.time_limit_report and all(job.returncode == 0 for job in self.jobs))
 
 
-class RemoteGateRoute(Protocol):
-    """Run the modules assigned to a remote host."""
+class CloudGateRoute(Protocol):
+    """Run AWS tests and identify the checked-out tree."""
     def route(self, repo: Path, *, mode: SuiteMode, full: bool,
-              module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES) -> GateRun | str: ...
-
-
-class CloudGateRoute(RemoteGateRoute, Protocol):
-    """Run AWS tests and identify the checkout tree."""
+              module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES,
+              gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun | str: ...
     def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
 
 
@@ -108,13 +101,19 @@ class MacGateCancellation:
 
 
 @dataclass(frozen=True)
-class UseCallerProcessLifetime:
-    """The Mac route watches its calling process for exit."""
+class MacGateExcludeFileMissing:
+    """The checkout has no Mac gate exclude file."""
+
+
+@dataclass(frozen=True)
+class MacGateExclusions:
+    """The exclude file lists these test paths."""
+    paths: tuple[str, ...]
 
 
 class MacGateRoute(Protocol):
-    """Read the allow list and run its assigned modules through the Mac queue."""
-    def read_modules(self, repo: Path) -> tuple[str, ...]: ...
+    """Read the exclude list and run the modules that the Mac queue assigns."""
+    def read_modules(self, repo: Path) -> MacGateExclusions | MacGateExcludeFileMissing: ...
 
     def route(self, repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
               selected: TreeSelection, cancellation: MacGateCancellation) -> GateRun | str: ...

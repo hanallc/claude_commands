@@ -74,9 +74,9 @@ from scripts.lib.build_steps import gate_job_for_command, read_step_names
 from scripts.production import affected_modules, change_review, land_runs, session_staff, staff, unit_config, unit_names  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_routes import (
-    ALL_MODULES as ALL_MODULES, AllModules as AllModules, AssignedModules,
+    ALL_MODULES as ALL_MODULES, AllModules as AllModules, CloudGateRoute,
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
-    MacGateCancellation, ModuleCoverage, SelectedModules as SelectedModules,
+    MacGateExcludeFileMissing, ModuleCoverage, SelectedModules as SelectedModules,
     SuiteMode as SuiteMode, TreeSelection as TreeSelection,
 )
 from scripts.production import mac_gate_process
@@ -1200,7 +1200,7 @@ class PassedTreeLedger:
                 records.append(record)
         return records
 
-    def reuse(self) -> bool:
+    def reuse(self, *, report: bool = True) -> bool:
         if isinstance(self.tree, UnrecordableTestTree):
             return False
         try:
@@ -1208,9 +1208,10 @@ class PassedTreeLedger:
                 if (record.get("kind", "full") == "full"
                         and record["tree"] == self.tree.tree and record["host"] == host_name()
                         and record["suites"] == self.suites):
-                    at = datetime.fromisoformat(cast(str, record["at"]))
-                    when = at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
-                    print(f"tests reused from {self.tree.tree[:12]} ({when}, {record['source']}, {record['checkout']})", flush=True)
+                    if report:
+                        at = datetime.fromisoformat(cast(str, record["at"]))
+                        when = at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+                        print(f"tests reused from {self.tree.tree[:12]} ({when}, {record['source']}, {record['checkout']})", flush=True)
                     return True
         except (OSError, ValueError) as error:
             self.report_error(error)
@@ -1426,7 +1427,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         ledger = PassedTreeLedger(repo, source, tested_tree, suites)
         if isinstance(selected, AllModules):
             required = full_required() if mode is SuiteMode.MERGE_GATE else NoFullRunRequired()
-            reused = not full and not isinstance(required, FullSuite) and ledger.reuse()
+            reused = not full and isinstance(required, NoFullRunRequired) and ledger.reuse()
             selection = FullSuite("passed tree reused")
             if not reused:
                 if isinstance(required, FullSuite):
@@ -2797,48 +2798,16 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
                    time_limit_report=reports)
 
 
-def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float,
-          selected: TreeSelection, cancellation: MacGateCancellation) -> GateRun | str:
-    """Pass the cancellation descriptor to the Mac route in the child."""
-    from scripts.mac_test import mac_gate
-
-    return mac_gate.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                          selected=selected, cancellation=mac_gate.MacGateCancellation(cancellation.caller_fd))
-
-
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
                     mode: SuiteMode = SuiteMode.MERGE_GATE,
                     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> GateRun:
-    """Route the selected tests and run Mac misses on natedev."""
-    from scripts.aws_target import cloud_gate as cloud
+    """Route merge gates through AWS. Split targeted tests between natedev and the Mac."""
+    def run_local(types: Sequence[str]) -> GateRun:
+        return run_suites(repo, types, module_time_limit_s, source=source, full=full, mode=mode)
 
-    absent = [name for name in type_dirs if not (repo / name).exists()]
-    if absent:
-        raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
-    selected: AllModules | TreeSelection = ALL_MODULES
-    if mode is SuiteMode.TARGETED_TEST and not full:
-        try:
-            tree, dirty = cloud.working_tree(repo)
-        except affected_modules.GraphError as error:
-            raise GateRefused(str(error)) from error
-        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
-                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
-        modules = discover_test_modules(repo)
-        selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
-        selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
-        if isinstance(selection, AffectedSelection) and not selection.modules:
-            if type_dirs:
-                return run_suites(repo, type_dirs, module_time_limit_s, source=source, mode=mode)
-            reused = ledger.reuse()
-            if not reused:
-                ledger.record_pass(selection)
-            record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
-                            hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
-                            max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
-            return GateRun((), 0.0, 0.0, selection_certified=True)
+    cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
 
     def run_local_subset(paths: tuple[str, ...], types: Sequence[str]) -> GateRun:
         return run_suites(repo, types, module_time_limit_s, source=source, full=full,
@@ -2849,13 +2818,42 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                               selected=selection, gate_job=gate_job)
         if isinstance(outcome, str):
             print('Cloud gate uses natedev: ' + outcome, flush=True)
-            if isinstance(selection, AssignedModules):
-                return run_local_subset(selection.paths, type_dirs)
-            return run_suites(repo, type_dirs, module_time_limit_s, source=source, full=full, mode=mode)
+            return run_local(type_dirs)
         if not type_dirs or outcome.time_limit_report:
             return outcome
         local = run_local_subset((), type_dirs)
         return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
+
+    absent = [name for name in type_dirs if not (repo / name).exists()]
+    if absent:
+        raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
+    if mode is SuiteMode.MERGE_GATE:
+        return run_cloud(ALL_MODULES)
+
+    selected: AllModules | TreeSelection = ALL_MODULES
+    whole_suite = full
+    if not full:
+        try:
+            tree, dirty = cloud.working_tree(repo)
+        except affected_modules.GraphError as error:
+            raise GateRefused(str(error)) from error
+        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
+                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
+        modules = discover_test_modules(repo)
+        selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+        if ledger.reuse(report=False):
+            return run_local(type_dirs)
+        whole_suite = isinstance(selection, FullSuite)
+        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
+        selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
+        if isinstance(selection, AffectedSelection) and not selection.modules:
+            if type_dirs:
+                return run_local(type_dirs)
+            ledger.record_pass(selection)
+            record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
+                            hold_wait_s=0.0, selection=selection, reused=False, reason="", status=0,
+                            max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
+            return GateRun((), 0.0, 0.0, selection_certified=True)
 
     mac_module = mac_gate_process.MAC_GATE_MODULE
     try:
@@ -2864,52 +2862,59 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if error.name != mac_module:
             raise
         return run_cloud(selected)
-    allowed = set(mac.read_modules(repo))
-    if not allowed:
-        return run_cloud(selected)
     try:
+        exclusions = mac.read_modules(repo)
+        if isinstance(exclusions, MacGateExcludeFileMissing):
+            return run_cloud(selected)
+        excluded = set(exclusions.paths)
         if isinstance(selected, AllModules):
             tree, _dirty = cloud.working_tree(repo)
-            assignment = TreeSelection(tuple(path.relative_to(repo).as_posix()
-                                             for _, path in discover_test_modules(repo)), tree)
+            modules = discover_test_modules(repo)
+            assignment = TreeSelection(tuple(path.relative_to(repo).as_posix() for _, path in modules), tree)
         else:
             assignment = selected
-        mac_paths = tuple(path for path in assignment.paths if path in allowed)
-        if not mac_paths:
-            return run_cloud(selected)
-        linux_paths = tuple(path for path in assignment.paths if path not in allowed)
-        child_module = "scripts.production.merge_gate" if mac_module == "scripts.mac_test.mac_gate" else mac_module
-        with mac_gate_process.start_mac_gate(
-                child_module, repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                selected=TreeSelection(mac_paths, assignment.tree)) as mac_result:
-            if linux_paths:
-                linux = run_cloud(AssignedModules(linux_paths, assignment.tree))
-            elif type_dirs:
-                linux = run_local_subset((), type_dirs)
-            else:
-                linux = GateRun((), 0.0, 0.0, selection_certified=True)
-            outcome = mac_result.result()
+        mac_paths = tuple(path for path in assignment.paths if path not in excluded)
+        linux_paths = tuple(path for path in assignment.paths if path in excluded)
+        if mac_paths:
+            with mac_gate_process.start_mac_gate(
+                    mac_module, repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                    selected=TreeSelection(mac_paths, assignment.tree)) as mac_result:
+                if linux_paths or type_dirs:
+                    linux = run_local_subset(linux_paths, type_dirs)
+                else:
+                    linux = GateRun((), 0.0, 0.0, selection_certified=True)
+                outcome = mac_result.result()
 
-        if isinstance(outcome, mac_gate_process.MacGateMiss):
-            print("Mac gate uses natedev: " + outcome.reason, flush=True)
-            outcome = GateRun((), outcome.seconds, 0.0, coverage=ModuleCoverage.SUBSET)
+            if isinstance(outcome, mac_gate_process.MacGateMiss):
+                print("Mac gate uses natedev: " + outcome.reason, flush=True)
+                outcome = GateRun((), outcome.seconds, 0.0, coverage=ModuleCoverage.SUBSET)
 
-        def module_path(job: GateJobResult) -> str:
-            return f"scripts/{job.suite}/{job.module}"
+            def module_path(job: GateJobResult) -> str:
+                return f"scripts/{job.suite}/{job.module}"
 
-        requested_paths = set(mac_paths)
-        passed_jobs = tuple(job for job in outcome.jobs
-                            if job.kind is GateJobKind.TEST_MODULE and job.returncode == 0
-                            and not job.killed_for and not job.tripwire_tripped and module_path(job) in requested_paths)
-        passed_paths = {module_path(job) for job in passed_jobs}
-        mac_pass = replace(outcome, jobs=passed_jobs, time_limit_report="",
-                           executions=outcome.executions or outcome.jobs)
-        run = combine_gate_runs(linux, mac_pass, seconds=max(linux.seconds, mac_pass.seconds))
-        missing = tuple(path for path in mac_paths if path not in passed_paths)
-        if missing:
-            print(f"Mac gate uses natedev for {len(missing)} modules without a pass", flush=True)
-            local = run_local_subset(missing, ())
-            run = combine_gate_runs(run, local, seconds=run.seconds + local.seconds)
+            requested_paths = set(mac_paths)
+            passed_jobs = tuple(job for job in outcome.jobs
+                                if job.kind is GateJobKind.TEST_MODULE and job.returncode == 0
+                                and not job.killed_for and not job.tripwire_tripped and module_path(job) in requested_paths)
+            passed_paths = {module_path(job) for job in passed_jobs}
+            mac_pass = replace(outcome, jobs=passed_jobs, time_limit_report="",
+                               executions=outcome.executions or outcome.jobs)
+            run = combine_gate_runs(linux, mac_pass, seconds=max(linux.seconds, mac_pass.seconds))
+            missing = tuple(path for path in mac_paths if path not in passed_paths)
+            if missing:
+                print(f"Mac gate uses natedev for {len(missing)} modules without a pass", flush=True)
+                complete_local_run = whole_suite and not linux_paths and not passed_paths
+                if complete_local_run:
+                    local = run_local(())
+                else:
+                    local = run_local_subset(missing, ())
+                run = combine_gate_runs(run, local, seconds=run.seconds + local.seconds)
+                if complete_local_run:
+                    run = replace(run, tests_reused=local.tests_reused, coverage=local.coverage)
+        elif whole_suite:
+            run = run_local(type_dirs)
+        else:
+            run = run_local_subset(linux_paths, type_dirs)
         if cloud.working_tree(repo)[0] != assignment.tree:
             raise GateRefused("The checkout changed during the split gate")
         return run

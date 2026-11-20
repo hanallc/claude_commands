@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 
 if __package__ in ('', None):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -31,13 +31,18 @@ from scripts.copies import copies
 from scripts.lib import build_folders, conf, copy_record, process_group, scratch
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
-from scripts.mac_test.mac_queue_run import MAC_BUSY_STATUS
 from scripts.production import merge_gate as gate
 from scripts.production.affected_modules import GraphError
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.test_times import gate_record
 
+if TYPE_CHECKING:
+    from scripts.production.gate_routes import (
+        MacGateCancellation, MacGateExcludeFileMissing, MacGateExclusions,
+    )
+
 MODULE_LIST = Path('config/mac_gate_modules.txt')
+MODULE_LIST_HEADER = '# List test modules that must run on natedev because the Mac cannot run them.\n'
 REMOTE_ROOT = '.local/state/mac-gate'
 RESULT_PREFIX = 'mac_gate_result='
 CLEANUP_ERROR_PREFIX = 'mac_gate_cleanup_error='
@@ -46,9 +51,9 @@ MAC_TIME_LIMIT_S = 3600
 
 
 @dataclass(frozen=True)
-class MacGateCancellation:
-    """The descriptor becomes readable when the caller cancels or exits."""
-    caller_fd: int
+class MacGateResult:
+    row: dict[str, object]
+    run: gate.GateRun
 
 
 @dataclass(frozen=True)
@@ -59,25 +64,22 @@ class UseCallerProcessLifetime:
 USE_CALLER_PROCESS_LIFETIME = UseCallerProcessLifetime()
 
 
-@dataclass(frozen=True)
-class MacGateResult:
-    row: dict[str, object]
-    run: gate.GateRun
+def read_modules(repo: Path) -> MacGateExclusions | MacGateExcludeFileMissing:
+    """Return excluded test paths in the tested checkout."""
+    from scripts.production.gate_routes import MacGateExcludeFileMissing, MacGateExclusions
 
-
-def read_modules(repo: Path) -> tuple[str, ...]:
-    """Return listed test paths in the tested checkout."""
     try:
-        entries = set((repo / MODULE_LIST).read_text().split())
+        entries = {line for row in (repo / MODULE_LIST).read_text().splitlines()
+                   if (line := row.partition('#')[0].strip())}
     except FileNotFoundError:
-        return ()
+        return MacGateExcludeFileMissing()
     if not entries:
-        return ()
-    included = set(gate.checked_git(repo, 'ls-files', '-z', '--cached', '--others',
-                                    '--exclude-standard', '--', 'scripts').split('\0'))
-    allowed = entries & included
-    return tuple(name for _, path in discover_test_modules(repo)
-                 if (name := path.relative_to(repo).as_posix()) in allowed)
+        return MacGateExclusions(())
+    tracked_paths = set(gate.checked_git(repo, 'ls-files', '-z', '--cached', '--others',
+                                        '--exclude-standard', '--', 'scripts').split('\0'))
+    excluded = entries & tracked_paths
+    return MacGateExclusions(tuple(name for _, path in discover_test_modules(repo)
+                                   if (name := path.relative_to(repo).as_posix()) in excluded))
 
 
 def attempt_name(folder: Path) -> str:
@@ -349,7 +351,11 @@ def run_guest_modules(folder: Path, repo: Path, *, full: bool) -> dict[str, obje
 
 def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
                selected: gate.AllModules | gate.TreeSelection,
-               cancellation: MacGateCancellation | UseCallerProcessLifetime) -> MacGateResult | str:
+               cancellation: MacGateCancellation | UseCallerProcessLifetime,
+               ) -> MacGateResult | str:
+    """Wait for a Mac placement in queue order and run the assigned modules."""
+    from scripts.production.gate_routes import MacGateCancellation
+
     try:
         repo = repo.resolve()
         with ExitStack() as cleanup:
@@ -372,12 +378,15 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             timings = gate.read_measures(gate.gate_state_dir() / 'module_seconds.json')
             _ = (folder / 'module_seconds.json').write_text(json.dumps(timings))
             command = [*QUEUE_COMMAND, '--what', 'gate tests', '--kind', 'run', '--package', '',
-                       '--worktree', str(repo), '--no-wait', '--owned-close',
+                       '--worktree', str(repo), '--owned-close',
                        '--lifecycle-script', str(Path(__file__).resolve()),
                        '--', str(folder), str(int(full))]
             command[2:2] = ['--caller-fd', str(caller)]
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, encoding='utf-8',
-                                       errors='replace', start_new_session=True, pass_fds=(caller,))
+            if cancelled.poll(0):
+                return 'The Mac gate was cancelled'
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, encoding='utf-8', errors='replace', start_new_session=True,
+                                       pass_fds=(caller,))
             with process:
                 try:
                     output, _ = process.communicate(timeout=MAC_TIME_LIMIT_S)
@@ -385,19 +394,13 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
                     with suppress(ProcessLookupError):
                         process_group.send_process_group(process.pid, signal.SIGKILL)
                     raise
-            if process.returncode:
-                prefix = f'{CLEANUP_ERROR_PREFIX}{folder.name}:'
-                detail = next((line.removeprefix(prefix) for line in reversed(output.splitlines())
-                               if line.startswith(prefix)), '')
-                if detail:
-                    return detail
-            if cancelled.poll(0):
-                return 'The Mac gate was cancelled'
-            if process.returncode == MAC_BUSY_STATUS:
-                return 'The Mac is busy'
-            if process.returncode:
-                return f'The Mac queue call ended with status {process.returncode}'
-            results = [line.removeprefix(RESULT_PREFIX) for line in output.splitlines() if line.startswith(RESULT_PREFIX)]
+            lines = output.splitlines()
+            was_cancelled = bool(cancelled.poll(0))
+            status = process.returncode
+            assert status is not None
+            if status or was_cancelled:
+                return queue_failure(lines, folder, status, cancelled=was_cancelled)
+            results = [line.removeprefix(RESULT_PREFIX) for line in lines if line.startswith(RESULT_PREFIX)]
             if len(results) != 1:
                 return 'The Mac returned no unique gate result'
             row = ledger.mapping(cast(object, json.loads(results[0])))
@@ -408,6 +411,14 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
         return f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds'
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError, copies.CopyError, scratch.ScratchError) as error:
         return f'The Mac gate could not finish: {error}'
+
+
+def queue_failure(lines: list[str], folder: Path, status: int, *, cancelled: bool) -> str:
+    prefix = f'{CLEANUP_ERROR_PREFIX}{folder.name}:'
+    cleanup = next((line.removeprefix(prefix).strip() for line in reversed(lines) if line.startswith(prefix)), '')
+    reason = cleanup or ('The Mac gate was cancelled' if cancelled else f'The Mac queue call ended with status {status}')
+    detail = next((line.strip().removeprefix(prefix).strip() for line in reversed(lines) if line.strip()), '')
+    return f'{reason}: {detail}' if detail and detail != reason and not detail.startswith(RESULT_PREFIX) else reason
 
 
 def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
@@ -456,15 +467,20 @@ def write_modules(repo: Path, mac_result: Path, natedev_record: Path) -> None:
     if cloud_gate.working_tree(repo)[0] != tree:
         raise GateRefused('The checkout tree differs from the Mac result')
     baseline = natedev_counts(natedev_record, tree)
-    passed: list[str] = []
+    observed = set(baseline)
+    passed: set[str] = set()
     for job in gate_box.decode_run(row['gate']).jobs:
+        if job.kind is not gate.GateJobKind.TEST_MODULE:
+            continue
         name = f'scripts/{job.suite}/{job.module}'
-        if (job.kind is gate.GateJobKind.TEST_MODULE and job.returncode == 0 and not job.killed_for
+        observed.add(name)
+        if (job.returncode == 0 and not job.killed_for
                 and isinstance(job.times, dict)
                 and baseline.get(name) == ModuleCounts(ledger.instant(ledger.mapping(job.times), 'tests_run'),
                                                        ledger.instant(ledger.mapping(job.times), 'skipped'))):
-            passed.append(name)
-    write_text_atomic(repo / MODULE_LIST, ''.join(name + '\n' for name in sorted(set(passed))))
+            passed.add(name)
+    write_text_atomic(repo / MODULE_LIST, MODULE_LIST_HEADER + ''.join(
+        name + '\n' for name in sorted(observed - passed)))
 
 
 @dataclass
@@ -488,7 +504,7 @@ def main() -> int:
     manual = commands.add_parser('run', help='run all modules on the Mac and save the result')
     _ = manual.add_argument('repo', type=Path)
     _ = manual.add_argument('output', type=Path)
-    writer = commands.add_parser('write-list', help='compare a Mac result with a natedev gate log')
+    writer = commands.add_parser('write-list', help='write exclusions from a Mac result and a natedev gate log')
     _ = writer.add_argument('repo', type=Path)
     _ = writer.add_argument('mac_result', type=Path)
     _ = writer.add_argument('natedev_record', type=Path)
