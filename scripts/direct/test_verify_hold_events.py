@@ -98,7 +98,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
 
         for unavailable in (errno.ENOSYS, errno.ENOTSUP):
             with self.subTest(errno=unavailable), \
-                 mock.patch.object(local_release_wait, "LocalReleaseEvents", side_effect=OSError(unavailable, "unavailable")), \
+                 mock.patch.object(release_events, "LocalReleaseEvents", side_effect=OSError(unavailable, "unavailable")), \
                  mock.patch.object(time, "sleep") as polling:
                 with release_events.local_release_waiter(self.fixture.root, self.fixture.root) as waiter:
                     self.assertIsInstance(waiter, release_events.IntervalReleasePolling)
@@ -109,7 +109,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_local_release_waiter_does_not_hide_resource_errors(self) -> None:
         from scripts.direct import release_events
 
-        with mock.patch.object(local_release_wait, "LocalReleaseEvents", side_effect=OSError(errno.EMFILE, "exhausted")), \
+        with mock.patch.object(release_events, "LocalReleaseEvents", side_effect=OSError(errno.EMFILE, "exhausted")), \
              self.assertRaises(OSError) as failed:
             _ = release_events.local_release_waiter(self.fixture.root, self.fixture.root)
         self.assertEqual(failed.exception.errno, errno.EMFILE)
