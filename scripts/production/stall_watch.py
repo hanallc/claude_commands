@@ -35,7 +35,9 @@ from uuid import uuid4
 
 
 from scripts.agents import detached_runs
-from scripts.build_targets.targets import Held, StartNotRecorded, StateUnreadable, local_hold_states
+from scripts.build_targets.targets import (
+    ConfigError, Held, SshTarget, StateUnreadable, local_hold_states, read_targets, ssh_target_state,
+)
 from scripts.lib import conf_reads
 from scripts.lib import conf as tunables
 from scripts.message import session_send
@@ -67,7 +69,7 @@ WATCH_DEFAULTS = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 COMPACTION_WAKE_KIND = "blocked"
 HOLDING_KIND = "holding"
-BUILD_HOLD_WAIT = re.compile(r"\b(?:build\s+hold|hold\s+release)\b", re.IGNORECASE)
+BUILD_HOLD_WAIT = re.compile(r"\bwait(?:s|ing)?\s+(?:for|on)\s+(?:[\w-]+\s+){0,3}hold\b", re.IGNORECASE)
 TURN_END = re.compile(rf"^\s*(?:[●⏺]\s+)?(?P<status>(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*)$",
                       re.MULTILINE)
 # A time a holding line names: a date, with or without its year, is optional, and UTC or GMT marks a time
@@ -702,10 +704,15 @@ def status_defers_bump(status: str, peers: Iterable[str], own_names: tuple[str, 
 
 def build_hold_is_live() -> bool:
     states = local_hold_states()
+    try:
+        states += tuple(ssh_target_state(target) for target in read_targets()
+                        if isinstance(target, SshTarget) and target.platform == "macos")
+    except ConfigError as error:
+        states += (StateUnreadable(str(error)),)
     for state in states:
         if isinstance(state, StateUnreadable):
             print(f"stall-watch: build hold state unreadable: {state.reason}", file=sys.stderr)
-    return any(isinstance(state, Held) and not isinstance(state.since, StartNotRecorded) for state in states)
+    return any(isinstance(state, Held) for state in states)
 
 
 def holding_names_outside(status: str, peers: Iterable[str], own_names: tuple[str, ...]) -> bool:

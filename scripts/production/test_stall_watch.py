@@ -266,6 +266,7 @@ class StallWatchTests(unittest.TestCase):
         _ = defaults.write_text(WATCH_DEFAULTS)
         _ = self.enterContext(mock.patch.object(stall_watch, "WATCH_DEFAULTS", defaults))
         configuration = {
+            "build_targets": "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n",
             "production": "# range: 0..\nPROMPT_ALERT_SECONDS=60\n",
             "rca": "# range: 0.001..\nsend_seconds=300\n",
             "staff": ("# range: 0.001..\nOPERATION_LOCK_SECONDS=30\n# range: 0.001..\nREMOTE_SECONDS=20\n"
@@ -2500,16 +2501,17 @@ runpy.run_path(str(script), run_name='__main__')
 
     def test_holding_statuses_log_each_pass_without_any_delivery(self) -> None:
         cases = (
-            ("— holding: no work until the showrunner restarts it on your word", False),
-            ("holding: waiting on your confirmed values", False),
-            ("— holding: waiting for the fps hold release", True),
+            ("— holding: no work until the showrunner restarts it on your word", False, True),
+            ("holding: waiting on your confirmed values", False, True),
+            ("— holding: waiting for the fps hold release", True, True),
+            ("holding: the build hold ended; waiting for my tests", True, False),
         )
-        for status, build_hold in cases:
+        for status, build_hold, holding in cases:
             with self.subTest(status=status):
                 holders = Path(self.environment["BUILD_HOLD_DIR"])
                 holder = holders / "fps"
                 if build_hold:
-                    holders.mkdir()
+                    holders.mkdir(exist_ok=True)
                     _ = write_holder(holders, "fps", "2026-10-06T18:59:00+00:00", "Build tests")
                 self.send_log.unlink(missing_ok=True)
                 self.state.mkdir(exist_ok=True)
@@ -2519,19 +2521,21 @@ runpy.run_path(str(script), run_name='__main__')
                 for at in (START, START + 300, START + 600):
                     result = self.tick(at)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    if at >= START + 300:
+                    if holding and at >= START + 300:
                         self.assertIn("inspected showrunner/unit-one: holding", result.stdout)
                         self.assertEqual(self.sent(), [])
                         path = self.watches["unit-one"].stretch_path
                         self.assertFalse(stall_watch.saved_stretch(path)["tell_sent"])
                         self.assertFalse(stall_watch.saved_stretch(path)["bump_sent"])
-                if build_hold:
+                if build_hold and holding:
                     holder.unlink()
                     result = self.tick(START + 601)
                     self.assertEqual(result.returncode, 0, result.stderr)
+                if build_hold:
                     sent = self.sent()
                     self.assertEqual(len(sent), 2)
                     self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
+                    holder.unlink(missing_ok=True)
 
     def test_own_work_order_and_own_names_do_not_hold_the_unit(self) -> None:
         self.configure({"showrunner": ["unit-one"], "sdlc": ["style"]})
