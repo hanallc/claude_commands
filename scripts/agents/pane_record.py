@@ -25,12 +25,14 @@ except FileNotFoundError:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
 if TYPE_CHECKING:
     from scripts.herdr import herdr
@@ -39,6 +41,7 @@ if TYPE_CHECKING:
 
 from scripts.herdr import herdr_types, pane_launch  # noqa: E402
 from scripts.lib import legacy_identity, models_registry
+from scripts.lib.transcripts import open_transcript, transcript_paths, transcript_source
 from scripts.message import sessions
 from scripts.herdr.pane_launch import PaneLaunch as PaneLaunch
 from scripts.herdr.pane_launch import (
@@ -114,6 +117,107 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
         if plugins:
             entry["plugin_directories"] = [str((Path(cwd) / directory).resolve()) for directory in plugins]
     return entry
+
+
+class ClaudeTurnSettings(NamedTuple):
+    """The model and optional effort from one real assistant turn."""
+
+    model: str
+    effort: str
+
+
+class NoClaudeTurn(NamedTuple):
+    """No readable assistant turn records a model for this session."""
+
+
+class ClaudeResumeSettings(NamedTuple):
+    """The model and effort flags for a Claude resume. Empty values omit flags."""
+
+    model: str = ""
+    effort: str = ""
+
+    def arguments(self) -> list[str]:
+        arguments: list[str] = []
+        if self.model:
+            arguments.extend(("--model", self.model))
+        if self.effort:
+            arguments.extend(("--effort", self.effort))
+        return arguments
+
+
+def claude_resume_settings(preferred: ClaudeTurnSettings | NoClaudeTurn | ClaudeResumeSettings, *,
+                           fallback: ClaudeResumeSettings = ClaudeResumeSettings(),
+                           explicit_model: str = "") -> ClaudeResumeSettings:
+    """Resolve each Claude resume flag from its own available settings."""
+    if isinstance(preferred, NoClaudeTurn):
+        preferred = ClaudeResumeSettings()
+    return ClaudeResumeSettings(explicit_model or preferred.model or fallback.model,
+                                preferred.effort or fallback.effort)
+
+
+def _transcript_lines_from_end(path: Path) -> Iterator[bytes]:
+    """Read newest entries first without loading the whole conversation."""
+    with open_transcript(path) as stream:
+        offset = stream.seek(0, os.SEEK_END)
+        pending = b""
+        while offset:
+            size = min(offset, 65536)
+            offset -= size
+            _ = stream.seek(offset)
+            lines = (stream.read(size) + pending).split(b"\n")
+            pending = lines[0]
+            yield from reversed(lines[1:])
+        if pending:
+            yield pending
+
+
+def claude_turn_settings(session_id: str, *config_dirs: Path) -> ClaudeTurnSettings | NoClaudeTurn:
+    """Read the latest real assistant turn across the session's Claude homes.
+
+    A dated turn wins over an undated turn. Use file mtime, then path, for ties.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
+        return NoClaudeTurn()
+    matches = set(sessions.transcript_locations(session_id))
+    for directory in config_dirs:
+        matches.update(path.resolve() for path in transcript_paths(directory / "projects", f"*/{session_id}.jsonl"))
+    turns: dict[tuple[bool, datetime, int, str], ClaudeTurnSettings] = {}
+    for path in matches:
+        try:
+            modified = transcript_source(path).stat().st_mtime_ns
+            for line in _transcript_lines_from_end(path):
+                if b'"assistant"' not in line:
+                    continue
+                try:
+                    value = cast(object, json.loads(line))
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(value, dict):
+                    continue
+                record = cast(dict[str, object], value)
+                message = record.get("message")
+                if record.get("type") != "assistant" or not isinstance(message, dict):
+                    continue
+                model = cast(dict[str, object], message).get("model")
+                if isinstance(model, str) and model and model != "<synthetic>":
+                    effort = record.get("effort")
+                    timestamp = record.get("timestamp")
+                    stamp = datetime.min.replace(tzinfo=UTC)
+                    dated = False
+                    if isinstance(timestamp, str):
+                        try:
+                            parsed = datetime.fromisoformat(timestamp)
+                            if parsed.tzinfo is not None:
+                                stamp = parsed.astimezone(UTC)
+                                dated = True
+                        except (ValueError, OverflowError):
+                            pass
+                    turns[dated, stamp, modified, str(path)] = ClaudeTurnSettings(
+                        model, effort if isinstance(effort, str) else "")
+                    break
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return turns[max(turns)] if turns else NoClaudeTurn()
 
 
 def resume_arguments(entry: PaneLaunch) -> list[str]:
