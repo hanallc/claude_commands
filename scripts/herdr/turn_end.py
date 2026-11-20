@@ -391,12 +391,22 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
         except (OSError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
             print(str(error), file=sys.stderr)
             result = worker.ExitCode.UNCERTAIN
+    diagnostic_text = diagnostics.getvalue()
+    prefix = f"{row.name}: compaction failed: "
+    compaction_failure = next((line for line in diagnostic_text.splitlines() if line.startswith(prefix)), "")
+    if compaction_failure:
+        path = run / f"compact-{instance}.log"
+        try:
+            with path.open("a", encoding="utf-8", errors="backslashreplace") as log:
+                _ = log.write(compaction_failure + "\n")
+        except OSError as error:
+            unit_runs.report_anomaly(f"anomaly: {path}: cannot save the compaction failure: {error}")
     if result is worker.DispatchSubmission.SUBMITTED:
         progress_history.confirm_assignment_submission(run, instance, delivery.completion_id)
-        print(diagnostics.getvalue(), end="", file=sys.stderr)
+        print(diagnostic_text, end="", file=sys.stderr)
         return TurnOutcome.SUBMITTED
     outcome = TurnOutcome.BUSY if result == worker.ExitCode.BUSY else TurnOutcome.UNCERTAIN
-    details = diagnostics.getvalue().strip() or f"Stage 2 submission returned {result}"
+    details = diagnostic_text.strip() or f"Stage 2 submission returned {result}"
     path = Path(delivery.reply_file)
     path = path.with_name(path.stem + "_turn" + path.suffix)
     worker.save_reply(path, details)

@@ -3267,6 +3267,27 @@ class LaunchDestinationTests(StaffTestCase):
             state = "pane closed" if closed else "pane close unconfirmed"
             self.assertEqual(errors.getvalue().splitlines(), [f"herdr agents:{pane}: agent start failed: {failure}; {state}"])
 
+    def test_split_close_refusal_keeps_the_agent_not_ready_cause(self) -> None:
+        pane = "launched-pane"
+        startup = subprocess.CompletedProcess([], 1, "", json.dumps({"error": {
+            "code": "agent_not_ready", "message": "the agent did not become ready"}}))
+        refusal = herdr_types.HerdrFailure("terminal identity changed", "wrong_target")
+        with (patch.object(herdr.Herdr, "result", return_value={"pane": {"pane_id": pane}}),
+              patch.object(herdr.Herdr, "label_pane"),
+              patch.object(herdr.Herdr, "run_in_pane"),
+              patch.object(herdr.Herdr, "start_command", return_value=startup),
+              patch.object(herdr.Herdr, "run", return_value="Trust dialog"),
+              patch.object(herdr.Herdr, "close_retained_pane", side_effect=refusal) as close,
+              redirect_stderr(io.StringIO()) as errors,
+              self.assertRaises(herdr_types.HerdrFailure) as raised):
+            _ = herdr.launch_prepared_agent("agents", herdr.SplitPane("parent", "right", 0.5, "worker"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", [], herdr.NoOpeningPrompt(), 1000, agent="worker")
+        close.assert_called_once_with(pane)
+        self.assertEqual(raised.exception.code, "wrong_target")
+        self.assertEqual(str(raised.exception), f"herdr agents:{pane}: agent start failed: start agent worker: "
+                         + "agent_not_ready: the agent did not become ready; pane close unconfirmed: terminal identity changed")
+        self.assertEqual(errors.getvalue().splitlines(), ["Trust dialog"])
+
     def test_declined_resume_explains_manual_prompt_recovery(self) -> None:
         prepared = herdr.PreparedAgentEnvironment(self.root, {})
         client = cast(herdr.Herdr, Mock())

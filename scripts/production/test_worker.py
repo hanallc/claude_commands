@@ -1275,6 +1275,39 @@ class WorkerCommandTests(unittest.TestCase):
                     script_prompt("End your final reply with DONE compact-proof"))])
                 self.assertEqual(self.agent.compact_inputs[current.pane], "")
 
+    def test_compaction_timeout_includes_the_cleanup_target_warning_once(self) -> None:
+        current = self.opened()
+        client = self.fixture.world
+        read = client.result
+        cleanup_read_failed = False
+
+        def read_target(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            nonlocal cleanup_read_failed
+            if arguments == ("pane", "process-info", "--pane", current.pane) and not cleanup_read_failed:
+                cleanup_read_failed = True
+                raise herdr_types.HerdrFailure("pane process info is unavailable")
+            return read(*arguments, deadline=deadline)
+
+        def composer(_pane: str) -> herdr.ComposerInput:
+            return herdr.ComposerInput("" if cleanup_read_failed else "/compact")
+
+        timeout = "compaction did not finish before the compaction bound"
+        line = "End your final reply with DONE compact-cleanup"
+        with (patch.object(worker, "_compact_before_dispatch", side_effect=herdr_types.HerdrFailure(timeout, "timeout")),
+              patch.object(client, "result", side_effect=read_target),
+              patch.object(client, "composer", side_effect=composer),
+              patch.object(client, "_send_keys") as keys,
+              redirect_stderr(io.StringIO()) as errors):
+            result = worker.dispatch_turn(self.fixture.parent.id, current, client, line, "compact-cleanup", run=self.run_dir)
+
+        keys.assert_not_called()
+        self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+        self.assertEqual(self.agent.submitted, [(current.pane, script_prompt(line))])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"{current.row.name}: compaction failed: {timeout}; compaction input cleanup failed: {current.pane}: "
+            + f"would send keys to an unproved target instead of session {current.row.current_session}; "
+            + "target evidence is unknown: pane process info is unavailable; target retained"])
+
     def test_compaction_dispatch_returns_before_completion_and_reports_detached_failure(self) -> None:
         class DispatchClock:
             seconds: float = 100.0

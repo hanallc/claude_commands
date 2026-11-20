@@ -3364,9 +3364,11 @@ class Herdr:
         if not target:
             raise HerdrFailure(f"{pane}: would send keys without a named target session")
         row = self.pane_row(pane)
+        warnings: list[str] = []
         if not check_target(target, action="keys", place=HerdrPlace(self.session, pane),
-                            pane_info=row, client=self, text=expected_text):
-            raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
+                            pane_info=row, client=self, text=expected_text, on_retained=warnings.append):
+            reason = f"; {' '.join(warnings)}" if warnings else ""
+            raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}{reason}")
         self._send_keys(pane, *keys)
 
     def answer_question(self, pane: str, text: str, *, target: str) -> None:
@@ -4038,7 +4040,8 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
                  terminal: str = "", text: str = "",
                  pane_info: PaneIdentity | NoPane = _TARGET_PANE_UNKNOWN,
                  recipient: PromptRecipientProcess | PromptRecipientUnavailable = _TARGET_RECIPIENT_UNKNOWN,
-                 client: Herdr | NotInHerdr = _TARGET_PLACE_UNKNOWN) -> bool:
+                 client: Herdr | NotInHerdr = _TARGET_PLACE_UNKNOWN,
+                 on_retained: Callable[[str], None] | None = None) -> bool:
     """Protect the selected session before a signal, input, or pane closure.
 
     Unknown evidence preserves the resource without stopping independent actions.
@@ -4049,6 +4052,9 @@ def check_target(target: str | AgentProcessIdentity, *, action: Literal["signal"
     name = f"pid {target.pid}" if isinstance(target, AgentProcessIdentity) else target or "shell"
 
     def retain(reason: str) -> bool:
+        if on_retained is not None:
+            on_retained(reason)
+            return False
         reported = _reported_target_retentions.get(None)
         key = (place, target, reason)
         if reported is None or key not in reported:
@@ -6926,14 +6932,19 @@ def launch_prepared_agent(name: str, destination: NewTab | SplitPane | ExistingP
             failure = PromptNotSubmitted(str(error))
         outcome = _without_prompt_transport(opening, launched_at, failure)
     if isinstance(outcome, AgentNotStarted):
+        reason = " ".join(outcome.reason.splitlines())
         pane_status = "pane retained"
         if outcome.state == "not_sent" and not isinstance(destination, ExistingPane):
-            if isinstance(destination, NewTab):
-                close_agent(name, pane)
-                pane_status = "pane closed"
-            else:
-                pane_status = "pane closed" if client.close_retained_pane(pane) else "pane close unconfirmed"
-        reason = " ".join(outcome.reason.splitlines())
+            try:
+                if isinstance(destination, NewTab):
+                    close_agent(name, pane)
+                    pane_status = "pane closed"
+                else:
+                    pane_status = "pane closed" if client.close_retained_pane(pane) else "pane close unconfirmed"
+            except HerdrFailure as error:
+                detail = " ".join(str(error).splitlines())
+                raise HerdrFailure(f"herdr {name}:{pane}: agent start failed: {reason}; pane close unconfirmed: {detail}",
+                                   error.code) from error
         print(f"herdr {name}:{pane}: agent start failed: {reason}; {pane_status}", file=sys.stderr)
     if (resuming_with_prompt and isinstance(outcome, PromptNotSubmitted)
             and (isinstance(destination, ExistingPane) or not isinstance(outcome, AgentNotStarted))):

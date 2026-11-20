@@ -2094,6 +2094,12 @@ class TurnEndTests(unittest.TestCase):
 
 class StageTwoCompactionTests(unittest.TestCase):
     def test_failed_compaction_reports_one_line_and_submits_one_prompt(self) -> None:
+        self.check_failed_compaction(native_stop=False)
+
+    def test_detached_stop_hook_saves_the_compaction_line_and_submits_one_prompt(self) -> None:
+        self.check_failed_compaction(native_stop=True)
+
+    def check_failed_compaction(self, *, native_stop: bool) -> None:
         case = test_worker.WorkerCommandTests("runTest")
         self.addCleanup(case.doCleanups)
         case.setUp()
@@ -2117,12 +2123,23 @@ class StageTwoCompactionTests(unittest.TestCase):
         atomic_file.write_text_atomic(ready, "ready\n")
         before = len(case.agent.submitted)
 
-        with redirect_stderr(io.StringIO()) as errors:
-            outcome = case.finish(name, turn_end.EventKind.STAGE_READY)
-
-        self.assertIs(outcome, turn_end.TurnOutcome.SUBMITTED)
-        self.assertEqual(errors.getvalue().splitlines(),
-                         [f"{name}: compaction failed: herdr agent compact: compact_failed: compact unavailable"])
+        diagnostic = f"{name}: compaction failed: herdr agent compact: compact_failed: compact unavailable"
+        if native_stop:
+            case.agent.complete(pane)
+            payload = json.dumps({"hook_event_name": "Stop", "session_id": str(row.current_session),
+                                  "last_assistant_message": case.agent.last_replies[str(row.current_session)]})
+            log = run / f"compact-{delivery.completion_id}.log"
+            atomic_file.write_text_atomic(log, "Earlier dispatch output\n")
+            with (patch.object(sys, "stdin", io.StringIO(payload)),
+                  open(os.devnull, "w", encoding="utf-8") as discarded,
+                  redirect_stderr(discarded)):
+                self.assertEqual(turn_end.main(["--handle-hook"]), 0)
+            self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["Earlier dispatch output", diagnostic])
+        else:
+            with redirect_stderr(io.StringIO()) as errors:
+                outcome = case.finish(name, turn_end.EventKind.STAGE_READY)
+            self.assertIs(outcome, turn_end.TurnOutcome.SUBMITTED)
+            self.assertEqual(errors.getvalue().splitlines(), [diagnostic])
         self.assertEqual(len(case.agent.submitted), before + 1)
         target, prompt = case.agent.submitted[-1]
         self.assertEqual(target, pane)
