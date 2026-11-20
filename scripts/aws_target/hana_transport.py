@@ -189,7 +189,7 @@ class SourceSender:
             commits = tuple(dict.fromkeys((identity.commit, *previous.commits)))[:maximum]
             self.save(AcknowledgedCommits(identity.repository, commits))
 
-    def forget_basis(self, answer: hana_source.MissingBasis) -> None:
+    def forget_basis(self, answer: hana_protocol.MissingBasis) -> None:
         """Forget the repository's basis so the next bundle is complete."""
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.record_path(answer.repository).with_suffix('.lock').open('a') as lock:
@@ -219,7 +219,7 @@ class SourceSender:
         return manifest, upload
 
     def retry_complete(self, source: Path, manifest: hana_protocol.SourceManifest,
-                       answer: hana_source.MissingBasis, *, staging: ExitStack
+                       answer: hana_protocol.MissingBasis, *, staging: ExitStack
                        ) -> tuple[hana_protocol.SourceManifest, Callable[[], None]]:
         """Retry the captured commit without reading changed caller working files."""
         hana_protocol.validate_manifest(manifest, self.limits)

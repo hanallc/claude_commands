@@ -14,11 +14,10 @@ from typing import override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_target, ledger, run_cost, spot_table
+from scripts.aws_target import aws_target, ledger, plan_identity, run_cost, spot_table
 from scripts.aws_target.aws_cli import AwsUnavailable, aws_error_code
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.lib import conf
-from scripts.lint.memory_test_support import write_config_fixture
 
 
 class AwsErrorCodeTests(unittest.TestCase):
@@ -55,7 +54,7 @@ class AwsErrorCodeTests(unittest.TestCase):
 
 class HanaGpuSnapshotTests(CostFixture):
     def test_snapshot_reads_and_displays_hana_gpu_prices(self) -> None:
-        _ = write_config_fixture(conf.path('cloud_gate'), 'spot_candidate_regions=us-east-1\n'
+        self.configure_gate('spot_candidate_regions=us-east-1\n'
                                   + 'gpu_instance_types=g6.2xlarge\n'
                                   + 'hana_gpu_instance_types=g4dn.2xlarge g6.2xlarge')
         now = 1768478400
@@ -73,7 +72,9 @@ class HanaGpuSnapshotTests(CostFixture):
             self.assertIn('get-service-quota', arguments)
             return subprocess.CompletedProcess(arguments, 0, '{"Quota":{"Value":8}}', '')
 
-        status = aws_target.snapshot(self.settings, self.state, execute=execute, clock=lambda: now)
+        with mock.patch.object(plan_identity, 'plan_credentials',
+                               side_effect=plan_identity.PlanIdentityRefused('The AWS plan key is missing.')):
+            status = aws_target.snapshot(self.settings, self.state, execute=execute, clock=lambda: now)
         self.assertEqual(status, 0)
         self.assertEqual(reads.count('g6.2xlarge'), 1)
         self.assertEqual(reads.count('g4dn.2xlarge'), 1)
@@ -97,7 +98,7 @@ class SpotPlacementTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = write_config_fixture(conf.path('cloud_gate'), 'regions=' + ' '.join(self.regions) + '\ninstance_types='
+        self.configure_gate('regions=' + ' '.join(self.regions) + '\ninstance_types='
                                  + ' '.join(self.types))
         self.credential_file = self.root / '.config/aws-build/credentials'
         self.credential_file.parent.mkdir(parents=True)

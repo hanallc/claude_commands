@@ -3,7 +3,7 @@
 
 Start writes a run record and returns after it starts the supervisor.
 The supervisor runs the command and delivers its result to the current worker.
-A unit director that names its run folder owns its run; its result goes through send.py.
+A unit director or showrunner names its run folder and receives its result through send.py.
 Reap finishes records whose supervisor disappeared and delivers their results.
 The command runs in its own session; the record names its process group.
 `stop` signals that group, and the supervisor records the exit status and delivers the result.
@@ -145,7 +145,7 @@ class PaneCaller:
 
 @dataclass(frozen=True)
 class DirectorCaller:
-    """A unit director; it owns a run only when it names its run folder."""
+    """A unit director or showrunner that owns a run in its own folder."""
 
     name: str
     staff_id: staff.StaffId
@@ -193,7 +193,7 @@ def _stop_caller_is_owner(owner: object, environment: Mapping[str, str]) -> bool
 
 
 def caller_from_environment(environment: dict[str, str]) -> Caller:
-    """Find the worker or unit director through its current native session."""
+    """Find the worker, unit director, or showrunner through its current session."""
     membership = staff.local_snapshot()
     member = membership.by_current_session(staff.runtime_id())
     if member is None or member.kind != "worker":
@@ -205,7 +205,7 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
         parent = membership.parent_of(member)
         if parent is not None:
             return PaneCaller(str(worker_panes.worker_run(member, record=membership)), member.name, member.id)
-    if member is not None and member.kind == "unit":
+    if member is not None and member.kind in ("unit", "showrunner"):
         return DirectorCaller(member.name, member.id)
     return NotDetachedWorker()
 
@@ -221,9 +221,9 @@ class RunOwnerUnavailable:
 
 
 def _run_owner(record: RunRecord, membership: staff.StaffSnapshot) -> staff.StaffRow | RunOwnerUnavailable:
-    """The worker or unit director that owns the run."""
+    """The worker, unit director, or showrunner that owns the run."""
     member = membership.by_id(staff.StaffId(record.get("staff_id", "")))
-    if member is None or member.kind not in ("worker", "unit"):
+    if member is None or member.kind not in ("worker", "unit", "showrunner"):
         reason = f"{record['worker']}: detached run has no worker or director staff row"
         return RunOwnerUnavailable(reason)
     return member
@@ -1684,7 +1684,7 @@ def command_reap(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     verbs = parser.add_subparsers(dest="verb", required=True)
-    start = verbs.add_parser("start", help="run a command detached for the calling worker, unless its same run is live")
+    start = verbs.add_parser("start", help="run a command detached unless the caller already has the same run live")
     _ = start.add_argument("--session-dir", default="")
     _ = start.add_argument("--to", default="")
     _ = start.add_argument("--director-dir", default="", help="the run folder whose director hears results")

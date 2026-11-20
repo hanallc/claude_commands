@@ -26,11 +26,11 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyPythonStartsTests(VerifyLintCacheFixture):
-    @classmethod
     @override
-    def setUpClass(cls) -> None:
-        with mock.patch.dict(os.environ, {"COPIES_RUN_PID": str(os.getpid())}):
-            super().setUpClass()
+    def build_fixture(self) -> None:
+        # Model a parent that calls the tests from copies.py run.
+        with mock.patch.dict(os.environ, COPIES_RUN_PID=str(os.getpid())):
+            super().build_fixture()
 
     def test_lint_trace_has_one_start_per_key_pair_and_no_unnamed_helper(self) -> None:
         self.assert_lint_start_count(self)
@@ -53,6 +53,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         print("lint helper starts:", dict(sorted(counts.items())), "total:", len(rows), flush=True)
         self.assertNotIn("INLINE_PY", counts, rows)
         self.assertNotIn("STDIN_PY", counts, rows)
+        self.assertNotIn("copies.py", counts, rows)
         # The trace counts interpreter starts, not calls inside the helper.
         self.assertEqual(counts["tree_watch.py"], 2, rows)
         self.assertEqual(counts["memory_kill.py"], 1, rows)
@@ -106,14 +107,17 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
             "VERIFY_HELPER_STARTED": "1",
             "BASH_ENV": str(hook),
             "GIT_INDEX_FILE": str(caller / "index"),
+            "LANGUAGE": "fr",
+            "LC_NUMERIC": "POSIX",
         }
-        with mock.patch.dict(os.environ, variables):
+        with mock.patch.dict(os.environ, {**variables, "LANG": "POSIX", "LC_ALL": "POSIX"}):
             with self.subTest(fixture="lint"):
                 lint = VerifyLintCacheFixture()
                 self.addCleanup(lint.doCleanups)
                 lint.setUp()
                 self.assert_lint_start_count(lint)
                 self.assertFalse(variables.keys() & lint.environment.keys())
+                self.assertEqual((lint.environment["LANG"], lint.environment["LC_ALL"]), ("C", "C"))
 
             with self.subTest(fixture="nested SSH"):
                 routing = VerifySshTargetsFixture()

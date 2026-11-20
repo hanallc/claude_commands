@@ -20,16 +20,17 @@ COPY_HELPERS = (
 )
 VERIFY_HELPERS = (*COPY_HELPERS, "scripts/whoami", "scripts/notify")
 VERIFY_TEST_ENVIRONMENT = frozenset({
-    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TERM",
+    "PATH", "HOME", "USER", "LOGNAME", "TZ", "TMPDIR", "TERM",
     # Keep the test runner's Python process settings in fixture subprocesses.
     "PYTHON_CPU_COUNT", "PYTHONDONTWRITEBYTECODE",
 })
 
 
 def verify_test_environment() -> dict[str, str]:
-    """Read the caller settings that Verify fixtures can inherit."""
-    return {name: value for name, value in os.environ.items()
-            if name in VERIFY_TEST_ENVIRONMENT or name.startswith("LC_")}
+    """Read the allowed caller settings and set the fixture locale."""
+    environment = {name: value for name, value in os.environ.items() if name in VERIFY_TEST_ENVIRONMENT}
+    environment["LANG"] = environment["LC_ALL"] = "C"
+    return environment
 
 
 class CopyTime(NamedTuple):

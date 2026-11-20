@@ -44,18 +44,21 @@ def _positive_amount(value: str) -> Decimal:
     return amount
 
 
-def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permit_max_seconds: int
-                         ) -> StartPermitSettings:
-    instance_type = configuration.text('instance_type')
-
+def read_fallback_instance_types(configuration: conf.ConfigRead, instance_type: str) -> tuple[str, ...]:
     def fallback_types(value: str) -> tuple[str, ...]:
         types = tuple(item.strip() for item in value.split(','))
         if not all(types) or len(set((instance_type, *types))) != 1 + len(types):
             raise ValueError('expected distinct types and no empty items')
         return types
 
+    return configuration.value('fallback_instance_types', fallback_types)
+
+
+def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permit_max_seconds: int
+                         ) -> StartPermitSettings:
+    instance_type = configuration.text('instance_type')
     return StartPermitSettings(enabled, configuration.text('region'), instance_type,
-        configuration.value('fallback_instance_types', fallback_types),
+        read_fallback_instance_types(configuration, instance_type),
         configuration.value('spot_max_usd_per_hour', _positive_amount),
         configuration.value('root_gib', conf.positive_whole), configuration.value('data_gib', conf.positive_whole),
         configuration.value('daily_budget_usd', _positive_amount),

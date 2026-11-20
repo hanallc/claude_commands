@@ -14,6 +14,7 @@ import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal, NamedTuple, cast, final
 
@@ -121,7 +122,7 @@ class LaunchSettings(NamedTuple):
     service_tier: str
 
 
-def claude_model(model: str, environment: Mapping[str, str]) -> str:
+def claude_model(model: str, environment: Mapping[str, str], *, timeout: float | None = None) -> str:
     """Resolve a model with the selected launch account's catalog."""
     try:
         configuration = LaunchModelConfiguration(*_snapshot(
@@ -131,7 +132,7 @@ def claude_model(model: str, environment: Mapping[str, str]) -> str:
              + '_agents_model_slug claude "$2"', "claude-model",
              str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), model],
             input=configuration_shell(configuration),
-            env={**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, capture_output=True, text=True, check=True)
+            env={**environment, "MODELS_CONFIG_TIER_ONLY": "1"}, capture_output=True, text=True, check=True, timeout=timeout)
     except (OSError, ValueError, subprocess.SubprocessError):
         return model
     return result.stdout.strip()
@@ -197,22 +198,41 @@ def launch_settings(section: str, key: str, family: Literal["claude", "codex", "
         try:
             profile = parse_producer_profile(value)
         except ValueError as error:
-            raise ValueError(f"invalid producer settings for {key}; {error}") from error
+            raise ValueError(f"invalid launch settings for {section}.{key}: {error}") from error
         resolver_arguments = [profile.family, f"{profile.model}:{profile.effort}"]
         resolver = ('AGENT_FAMILY="$4"; _agents_validate_pair "$2.$3" "$4" "$5" && '
                     '_agents_resolve_service_tier "$2.$3" "$4"')
+    return _resolve_settings(configuration, resolver, [section, key, *resolver_arguments],
+                             f"{section}.{key}")
+
+
+def requested_model(word: str, effort: str, configuration: RegistryEditBase) -> LaunchSettings:
+    """Validate a model and effort through the launch resolver."""
+    resolver = ('AGENT_FAMILY="$(_agents_agent_families_inline "$2")"; '
+                'case "$AGENT_FAMILY" in claude|codex) ;; *) '
+                'printf "Unknown or ambiguous model %s. Valid models: %s %s %s %s\\n" "$2" '
+                '"$(_agents_section_keys_inline claude.agents)" '
+                '"$(_agents_section_keys_inline claude.families)" '
+                '"$(_agents_section_keys_inline codex.families)" '
+                '"$(_agents_section_keys_inline codex.agents)" >&2; exit 1 ;; esac; '
+                '_agents_validate_pair model "$AGENT_FAMILY" "$2:$3" && '
+                'AGENT_SERVICE_TIER=""')
+    return _resolve_settings(configuration, resolver, [word, effort], word)
+
+
+def _resolve_settings(configuration: LaunchModelConfiguration | RegistryEditBase, resolver: str,
+                      arguments: list[str], context: str) -> LaunchSettings:
     result = subprocess.run(
         ["bash", "-c", 'source "$1" && { IFS= read -r -d "" table; _models_table_load "$table"; } && '
          + '{ ' + resolver + '; } && '
          + 'printf "%s\\n%s\\n%s\\n%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "$AGENT_SERVICE_TIER"',
-         "launch-settings", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), section, key,
-         *resolver_arguments],
+         "launch-settings", str(Path(__file__).resolve().parents[1] / "agents/models_config.sh"), *arguments],
         input=configuration_shell(configuration), text=True, capture_output=True, check=False,
         env={**os.environ, "MODELS_CONFIG_TIER_ONLY": "1"})
     values = result.stdout.splitlines()
     kind = values[0] if values else ""
     if result.returncode or len(values) != 4 or kind not in ("claude", "codex") or not values[1]:
-        raise ValueError(result.stderr.strip() or f"invalid launch settings for {section}.{key}")
+        raise ValueError(result.stderr.strip() or f"invalid launch settings for {context}")
     if result.stderr:
         print(result.stderr, end="", file=sys.stderr)
     return LaunchSettings(kind, values[1], values[2], values[3])
@@ -431,13 +451,49 @@ def publish_pending(registry: Path) -> bool:
         return _publish(target.repository, path, "rows written while main was busy", registry_rows.replay_pending)
 
 
+class RegistryPublication(StrEnum):
+    SHARED = "confirmed"
+    DEFERRED = "deferred"
+    LOCAL_ONLY = "disabled"
+    UNCONFIRMED = "unconfirmed"
+
+
+class SavedRegistry(NamedTuple):
+    text: str
+    changed: bool
+    publication: RegistryPublication
+    detail: str = ""
+
+
 def store_registry(registry: Path, before: str, after: str, description: str, *,
-                   additive_catalog: bool = False) -> str:
-    """Write the registry live before waiting for publication. Keep the live rows if publication fails."""
+                   additive_catalog: bool = False, preserve_producer_rows: bool = False) -> str:
+    """Save the registry and report a publication failure to existing callers."""
+    saved = save_registry(registry, before, after, description, additive_catalog=additive_catalog,
+                          preserve_producer_rows=preserve_producer_rows)
+    if saved.publication == RegistryPublication.UNCONFIRMED:
+        raise OSError(f"the rows are live; main does not have them yet: {saved.detail}; the notes timer tries again")
+    return saved.text
+
+
+def save_registry(registry: Path, before: str, after: str, description: str, *,
+                  additive_catalog: bool = False, preserve_producer_rows: bool = False) -> SavedRegistry:
+    """Return the local save and the outcome of publication."""
     path = registry.resolve()
     changes = [row for row in registry_rows.changes(before, after)
                if not additive_catalog or row.section in ("codex.agents", "codex.families")]
     replay = registry_rows.replay_pending
+    if preserve_producer_rows:
+        keys = {(row.section, row.key) for row in changes}
+        if any(section != "producers" for section, _ in keys) or keys & registry_rows.values(before).keys():
+            raise ValueError("expected new producer rows")
+
+        def replay_preserving_producers(head: str, local: str, target: str) -> str:
+            existing = registry_rows.values(target)
+            pending = [row for row in registry_rows.changes(head, local)
+                       if (row.section, row.key) not in keys or (row.section, row.key) not in existing]
+            return registry_rows.replay(target, pending, False)
+
+        replay = replay_preserving_producers
     target = _publish_repository(path)
     lock_path = _publish_lock_path(target, path)
     with ExitStack() as locks:
@@ -446,26 +502,35 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
         if isinstance(target, SharedRegistry):
             journal = locks.enter_context(waiting_rows.locked_journal(waiting_rows.journal_path()))
             journal.restore(target.repository, "HEAD")
-        if changes:
-            latest = registry_text(path)
-            result = registry_rows.replay(latest, changes, additive_catalog)
-            if additive_catalog:
-                replay = _catalog_replay(latest, result, changes)
-            if registry_rows.values(latest) != registry_rows.values(result):
-                write_text_atomic(path, after if latest == before and not additive_catalog else result)
-    if (isinstance(target, SharedRegistry) and path == DEFAULT_PATH.resolve()
-            and os.environ.get("MODELS_CONFIG_PUBLISH") not in ("0", "later")):
-        try:
-            with ExitStack() as locks:
-                if _on_main(target):
-                    locks.enter_context(main_push_lock.main_push_lock(target.repository))
-                lock = locks.enter_context(lock_path.open("a"))
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                _ = _publish(target.repository, path, description, replay)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise OSError(f"the rows are live; main does not have them yet: {' '.join(str(error).split())}; "
-                          + "the notes timer tries again") from error
-    return registry_text(path)
+        latest = registry_text(path)
+        if preserve_producer_rows:
+            existing = registry_rows.values(latest)
+            changes = [row for row in changes if (row.section, row.key) not in existing]
+        result = registry_rows.replay(latest, changes, additive_catalog) if changes else latest
+        if changes and additive_catalog:
+            replay = _catalog_replay(latest, result, changes)
+        changed = registry_rows.values(latest) != registry_rows.values(result)
+        if changed:
+            result = after if latest == before and not additive_catalog else result
+            write_text_atomic(path, result)
+    if not isinstance(target, SharedRegistry) or path != DEFAULT_PATH.resolve():
+        return SavedRegistry(result, changed, RegistryPublication.LOCAL_ONLY)
+    publish = os.environ.get("MODELS_CONFIG_PUBLISH")
+    if publish == "0":
+        return SavedRegistry(result, changed, RegistryPublication.LOCAL_ONLY)
+    if publish == "later":
+        return SavedRegistry(result, changed, RegistryPublication.DEFERRED)
+    try:
+        with ExitStack() as locks:
+            if _on_main(target):
+                locks.enter_context(main_push_lock.main_push_lock(target.repository))
+            lock = locks.enter_context(lock_path.open("a"))
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            _ = _publish(target.repository, path, description, replay)
+            result = registry_text(path)
+    except (OSError, subprocess.SubprocessError) as error:
+        return SavedRegistry(result, changed, RegistryPublication.UNCONFIRMED, " ".join(str(error).splitlines()))
+    return SavedRegistry(result, changed, RegistryPublication.SHARED)
 
 
 def _producer_candidate(name: str, family: str, model: str, effort: str) -> tuple[Path, str, str, LaunchSettings]:

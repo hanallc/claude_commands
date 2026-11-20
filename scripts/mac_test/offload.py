@@ -1242,6 +1242,10 @@ def decline_already_shown(reason: MacDeclineReason, last_decline: LastMacDecline
     return isinstance(last_decline, PriorMacDecline) and reason == last_decline.reason
 
 
+def fetch_result(result: MacOffloadResult) -> FetchResult:
+    return result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
+
+
 def write_result(
     result: MacOffloadResult,
     destination: ResultDestination,
@@ -1304,7 +1308,6 @@ def write_result(
             reason = result.reason
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the {label} ({description})")
-    fetched = result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
     fixed = result.fix if isinstance(result, PassedOnMac) else FIX_NOT_RUN
     if isinstance(destination, ResultFile):
         holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
@@ -1320,14 +1323,10 @@ def write_result(
             details += f'build_target_directory={result.build_target_directory}\n'
         _ = destination.path.write_text(
             f"{prefix}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line + details
-            + (f"fetch={fetch_word(fetched)}\n" if isinstance(fetch, FetchFolder) else "")
+            + (f"fetch={fetch_word(fetch_result(result))}\n" if isinstance(fetch, FetchFolder) else "")
             + (f"fix={fix_return.fix_word(fixed)}\n" if verb == "mend-fix" else ""),
             encoding="utf-8",
         )
-    if isinstance(fetch, FetchFolder):
-        report_fetch(fetch, fetched)
-    if verb == "mend-fix" and isinstance(result, PassedOnMac):
-        report_fix(fixed)
     return status
 
 
@@ -3539,14 +3538,15 @@ def write_attempt_records(controller: ProcessController, request: OffloadRequest
         try:
             _ = entry.write()
         except Exception as error:
-            if entry in hana_writes:
-                store.note_error(f'Could not record {entry.name}: {error}')
-            with suppress(OSError):
-                print(f'offload: Cannot record {entry.name} ({type(error).__name__}).', file=sys.stderr)
+            with suppress(Exception):
+                if entry in hana_writes:
+                    store.note_error(f'Could not record {entry.name}: {error}')
+                if sys.stderr is not None:
+                    print(f'offload: Cannot record {entry.name} ({type(error).__name__}).', file=sys.stderr)
 
 
-def finish_offload(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult, started: float) -> int:
-    """Deliver the result before any record write for this completion."""
+def publish_offload_result(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult) -> int:
+    """Deliver the command output and publish the caller's result."""
     output = controller.hana_output
     if output.stdout:
         _ = sys.stdout.buffer.write(output.stdout)
@@ -3554,12 +3554,30 @@ def finish_offload(controller: ProcessController, request: OffloadRequest, resul
     if output.stderr:
         _ = sys.stderr.buffer.write(output.stderr)
         _ = sys.stderr.buffer.flush()
-    status = write_result(result, request.result, request.last_decline, request.verb, request.target,
-                          controller.attempt_evidence, request.fetch)
-    if isinstance(controller.pending, PendingHanaOperation):
-        print(f'offload: Hana cleanup pending. {controller.pending.reason}', file=sys.stderr)
-    write_attempt_records(controller, request, result, started, controller.hana_record_writes)
-    return status
+    return write_result(result, request.result, request.last_decline, request.verb, request.target,
+                        controller.attempt_evidence, request.fetch)
+
+
+def report_result_details(request: OffloadRequest, result: MacOffloadResult) -> None:
+    """Print the Mac fetch or fix summary after publication."""
+    if sys.stdout is None:
+        return
+    if isinstance(request.fetch, FetchFolder):
+        report_fetch(request.fetch, fetch_result(result))
+    if request.verb == "mend-fix" and isinstance(result, PassedOnMac):
+        report_fix(result.fix)
+
+
+def report_offload_completion(controller: ProcessController, request: OffloadRequest,
+                              result: MacOffloadResult, started: float) -> None:
+    """Report completion after the caller has the verdict."""
+    with suppress(Exception):
+        try:
+            report_result_details(request, result)
+            if sys.stderr is not None and isinstance(controller.pending, PendingHanaOperation):
+                print(f'offload: Hana cleanup pending. {controller.pending.reason}', file=sys.stderr)
+        finally:
+            write_attempt_records(controller, request, result, started, controller.hana_record_writes)
 
 
 def main() -> int:
@@ -3626,21 +3644,42 @@ def main() -> int:
             started = time.monotonic()
             result = LostMacRun(0, "replacement placement did not complete")
             request = submit_direct_placement(request, since, config)
-        return finish_offload(controller, request, result, started)
+        status = publish_offload_result(controller, request, result)
     except OffloadInterrupted as interrupted:
         result = LostMacRun(elapsed_seconds(started), f"interrupted by signal {interrupted.signal_number}")
         status = 128 + interrupted.signal_number
     except Exception:
-        traceback.print_exc()
+        if sys.stderr is not None:
+            traceback.print_exc()
         if isinstance(request.result, ResultFile):
             try:
                 request.result.path.unlink(missing_ok=True)
             except OSError:
                 pass
         status = 75
+    else:
+        report_offload_completion(controller, request, result, started)
+        return status
     write_attempt_records(controller, request, result, started)
     return status
 
 
+def flush_cli_output() -> None:
+    """Prevent failed output from changing the exit status at Python shutdown."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        try:
+            _ = stream.flush()
+        except OSError:
+            # Python can retry the failed flush at shutdown.
+            with suppress(OSError, ValueError), open(os.devnull, "wb") as sink:
+                _ = os.dup2(sink.fileno(), stream.fileno())
+        except ValueError:
+            pass
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_status = main()
+    flush_cli_output()
+    raise SystemExit(exit_status)
