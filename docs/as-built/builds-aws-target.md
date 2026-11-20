@@ -913,6 +913,14 @@ Paired trials use this booked cost for completed gates.
 Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
+The Spend tiles show the AWS amount for a day with a bill.
+For an unbilled day, the shared estimate carries storage from the most recent earlier bill.
+It scales public IPv4 in-use hours, request costs, and transfer costs by accepted machine hours.
+The estimate uses a rate only when the earlier bill records machine hours.
+Unknown usage and Cost Explorer request costs have no carry-forward amount.
+The guard uses the same estimate and accounts for query fees, reserves, and headroom separately.
+A Hana demand start accrues compute only after provider acceptance.
+An unaccepted open start still reserves the projected cost.
 Reports keep the existing reconciliation floors.
 The account checks adjust the existing total for each qualifying UTC day inside the limit window.
 They subtract that day's existing usage and add the newest qualifying AWS amount.

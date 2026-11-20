@@ -308,7 +308,7 @@ def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, ho
     seen_generations: set[int] = set()
     now = int(end.timestamp())
     for exposure in snapshot.hana_compute:
-        if exposure.generation in seen_generations:
+        if exposure.generation in seen_generations or not ledger.hana_compute_accrues(snapshot, exposure):
             continue
         seen_generations.add(exposure.generation)
         if exposure.region not in scope.hana_sizes_by_region:

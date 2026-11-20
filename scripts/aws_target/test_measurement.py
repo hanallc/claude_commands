@@ -97,10 +97,10 @@ class MeasurementTests(MeasurementFixture):
                     self.assertEqual(result.usd, ledger.period_cost(full.intervals, left, right))
 
         reading = ledger.ChargeRead(DAY, now, start, end, Decimal(24), Decimal(0), Decimal(1),
-                                   (ledger.UsageTypeCost('storage', Decimal(24)),))
+                                   (ledger.UsageTypeCost('EBS:VolumeUsage.gp3', Decimal(24)),))
         _ = book.refresh_charges(self.settings, now, lambda _start, _end: (reading,))
         with read_only_evidence(self, self.state):
-            for day, expected in (('2026-01-14', Decimal(25)), (DAY, Decimal(24)), ('2026-01-16', Decimal(1))):
+            for day, expected in (('2026-01-14', Decimal(6)), (DAY, Decimal(24)), ('2026-01-16', Decimal(1))):
                 with self.subTest(day=day, source='account bill'):
                     result = narrow(self, measurement.daily_usage(
                         self.settings, self.state, day, now), measurement.DailyUsage)

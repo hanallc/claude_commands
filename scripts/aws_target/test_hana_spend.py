@@ -53,6 +53,16 @@ class HanaSpendTests(CostFixture):
         self.assertEqual(result.exposure.expires, self.start + self.workload.permit_max_seconds)
         self.assertEqual(state.hana_storage[0].usd_per_month, self.workload.storage_usd_per_month)
 
+    def test_demand_start_accrues_only_after_acceptance(self) -> None:
+        reserved = self.controller.reserve_start(self.start, self.start + self.workload.permit_max_seconds)
+        assert isinstance(reserved, hana_spend.StartReserved)
+        now = self.start + 60
+        pending = self.book.read_snapshot()
+        self.assertFalse(any(row.kind == 'instance' for row in ledger.hana_intervals(pending, now, 60)))
+        self.assertTrue(any(row.kind == 'instance' for row in ledger.hana_intervals(pending, now, 60, reserve=True)))
+        self.controller.reconcile(now, 'running', generation=reserved.exposure.generation)
+        self.assertTrue(any(row.kind == 'instance' for row in ledger.hana_intervals(self.book.read_snapshot(), now, 60)))
+
     def test_fallback_types_reject_empty_items_and_duplicates(self) -> None:
         configuration = self.root / 'hana_aws.conf'
         for value in ('c7a.4xlarge,', ',m7i.4xlarge', 'c7a.4xlarge,c7a.4xlarge',

@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from contextlib import redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 import fcntl
 import io
@@ -18,7 +18,7 @@ from unittest import mock
 import unittest
 from zoneinfo import ZoneInfo
 
-from scripts.aws_target import aws_trial, config, ledger
+from scripts.aws_target import aws_page, aws_trial, config, ledger, run_cost, spend
 from scripts.aws_target.ledger_test_support import CostFixture, charge_readings, git_only, instant
 from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
@@ -39,6 +39,89 @@ class LedgerTests(CostFixture):
     def inventory(self, at: int, monthly: str = "0") -> None:
         self.book.record_inventory(ledger.ResourceInventory(
             at, (ledger.PricedResource("retained-storage", Decimal(monthly)),), "priced fixture inventory"))
+
+    def test_day_tile_and_guard_exclude_cancelled_starts_and_scale_machine_activity(self) -> None:
+        self.replace('limit_reserve_usd', '0')
+        bill_start = instant('2026-11-18T00:00:00+00:00')
+        today = bill_start + 2 * 86400
+        now = today + 7200
+        self.book.record_inventory(ledger.ResourceInventory(bill_start, (), 'fixture', builder_removed=True))
+        self.observe(bill_start, 'terminated')
+        types = (
+            ledger.UsageTypeCost('USE2-SpotUsage:c7a.4xlarge', Decimal('6.00'), Decimal(2), 'Hrs'),
+            ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal('1.16')),
+            ledger.UsageTypeCost('USE2-EBS:SnapshotUsage', Decimal('.01')),
+            ledger.UsageTypeCost('USE2-TimedStorage-ByteHrs', Decimal('.01')),
+            ledger.UsageTypeCost('USE2-Requests-Tier1', Decimal('.20')),
+            ledger.UsageTypeCost('USE2-DataTransfer-Out-Bytes', Decimal('.07')),
+            ledger.UsageTypeCost('USE2-PublicIPv4:InUseAddress', Decimal('.26')),
+            ledger.UsageTypeCost('CostExplorer-APIRequest', Decimal('.02')),
+        )
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-11-18', now,
+            bill_start, bill_start + 86400, Decimal('7.73'), Decimal(0), Decimal(0), types))
+        provider = self.state / 'hana' / 'provider'
+        provider.mkdir(parents=True)
+        with self.book.transaction() as evidence:
+            for generation in range(1, 27):
+                at = today + 142 * generation
+                evidence.hana_compute.append(ledger.HanaComputeExposure(at, at + 600, generation,
+                    Decimal('.288'), ledger.HanaExposureClosed(at + 136), region='us-east-2'))
+                _ = (provider / f'start-{generation}.json').write_text(json.dumps({
+                    'action': 'start', 'generation': generation, 'dispatched': True, 'cancelled': True}))
+            evidence.gate_reservations.append(ledger.GateReservation('refused', today, today + 600,
+                Decimal(3), Decimal(1), state=ledger.GateAbsent(today + 60), region='us-east-2'))
+        settings = config.read_settings(self.settings)
+        scope = run_cost.SpotHoursScope(('m7a.4xlarge',), {'us-east-2': ('m7a.4xlarge',)})
+        start, end = datetime.fromtimestamp(today, UTC), datetime.fromtimestamp(now, UTC)
+
+        def amounts(expected: Decimal, expected_hours: Decimal) -> None:
+            days = self.book.spend_days(settings, now)
+            by_day = {day.day: day for day in days}
+            forecast = by_day['2026-11-20']
+            self.assertEqual(forecast.usd, expected)
+            self.assertEqual(forecast.runs, 0)
+            self.assertEqual(by_day['2026-11-18'].usd, Decimal('7.73'))
+            self.assertEqual(by_day['2026-11-18'].source, 'AWS bill')
+            month = spend.month_spend(days, end.date(), 1)
+            assert month is not None
+            self.assertEqual(month.to_date, Decimal('8.91') + expected)
+            tiles = aws_page.spend_data(spend.Spend(days, settings.daily_limit_usd, settings.monthly_limit_usd), now, 1)
+            self.assertEqual(tiles['tiles'][0]['usd'], f'${expected:.2f}')
+            self.assertEqual(tiles['tiles'][2]['usd'], f'${month.to_date:.2f}')
+            costs = self.guard(now).evidence.costs
+            assert isinstance(costs, ledger.CostEstimate)
+            self.assertEqual((costs.daily.usd, costs.monthly.usd), (expected, month.to_date))
+            self.assertEqual(self.book.accrued_cost(self.settings, now, window='day').limit_count, expected)
+            self.assertEqual(self.book.accrued_cost(self.settings, now, window='month').limit_count, month.to_date)
+            hours = run_cost.day_hours_checks(self.book, start, datetime.fromtimestamp(today + 86400, UTC),
+                                               'us-east-2', settings.instance_type, scope, Decimal(1))
+            self.assertEqual(sum((row.hana_reserved_hours for row in hours.values()), Decimal(0)), expected_hours)
+
+        amounts(Decimal('1.18'), Decimal(0))
+        with self.book.transaction() as evidence:
+            evidence.hana_compute.append(ledger.HanaComputeExposure(now - 1800, now + 60, 27,
+                Decimal('.28'), ledger.HanaExposureClosed(now), region='us-east-2'))
+        _ = (provider / 'accepted-start.json').write_text(json.dumps({
+            'action': 'start', 'generation': 27, 'dispatched': True, 'accepted': True, 'cancelled': True}))
+        amounts(Decimal('1.4525'), Decimal('.5'))
+
+    def test_unbilled_day_ignores_unclassified_usage_and_activity_without_billed_hours(self) -> None:
+        self.inventory(self.start)
+        self.observe(self.start, 'terminated')
+        end = self.start + 86400
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-15', end, self.start, end,
+            Decimal(20), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-EBS:VolumeUsage.gp3', Decimal(1)),
+                ledger.UsageTypeCost('USE2-EBS:VolumeIOUsage', Decimal(3)),
+                ledger.UsageTypeCost('USE2-PublicIPv4:InUseAddress', Decimal(5)),
+                ledger.UsageTypeCost('UnknownUsage', Decimal(7)),
+            )))
+        with self.book.transaction() as evidence:
+            evidence.hana_compute.append(ledger.HanaComputeExposure(end, end + 3600, 1,
+                Decimal(2), ledger.HanaExposureClosed(end + 3600), region='us-east-2'))
+        days = {row.day: row for row in self.book.spend_days(config.read_settings(self.settings), end + 7200)}
+        self.assertEqual(days['2026-01-15'].usd, Decimal(20))
+        self.assertEqual(days['2026-01-16'].usd, Decimal(3))
 
     def test_quota_refusal_without_saved_time_is_expired(self) -> None:
         pool = ledger.SpotQuotaPool('us-west-2', ledger.SpotQuotaClass.STANDARD)
@@ -599,7 +682,7 @@ class LedgerTests(CostFixture):
         self.assertEqual(days['2026-01-15'].runs, 3)
         request = ledger.GateReservation('next', now, now + 60, Decimal('.9'), Decimal('.02'), instance_type='m7a.8xlarge')
         # The passing daily cap includes both open allowances.
-        for daily, monthly, reason in (('3.445', '400', 'daily_limit'), ('3.50', '9.745', 'monthly_limit')):
+        for daily, monthly, reason in (('3.445', '400', 'daily_limit'), ('3.50', '4.945', 'monthly_limit')):
             with self.subTest(reason=reason):
                 self.costs({'daily_limit_usd': daily, 'monthly_limit_usd': monthly})
                 self.assertEqual(self.book.reserve_gate(self.settings, request), ledger.GateCapReached(reason))
@@ -854,7 +937,7 @@ class LedgerTests(CostFixture):
         self.assertEqual(costs.daily.usd, Decimal(0))
 
     def test_accrued_cost_uses_each_day_source_and_the_guard_limit_count(self) -> None:
-        self.costs({'monthly_limit_usd': '10.03',
+        self.costs({'monthly_limit_usd': '9.513',
                     'cost_explorer_read_usd': '.01'})
         first = instant('2026-01-01T00:00:00+00:00')
         second = first + 86400
@@ -878,9 +961,9 @@ class LedgerTests(CostFixture):
         self.assertEqual(accrued.days, (
             ledger.AccruedDay(date(2026, 1, 1), Decimal('2.01'), 'billed_not_final', None, fee),
             ledger.AccruedDay(date(2026, 1, 2), Decimal('3.01'), 'estimate', Decimal(5), fee),
-            ledger.AccruedDay(date(2026, 1, 3), Decimal('1.01'), 'estimate', None, fee),
+            ledger.AccruedDay(date(2026, 1, 3), Decimal('.493'), 'estimate', None, fee),
         ))
-        self.assertEqual(accrued.cost, Decimal('6.03'))
+        self.assertEqual(accrued.cost, Decimal('5.513'))
         self.assertEqual(sum((day.cost for day in accrued.days), Decimal(0)), accrued.cost)
         self.assertEqual(accrued.reserves, Decimal(1))
         self.assertEqual(accrued.limit_count, accrued.cost + accrued.reserves + accrued.headroom)
@@ -900,14 +983,14 @@ class LedgerTests(CostFixture):
         self.assertEqual(self.book.accrued_cost(self.settings, now, window='month'), accrued)
         daily = self.book.accrued_cost(self.settings, now, window='day')
         self.assertEqual(daily, ledger.AccruedCost(
-            Decimal('1.01'), Decimal('5.01'), Decimal(1), Decimal(3), accrued.days[-1:]))
+            Decimal('.493'), Decimal('4.493'), Decimal(1), Decimal(3), accrued.days[-1:]))
         decision = self.guard(now)
         self.assertIsInstance(decision, ledger.SpendingRefused)
         assert isinstance(decision, ledger.SpendingRefused)
         self.assertEqual(decision.reason, 'monthly_limit')
         notice, = self.notices
         self.assertEqual(notice.estimate_usd + config.read_settings(self.settings).limit_reserve_usd, accrued.limit_count)
-        self.assertEqual(accrued.limit_count, Decimal('10.03'))
+        self.assertEqual(accrued.limit_count, Decimal('9.513'))
 
     def test_accrued_cost_estimates_a_day_with_a_damaged_charge_file(self) -> None:
         start = self.start

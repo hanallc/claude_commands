@@ -286,6 +286,7 @@ class AwsHanaProvider:
     def _record_milestone(self, path: Path, saved: dict[str, object], operation: box.PendingOperation,
                           milestone: MutationMilestone) -> None:
         saved['generation'] = operation.generation
+        saved['action'] = operation.action.value
         now = self.clock()
         if milestone == MutationMilestone.DISPATCHED:
             saved['dispatched_at'] = int(now)
@@ -309,7 +310,7 @@ class AwsHanaProvider:
                 saved: dict[str, object] = remote.read_record(path) if path.exists() else {}
                 if saved.get('cancelled') is True:
                     raise ProviderPending('The Hana ' + operation.action.value + ' operation is cancelled')
-                if saved.get('accepted') is True:
+                if remote.mutation_accepted(saved):
                     return self._accepted(identity, start, operation)
                 acceptance = MutationMilestone.DIRECT_ACCEPTANCE
                 if saved:
@@ -390,11 +391,12 @@ class AwsHanaProvider:
                 if abandon_start:
                     read_started_at = self.clock()
                     observed = self._observation(identity, start)
+                    _ = self._record_observed_start(path, saved, operation, observed)
                     if saved.get('cancelled') is not True:
                         saved = {**saved, 'version': 1, 'token': operation.token, 'cancelled': True}
                         self._record_milestone(path, saved, operation, MutationMilestone.START_ABANDONED)
                     if operation.action == box.Action.START and observed.state == 'stopped':
-                        if saved.get('accepted') is True:
+                        if remote.mutation_accepted(saved):
                             return box.StartMayBeRunning(operation.token, observed)
                         if saved.get('dispatched') is True:
                             return self._recover_fenced_start(path, operation, saved, observed, read_started_at)
@@ -402,6 +404,16 @@ class AwsHanaProvider:
                 return self._recover(identity, start, operation, path, saved)
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _record_observed_start(self, path: Path, saved: dict[str, object], operation: box.PendingOperation,
+                               observed: box.BoxObservation) -> bool:
+        if operation.action != box.Action.START or observed.state not in ('pending', 'running', 'stopping'):
+            return False
+        if (saved.get('dispatched') is True and saved.get('generation') == operation.generation
+                and not remote.mutation_accepted(saved)):
+            saved['accepted'] = True
+            self._record_milestone(path, saved, operation, MutationMilestone.OBSERVED_ACCEPTANCE)
+        return True
 
     def _recover_fenced_start(self, path: Path, operation: box.PendingOperation, saved: dict[str, object],
                               observed: box.BoxObservation, read_started_at: float) -> box.MutationRecovery:
@@ -421,13 +433,13 @@ class AwsHanaProvider:
         read_started_at = self.clock()
         observed = self._observation(identity, box.NoDemandStart() if operation.action == box.Action.BOOTSTRAP else start)
         if (operation.action == box.Action.START and observed.state == 'stopped'
-                and saved.get('dispatched') is True and saved.get('accepted') is not True
+                and saved.get('dispatched') is True and not remote.mutation_accepted(saved)
                 and saved.get('cancelled') is True):
             return self._recover_fenced_start(path, operation, saved, observed, read_started_at)
-        settled = not saved or saved.get('accepted') is True or saved.get('cancelled') is True
-        if saved and saved.get('accepted') is not True and saved.get('cancelled') is not True:
+        settled = not saved or remote.mutation_accepted(saved) or saved.get('cancelled') is True
+        if saved and not remote.mutation_accepted(saved) and saved.get('cancelled') is not True:
             if operation.action == box.Action.START:
-                settled = observed.state in ('pending', 'running', 'stopping')
+                settled = self._record_observed_start(path, saved, operation, observed)
             elif operation.action == box.Action.STOP:
                 settled = observed.state in ('stopped', 'stopping', 'terminated')
             elif (operation.action == box.Action.BOOTSTRAP
