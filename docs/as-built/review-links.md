@@ -19,7 +19,7 @@ The flow:
 
 1. The skill runs `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/review_link.py <file>... [--new]` on the machine that has the files. `scripts/lib/py` finds Python 3.12 or later. Inline programs import from the shim’s repository root through `PYTHONPATH` and `-P`. File scripts keep their existing import path behavior.
 2. The publisher checks every input, gets the host, writes the snapshot under the index lock and prints one URL per file.
-3. The skill fetches each URL with `curl` on the same machine. It gives only the links that return `200`, as clickable Markdown links that show the file name.
+3. The skill fetches each URL with `curl` on the same machine. It gives only the links that return `200`, each as the full URL in plain text. The user's terminal cannot open a Markdown link.
 4. The browser on the Mac gets the file from the server on that machine, over the tailnet.
 
 ### Publisher
