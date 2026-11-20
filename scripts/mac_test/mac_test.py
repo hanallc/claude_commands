@@ -1612,7 +1612,8 @@ def claim_needs_settlement(paths: StatePaths, record: claim_state.RemoteClaim) -
 
 def settle_retained_mac_claims(paths: StatePaths, settings: Path, *,
                               configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
-                              now: Callable[[], float] = time.time) -> claim_state.MacCiReading:
+                              read_ci: Callable[[conf.ConfigRead], claim_state.MacCiReading] = mac_ci.read_mac_ci_activity
+                              ) -> claim_state.MacCiReading:
     """Settle exact retained claims and read CI activity before a capacity check."""
     with locked(paths.lock):
         claims = read_claims(paths)
@@ -1623,8 +1624,7 @@ def settle_retained_mac_claims(paths: StatePaths, settings: Path, *,
                 _ = release_exact_claims(paths, record["pid"], claim_state.claim_identity(record), str(settings))
             except (OSError, ValueError):
                 continue
-    return mac_ci.read_mac_ci_activity(
-        configuration if isinstance(configuration, conf.ConfigRead) else conf.read(settings), now)
+    return read_ci(configuration if isinstance(configuration, conf.ConfigRead) else conf.read(settings))
 
 
 def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:

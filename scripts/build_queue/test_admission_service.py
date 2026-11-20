@@ -47,7 +47,6 @@ from scripts.lib import conf
 from scripts.lib import inotify, test_hang_guard
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
-from scripts.mac_test.claim_state import MacCiActivity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import session_send
 from scripts.production import staff
@@ -977,8 +976,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 entered.set()
                 if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
                     raise AssertionError("the test did not release the probe")
-                return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost(),
-                    mac_ci=MacCiActivity.IDLE)
+                return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
 
             fixture.server.host_probe = probe
             request = placement_request(fixture)
@@ -1040,8 +1038,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                     entered.set()
                     if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
                         raise AssertionError("the test did not release the probe")
-                    return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost(),
-                        mac_ci=MacCiActivity.IDLE)
+                    return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
 
                 fixture.server.host_probe = probe
                 request = placement_request(fixture)
@@ -1300,8 +1297,7 @@ class LocalHoldPlacementTests(unittest.TestCase):
                         raise OSError("private provider unavailable")
                     if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
                         raise AssertionError("the test did not release the hanging probe")
-                    return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost(),
-                        mac_ci=MacCiActivity.IDLE)
+                    return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
 
                 fixture.server.host_probe = probe
                 request = placement_request(fixture)

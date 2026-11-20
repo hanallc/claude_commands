@@ -26,6 +26,7 @@ from scripts.build_queue import execution_identity
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import eligibility, nextest_log, offload, claim_state
+from scripts.mac_test.mac_ci_test_support import idle_ci_reading
 from scripts.build_queue import admission_client, admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import caller_admission
 if TYPE_CHECKING:
@@ -724,9 +725,10 @@ class OffloadSettingsTests(unittest.TestCase):
         request = wire.PlacementRequest(local.episode,
             placement.SubmittingOwner(fixture.server.host, local.owner.pid, local.owner.start_time),
             local.since, local.profile, constraints, identity=local.identity, code_version=local.code_version)
+        observed_at = fixture.clock.now()
         fixture.server.publish_host_evidence(placement.FreshHostEvidence(
-            fixture.server.host_evidence_key(request, target), fixture.clock.now(), "", placement.AllowedHost(),
-            mac_ci=claim_state.MacCiActivity.IDLE))
+            fixture.server.host_evidence_key(request, target), observed_at, "", placement.AllowedHost(),
+            mac_ci=idle_ci_reading(observed_at)))
         assigned, = fixture.server.handle_request(request)
         self.assertIsInstance(assigned, wire.Assignment)
         assignment_file = self.root / "probe.assignment"

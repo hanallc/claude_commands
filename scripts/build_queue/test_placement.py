@@ -29,7 +29,7 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
 from scripts.mac_test import claim_state, eligibility, mac_ci, mac_test, offload
-from scripts.mac_test.mac_ci_test_support import BUSY_PROCESS_LIST, IDLE_PROCESS_LIST
+from scripts.mac_test.mac_ci_test_support import BUSY_PROCESS_LIST, IDLE_PROCESS_LIST, idle_ci_reading
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
@@ -59,7 +59,11 @@ class PlacementFixture(AdmissionFixture):
     def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
         if key.destination.provider == "local" and key not in self.provider_evidence:
             return placement.FreshHostEvidence(key, self.clock.now(), "", placement.AllowedHost())
-        return self.provider_evidence.get(key, placement.HostEvidenceUnavailable(key, self.clock.now(), "not read"))
+        evidence = self.provider_evidence.get(key, placement.HostEvidenceUnavailable(key, self.clock.now(), "not read"))
+        if (key.destination.provider == "mac" and isinstance(evidence, placement.FreshHostEvidence)
+                and isinstance(evidence.mac_ci, claim_state.NoMacCiReading)):
+            return replace(evidence, mac_ci=idle_ci_reading(evidence.observed_at))
+        return evidence
 
     @override
     def new_server(self, *, start: bool = True) -> ObservedAdmissionServer:
@@ -105,8 +109,9 @@ def publish_candidate(fixture: PlacementFixture, request: wire.PlacementRequest,
                       claims: tuple[placement.AdoptedProviderClaim, ...] = ()) -> placement.FreshHostEvidence:
     destination = request.constraints.candidates[0].destination
     key = fixture.server.host_evidence_key(request, destination)
-    evidence = placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a", eligibility, claims,
-        mac_ci=claim_state.MacCiActivity.IDLE)
+    observed_at = fixture.clock.now()
+    evidence = placement.FreshHostEvidence(key, observed_at, "host-generation-a", eligibility, claims,
+        mac_ci=idle_ci_reading(observed_at))
     fixture.provider_evidence[key] = evidence
     fixture.server.publish_host_evidence(evidence)
     return evidence
@@ -602,7 +607,7 @@ class MacBuildLimitTests(unittest.TestCase):
                     self.assertEqual(read.call_args.args[0][-2:], ["fixture-mac", mac_ci.PROCESS_LIST_COMMAND])
                     self.assertEqual(read.call_args.kwargs["timeout"], 7)
                     assert isinstance(evidence, placement.FreshHostEvidence)
-                    self.assertIs(evidence.mac_ci, activity)
+                    self.assertEqual(evidence.mac_ci, claim_state.MacCiReading(activity, fixture.clock.now()))
                     fixture.provider_evidence[key] = evidence
                     fixture.server.publish_host_evidence(evidence)
 
@@ -638,76 +643,7 @@ class MacBuildLimitTests(unittest.TestCase):
                       getattr(fixture.server, "_host_evidence_reader"))
         return reader(key, records.read_memory_config().waiting_pass_seconds)
 
-    def test_an_older_waiter_gets_the_mac_when_it_frees_during_a_pass(self) -> None:
-        with (self.mac_fixture(1) as (fixture, _paths),
-              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
-            older = self.request(fixture, "hana", kind="run", publish=False)
-            fixture.clock.advance(1)
-            younger = self.request(fixture, "hana", kind="run", publish=False)
-            younger = replace(younger, constraints=replace(younger.constraints, session=OwningSession("younger")))
-            for request in (older, younger):
-                reply, = fixture.connect(request).replies()
-                self.assertIsInstance(reply, wire.PlacementWait)
-
-            readers = tuple(fixture.server.host_readers.values())
-            first, second = readers
-            worker = first.worker
-            assert isinstance(worker, ManualEvidenceWorker)
-            self.assertIs(second.worker, worker)
-            fixture.server.host_probe = fixture.read_host_evidence
-            busy = True
-
-            def read_availability(*_arguments: object, **_options: object) -> mac_test.FreeNowAnswer:
-                nonlocal busy
-                if busy:
-                    busy = False
-                    fixture.clock.advance(1)
-                    return "busy"
-                return "free"
-
-            idle_ci = subprocess.CompletedProcess(["ssh"], 0, IDLE_PROCESS_LIST, "")
-            with (mock.patch.object(mac_ci, "run", return_value=idle_ci) as read,
-                  mock.patch.object(mac_test, "free_now", side_effect=read_availability)):
-                worker.probe_due_pass()
-                read.assert_called_once()
-                older_evidence, younger_evidence = first.latest, second.latest
-                assert isinstance(older_evidence, placement.FreshHostEvidence), older_evidence
-                assert isinstance(younger_evidence, placement.FreshHostEvidence), younger_evidence
-                self.assertEqual(older_evidence.eligibility, placement.TemporaryExclusion("busy"))
-                self.assertEqual(younger_evidence.eligibility, ALLOWED_HOST)
-
-                _ = fixture.run_pass()
-                self.assertEqual(fixture.server.current_assignments, {})
-                worker.probe_due_pass()
-                _ = fixture.run_pass()
-                self.assertEqual(list(fixture.server.current_assignments), [older.episode])
-
-    def test_a_key_expedited_during_a_mac_pass_runs_next_and_keeps_its_deadline(self) -> None:
-        with (self.mac_fixture(1) as (fixture, _paths),
-              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
-            first, ordinary, expedited = (
-                self.evidence_reader(fixture, self.request(fixture, name, kind="run", publish=False))
-                for name in ("hana", "cargo-liner", "handler"))
-            worker = first.worker
-            assert isinstance(worker, ManualEvidenceWorker)
-            self.assertIs(expedited.worker, worker)
-            probed: list[placement.HostEvidenceKey] = []
-
-            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
-                probed.append(key)
-                if key == first.key:
-                    worker.expedite(expedited.key)
-                return fixture.read_provider(key)
-
-            fixture.server.host_probe = probe
-            with mock.patch.object(time, "monotonic", side_effect=fixture.clock.monotonic):
-                worker.probe_due_pass()
-                self.assertEqual(probed, [first.key, expedited.key, ordinary.key])
-                probed.clear()
-                worker.probe_due_pass()
-                self.assertEqual(probed, [expedited.key])
-
-    def test_registered_mac_targets_share_one_ci_read_per_host_pass(self) -> None:
+    def test_registered_mac_targets_reuse_ci_until_the_reading_expires(self) -> None:
         with (self.mac_fixture(1) as (fixture, _paths),
               mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
             _ = fixture.run_pass()
@@ -722,74 +658,44 @@ class MacBuildLimitTests(unittest.TestCase):
             spare = replace(candidate, destination=replace(candidate.destination, target="spare-mac"))
             secondary = self.evidence_reader(fixture, replace(request,
                 constraints=replace(request.constraints, candidates=(spare,))))
-            self.assertIs(primary.worker, secondary.worker)
-            worker = primary.worker
-            assert isinstance(worker, ManualEvidenceWorker)
+            first, second = primary.worker, secondary.worker
+            self.assertIsNot(first, second)
+            assert isinstance(first, ManualEvidenceWorker)
+            assert isinstance(second, ManualEvidenceWorker)
             fixture.server.host_probe = fixture.read_host_evidence
 
-            probe_spacing = 1.0
-            for output, activity in ((BUSY_PROCESS_LIST, claim_state.MacCiActivity.RUNNING),
-                                     (IDLE_PROCESS_LIST, claim_state.MacCiActivity.IDLE)):
-                with self.subTest(activity=activity):
-                    worker.expedite(primary.key)
-                    worker.expedite(secondary.key)
-                    started = fixture.clock.now()
-
-                    def ci_reply(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-                        fixture.clock.advance(probe_spacing)
-                        return subprocess.CompletedProcess(arguments, 0, output, "")
-
-                    with mock.patch.object(mac_ci, "run", side_effect=ci_reply) as read:
-                        worker.probe_due_pass()
-                    read.assert_called_once()
-                    self.assertEqual(read.call_args.args[0][-2:], ["fixture-mac", mac_ci.PROCESS_LIST_COMMAND])
-                    later_probe_at = fixture.clock.now()
-                    for reader, observed_at in ((primary, started), (secondary, later_probe_at)):
-                        evidence = reader.latest
-                        assert isinstance(evidence, placement.FreshHostEvidence), evidence
-                        self.assertIs(evidence.mac_ci, activity)
-                        self.assertEqual(evidence.observed_at, observed_at)
-                        self.assertEqual(evidence.mac_ci_observed_at, started)
-                    config = records.read_memory_config()
-                    lifetime = config.waiting_pass_seconds + secondary.timeout
-                    fixture.clock.advance(lifetime - probe_spacing / 2)
-                    self.assertEqual(fixture.server.host_evidence(secondary.key), placement.StaleHostEvidence(
-                        secondary.key, later_probe_at, "Mac CI evidence expired"))
-
-    def test_mac_evidence_pass_defers_keys_added_during_a_probe(self) -> None:
-        with (self.mac_fixture(1) as (fixture, _paths),
-              mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
-            first = self.evidence_reader(fixture, self.request(fixture, "hana", kind="run", publish=False))
-            arriving = self.request(fixture, "cargo-liner", kind="run", publish=False)
-            worker = first.worker
-            assert isinstance(worker, ManualEvidenceWorker)
-            fixture.server.host_probe = fixture.read_host_evidence
-            added: list[service.HostEvidenceReader] = []
-
-            def ci_reply(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-                added.append(self.evidence_reader(fixture, arriving))
-                return subprocess.CompletedProcess(arguments, 0, BUSY_PROCESS_LIST, "")
-
-            with mock.patch.object(mac_ci, "run", side_effect=ci_reply) as read:
-                worker.probe_due_pass()
-            read.assert_called_once()
-            next_reader, = added
-            self.assertIs(next_reader.worker, worker)
-            self.assertIsInstance(next_reader.latest, placement.HostEvidenceUnavailable)
-            first_evidence = first.latest
-            assert isinstance(first_evidence, placement.FreshHostEvidence), first_evidence
-            self.assertIs(first_evidence.mac_ci, claim_state.MacCiActivity.RUNNING)
-
-            fixture.clock.advance(1)
+            config = records.read_memory_config()
+            lifetime = config.waiting_pass_seconds + secondary.timeout
             started = fixture.clock.now()
-            response = subprocess.CompletedProcess(["ssh"], 0, IDLE_PROCESS_LIST, "")
-            with mock.patch.object(mac_ci, "run", return_value=response) as read:
-                worker.probe_due_pass()
-            read.assert_called_once()
-            next_evidence = next_reader.latest
-            assert isinstance(next_evidence, placement.FreshHostEvidence), next_evidence
-            self.assertIs(next_evidence.mac_ci, claim_state.MacCiActivity.IDLE)
-            self.assertEqual(next_evidence.observed_at, started)
+            responses = tuple(subprocess.CompletedProcess(["ssh"], 0, output, "")
+                              for output in (BUSY_PROCESS_LIST, IDLE_PROCESS_LIST))
+            with mock.patch.object(mac_ci, "run", side_effect=responses) as read:
+                self.assertEqual(first.probe_next(), primary.key)
+                first_evidence = primary.latest
+                assert isinstance(first_evidence, placement.FreshHostEvidence), first_evidence
+                self.assertEqual(first_evidence.mac_ci, claim_state.MacCiReading(claim_state.MacCiActivity.RUNNING, started))
+                self.assertEqual(first_evidence.observed_at, started)
+
+                fixture.clock.advance(lifetime / 2)
+                second_probe_at = fixture.clock.now()
+                self.assertEqual(second.probe_next(), secondary.key)
+                read.assert_called_once()
+                second_evidence = secondary.latest
+                assert isinstance(second_evidence, placement.FreshHostEvidence), second_evidence
+                self.assertIs(second_evidence.mac_ci, first_evidence.mac_ci)
+                self.assertEqual(second_evidence.observed_at, second_probe_at)
+
+                fixture.clock.advance(lifetime * 3 / 4)
+                self.assertEqual(fixture.server.host_evidence(secondary.key), placement.StaleHostEvidence(
+                    secondary.key, second_probe_at, "Mac CI evidence expired"))
+                refreshed_at = fixture.clock.now()
+                self.assertEqual(second.probe_next(), secondary.key)
+                self.assertEqual(first.probe_next(), primary.key)
+                self.assertEqual(read.call_count, len(responses))
+                refreshed = primary.latest
+                assert isinstance(refreshed, placement.FreshHostEvidence), refreshed
+                self.assertEqual(refreshed.mac_ci, claim_state.MacCiReading(claim_state.MacCiActivity.IDLE, refreshed_at))
+                self.assertEqual(refreshed.eligibility, ALLOWED_HOST)
 
     def test_mac_grant_reserves_capacity_from_a_standalone_claim(self) -> None:
         with self.mac_fixture(1) as (fixture, paths):
@@ -2909,8 +2815,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 entered.set()
                 if not finish.wait(5):
                     raise AssertionError("the test did not release the blocked probe")
-                return placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a",
-                    placement.AllowedHost(), mac_ci=claim_state.MacCiActivity.IDLE)
+                return placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a", placement.AllowedHost())
 
             fixture.server.host_probe = blocked_probe
             key = fixture.server.host_evidence_key(request, assignment.destination)
@@ -2957,17 +2862,11 @@ class ManualEvidenceWorker(service.HostEvidenceWorker):
 
     def probe_next(self) -> placement.HostEvidenceKey:
         with self.lock:
-            ready = self._ready_pass(float("inf"))
-            assert ready, "the worker has no key to probe"
-            first = min(ready, key=lambda probe: probe.deadline.at)
-        assert self._probe_pass((first,))
-        return first.key
-
-    def probe_due_pass(self) -> None:
-        with self.lock:
-            ready = self._ready_pass(time.monotonic())
-        assert ready, "the worker has no due key"
-        assert self._probe_pass(ready)
+            ready = self._next_ready(float("inf"))
+        if not isinstance(ready, tuple):
+            raise AssertionError("the worker has no key to probe")
+        _ = self._probe(*ready)
+        return ready[0]
 
 
 @dataclass(frozen=True)
@@ -2996,7 +2895,7 @@ class MacOrderTests(unittest.TestCase):
         older_key = self.provide(fixture, older, placement.TemporaryExclusion("busy"))
         self.assertIsInstance(fixture.connect(older).replies()[-1], wire.PlacementWait)
         _ = fixture.run_pass()
-        worker = fixture.server.host_readers[older_key].worker
+        worker = fixture.server.host_targets[("mac", "mac")]
         assert isinstance(worker, ManualEvidenceWorker)
         self.assertEqual(worker.probe_next(), older_key)
         fixture.clock.advance(1)
@@ -3017,7 +2916,7 @@ class MacOrderTests(unittest.TestCase):
         """Set the Mac reading that the next probe of this request returns."""
         key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
         fixture.provider_evidence[key] = placement.FreshHostEvidence(
-            key, fixture.clock.now(), "host-generation-a", eligibility, mac_ci=claim_state.MacCiActivity.IDLE)
+            key, fixture.clock.now(), "host-generation-a", eligibility)
         return key
 
     @staticmethod
@@ -3091,14 +2990,14 @@ class MacOrderTests(unittest.TestCase):
                                          since=fixture.clock.now() - 1300)
                 readings[self.provide(fixture, tile, ALLOWED_HOST)] = ALLOWED_HOST
                 self.assertIsInstance(fixture.connect(tile).replies()[-1], wire.PlacementWait)
-                worker = fixture.server.host_readers[next(iter(readings))].worker
+                worker = fixture.server.host_targets[("mac", "mac")]
                 assert isinstance(worker, ManualEvidenceWorker)
                 for _probe in range(15):
                     # Each Mac probe takes four seconds, so three probes outlast one reading.
                     fixture.clock.advance(4)
                     for key, eligibility in readings.items():
                         fixture.provider_evidence[key] = placement.FreshHostEvidence(
-                            key, fixture.clock.now(), "host-generation-a", eligibility, mac_ci=claim_state.MacCiActivity.IDLE)
+                            key, fixture.clock.now(), "host-generation-a", eligibility)
                     _ = worker.probe_next()
                     _ = fixture.run_pass()
                 self.assertEqual(self.assigned(fixture, *older, tile), [tile.episode])

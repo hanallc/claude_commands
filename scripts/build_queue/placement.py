@@ -7,7 +7,7 @@ from typing import Literal
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
-from scripts.mac_test.claim_state import ClaimScope, MacCiActivity, NO_MAC_CI_READING, NoMacCiReading
+from scripts.mac_test.claim_state import ClaimScope, MacCiReading, NO_MAC_CI_READING, NoMacCiReading
 
 SubmittingSession = OwningSession | NoOwningSession
 
@@ -468,8 +468,7 @@ class FreshHostEvidence:
     executions: tuple[tuple[ProviderClaimReference, execution_identity.ExecutionEvidence], ...] = ()
     holder: ResourceHolder = ResourceHolderUnknown()
     provider_diagnostic: BusyProviderDiagnostic | NoProviderDiagnostic = NO_PROVIDER_DIAGNOSTIC
-    mac_ci: MacCiActivity = MacCiActivity.UNCHECKED
-    mac_ci_observed_at: float | NoMacCiReading = NO_MAC_CI_READING
+    mac_ci: MacCiReading | NoMacCiReading = NO_MAC_CI_READING
 
 
 @dataclass(frozen=True)

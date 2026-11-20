@@ -22,13 +22,11 @@ The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac 
 `max_active_builds` in `config/mac_test.conf` sets the capacity for each managed Mac target.
 The initial limit is one build across repositories.
 A live `Runner.Worker` on the Mac counts as one Hana CI build.
-The admission service groups registered Mac targets by their configured SSH address.
-Each host pass reads CI once for the placement keys due at its start.
+Each registered target has its own evidence worker.
+Workers reuse the CI reading for the same configured SSH address while it is within the placement evidence age limit.
+The limit is the waiting pass interval plus the target probe timeout.
 The service checks CI freshness from the start of the CI read.
 It uses each placement probe's own time to enforce queue priority.
-An expedited key takes priority among the remaining probes in the pass.
-A key expedited during the pass also stays due for the next pass.
-New keys wait for the next pass and its new CI read.
 The shared settlement step reads CI before a standalone claim takes the state lock.
 An unreadable CI result keeps new agent builds waiting.
 A queue grant reserves a claim under the same lock that a standalone claim uses.
@@ -39,6 +37,7 @@ A replacement grant can clean up an existing claim before it acquires capacity.
 The limit applies to queued Mac runs and standalone claims.
 Interactive Mac terminal work bypasses the limit.
 Hana CI can start at any time.
+A cached idle result can stay in use until its age limit after CI starts.
 
 Converted verify steps execute only at the destination assigned by the queue.
 The queue preserves configured target order.

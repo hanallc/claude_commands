@@ -354,10 +354,17 @@ class MacCiReading:
     activity: MacCiActivity
     observed_at: float
 
+    def is_fresh(self, now: float, max_age: float) -> bool:
+        return now - self.observed_at <= max_age
+
 
 @dataclass(frozen=True)
 class NoMacCiReading:
-    """The evidence has no timestamp for a CI read."""
+    """No Mac CI reading is available."""
+
+    @property
+    def activity(self) -> Literal[MacCiActivity.UNCHECKED]:
+        return MacCiActivity.UNCHECKED
 
 
 NO_MAC_CI_READING = NoMacCiReading()

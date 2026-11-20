@@ -36,6 +36,7 @@ from scripts.build_queue import queue_place as shell_place
 from scripts.build_targets import target_config
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.mac_test import mac_test, claim_state
+from scripts.mac_test.mac_ci_test_support import idle_ci_reading
 from scripts.lib import process_start as process_identity
 from scripts.build_queue import admission_records as records, admission_service as service, step_estimator
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
@@ -561,8 +562,9 @@ class ClientTests(unittest.TestCase):
                         return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
                     if not finish_probe.wait(10):
                         raise AssertionError("the test did not release its private evidence reader")
-                    return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost(),
-                        mac_ci=claim_state.MacCiActivity.IDLE)
+                    observed_at = fixture.clock.now()
+                    return placement.FreshHostEvidence(key, observed_at, "", placement.AllowedHost(),
+                        mac_ci=idle_ci_reading(observed_at))
 
                 fixture.server.host_probe = provider
                 assignment_file = fixture.root / "assignment.json"
@@ -644,9 +646,10 @@ class ClientTests(unittest.TestCase):
                             with fixture.loop_turn():
                                 remote = next(candidate.destination for candidate in submitted.constraints.candidates
                                               if candidate.destination.provider == "mac")
+                                observed_at = fixture.clock.now()
                                 fixture.server.publish_host_evidence(placement.FreshHostEvidence(
-                                    fixture.server.host_evidence_key(submitted, remote), fixture.clock.now(), "", allowed,
-                                    mac_ci=claim_state.MacCiActivity.IDLE))
+                                    fixture.server.host_evidence_key(submitted, remote), observed_at, "", allowed,
+                                    mac_ci=idle_ci_reading(observed_at)))
                         _ = fixture.run_pass()
                         self.assertEqual(client.main(arguments), 0)
                         lines = output.getvalue().splitlines()

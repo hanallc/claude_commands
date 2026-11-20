@@ -35,7 +35,7 @@ from scripts.build_queue import admission_records as records
 from scripts.build_queue import admission_service as service
 from scripts.build_queue import placement
 from scripts.mac_test import claim_state, mac_ci
-from scripts.mac_test.mac_ci_test_support import idle_ci_reply
+from scripts.mac_test.mac_ci_test_support import idle_ci_reading, idle_ci_reply
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
@@ -975,8 +975,9 @@ def private_provider_evidence(fixture: AdmissionFixture, key: placement.HostEvid
             placement.ClaimHolderIdentity(fixture.server.host, pid, record["proc_start"]),
             OwningSession(session_id) if session_id else NoOwningSession(),
             record["remote_host"], record.get("instance_generation", "")))
-    return placement.FreshHostEvidence(key, fixture.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup),
-        holder=holder, provider_diagnostic=diagnostic, mac_ci=claim_state.MacCiActivity.IDLE)
+    observed_at = fixture.clock.now()
+    return placement.FreshHostEvidence(key, observed_at, generation, eligibility, tuple(adopted), tuple(cleanup),
+        holder=holder, provider_diagnostic=diagnostic, mac_ci=idle_ci_reading(observed_at))
 
 
 class CallerProviderControls:

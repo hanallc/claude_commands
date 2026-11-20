@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from subprocess import DEVNULL, PIPE, TimeoutExpired, run
+from threading import Lock
+from time import time
 from typing import TYPE_CHECKING
 
 from scripts.lib import conf
@@ -19,42 +19,41 @@ if TYPE_CHECKING:
 PROCESS_LIST_COMMAND = "LC_ALL=C ps -axww -o pid=,stat=,ucomm="
 
 
-@dataclass(frozen=True)
-class MacSshHost:
-    """The configured SSH address shared by Mac targets."""
-
-    address: str
-
-
-@dataclass(frozen=True)
-class UnsharedMacCi:
-    """The worker has no shared Mac CI reading."""
-
-
-UNSHARED_MAC_CI = UnsharedMacCi()
-
-
 @dataclass
-class MacCiEvidencePass:
-    """Read one host once during a pass of its evidence worker."""
+class MacCiHostReading:
+    """Serialize refreshes of the CI reading for one SSH host."""
 
-    host: MacSshHost
     reading: MacCiReading | NoMacCiReading = NO_MAC_CI_READING
+    lock: Lock = field(default_factory=Lock)
 
 
-_MAC_CI_EVIDENCE_PASS: ContextVar[MacCiEvidencePass] = ContextVar("mac_ci_evidence_pass")
+class MacCiReadings:
+    """Share one CI reading per configured Mac SSH host among the target workers."""
 
+    def __init__(self, now: Callable[[], float]) -> None:
+        self._now: Callable[[], float] = now
+        self._hosts: dict[str, MacCiHostReading] = {}
+        self._lock: Lock = Lock()
 
-@contextmanager
-def evidence_pass(host: MacSshHost | UnsharedMacCi) -> Generator[None]:
-    if isinstance(host, UnsharedMacCi):
-        yield
-        return
-    token = _MAC_CI_EVIDENCE_PASS.set(MacCiEvidencePass(host))
-    try:
-        yield
-    finally:
-        _MAC_CI_EVIDENCE_PASS.reset(token)
+    def read(self, configuration: conf.ConfigRead, max_age: float) -> MacCiReading:
+        from scripts.mac_test import eligibility
+
+        settings = eligibility.SshProbeSettings(configuration)
+        try:
+            host = settings.host
+        except conf.Unusable:
+            return MacCiReading(MacCiActivity.UNKNOWN, self._now())
+        with self._lock:
+            entry = self._hosts.get(host)
+            if entry is None:
+                entry = MacCiHostReading()
+                self._hosts[host] = entry
+        with entry.lock:
+            reading = entry.reading
+            if isinstance(reading, MacCiReading) and reading.is_fresh(self._now(), max_age):
+                return reading
+            entry.reading = _read_mac_ci_activity(settings, self._now)
+            return entry.reading
 
 
 def is_runner_worker(name: str) -> bool:
@@ -62,26 +61,16 @@ def is_runner_worker(name: str) -> bool:
     return name == "Runner.Worker"
 
 
-def read_mac_ci_activity(configuration: conf.ConfigRead, now: Callable[[], float]) -> MacCiReading:
-    """Read CI activity for this Mac evidence pass or standalone call."""
+def read_mac_ci_activity(configuration: conf.ConfigRead) -> MacCiReading:
+    """Read CI activity for a standalone capacity check."""
     from scripts.mac_test import eligibility
 
-    settings = eligibility.SshProbeSettings(configuration)
-    current = _MAC_CI_EVIDENCE_PASS.get(None)
-    if current is not None:
-        try:
-            matches_host = settings.host == current.host.address
-        except conf.Unusable:
-            matches_host = False
-        if not matches_host:
-            return MacCiReading(MacCiActivity.UNKNOWN, now())
-        if isinstance(current.reading, MacCiReading):
-            return current.reading
+    return _read_mac_ci_activity(eligibility.SshProbeSettings(configuration), time)
+
+
+def _read_mac_ci_activity(settings: eligibility.SshProbeSettings, now: Callable[[], float]) -> MacCiReading:
     observed_at = now()
-    reading = MacCiReading(_read_mac_ci_processes(settings), observed_at)
-    if current is not None:
-        current.reading = reading
-    return reading
+    return MacCiReading(_read_mac_ci_processes(settings), observed_at)
 
 
 def _read_mac_ci_processes(settings: eligibility.SshProbeSettings) -> MacCiActivity:

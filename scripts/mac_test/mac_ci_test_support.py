@@ -5,11 +5,17 @@ import shlex
 import subprocess
 import sys
 
+from scripts.mac_test.claim_state import MacCiActivity, MacCiReading
 from scripts.mac_test.mac_ci import PROCESS_LIST_COMMAND
 
 
 IDLE_PROCESS_LIST = "1 Ss launchd\n"
 BUSY_PROCESS_LIST = IDLE_PROCESS_LIST + "43 ? Runner.Worker\n44 S Runner.Worker\n"
+
+
+def idle_ci_reading(observed_at: float) -> MacCiReading:
+    """Supply a timed idle result for a private provider probe."""
+    return MacCiReading(MacCiActivity.IDLE, observed_at)
 
 
 def idle_ci_reply(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
