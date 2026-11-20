@@ -2403,6 +2403,11 @@ def aws_section(connection: sqlite3.Connection, day: str, *,
     start, end = measurement.accounting_day_bounds(date.fromisoformat(usage_day), instant, usage_zone)
     saving = aws_report.estimate_wait_saved(connection, usage_day, 'aws', bounds=(store.utc_iso(start), store.utc_iso(end)))
     lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, spend.daily_limit, today)]
+    refused = ledger.CostLedger(directory).refused_bill_records(instant)
+    if refused:
+        lines.extend(('**AWS bill records excluded from daily spend**', ''))
+        lines.extend(f'- {record.display_line()}' for record in refused)
+        lines.append('')
     try:
         pace_days = conf.read(settings).whole('spend_pace_days')
         lines.extend(spend_analysis(shown, spend.monthly_limit, date.fromisoformat(today), pace_days))

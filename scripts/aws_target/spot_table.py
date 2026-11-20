@@ -232,7 +232,7 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[
     start = end - timedelta(days=days)
     book = ledger.CostLedger(directory)
     history = run_cost.read_gate_run_history(book, start, end, home)
-    bills = run_cost.spot_bills(book, start, end)
+    bills = run_cost.spot_bills(book, start, end, bill_cutoff=now)
     paid_hourly = run_cost.paid_per_hour(bills)
     allocations = run_cost.billed_allocations(bills, history.runs)
     gate_minimum: dict[tuple[str, str], Decimal] = {}
@@ -327,7 +327,7 @@ def billed_hours(directory: Path, now: int, regions: tuple[str, ...], scope: run
     end = datetime.fromtimestamp(now, UTC)
     try:
         checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, builder, scope,
-                                       max_ratio)
+                                       max_ratio, bill_cutoff=now)
     except ledger.LedgerUnavailable:
         return BilledHoursTable(title, ('type', *regions), frozenset(), (), 'columns',
                                 active_regions_by_size={}, note='No billed hours: the cost ledger is not readable.', reserved_by_region={})

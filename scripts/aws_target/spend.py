@@ -16,7 +16,7 @@ from scripts.aws_target import config as aws_config, ledger, measurement
 
 @dataclass(frozen=True)
 class Spend:
-    # Every billed day, then each estimate day after the newest bill through the last day; newest first.
+    # Include bills and shown estimates in reverse date order.
     days: tuple[ledger.DailySpend, ...]
     daily_limit: Decimal
     monthly_limit: Decimal
@@ -45,9 +45,20 @@ def spend_from(inputs: measurement.MeasurementInputs, snapshot: measurement.AwsM
         return aws_config.MeasurementUnavailable(snapshot.costs.reason)
     if isinstance(inputs.settings, aws_config.MeasurementUnavailable):
         return inputs.settings
-    spends = ledger.CostLedger(directory).spend_days(inputs.settings, instant)
+    book = ledger.CostLedger(directory)
+    refused_days = {record.day.isoformat(): record.day for record in book.refused_bill_records(instant)
+                    if isinstance(record.day, date) and record.day.isoformat() <= last_day}
+    spends = book.spend_days(inputs.settings, instant, estimate_days=tuple(refused_days.values()))
     newest_bill_day = max((spend.day for spend in spends if spend.source == 'AWS bill'), default='')
-    days = sorted((spend for spend in spends if spend.source == 'AWS bill' or newest_bill_day < spend.day <= last_day),
+
+    def shown(spend: ledger.DailySpend) -> bool:
+        if spend.source == 'AWS bill' or newest_bill_day < spend.day <= last_day:
+            return True
+        return spend.day in refused_days and any(
+            charge.usd > 0 and charge.kind != 'explorer' and charge.source != 'newest bill non-compute'
+            for charge in spend.intervals)
+
+    days = sorted((spend for spend in spends if shown(spend)),
                   key=lambda spend: spend.day, reverse=True)
     return Spend(tuple(days), inputs.settings.daily_limit_usd, inputs.settings.monthly_limit_usd)
 

@@ -10,6 +10,7 @@ from enum import Enum
 import json
 from pathlib import Path
 from statistics import median
+import time
 from typing import cast
 
 from scripts.aws_target import hana_spend, ledger
@@ -146,15 +147,19 @@ DayKey = tuple[str, str, str]
 BilledKey = tuple[str, str, str, str]
 
 
-def billed_readings(book: ledger.CostLedger, start: datetime, end: datetime) -> list[ledger.ChargeRead]:
-    """The bill reads of the UTC days in [start, end) that have a bill."""
-    return [reading for reading in book.read_bills()
-            if start.date().isoformat() <= reading.day < end.date().isoformat() and ledger.is_billed_day(reading)]
+def billed_readings(book: ledger.CostLedger, start: datetime, end: datetime, *,
+                    bill_cutoff: int | None = None) -> list[ledger.ChargeRead]:
+    """Read bill amounts for the UTC days in [start, end)."""
+    readings = (tuple(reading for reading in book.read_bills() if ledger.is_billed_day(reading))
+                if bill_cutoff is None else book.validated_bills(bill_cutoff))
+    first, following = start.date().isoformat(), end.date().isoformat()
+    return [reading for reading in readings if first <= reading.day < following]
 
 
-def spot_bills(book: ledger.CostLedger, start: datetime, end: datetime) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
+def spot_bills(book: ledger.CostLedger, start: datetime, end: datetime, *,
+               bill_cutoff: int | None = None) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
     """The billed Spot USD and box hours for each type, region and day in [start, end)."""
-    return bills_from_readings(billed_readings(book, start, end))
+    return bills_from_readings(billed_readings(book, start, end, bill_cutoff=bill_cutoff))
 
 
 def _spot_usage_key(usage_type: str) -> tuple[str, str] | None:
@@ -179,8 +184,10 @@ def hana_billed_hours(directory: Path, day: date) -> Decimal | None:
     """Read Hana's billed Spot hours for a UTC day, or return None when the bill is unavailable."""
     path = directory / 'charges' / (day.isoformat() + '.json')
     try:
-        bill = ledger.read_strict_charge(path)
-        if not ledger.matches_utc_charge_day(path.name, bill, day):
+        record = ledger.read_saved_bill(path, int(time.time()))
+        bill = record.pricing_read
+        if (record.usable_bill is ledger.BillRecordRejection.DUPLICATE_FIELDS
+                or not ledger.matches_utc_charge_day(path.name, bill, day)):
             return None
     except (OSError, ValueError, ArithmeticError):
         return None
@@ -295,11 +302,11 @@ def _box_hours(snapshot: ledger.LedgerEvidence, start: datetime, end: datetime, 
 
 
 def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
-                     scope: SpotHoursScope, max_ratio: Decimal) -> dict[DayKey, HoursCheck]:
+                     scope: SpotHoursScope, max_ratio: Decimal, *, bill_cutoff: int | None = None) -> dict[DayKey, HoursCheck]:
     """Check each type in scope by region and UTC day in the window.
 
     A bill without Spot usage for a type counts as zero hours."""
-    readings = billed_readings(book, start, end)
+    readings = billed_readings(book, start, end, bill_cutoff=bill_cutoff)
     read_days = {reading.day for reading in readings}
     bills = bills_from_readings(readings)
     snapshot = book.read_snapshot()
@@ -308,7 +315,7 @@ def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, ho
     seen_generations: set[int] = set()
     now = int(end.timestamp())
     for exposure in snapshot.hana_compute:
-        if exposure.generation in seen_generations:
+        if exposure.generation in seen_generations or not ledger.hana_compute_counts(snapshot, exposure):
             continue
         seen_generations.add(exposure.generation)
         if exposure.region not in scope.hana_sizes_by_region:
@@ -325,11 +332,11 @@ def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, ho
 
 
 def hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
-                 scope: SpotHoursScope, max_ratio: Decimal) -> dict[tuple[str, str], HoursCheck]:
+                 scope: SpotHoursScope, max_ratio: Decimal, *, bill_cutoff: int | None = None) -> dict[tuple[str, str], HoursCheck]:
     """The hours check of each type in sizes and region, summed over the days in [start, end) with a bill."""
     billed: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
     unbilled: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
-    daily = day_hours_checks(book, start, end, home, builder, scope, max_ratio)
+    daily = day_hours_checks(book, start, end, home, builder, scope, max_ratio, bill_cutoff=bill_cutoff)
     for (size, region, _day), check in daily.items():
         (unbilled if check.billed_hours is None else billed)[size, region].append(check)
     checks: dict[tuple[str, str], HoursCheck] = {}

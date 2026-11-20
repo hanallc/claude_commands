@@ -630,8 +630,10 @@ region_transfer_usd={"us-west-1":0.00015}
                                  Decimal(1), Decimal(0), Decimal(0), (ledger.UsageTypeCost(
                                      ledger.REGION_USAGE_PREFIXES[home][-1] + '-SpotUsage:' + billed_size,
                                      Decimal('0.05'), Decimal('0.1'), 'Hrs'),))
-        with mock.patch.object(ledger.CostLedger, 'read_bills', return_value=(bill,)):
-            tables = spot_table.spot_tables(self.state, max(int(self.clock.now), midnight + 120), settings_path=self.settings)
+        charges = self.state / 'charges'
+        charges.mkdir(exist_ok=True)
+        _ = (charges / (bill.day + '.json')).write_text(json.dumps(ledger.charge_record(bill)))
+        tables = spot_table.spot_tables(self.state, max(int(self.clock.now), bill.at), settings_path=self.settings)
         cells = {table.title: table.rows[0][6] for table in tables.runs[0].tables}
         self.assertEqual(cells[billed_size], '0.0500 (1 bill due)')
         self.assertEqual(cells[due_size], '1 bill due')
@@ -1214,10 +1216,14 @@ class HoursCheckTests(CostFixture):
 
     def bill(self, day: datetime, hours: dict[tuple[str, str], Decimal]) -> None:
         start = int(day.timestamp())
-        self.bills.append(ledger.ChargeRead(day.date().isoformat(), start + 90000, start, start + 86400,
+        bill = ledger.ChargeRead(day.date().isoformat(), start + 90000, start, start + 86400,
             Decimal(1), Decimal(0), Decimal(0), tuple(ledger.UsageTypeCost(
                 ledger.REGION_USAGE_PREFIXES[region][-1] + '-SpotUsage:' + size, Decimal(1), quantity, 'Hrs')
-                for (size, region), quantity in hours.items())))
+                for (size, region), quantity in hours.items()))
+        self.bills.append(bill)
+        charges = self.state / 'charges'
+        charges.mkdir(exist_ok=True)
+        _ = (charges / (bill.day + '.json')).write_text(json.dumps(ledger.charge_record(bill)))
 
     def checks(self) -> dict[run_cost.DayKey, run_cost.HoursCheck]:
         end = datetime.fromtimestamp(self.clock.now, UTC)
