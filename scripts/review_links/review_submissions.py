@@ -792,25 +792,47 @@ def _submission_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapsho
 
 @dataclass(frozen=True)
 class PageOwnerUnavailable:
-    """The configured production has no active recipient."""
+    """This page owner is unavailable."""
 
 
-def page_owner(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
-    """Resolve the page owner from retained staff state on either machine."""
+@dataclass(frozen=True)
+class PageOwners:
+    shown: staff.StaffRow | PageOwnerUnavailable
+    route: staff.StaffRow | PageOwnerUnavailable
+
+
+def _page_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapshot) -> bool:
+    return (row.id not in members.pending_retire and not isinstance(row.exited, staff.Exited)
+            and not isinstance(row.doc, staff.WrappedDoc) and not isinstance(row.worktree, staff.RemovedWorktree)
+            and (row.kind != "showrunner" or isinstance(row.doc, staff.LiveDoc)))
+
+
+def page_owners(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> PageOwners:
+    """Resolve the owner to show and the recipient for new items."""
     key = f"page.{page}.owner"
     values = settings.values(key, "owner.default")
     designated = staff.StaffId(values.get(key, ""))
     default = staff.StaffId(values.get("owner.default", ""))
+    route = _page_owner_route(designated, default, members)
+    shown = members.rows_by_id.get(designated)
+    if shown is not None and shown.kind in ("unit", "showrunner", "producer") and _page_owner_is_active(shown, members):
+        return PageOwners(shown, route)
+    return PageOwners(route, route)
+
+
+def page_owner(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
+    """Resolve the recipient for new items from a console page."""
+    return page_owners(page, settings, members).route
+
+
+def _page_owner_route(designated: staff.StaffId, default: staff.StaffId,
+                      members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
     for identity in (designated, default):
         for candidate in investigation.owner_chain(identity, members):
             row = members.rows_by_id.get(candidate)
-            if row is None or row.id in members.pending_retire or isinstance(row.exited, staff.Exited):
+            if row is None or not _page_owner_is_active(row, members):
                 continue
-            if isinstance(row.doc, staff.WrappedDoc) or isinstance(row.worktree, staff.RemovedWorktree):
-                continue
-            if row.kind == "showrunner" and isinstance(row.doc, staff.LiveDoc):
-                return row
-            if row.kind == "producer" and row.id == designated:
+            if row.kind == "showrunner" or (row.kind == "producer" and row.id == designated):
                 return row
     return PageOwnerUnavailable()
 
@@ -821,9 +843,7 @@ def list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> st
     if isinstance(configured, conf.UnavailableValue):
         return PageOwnerUnavailable()
     row = members.rows_by_id.get(staff.StaffId(configured.value))
-    if (row is None or row.kind != "producer" or row.id in members.pending_retire
-            or isinstance(row.exited, staff.Exited) or isinstance(row.doc, staff.WrappedDoc)
-            or isinstance(row.worktree, staff.RemovedWorktree)):
+    if row is None or row.kind != "producer" or not _page_owner_is_active(row, members):
         return PageOwnerUnavailable()
     return row
 

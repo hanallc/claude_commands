@@ -76,6 +76,46 @@ class PageStatusTests(unittest.TestCase):
         self.assertEqual(page.count(b'<dialog id="review-new-item"'), 1)
         self.assertEqual(page_frame.with_owner(page, "list", owner, rows, lambda: self.fail("The dialog already exists.")), page)
 
+    def test_accounts_shows_the_configured_owner_and_names_the_route(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = root / "console.conf"
+        document = root / "production.md"
+        showrunner = staff.StaffRow(staff.StaffId("showrunner"), "showrunner", "natedev", staff.STAFF_ROOT,
+                                    current_session=staff.StaffId("session-showrunner"),
+                                    doc=staff.LiveDoc("natedev", document))
+        unit = staff.StaffRow(staff.StaffId("unit"), "unit", "accounts", staff.ReportsTo(showrunner.id),
+                              current_session=staff.StaffId("session-unit"), unit_type=staff.UnitDetails("direct"))
+        producer = staff.StaffRow(staff.StaffId("producer"), "producer", "producer", staff.STAFF_ROOT,
+                                  current_session=staff.StaffId("session-producer"))
+        rows = staff.StaffSnapshot((unit, showrunner, producer))
+        content = b'<html><head></head><body><main><h1>Accounts</h1></main></body></html>'
+        cases = (
+            ("unit", unit, rows, unit, showrunner, "role.unit-director"),
+            ("showrunner", showrunner, rows, showrunner, showrunner, "role.showrunner"),
+            ("producer", producer, rows, producer, producer, "role.producer"),
+            ("inactive unit", unit, replace(rows, pending_retire=(unit.id,)), showrunner, showrunner, "role.showrunner"),
+        )
+        for case, configured, members, shown, route, color in cases:
+            with self.subTest(case=case):
+                _ = config.write_text(f"page.accounts.owner={configured.id}\n", encoding="utf-8")
+                settings = conf.read(config)
+                self.assertEqual(review_submissions.page_owner("accounts", settings, members), route)
+                with (patch.object(staff, "local_snapshot", return_value=members),
+                      patch.dict(os.environ, {"CONF_DIR": str(root)})):
+                    page = serve.owned_document(content, "accounts").decode()
+                self.assertIn('data-page-owner="accounts"', page)
+                self.assertRegex(page, r'<span class="page-owner-name"><span class="staff-name" ' +
+                                 rf'data-color-text="{re.escape(color)}" [^>]+>{shown.name}</span></span>')
+                label = f"New item for {route.name}"
+                self.assertIn(f'aria-label="{label}" title="{label}"', page)
+
+        _ = config.write_text(f"page.accounts.owner={unit.id}\n", encoding="utf-8")
+        with (patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((unit,))),
+              patch.dict(os.environ, {"CONF_DIR": str(root)})):
+            page = serve.owned_document(content, "accounts")
+        self.assertIn(b'>accounts</span></span>', page)
+        self.assertNotIn(b'data-owner-new', page)
+
     def test_each_page_uses_the_same_states_and_retains_the_last_good_read(self) -> None:
         for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
             with self.subTest(page=page):

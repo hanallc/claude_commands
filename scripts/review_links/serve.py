@@ -98,9 +98,11 @@ def owned_document(content: bytes, page: str) -> bytes:
     """Read the current owner when serving a console document."""
     try:
         members = staff.local_snapshot()
-        owner = review_submissions.page_owner(page, conf.read_or_repository("console"), members)
-        if isinstance(owner, staff.StaffRow):
-            return page_frame.with_owner(content, page, owner, members, new_item_dialog.render)
+        owners = review_submissions.page_owners(page, conf.read_or_repository("console"), members)
+        if isinstance(owners.shown, staff.StaffRow):
+            recipient = owners.route.name if isinstance(owners.route, staff.StaffRow) else page_frame.OwnerNewItem.UNAVAILABLE
+            return page_frame.with_owner(content, page, owners.shown, members, new_item_dialog.render,
+                                         recipient=recipient)
     except (OSError, ValueError):
         pass
     return content

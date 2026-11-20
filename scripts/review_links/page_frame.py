@@ -22,8 +22,14 @@ TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
 HEADING_ACTIONS = '<div class="page-heading-actions">'
 
 
+class OwnerNewItem(StrEnum):
+    FOR_SHOWN_OWNER = "shown"
+    UNAVAILABLE = "unavailable"
+
+
 def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.StaffSnapshot,
-               dialog: Callable[[], str]) -> bytes:
+               dialog: Callable[[], str], *,
+               recipient: str | OwnerNewItem = OwnerNewItem.FOR_SHOWN_OWNER) -> bytes:
     """Add the shared owner control to one served console document."""
     from scripts.review_links import staff_names
 
@@ -31,10 +37,14 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.
     if main is None or b'data-page-owner="' in content:
         return content
     name = staff_names.StaffNames(members).html(owner.id, owner.name)
-    label = html.escape(f"New item for {owner.name}", quote=True)
+    button = ""
+    if recipient is not OwnerNewItem.UNAVAILABLE:
+        recipient_name = owner.name if recipient is OwnerNewItem.FOR_SHOWN_OWNER else recipient
+        label = html.escape(f"New item for {recipient_name}", quote=True)
+        button = (f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
+                  + icon_svg("message-circle-question") + '</button>')
     control = (f'<div class="page-owner" data-page-owner="{page}"><span class="page-owner-name">{name}</span>'
-               + f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
-               + icon_svg("message-circle-question") + '</button></div>').encode()
+               + button + '</div>').encode()
     actions = HEADING_ACTIONS.encode()
     heading = TITLE_ELEMENT.search(content, main.end())
     if heading is not None and content.startswith(actions, heading.end()):
@@ -55,7 +65,7 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.
     if row_style not in content:
         style = b'<style>' + row_style + b'</style>' + style
     content = content.replace(b'</head>', style + b'</head>', 1)
-    if b'id="review-new-item"' not in content:
+    if button and b'id="review-new-item"' not in content:
         content = content.replace(b'</body>', dialog().encode() + b'</body>', 1)
     return content
 

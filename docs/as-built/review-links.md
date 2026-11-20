@@ -89,6 +89,12 @@ Staff names use the current role colors from the Accounts reader.
 `staff_names.StaffNames` shares one staff snapshot and one color reading across each server render.
 It resolves fixed IDs, session IDs, and unambiguous staff names.
 The shared renderer escapes unknown names and free text without a role color.
+The owner corner shows the active unit, showrunner, or producer set in `page.<page>.owner`.
+It uses the owner's staff color.
+If the configured owner is unavailable, the corner shows the New item recipient.
+An item for a unit goes to its showrunner.
+Showrunner and producer owners receive their items directly.
+The New item button names the recipient and appears when the page has a recipient.
 The List colors Owner, Producer, supporting unit names, staff names in log sources, and showrunner names in the count strip.
 List delivery notices color morty and the recorded showrunner through the same page renderer.
 They keep the notice words and time.
@@ -114,7 +120,7 @@ Empty target role labels use the recorded holder. Only the holder name can have 
 Disks uses the same spans for slot holders, sessions, and shared tooltip fields.
 Current Builds rows carry their name parts through `slotStep` to the Disks slot label.
 Its existing Builds refresh updates the name spans without a new timer.
-AWS and the console navigation show no staff name fields.
+The AWS data and the console navigation show no staff name fields.
 The Units board emits Markdown through `unit_phases.py`; this checkout has no Units console route.
 
 Saved role colors apply after the next page render or Builds data reading.
