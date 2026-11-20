@@ -14,7 +14,6 @@ import json
 import os
 import select
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -28,13 +27,12 @@ from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
-from typing import ClassVar, cast, override
+from typing import cast, override
 from zoneinfo import ZoneInfo
 
 from scripts.agents import detached_runs
 from scripts.lib import unit_runs
 from scripts.lib.test_models_registry import write_registry
-from scripts.lib.process_group import send_process_group
 from scripts.lib.process_supervisor import ManagedProcess, launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -190,13 +188,6 @@ class FixtureProcessExit:
         return self.output, ""
 
 
-@dataclass(frozen=True)
-class ListeningPeer:
-    """A fixture listener that can serve another case before its deadline."""
-    process: ManagedProcess[bytes]
-    deadline: float
-
-
 def stop_child(child: subprocess.Popen[bytes]) -> None:
     if child.stdin is not None:
         child.stdin.close()
@@ -214,15 +205,6 @@ def setUpModule() -> None:
 
 
 class StallWatchTests(unittest.TestCase):
-    listener_root: ClassVar[Path]
-    listeners: ClassVar[list[ListeningPeer]]
-
-    @classmethod
-    @override
-    def setUpClass(cls) -> None:
-        cls.listener_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="sw-peers-", dir="/tmp")))
-        cls.listeners = []
-
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -484,14 +466,7 @@ always=natedev
         check = f"CHECK=zsh /scripts/production/production_check.sh {owner.id}\n"
         _ = (directory / "conf").write_text(f"TARGET=session:{owner.id}\nPROMPT_FILE={prompt}\n{check}")
 
-    def unit_listener(self, slot: int, peer_path: Path) -> ListeningPeer:
-        reuse_slot = slot < len(self.listeners)
-        if reuse_slot:
-            previous = self.listeners[slot]
-            if wall_monotonic() < previous.deadline and previous.process.poll() is None:
-                return previous
-            previous.process.close()
-            peer_path.unlink(missing_ok=True)
+    def unit_listener(self, peer_path: Path) -> ManagedProcess[bytes]:
         source = """import os, select, socket, sys, time
 path = sys.argv[1]
 deadline = float(sys.argv[2])
@@ -510,23 +485,18 @@ with socket.socket(socket.AF_UNIX) as sock:
         os.unlink(path)
 """
         deadline = wall_monotonic() + TEST_HANG_GUARD_SECS
-        child = self.enterClassContext(launch([sys.executable, "-c", source, str(peer_path), str(deadline)],
-                                             env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                             stderr=subprocess.DEVNULL))
-        listener = ListeningPeer(child, deadline)
-        if reuse_slot:
-            self.listeners[slot] = listener
-        else:
-            self.listeners.append(listener)
+        child = self.enterContext(launch([sys.executable, "-c", source, str(peer_path), str(deadline)],
+                                        env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL))
         assert child.stdout is not None
         with child.stdout:
             self.assertEqual(child.stdout.readline(), b"listening\n")
-        return listener
+        return child
 
     def unit(self, name: str) -> tuple[int, Path]:
         socket_path = self.root / f"{unit_session(name)}.sock"
-        peer_path = self.listener_root / str(self.unit_count)
-        pid = self.unit_listener(self.unit_count, peer_path).process.pid
+        peer_path = self.root / f"peer-{self.unit_count}"
+        pid = self.unit_listener(peer_path).pid
         self.unit_count += 1
         socket_path.symlink_to(peer_path)
         pane_pid = 10_000 + len(self.panes)
@@ -660,10 +630,13 @@ runpy.run_path(str(script), run_name='__main__')
             exec(SESSION_LOOKUP_CODE, {})
             return 0
 
-        def start(command: list[str], *arguments: object, **options: object) -> subprocess.Popen[str] | FixtureProcessExit:
-            if not real_ps and command == ["ps", "-eo", "pid=,ppid=,args="]:
-                output = self.ps_file.read_text()
-                return FixtureProcessExit(command, output=output)
+        def start(command: list[str], *arguments: object,
+                  **options: object) -> subprocess.Popen[str] | ManagedProcess[str] | FixtureProcessExit:
+            if command == ["ps", "-eo", "pid=,ppid=,args="]:
+                if real_ps:
+                    self.assertIs(options["start_new_session"], True)
+                    return self.enterContext(launch(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+                return FixtureProcessExit(command, output=self.ps_file.read_text())
             if command[:2] == [sys.executable, str(self.bin / "send.py")] and "STALL_TEST_SEND_BARRIER" not in environment:
                 with mock.patch.object(sys, "argv", command[1:]):
                     try:
@@ -3121,7 +3094,7 @@ runpy.run_path(str(script), run_name='__main__')
         original = stall_watch.tick
         for fault in ("timeout", "exit"):
             with self.subTest(fault=fault):
-                executable(self.bin / "ps", "#!/usr/bin/env python3\nimport signal\nsignal.pause()\n"
+                executable(self.bin / "ps", f"#!/usr/bin/env python3\nimport time\ntime.sleep({TEST_HANG_GUARD_SECS})\n"
                            if fault == "timeout" else "#!/bin/sh\nexit 7\n")
                 began = time.monotonic()
                 deadline = began + 1.5
@@ -3159,62 +3132,50 @@ runpy.run_path(str(script), run_name='__main__')
         script = self.root / "relay.py"
         pid_file = self.root / "grandchild.pid"
         _ = script.write_text("import subprocess, sys\n"
-            + "child = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'])\n"
+            + f"child = subprocess.Popen({MARKED_SLEEPER!r})\n"
             + "open(sys.argv[1], 'w').write(str(child.pid))\n"
             + "child.wait()\n")
         state = self.root / "retiring.prompt.json"
         _ = state.write_text("saved retire state\n")
         _ = self.watch_settings(sender_batch_seconds="0.4", sender_cleanup_seconds="0.4")
         errors = io.StringIO()
-        processes: list[subprocess.Popen[str]] = []
-        original = subprocess.Popen
+        command = [sys.executable, str(script), str(pid_file)]
+        processes: list[ManagedProcess[str]] = []
+        real_start = cast(Callable[..., subprocess.Popen[str]], subprocess.Popen)
 
-        def start(command: list[str], **keywords: object) -> subprocess.Popen[str]:
-            # Keep the actual process group and inherited pipes; only record the owned pid.
-            child = original(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, start_new_session=bool(keywords["start_new_session"]))
+        def start(argv: list[str], *arguments: object, **options: object) -> subprocess.Popen[str] | ManagedProcess[str]:
+            if argv != command:
+                return real_start(argv, *arguments, **options)
+            self.assertIs(options["start_new_session"], True)
+            child = self.enterContext(launch(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
             processes.append(child)
             return child
 
         began = time.monotonic()
         deadline = began + 1.5
+        with (mock.patch.dict(os.environ, self.environment), redirect_stderr(errors),
+              mock.patch.object(subprocess, "Popen", side_effect=start),
+              mock.patch.object(stall_watch, "retry_cases")):
+            stall_watch.send_all([stall_watch.Delivery(state, "retire", command)], START, deadline=deadline)
+        self.assertLessEqual(time.monotonic(), deadline)
+        self.assertEqual(errors.getvalue(), "stall-watch: retire: send timeout\n")
+        self.assertEqual(state.read_text(), "saved retire state\n")
+        self.assertTrue(pid_file.exists(), "The relay must start its descendant with the output pipe.")
+        pid = int(pid_file.read_text())
         try:
-            with (mock.patch.dict(os.environ, self.environment), redirect_stderr(errors),
-                  mock.patch.object(subprocess, "Popen", side_effect=start),
-                  mock.patch.object(stall_watch, "retry_cases")):
-                stall_watch.send_all([stall_watch.Delivery(state, "retire",
-                    [sys.executable, str(script), str(pid_file)])], START, deadline=deadline)
-            self.assertLessEqual(time.monotonic(), deadline)
-            self.assertEqual(errors.getvalue(), "stall-watch: retire: send timeout\n")
-            self.assertEqual(state.read_text(), "saved retire state\n")
-            self.assertTrue(pid_file.exists(), "the relay must start its pipe-holding descendant")
-            pid = int(pid_file.read_text())
+            descriptor = os.pidfd_open(pid)
+        except ProcessLookupError:
+            pass
+        else:
             try:
-                descriptor = os.pidfd_open(pid)
-            except ProcessLookupError:
-                pass
-            else:
-                try:
-                    _ = select.select([descriptor], [], [], max(0, deadline - time.monotonic()))
-                finally:
-                    os.close(descriptor)
-            # A zombie is dead, awaiting the machine's init reaper, and cannot hold pipes.
-            status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
-                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-            self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"), status.stdout)
-            self.assertIsNotNone(processes[0].returncode)
-        finally:
-            for child in processes:
-                try:
-                    send_process_group(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
-            if pid_file.exists():
-                try:
-                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _ = select.select([descriptor], [], [], max(0, deadline - time.monotonic()))
+            finally:
+                os.close(descriptor)
+        # A zombie cannot hold pipes.
+        status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"), status.stdout)
+        self.assertIsNotNone(processes[0].returncode)
 
     def test_invalid_sender_limits_use_packaged_limits_and_deliver_pending_work(self) -> None:
         for key in ("sender_cleanup_seconds", "sender_batch_seconds"):

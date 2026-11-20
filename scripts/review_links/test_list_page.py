@@ -782,9 +782,10 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                             url = f'http://127.0.0.1:{server.server_port}' + list_place.replace('#', '?direct=1#', 1)
                         if size == "screenshot":
                             assert proof is not None
-                            result = subprocess.run([*command, '--screenshot', proof, url + '&shot=1'],
-                                                    capture_output=True, text=True, timeout=45, env=browser_env)
-                            self.assertEqual(result.returncode, 0, result.stderr)
+                            with launch([*command, '--screenshot', proof, url + '&shot=1'],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=browser_env) as browser:
+                                _, stderr = browser.communicate(timeout=45)
+                                self.assertEqual(browser.returncode, 0, stderr)
                         else:
                             if size == "600,900":
                                 url += '&phone=1'
