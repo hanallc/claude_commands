@@ -340,7 +340,7 @@ contains only:
 - Three questions:
 
   1. For each id, is it `FIXED`, `NOT FIXED`, or `UNCLEAR`, with file/line evidence?
-  2. For each id with a test, does the test meet the two test rules, and does it fail without the repair? An id without a test is `FIXED` when the diff answers it. Name any test the repair added that the rules do not allow.
+  2. For each id with a test, does the test meet the `<TestRules>` block, and does it fail without the repair? An id without a test is `FIXED` when the diff answers it. Name any test the repair added that the rules do not allow.
   3. Does this repair break any caller, consumer, transition, or invariant of its changed symbols?
 - The `## Three Gods` section of <WritePromptContract/>, verbatim; a repair
   hunk that breaks one is a finding of the repair.

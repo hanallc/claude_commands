@@ -142,7 +142,7 @@ Codex review prompts also include section 3's command block.
 2. Write no test for a refusal, a message text, a doc, a prompt or a config wording.
 3. Write no test for a helper, a fixture or test support code.
 4. Write no test for a case that an existing test of the same function reaches.
-5. For a fix, add one row to an existing table. If no table fits, say so; do not add a function.
+5. For a fix, add one row to an existing table, or one check to the existing render test of the scene (test rule 1). If neither fits, say so; do not add a function, except a new render test for a scene that has none.
 6. A rare case gets a test only when the defect destroys work or saved state for good.
 7. A test that needs a subprocess, a sleep or a real Git repository needs a reason in the summary.
 8. When your change makes a test a duplicate, delete it and name it in the summary.
@@ -206,7 +206,7 @@ Use <PhaseCleanup/> for removal.
 `test` opens against the **specification, not the implementation**. The Work
 Order defines the behavior, so tests can be written before any of it exists;
 a tester that waits for `impl` has converted a parallel team back into a queue.
-Apply the two test rules in <WritePromptContract/> item 6.
+Apply the `<TestRules>` block in <WritePromptContract/> item 6.
 In each edit round, `test` also runs the existing tests of the callers of the
 changed code, so a caller red shows before the full gate.
 

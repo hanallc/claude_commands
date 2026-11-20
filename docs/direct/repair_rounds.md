@@ -162,7 +162,7 @@ choice 3 preserves the gate. With no gating issues, continue to
 
 <FixDispatch>
 Apply <LongLivedWorkers/>.
-Every fix prompt carries the two test rules verbatim, a short follow-up to a retained worker included. Never write 'add a test that fails on <hash>' without them.
+Every fix prompt carries the `<TestRules>` block from write_prompt_contract.md item 6 verbatim, a short follow-up to a retained worker included. Never write 'add a test that fails on <hash>' without them.
 When a repair round fails or its next edit replaces a run's tree, apply <WorkerRuns/>.
 
 Before you assign a repair, have a worker quote the failing log line and the
@@ -191,7 +191,7 @@ under <RoleReassignment/> when needed. Only then open `fix2`, `fix3`… when no
 open worker can take another file set. Each worker's task and kind are `fix`, its
 ninth argument remains its slot, and it gets its own
 `fix_prompt_${FIX_ROUND}[_<slot>].md`. Each worker repairs its findings.
-A finding gets a test only when test rule 2 in write_prompt_contract.md item 6 allows one. Then add a table row, and the row must fail without the repair. Every other finding closes by the reviewer's read of the diff; say `no test: <reason>` in the summary.
+A finding gets a test only when test rule 2 in write_prompt_contract.md item 6 allows one. Then put it where test rule 1 says, and it must fail without the repair. Every other finding closes by the reviewer's read of the diff; say `no test: <reason>` in the summary.
 For a finding about what is drawn, use the live pixel check the prompt names.
 Use a test instead if test rule 2 allows one. Test rule 1 says where it goes and what it reads.
 Name each test for the behavior it checks. Put the finding id only in the summary.
@@ -266,7 +266,7 @@ reviewer early.
 
 **A repair the main read can close, closes without a worker review.**
 Apply <ReviewDiffContract/> and read every repair hunk yourself.
-Check each testable id's coverage under the two test rules in [write_prompt_contract.md](write_prompt_contract.md), item 6.
+Check each testable id's coverage under the `<TestRules>` block in [write_prompt_contract.md](write_prompt_contract.md), item 6.
 Record each verdict and continue to <Synthesize/> when the diff answers every id and each hunk is one of:
 
 - a path the batch's own findings named, a new file one of those paths

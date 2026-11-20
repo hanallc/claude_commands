@@ -142,7 +142,9 @@ The [review regime record](review-regime-trial.md) defines the counts and time f
 Fixes extend an existing test of the same behavior when one exists.
 A rare-case test requires a wrong user result, damaged saved state, or lost work.
 All main-path tests remain.
-[WritePromptContract item 6](../direct/write_prompt_contract.md) owns these two test rules.
+A drawn-defect check joins the existing render test of its scene and reads pixels.
+A worker states the measured time of each new test.
+[WritePromptContract item 6](../direct/write_prompt_contract.md) owns these test rules.
 
 ## Tested publication
 
