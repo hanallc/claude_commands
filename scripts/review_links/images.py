@@ -297,7 +297,9 @@ def ask_question(root: Path, identity: str, words: str, status: change_page.Deli
 
 
 def answer_question(root: Path, identity: str, question_id: str, text: str) -> None:
-    result = page_question.answer(image_store.ImageQuestionStore(images_root(root)), identity, question_id, text)
+    store = image_store.ImageQuestionStore(images_root(root))
+    with change_page.question_answer_lock(store.folder(identity) / image_store.RECORD, question_id):
+        result = page_question.answer(store, identity, question_id, text)
     if isinstance(result, page_question.AnswerRefused):
         raise question_record.AnswerRefused(result.reason)
 

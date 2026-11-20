@@ -1796,7 +1796,7 @@ class _ListQuestionStore:
 
     def set_answer(self, item: str, question_id: str, answer: question_record.Answer) -> None:
         store = _store(self.keeper)
-        with store.locked():
+        with change_page.question_answer_lock(store.path(item), question_id), store.locked():
             current = load(self.keeper, item)
             question = next((question for question in current.questions if question.question_id == question_id), None)
             if question is None or question.answer is not None:

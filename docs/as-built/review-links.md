@@ -1031,8 +1031,27 @@ The page shows “Question not delivered.” after a confirmed failure.
 List, Images, and Review use the same text.
 All attempts for one question use the same sender lock.
 List, Images, and Review question sends use the same retry loop.
-An unconfirmed send keeps its saved message ID for the next attempt.
-The server retries unresolved attempts during recovery.
+Each recipient keeps the same message ID through retries and recovery.
+A refusal after an unconfirmed send preserves the unconfirmed result for that recipient.
+The transport can confirm acceptance on a later retry.
+Review saves each recipient's result so recovery can skip confirmed recipients.
+The server retries unresolved attempts until the deadline.
+The server stores the question ID and deadline when it saves the delivery attempt.
+The `question_recovery_seconds` setting defaults to 1800 seconds.
+A finished Review delivery takes precedence over the deadline.
+The server checks the deadline after it writes the send marker.
+Each retry pause lasts at most as long as the time left before the deadline.
+A route that stops before transport can fail as soon as the staff recipient is gone.
+An unusable setting stops a send that could not start and names the setting in the log.
+An unreadable delivery record or missing save proof can expire without another send.
+An unreadable job lock blocks sends and permits expiry.
+An expired attempt shows “Question not delivered.” and cannot start a send.
+If startup cannot read a delivery record, the server schedules another read.
+If recovery cannot locate or read the Change lists, the server keeps the questions for the next attempt.
+The fixed staff route defers a send while the recipient's messaging socket is unavailable.
+The server checks the saved question before each retry.
+If a native Review question has an answer, recovery retires its pending delivery.
+If publishing READY reports an error, the server checks both the old and new revisions.
 If the server cannot record a failure, it logs one line and keeps the attempt for recovery.
 The question reader checks the saved question words and answer command.
 A List title edit preserves the delivery state.
@@ -1061,12 +1080,20 @@ The entry keeps the question ID, words, and time.
 The question no longer accepts answers or retries.
 Older Closed records stay in the store in their original format.
 Question delivery checks the current List record under the same lock that Close uses.
-List, Images, and Review use the same send loop.
-The loop checks the saved source before each attempt.
+The send loop holds the answer lock from the source check through each transport call.
+List, Images, and Change use a lock for the specific question.
+Other Review types use the lock for their answer writer.
+Each question transport call uses the configured sender budget.
+The sender uses the current staff ID and bypasses the deferred queue and review hold.
+A timeout or a deferred result leaves the attempt unconfirmed.
+An answer that saves first prevents the next send attempt.
+A transport call that starts first holds the answer until the call returns.
 A close preserves the delivery result of a send already in progress.
 The sender checks the item again before it sends a failure alert.
 A read error during retry authorization preserves the confirmed failure and reports the read error separately.
 Recovery skips closed or answered questions.
+Recovery keeps a question pending during a delivery record or Change list read error.
+Recovery skips recipients with confirmed receipts for the same attempt.
 The server checks deferred questions again after the sender locks become free.
 A new Ask on a Closed item is refused.
 A retry of a saved Ask returns its saved result without sending again.
@@ -1100,8 +1127,8 @@ The record stores the source, stable message ID, revision, attempt ID, job owner
 The delivery lock protects every atomic update.
 A job holds the question's sender lock from claim through result publication.
 The sender publishes `sending` before it calls the transport.
-The transport can confirm `sent`, `queued`, or `failed`.
-A missing confirmation leaves the outcome `unknown`.
+The question transport can confirm delivery or failure.
+A queued result or a missing confirmation leaves the outcome `unknown`.
 Startup recovery verifies the saved question and claims work when the sender lock is free.
 If a sender stopped after it wrote the send marker, recovery reuses the same message ID.
 A closed item or a question that has an answer requires no send.
@@ -1674,7 +1701,7 @@ Image feedback uses the image registration, action, and feedback to identify the
 The server saves the answered question IDs before the first send.
 A retry hides the image only if no new question answer has arrived.
 A skipped send can save the feedback mark after a failed write.
-`QUEUED` and `KEPT` count as kept.
+`QUEUED` and `KEPT` count as kept for feedback and verdict delivery.
 `SKIPPED` confirms that the sender already accepted the key.
 For a Review send, `PENDING` means the message may have arrived.
 Codex queue retries reuse the same client message ID.

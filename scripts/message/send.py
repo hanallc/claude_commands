@@ -780,6 +780,18 @@ class RecordedDeliveryAcceptance(Result):
     """This keyed send has durable acceptance; later bookkeeping must not repeat it."""
 
 
+QUESTION_NOT_STARTED = "Question send not started."
+QUESTION_RECIPIENT_GONE = "Question recipient gone."
+
+
+class SendNotStarted(Result):
+    """The transport confirms that it did not start this send."""
+
+
+class QuestionRecipientGone(Result):
+    """The fixed staff recipient no longer exists."""
+
+
 class ConfirmedSocketMiss(Result):
     """No message bytes reached the selected socket."""
 
@@ -897,6 +909,11 @@ class RemoteDelivery:
 @dataclass(frozen=True)
 class RecipientLookupFailed:
     reason: str
+
+
+@dataclass(frozen=True)
+class RecipientRoutePending(RecipientLookupFailed):
+    """The fixed recipient has no verified route yet."""
 
 
 class RecipientNameMissing(SystemExit):
@@ -1983,7 +2000,7 @@ def complete_postmaster_fallback(message: Message, recipient: StableRecipient, e
             marker["postmaster"] = RelayAcceptanceUnconfirmed(stage="relay-unconfirmed", entry_id=entry_id,
                 owner_pid=reservation["owner_pid"], owner_start=reservation["owner_start"])
             return True
-        if result.outcome == "failed":
+        if result.outcome in ("failed", "retry"):
             release_postmaster_claim(state, message.to, marker)
             return True
         if result.outcome not in ("sent", "queued"):
@@ -2379,10 +2396,11 @@ def relay_socket(message: Message, timeout: float, *,
                 return ClaudeRoutingFailed(unit_lookup.ClaudeOwnerMismatch("the review recipient changed before delivery"))
         return plan
 
+    unavailable: Literal["retry", "failed"] = "retry" if message.review_delivery else "failed"
     if isinstance(selection, FixedStaffLookup):
         plan = fixed_plan(selection)
         if isinstance(plan, ClaudeRoutingFailed):
-            return message, Result("failed", plan.failure.reason)
+            return message, SendNotStarted(unavailable, plan.failure.reason)
         message = plan.message
     attempt = message.claude_attempt
     if not isinstance(attempt, ClaudeDeliveryAttempt):
@@ -2394,9 +2412,9 @@ def relay_socket(message: Message, timeout: float, *,
     if isinstance(selection, FixedStaffLookup):
         replacement = fixed_plan(selection)
         if isinstance(replacement, ClaudeRoutingFailed):
-            return message, Result("failed", f"{result.detail}; {replacement.failure.reason}")
+            return message, SendNotStarted(unavailable, f"{result.detail}; {replacement.failure.reason}")
         if replacement.message.to == message.to:
-            return message, Result("failed", f"{result.detail}; no replacement socket for staff ID {selection.to}")
+            return message, SendNotStarted(unavailable, f"{result.detail}; no replacement socket for staff ID {selection.to}")
         retried = relay(replacement.message, max(1.0, timeout - (time.monotonic() - started)))
         return replacement.message, retried
     mailbox = attempt.recipient
@@ -3185,6 +3203,7 @@ def matching_recipients(
 def resolve_recipient(
     target: str | FixedStaffLookup, scope: RecipientResolutionScope, observed: roster.Roster, *,
     membership: staff.StaffSnapshot | None = None, records: list[sessions.SessionRecord] | None = None,
+    defer_fixed_route: bool = False,
 ) -> DeliveryRoute:
     """Resolve locally first and require a current staff row for a fixed staff lookup."""
     from scripts.message import roster
@@ -3230,6 +3249,12 @@ def resolve_recipient(
         result = matching_recipients(to, resolution_scope, observed, membership=membership)
         problems = result.problems
         if isinstance(result, RecipientMatches) and result.entries:
+            if defer_fixed_route and isinstance(target, FixedStaffLookup) and len(result.entries) == 1:
+                entry = result.entries[0]
+                if (isinstance(entry.session, roster.ClaudeSession)
+                        and isinstance(entry.reach, roster.CannotReceiveMessages)
+                        and entry.reach.reason == "no messaging socket"):
+                    return RecipientRoutePending(roster.cannot_receive_message_text(entry))
             route = _matched_recipient(to, result.entries, result.destination)
             if (isinstance(route, RemoteDelivery) and route.selected_conversation
                     and isinstance(member, staff.StaffRow)):
@@ -3242,12 +3267,17 @@ def resolve_recipient(
             if isinstance(fallback, staff.StaffRow):
                 return resolve_recipient(str(fallback.id), scope, observed, membership=membership, records=records)
         if isinstance(result, LocalRosterIncomplete):
-            usage_error(f"absence of {to} here is not proven; use an address or --machine")
+            reason = f"absence of {to} here is not proven; use an address or --machine"
+            if defer_fixed_route and isinstance(target, FixedStaffLookup):
+                return RecipientRoutePending(reason)
+            usage_error(reason)
         if isinstance(result, RecipientSearchFailed):
             related = _recipient_roster_problems(to, problems, observed, membership)
             reason = (f"recipient lookup failed for {to!r}"
                       if any(problem in result.reason for problem in problems if problem not in related)
                       else result.reason)
+            if defer_fixed_route and isinstance(target, FixedStaffLookup):
+                return RecipientRoutePending(reason)
             return RecipientLookupFailed(reason)
         if to.startswith("worker:"):
             usage_error(f"no roster session has address {to}")
@@ -3262,7 +3292,10 @@ def resolve_recipient(
             if sessions.addressed(address, records or [], membership=membership) is not None:
                 return ClaudeRecipient(address)
             if isinstance(target, FixedStaffLookup):
-                usage_error(f"no live session answers to staff ID {to}")
+                reason = f"no live session answers to staff ID {to}"
+                if defer_fixed_route:
+                    return RecipientRoutePending(reason)
+                usage_error(reason)
             return QueuedStaffRecipient(address, member.name, str(member.current_session))
         if to.startswith("session:"):
             return ClaudeRecipient(to)
@@ -3450,7 +3483,7 @@ def _unaccepted_relay(forward: RelayForward, reason: str, *, queue_if_unsent: bo
     if isinstance(forward, RefusedRelayRequest):
         return forward
     if isinstance(forward, RelayRequestNotForwarded):
-        return Result("queued" if queue_if_unsent else "failed", reason)
+        return SendNotStarted("queued", reason) if queue_if_unsent else Result("failed", reason)
     return UncertainRelayDelivery("failed", f"{reason}; delivery unconfirmed")
 
 
@@ -4044,7 +4077,7 @@ def relay(message: Message, timeout: float) -> Result:
         return Result("failed", "no Claude delivery attempt was selected")
     claude = claude_binary()
     if claude is None:
-        return Result("queued", "no claude binary found")
+        return SendNotStarted("queued", "no claude binary found")
     tools = "SendMessage"
     # An inherited CLAUDE_* variable makes the relay pass for the caller's session:
     # CLAUDE_CODE_MESSAGING_SOCKET, for one, is that session's inbox.
@@ -4056,7 +4089,7 @@ def relay(message: Message, timeout: float) -> Result:
     try:
         selected = accounts.account_for_unscoped_launch(os.environ)
     except accounts.AccountsError as error:
-        return Result("queued", str(error))
+        return SendNotStarted("queued", str(error))
     if not isinstance(selected, accounts.LegacyHomeLaunch):
         env.update(named_account_environment(selected.dir))
     model = models_registry.claude_model(MODEL, env)
@@ -4073,7 +4106,7 @@ def relay(message: Message, timeout: float) -> Result:
             token = subprocess.run(["gpg", "--pinentry-mode", "error", "--quiet", "--decrypt", str(token_file)],
                                    capture_output=True, text=True, timeout=10, check=False)
             if token.returncode != 0:
-                return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
+                return SendNotStarted("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
             env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
         relay_env = models_registry.agent_environment(env)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -4101,7 +4134,8 @@ def relay(message: Message, timeout: float) -> Result:
             return result
         return _unaccepted_relay(observed.forward, f"relay timed out after {timeout:g} s")
     if result.outcome == "queued" and code != 0:
-        return Result("queued", f"relay exit {code}: {result.detail}; {one_line(err, 200)}")
+        detail = f"relay exit {code}: {result.detail}; {one_line(err, 200)}"
+        return SendNotStarted("queued", detail) if isinstance(result, SendNotStarted) else Result("queued", detail)
     return result
 
 
@@ -4424,8 +4458,15 @@ def remote(message: Message, host: str, options: Options) -> Result:
     outcome = send_outcome(code, out)
     if isinstance(outcome, UnconfirmedSendOutcome):
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
+        if isinstance(selection, FixedStaffLookup) and options.review_delivery:
+            return UncertainRelayDelivery("failed", f"ssh {host}: {why}")
         return Result("held" if isinstance(failure, FailedPush) and failure.held else "failed", f"ssh {host}: {why}", failure)
     parsed = outcome.header
+    if isinstance(selection, FixedStaffLookup) and options.review_delivery:
+        if parsed.outcome == "retry" and parsed.payload == QUESTION_NOT_STARTED:
+            return SendNotStarted("retry", f"on {host}: {parsed.detail}", failure, receiver)
+        if parsed.outcome == "refused" and parsed.payload == QUESTION_RECIPIENT_GONE:
+            return QuestionRecipientGone("refused", f"on {host}: {parsed.detail}", failure, receiver)
     detail = parsed.detail
     if parsed.payload:
         detail += "\n" + parsed.payload
@@ -4951,7 +4992,10 @@ def send(options: Options) -> Result:
         membership = (staff.snapshot() if options.to != USER
                       else staff.StaffSnapshot(()))
     except staff.StaffUnreadable as error:
-        usage_error(f"staff lookup for {options.to!r}: {error}")
+        reason = f"staff lookup for {options.to!r}: {error}"
+        if isinstance(options.selection, FixedStaffLookup) and options.review_delivery:
+            return SendNotStarted("retry", reason)
+        usage_error(reason)
     if not isinstance(options.recipient_identity, LogicalRecipientIdentity):
         return _send(options, membership=membership)
     identity = Message(options.recipient_identity.name, options.sender or default_sender(),
@@ -5149,6 +5193,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                              participants=participants) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
     fixed = isinstance(options.selection, FixedStaffLookup)
+    defer_fixed_route = fixed and options.review_delivery
     native = not fixed and target.startswith("session:")
     raw_socket = not fixed and target.startswith("uds:")
     if isinstance(options.selection, FixedStaffLookup):
@@ -5158,6 +5203,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     else:
         member = resolve_staff_recipient(target, membership, observed=observed.entries)
     if isinstance(member, RecipientLookupFailed):
+        if defer_fixed_route:
+            return QuestionRecipientGone("refused", member.reason)
         usage_error(member.reason)
     mailbox: ClaudeMailbox | NoRelayReplyMailbox = NO_RELAY_REPLY_MAILBOX
     if native:
@@ -5179,7 +5226,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     else:
         try:
             selected = options.selection if isinstance(options.selection, FixedStaffLookup) else target
-            route = resolve_recipient(selected, options.scope, observed, membership=membership, records=running)
+            route = resolve_recipient(selected, options.scope, observed, membership=membership, records=running,
+                                      defer_fixed_route=defer_fixed_route)
         except RecipientNameMissing as error:
             from scripts.message import failed_lookup
 
@@ -5226,7 +5274,9 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     unproved_claude = (claude_route and isinstance(plan, ClaudeRoutingFailed)
                        or isinstance(route, RecipientLookupFailed) and raw_socket)
     if isinstance(plan, ClaudeRoutingFailed) and claude_route:
-        route = RecipientLookupFailed(plan.failure.reason)
+        route = (RecipientRoutePending(plan.failure.reason)
+                 if defer_fixed_route
+                 else RecipientLookupFailed(plan.failure.reason))
     recipient: ClaudeRecipientIdentity | NoRelayReplyMailbox = mailbox
     if isinstance(plan, RelayAttempt):
         attempt = plan.message.claude_attempt
@@ -5335,7 +5385,9 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     def deliver(transport_message: Message, *, batch_only: bool = False) -> Result:
         nonlocal claim_result, log_route
         delivery_identity = replace(postmaster_identity, key=transport_message.key)
-        if isinstance(route, RecipientLookupFailed):
+        if isinstance(route, RecipientRoutePending):
+            result = SendNotStarted("retry", route.reason)
+        elif isinstance(route, RecipientLookupFailed):
             from scripts.message import failed_lookup
 
             failed_lookup.report(sender, options.to, f"FAILED: {route.reason}")
@@ -5380,8 +5432,10 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                 else:
                     delivery_message, relayed_result = relay_socket(relay_message, timeout, selection=options.selection)
                 if isinstance(options.selection, FixedStaffLookup):
+                    if options.review_delivery and isinstance(relayed_result, (ConfirmedSocketMiss, SendNotStarted)):
+                        return SendNotStarted("retry", relayed_result.detail)
                     if relayed_result.outcome == "queued":
-                        return Result("failed", relayed_result.detail)
+                        return Result("retry" if options.review_delivery else "failed", relayed_result.detail)
                     if relayed_result.outcome == "sent":
                         owner = delivery_message.claude_attempt
                         assert isinstance(owner, ClaudeDeliveryAttempt) and isinstance(owner.recipient, StaffClaudeRecipient)
@@ -5515,7 +5569,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                 and isinstance(claim_result, ClaimGranted)
                 and not isinstance(result, (UncertainRelayDelivery, WorkerMessageUnconfirmed))
                 and ((emergency and result.outcome != "sent")
-                     or result.outcome in {"failed", "refused", "held", "pending"})):
+                     or result.outcome in {"failed", "refused", "held", "pending"}
+                     or defer_fixed_route and result.outcome == "retry")):
             forget_sent(key, attempt_recipient.value, started)
         elif (key is not None and not refused and held is None and isinstance(claim_result, ClaimGranted)
               and not isinstance(result, RecordedDeliveryAcceptance)
@@ -5668,9 +5723,17 @@ def main(argv: list[str]) -> int:
                 print("not sent: probe sessions never push to the phone")
                 return 0
             result = send(options)
+            fixed_question = isinstance(options.selection, FixedStaffLookup) and options.review_delivery
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
-            print(f"{outcome.upper()}: {result.detail}")
+            detail = one_line(result.detail) if fixed_question and isinstance(
+                result, (SendNotStarted, QuestionRecipientGone)) else result.detail
+            print(f"{outcome.upper()}: {detail}")
+            if fixed_question:
+                if isinstance(result, SendNotStarted) and outcome == "retry":
+                    print(QUESTION_NOT_STARTED)
+                elif isinstance(result, QuestionRecipientGone):
+                    print(QUESTION_RECIPIENT_GONE)
             if outcome == "failed" and options.to.startswith("uds:"):
                 print(f"send.py: {result.detail}", file=sys.stderr)
             if isinstance(result.failure, FailedPush):

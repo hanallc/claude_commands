@@ -268,6 +268,7 @@ def retain_question_delivery(item: ReviewItem, assets: dict[str, str], status: c
     if not isinstance(question, change_page.OpenQuestion) or isinstance(question, change_page.OpenFeedback):
         return
     sources.append(status.closeout_path(page, row))
+    sources.append(change_page.question_recovery_path(status.path(page, row)))
     if change_page.review_question_failed(status, page, row, question):
         assets['question-delivery:'+item.key] = change_page.question_failure_html(True)
 

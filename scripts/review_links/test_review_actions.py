@@ -86,7 +86,8 @@ class WaitingActionTests(unittest.TestCase):
             change_page.deliver(delivery, status)
         self.assertIn('\n' + words + '\nAnswer with this command:', delivery.message)
         send.assert_called_once_with(recipient.id, change_page.SENDER, delivery.message,
-                                     key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt))
+                                     key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt),
+                                     question=True)
 
 
 if __name__ == '__main__':

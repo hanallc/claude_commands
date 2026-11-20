@@ -4202,14 +4202,16 @@ observer.observe(original.parentNode,{childList:true});
                 assert isinstance(delivery.job, change_page.QuestionJob)
                 claimed = delivery.job.record
                 path = status.path(delivery.page, delivery.row)
-                if previous_state is state.READY:
+                if previous_state in (state.READY, state.QUEUED):
+                    # Older attempts can have a receipt from the sender queue.
+                    receipt = (delivery_state.QuestionSendReceipt("queued", "") if previous_state is state.QUEUED
+                               else delivery_state.NoQuestionSendReceipt())
                     with status.locked():
                         change_page.advance_question_attempt(path, claimed, replace(
-                            claimed, state=state.READY, owner=delivery_state.NoQuestionSendOwner()))
+                            claimed, state=previous_state, owner=delivery_state.NoQuestionSendOwner(), receipt=receipt))
                     _ = delivery.job.release()
                 else:
-                    outcome = "queued" if previous_state is state.QUEUED else "sent"
-                    with patch.object(change_page, "send_question", return_value=question_outcome(outcome)):
+                    with patch.object(change_page, "send_question", return_value=question_outcome()):
                         list_page.deliver(asked)
 
                 edited = the_list.update(MORTY.id, item.id, {"title": "New title"}, source="morty")

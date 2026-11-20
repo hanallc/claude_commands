@@ -75,10 +75,12 @@ def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
                 retry = replace(prepared, revision=record.revision + 1,
                                 earlier_unconfirmed=record.earlier_unconfirmed or (
                                     not unsaved_draft and view.state is QuestionSendState.UNKNOWN))
+                _ = status.question_recovery_remaining(path, retry.attempt_id, saved.source.question_id)
                 change_page.advance_question_attempt(path, record, retry)
                 record = retry
         else:
             record = replace(prepared, earlier_unconfirmed=not new_question and view.state is QuestionSendState.UNKNOWN)
+            _ = status.question_recovery_remaining(path, record.attempt_id, saved.source.question_id)
             change_page.publish_question_attempt(path, record)
         if new_question:
             store.add(item, question)

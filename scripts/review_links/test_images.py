@@ -1010,6 +1010,58 @@ class ImageQuestionTests(ImagesFixture):
         questions = image_store.ImageQuestionStore(images.images_root(self.root)).questions(record['id'])
         self.assertEqual([question.question_id for question in questions], ['Q1'])
 
+    def test_ready_sync_failure_accepts_the_published_revision(self) -> None:
+        record = self.register()
+        sync = atomic_file.sync_folder
+        read = change_page.read_question_attempt
+        fail_readback = False
+
+        def sync_ready(folder: Path) -> None:
+            nonlocal fail_readback
+            if folder == self.root and any(read(path).state is delivery_state.QuestionSendState.READY
+                                           for path in folder.glob(change_page.DELIVERY_PREFIX + '*')):
+                fail_readback = True
+                raise OSError('Cannot sync the READY record.')
+            sync(folder)
+
+        def read_attempt(path: Path) -> delivery_state.QuestionAttempt:
+            nonlocal fail_readback
+            if fail_readback:
+                fail_readback = False
+                raise OSError('Cannot verify the READY record.')
+            return read(path)
+
+        with (patch.object(atomic_file, 'sync_folder', side_effect=sync_ready),
+              patch.object(change_page, 'read_question_attempt', side_effect=read_attempt)):
+            self.ask(record)
+
+        path, = self.root.glob(change_page.DELIVERY_PREFIX + '*')
+        self.assertEqual(read(path).state, delivery_state.QuestionSendState.FAILED)
+        self.assertEqual(self.sent, [])
+        self.assertIn('Question not delivered.', images.render(self.status).decode())
+
+    def test_startup_retries_an_unreadable_delivery_record(self) -> None:
+        record = self.register()
+        delivery = images.ask_question(self.root, record['id'], 'Which check passed?', self.status)
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        _ = delivery.job.release()
+        path = self.status.path(delivery.page, delivery.row)
+        saved = change_page.read_question_attempt(path)
+        restarted = change_page.DeliveryStatus(self.root)
+
+        with (patch.object(delivery_state, 'read_fields', side_effect=OSError('Cannot read the record.')),
+              patch.object(change_page, 'send_question', return_value=question_outcome()) as send):
+            change_page.recover_review_messages(restarted)
+            send.assert_not_called()
+        self.assertTrue(restarted.has_deferred_questions())
+        with patch.object(change_page, 'send_question', return_value=question_outcome()) as send:
+            change_page.recover_deferred_questions(restarted)
+            change_page.recover_deferred_questions(restarted)
+        send.assert_called_once_with(saved.recipient_id, saved.message, saved.message_id)
+        self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+        self.assertFalse(restarted.has_deferred_questions())
+
     def test_pending_send_retries_with_the_saved_message_id(self) -> None:
         record = self.register()
         with patch.object(change_page, 'send_question', return_value=question_outcome('pending')) as send:

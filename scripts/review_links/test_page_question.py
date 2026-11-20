@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import call, patch
 
-from scripts.lib import atomic_file, process_start
+from scripts.lib import atomic_file, conf, process_start
 from scripts.message import send_result
 from scripts.production import delivery_state, staff
 from scripts.review_links import change_page, image_store, page_question, question_record
@@ -305,9 +305,10 @@ class PageQuestionTests(unittest.TestCase):
         replace_file = os.replace
 
         def fail_result_rename(source: Path, destination: Path) -> None:
-            candidate = change_page.read_question_attempt(source)
-            if candidate.state is delivery_state.QuestionSendState.SENT:
-                raise OSError("Cannot replace the delivery record.")
+            if destination == path:
+                candidate = change_page.read_question_attempt(source)
+                if candidate.state is delivery_state.QuestionSendState.SENT:
+                    raise OSError("Cannot replace the delivery record.")
             replace_file(source, destination)
 
         with (patch.object(change_page, "send_question", side_effect=transport.send),
@@ -325,7 +326,7 @@ class PageQuestionTests(unittest.TestCase):
     def test_typed_transport_results_set_the_delivery_state(self) -> None:
         state = delivery_state.QuestionSendState
         cases: tuple[tuple[send_result.Outcome, delivery_state.QuestionSendState], ...] = (
-            ("sent", state.SENT), ("kept", state.SENT), ("queued", state.QUEUED),
+            ("sent", state.SENT), ("kept", state.UNKNOWN), ("queued", state.UNKNOWN),
             ("failed", state.FAILED), ("refused", state.FAILED), ("skipped", state.SENT),
             ("replaced", state.FAILED), ("held", state.UNKNOWN), ("pending", state.UNKNOWN),
             ("retry", state.UNKNOWN),
@@ -344,6 +345,111 @@ class PageQuestionTests(unittest.TestCase):
                 self.assertEqual(set(self.status.take_deferred_questions()), {path} if expected is state.UNKNOWN else set())
                 if outcome == "skipped":
                     self.assertEqual(result.receipt, delivery_state.QuestionSendReceipt("kept", "fixture receipt"))
+
+    def test_unreadable_pending_attempt_expires_without_another_send(self) -> None:
+        delivery = self.ask()
+        path = self.status.path(delivery.page, delivery.row)
+        with patch.object(change_page, "send_question", return_value=question_outcome("pending")):
+            change_page.deliver(delivery, self.status)
+        pending = path.read_bytes()
+        self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.UNKNOWN)
+        recovery = change_page.read_question_recovery(path)
+        assert recovery is not None
+
+        _ = path.write_bytes(b"{")
+        restarted = change_page.DeliveryStatus(self.status.root)
+        with (patch.object(change_page.time, "time", return_value=recovery.deadline),
+              patch.object(change_page, "send_question") as transport):
+            change_page.recover_review_messages(restarted)
+            change_page.recover_deferred_questions(restarted)
+            self.assertFalse(restarted.has_deferred_questions())
+            self.status = restarted
+            self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
+            _ = path.write_bytes(pending)
+            change_page.recover_review_messages(restarted)
+            change_page.deliver(self.ask(), restarted)
+        transport.assert_not_called()
+        self.assertFalse(restarted.has_deferred_questions())
+        self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
+
+    def test_unreadable_attempt_expires_before_the_first_send(self) -> None:
+        delivery = self.ask()
+        path = self.status.path(delivery.page, delivery.row)
+        _ = self.job(delivery).release()
+        recovery = change_page.read_question_recovery(path)
+        assert recovery is not None
+        self.assertEqual(recovery.question_id, self.store.questions("image-1")[0].question_id)
+        _ = path.write_bytes(b"{")
+        self.status = change_page.DeliveryStatus(self.status.root)
+
+        with (patch.object(change_page.time, "time", return_value=recovery.deadline),
+              patch.object(change_page, "send_question") as transport):
+            change_page.recover_review_messages(self.status)
+            change_page.recover_deferred_questions(self.status)
+        transport.assert_not_called()
+        self.assertFalse(self.status.has_deferred_questions())
+        self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
+
+    def test_question_does_not_send_when_the_marker_write_crosses_the_deadline(self) -> None:
+        delivery = self.ask()
+        path = self.status.path(delivery.page, delivery.row)
+        recovery = change_page.read_question_recovery(path)
+        assert recovery is not None
+        now = recovery.deadline - 1
+        publish = change_page.publish_question_attempt
+
+        def cross_deadline(target: Path, attempt: delivery_state.QuestionAttempt) -> None:
+            nonlocal now
+            publish(target, attempt)
+            if target == path and attempt.state is delivery_state.QuestionSendState.SENDING:
+                now = recovery.deadline
+
+        with (patch.object(change_page.time, "time", side_effect=lambda: now),
+              patch.object(change_page, "publish_question_attempt", side_effect=cross_deadline),
+              patch.object(change_page, "send_question") as transport):
+            change_page.deliver(delivery, self.status)
+        transport.assert_not_called()
+        self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
+
+    def test_unreadable_job_lock_blocks_send_and_allows_expiry(self) -> None:
+        delivery = self.ask()
+        path = self.status.path(delivery.page, delivery.row)
+        recovery = change_page.read_question_recovery(path)
+        assert recovery is not None
+        _ = self.job(delivery).release()
+        self.status = change_page.DeliveryStatus(self.status.root)
+
+        with (patch.object(change_page, "_question_lock_state", return_value="unreadable"),
+              patch.object(change_page, "send_question") as transport):
+            with patch.object(change_page.time, "time", return_value=recovery.deadline - 1):
+                change_page.recover_review_messages(self.status)
+                self.assertTrue(self.status.has_deferred_questions())
+            with patch.object(change_page.time, "time", return_value=recovery.deadline):
+                change_page.recover_deferred_questions(self.status)
+            self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
+        transport.assert_not_called()
+        self.assertFalse(self.status.has_deferred_questions())
+
+    def test_retry_pause_ends_at_the_question_deadline(self) -> None:
+        delivery = self.ask()
+        path = self.status.path(delivery.page, delivery.row)
+        recovery = change_page.read_question_recovery(path)
+        assert recovery is not None
+        _ = conf.path("review_links").write_text("delivery_tries=2\ndelivery_pause_seconds=300\n")
+        now = recovery.deadline - 1
+
+        def elapse(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        with (patch.object(change_page.time, "time", side_effect=lambda: now),
+              patch.object(change_page.time, "sleep", side_effect=elapse) as pause,
+              patch.object(change_page, "send_question", return_value=question_outcome("pending")) as transport):
+            change_page.deliver(delivery, self.status)
+        transport.assert_called_once()
+        pause.assert_called_once_with(1)
+        self.assertFalse(self.status.has_deferred_questions())
+        self.assertEqual(self.effective(delivery), delivery_state.QuestionSendState.FAILED)
 
     def test_an_empty_question_does_not_write_or_claim(self) -> None:
         with self.assertRaisesRegex(question_record.AnswerRefused, 'Enter a question first'):

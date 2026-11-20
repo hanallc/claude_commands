@@ -3771,7 +3771,8 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 write = atomic_file.write_bytes_atomic
                 seen: list[str] = []
 
-                def relay(_address: str, _sender: str, message: str, *, key: str, recipient_key: str) -> None:
+                def relay(_address: str, _sender: str, message: str, *, key: str, recipient_key: str,
+                          question_kind: staff.Kind | None = None) -> None:
                     self.assertTrue(recipient_key)
                     seen.append(key)
                     if key not in sent:

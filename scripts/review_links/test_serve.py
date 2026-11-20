@@ -3643,11 +3643,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         claim_question = change_page.claim_question
 
         def claim(status: change_page.DeliveryStatus,
-                  delivery: change_page.VerifiedQuestionAttempt) -> change_page.PageQuestionSend:
+                  delivery: change_page.VerifiedQuestionAttempt, *, recovering: bool = False) -> change_page.PageQuestionSend:
             claiming.set()
             if not resume_claim.wait(TEST_HANG_GUARD_SECS):
                 raise TimeoutError("The test did not resume the send claim.")
-            return claim_question(status, delivery)
+            return claim_question(status, delivery, recovering=recovering)
         deliveries: list[tuple[staff.StaffId, str]] = []
         saved_at_send: list[the_list.ListItem] = []
 

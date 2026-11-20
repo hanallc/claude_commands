@@ -28,11 +28,11 @@ def send_message(recipient: str, sender: str, message: str) -> None:
     raise RuntimeError(error)
 
 
-def message_outcome(recipient: str, sender: str, message: str, *options: str
+def message_outcome(recipient: str, sender: str, message: str, *options: str, timeout: float | None = None
                     ) -> tuple[send_result.ConfirmedSendOutcome | send_result.UnconfirmedSendOutcome, str]:
     """Return the confirmed transport result and its diagnostic."""
     result = subprocess.run(session_send.send_argv("--to", recipient, "--from", sender, "--text", message, *options),
-                            capture_output=True, text=True, check=False)
+                            capture_output=True, text=True, check=False, timeout=timeout)
     return (send_result.send_outcome(result.returncode, result.stdout),
             (result.stderr or result.stdout).strip() or "message delivery failed")
 
