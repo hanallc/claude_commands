@@ -334,6 +334,21 @@ class AwsReportTests(MeasurementFixture):
         self.assertIn('**Month to date (UTC 2026-01): $2.00 of the $400.00 monthly limit.**', output)
         self.assertNotIn('Month forecast:', output)
 
+    def test_report_keeps_measures_when_the_forecast_setting_is_missing(self) -> None:
+        self.remove('spend_pace_days')
+        self.write_records(self.local_step('forecast-evidence', 60, 10))
+        _ = index.update()
+        with closing(index.read_only()) as connection, read_only_evidence(self, self.root, allow_private_history=True):
+            output = report.report(connection, DAY)
+        notices = [line for line in output.splitlines() if line.startswith('Month forecast unavailable:')]
+        self.assertEqual(notices, [f"Month forecast unavailable: {self.settings}: spend_pace_days='<missing>': "
+                                   + 'key is missing; no usable committed value.'])
+        self.assertNotIn('Month forecast:', output)
+        self.assertIn('**Today (UTC 2026-01-15, estimate): $2.00 of the $20.00 daily limit.', output)
+        self.assertIn('**Month to date (UTC 2026-01): $2.00 of the $400.00 monthly limit.**', output)
+        self.assertIn('Ledger query fees for these days: $0.00.', output)
+        self.assertIn('### Summary: all', output)
+
     def test_gate_type_comparison_uses_finished_times_and_billed_days_in_the_window(self) -> None:
         numeric_settings(self.settings, {'gate_type_window_days': '2'})
         launches: list[dict[str, object]] = []
