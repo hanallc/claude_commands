@@ -64,10 +64,10 @@ def fixture_data(*, aws_closed: bool = False) -> machines_data.MachinesPageData:
                                   D(0), D(0), machines_data.NoHoursSaved(), limits[0]),
         machines_data.MachineStep(*bands[1], (large,), (
             machines_data.MachineRunShare(large, D('.978')), machines_data.MachineRunShare(small, D('.022'))),
-            D('14.14'), D('218'), D('.065'), limits[1]),
+            D('14.14'), D(218), D('14.14') / D(218), limits[1]),
         machines_data.MachineStep(*bands[2], (reserve,), (
             machines_data.MachineRunShare(large, D('.978')), machines_data.MachineRunShare(reserve, D('.014')),
-            machines_data.MachineRunShare(small, D('.008'))), D('15.10'), D('222'), D('.068'), limits[2]),
+            machines_data.MachineRunShare(small, D('.008'))), D('15.10'), D(222), D('15.10') / D(222), limits[2]),
     )
     workload = machines_data.MeasuredWorkload(WORKLOAD_NAME, 'merge-gate', choices, small, 1075, D(4658),
         D('62.72'), ((1, 611), (2, 272), (3, 125), (4, 43), (5, 19), (6, 5)), D('1.50'), D('14.14'), steps,
@@ -80,6 +80,29 @@ def fixture_data(*, aws_closed: bool = False) -> machines_data.MachinesPageData:
             'The records for targeted test hold 608 completed runs on 1 machine size in this period.'),
         machines_data.WorkloadWithoutComparison('test affected', 'test-affected',
             'The records for test affected hold 38 completed runs on 1 machine size in this period.')))
+
+
+def fixture_two_jobs() -> machines_data.MachinesPageData:
+    """Give the two measured jobs different limits for their faster machines."""
+    data = fixture_data()
+    gate = data.workloads[0]
+    assert isinstance(gate, machines_data.MeasuredWorkload)
+    small, large = (replace(choice, checks=count, launched=count, small_sample=False)
+                    for choice, count in zip(gate.choices[:2], (568, 40), strict=True))
+    large = replace(large, quota_fit_share=D(1), spot_granted_share=D('.75'), free_share=D('.75'))
+    base, extra, hours = D('35.28'), D('5.08'), D(70)
+    limits = tuple(machines_data.MachineLimit(limit.ratio, (limit.ratio - 1) * base)
+                   for step in gate.steps for limit in step.limits)
+    steps = (
+        replace(gate.steps[0], last_ratio=D('1.30'), limits=limits[:7]),
+        machines_data.MachineStep(D('1.35'), D('3'), (large.machine,), (
+            machines_data.MachineRunShare(large.machine, D('.75')),
+            machines_data.MachineRunShare(small.machine, D('.25'))),
+            extra, hours, extra / hours, limits[7:]),
+    )
+    targeted = machines_data.MeasuredWorkload('targeted test', 'targeted-test', (small, large), small.machine,
+        608, D(2635), base, ((1, 608),), gate.live_ratio, extra, steps, ('The measured run rate repeats.',))
+    return replace(data, workloads=(gate, targeted, data.workloads[2]))
 
 
 class _PageServer(ThreadingHTTPServer):
@@ -119,22 +142,24 @@ class MachinesPageTests(unittest.TestCase):
         self.assertIn('No saved Spot prices', page)
         self.assertNotIn('id="machine-controls"', page)
 
-    def test_page_uses_the_workload_name_in_the_heading_button_and_measurements(self) -> None:
-        data = fixture_data()
+    def test_page_uses_the_workload_name_in_the_details(self) -> None:
+        data = fixture_two_jobs()
         workload = replace(data.workloads[0], name='Landing & validation')
         page = machines_page.render(replace(data, workloads=(workload, *data.workloads[1:])), NOW)
-        self.assertIn('<h2>Landing &amp; validation</h2>', page)
-        self.assertIn('Set the limit for Landing &amp; validation</button>', page)
+        self.assertIn('<h2>All jobs</h2>', page)
+        self.assertIn('<h2>Where the jobs run · Landing &amp; validation', page)
+        self.assertIn('Set the limit</button>', page)
         self.assertIn('1,075 completed runs for Landing &amp; validation', page)
         self.assertNotRegex(page.lower(), r'merge[- ](?:check|gate)')
 
-    def test_page_shows_an_additional_measured_job_without_controls(self) -> None:
+    def test_page_shows_a_comparison_when_only_a_targeted_test_has_one(self) -> None:
         data = fixture_data()
         primary = data.workloads[0]
         assert isinstance(primary, machines_data.MeasuredWorkload)
-        other = replace(primary, name='test named', mode='test-modules')
-        page = machines_page.render(replace(data, workloads=(*data.workloads, other)), NOW)
-        self.assertIn('<p>The records for test named hold 1075 completed runs on 2 machine sizes in this period.</p>', page)
+        targeted = replace(primary, name='test named', mode='test-modules')
+        page = machines_page.render(replace(data, workloads=(*data.workloads[1:], targeted)), NOW)
+        self.assertIn('<h2>What we measured for test named</h2>', page)
+        self.assertEqual(page.count('data-job-projection>'), 1)
         self.assertEqual(page.count('id="machine-controls"'), 1)
         self.assertNotIn('<select', page)
 
@@ -198,11 +223,12 @@ machines.ratio_step=0.25
   check(!/\bmerge\b/i.test(document.querySelector('main').innerText), 'No old name in the visible page');
   check(document.querySelectorAll('.sample').length === 2, 'Small samples');
   check(slider.valueAsNumber === 1.5 && amount.value === '31.36', 'Live ratio and ceiling');
-  check(go.textContent === 'Set the limit to 1.50 for gate', 'Go uses the workload name');
+  check(go.textContent === 'Set the limit to 1.50', 'Go uses the shared limit');
   go.dispatchEvent(new Event('click'));
   document.querySelector('[data-setting-save]').click();
   check(document.querySelector('[data-setting-confirm]').hidden, 'An unchanged value has no confirmation');
   check(document.getElementById('extra-cost').textContent === '$14.14', 'The tile uses the estimate');
+  check(document.querySelector('[data-job-extra]').textContent === '$14.14', 'One job matches the total');
   check(document.getElementById('saved-hour-cost').textContent ===
         document.querySelector('[data-step="1"]').lastElementChild.textContent, 'The table and tile use the same price rounding');
   check(document.getElementById('monthly-cap').textContent.includes('$31.36'), 'The cap uses the ceiling');
@@ -240,13 +266,54 @@ machines.ratio_step=0.25
         self.browser(markup, probe, expected_saves=('2.15',))
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for the Machines page checks')
+    def test_browser_shows_the_total_and_updates_both_jobs(self) -> None:
+        markup = machines_page.render(fixture_two_jobs(), NOW)
+        probe = """<script>
+const jobs = [...document.querySelectorAll('[data-job-projection]')];
+const slider = document.getElementById('cost-limit-value');
+const amount = document.getElementById('monthly-limit');
+const go = document.querySelector('[data-setting-go]');
+const jobValues = selector => jobs.map(job => job.querySelector(selector).textContent);
+function check(condition, label) { if (!condition) throw new Error(label); }
+let result = 'passed';
+try {
+ check(jobValues('h2').join('|') === 'Where the jobs run · gate at 1.50|Where the jobs run · targeted test at 1.50',
+       'Jobs are shown in data order');
+ check(jobValues('[data-job-extra]').join('|') === '$14.14|$5.08', 'Job estimates');
+ check(document.getElementById('extra-cost').textContent === '$19.22', 'Total estimate');
+ check(document.getElementById('saved-hours').textContent === '288 h', 'Total hours');
+ check(document.getElementById('saved-hour-cost').textContent === '$0.07', 'Cost per hour uses total hours');
+ check(amount.value === '49.00' && document.getElementById('monthly-cap').textContent.includes('$49.00'),
+       'The amount and the cap use the total ceiling');
+ const steps = [...document.querySelectorAll('[data-step]')];
+ check(steps[2].innerText.includes('targeted test') && steps[2].innerText.includes('c7a.8xlarge'),
+       'The step names the job and the added machine');
+ steps[1].querySelector('button').click();
+ check(slider.valueAsNumber === 1.25 && amount.value === '24.50', 'A step selects its first limit');
+ check(jobValues('[data-job-ratio]').join('|') === '1.25|1.25', 'Both jobs follow the slider');
+ check(jobValues('[data-job-extra]').join('|') === '$14.14|$0.00', 'The targeted test has no extra cost at 1.25');
+ check(jobValues('[data-choice="1"] [data-share]').join('|') === '97.8%|0%', 'Both jobs use their saved shares');
+ steps[0].querySelector('button').click();
+ go.click();
+ check(document.querySelector('[data-setting-summary]').textContent ===
+       'Change from 1.50 to 1.00. The estimate changes by -$19.22 a month.', 'Confirmation uses the total change');
+} catch (error) {
+ result = String(error);
+}
+void fetch('/probe?result=' + encodeURIComponent(result));
+</script>"""
+        self.browser(markup, probe)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for the Machines page checks')
     def test_browser_uses_the_exact_live_text_and_its_step_for_confirmation(self) -> None:
         data = fixture_data()
         workload = data.workloads[0]
         assert isinstance(workload, machines_data.MeasuredWorkload)
-        for live, monthly_change in (('1.249', '+$14.14'), ('1.2750', '$0.00'), ('1.25000000000000001', '$0.00')):
+        for live, live_extra, monthly_change in (
+                ('1.249', '4.00', '+$10.14'), ('1.2750', '14.14', '$0.00'),
+                ('1.25000000000000001', '14.14', '$0.00')):
             with self.subTest(live=live):
-                live_workload = replace(workload, live_ratio=D(live), live_extra_usd_per_month=D('9.99'))
+                live_workload = replace(workload, live_ratio=D(live), live_extra_usd_per_month=D(live_extra))
                 markup = machines_page.render(replace(data, workloads=(live_workload, *data.workloads[1:])), NOW)
                 expected = json.dumps(f'Change from {live} to 1.25. The estimate changes by {monthly_change} a month.')
                 probe = """<script>
@@ -268,7 +335,7 @@ void fetch('/probe?result=' + encodeURIComponent(passed ? 'passed' : JSON.string
         data = fixture_data()
         workload = data.workloads[0]
         assert isinstance(workload, machines_data.MeasuredWorkload)
-        live_workload = replace(workload, live_ratio=D('1.249'))
+        live_workload = replace(workload, live_ratio=D('1.249'), live_extra_usd_per_month=D(0))
         data = replace(data, workloads=(live_workload, *data.workloads[1:]))
         probe = """<script>
 (async()=>{

@@ -39,6 +39,7 @@ small {display:block; color:var(--ink-3); font-weight:400}
 .sample {color:var(--warning)}
 #machine-steps {margin-top:0}
 #machine-steps :is(th,td):nth-child(2) {text-align:left}
+#machine-steps td:nth-child(2) div+div {margin-top:4px}
 #machine-steps tbody tr {cursor:pointer}
 #machine-steps tbody tr:hover {background:var(--hover)}
 #machine-steps tr[data-selected] {background:color-mix(in srgb,var(--accent) 12%,var(--card))}
@@ -68,7 +69,11 @@ __PAGE_SETTING_CONTROLS__
 <body>
 <main>
 __PAGE_TITLE__
-__PRIMARY_WORKLOAD__
+<section class="card">
+<h2>All jobs</h2>
+__ALL_JOBS_CONTROLS__
+</section>
+__JOB_SECTIONS__
 <section class="card other-workloads">
 <h2>Other workloads</h2>
 __OTHER_WORKLOADS__
@@ -90,15 +95,14 @@ if (location.protocol !== 'file:') createPageRefresh(refreshMachines, () => 0, (
 
 const model = document.getElementById('machines-model');
 if (model) {
- const {choices, projections, liveExtra} = JSON.parse(model.textContent);
+ const {choices, projections, jobProjections, liveExtra} = JSON.parse(model.textContent);
  const slider = pageSettingControls.connectSlider(document.getElementById('cost-limit'));
  const amount = document.getElementById('monthly-limit');
- const workloadName = document.getElementById('machine-controls').dataset.workloadName;
  const goRoot = document.getElementById('save-limit');
  const goButton = goRoot.querySelector('[data-setting-go]');
  const confirmation = goRoot.querySelector('[data-setting-confirm]');
  const steps = [...document.querySelectorAll('[data-step]')];
- const machines = [...document.querySelectorAll('[data-choice]')];
+ const jobs = [...document.querySelectorAll('[data-job-projection]')];
  const chart = document.getElementById('machine-chart');
  const paint = chart.getContext('2d');
  const currency = new Intl.NumberFormat('en-US', {style:'currency', currency:'USD'});
@@ -190,7 +194,7 @@ if (model) {
 
  function draw() {
   const item = stop(slider.value);
-  const {extra, hours, cost_per_hour, shares} = projection(item);
+  const {extra, hours, cost_per_hour} = projection(item);
   const ratio = slider.format(item.ratio);
   document.getElementById('extra-cost').textContent = currency.format(extra);
   document.getElementById('saved-hours').textContent = decimal.format(hours) + ' h';
@@ -198,18 +202,23 @@ if (model) {
    cost_per_hour === null ? '—' : currency.format(cost_per_hour);
   document.getElementById('monthly-cap').textContent = 'At this run count, the limit allows up to ' +
    currency.format(item.ceiling_cents / 100) + ' more a month. More runs can raise the monthly cost.';
-  document.getElementById('where-ratio').textContent = ratio;
   steps.forEach((row, index) => {
    const selected = index === item.step_index;
    row.toggleAttribute('data-selected', selected);
    row.querySelector('button').setAttribute('aria-pressed', String(selected));
   });
-  machines.forEach((row, index) => {
-   const allowed = Object.hasOwn(shares, index);
-   row.querySelector('[data-allowed]').textContent = allowed ? 'Yes' : 'No';
-   row.querySelector('[data-share]').textContent = percent.format(allowed ? shares[index] : 0);
+  jobs.forEach((job, index) => {
+   const {extra, shares} = jobProjections[index].findLast(step => step.first_ratio <= item.ratio);
+   job.querySelector('[data-job-ratio]').textContent = ratio;
+   job.querySelector('[data-job-extra]').textContent = currency.format(extra);
+   job.querySelectorAll('[data-choice]').forEach(row => {
+    const choice = row.dataset.choice;
+    const allowed = Object.hasOwn(shares, choice);
+    row.querySelector('[data-allowed]').textContent = allowed ? 'Yes' : 'No';
+    row.querySelector('[data-share]').textContent = percent.format(allowed ? shares[choice] : 0);
+   });
   });
-  go.setLabel('Set the limit to ' + ratio + ' for ' + workloadName);
+  go.setLabel('Set the limit to ' + ratio);
   goButton.disabled = slider.atLive || !Number.isFinite(estimateAtLive()) || !amount.validity.valid;
   drawChart();
  }
