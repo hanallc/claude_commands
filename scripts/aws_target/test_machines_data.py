@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import StringIO
@@ -177,6 +178,55 @@ names.test-all=fixture all
             self.assertEqual(workload.sentence,
                              f'The records for {name} hold 1 completed run on 1 machine size in this period.')
 
+    def test_total_uses_every_measured_job_and_every_step_start(self) -> None:
+        data = self.read()
+        gate = data.workloads[0]
+        assert isinstance(gate, machines_data.MeasuredWorkload)
+        zero, last = Decimal(0), Decimal('1.75')
+        limits = tuple(machines_data.MachineLimit(limit.ratio, (limit.ratio - 1) * Decimal('.40'))
+                       for step in gate.steps for limit in step.limits)
+        extra, hours, live = Decimal('.25'), Decimal('.50'), Decimal('1.76')
+        targeted = replace(gate, name='fixture targeted', mode='targeted-test', live_ratio=live,
+            live_extra_usd_per_month=extra, steps=(
+                replace(gate.steps[0], last_ratio=Decimal('1.50'), limits=limits[:-1]),
+                machines_data.MachineStep(last, last, (FAST,), (), extra, hours, extra / hours, limits[-1:]),
+            ))
+        gate = replace(gate, live_ratio=live)
+        total = replace(data, workloads=(gate, targeted, data.workloads[2])).total
+        assert isinstance(total, machines_data.AllJobsProjection)
+        self.assertEqual(tuple((step.first_ratio, step.last_ratio) for step in total.steps),
+                         tuple((limit.ratio, limit.ratio) for limit in limits))
+        self.assertEqual(total.steps[2].added, (machines_data.JobMachineAddition(gate.name, FASTER),))
+        self.assertEqual(total.steps[3].added, (machines_data.JobMachineAddition(targeted.name, FAST),))
+        self.assertIsInstance(total.steps[0].usd_per_hour_saved, machines_data.NoHoursSaved)
+        for index, (gate_step, job_extra, job_hours) in enumerate((
+                (gate.steps[1], zero, zero), (gate.steps[2], zero, zero), (gate.steps[2], extra, hours)), start=1):
+            with self.subTest(ratio=limits[index].ratio):
+                step = total.steps[index]
+                expected_extra = gate_step.extra_usd_per_month + job_extra
+                expected_hours = gate_step.hours_saved_per_month + job_hours
+                gate_limit = next(limit for limit in gate_step.limits if limit.ratio == limits[index].ratio)
+                self.assertEqual(step.extra_usd_per_month, expected_extra)
+                self.assertEqual(step.hours_saved_per_month, expected_hours)
+                self.assertEqual(step.usd_per_hour_saved, expected_extra / expected_hours)
+                self.assertEqual(step.limits[0].ceiling_extra_usd_per_month,
+                                 gate_limit.ceiling_extra_usd_per_month + limits[index].ceiling_extra_usd_per_month)
+        self.assertEqual(total.live_ratio, live)
+        self.assertEqual(total.live_extra_usd_per_month, gate.live_extra_usd_per_month + extra)
+
+    def test_one_measured_job_gives_the_same_total_as_that_job(self) -> None:
+        data = self.read()
+        gate = data.workloads[0]
+        assert isinstance(gate, machines_data.MeasuredWorkload)
+        total = data.total
+        assert isinstance(total, machines_data.AllJobsProjection)
+        for step, gate_step in zip(total.steps, gate.steps, strict=True):
+            self.assertEqual((step.first_ratio, step.last_ratio, step.limits),
+                             (gate_step.first_ratio, gate_step.last_ratio, gate_step.limits))
+            self.assertEqual((step.extra_usd_per_month, step.hours_saved_per_month, step.usd_per_hour_saved),
+                             (gate_step.extra_usd_per_month, gate_step.hours_saved_per_month, gate_step.usd_per_hour_saved))
+        self.assertEqual(total.live_extra_usd_per_month, gate.live_extra_usd_per_month)
+
     def test_recorded_steps_take_precedence_over_modes(self) -> None:
         jobs = {'fixture-1': StepJob('integrate'), 'fixture-2': StepJob('test-modules', modules=1),
                 'fixture-3': StepJob('test-all')}
@@ -201,6 +251,24 @@ names.test-all=fixture all
         targeted = workloads['targeted-test']
         assert isinstance(targeted, machines_data.WorkloadWithoutComparison)
         self.assertEqual(targeted.sentence, 'The records for fixture targeted hold 0 completed runs in this period.')
+
+    def test_the_gate_without_two_sizes_has_no_comparison(self) -> None:
+        path = self.book.launch_history_path
+        rows = [row for row in path.read_text().splitlines()
+                if FAST.region not in row and FASTER.region not in row]
+        _ = path.write_text('\n'.join(rows) + '\n')
+        merge = self.read().workloads[0]
+        self.assertIsInstance(merge, machines_data.WorkloadWithoutComparison)
+        self.assertEqual(merge.sentence, 'The records for fixture gate hold 1 completed run on 1 machine size in this period.')
+
+    def test_live_cost_uses_the_live_ratio_between_slider_values(self) -> None:
+        path = self.configuration.gate.source
+        _ = path.write_text(path.read_text().replace('faster_box_max_cost_ratio=1.50', 'faster_box_max_cost_ratio=1.26'))
+        self.configuration = replace(self.configuration, gate=conf.read(path))
+        merge = self.merge()
+        self.assertEqual(merge.live_ratio, Decimal('1.26'))
+        self.assertEqual(merge.live_extra_usd_per_month, merge.steps[1].extra_usd_per_month)
+        self.assertGreater(merge.live_extra_usd_per_month, 0)
 
     def test_removed_deployment_region_stays_measured_and_leaves_the_projection(self) -> None:
         self.write_deployment(SMALL.region, FASTER.region)
