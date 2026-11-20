@@ -918,13 +918,14 @@ Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
 An unbilled day with an accepted or pending run keeps the usual prices and carry from the bill.
+A current builder observation of running, pending, or stopping keeps the usual prices at UTC midnight.
 After the latest bill, an unbilled idle day carries retained resource costs and unknown usage types.
 It skips usage linked to runs and uses the usual accounting for Cost Explorer fees.
 The page and guard use the same idle-day carry.
 The guard keeps any higher established charges.
-The ledger and hours table exclude a closed Hana exposure when the journal proves a refusal or cancellation before dispatch.
+The ledger and hours table exclude a closed Hana exposure only when its START record has a valid `start_refusal_code`.
 A possible start or an observed acceptance in any generation of the exposure keeps the full exposure.
-A later stopped state alone gives no proof of a refusal.
+Legacy cancellations and stopped states retain the full exposure when the journal has no refusal code.
 Reports keep the existing reconciliation floors.
 The account checks adjust the existing total for each qualifying UTC day inside the limit window.
 They subtract that day's existing usage and add the newest qualifying AWS amount.

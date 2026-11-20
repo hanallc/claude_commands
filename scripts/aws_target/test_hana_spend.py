@@ -126,14 +126,15 @@ class HanaSpendTests(CostFixture):
         self.assertEqual(renewed.exposure.region, first.exposure.region)
         self.assertEqual(renewed.exposure.instance_type, first.exposure.instance_type)
 
-    def test_observed_hana_keeps_its_exposure_after_renewal_and_cancellation(self) -> None:
+    def test_observed_hana_keeps_its_exposure_after_renewal_and_refusal(self) -> None:
         first = self.issued(self.start)
         self.controller.reconcile(self.start, 'running', generation=first.exposure.generation)
         renewed = self.issued(self.start + 1, generation=first.exposure.generation)
         journal = self.state / 'hana' / 'provider'
         journal.mkdir(parents=True)
-        _ = (journal / 'publish.json').write_text(json.dumps({
-            'generation': renewed.exposure.generation, 'cancelled': True,
+        _ = (journal / 'renewed-start.json').write_text(json.dumps({
+            'action': 'start', 'generation': renewed.exposure.generation, 'dispatched': True,
+            'start_refusal_code': 'Blocked',
         }))
         stop = self.start + 120
         self.controller.reconcile(stop, 'stopped', generation=renewed.exposure.generation)

@@ -1492,10 +1492,15 @@ def _carried_bill_groups(bill: ChargeRead, *, idle: bool) -> tuple[SpendGroupCos
     return tuple(SpendGroupCost(group, usd) for group, usd in groups.items())
 
 
-def _uses_idle_bill_carry(day: str, start: int, end: int, prior_bill: ChargeRead,
+def _uses_idle_bill_carry(day: str, start: int, end: int, now: int, prior_bill: ChargeRead,
                           saved_days: set[str], state: LedgerEvidence, compute: Sequence[ChargedInterval]) -> bool:
     if day <= prior_bill.day or day in saved_days:
         return False
+    if start <= now < end:
+        latest = max((row for row in state.observations if row.state != 'unknown' and row.at <= now),
+                     key=lambda row: row.at, default=None)
+        if latest is not None and latest.state in ('running', 'pending', 'stopping'):
+            return False
     if any(row.at < end and row.expires > start and gate_is_open(row) for row in state.gate_reservations):
         return False
     if any(row.at < end and row.expires > start and isinstance(row.state, HanaExposureOpen)
@@ -1864,7 +1869,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
         else:
             source = 'estimated from the newest bill' if latest is not None else 'estimated from configured prices'
             if latest is not None:
-                idle = _uses_idle_bill_carry(key, start, end, latest, saved_days, state, compute)
+                idle = _uses_idle_bill_carry(key, start, end, now, latest, saved_days, state, compute)
                 for group in _carried_bill_groups(latest, idle=idle):
                     groups[group.group] += group.usd
                 include(ChargedInterval(start, end, sum(groups.values(), Decimal(0)), 'newest bill non-compute', 'fixed'))
@@ -1919,7 +1924,8 @@ def _add_idle_bill_carry(state: LedgerEvidence, costs: CostEstimate, settings: S
     for day_start, _ in _days(max(latest.period_end, utc_month_start), costs.at + 1, utc):
         day = datetime.fromtimestamp(day_start, utc).date().isoformat()
         day_end = day_start + 86400
-        if day_end <= month_start or not _uses_idle_bill_carry(day, day_start, day_end, latest, saved_days, state, compute):
+        if day_end <= month_start or not _uses_idle_bill_carry(
+                day, day_start, day_end, costs.at, latest, saved_days, state, compute):
             continue
         for start, end in _days(max(day_start, month_start), day_end, zone):
             if start > costs.at:
