@@ -36,6 +36,7 @@ from scripts.lib.process_group import send_process_group
 from scripts.production.cli_fixture import invoke_cli
 from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, placement
+from scripts.build_targets.target_config import MAC_DISABLED_REASON
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import claim_state
 
@@ -62,9 +63,8 @@ def assigned_adapter_main() -> int:
     """Run the adapter after placement, with the current provider state."""
     arguments = offload.parser().parse_args(namespace=offload.CliArguments())
     request = offload.request_from_arguments(arguments)
-    target = eligibility.configured_ssh_target(request.target or "mac")
     settings = Path(arguments.settings) if arguments.settings else eligibility.DEFAULT_MAC_SETTINGS
-    config = eligibility.read_placement_config(settings, platform=target.platform)
+    config = eligibility.read_config(settings)
     controller = offload.ProcessController()
     started = time.monotonic()
     with offload.interrupt_handlers(controller), buildlog_sync.measure_transfers(controller.attempt_evidence.traffic):
@@ -720,7 +720,8 @@ raise SystemExit(offload.main())
         self, result: subprocess.CompletedProcess[str], reason: str
     ) -> None:
         self.assertEqual(result.returncode, 75, result.stdout)
-        self.assertTrue(result.stdout.endswith(f"mac_test: not running on the Mac ({reason})\n"), result.stdout)
+        description = MAC_DISABLED_REASON if reason == "off" else reason
+        self.assertTrue(result.stdout.endswith(f"mac_test: not running on the Mac ({description})\n"), result.stdout)
         self.assertNotIn("mac_test: running on the Mac", result.stdout)
         self.assert_wire("declined", reason)
         self.assertFalse(self.claim_file.exists())

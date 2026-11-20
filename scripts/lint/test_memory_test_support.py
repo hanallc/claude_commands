@@ -7,11 +7,34 @@ import tempfile
 import unittest
 from unittest import mock
 
-from scripts.lint.memory_test_support import ConfigFixtureRefused, commit_config_fixture, write_config_fixture
+from scripts.lint.memory_test_support import ConfigFixtureRefused, commit_config_fixture, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class ConfigFixtureTests(unittest.TestCase):
+    def test_target_registry_uses_a_private_fixture(self) -> None:
+        tracked = Path(__file__).resolve().parents[2] / "config" / "build_targets.conf"
+        read_text, read_bytes = Path.read_text, Path.read_bytes
+
+        def fixture_text(path: Path) -> str:
+            self.assertNotEqual(path, tracked)
+            return read_text(path)
+
+        def fixture_bytes(path: Path) -> bytes:
+            self.assertNotEqual(path, tracked)
+            return read_bytes(path)
+
+        with (tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(Path, "read_text", new=fixture_text),
+            mock.patch.object(Path, "read_bytes", new=fixture_bytes),
+        ):
+            root = Path(directory)
+            private = Path(config_environment(root)["BUILD_TARGETS_CONFIG"])
+            self.assertEqual(private, root / "build_targets.conf")
+            self.assertIn("enabled.mac=on\n", private.read_text())
+            _ = write_config_fixture(private, "enabled.mac=off\n")
+            self.assertIn("enabled.mac=off\n", private.read_text())
+
     def test_partial_config_keeps_values_and_receives_committed_defaults_and_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "direct.conf"

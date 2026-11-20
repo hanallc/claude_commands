@@ -35,6 +35,7 @@ class NightlySlotSweepTests(unittest.TestCase):
                     if argv[1].endswith("nix_env.py"):
                         self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
                         self.assertTrue(argv[4].endswith("mac_queue_run.py"))
+                        self.assertNotIn("--manual", argv)
                         events.append("Mac")
                         self.assertEqual(list(argv[5:15]),
                                          ["--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",
@@ -70,7 +71,8 @@ class NightlySlotSweepTests(unittest.TestCase):
                     if argv[1].endswith("nix_env.py"):
                         self.assertEqual(list(argv[2:4]), ["exec", sys.executable])
                         self.assertTrue(argv[4].endswith("mac_queue_run.py"))
-                        raise subprocess.CalledProcessError(2, argv, output="refused\trepo\n",
+                        self.assertNotIn("--manual", argv)
+                        raise subprocess.CalledProcessError(2, argv, output="enabled.mac is off\n",
                                                             stderr="Mac queue: Sweep Mac build slots\n")
                     self.assertTrue(argv[1].endswith("send.py"))
                     notices.append(argv[-1])
@@ -86,6 +88,7 @@ class NightlySlotSweepTests(unittest.TestCase):
                 local.assert_called_once_with()
                 self.assertEqual(len(notices), 1)
                 self.assertIn("on Mac failed:", notices[0])
+                self.assertIn("enabled.mac is off", notices[0])
                 self.assertIn("Mac queue: Sweep Mac build slots refused\trepo", notices[0])
                 self.assertEqual(output.getvalue().strip(), notices[0])
 

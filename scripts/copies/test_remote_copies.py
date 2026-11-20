@@ -553,7 +553,7 @@ class RemoteCopiesTests(unittest.TestCase):
                 return_value=target_config.SshTarget(name, platform, self.root / "settings")):
                 request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                                 target=name, owner="alpha", holder_session="session")
-                config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1), 1, 1, 1, "1", {})
+                config = eligibility.OffloadConfig(eligibility.SshConnectionSettings("host", 1, 1), 1, 1, 1, "1", {})
                 mirror = offload.request_mirror(config, request, eligibility.KnownRepository("repository"))
                 self.assertEqual(mirror.owner, "alpha")
                 self.assertEqual(mirror.repository, copies.SelectedRepository("repository"))

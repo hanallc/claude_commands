@@ -560,10 +560,13 @@ def target_notes(route: target_config.StepRoute, routes: target_availability.Mac
     runs_on = step_runs_on(route, routes, step, folder, package)
     route_excludes_mac = isinstance(route, target_config.LocalRequired) or (
         isinstance(route, target_config.PinnedTarget) and not routes.is_mac(route.target))
+    fit = routes.route_fit(route, step, folder, package) if not route_excludes_mac else target_availability.NoMacTarget()
     notes: TargetNotes = {"runs_on": runs_on.text(), "targets": list(runs_on.targets),
                           "because": route_reason(runs_on.reason),
-                          "mac_text": "" if route_excludes_mac else
-                          target_availability.mac_reason(routes.route_fit(route, step, folder, package))}
+                          "mac_text": "" if route_excludes_mac else target_availability.mac_reason(fit)}
+    if fit == target_availability.NotAllowed(target_config.MAC_DISABLED_REASON):
+        notes["because"] = target_config.MAC_DISABLED_REASON
+        return notes
     if mac_only_route(route, routes) and (holds := routes.holds(folder)):
         notes["because"] = route_reason(holds)
         notes["mac_state"] = holds

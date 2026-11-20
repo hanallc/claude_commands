@@ -101,7 +101,6 @@ class SshConnectionSettings:
 class OffloadConfig:
     """Settings that govern one remote execution decision."""
 
-    enabled: bool
     connection: SshConnectionSettings
     probe_timeout_s: float
     unreachable_backoff_s: float
@@ -222,7 +221,7 @@ def connection_settings(config: conf.ConfigRead) -> SshConnectionSettings:
                                  config.number("leftover_timeout_s"))
 
 
-def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS, *, enabled: bool = True) -> OffloadConfig:
+def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
     """Read SSH execution settings without reading placement policy."""
     settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
     config = conf.read(settings)
@@ -230,7 +229,6 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS, *, enabl
     values["mirror_busy_backoff_s"] = str(conf.read("mac_test").number("mirror_busy_backoff_s"))
     values["abandoned_session_minutes"] = str(conf.read("mac_test").whole("abandoned_session_minutes"))
     return OffloadConfig(
-        enabled=enabled,
         connection=connection_settings(config),
         probe_timeout_s=config.number("probe_timeout_s"),
         unreachable_backoff_s=config.number("unreachable_backoff_s"),
@@ -240,12 +238,6 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS, *, enabl
         source=settings,
         settings=config,
     )
-
-
-def read_placement_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS, *,
-                          platform: target_config.Platform = "macos") -> OffloadConfig:
-    """Read SSH execution settings with the switch for a Mac placement."""
-    return read_config(path, enabled=placement_enabled(platform))
 
 
 def placement_enabled(platform: target_config.Platform) -> bool:
@@ -461,9 +453,6 @@ def mac_step_eligibility(config: OffloadConfig | conf.ConfigRead, repo_root: Pat
                          backoff: BackoffState | ReadBackoff = READ_BACKOFF) -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
     platform = configured_ssh_target(target).platform if target else "macos"
-    enabled = config.enabled if isinstance(config, OffloadConfig) else placement_enabled(platform)
-    if not enabled:
-        return IneligibleMacStep("off")
     repository = repository_identity(repo_root)
     if isinstance(repository, UnknownRepository):
         return IneligibleMacStep("repo")

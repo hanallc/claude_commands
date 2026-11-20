@@ -324,11 +324,11 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.clear_events()
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
+            subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 75, answer.stdout + answer.stderr)
         self.assert_fetch_wire("not_run", "declined", "off")
-        self.assertEqual(self.events(), [])
+        self.assertNotIn("mac_test: running on the Mac", answer.stdout)
 
     def test_existing_destination_is_not_overwritten(self) -> None:
         landing = self.state_directory / "fetched/call-forward"

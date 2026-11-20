@@ -2936,6 +2936,7 @@ def _sweep_nightly_slots() -> None:
                            if key == "roots.slots" or key.startswith("roots.slots.")):
                     continue
                 scripts = Path(__file__).resolve().parents[1]
+                # The nightly sweep uses placed Mac work.
                 _ = subprocess.run([sys.executable, str(scripts / "lib/nix_env.py"), "exec",
                                     sys.executable, str(scripts / "mac_test/mac_queue_run.py"),
                                     "--kind", "run", "--what", "Sweep Mac build slots", "--package", "claude",

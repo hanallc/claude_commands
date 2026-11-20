@@ -22,6 +22,7 @@ from scripts.lib import conf
 
 
 Platform = Literal["linux", "macos"]
+MAC_DISABLED_REASON = "enabled.mac is off"
 
 
 @dataclass(frozen=True)

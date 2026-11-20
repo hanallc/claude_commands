@@ -2247,7 +2247,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 repository = fixture.root / "hana"
                 (repository / ".git").mkdir(parents=True)
                 _ = (fixture.root / "build_targets.conf").write_text(
-                    f"targets=box\nkind.box=ssh\nplatform.box={platform}\nsettings.box=box.conf\n")
+                    f"enabled.mac=on\ntargets=box\nkind.box=ssh\nplatform.box={platform}\nsettings.box=box.conf\n")
                 _ = write_config_fixture(fixture.root / "box.conf",
                     "host=fixture-box\nkinds=test,lint,check,doc,build\nslots=2\n", template="mac_test")
                 request = placement_request(fixture)
@@ -2275,6 +2275,81 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     reply, = fixture.server.handle_request(request)
                     assert isinstance(reply, wire.DispatchStatus)
                     self.assertEqual(reply.retry, placement.DoNotRetry("command"))
+
+    def test_switch_change_before_authorization_returns_to_normal_placement(self) -> None:
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints,
+                candidates=(*request.constraints.candidates, local_candidate(fixture))))
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.mac=off\n")
+            refusal, = fixture.connect(consume_permission("switch-off", assignment, claim)).replies()
+            assert isinstance(refusal, wire.DispatchStatus)
+            self.assertEqual(refusal.state, placement.ClosedAssignment("off"))
+            self.assertEqual(refusal.reason, "enabled.mac is off")
+            self.assertIsInstance(refusal.permission, placement.PermissionAvailable)
+
+            _ = publish_candidate(fixture, request, placement.TemporaryExclusion("off"))
+            local = request.constraints.candidates[1].destination
+            local_key = fixture.server.host_evidence_key(request, local)
+            fixture.server.publish_host_evidence(placement.FreshHostEvidence(local_key, fixture.clock.now(), "",
+                                                                          placement.AllowedHost()))
+            reply, = fixture.connect(request).replies()
+            assert isinstance(reply, wire.LocalPlacementGranted), reply
+            self.assertEqual(reply.assignment.destination, local)
+
+    def test_launch_authorization_survives_switch_change_and_restart(self) -> None:
+        with PlacementFixture() as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            consume = consume_permission("first-authorization", assignment, claim)
+            self.assertEqual(fixture.connect(consume).replies(), [wire.FirstAuthorization(assignment, claim)])
+            _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.mac=off\n")
+            fixture.restart()
+            reply, = fixture.connect(consume).replies()
+            assert isinstance(reply, wire.DispatchStatus)
+            self.assertIsInstance(reply.permission, placement.PermissionConsumed)
+            self.assertEqual(reply.state, placement.CurrentAssignment())
+            completed, = fixture.connect(wire.ExecutionReport("completed-after-off", assignment, claim,
+                execution_identity.ExecutionNotStarted(), placement.AttemptCompleted(0),
+                placement.DispatchPathSettled())).replies()
+            assert isinstance(completed, wire.DispatchStatus)
+            self.assertEqual(completed.state, placement.ClosedAssignment("completed"))
+
+    def test_only_manual_mac_commands_can_launch_with_the_switch_off(self) -> None:
+        cases = ((placement.PlacedMacWork(), "run"),
+                 *((placement.ManualMacCommand(), kind) for kind in placement.MAC_RUN_KINDS))
+        for origin, kind in cases:
+            with self.subTest(origin=origin, kind=kind), PlacementFixture() as fixture:
+                _ = write_config_fixture(fixture.root / "build_targets.conf",
+                    "enabled.mac=off\ntargets=mac\n")
+                request = placement_request(fixture)
+                request = replace(request, constraints=replace(request.constraints,
+                    command_kind=kind, mac_origin=origin, selection=placement.PinnedHost("mac")))
+                destination = request.constraints.candidates[0].destination
+                key = fixture.server.host_evidence_key(request, destination)
+                fixture.server.host_requests[key] = request
+                evidence = fixture.read_host_evidence(key)
+                assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                if isinstance(origin, placement.PlacedMacWork):
+                    self.assertEqual(evidence.eligibility, placement.TemporaryExclusion("off"))
+                    # Simulate an allowed observation that predates first launch authorization.
+                    evidence = replace(evidence, eligibility=placement.AllowedHost())
+                fixture.server.publish_host_evidence(evidence)
+                reply, = fixture.connect(request).replies()
+                if isinstance(origin, placement.ManualMacCommand):
+                    assert isinstance(reply, wire.Assignment), reply
+                    saved = fixture.server.assignments[execution_identity.attempt_key(
+                        reply.assignment.episode, reply.assignment.attempt)]
+                    self.assertIsInstance(saved.permission, placement.PermissionConsumed)
+                else:
+                    assert isinstance(reply, wire.DispatchStatus), reply
+                    self.assertEqual(reply.state, placement.ClosedAssignment("off"))
+                    self.assertEqual(reply.reason, "enabled.mac is off")
 
     def test_each_command_kind_reads_its_own_host_evidence(self) -> None:
         with PlacementFixture() as fixture:

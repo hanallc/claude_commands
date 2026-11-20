@@ -266,6 +266,19 @@ MAC_RUN_KINDS: tuple[MacRunKind, ...] = ("shot", "install", "probe", "run")
 
 
 @dataclass(frozen=True)
+class PlacedMacWork:
+    """The Mac switch applies to the request."""
+
+
+@dataclass(frozen=True)
+class ManualMacCommand:
+    """A person explicitly requested a command on the Mac."""
+
+
+MacCommandOrigin = PlacedMacWork | ManualMacCommand
+
+
+@dataclass(frozen=True)
 class CommandKindNotSent:
     """An older client sends no command kind, so the service reads it from the recorded step."""
 
@@ -310,6 +323,7 @@ class PlacementConstraints:
     selection: HostSelection = ConfiguredOrder()
     command_kind: CommandKind | CommandKindNotSent = CommandKindNotSent()
     cargo_folder: CargoFolder | NoCargoFolder = NoCargoFolder()
+    mac_origin: MacCommandOrigin = PlacedMacWork()
 
 
 @dataclass(frozen=True)
@@ -410,6 +424,7 @@ class HostEvidenceKey:
     settings: ProviderSettings = ConfiguredProviderSettings()
     local_hold_owner: SubmittingOwner | NoLocalHoldOwner = NoLocalHoldOwner()
     command_kind: CommandKind | CommandKindNotSent = CommandKindNotSent()
+    mac_origin: MacCommandOrigin = PlacedMacWork()
 
 
 @dataclass(frozen=True)

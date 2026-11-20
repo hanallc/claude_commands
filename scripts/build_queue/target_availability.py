@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, TypedDict, final
 
 from scripts.build_queue.admission_records import PackageNotRecorded, RunningStep, WaitingStep
 from scripts.build_targets import build_targets, targets
-from scripts.build_targets.target_config import ConfigError, ExcludedTarget, SshTarget, StepRoute, LocalRequired, PinnedTarget, MacOnly
+from scripts.build_targets.target_config import MAC_DISABLED_REASON, ConfigError, ExcludedTarget, SshTarget, StepRoute, LocalRequired, PinnedTarget, MacOnly
 from scripts.direct import step_record
 from scripts.message import unit_labels
 
@@ -92,7 +92,7 @@ def unavailable_row(target: str, reason: str) -> TargetRow:
 
 DYNAMIC_REASONS = frozenset({"backoff", "state"})
 # Plain words for the static Mac exclusions; other reasons show as recorded.
-EXCLUSION_TEXT = {"off": "enabled.mac is off", "repo": "this repository does not run on the Mac"}
+EXCLUSION_TEXT = {"off": MAC_DISABLED_REASON, "repo": "this repository does not run on the Mac"}
 
 
 @dataclass(frozen=True)
@@ -159,6 +159,11 @@ class MacRoutes:
             return NotAllowed(f"this step is pinned to {route.target}")
         if isinstance(route, (MacOnly, PinnedTarget)):
             mac = self.mac
+            kind = step if step in step_record.KINDS else build_targets.recorded_step_kind(step)
+            if isinstance(mac, targets.TargetSnapshot) and not isinstance(kind, build_targets.KindNotOffloaded):
+                policy = self.policy(mac, folder, package, kind)
+                if policy == NotAllowed(MAC_DISABLED_REASON):
+                    return policy
             return (self.state_fit(mac.states[0]) if isinstance(mac, targets.TargetSnapshot)
                     else FitUnreadable("Mac state unreadable, " + mac.reason)
                     if isinstance(mac, SnapshotsUnreadable) else mac)

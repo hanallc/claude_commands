@@ -15,6 +15,7 @@ require_checkout(Path(__file__))
 
 
 ADMISSION_CONFIG_FIXTURE = Path(__file__).with_name("fixtures") / "build_admission.conf"
+TARGETS_CONFIG_FIXTURE = ADMISSION_CONFIG_FIXTURE.with_name("build_targets.conf")
 
 
 @cache
@@ -33,14 +34,13 @@ def admission_policy_fixture() -> AdmissionPolicy:
 
 
 def _template(name: str) -> Path:
+    if name == TARGETS_CONFIG_FIXTURE.name:
+        return TARGETS_CONFIG_FIXTURE
     return Path(__file__).resolve().parents[2] / "config" / name
 
 
 # Test clocks move only when a test moves them, so a test configuration has no pass gap unless the test sets one.
-TEST_CONFIG_DEFAULTS = {
-    "build_admission.conf": "min_pass_gap_seconds=0\n",
-    "build_targets.conf": "enabled.mac=on\n",
-}
+TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
@@ -137,7 +137,7 @@ def config_environment(root: Path) -> dict[str, str]:
     """Give subprocess fixtures their own complete configuration folder."""
     folder = root
     names = {source.name for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf")}
-    names.add(ADMISSION_CONFIG_FIXTURE.name)
+    names.update((ADMISSION_CONFIG_FIXTURE.name, TARGETS_CONFIG_FIXTURE.name))
     for name in sorted(names):
         destination = folder / name
         if not destination.exists():

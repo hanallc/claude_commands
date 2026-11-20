@@ -240,8 +240,8 @@ class TargetStateTests(IsolatedTargetState):
         _ = write_config_fixture(self.config, "enabled.mac=invalid\n")
         with self.assertRaisesRegex(ValueError, "enabled.mac"):
             _ = mac_test.free_now(mac_test.state_paths("mac"), self.root / "mac.conf", self.root)
-        self.assertEqual(mac_test.free_now(mac_test.state_paths("mac"), self.root / "mac.conf", self.root,
-                                          purpose=mac_test.CapacityPurpose.MANUAL_MAC_COMMAND), "free")
+        result = self.invoke_mac(["free-now", "--target", "mac", "--manual"])
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "free"))
         self.assertEqual(self.invoke_mac(["status", "--target", "mac"]).returncode, 0)
 
     def test_macos_peer_accepts_ci_settings_and_linux_peer_refuses_them(self) -> None:

@@ -1300,7 +1300,7 @@ def write_result(
         mac = "declined"
         reason = result.detail if isinstance(result, DeclinedMacRun) and result.detail else result.reason
         status = 75
-        description = reason
+        description = target_config.MAC_DISABLED_REASON if reason == "off" else reason
         if isinstance(result, DeclinedMacRun) and result.reason == "disk":
             reason = "disk"
             description = f"disk: {result.detail}" if result.detail else reason
@@ -2599,7 +2599,6 @@ def claimed_run(
         )
         if linux:
             running = f"running on {request.target} (Linux, host {probe.hostname})"
-        print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         copies.register_remote(request_mirror(config, request, repository))
         if isinstance(request.placement, AssignedOffloadRequest):
             from scripts.build_queue import admission_client, admission_protocol as wire
@@ -2627,6 +2626,8 @@ def claimed_run(
                     return declined("state", started)
                 if isinstance(permission, wire.FirstAuthorization):
                     break
+                if permission.state == placement.ClosedAssignment("off"):
+                    return declined("off", started)
                 if (not isinstance(permission.state, placement.CurrentAssignment)
                         or not isinstance(permission.permission, placement.PermissionAvailable)):
                     return declined("state", started)
@@ -2634,6 +2635,7 @@ def claimed_run(
 
                 time.sleep(records.read_memory_config().waiting_pass_seconds)
             evidence.launch_authorized = True
+        print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         release_allowed = False
         identity = controller.claim_identity
         command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
@@ -3430,6 +3432,10 @@ class DirectPlacementConstraintBuilder(Protocol):
                  *, selection: Pinned, provider_settings: placement.ProviderSettings) -> placement.PlacementConstraints: ...
 
 
+class DirectMacPlacementOff(Exception):
+    """The queue refused the direct placement because the switch is off."""
+
+
 def submit_direct_placement(request: OffloadRequest, since: float,
                             config: OffloadConfig | hana_placement.HanaControlTransport) -> OffloadRequest:
     """A direct caller keeps its fixed destination through queue placement."""
@@ -3464,6 +3470,8 @@ def submit_direct_placement(request: OffloadRequest, since: float,
                                             else reply.assignment.destination.target),
                            slot=reply.assignment.destination.slot or 1,
                            placement=AssignedOffloadRequest(reply.assignment))
+        if isinstance(reply, wire.DispatchStatus) and reply.state == placement.ClosedAssignment("off"):
+            raise DirectMacPlacementOff()
         if not isinstance(reply, wire.PlacementWait):
             raise wire.AdmissionUnavailable("the fixed remote assignment did not permit execution")
         time.sleep(records.read_memory_config().waiting_pass_seconds)
@@ -3615,8 +3623,7 @@ def main() -> int:
     target = eligibility.configured_ssh_target(request.target or 'mac')
     transport = hana.read_execution_transport(target)
     config: OffloadConfig | hana.HanaControlTransport = (transport if isinstance(transport, hana.HanaControlTransport)
-        else eligibility.read_placement_config(Path(settings) if settings else eligibility.DEFAULT_MAC_SETTINGS,
-                                               platform=target.platform))
+        else eligibility.read_config(Path(settings) if settings else eligibility.DEFAULT_MAC_SETTINGS))
     if isinstance(request.placement, AssignedOffloadRequest):
         request = replace(request, slot=request.placement.assignment.destination.slot or 1)
     controller = ProcessController()
@@ -3625,7 +3632,7 @@ def main() -> int:
     direct = isinstance(request.placement, DirectOffloadRequest)
     since = time.time()
     try:
-        if direct and (not isinstance(config, OffloadConfig) or config.enabled):
+        if direct:
             request = submit_direct_placement(request, since, config)
         while True:
             with interrupt_handlers(controller), transfer_bytes.measure_transfers(controller.attempt_evidence.traffic):
@@ -3646,6 +3653,9 @@ def main() -> int:
             started = time.monotonic()
             result = LostMacRun(0, "replacement placement did not complete")
             request = submit_direct_placement(request, since, config)
+        status = publish_offload_result(controller, request, result)
+    except DirectMacPlacementOff:
+        result = declined("off", started)
         status = publish_offload_result(controller, request, result)
     except OffloadInterrupted as interrupted:
         result = LostMacRun(elapsed_seconds(started), f"interrupted by signal {interrupted.signal_number}")

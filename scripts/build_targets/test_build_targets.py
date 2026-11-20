@@ -728,7 +728,7 @@ class StatusTests(IsolatedBuildTargetTest):
 
     def test_probe_uses_shared_settings_reader_without_building_config(self) -> None:
         target = targets.SshTarget("mac", "macos", self.settings)
-        config = eligibility.OffloadConfig(False, eligibility.SshConnectionSettings("reader-mac", 2.0, 10.0), 3.0, 4.0, 5.0, "6", {})
+        config = eligibility.OffloadConfig(eligibility.SshConnectionSettings("reader-mac", 2.0, 10.0), 3.0, 4.0, 5.0, "6", {})
         calls: list[eligibility.OffloadConfig] = []
 
         def reachable(
@@ -947,6 +947,13 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         self.assertEqual(self.kind_answer("doc"), "any_target\n")
         _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
         self.assertEqual(self.kind_answer("lint"), "any_target\n")
+
+    def test_eligibility_without_a_kind_obeys_the_mac_switch(self) -> None:
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(build_targets.command_eligible(self.root, "portable"), 0)
+        self.assertIn("mac\texcluded\toff\t", output.getvalue())
+        self.assertIn("natedev\teligible\t", output.getvalue())
 
     def test_temporary_mac_exclusions_keep_the_leave_route_available(self) -> None:
         target = targets.SshTarget("mac", "macos", self.settings)
@@ -1664,14 +1671,16 @@ class RecordedStepKindTests(unittest.TestCase):
     def test_step_policy_passes_the_snapshot_backoff_to_each_remote_kind(self) -> None:
         target = targets.SshTarget("mac", "macos", Path("/fixture/mac.conf"))
         unreadable = eligibility.UnreadableBackoff("bad")
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1", {})
-        with mock.patch.object(eligibility, "read_placement_config", return_value=config), \
+        config = eligibility.OffloadConfig(eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1", {})
+        with mock.patch.object(eligibility, "placement_enabled", return_value=True), \
+             mock.patch.object(eligibility, "read_config", return_value=config), \
              mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.KnownRepository("hana")) as checks:
             result = build_targets.step_policy(target, Path("/fixture/hana"), "hana", "final", backoff=unreadable)
         self.assertEqual(result, eligibility.KnownRepository("hana"))
         self.assertEqual([call.kwargs["kind"] for call in checks.call_args_list], ["check", "test"])
         self.assertTrue(all(call.kwargs["backoff"] is unreadable for call in checks.call_args_list))
-        with mock.patch.object(eligibility, "read_placement_config", return_value=config), \
+        with mock.patch.object(eligibility, "placement_enabled", return_value=True), \
+             mock.patch.object(eligibility, "read_config", return_value=config), \
              mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.IneligibleMacStep("state")):
             self.assertEqual(build_targets.step_policy(target, Path("/fixture/hana"), "hana", "check", backoff=unreadable),
                              targets.ExcludedTarget(target, "state"))

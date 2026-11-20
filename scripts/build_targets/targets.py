@@ -178,6 +178,8 @@ def mac_policy_eligibility(
             results.append(EligibleTarget(target))
         elif isinstance(routing, LocalRequired):
             results.append(ExcludedTarget(target, routing.reason))
+        elif not eligibility.placement_enabled(target.platform):
+            results.append(ExcludedTarget(target, "off"))
         elif isinstance(repository, eligibility.UnknownRepository):
             results.append(ExcludedTarget(target, "repo"))
         else:

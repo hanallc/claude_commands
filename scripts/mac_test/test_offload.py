@@ -371,7 +371,7 @@ class CompletedRunSyncTests(unittest.TestCase):
 
     def check_finished_run(self, root: Path, target: str, status: int, fails: bool) -> None:
         configured = target_config.SshTarget(target, "linux" if target == "linux" else "macos", root / "target.conf")
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("linux-build", 1, 1), 1, 1, 1, "1", {})
+        config = eligibility.OffloadConfig(eligibility.SshConnectionSettings("linux-build", 1, 1), 1, 1, 1, "1", {})
         request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target=target, holder_session="fixture-session")
         controller = offload.ProcessController()
         output = io.StringIO()
@@ -442,7 +442,7 @@ class LocalVersionPreflightTests(unittest.TestCase):
             if content is not None:
                 _ = (root / "box-tools.json").write_text(content)
             target = target_config.SshTarget("linux", "linux", root / "linux.conf")
-            config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1),
+            config = eligibility.OffloadConfig(eligibility.SshConnectionSettings("dummy", 1, 1),
                                           1, 1, 1, "1", {"version_pin_file": "box-pins.nix"})
             request = offload.OffloadRequest(root, "hana", "call", offload.NO_RESULT_FILE, (), owner="verify", target="linux", holder_session="fixture-session")
             controller = offload.ProcessController()
@@ -588,7 +588,6 @@ class OffloadSettingsTests(unittest.TestCase):
                     + f"unreachable_backoff_s=4\nfree_floor_gib=5\n{budget_key}=6\n"
                     + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\nmirror_busy_backoff_s=91\n", template="mac_test")
                 config = eligibility.read_config(settings)
-                self.assertTrue(config.enabled)
                 self.assertEqual(config.host, "other-mac")
                 self.assertEqual(config.connect_timeout_s, 2.0)
                 self.assertEqual(config.probe_timeout_s, 3.0)
@@ -652,7 +651,6 @@ class OffloadSettingsTests(unittest.TestCase):
     def test_no_argument_config_reader_uses_the_file_values(self) -> None:
         config = eligibility.read_config()
         self.assertEqual(config, eligibility.read_config(self.settings))
-        self.assertTrue(config.enabled)
         self.assertEqual(config.free_floor_gib, 100)
         self.assertEqual(config.host, "mac")
 
@@ -960,12 +958,21 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("build_target_directory=/remote/cargo output\n", self.result_path.read_text())
 
-    def test_configuration_declines_before_claiming(self) -> None:
-        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
-        self.assert_declined(self.command(), "off")
-        self.assertEqual(self.events(), [])
+    def test_switch_change_before_authorization_declines_and_releases_the_claim(self) -> None:
+        consume = admission_client.consume_permission
 
-        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=on\n")
+        def switch_off(request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+            _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=off\n")
+            return consume(request)
+
+        with mock.patch.object(admission_client, "consume_permission", side_effect=switch_off):
+            result = self.command()
+        self.assert_declined(result, "off")
+        self.assertIn("enabled.mac is off", result.stdout)
+        self.assertNotIn("mac_test: running on the Mac", result.stdout)
+        self.assertFalse(self.claim_file.exists())
+
+    def test_repository_policy_declines_before_claiming(self) -> None:
         _ = self.config.pop("linux_only.hana")
         self.sync_config()
         self.assert_declined(self.command(), "repo")
@@ -1841,7 +1848,7 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.result_path: Path = self.root / "missing" / "result"
         result = self.command()
         self.assertEqual(result.returncode, 75, result.stdout)
-        self.assertIn("mac_test: not running on the Mac (off)\n", result.stdout)
+        self.assertIn("mac_test: not running on the Mac (enabled.mac is off)\n", result.stdout)
         self.assertIn("FileNotFoundError", result.stdout)
         self.assertFalse(self.result_path.exists())
 
@@ -1884,7 +1891,7 @@ class BackoffReadTests(unittest.TestCase):
                 self.assertIs(eligibility.read_backoff(100, strict=True), eligibility.ACTIVE_BACKOFF)
 
     def test_a_passed_backoff_decides_eligibility_without_a_read(self) -> None:
-        config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1",
+        config = eligibility.OffloadConfig(eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1",
                                        {"linux_only.hana": ""})
         cases: tuple[tuple[eligibility.BackoffState, eligibility.KnownRepository | eligibility.IneligibleMacStep], ...] = (
             (eligibility.UnreadableBackoff("bad"), eligibility.IneligibleMacStep("state")),

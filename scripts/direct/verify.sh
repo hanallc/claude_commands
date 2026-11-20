@@ -2749,6 +2749,7 @@ try_reserved_target() {
 pinned_target_refuse() {
     local reason=$1
     [[ "$reason" != command ]] || reason="the target cannot run this command"
+    [[ "$reason" != off || "$PINNED_TARGET" != mac ]] || reason="enabled.mac is off"
     printf 'verify.sh: target %s refused: %s\n' "$PINNED_TARGET" "$reason" >&2
     note_event failed "$SECONDS" 0 "" 0 2
     exit 2

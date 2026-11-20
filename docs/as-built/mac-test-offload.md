@@ -483,11 +483,18 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 
 ## Configuration
 
-The `enabled.mac` key in `config/build_targets.conf` controls placed work on the Mac.
-When it is `off`, the queue sends no new builds or tests to the Mac.
-A run in progress uses the switch value it read at startup and can finish.
+The admission service reads `enabled.mac` in `config/build_targets.conf` at first launch authorization.
+When the value is `off`, the service refuses new placed work with `enabled.mac is off`.
+A run with launch authorization can finish after the value changes.
 Status reads continue.
-Manual Mac `shot`, `install`, `probe`, and `run` commands bypass this switch.
+
+Use `mac_queue_run.py --manual` with `--kind shot`, `install`, `probe`, or `run` for a command you type.
+Use `mac_run.sh --manual` to request a manual Hana run.
+Use `mac_test.py free-now --target mac --manual` to check capacity for a manual Mac command.
+These commands skip the switch and still check capacity.
+Automated commands omit `--manual` and use the switch.
+The nightly slot sweep is an automated command.
+For commands from `mac_queue_run.py`, the reply that supplies the assignment also authorizes launch.
 
 ### `config/mac_test.conf`
 
