@@ -1391,10 +1391,6 @@ def _decode_charge_history(record: dict[str, object], latest: ChargeRead) -> _Ch
     return _ChargeReadHistory(latest, amounts, record.get('provisional') is False)
 
 
-def read_strict_charge(path: Path) -> ChargeRead:
-    return _decode_charge(_strict_charge_record(path.read_text()))
-
-
 def _strict_charge_record(document: str) -> dict[str, object]:
     fields, duplicates = _read_charge_fields(document)
     if duplicates:
@@ -1410,12 +1406,40 @@ def matches_utc_charge_day(name: str, reading: ChargeRead, day: date) -> bool:
 
 
 class BillRecordRejection(Enum):
+    UNREADABLE = 'cannot read the record'
+    MALFORMED = 'invalid bill format'
     DUPLICATE_FIELDS = 'duplicate JSON fields'
     INVALID_HISTORY = 'invalid amount history'
     UTC_DAY_MISMATCH = 'file name, day label, or bounds do not match a full UTC day'
     FUTURE_READ = 'read time is in the future'
     NOT_ACCOUNT_BILL = 'account bill marker is absent'
-    BELOW_ONE_CENT = 'amount is below USD 0.01'
+    BELOW_ONE_CENT = 'amount below USD 0.01 uses the estimate'
+
+
+@dataclass(frozen=True)
+class BillDayUnavailable:
+    """The record has no usable UTC day."""
+
+
+@dataclass(frozen=True)
+class RefusedBillRecord:
+    day: date | BillDayUnavailable
+    reason: BillRecordRejection
+
+    def display_line(self) -> str:
+        day = self.day.isoformat() if isinstance(self.day, date) else 'UTC day unavailable'
+        return f'{day}: {self.reason.value}'
+
+
+def _refused_bill_day(name: str, label: str = '') -> date | BillDayUnavailable:
+    for candidate in (name.removesuffix('.json'), label):
+        try:
+            day = date.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if day.isoformat() == candidate:
+            return day
+    return BillDayUnavailable()
 
 
 @dataclass(frozen=True)
@@ -2273,30 +2297,39 @@ class CostLedger:
         """Read the pricing inputs that the existing cap counts require."""
         return tuple(read_charge(path) for path in self.bill_paths())
 
-    def _saved_bill_records(self, now: int) -> Iterator[SavedBillRecord]:
+    def _saved_bill_records(self, now: int) -> Iterator[_ChargeReadHistory | RefusedBillRecord]:
         for path in self.bill_paths():
             try:
-                yield read_saved_bill(path, now)
-            except (OSError, ValueError, ArithmeticError):
-                continue
+                record = read_saved_bill(path, now)
+            except OSError:
+                yield RefusedBillRecord(_refused_bill_day(path.name), BillRecordRejection.UNREADABLE)
+            except (ValueError, ArithmeticError):
+                yield RefusedBillRecord(_refused_bill_day(path.name), BillRecordRejection.MALFORMED)
+            else:
+                bill = record.usable_bill
+                if isinstance(bill, BillRecordRejection):
+                    yield RefusedBillRecord(_refused_bill_day(path.name, record.pricing_read.day), bill)
+                else:
+                    yield bill
+
+    def refused_bill_records(self, now: int) -> tuple[RefusedBillRecord, ...]:
+        """List the records that fail the account bill checks."""
+        return tuple(record for record in self._saved_bill_records(now) if isinstance(record, RefusedBillRecord))
 
     def validated_bills(self, now: int) -> tuple[ChargeRead, ...]:
         """Read the usable account amount for each canonical UTC day."""
-        return tuple(bill.latest for record in self._saved_bill_records(now)
-                     if isinstance(bill := record.usable_bill, _ChargeReadHistory))
+        return tuple(bill.latest for bill in self._saved_bill_records(now) if isinstance(bill, _ChargeReadHistory))
 
     def read_complete_day_amounts(self, settings: SpendingSettings, now: int) -> tuple[CompleteDayAmount, ...]:
         """Read amounts that qualify to replace a full UTC day."""
         return tuple(CompleteDayAmount(bill.latest.period_start, bill.latest.period_end, bill.latest.actual_usd)
-                     for record in self._saved_bill_records(now)
-                     if isinstance(bill := record.usable_bill, _ChargeReadHistory)
-                     and _bill_is_complete(bill, settings, now))
+                     for bill in self._saved_bill_records(now)
+                     if isinstance(bill, _ChargeReadHistory) and _bill_is_complete(bill, settings, now))
 
     def read_charge_watch(self, settings: SpendingSettings, now: int) -> tuple[WatchedChargeDay, ...]:
         """Read the settlement status of each usable account bill."""
         return tuple(WatchedChargeDay(history.latest.day, history.latest.at, _charge_settlement(history, settings))
-                     for record in self._saved_bill_records(now)
-                     if isinstance(history := record.usable_bill, _ChargeReadHistory))
+                     for history in self._saved_bill_records(now) if isinstance(history, _ChargeReadHistory))
 
     def launches(self) -> tuple[dict[str, object], ...]:
         path = self.launch_history_path
@@ -2422,7 +2455,7 @@ class CostLedger:
                                                        if isinstance(row.trial, GateTrialBudget))])
                 trial_id = request.trial.trial_id
                 request = replace(request, trial=GateTrialBudget(trial_id, limit))
-                self._price_gates(state, self.read_bills(), request.at)
+                self._price_gates(state, self.validated_bills(request.at), request.at)
                 scoped = [row for row in state.gate_reservations
                     if isinstance(row.trial, GateTrialBudget) and row.trial.trial_id == trial_id]
                 total = sum((trial_gate_cost(row, settings.box_minimum_seconds) for row in scoped), Decimal(0))
@@ -2463,12 +2496,12 @@ class CostLedger:
         return SpendingRefused(now, reason, decision.evidence) if reason else decision
 
     def placement_spending_preview(self, state: LedgerEvidence, settings_path: Path, now: int) -> SpendingDecision:
-        """Project spending for placement with one read of the pricing inputs."""
+        """Project the guard decision and admission cap for placement."""
         return self._decide(state, settings_path, 'start', now, placement_preview=True)
 
     def reservation_cap(self, state: LedgerEvidence, settings: SpendingSettings, now: int, costs: CostEstimate) -> str:
         """Refresh prices and apply the account bill cap to the proposed reservations."""
-        readings = self.read_bills()
+        readings = self.validated_bills(now)
         self._price_gates(state, readings, now)
         complete_days = self.read_complete_day_amounts(settings, now)
         return self._reservation_cap(state, settings, now, costs, readings, complete_days)
@@ -2785,6 +2818,7 @@ class CostLedger:
             settings = read_settings(settings_path)
             evidence = GuardEvidence(purpose, settings.limits, evidence.costs, settings)
             readings = self.read_bills()
+            admission_state = replace(state) if placement_preview else state
             costs = self._guard_estimate(state, settings, now, readings)
             evidence = GuardEvidence(purpose, settings.limits, costs, settings)
             if purpose != "deployment":
@@ -2809,7 +2843,12 @@ class CostLedger:
                     state.events.append(LimitEvent(event_id, now, period, amount.before_headroom, limit,
                                                    settings.notification_recipient, settings.notification_timeout_s))
             if not reason and placement_preview:
-                reason = self._reservation_cap(state, settings, now, costs, readings, complete_days)
+                admission_bills = self.validated_bills(now)
+                if admission_bills == readings:
+                    admission_state, admission_costs = state, costs
+                else:
+                    admission_costs = self._guard_estimate(admission_state, settings, now, admission_bills)
+                reason = self._reservation_cap(admission_state, settings, now, admission_costs, admission_bills, complete_days)
             return SpendingRefused(now, reason, evidence) if reason else SpendingAllowed(now, evidence)
         except SpendingConfigurationUnavailable as error:
             return SpendingUnavailable(now, str(error), GuardEvidence(purpose, error.limits, evidence.costs))

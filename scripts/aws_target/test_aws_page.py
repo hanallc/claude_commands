@@ -285,6 +285,8 @@ class AwsPageSettledAmountsTests(ledger_test_support.CostFixture):
             'Settled AWS amounts: 8 of 9 did not change after they settled (checked Nov 19).',
             '2026-11-12 changed from USD 7.73 to USD 7.81 (+0.08).',
         ])
+        _ = (charges / 'private-alias.json').write_text(json.dumps(ledger.charge_record(reads[0])))
+        self.assertEqual(settled_notes()[-1], 'AWS bill records excluded from this page: 1.')
 
 
 @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the AWS table checks")

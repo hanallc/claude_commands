@@ -216,6 +216,10 @@ class AwsReportTests(MeasurementFixture):
                 # A us-east-1 usage type has no region prefix; the runs have no region, so they ran in the home region.
                 ledger.UsageTypeCost('SpotUsage:m7a.8xlarge', Decimal('.30'), Decimal('.1'), 'Hrs'),))
         _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
+        idle = ledger.ChargeRead('2026-01-13', NOW, MIDNIGHT - 2 * 86400, MIDNIGHT - 86400,
+                                 Decimal('.006'), Decimal(0), Decimal(0))
+        _ = (charges / '2026-01-13.json').write_text(json.dumps(ledger.charge_record(idle)))
+        _ = (charges / 'private-alias.json').write_text(json.dumps(ledger.charge_record(reading)))
         events: list[dict[str, object]] = []
         for attempt, mode, at, box_s, gate_s in (
             ('merge-bill', 'merge-gate', MIDNIGHT - 3600, 120, 60),
@@ -236,6 +240,9 @@ class AwsReportTests(MeasurementFixture):
         bill = '| 2026-01-14 | $1.10 | $0.30 | $0.20 | $0.00 | $0.40 | $0.20 | 2 | bill |'
         self.assertIn(today, section)
         self.assertIn(bill, section)
+        self.assertIn('- 2026-01-13: amount below USD 0.01 uses the estimate', section)
+        self.assertIn('- 2026-01-14: file name, day label, or bounds do not match a full UTC day', section)
+        self.assertNotIn('private-alias', section)
         self.assertLess(section.index(today), section.index(bill))
         self.assertEqual(section.count('\n|---'), 3)
         self.assertIn('| All shown days | 2 | 0m 52s | 1m 45s | 2 | 0m 22s | 0m 45s | $0.1500 |', section)
@@ -441,7 +448,7 @@ class AwsReportTests(MeasurementFixture):
         finished = {**launched, 'time': NOW, 'result': 'finished'}
         missing_time = json.dumps(launched) + '\n' + json.dumps(finished) + '\n'
         for filename, content, reason in (
-            (f'charges/{DAY}.json', '{bad json\n', 'Expecting property name enclosed in double quotes'),
+            (f'charges/{DAY}.json', '{bad json\n', f'{DAY}: invalid bill format'),
             ('cloud-gate-launches.jsonl', '{bad json\n', 'Expecting property name enclosed in double quotes'),
             ('cloud-gate-launches.jsonl', missing_time, "'gate_s'"),
         ):
@@ -450,8 +457,12 @@ class AwsReportTests(MeasurementFixture):
                 path.parent.mkdir(exist_ok=True)
                 _ = path.write_text(content)
                 output = self.render()
-                self.assertIn(f'- Gate type comparison unavailable: {reason}', output)
-                self.assertEqual(output.count('Gate type comparison unavailable:'), 1)
+                if filename.startswith('charges/'):
+                    self.assertIn(f'- {reason}', output)
+                    self.assertNotIn('Gate type comparison unavailable:', output)
+                else:
+                    self.assertIn(f'- Gate type comparison unavailable: {reason}', output)
+                    self.assertEqual(output.count('Gate type comparison unavailable:'), 1)
                 self.assertIn('### AWS\n', output)
                 self.assertNotIn('AWS: up ', output)
                 self.assertIn('Mac copies: none started.', output)
