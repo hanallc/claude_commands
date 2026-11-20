@@ -31,6 +31,7 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.lib import proc_text
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib import build_folders, cargo_output, copy_record, git_files, process_group, scratch, session_folder, time_limit
+from scripts.lib.cleanup_process_test_support import private_cleanup_processes
 from scripts.lint import folder_audit, sweep, tmp_sweep
 
 from scripts.lib import conf
@@ -64,10 +65,12 @@ def setUpModule() -> None:
 
 class ScratchTests(unittest.TestCase):
     base: Path = Path()
+    proc: Path = Path()
 
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.proc = self.enterContext(private_cleanup_processes(self.base))
         self.enterContext(mock.patch.dict(os.environ, {
             **copies_environment(self.base),
             "HOME": str(self.base),
@@ -3309,6 +3312,9 @@ print(scratch.target('gate:proof', 'tree', False))
         destination = self.base / "repro" / "cargo-liner-C54-open"
         with (note.open("a") as writer, mock.patch.object(scratch, "rename_adoption", return_value=False),
               mock.patch.object(shutil, "copytree") as copy):
+            descriptor = self.proc / str(os.getpid()) / "fd" / str(writer.fileno())
+            descriptor.parent.mkdir(parents=True)
+            descriptor.symlink_to(note)
             with self.assertRaisesRegex(scratch.RemovalRefused, f"process {os.getpid()} "):
                 _ = scratch.adopt(source, ROW, "open", visible=True)
             _ = writer.write(" and after")

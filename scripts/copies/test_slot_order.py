@@ -37,6 +37,7 @@ from scripts.disks import slots
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, reap
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots, conf
+from scripts.lib.cleanup_process_test_support import private_cleanup_processes
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -90,8 +91,9 @@ class SlotOrderTests(unittest.TestCase):
         self.queue = self.enterContext(AdmissionFixture(root=Path(environment["CONF_DIR"])))
         self.queue.clock.epoch = time.time()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**environment,
-            "PYTHONPATH": str(CHECKOUT), "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
-            "HERDR_BIN": "/nonexistent/herdr", "BUILDLOG_RUN": ""})))
+            "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
+            "HERDR_BIN": "/nonexistent/herdr", "BUILDLOG_RUN": "", "LINT_SKIP_SWEEP": "1"})))
+        _ = self.enterContext(private_cleanup_processes(self.root))
         for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"):
             _ = os.environ.pop(key, None)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))

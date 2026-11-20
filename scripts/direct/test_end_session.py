@@ -19,6 +19,7 @@ from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib import build_folders, unit_runs
+from scripts.lib.cleanup_process_test_support import private_cleanup_processes
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker, fixture_runtime_id
@@ -43,6 +44,7 @@ class EndSessionTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(private_cleanup_processes(self.root))
         self.session_dir = self.root / "run"
         self.session_dir.mkdir()
         session_id = fixture_runtime_id(f"end-session:{self.root.name}")

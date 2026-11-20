@@ -17,6 +17,7 @@ from unittest import mock
 
 from scripts.direct import remove_run_scratch, workers
 from scripts.lib import scratch
+from scripts.lib.cleanup_process_test_support import private_cleanup_processes
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
@@ -30,6 +31,7 @@ class RemoveRunScratchTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = self.enterContext(private_cleanup_processes(root))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {scratch.HOLDS_ENV: str(root / "holds.json")})))
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
         owner = fixture_member("showrunner", name="demo")

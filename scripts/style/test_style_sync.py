@@ -49,6 +49,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.cleanup_process_test_support import private_cleanup_processes
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 
 from scripts.style.style_reader_test_support import oracle_reader
@@ -180,6 +181,7 @@ class StyleSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="style-sync-test-")))
+        _ = self.enterContext(private_cleanup_processes(self.root))
         self.repo = self.root / "sample"
         self.style = self.root / "sample-style"
         self.repo.mkdir()

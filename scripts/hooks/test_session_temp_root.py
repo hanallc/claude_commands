@@ -21,7 +21,16 @@ class SessionTempRootTests(unittest.TestCase):
         _ = staff.write_text('{"schema": 2, "rows": []}', encoding="utf-8")
         config = base / "config"
         config.mkdir(exist_ok=True)
-        _ = (config / "build_folders.conf").write_text(f"roots.session={base / 'session'}\n", encoding="utf-8")
+        _ = (config / "build_folders.conf").write_text(
+            f"""roots.session={base / 'session'}
+patterns.legacy-stable={{purpose}}
+# range: 0.001..60
+locks.probe_wait_seconds=0.25
+# range: 0.001..1
+locks.probe_retry_seconds=0.005
+""",
+            encoding="utf-8",
+        )
         environment = {**os.environ, "TMPDIR": str(base), "CONF_DIR": str(config), "STAFF_FILE": str(staff),
                        "PYTHONDONTWRITEBYTECODE": "1", "SESSION_FORMER_ROOT": str(base / "former"),
                        "SESSION_TEMP_ROOT": str(base / "session"), "SESSION_PREVIOUS_ROOT": str(base / "previous")}

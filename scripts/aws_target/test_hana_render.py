@@ -38,6 +38,7 @@ IMAGE_INPUTS = (
 # The guest does not ship these imports for host operations, tests, and type annotations.
 UNSHIPPED_IMPORTS = {
     'build_queue/admission_client.py': {'accounts/__init__.py', 'accounts/outage_alerts.py',
+        'agents/detached_runs.py', 'agents/worker_lifecycle.py',
         'message/send_budget.py', 'message/send_result.py', 'message/session_send.py', 'notify/push_texts.py'},
     'build_queue/slot_wait.py': {'hooks/checkpoint_gate.py', 'lib/shell_test_support.py'},
     'build_queue/step_estimator.py': {'lint/tmp_sweep.py'},
@@ -46,6 +47,7 @@ UNSHIPPED_IMPORTS = {
     'copies/copies.py': {'lint/tmp_sweep.py', 'agents/remote.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'direct/local_release_wait.py': {'build_targets/build_targets.py', 'build_targets/targets.py', 'build_hold/build_hold.py'},
     'lib/build_folders.py': {'lib/descendants.py'},
+    'lib/build_steps.py': {'build_hold/build_hold.py', 'production/land_runs.py'},
     'lib/scratch.py': {'direct/phase_table.py', 'production/proposals_table.py', 'production/unit_lookup.py',
         'production/production_doc.py', 'direct/plan_history.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'lib/unit_runs.py': {'direct/worker_state.py'},
