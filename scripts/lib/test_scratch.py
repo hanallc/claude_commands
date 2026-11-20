@@ -2353,7 +2353,13 @@ print(scratch.target('gate:proof', 'tree', False))
         intermediate = self.copy("intermediate", task="until:2000-01-01T0000Z")
         link = intermediate / "objects"
         link.symlink_to(store, target_is_directory=True)
-        for name, stores in (("bare objects link", (store,)), ("bare objects link chain", (link, store))):
+        relative_store = Path("..") / source.name / ".git/objects"
+        for name, target, stores in (
+            ("bare objects link", relative_store, (store,)),
+            ("bare objects link chain", Path("..") / intermediate.name / link.name, (link, store)),
+            ("leave a managed directory", Path("..") / intermediate.name / relative_store, (intermediate, store)),
+            ("missing link target", Path("../missing-objects"), ()),
+        ):
             with (self.subTest(borrower=name),
                   tempfile.TemporaryDirectory(prefix="z-borrower-", dir=source.parent) as directory):
                 borrower = Path(directory)
@@ -2362,12 +2368,23 @@ print(scratch.target('gate:proof', 'tree', False))
                 self.assertEqual(scratch.checkout_storage(borrower), ())
                 objects = borrower / "objects"
                 shutil.rmtree(objects)
-                objects.symlink_to(os.path.relpath(stores[0], borrower), target_is_directory=True)
-                if link in stores:
+                objects.symlink_to(target, target_is_directory=True)
+                if name == "missing link target":
+                    with self.assertRaisesRegex(ValueError, "cannot reach the object store"):
+                        _ = scratch.checkout_storage(borrower)
+                    self.assertIsInstance(scratch.record_lifetime(source, time.time()), scratch.Unknown)
+                    with self.assertRaisesRegex(copies.CopyError, "cannot check borrowed objects"):
+                        copies.remove_trees("maker")
+                    self.assertTrue(objects.is_symlink())
+                    continue
+                if link in stores or intermediate in stores:
                     self.assertEqual(scratch.record_lifetime(intermediate, time.time()),
                                      scratch.Live(f"borrowed: {borrower} still uses its git objects"))
                     self.assertEqual([workspace[0] for workspace in copies.owned_workspaces("maker")],
                                      [borrower, intermediate, source])
+                if intermediate in stores:
+                    self.assertEqual(scratch.remove_folder(intermediate, scratch.ExpiredFolderRemoval(time.time()), dry_run=True),
+                        scratch.KeptFolder(intermediate, f"borrowed: {borrower} still uses its git objects"))
                 self.assertEqual(scratch.checkout_storage(borrower), stores)
                 self.assertEqual(scratch.record_lifetime(source, time.time()),
                                  scratch.Live(f"borrowed: {borrower} still uses its git objects"))

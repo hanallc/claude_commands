@@ -1083,21 +1083,28 @@ def object_alternates(objects: Path) -> Iterator[Path]:
 
 
 def _object_link_chain(objects: Path) -> Iterator[Path]:
-    """Yield the intermediate links and the final object store path."""
-    current = objects.parent.resolve()
+    """Yield the object store and the other paths its link needs."""
+    checkout = objects.parent.resolve()
+    current = checkout
     remaining = [objects.name]
     followed = 0
     while remaining:
         part = remaining.pop()
         if part == "..":
+            # The filesystem needs this directory to exist before it can leave it.
+            # The checkout already owns its directory.
+            if current != checkout:
+                yield current
             current = current.parent
             continue
         current /= part
         try:
             mode = current.lstat().st_mode
-        except (FileNotFoundError, NotADirectoryError):
-            continue
+        except (FileNotFoundError, NotADirectoryError) as error:
+            raise ValueError(f"{current}: cannot reach the object store") from error
         if not stat.S_ISLNK(mode):
+            if not stat.S_ISDIR(mode):
+                raise ValueError(f"{current}: expected a directory in the object store path")
             continue
         if followed == _OBJECT_LINK_LIMIT:
             raise ValueError(f"{objects}: object store path exceeds {_OBJECT_LINK_LIMIT} symbolic links")

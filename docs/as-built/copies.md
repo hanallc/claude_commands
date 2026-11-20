@@ -125,6 +125,8 @@ Recovery leaves the files if the clone is already absent when recovery starts.
 
 The borrow check keeps a source when a copy record or live Git metadata names its storage.
 Live Git metadata includes alternates and a bare copy's symbolic link to its object store.
+The borrow check keeps intermediate links and directories that a bare copy's object store path needs before `..`.
+An incomplete link path prevents removal when the borrow check cannot read it.
 Workspace and task clone registration record the root stores before setup publishes the Git checkout.
 Task clones find their root stores before creating a folder or lease files.
 The recorded borrow ends when cleanup removes the copy and its record.
