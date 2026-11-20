@@ -392,6 +392,7 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
             print(str(error), file=sys.stderr)
             result = worker.ExitCode.UNCERTAIN
     if result is worker.DispatchSubmission.SUBMITTED:
+        progress_history.confirm_assignment_submission(run, instance, delivery.completion_id)
         return TurnOutcome.SUBMITTED
     outcome = TurnOutcome.BUSY if result == worker.ExitCode.BUSY else TurnOutcome.UNCERTAIN
     details = diagnostics.getvalue().strip() or f"Stage 2 submission returned {result}"
@@ -1122,6 +1123,7 @@ def _handle_locked(event: WorkerEvent,
             return ignore_turn(reason, close_pane=False)
         stale_done = _stale_done_detail(reply, delivery.completion_id)
         if isinstance(receipt, worker.DispatchComplete):
+            progress_history.confirm_assignment_submission(run, instance, delivery.completion_id)
             if Path(delivery.early_ready).exists():
                 completion_id = worker_panes.stage_two_completion_id(instance)
                 diff = delivery.early_ready.removesuffix(".ready") + ".diff"

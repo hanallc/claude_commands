@@ -244,6 +244,23 @@ def _worker_lock_path(key: str) -> Path:
     return staff.record_path().parent / "locks" / f"{key}.lock"
 
 
+@contextmanager
+def worker_id_lock(identity: StaffId, *, blocking: bool = False,
+                   deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[None]:
+    """Hold the same worker lock across renames."""
+    path = _worker_lock_path(identity)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        if deadline == worker_lifecycle.NO_LOCK_DEADLINE:
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        else:
+            try:
+                worker_lifecycle.acquire_flock(handle, deadline=deadline)
+            except worker_lifecycle.OperationDeadlineExpired as error:
+                raise BlockingIOError(errno.EAGAIN, "dispatch lock is held") from error
+        yield
+
+
 @final
 class WorkerLockHold:
     """Hold the worker's fixed-id lock through startup and dispatch."""
@@ -261,16 +278,7 @@ class WorkerLockHold:
         if not self.active or not row.reports_to(self.parent) or row.name != self.name.value:
             raise ValueError("worker lock does not own this worker")
         if row.id not in self._held:
-            path = _worker_lock_path(row.id)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            handle = self._operations.enter_context(path.open("a"))
-            if deadline == worker_lifecycle.NO_LOCK_DEADLINE:
-                fcntl.flock(handle, fcntl.LOCK_EX | (0 if self._blocking else fcntl.LOCK_NB))
-            else:
-                try:
-                    worker_lifecycle.acquire_flock(handle, deadline=deadline)
-                except worker_lifecycle.OperationDeadlineExpired as error:
-                    raise BlockingIOError(errno.EAGAIN, "dispatch lock is held") from error
+            self._operations.enter_context(worker_id_lock(row.id, blocking=self._blocking, deadline=deadline))
             self._held.add(row.id)
 
     def owns(self, row: staff.StaffRow) -> bool:
