@@ -43,7 +43,7 @@ from scripts.build_queue import memory_files
 from scripts.lib import conf, scratch
 from scripts.production import change_routing, change_review, staff, the_list
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import new_item_dialog, page_frame, question_record, review_actions, review_submissions, staff_names
+from scripts.review_links import new_item_dialog, page_frame, question_record, review_actions, review_link, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -774,6 +774,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == review_page.ATTACHMENT_PATH:
             self.send_error(405)
             return
+        if not self.same_origin():
+            self.send_error(403)
+            return
         if route.query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
             return
@@ -957,10 +960,22 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return "The Tailscale address is not available."
         return ""
 
+    def accepts_host(self, host: str) -> bool:
+        """Accept one Host for the bound or published address on this port."""
+        if not host or self.headers.get_all("Host", []) != [host]:
+            return False
+        server = cast(ReviewLinksServer, self.server)
+        address, port = server.bound_address, server.server_port
+        if host == f"{address}:{port}" or (port == 80 and host == address):
+            return True
+        published = review_link.link_host(bound_address=address).lower()
+        host = host.lower()
+        return bool(published) and (host == f"{published}:{port}" or (port == 80 and host == published))
+
     def same_origin(self) -> bool:
         origins = self.headers.get_all("Origin", [])
         host = self.headers.get("Host", "")
-        return not origins or bool(host and origins == [f"http://{host}"])
+        return self.accepts_host(host) and (not origins or origins == [f"http://{host}"])
 
     def new_item_options(self) -> None:
         """Return a New item token and current recipients."""
