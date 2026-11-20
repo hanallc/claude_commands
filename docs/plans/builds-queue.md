@@ -2971,6 +2971,7 @@ Work:
 4. The test replays the case: two compiling holders under sccache, with low cgroup memory and high compiler job memory.
 
 ### Phase 44co — A Mac offload step never waits in the natedev memory line  · status: todo
+**Moved to phase 44dx (2026-11-20):** 44dx does this work with the handoff release.
 **From builds, 2026-11-18 23:45 EST (head-stall):** the queue head was copy_watch.py pid 3682121 (Mac offload runner), need 13.9 GiB, for 50+ min. It is a child of holder pid 4094003 (`verify.sh test hana`, inspectors-combined), which already holds a 13.9 GiB promise for its local nextest compile. One run holds one grant and asks for a second. A Mac step does not need natedev memory.
 Lead: `offload.py` `submit_direct_placement` sends `local.profile` from `admission_client.step_request`, the natedev step profile, with a Mac-pinned placement.
 1. Find the cause with a failing test first: why a Mac-pinned placement request carries a natedev need and stands at the head of the natedev line.
@@ -3249,6 +3250,19 @@ Tests: the three modules pass 20 times in a row under load, and each fix has a r
 2. Remove natest's marked temporary fixture hold in `test_pinned_linux_reservation_race_waits_only_with_a_live_claim` (scripts/direct/test_verify_wait_holder.py:737), so that its single-attempt assertion guards the fix again. The hold is in natest phase 396, not on main yet (builds 22:58: hash about 01:00 EST Nov 20). Do not merge a natest branch. Order: 396 merges first; then 44ds merges main, removes the hold, runs its suite, and sends the hash.
 
 Tests: one row in the existing placement retry test for a busy local refusal with a cached free reading: no second assignment until a newer reading. It fails first. Item 2 makes the natest row the end-to-end check.
+
+### Phase 44dx — A Mac step gives back its natedev memory at the handoff  · status: todo
+**From builds, 2026-11-20 07:24 EST (bob proposed, builds accepted).** First after the 44dt re-tip. Base: current main. This phase also does phase 44co: both are the same Mac placement path.
+
+Evidence: two hana Mac runs (`offload.py` through `copy_watch.py`) held 27.7 GiB of natedev promise for 60-75 min. natedev ran nothing for them, and the queue head waited about 2 h. On 11-18 (44co), a Mac offload child stood at the natedev queue head with a 13.9 GiB need while its parent held a grant. Lead: `offload.py` `submit_direct_placement` (scripts/mac_test/offload.py:3433) sends `local.profile` from `admission_client.step_request`, the natedev step profile, with a Mac-pinned placement. `verify.sh` `buildlog_release_memory` (:4006) calls `release-step-memory` only for a slot capacity file.
+
+1. Replay both cases with failing tests first:
+   - A Mac offload child of a verify call asks for Mac placement. Today it stands in the natedev memory line with a natedev need (44co).
+   - A step goes to the Mac and its natedev memory promise stays held for the whole Mac run.
+2. Fix it at the cause. A Mac-pinned request waits for its Mac slot only and holds no natedev memory. A step that goes to the Mac gives back its natedev promise at the handoff. The page shows it as a Mac wait.
+3. A fall-back from the Mac to natedev asks the queue again, in the normal order. It does not keep an old promise.
+
+Tests: each replay fails on main and passes with the fix. The admission, offload and copy_watch modules pass.
 
 ### Phase 44du — Slot-order test cleanup reads only its own processes  · status: todo
 **Follow-up from the 44dt closure review and the group review (G6), 2026-11-20.** Not a regression: main has the same reads, and the tests pass under load. Starts after the group merges.
