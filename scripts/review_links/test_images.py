@@ -270,7 +270,6 @@ class ImagesTests(ImagesFixture):
         self.assertNotIn("start.get('show')", source)
         self.assertIn("card.remove();", source)
         self.assertIn("home.insertBefore(card, next?.parentNode === home ? next : null);", source)
-        self.assertIn("status.textContent = 'Not sent: ' + error.message;", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
@@ -348,6 +347,10 @@ class ImagesTests(ImagesFixture):
   check(list() !== previous, action + ' refreshes the cards after the POST');
   check(!form.isConnected, action + ' replaces the old form');
   check(list().querySelector('article')?.id === card.id, action + ' shows the card that the server kept');
+  if (words !== 'Please retry.') {
+   const status = list().querySelector('[data-image-status]');
+   check(status.hidden && !status.textContent, action + ' leaves no action status.');
+  }
  }
  const restored = list().querySelector('form');
  check(restored.elements.feedback.value === 'Please retry.', 'failed feedback keeps its draft');
@@ -1040,7 +1043,7 @@ class ImageQuestionTests(ImagesFixture):
         blocked = "Resend is unavailable until the sender can be checked."
         with patch.object(process_start, "process_start", return_value=process_start.Unreadable("Cannot read the sender.")):
             content = images.render(self.status).decode()
-            self.assertIn(f'<p role="status" data-resend-blocked>{blocked}</p>', content)
+            self.assertIn(page_frame.action_failure(None, blocked), content)
             self.assertNotIn('Enter the same words and press Ask question to send it again.', content)
             self.ask(record, words)
             self.assertEqual(self.sent, [])
@@ -1322,6 +1325,24 @@ async (find, whenPageShows, check, controlRefresh) => {
  check((await fetch('/fixture-delivery', {method: 'POST'})).ok, 'The fixture completes delivery.');
 }'''
         _ = self.run_question_browser(self.question_probe(probe), fail_first_refresh=True)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser actions')
+    def test_successful_delete_shows_refresh_failure_outside_the_removed_card(self) -> None:
+        probe = r'''
+async (find, whenPageShows, check) => {
+ const card = find('Question fixture'), form = card.querySelector('form');
+ const notice = document.getElementById('image-action-failure');
+ form.requestSubmit(form.querySelector('button[value="delete"]'));
+ await whenPageShows('the refresh failure', () => !notice.hidden);
+ check(notice.textContent === 'Update failed: HTTP 503', 'The page notice shows the refresh error.');
+ check(!card.isConnected, 'The deleted card stays out of the list.');
+ check(form.querySelector('[data-image-status]').hidden, 'The removed card has no failure notice.');
+ document.dispatchEvent(new Event('visibilitychange'));
+ await whenPageShows('the cleared notice', () => notice.hidden);
+ check(!find('Question fixture'), 'The refreshed list also leaves the deleted card out.');
+}'''
+        requests = self.run_question_browser(self.question_probe(probe), fail_first_refresh=True)
+        self.assertEqual([request['action'] for request in requests], [['delete']])
 
     @staticmethod
     def question_probe(check_page: str) -> str:

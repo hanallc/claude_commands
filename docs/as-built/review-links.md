@@ -90,8 +90,7 @@ Staff names use the current role colors from the Accounts reader.
 It resolves fixed IDs, session IDs, and unambiguous staff names.
 The shared renderer escapes unknown names and free text without a role color.
 The List colors Owner, Producer, supporting unit names, staff names in log sources, and showrunner names in the count strip.
-List delivery notices color morty and the recorded showrunner through the same page renderer.
-They keep the notice words and time.
+List delivery failures keep the recorded showrunner's color and the notice time.
 Review colors Owner, Source, staff log names, and owner menu options.
 Images colors card owners and copies those colored names into the group links.
 Legacy question pages color each source and its parent separately.
@@ -144,6 +143,16 @@ Cards and form controls keep their page styles.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
 The frame reserves scrollbar space, so short and long pages keep the same column position.
+A successful action updates the page and shows no confirmation line.
+An action that fails uses the shared action failure notice.
+Branches shows the remaining branches after deletion.
+The page uses the shared notice for deletion or delivery failures.
+The original address follows the latest saved list, including when report delivery fails.
+Each Git command uses `branch_git_timeout_seconds` in `config/review_links.conf`.
+The default limit is 15 seconds.
+The shared notice shows timeouts and unusable timeout settings.
+If the manifest update and next-list publication fail, the POST response still excludes the branches it deleted.
+Images uses the page notice if the image is deleted and the list cannot refresh.
 The shared `.page-status` line follows the title.
 It shows the state, data time, round trip and server render time, in that order.
 Live uses `radio` and `--room`; Reading uses `loader-circle` and `--accent`.
@@ -152,7 +161,7 @@ Paused uses `circle-pause` and `--ink-3`.
 A hidden page or a replacement hold shows Paused before the other states.
 Otherwise, the state order is Failed, Late, a busy Paused state, Reading, Live.
 Late, Failed and Paused show a reason after the last data time instead of timings.
-Builds and Disks keep the shown data time when a later read or measure fails.
+Builds and Disks keep the shown data time when a later read fails.
 A first read shows only Reading until data arrives.
 A slow read retains the last data time and timings.
 The age increases each second without a request.
@@ -197,7 +206,10 @@ The shared component uses that time for Late and keeps the size timestamp for th
 Other pages use their data timestamp for Late.
 A completed measure returns Disks to Live with the new size age.
 A measure that exceeds `wait_seconds` clears the measure state even when reads fail.
-The status shows Failed with **The measure did not finish.** or the read error.
+The action failure notice shows **The measure did not finish.**
+A refused measure shows its reason in the same notice.
+A successful measure request clears the notice.
+A failed data read uses the refresh status line.
 If a read remains pending past the age limit, the status shows Late with the retained data age.
 AWS reads its published page when shown; its hourly publisher sets the data time and render time.
 Images reads its rendered page when shown.
@@ -403,7 +415,6 @@ If the request fails, the row slides back into view and the current card stays s
 Review and The List read both settings when they render.
 If the fade is still in progress, the return starts at the copy's current height and opacity.
 The animation updates when the user opens or closes a card during the transition.
-A successful save adds no notice above the table.
 The status region above the table shows a failure only for the most recent submission.
 It shows that failure when the row or its details are hidden.
 The next save attempt or reload clears this notice.
@@ -487,7 +498,6 @@ The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
 Review submissions retain the Type, Show and Owner chips and the search words.
 A new item opens when it matches the current filters.
-Review shows a save confirmation when the current filters hide the new item.
 A save conflict shows its reason and preserves the current filters.
 The Type, Show and Owner chip rows wrap at phone width.
 If a refresh hides the focused Owner chip, focus moves to the selected Owner chip.
@@ -1013,7 +1023,7 @@ Mark read, Park until, and Remove release the link to the item.
 If the item stops matching the filters, it starts to fade as soon as the user submits the action.
 If the read write fails, the question or feedback remains saved and the sender can deliver it.
 The store keeps the unread update if the read write fails or a newer update exists.
-Tell morty shows “sent to morty; update remains unread” in both cases.
+The unread dot shows that the update remains unread in both cases.
 Tell morty applies the current filters. A read item leaves the view when Unread only is on.
 Tell morty with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
@@ -1072,7 +1082,7 @@ A retry of a saved Ask returns its saved result without sending again.
 After the last answer, the next refresh returns the row to its status chip.
 The item stays in Parked while its park is active.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
-That request moves the item to Morty answering and shows its confirmation next to Show.
+That request moves the item to Morty answering.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
 Opening an individual row with an unread answer uses the same signed read operation.
@@ -1129,11 +1139,9 @@ The response reports the saved request outcome and the current parking state.
 The page shows “Parking time already expired” for an expired time.
 It shows “No active parking time to clear” when the time is absent.
 Both results preserve the parking draft.
-A replay of a successful Unpark reports the original result and any newer active parking time.
-When Unpark clears parking and removes the row from Parked, the page shows “Item #N unparked.”
-The page shows confirmations for hidden rows next to the Show filter.
-It keeps one confirmation per hidden row after overlapping Unpark requests.
-Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
+A replay of a successful Unpark preserves and displays any newer active parking time.
+When Unpark removes the row from Parked, focus moves to the Parked filter.
+The page scrolls to keep the Parked filter in view.
 If All is active when Unpark saves, the row stays expanded and its item number can receive focus.
 After Unpark, the item's saved state sets its status chip.
 After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
@@ -1211,7 +1219,7 @@ A repeated POST retries a pending request without adding another pending log ent
 Sent and alerted requests do not send again.
 A process claim prevents concurrent sends of one request without holding the List lock during delivery.
 Delivery is at least once; a crash after a send but before its saved result can cause another send.
-The Update cell shows “sent to morty” with its time until the next log entry from morty.
+The Update cell shows delivery failures with their time. The Log keeps the delivery history.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
 After a lost Park or Remove response, the List reads the current item before it restores the row.
@@ -1220,7 +1228,7 @@ Changed feedback uses the fresh signed request from the page.
 A successful send clears the saved request ID and only the text that the user sent.
 Each successful POST returns a fresh signed request ID for the next action.
 A retry retains its original request ID.
-It shows a save or send notice as soon as the user submits a form.
+The form disables its action controls while the request runs.
 An unread update shows a dot and marks the navigation entry as new.
 The navigation key includes the record ID and update time.
 The page uses `page_refresh_seconds` and the shared refresh helper.
@@ -1498,7 +1506,7 @@ The message includes any feedback from the form.
 This answer writes no verdict and runs no feature-log command.
 The row leaves the view when the request saves.
 The review list retains the row until the showrunner saves a verdict.
-A direct link shows **The showrunner will validate this** without answer buttons.
+A direct link shows **With the showrunner for validation** in the card details.
 The delivery record preserves this state across page loads and server restarts.
 The page calls `next_item.move_to_end` to move the row to the end of the showrunner's own queue.
 The CLI keeps its current form and still moves the pinned item.
@@ -1533,8 +1541,7 @@ The message includes the feedback ID and the command to record the action.
 The recorded action returns the change to Open.
 
 Each answer uses a background `fetch` POST.
-The row shows **Saving…** during the save and **Saved: <result>** after success.
-The row then leaves the view without opening another card.
+After the save, the row leaves the view without opening another card.
 A failed save keeps the row and typed text and shows **Not saved: <reason>**.
 
 The fixed `console/` folder holds the all-list browser's private `.review-link-browser.json` and no HTML file.
@@ -1630,7 +1637,6 @@ An empty Producer cell belongs to the list's staff showrunner.
 Retries retain stored staff recipient ids.
 Older records without recipient ids compute the same recipients as a fresh verdict send.
 No agent polls for answers.
-A save shows **Saved: &lt;answer&gt;** from the review record.
 `DeliveryStatus` owns one private delivery record per review list and row under the configured review root.
 `scripts/production/delivery_state.py` owns its typed states and decoder.
 Both the page and waiting-count readers use this decoder.
@@ -1651,7 +1657,7 @@ The server reads the owner and its production document at use through `StaffRout
 `DeliveryIntent` models a pending send; it has no failed state.
 `ValidationRequested` keeps validation ownership and feedback after delivery or an alert.
 Only a showrunner answer returns an open question to the user.
-The page shows **Saved: <answer>**, **The showrunner will validate this**, or **The showrunner will answer this**.
+The page shows the recorded verdict or the current state in the card.
 The page shows no delivery state, attention links, or resend buttons.
 
 The server reads `config/review_links.conf` through `scripts/lib/conf.py` when delivery starts.
@@ -1954,7 +1960,7 @@ The renderer removes blank lines at each text part's edges.
 Code blocks and paragraphs use the same 16px margin.
 Inline code keeps its current style.
 The button copies the code text without the button or its label.
-The button shows a check and the label “Copied” for two seconds after success.
+The button shows a check for two seconds after success. Its label stays the same.
 A second click starts the two seconds again.
 A failed copy keeps the copy icon and shows “Copy failed” for two seconds.
 The shared script uses the clipboard API when available.

@@ -1466,10 +1466,15 @@ class ChangeDetails:
                                                     ("commit", self.commit), ("kind", self.kind)) if value]
 
 
-def change_details(row: dict[str, str], key: str) -> str:
+def change_details(row: dict[str, str], key: str, *, validating: bool = False) -> str:
     """Show the change's facts as aligned lines, always open."""
+    details = ChangeDetails.read(row, key).lines()
+    if verdict := row.get("Verdict"):
+        details.append(("verdict", verdict))
+    elif validating:
+        details.append(("state", "With the showrunner for validation"))
     return ('<dl class="change-details">'
-            + "".join(f"<dt>{label}:</dt><dd>{html.escape(value)}</dd>" for label, value in ChangeDetails.read(row, key).lines())
+            + "".join(f"<dt>{label}:</dt><dd>{html.escape(value)}</dd>" for label, value in details)
             + "</dl>")
 
 
@@ -1484,7 +1489,8 @@ def source_name(members: staff.StaffSnapshot, owner: staff.StaffId) -> str:
 
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     feedback_rows = conf.read("review_links").whole("feedback_rows")
-    return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
+    return document(page_frame.action_failure("change-save-failure", "Not saved: " + notice.reason)
+                    + answer_form(page, notice, feedback_rows))
 
 
 LINK = re.compile(r"(https?://(?:[^\s<>\"'`]|`(?![^`\n]+`))*"
@@ -1657,12 +1663,6 @@ def answer_row(page: ReviewPage, row_id: str) -> dict[str, str]:
     return next(row for row in answer_rows(page) if row["#"] == row_id)
 
 
-def answer_status(verdict: str, slots: DeliverySlots) -> str:
-    if verdict:
-        return "Saved: " + verdict
-    return "The showrunner will validate this" if slots.validation_requested else ""
-
-
 def list_routing(snapshots: dict[Path, change_review.ReviewListSnapshot]) -> change_routing.StaffRouting:
     documents = change_routing.production_documents(dict(showrunners.timer_docs()),
         ((listing.stem.removeprefix(change_review.PREFIX), snapshot.text) for listing, snapshot in snapshots.items()))
@@ -1683,20 +1683,18 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         if notice.reason and notice.row == row["#"]:
             reason = WITH_SHOWRUNNER if not verdict and not slots.waits_for_user(False) else notice.reason
             warning = "Not saved: " + reason
-        alert = f'<p role="alert">{html.escape(warning)}</p>' if warning else ""
+        alert = page_frame.action_failure("change-save-failure", warning) if warning else ""
         form_notice = notice if notice.row == row["#"] else AnswerNotice(row["#"])
-        status_text = answer_status(verdict, slots)
-        answer = (f'<p role="status">{html.escape(status_text)}</p>' if status_text else
-                  "" if isinstance(question, OpenQuestion) else answer_form(page, form_notice, feedback_rows))
+        answer = answer_form(page, form_notice, feedback_rows) if slots.waits_for_user(bool(verdict)) else ""
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
 <h2>{proof_title}</h2>{review_html(row[change_review.CHECK])}
 {question_html(question)}{answer}
-{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}'''
+{change_details(row, change_review.display_id(row, route_owner(page, row).tab), validating=slots.validation_requested)}'''
         sections.append(f'<section id="{row_id}" data-change-card>' + change_content(row, content) + '</section>')
     if notice.reason and not notice.row:
-        sections.insert(0, f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>')
+        sections.insert(0, page_frame.action_failure("change-save-failure", "Not saved: " + notice.reason))
     queue = next_item.change_queue(page.production)
     moved = urgency.ended(queue.name)
     if saved or any(queue_key(page, row) in moved for row in page.rows):

@@ -148,10 +148,11 @@ MENU_PROBE = '''<script>
    saves[0].options.headers['Content-Type']==='application/x-www-form-urlencoded','the post names the group and the account');
   check(state()==='Paused','a pending move holds refresh');
   saves[0].resolve({ok:true,json:async()=>({state:'saved'})});await flush();await flush();
-  check(reads===readsBefore+1 && state()!=='Paused','a saved move reloads the board');
+  check(reads===readsBefore+1 && state()!=='Paused','A saved move reloads the board.');
+  const error=document.querySelector('[data-color-save-error]');
+  check(error.hidden && !error.textContent,'A saved move shows no action status.');
   open();items()[0].click();
   saves[1].resolve({ok:false,json:async()=>({reason:'next: cannot set entry: busy'})});await flush();
-  const error=document.querySelector('[data-color-save-error]');
   check(!error.hidden && error.textContent==='units: next: cannot set entry: busy','a failed move reports its reason in the status line');
   open();menu.querySelector('[data-move-clear]').click();
   const cleared=new URLSearchParams(saves[2].options.body);
@@ -160,7 +161,8 @@ MENU_PROBE = '''<script>
   check(menu.hidden && document.activeElement===button(),'clear returns focus to the button');
   freshPage=EMPTY_PAGE;
   saves[2].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
-  check(button().closest('td').querySelector('.next-muted').textContent==='none','clear refreshes the cell to none');
+  check(button().closest('td').querySelector('.next-muted').textContent==='none','Clear changes the cell to none.');
+  check(error.hidden && !error.textContent,'Clear removes the previous failure and shows no action status.');
   open();check(!menu.querySelector('[data-move-clear]'),'an empty group has no clear item');key('Escape');
   open();dispatchEvent(new Event('resize'));check(menu.hidden,'resize closes the menu');
   open();dispatchEvent(new Event('scroll'));check(menu.hidden,'scroll closes the menu');

@@ -170,6 +170,7 @@ function untilError() {
    send.click();
    check((await created).detail.id === 'I1', 'The event reports the saved item ID.');
    check(closeToLauncher(), 'A successful send closes the dialog and returns focus.');
+   check(error.hidden && !error.textContent, 'A successful send clears the failure and shows no action status.');
 
    await open({kind:'question', evidence:{kind:'none'}});
    check(document.activeElement.value === 'question' && evidence.hidden && !textarea.value &&
@@ -418,6 +419,9 @@ function untilError() {
      return json({token:'', recipients:[{id:'list-staff',name:'morty'}],
                   send_disabled:'Sending is off on a practice List.'});
     }
+    if (url === '/console/review/new-item?page=accounts') {
+     return json({error:'The recipient service is unavailable.'}, 503);
+    }
     if (url === '/console/review/new-item' && options?.method === 'POST') {
      ownerPosts.push(JSON.parse(options.body));
      return json({});
@@ -434,6 +438,14 @@ function untilError() {
    check(send.disabled && checkbox.closest('label').hidden, 'The practice dialog disables Send and hides capture.');
    send.click();
    check(ownerPosts.length === beforePractice, 'The practice dialog makes no POST.');
+   dialog.querySelector('[data-cancel]').click();
+   await open({page:'accounts',kind:'question'});
+   check(notice.hidden && !notice.textContent, 'The next dialog clears the previous refusal.');
+   const recipientFailure = dialog.querySelector('[data-recipients-status]');
+   check(!recipientFailure.hidden && recipientFailure.textContent === 'The recipient service is unavailable.',
+         'The recipient request failure shows its reason.');
+   check(dialog.querySelector('[data-recipients-loading]').hidden && send.disabled,
+         'A failed request clears loading and leaves Send disabled.');
    dialog.querySelector('[data-cancel]').click();
    window.fetch = originalFetch;
   }

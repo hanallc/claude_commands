@@ -579,7 +579,8 @@ def render() -> str:
   <header><h2 id="new-item-title">New item</h2><button type="button" data-close aria-label="Close">×</button></header>
   <div class="new-item-body">
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
-   <fieldset><legend>To</legend><p data-recipients-status role="status" hidden></p>
+   <fieldset><legend>To</legend><p data-recipients-loading role="status" hidden>Loading recipients…</p>
+    <p data-recipients-status role="status" hidden></p>
     <div class="new-item-chips" data-recipients></div>
    </fieldset>
    <section data-evidence aria-labelledby="new-item-evidence-title" hidden>
@@ -687,7 +688,7 @@ padding:5px 14px;margin:0;flex:none;white-space:nowrap}
 #review-new-item .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
 #review-new-item .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
 #review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
-#review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
+#review-new-item :is([data-recipients-status], [data-recipients-loading]) { margin: 0; color: var(--ink-2, #c3c2b7); }
 #review-new-item textarea {
  display: block; width: 100%; min-width: 0; padding: 10px 12px; resize: vertical;
  border: 1px solid var(--line, #34332f); border-radius: 8px;
@@ -768,13 +769,14 @@ padding:5px 14px;margin:0;flex:none;white-space:nowrap}
 '''
 
 
-SCRIPT = r'''(() => {
+SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
  const endpoint = '/console/review/new-item';
  const limits = __LIMITS__;
  const dialog = document.querySelector('#review-new-item');
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
+ const recipientLoading = dialog.querySelector('[data-recipients-loading]');
  const evidenceSection = dialog.querySelector('[data-evidence]');
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
  const pageCapture = dialog.querySelector('[data-page-capture]'), includePage = form.elements.include_page;
@@ -845,11 +847,6 @@ SCRIPT = r'''(() => {
   box.append(heading, cells, memory, tip);
  }
 
- function setError(reason) {
-  error.textContent = reason;
-  error.hidden = !reason;
- }
-
  function updateSend() {
   send.disabled = sending || !token || !recipientChips.querySelector('input:checked') ||
                   !words.value.trim() || words.value.length > words.maxLength;
@@ -872,8 +869,7 @@ SCRIPT = r'''(() => {
    chip.append(input, face);
    recipientChips.append(chip);
   }
-  recipientStatus.textContent = available.length ? '' : 'No recipients are available.';
-  recipientStatus.hidden = !!available.length;
+  showActionFailure(recipientStatus, available.length ? '' : 'No recipients are available.');
  }
 
  function editDraft(event) {
@@ -883,7 +879,7 @@ SCRIPT = r'''(() => {
    if (isPageBug()) discardCapture();
    else startCapture();
   }
-  setError('');
+  showActionFailure(error);
   updateSend();
  }
 
@@ -903,11 +899,11 @@ SCRIPT = r'''(() => {
   event.preventDefault();
   const total = [...images.map(image => image.file), ...files].reduce((sum, file) => sum + file.size, 0);
   if (files.some(file => !limits.types.includes(file.type))) {
-   setError('Paste PNG, JPEG, GIF or WebP images.'); return;
+   showActionFailure(error, 'Paste PNG, JPEG, GIF or WebP images.'); return;
   }
   if (images.length + files.length > limits.images || total > limits.totalImageBytes ||
       files.some(file => !file.size || file.size > limits.imageBytes)) {
-   setError('Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
+   showActionFailure(error, 'Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
   }
   for (const file of files) {
    const row = node('div', '', 'new-item-preview'), photo = node('img');
@@ -1012,7 +1008,7 @@ SCRIPT = r'''(() => {
   const search = document.querySelector('#list-search,[data-filter-words]');
   if (search?.value && visible(search)) filters.push('Search ' + clip(search.value));
   const notices = new Set();
-  const selector = '[data-review-source-notices] li,[data-review-notice],[data-missing-item],.notice,' +
+  const selector = '[data-review-source-notices] li,[data-hidden-action-status],[data-missing-item],.notice,' +
                    '[role="alert"],[data-page-status][data-state="Failed"] [data-status-reason]';
   for (const element of document.querySelectorAll(selector)) {
    if (!visible(element)) continue;
@@ -1122,13 +1118,13 @@ SCRIPT = r'''(() => {
   setPageMode(page);
   launcher = trigger || document.activeElement;
   token = '';
-  sendNotice.hidden = true;
+  showActionFailure(sendNotice);
   if (!keepDraft) form.reset();
   if (!keepDraft || changedMode) {
    evidence = structuredClone(capture);
    recipients = null;
    includePage.checked = includePage.defaultChecked;
-   setError('');
+   showActionFailure(error);
    recipientChips.replaceChildren();
    const kinds = [...form.querySelectorAll('input[name="kind"]:not(:disabled)')];
    if (!keepDraft || !kinds.some(input => input.checked)) {
@@ -1136,8 +1132,8 @@ SCRIPT = r'''(() => {
    }
    showEvidence();
   }
-  recipientStatus.textContent = 'Loading recipients…';
-  recipientStatus.hidden = false;
+  showActionFailure(recipientStatus);
+  recipientLoading.hidden = false;
   showBugPage();
   updateSend();
   const controller = new AbortController();
@@ -1150,8 +1146,7 @@ SCRIPT = r'''(() => {
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
    token = data.token;
-   sendNotice.textContent = data.send_disabled || '';
-   sendNotice.hidden = !data.send_disabled;
+   showActionFailure(sendNotice, data.send_disabled);
    if (data.send_disabled) pageCapture.hidden = true;
    recipients = data.recipients;
    pageOwnerId = ownerPage ? data.page_owner ?? (recipients.length === 1 ? recipients[0].id : '') : '';
@@ -1159,7 +1154,9 @@ SCRIPT = r'''(() => {
    startCapture();
    updateSend();
   } catch (failure) {
-   if (!controller.signal.aborted) recipientStatus.textContent = failure.message;
+   if (!controller.signal.aborted) showActionFailure(recipientStatus, failure.message);
+  } finally {
+   if (!controller.signal.aborted) recipientLoading.hidden = true;
   }
  }
 
@@ -1182,7 +1179,7 @@ SCRIPT = r'''(() => {
   const payload = {request_id: draft, kind, recipient_id: recipient.value,
                    words: words.value, ...(ownerPage && {page: ownerPage,
                     ...(recipient.value !== pageOwnerId && {page_recipient: 'list-owner'})})};
-  setError('');
+  showActionFailure(error);
   setSending(true);
   let saved, usedCapture;
   try {
@@ -1210,7 +1207,7 @@ SCRIPT = r'''(() => {
    }
    saved = result;
   } catch (failure) {
-   setError(failure.message);
+   showActionFailure(error, failure.message);
   } finally {
    setSending(false);
   }

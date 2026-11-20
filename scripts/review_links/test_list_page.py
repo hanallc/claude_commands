@@ -709,7 +709,8 @@ async function inspect(){
  });
  submit('works');
  if(!phone){
-  await changed(card.body,()=>status().startsWith('Saved:'),'the verdict is saved');
+  await changed(dialog,()=>!close.disabled,'the verdict is saved');
+  check(status()==='' && card.querySelector('[data-send-status]').hidden,'The verdict shows no status text.');
   await animationFrames(win);
   check(dialog.open && listReads===0 && row()===before,'The Review save waits for the pending List action.');
   releaseList(new win.Response(JSON.stringify({reason:'The test List action was refused.'}),{status:400}));
@@ -1948,7 +1949,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         self.assertNotIn('<label for="words-', words)
         self.assertIn('placeholder="Your words for morty about this item"', words)
         self.assertIn('aria-label="Your words for morty about this item"', words)
-        self.assertIn('</textarea><div class="list-tell"><span role="status" data-send-status></span>'
+        self.assertIn('</textarea><div class="list-tell"><span role="status" data-send-status hidden></span>'
                       + '<button name="action" value="question" disabled>Ask question</button>'
                       + '<button name="action" value="tell" disabled>Tell morty</button></div>', words)
         self.assertIn("!words.value.trim()", list_page.SCRIPT)
@@ -2663,7 +2664,7 @@ window.fetch=async(_path,options={})=>{
   finishPost({item_state:'Working',parked:'true'});await flush();await flush();
   check(row('105').hidden,'Park stays outside Working after success');
   await choose('parked','105');check(visible()==='105','Park updates the Parked view');
-  check(parked.querySelector('[data-send-status]').textContent==='Parked','Park shows its result');
+  check(parked.querySelector('[data-send-status]').textContent==='','Park shows no action status');
   await choose('all','58');row('58').querySelector('.list-toggle').click();
   const form=row('58').querySelector('form');
   check(row('58').dataset.unread==='false' && !form.querySelector('[value="read"]'),'the unread sync case starts read');
@@ -2731,10 +2732,12 @@ window.fetch=async(_path,options={})=>{
   'All keeps the server order until a refresh.');
  check(document.querySelector('#filter-show-all b').textContent==='2' &&
   document.querySelector('#filter-show-parked b').textContent==='1','All and Parked count the parked item.');
- check(form.querySelector('[data-send-status]').textContent==='Parked until delivered',
-  'All confirms the parking action in the row.');
+ check(form.querySelector('[data-send-status]').hidden && form.querySelector('[data-send-status]').textContent==='',
+  'All shows no action status after Park.');
  show('working');
  check(row.hidden,'Working hides the item until delivery');
+ const status=document.querySelector('[data-hidden-action-status]');
+ check(status.hidden && !status.textContent,'The hidden parked row leaves no action status.');
  show('parked');
  check(!row.hidden && !form.querySelector('[value="unpark"]').hidden,'Parked shows the item and Unpark');
  check(form.querySelector('[data-parked-detail]').textContent==='Parked until delivered','The panel shows the condition');
@@ -2975,10 +2978,10 @@ window.fetch=async(_path,options={})=>{
  finishPost(SAVED_UNPARK);await flush();
  check(row.hidden && document.activeElement===document.querySelector('#filter-show-parked'),'focus moves to Parked');
  const status=document.querySelector('[data-hidden-action-status][role="status"]');
- check(!status.hidden && status.getClientRects().length>0 && status.textContent==='Item #1 unparked.',
-       'Parked announces which item left');
+ check(status.hidden && !status.textContent,'Parked shows no action status.');
  show('all');
- check(status.hidden,'All shows the confirmation in the row');
+ check(status.hidden && !form.querySelector('[data-send-status]').textContent,
+       'All shows no action status after Unpark.');
  const nextCheck=row.querySelector('[data-list-check]');
  check(nextCheck.getClientRects().length>0 &&
   nextCheck.querySelector('.warning')?.textContent==='Check overdue Nov 16 14:00 EST',
@@ -3098,7 +3101,7 @@ window.fetch=async(_path,options={})=>{
  finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'expired'});
  await flush();
  const status=document.querySelector('[data-hidden-action-status]');
- check(row.hidden && !status.hidden && status.textContent==='Item #1: Parking time already expired.',
+ check(row.hidden && !status.hidden && status.textContent==='Item 1: Parking time already expired',
        'Parked reports that the parking time already expired.');
  show('all');
  check(form.querySelector('[data-send-status]').textContent==='Parking time already expired',
@@ -3122,8 +3125,7 @@ window.fetch=async(_path,options={})=>{
   unpark_outcome:'cleared_newer_parking_active'});
  await flush();
  const message=form.querySelector('[data-send-status]').textContent;
- check(message==='The original Unpark cleared parking. A newer parking time is active',
-       'The replay reports the original result and the newer parking time.');
+ check(message==='','A successful replay shows no action status.');
  check(!row.hidden && !unpark.hidden && document.activeElement===unpark,
        'The reparked row stays in view and Unpark keeps focus.');
  check(form.querySelector('[data-parked-detail]').textContent==='Parked until Dec 4 00:00 EST',
@@ -3142,13 +3144,13 @@ window.fetch=async(_path,options={})=>{
  finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'no_active_parking'});
  await flush();
  const status=document.querySelector('[data-hidden-action-status]');
- check(row.hidden && !status.hidden && status.textContent==='Item #1: No active parking time to clear.',
+ check(row.hidden && !status.hidden && status.textContent==='Item 1: No active parking time to clear',
        'The result shows that there was no active parking time.');
  check(form.elements.until.value==='2026-12-03','The request preserves the parking draft.');
 ''', reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_preserves_both_overlapping_unpark_confirmations(self) -> None:
+    def test_browser_leaves_no_status_after_overlapping_unparks(self) -> None:
         for number in (1, 2):
             item = self.add(f"Parked item {number}", number=number)
             _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
@@ -3162,23 +3164,18 @@ window.fetch=async(_path,options={})=>{
  const result={item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'};
  const status=document.querySelector('[data-hidden-action-status]');
  finishFirst(result);await flush();
- check(row.hidden && !second.hidden && !status.hidden && status.textContent==='Item #1 unparked.',
-       'The first request shows its result while the second request runs.');
+ check(row.hidden && !second.hidden && status.hidden && !status.textContent,
+       'The first row leaves Parked with no action status.');
  finishPost(result);await flush();
- check(second.hidden && !status.hidden && status.textContent==='Item #1 unparked. Item #2 unparked.',
-       'Both results stay visible after both rows leave Parked.');
+ check(second.hidden && status.hidden && !status.textContent,'The second row leaves Parked with no action status.');
  show('all');
- check(!status.hidden && status.textContent==='Item #1 unparked.' &&
-       !second.hidden && !second.querySelector('[data-detail]').hidden &&
-       second.querySelector('[data-send-status]').textContent==='Unparked',
-       'All shows the first result above the table and the second result in the visible details.');
- show('parked');
- check(!status.hidden && status.textContent==='Item #1 unparked. Item #2 unparked.',
-       'Parked shows both results again.');
+ check(status.hidden && !second.hidden && !second.querySelector('[data-detail]').hidden &&
+       !second.querySelector('[data-send-status]').textContent,
+       'All shows the open row without action status.');
 ''', reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_brings_parked_filter_and_confirmation_into_view(self) -> None:
+    def test_browser_brings_parked_filter_into_view(self) -> None:
         for number in range(1, 25):
             item = self.add(f"Parked item {number}", number=number)
             _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
@@ -3207,12 +3204,11 @@ window.fetch=async(_path,options={})=>{
  const bounds=filter.getBoundingClientRect();
  const hit=document.elementFromPoint(bounds.left+bounds.width/2,bounds.top+bounds.height/2);
  const screen=JSON.stringify({innerWidth,innerHeight,scrollY,
-  focus:document.activeElement.id,top:bounds.top,statusBottom:status.getBoundingClientRect().bottom,
+  focus:document.activeElement.id,top:bounds.top,
   hit:hit?.outerHTML.slice(0,150),pageStatus:document.querySelector('[data-page-status]').getBoundingClientRect().height});
  check(row.hidden && document.activeElement===filter && withinViewport(filter) && filter.contains(hit),
        'Unpark moves focus and brings the Parked filter into view. '+screen);
- check(withinViewport(status) && status.textContent==='Item #1 unparked.',
-       'Unpark brings the confirmation into the same viewport. '+screen);
+ check(status.hidden && !status.textContent,'Unpark leaves no action status. '+screen);
 '''
         for window_size in ((1440, 900), (500, 260)):
             with self.subTest(window_size=window_size):
@@ -4156,17 +4152,15 @@ observer.observe(original.parentNode,{childList:true});
  await flush();
  check(row.hidden && chip.dataset.filterCount==='0','The waiting item leaves Parked and its count.');
  check(document.activeElement===chip,'The Parked filter receives focus.');
- check(!status.hidden && status.textContent==='Item #1 unparked.',
-  'Show keeps the Unpark confirmation for the waiting item.');
+ check(status.hidden && !status.textContent,'Unpark leaves no action status for the waiting item.');
  location.hash=new URLSearchParams({show:'parked',item:row.dataset.key}).toString();
  await flush();
  check(!row.hidden && !row.querySelector('[data-detail]').hidden &&
   row.querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
   !row.querySelector('form'),'The direct link opens the item with only the waiting line.');
- check(chip.dataset.filterCount==='0' && !status.hidden,
-  'The direct link leaves the item out of the count and keeps the Unpark confirmation.');
+ check(chip.dataset.filterCount==='0' && status.hidden,'The direct link leaves the item out of the count.');
  show('morty-answering');
- check(!row.hidden && !status.hidden,'Morty answering keeps the Unpark confirmation.');
+ check(!row.hidden && status.hidden,'Morty answering shows the item without action status.');
 ''', reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -5288,7 +5282,7 @@ const change=async path=>{
  try{
   await open('all','','1');
   check(!row().hidden && hasDot(),'the item starts in Unread');
-  check(await act('question','Which check passed?')==='Question saved','the first question saves');
+  check(await act('question','Which check passed?')==='','The first question saves without action status.');
   check(row().hidden && !hasDot(),'the saved question leaves Unread and clears the dot');
   check(row().querySelector('[data-waiting-questions] time[datetime]'),
    'the save response supplies the asked time for the waiting row');
@@ -5314,7 +5308,7 @@ const change=async path=>{
    'the unread answer shows both times and the Unread mark');
   check(!row().querySelector('.list-log').textContent.includes('The gate passed.'),
    'the log has no unread answer');
-  check(await act('read')==='Marked read','Mark read saves the existing read action');
+  check(await act('read')==='','Mark read saves without action status.');
   await open('working',key);
   const log=row().querySelector('.list-log');
   check(!hasDot() && !row().querySelector('[data-question="Q1"]'),
@@ -5325,8 +5319,7 @@ const change=async path=>{
   await change('/update');
   await open('working','','1');
   await change('/newer');
-  check(await act('question','Which check is next?')==='Question saved; update remains unread',
-   'the notice says the newer update remains unread');
+  check(await act('question','Which check is next?')==='','The second question saves without action status.');
   check(hasDot() && row().hidden,'The unread item leaves Working after the question saves.');
   frame.contentDocument.getElementById('filter-show-morty-answering').click();
   check(hasDot() && !row().hidden,'Morty answering shows the unread item.');
@@ -5529,9 +5522,9 @@ window.fetch=async(path,options={})=>{
 
     def test_delivery_notices_color_staff_names_and_keep_the_recorded_words(self) -> None:
         _ = self.add("Delivery notice")
-        cases: tuple[tuple[the_list.PageFeedback, str, tuple[str, ...]], ...] = (
-            (the_list.PageFeedback("request", "Words"), "sent to morty", ("morty",)),
-            (the_list.PageFeedback("request", "Words", "sent"), "sent to morty", ("morty",)),
+        cases: tuple[tuple[the_list.PageFeedback, str | None, tuple[str, ...]], ...] = (
+            (the_list.PageFeedback("request", "Words"), None, ()),
+            (the_list.PageFeedback("request", "Words", "sent"), None, ()),
             (the_list.PageFeedback("request", "Words", "alerted", "sdlc"), "not sent; sdlc told", ("sdlc",)),
             (the_list.PageFeedback("request", "Words", "alerted", "<unknown>"), "not sent; <unknown> told", ()),
             (the_list.PageFeedback("request", "Words", "alerted"), "not sent; no showrunner for alert", ()),
@@ -5543,6 +5536,9 @@ window.fetch=async(path,options={})=>{
                 body = list_page.render(self.root / "reviews").decode()
                 cell = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
                 notice = ElementTree.fromstring('<root>' + cell + '</root>').find('small')
+                if text is None:
+                    self.assertIsNone(notice)
+                    continue
                 assert notice is not None
                 self.assertEqual(''.join(notice.itertext()), text + ", 13:00 EST")
                 self.assertEqual(tuple(span.text for span in notice.findall('span')), colored)
@@ -5576,7 +5572,8 @@ window.fetch=async(path,options={})=>{
                     if action == "remove":
                         self.assertNotIn(f'data-key="{MORTY.id}/{item.id}"', body)
                     else:
-                        self.assertIn("sent to morty, 13:00 EST", without_role_colors(body))
+                        update = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
+                        self.assertNotIn('<small>', update)
                         self.assertIn('data-feedback-form', body)
                         log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
                         self.assertIn("Feedback for morty", log)
@@ -5587,6 +5584,12 @@ window.fetch=async(path,options={})=>{
                     expected = "List page: nate's words for item 106\n" + words if action == "tell" else words
                     self.assertEqual(send.call_args.args[2], expected)
                     item = the_list.load(MORTY.id, item.id)
+                    if action != "remove":
+                        body = list_page.render(root).decode()
+                        update = body.split('<td data-label="Update">', 1)[1].split('</td>', 1)[0]
+                        self.assertNotIn('<small>', update)
+                        log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
+                        self.assertIn("Feedback sent to morty", log)
                     before = send.call_count, item.log
                     list_page.deliver(list_page.submit(root, urlencode(fields)))
                     self.assertEqual((send.call_count, the_list.load(MORTY.id, item.id).log), before)
@@ -5595,7 +5598,6 @@ window.fetch=async(path,options={})=>{
             self.assertEqual((item.title, item.owner, item.next_step), (initial.title, initial.owner, initial.next_step))
             _ = the_list.reopen(MORTY.id, item.id, source="morty")
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "Morty acts."}, source="morty")
-            self.assertNotIn("<small>sent to morty,", without_role_colors(list_page.render(root).decode()))
             good = self.fields(item, "tell", words="Keep it.")
             for body in (urlencode({**good, "token": "bad"}), urlencode(good) + '&id=L2',
                          urlencode({**good, "words": ""}), urlencode({**good, "words": " \t\n "}),
@@ -5744,16 +5746,14 @@ window.fetch=async(_path,options={})=>{
  const after=EXPECTED_UNREAD ? retained : cleared;
  const notice=form.querySelector('[data-send-status]').textContent;
  const result=document.createElement('p');result.id='probe-result';
- result.textContent=before && after && notice==='NOTICE' ? 'PASS' : 'FAIL';document.body.append(result);
+ result.textContent=before && after && notice==='' ? 'PASS' : 'FAIL';document.body.append(result);
 })();
 </script>'''
-        for action, unread, notice in (("read", "false", "Marked read"), ("read", "true", "Update remains unread"),
-                                      ("tell", "false", "sent to morty"),
-                                      ("tell", "true", "sent to morty; update remains unread")):
+        for action, unread in (("read", "false"), ("read", "true"), ("tell", "false"), ("tell", "true")):
             with self.subTest(action=action, unread=unread):
                 page = self.root / f"{action}-{unread}.html"
                 _ = page.write_text(markup.replace('<head>', '<head>' + setup.replace('UNREAD', unread), 1).replace('</body>',
-                    probe.replace('ACTION', action).replace('NOTICE', notice).replace('EXPECTED_UNREAD', unread) + '</body>'))
+                    probe.replace('ACTION', action).replace('EXPECTED_UNREAD', unread) + '</body>'))
                 result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
                     '--user-data-dir=' + str(self.root / f'chrome-{action}-{unread}'), '--virtual-time-budget=1000',
                     '--dump-dom', page.as_uri()], capture_output=True, text=True, timeout=20)
@@ -6349,8 +6349,9 @@ try{
   if(holdPost){await until(()=>typeof finishPost==='function','the held response');
    form.elements.words.value='New draft during send';form.elements.words.dispatchEvent(new Event('input'));
    check(form.querySelector('[value="tell"]').disabled,'editing words during delivery keeps Tell morty disabled');finishPost();}
-  check(form.querySelector('[data-send-status]').textContent===(action==='read' ? 'Saving…' : 'Sending…'),'immediate response '+action);
+  check(!form.querySelector('[data-send-status]').textContent,'The pending action shows no status text.');
   await until(()=>!form.dataset.sending,'the '+action+' response');
+  check(!form.querySelector('[data-send-status]').textContent,'The saved action shows no status text.');
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
   check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');

@@ -408,7 +408,7 @@ def feedback_form(entry: ListRecord, secret: str, today: datetime, resends: tupl
             + retry
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
-            + '<div class="list-tell"><span role="status" data-send-status></span>'
+            + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
             + '<button name="action" value="question" disabled>Ask question</button>'
             + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
 
@@ -570,7 +570,7 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str) ->
             + '<div class="list-actions">' + read
             + '<div class="list-parking-actions">'
             + f'<button name="action" value="unpark" id="unpark-{key}"{unpark}>Unpark</button></div></div>'
-            + '<span role="status" data-send-status></span></form>')
+            + '<span role="status" data-send-status hidden></span></form>')
 
 
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
@@ -655,14 +655,13 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         else:
             state += '<small data-list-review-summary>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
-    sent = the_list.sent_to_morty(item)
-    if isinstance(sent, datetime):
+    notice_time = the_list.sent_to_morty(item)
+    if isinstance(notice_time, datetime):
         feedback = tuple(the_list.feedback_requests(item).values())[-1]
-        notice = "sent to " + names.html("morty")
         if feedback.state == "alerted":
             notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
                       else "not sent; no showrunner for alert")
-        update += '<small>' + notice + ", " + html.escape(list_time(sent, today)) + '</small>'
+            update += '<small>' + notice + ", " + html.escape(list_time(notice_time, today)) + '</small>'
     overdue = due is not None and due < today and item.state != the_list.ItemState.CLOSED
     eta_class = "list-eta warning" if overdue else "list-eta"
     full_eta = field_html("eta", item.eta, today, names)
@@ -1188,9 +1187,7 @@ function refreshAfterListSave(needed){
  else if(refreshNeeded || createdItem) void pageRefresh.refresh(true);
 }
 const drafts=new Map();
-const unparkMessages={
- cleared:'Unparked',
- cleared_newer_parking_active:'The original Unpark cleared parking. A newer parking time is active',
+const unparkFailures={
  expired:'Parking time already expired',
  no_active_parking:'No active parking time to clear',
 };
@@ -1338,8 +1335,7 @@ async function markOpenedAnswerRead(item,watch){
     keepOpenAfterRead.add(key);
   }
  }catch(error){
-  tableView.showActionResult(item,submission,'Item '+item.dataset.number,
-   {kind:'failure',message:'Read not confirmed: '+error.message});
+  tableView.showActionFailure(item,submission,'Item '+item.dataset.number,'Read not confirmed: '+error.message);
  }finally{
   pendingOpenReads.delete(key);saving--;
   refreshAfterListSave(saved);
@@ -1447,7 +1443,7 @@ function bindFeedbackForm(form){
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
   const unpark=form.querySelector('[value="unpark"]'),parkedDetail=form.querySelector('[data-parked-detail]');
-  notice.textContent=tableView.actionNotice(item);
+  showActionFailure(notice,tableView.actionFailure(item));
   const waitingForm=form.hasAttribute('data-waiting-actions');
   const confirmed={state:item.dataset.state,parked:item.dataset.parked,
    unread:item.dataset.unread==='true',unreadDelivery:item.dataset.unreadDelivery,
@@ -1569,7 +1565,7 @@ function bindFeedbackForm(form){
    if(action==='park'){
     if(!retry && !/^\d{4}-\d{2}-\d{2}$/.test(parkingTime)){
      const at=dateTimeDraftEpoch(zone,parkingTime);
-     if(!(at>Date.now())){notice.textContent='Choose a future parking time.';return;}
+     if(!(at>Date.now())){showActionFailure(notice,'Choose a future parking time.');return;}
      parkingTime=new Date(at).toISOString();
     }
    }
@@ -1587,7 +1583,6 @@ function bindFeedbackForm(form){
    if(hadFocus) document.addEventListener('focusin',trackFocus);
    let saved=false,refused=false,nextForm;
    setCardSubmitting(form,true,item);
-   notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    if(action==='remove'){
     item.dataset.state='Closed';
@@ -1611,24 +1606,11 @@ function bindFeedbackForm(form){
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     saved=true;
     nextForm=applySavedState(result,changesParking);
-    const unread=result.unread==='true';
-    const unparked=action==='unpark' && result.unpark_outcome==='cleared';
-    const message=action==='remove' ? 'Removed' : parks ? (parkForDelivery ? 'Parked until delivered' : 'Parked') :
-     action==='unpark' ? (unparkMessages[result.unpark_outcome] ?? 'Unpark result unavailable') :
-     action==='read' ? (unread ? 'Update remains unread' : 'Marked read') :
-     asksQuestion ? (unread ? 'Question saved; update remains unread' : 'Question saved') :
-     action==='tell' && unread ? 'sent to morty; update remains unread' : 'sent to morty';
     if(usesWords && words.value===data.get('words')) words.value='';
-    if(unparked) until.value='';
-    if(action==='unpark' || parkForDelivery){
-     const label='Item #'+item.dataset.number;
-     const hiddenMessage=parkForDelivery ? label+' parked until delivered.'
-      : unparked ? label+' unparked.' : label+': '+message+'.';
-     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
-    }else{
-     notice.textContent=message;
-     tableView.applyAction();
-    }
+    if(action==='unpark' && result.unpark_outcome==='cleared') until.value='';
+    const failure=action==='unpark' ? unparkFailures[result.unpark_outcome] : '';
+    if(failure) tableView.showActionFailure(item,submission,'Item '+item.dataset.number,failure);
+    else tableView.applyAction();
    }catch(error){
     const wasHidden=item.hidden;
     let restore=refused || releasesHolds;
@@ -1656,7 +1638,7 @@ function bindFeedbackForm(form){
     }
     if((refused || hidUnread) && !tableView.opened.size) tableView.openCard(key);
     const message=(refused ? 'Not saved: ' : 'Save not confirmed: ')+error.message;
-    tableView.showActionResult(item,submission,'Item '+item.dataset.number,{kind:'failure',message});
+    tableView.showActionFailure(item,submission,'Item '+item.dataset.number,message);
     // The return animation now has the confirmed sort keys.
     if(refused && wasHidden && !item.hidden) tableView.applyAction();
    }
@@ -1673,10 +1655,9 @@ function bindFeedbackForm(form){
      if(target?.getClientRects().length){
       target.focus({preventScroll:true});
       if(saved && item.hidden){
-       const status=content.querySelector('[data-hidden-action-status]');
-       const top=target.getBoundingClientRect().top;
+       const {top,bottom}=target.getBoundingClientRect();
        const inset=document.querySelector('[data-page-status]').offsetHeight+12;
-       if(top<inset || status.getBoundingClientRect().bottom>innerHeight)
+       if(top<inset || bottom>innerHeight)
         scrollBy({top:Math.floor(top-inset),behavior:'instant'});
       }
      }

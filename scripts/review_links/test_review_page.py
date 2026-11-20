@@ -1623,7 +1623,7 @@ window.fetch=(url,options)=>{
   await until(()=>!row('page-owner/C4') && !stale.dataset.sending &&
    document.querySelector('[data-review]').dataset.version!==conflictVersion,
    'the refreshed view without the completed row');
-  const conflictNotice=document.querySelector('[data-review-notice]');
+  const conflictNotice=document.querySelector('[data-hidden-action-status]');
   check(document.querySelector('[data-review]').dataset.show==='open' &&
    !conflictNotice.hidden && conflictNotice.textContent.includes('This item is already Done.'),
    'F015: HTTP 409 keeps the reason when the completed item leaves Review.');
@@ -1708,7 +1708,7 @@ window.fetch=(url,options)=>{
   removed.requestSubmit(removed.querySelector('button[value=later]'));
   await until(()=>!row('page-owner/C6') && document.querySelector('[data-review]').dataset.version!==removalVersion,
    'the refreshed view without the removed row');
-  const notice=document.querySelector('[data-review-notice]');
+  const notice=document.querySelector('[data-hidden-action-status]');
   check(notice && !notice.hidden && notice.textContent.includes('This item is no longer on the list.'),
    'F029: the page retains the conflict reason when refresh removes the card.');
  }catch(error){failures.push(String(error), ...window.coldErrors);}
@@ -4128,8 +4128,8 @@ window.fetch=async(url,options={})=>{
    }
   }else{
    check(!row && history.length===previous,'Send keeps a hidden item outside the view.');
-   check(review.querySelector('[data-review-notice]').textContent==='Saved '+fixture.id+'.',
-         'A hidden item has a save confirmation.');
+   const status=review.querySelector('[data-hidden-action-status]');
+   check(status.hidden && !status.textContent,'A hidden item leaves no action status.');
   }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -5249,7 +5249,7 @@ window.fetch=(url,options={})=>{
     }
    }
    await saved;
-   check(form.querySelector('[data-send-status]').textContent==='Saved: works',key+' saved.');
+   check(!form.querySelector('[data-send-status]').textContent,key+' saves without action status.');
    check(!change(key),'The save removes '+key+'.');
    if(key==='page-owner/C2'){
     const fades=[...review.querySelectorAll('.record-motion-clip')].flatMap(node=>node.getAnimations());
@@ -5411,12 +5411,14 @@ window.fetch=async(_url,options={})=>{
   form.requestSubmit(form.querySelector('[value="works"]'));
   check(leavingNow(target),'A save starts the departure before the response.');
   savedResponse.save();
-  await flush();check(form.querySelector('[data-send-status]').textContent==='Saved: works','the row shows the saved result');
-  check(!visibleStatus('Saved: works'),'a successful save adds no notice above the table');
+  await flush();
+  check(!form.querySelector('[data-send-status]').textContent,'The saved row shows no action status.');
+  const status=document.querySelector('[data-hidden-action-status]');
+  check(status.hidden && !status.textContent,'The hidden row leaves no action status.');
   check(!visibleStatus('Not saved: Fixture newer refusal'),'saving another card clears the failure notice');
   await new Promise(resolve=>nativeTimeout(resolve,950));
   check(target.hidden,'the saved row leaves the view');
-  check(!visibleStatus('Saved: works'),'no save notice appears after the animation');
+  check(status.hidden && !status.textContent,'The animation leaves no action status.');
   check(document.querySelector('[data-show-chip="open"] b').textContent==='4','the count excludes the saved row');
   check(rows().every(row=>row.querySelector('[data-detail]').hidden),'no next card opens');
   choose('list-show','all');
@@ -5541,8 +5543,8 @@ window.fetch=async(_url,options={})=>{
   answerForm.elements.later.value='';
   answerForm.requestSubmit(answerForm.querySelector('[value="later"]'));await flush();
   answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));await flush();
-  check(answerForm.querySelector('[data-send-status]').textContent==='Saved: works',
-    'F023: an empty Later does not block Answer');
+  check(!answerForm.querySelector('[data-send-status]').textContent,
+    'F023: Answer leaves no action status after an empty Later.');
   await new Promise(resolve=>nativeTimeout(resolve,1000));
   choose('list-show','open');choose('list-search','','input');choose('list-owner','');
   document.querySelector('[data-type-chip=""]').click();

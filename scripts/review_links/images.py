@@ -40,7 +40,7 @@ ACTIONS = frozenset(("delete", "question", *ANSWERS))
 
 class QuestionDelivery(StrEnum):
     ACCEPTED = "Waiting for the owner"
-    SENDING = "Question saved. Sending to the owner."
+    SENDING = "Sending"
     RETRY = "Not sent. Press Ask question again with the same words."
     UNCONFIRMED = "The send result is unknown. Enter the same words and press Ask question to send it again."
 
@@ -208,12 +208,10 @@ def question_html(question: question_record.Question, open_questions: Mapping[st
         return page_question.answered_question_html(question, answer)
     content = page_question.open_question_html(question)
     delivery = open_questions.get(question.question_id, QuestionDelivery.ACCEPTED)
-    if delivery is QuestionDelivery.ACCEPTED:
+    if isinstance(delivery, QuestionDelivery) and delivery.waits:
         return content
     if isinstance(delivery, change_page.ResendBlocked):
-        notice = f'<p role="status" data-resend-blocked>{html.escape(delivery.reason)}</p>'
-    elif delivery is QuestionDelivery.SENDING:
-        notice = f'<p role="status">{delivery}</p>'
+        notice = page_frame.action_failure(None, delivery.reason)
     else:
         words = html.escape(question.words, quote=True)
         notice = f'<p role="status" data-resend-question="{words}">{delivery}</p>'
@@ -255,7 +253,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + f'<label for="feedback-{record["id"]}">Feedback</label>'
             + f'<textarea id="feedback-{record["id"]}" name="feedback" rows="{feedback_rows}"></textarea>'
             + page_frame.review_action_groups(closing_buttons, returning_buttons)
-            + '<span role="status" data-image-status></span></form></article>')
+            + '<span role="status" data-image-status hidden></span></form></article>')
 
 
 def render(status: change_page.DeliveryStatus) -> bytes:
@@ -281,6 +279,7 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     refresh_seconds = answer_refresh_seconds if refresh_needed else 0
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
     content = (STYLE + page_frame.title("Images", "images")
+               + page_frame.action_failure("image-action-failure")
                + f'<p hidden data-image-waiting role="status">{waiting_text}</p>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-script="{SCRIPT_VERSION}" data-refresh-seconds="{refresh_seconds}"'
@@ -444,8 +443,10 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-images] article:not(.pair),[data-empty]{max-width:680px;margin-inline:auto}}
 </style>"""
 
-SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + r"""(() => {
+SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT
+          + page_frame.ACTION_STATUS_SCRIPT) + r"""(() => {
 const empty = document.querySelector('[data-empty]');
+const actionFailure = document.getElementById('image-action-failure');
 const groups = document.querySelector('[data-image-groups]');
 const layout = document.querySelector('[data-image-layout]');
 const waiting = document.querySelector('[data-image-waiting]');
@@ -497,19 +498,18 @@ function bind(root) {
     if (cardSubmitBlocked(form)) return;
     const question = event.submitter?.value === 'question';
     const feedback = event.submitter?.value === 'feedback', status = form.querySelector('[data-image-status]');
-    delete status.dataset.refreshFailed;
     if (question && !form.elements.feedback.value.trim()) {
-      status.textContent = 'Enter a question first.';
+      showActionFailure(status, 'Enter a question first.');
       return;
     }
     if (feedback && !form.elements.feedback.value.trim()) {
-      status.textContent = 'Enter feedback first.';
+      showActionFailure(status, 'Enter feedback first.');
       return;
     }
     // Remove the card after the fade. Restore the card if the request fails.
     const card = form.closest('article'), home = card.parentNode, next = card.nextSibling;
     const body = new URLSearchParams(new FormData(form, event.submitter));
-    status.textContent = '';
+    showActionFailure(status);
     let postFailed = false;
     setCardSubmitting(form, true);
     sending++;
@@ -522,7 +522,7 @@ function bind(root) {
       }
       if (question) {
         const words = form.elements.feedback.value.trim();
-        const otherResend = [...card.querySelectorAll('[data-resend-question],[data-resend-blocked]')]
+        const otherResend = [...card.querySelectorAll('[data-resend-question],.page-question .action-failure')]
           .some(notice => notice.dataset.resendQuestion !== words);
         if (otherResend) {
           form.elements.feedback.value = '';
@@ -537,7 +537,7 @@ function bind(root) {
     } catch (error) {
       postFailed = true;
       if (!question) home.insertBefore(card, next?.parentNode === home ? next : null);
-      status.textContent = 'Not sent: ' + error.message;
+      showActionFailure(status, 'Not sent: ' + error.message);
       apply();
     } finally {
       sending--;
@@ -545,8 +545,7 @@ function bind(root) {
       if (question && !postFailed) void pageRefresh.refresh(true);
       else void refresh().catch(error => {
         if (postFailed) return;
-        status.dataset.refreshFailed = 'true';
-        status.textContent = 'Update failed: ' + error.message;
+        showActionFailure(actionFailure, 'Update failed: ' + error.message);
       });
     }
   }));
@@ -568,7 +567,8 @@ async function refresh(_supersede=false,current=()=>true) {
       return;
     }
     const facts = pageRefreshFacts(page);
-    // Keep drafts and action results on cards that the server still shows.
+    showActionFailure(actionFailure);
+    // Keep drafts and action failures on cards that the server still shows.
     const forms = new Map([...list.querySelectorAll('form[data-image-form]')]
       .map(form => [form.elements.image.value, form]));
     fresh.querySelectorAll('form[data-image-form]').forEach(form => {
@@ -576,7 +576,7 @@ async function refresh(_supersede=false,current=()=>true) {
       if (!previous) return;
       form.elements.feedback.value = previous.elements.feedback.value;
       const oldStatus = previous.querySelector('[data-image-status]');
-      if (!oldStatus.dataset.refreshFailed) form.querySelector('[data-image-status]').textContent = oldStatus.textContent;
+      showActionFailure(form.querySelector('[data-image-status]'), oldStatus.textContent);
     });
     const top = scrollY;
     const wasWaiting = !waiting.hidden;
