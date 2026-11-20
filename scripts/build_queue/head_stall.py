@@ -8,12 +8,14 @@ except FileNotFoundError:
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 import subprocess
 import sys
 from typing import Literal, cast
 
+from scripts.build_hold import build_hold
 from scripts.build_queue import admission_records as records
 from scripts.build_queue.queue_evidence import gib
 from scripts.build_queue.queue_snapshot import QueueSnapshot, read_queue_snapshot
@@ -206,6 +208,16 @@ def builds_text(stall: HeadStall) -> str:
     return "\n".join(lines)
 
 
+def _alert_text(stall: HeadStall, now: float) -> str:
+    instant = datetime.fromtimestamp(now, UTC)
+    holds = build_hold.natedev_holds(build_hold.holder_directory())
+    for holder in holds.in_force:
+        if not build_hold.release_overdue(holder.release, instant):
+            release_time = build_hold.release_eta_text(holder.release)
+            return f"A build hold by {holder.name} is active for {holder.purpose}. The release time is {release_time}."
+    return builds_text(stall)
+
+
 def _run(command: list[str], text: str = "") -> bool:
     from scripts.message import send_budget, send_result
     try:
@@ -253,11 +265,13 @@ def send_alert(stall: HeadStall, state: Path, now: float, run: Callable[[list[st
     from scripts.message.session_send import session_send_argv
 
     delivered = _delivered_stalls(state)
-    text = builds_text(stall)
+    pending: tuple[AlertRecipient, ...] = tuple(recipient for recipient in ALERT_RECIPIENTS
+        if recipient not in delivered or not _already_alerted(delivered[recipient], stall.last_start))
+    if not pending:
+        return
+    text = _alert_text(stall, now)
     write_errors: list[OSError] = []
-    for recipient in ALERT_RECIPIENTS:
-        if recipient in delivered and _already_alerted(delivered[recipient], stall.last_start):
-            continue
+    for recipient in pending:
         command = session_send_argv(recipient, sender=SENDER)
         command.extend(["--key", f"head-stall-{stall.last_start}"])
         if run(command, text):

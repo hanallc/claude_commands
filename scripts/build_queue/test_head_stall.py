@@ -6,6 +6,7 @@ import os
 from collections.abc import Callable
 from contextlib import redirect_stderr
 from dataclasses import replace
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 import subprocess
@@ -19,7 +20,8 @@ from scripts.build_queue import admission_records as records, head_stall
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.queue_snapshot import QueueSnapshot, write_queue_snapshot
 from scripts.buildlog import cli, mac_idle, sample
-from scripts.lint.memory_test_support import admission_policy_fixture, config_environment
+from scripts.lint.memory_test_support import admission_policy_fixture
+from scripts.production import staff
 
 GIB = records.GIB
 NOW = 1_800_000_000.0
@@ -235,14 +237,27 @@ class LastAdmissionTests(unittest.TestCase):
 
 class WatchTests(unittest.TestCase):
     paths: head_stall.StallPaths = head_stall.StallPaths(Path(), Path())
+    holders: Path = Path()
     sent: list[tuple[list[str], str]] = []
 
     @override
     def setUp(self) -> None:
-        folder = self.enterContext(tempfile.TemporaryDirectory())
-        self.paths = head_stall.StallPaths(Path(folder) / "admission", Path(folder) / "head_stall.json")
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.paths = head_stall.StallPaths(root / "admission", root / "head_stall.json")
         self.paths.admission.mkdir()
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(Path(folder) / "config"))))
+        self.holders = root / "holders"
+        self.holders.mkdir()
+        for name, keys in (
+            ("lint", ("sweep_sender_timeout_seconds",)),
+            ("send", ("delivery_timeout", "kill_grace", "remote_transport_seconds", "waits_review_seconds", "caller_margin_seconds")),
+            ("postmaster", ("wait_seconds", "claim_grace_seconds")),
+            ("codex_daemon", ("timeout_seconds",)),
+        ):
+            _ = (root / f"{name}.conf").write_text("".join(f"# range: 1..\n{key}=5\n" for key in keys))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(root), "BUILD_HOLD_DIR": str(self.holders), "USER_ZONE": "America/New_York",
+        })))
+        self.enterContext(staff.supplied_snapshot(staff.StaffSnapshot(())))
         _ = self.enterContext(mock.patch.object(head_stall, "configured_limits", return_value=(LIMIT, 120.0)))
         self.sent = []
 
@@ -276,6 +291,28 @@ class WatchTests(unittest.TestCase):
 
     def sent_recipients(self) -> list[str]:
         return [command[command.index("--to") + 1] for command, _ in self.sent]
+
+    def test_alert_uses_the_hold_text_only_before_its_release_time(self) -> None:
+        now = datetime.fromisoformat("2026-11-20T10:50:00-05:00").timestamp()
+        queue = snapshot([waiter(now - 53 * 60)], (holder(now - 53 * 60),))
+        hold = self.holders / "natemerge"
+        for case, release in (("active", "11:13"), ("no hold", ""), ("overdue", "10:49")):
+            with self.subTest(case=case):
+                self.paths.state.unlink(missing_ok=True)
+                self.sent.clear()
+                hold.unlink(missing_ok=True)
+                if release:
+                    _ = hold.write_text(json.dumps({"holder": "natemerge", "for": "landing merge test",
+                        "since": "2026-11-20T09:57:00-05:00", "release_eta": f"2026-11-20T{release}:00-05:00"}))
+
+                stall = self.observe(queue, now)
+                assert isinstance(stall, head_stall.HeadStall)
+                expected = ("A build hold by natemerge is active for landing merge test. The release time is 11:13 EST."
+                            if case == "active" else head_stall.builds_text(stall))
+                self.assertEqual(self.sent_recipients(), ["builds", "bob"])
+                self.assertEqual([text for _, text in self.sent], [expected, expected])
+                _ = self.observe(queue, now + 60)
+                self.assertEqual(self.sent_recipients(), ["builds", "bob"])
 
     def test_only_the_failed_recipient_retries(self) -> None:
         self.mock_send_outcomes((0, "SENT"), (3, "FAILED"), (0, "SENT"))
