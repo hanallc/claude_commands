@@ -979,8 +979,19 @@ class NatedevHeld:
     holder: str
     purpose: str
 
+
+@dataclass(frozen=True)
+class LandingWait:
+    """Natemerge's merge test holds this step on natedev."""
+
+
+LANDING_WAIT_TEXT = (
+    "Waits for natedev: natemerge's integrate job runs there, and no other target can take this test now."
+)
+
+
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
-             | BehindHead | GpuSlotWait | ReadyForAdmission | placement.CargoFolderWait)
+             | BehindHead | GpuSlotWait | ReadyForAdmission | LandingWait | placement.CargoFolderWait)
 
 
 @dataclass(frozen=True)
@@ -993,7 +1004,7 @@ class HeadAdmissionStatus:
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
               | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
-              | NatedevHeld | placement.CargoFolderWait)
+              | NatedevHeld | LandingWait | placement.CargoFolderWait)
 
 
 def held_text(wait: NatedevHeld) -> str:
@@ -1006,6 +1017,8 @@ def gpu_slot_text(wait: GpuSlotWait) -> str:
 
 def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
     cause = reason.cause
+    if isinstance(cause, LandingWait):
+        return "head: " + LANDING_WAIT_TEXT
     if isinstance(cause, (PressureUnavailable, ReadingUnavailable)):
         return "head: " + cause.reason
     if isinstance(cause, MemoryPressure):
@@ -1263,6 +1276,9 @@ class QueueInputs:
     occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
     pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
+    landing_waiters: frozenset[str] = field(default=frozenset(), kw_only=True)
+    cloud_route_waiters: frozenset[str] = field(default=frozenset(), kw_only=True)
+    cloud_route_waiters_past_deadline: frozenset[str] = field(default=frozenset(), kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1340,6 +1356,7 @@ class ProgramProfile:
     repo: str
     worktree: str
     sizing: HistoryPeakSizing
+    receive_route_notices: bool = field(default=False, kw_only=True)
 
     @property
     def step(self) -> str:
@@ -1655,6 +1672,8 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return reason.reason
         case NatedevHeld():
             return held_text(reason)
+        case LandingWait():
+            return LANDING_WAIT_TEXT
         case MemoryPressure():
             return "memory pressure"
         case PressureUnavailable():

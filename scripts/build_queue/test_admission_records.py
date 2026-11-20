@@ -5,8 +5,21 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from scripts.build_queue import admission_records as records
+
+
+class LandingWaitTextTests(unittest.TestCase):
+    def test_head_and_follower_display_the_landing_wait_reason(self) -> None:
+        reason = records.LandingWait()
+        decision = records.AdmissionDecision("hold", 1, 0, 0, 0)
+        head = records.HeadAdmissionStatus(decision, 1, 2, cause=reason)
+        text = ("Waits for natedev: natemerge's integrate job runs there, "
+                + "and no other target can take this test now.")
+        self.assertEqual(records.reason_phrase(reason, ()), text)
+        self.assertEqual(records.reason_phrase(head, ()), text)
+        self.assertEqual(records.head_wait_text(head, ZoneInfo("UTC")), f"head: {text}")
 
 
 class ProcessStartTimeTests(unittest.TestCase):

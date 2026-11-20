@@ -104,15 +104,6 @@ if name == "ssh":
     raise SystemExit(0)
 if name == "suite-python":
     os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-if name == "style_sync.py":
-    import subprocess
-    args = sys.argv[1:]
-    repo = args[args.index("--repo-dir") + 1]
-    branch = args[args.index("--branch") + 1]
-    observed = subprocess.run(["git", "-C", repo, "ls-remote", "origin", "refs/heads/" + branch],
-                              capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.split()[0]
-    (state / "notified-tip").write_text(observed)
-    raise SystemExit(1 if (state / "notify-fails").exists() else 0)
 if name == "send.py":
     if (state / "send-fails").exists():
         print("fixture message failed", file=sys.stderr)
@@ -219,9 +210,6 @@ class FixtureTest(unittest.TestCase):
             (state / "child-pid.tmp").write_text(str(child.pid))
             # Publish by rename: a reader must never see the file empty.
             os.replace(state / "child-pid.tmp", state / "child-pid")
-        if (state / "modify-tracked").exists() and suite == "hooks":
-            Path("unit.txt").write_text("gate debris\\n")
-            self.fail("fixture edited a tracked checkpoint file")
         if (state / "hold-module").exists() and suite == "hooks":
             (state / "module-held.tmp").write_text(str(os.getpgrp()))
             # Publish by rename: a reader must never see the file empty.
@@ -442,7 +430,6 @@ class MergeGateFixture(unittest.TestCase):
             "MERGE_GATE_UV": str(self.bin / "uv"),
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
             "MERGE_GATE_PASSED_DIR": str(self.state / "passes"),
-            "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
@@ -599,7 +586,7 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.unit / "unit.txt", "checkpoint\n")
         self.checkpoint = self.commit(self.unit, "unit checkpoint")
         _ = self.git(self.unit, "push", "-u", "origin", "unit-phase")
-        for name in ("basedpyright", "uv", "ssh", "suite-python", "style_sync.py", "systemd-run", "send.py"):
+        for name in ("basedpyright", "uv", "ssh", "suite-python", "systemd-run", "send.py"):
             self.write(self.bin / name, TOOL_STUB.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
             (self.bin / name).chmod(0o755)
 
@@ -646,24 +633,16 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "scripts/hooks/test_first.py", "from scripts.hooks import affected_subject\n" + SUITE_MODULE)
         return subject, self.commit(self.checkout, "dependency fixture")
 
-    def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
-                 ignored_signals: bool = False, callers_production: bool = False,
+    def run_gate(self, *extra: str, ignored_signals: bool = False,
                  own_process: bool = False, preamble: str = "",
                  type_dirs: Sequence[str] = ("scripts/production",)) -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
-             "--merge-branch", "integration", "--unit-branch", "unit-phase",
-             "--checkpoint", checkpoint or self.checkpoint,
-             "--previous-checkpoint", previous or self.base,
-             "--unit", "fixture", "--phase", "phase-2",
-             "--body", "Fixture checkpoint gate.",
-             *(["--type-dirs", *type_dirs] if type_dirs else []),
-             "--main-repo", str(self.main),
-             "--ssh", str(self.bin / "ssh"),
-             *([] if callers_production or "--production" in extra else ["--production", "quiet"]),
-             *extra]
-        if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST:
-            arguments = ["--repo", str(self.checkout),
-                         *(["--type-dirs", *type_dirs] if type_dirs else []), *extra]
+                     *(["--type-dirs", *type_dirs] if type_dirs else []), *extra]
+        if self.suite_mode is merge_gate.SuiteMode.MERGE_GATE:
+            if "--nightly" in extra:
+                arguments.extend(("--merge-branch", "integration"))
+            elif "--tests-only" not in extra:
+                arguments.append("--tests-only")
         if own_process or ignored_signals:
             return subprocess.run(
                 [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
@@ -736,12 +715,6 @@ class MergeGateFixture(unittest.TestCase):
 
     def assert_not_pushed(self) -> None:
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.base)
-
-    def assert_refused_before_gate(self, result: subprocess.CompletedProcess[str]) -> None:
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_not_pushed()
-        self.assertEqual(self.calls(), [])
-        self.assertEqual(self.module_events(), [])
 
     def checkpoint_commit(self, message: str) -> str:
         """A checkpoint(...) commit on the unit branch, dated after the Change-Review rule landed."""

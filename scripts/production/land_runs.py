@@ -10,14 +10,19 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from collections.abc import Collection, Generator, Sequence
+from collections.abc import Collection, Generator, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_start import Started, Unreadable, process_start
+
+
+if TYPE_CHECKING:
+    from scripts.build_hold.build_hold import ProcessIdentity
 
 
 # The results file keeps only this many newest rows.
@@ -75,25 +80,81 @@ def landing(commits: Sequence[str], owners: Sequence[str] = ()) -> Generator[Non
         path.unlink(missing_ok=True)
 
 
-def running_lands() -> dict[str, str]:
-    """The commits of every land whose process still runs, each with its "unit phase" or "".
+@dataclass(frozen=True)
+class NoLandRecord:
+    """The path has no valid land record."""
 
-    It removes the record of a land that ended.
-    """
-    commits: dict[str, str] = {}
+
+def _read_land(path: Path) -> LandRecord | NoLandRecord:
+    try:
+        parsed = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, RecursionError):
+        return NoLandRecord()
+    if not isinstance(parsed, dict):
+        return NoLandRecord()
+    row = cast(dict[str, object], parsed)
+    pid, start = row.get("pid"), row.get("start")
+    commits, owners = row.get("commits"), row.get("owners", [])
+    if (type(pid) is not int or pid <= 0 or not isinstance(start, str) or not start
+            or not isinstance(commits, list) or not isinstance(owners, list)):
+        return NoLandRecord()
+    if (all(isinstance(commit, str) for commit in cast(list[object], commits))
+            and all(isinstance(owner, str) for owner in cast(list[object], owners))):
+        return cast(LandRecord, cast(object, row))
+    return NoLandRecord()
+
+
+def _land_records() -> Iterator[tuple[Path, LandRecord]]:
     try:
         paths = sorted(lands_dir().glob("*.json"))
-    except OSError:
-        return {}
+    except (OSError, RuntimeError, ValueError):
+        return
     for path in paths:
-        try:
-            record = cast(LandRecord, json.loads(path.read_text()))
-            pid, start, listed, owners = record["pid"], record["start"], record["commits"], record.get("owners", [])
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        record = _read_land(path)
+        if not isinstance(record, NoLandRecord):
+            yield path, record
+
+
+@dataclass(frozen=True)
+class NoNatemergeLand:
+    """The lineage has no verified natemerge land."""
+
+
+def natemerge_land(proc: Path, lineage: frozenset[ProcessIdentity]) -> ProcessIdentity | NoNatemergeLand:
+    """Find the live land in the caller lineage and check its session in staff."""
+    from scripts.build_hold.build_hold import process_start_time
+    from scripts.build_queue.scope_activity import environment_values
+    from scripts.lint.memory_admit import is_natemerge, queue_staff_chain
+    from scripts.production import staff
+
+    folder = lands_dir()
+    for ancestor in sorted(lineage, key=lambda item: (int(item.start_time), item.pid), reverse=True):
+        record = _read_land(folder / f"{ancestor.pid}.json")
+        if isinstance(record, NoLandRecord) or (record["pid"], record["start"]) != (ancestor.pid, ancestor.start_time):
             continue
-        owner = process_start(pid)
-        if owner == Started(start):
-            commits.update((commit, owners[index] if index < len(owners) else "") for index, commit in enumerate(listed))
+        values = environment_values(proc / str(ancestor.pid) / "environ", ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"))
+        session = values.get("CLAUDE_CODE_SESSION_ID") or values.get("CODEX_THREAD_ID", "")
+        if not session or process_start_time(ancestor.pid, proc) != ancestor.start_time:
+            return NoNatemergeLand()
+        try:
+            members = staff.local_snapshot()
+        except staff.StaffUnreadable:
+            return NoNatemergeLand()
+        if any(map(is_natemerge, queue_staff_chain(members, session))):
+            return ancestor
+        return NoNatemergeLand()
+    return NoNatemergeLand()
+
+
+def running_lands() -> dict[str, str]:
+    """Return the commits and owners of live lands. Remove the records of lands that ended."""
+    commits: dict[str, str] = {}
+    for path, record in _land_records():
+        owner = process_start(record["pid"])
+        if owner == Started(record["start"]):
+            owners = record.get("owners", [])
+            commits.update((commit, owners[index] if index < len(owners) else "")
+                           for index, commit in enumerate(record["commits"]))
         elif not isinstance(owner, Unreadable):
             path.unlink(missing_ok=True)
     return commits

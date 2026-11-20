@@ -56,10 +56,11 @@ class LandingMergeOrderTests(unittest.TestCase):
         self.host_grant = self.fixture.occupy_host()
         self.fixture.free(0)
 
-    def land_record(self, pid: int, *, start: str = "10") -> None:
+    def land_record(self, pid: int, *, start: str = "10", session: str = "gate-session") -> None:
         directory = self.merge_state / "lands"
         directory.mkdir(parents=True, exist_ok=True)
         write_process(self.fixture.proc.path, pid, start="10")
+        _ = (self.fixture.proc.path / str(pid) / "environ").write_bytes(f"CODEX_THREAD_ID={session}\0".encode())
         _ = (directory / f"{pid}.json").write_text(json.dumps({"pid": pid, "start": start, "commits": ["abc"]}))
 
     def request(self, pid: int, *, step: str = "nextest", parent: int = 1,
@@ -270,10 +271,10 @@ class LandingMergeOrderTests(unittest.TestCase):
         self.assertEqual(self.fixture.queue_pids(), [102, 100, 101])
 
     def test_landing_gate_requires_the_natemerge_staff_chain(self) -> None:
-        self.land_record(10)
+        self.land_record(10, session="trial-session")
         self.land_record(11)
         _ = self.submit(100)
-        _ = self.submit(101, step="merge-gate", parent=10, session="trial-session")
+        _ = self.submit(101, step="merge-gate", parent=10)
         _ = self.submit(102, step="merge-gate", parent=11)
         self.fixture.free(60 * GIB)
         _ = self.fixture.run_pass()

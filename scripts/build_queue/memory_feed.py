@@ -54,7 +54,7 @@ from scripts.build_queue.queue_view import reason_phrase
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.build_steps import (GATE_PROGRAMS, OTHER_COMMAND, RECORDED_STEP_NAMES, CopiesRunCommand,
                                      OtherCommand, StepNames, command_script, copies_run_command,
-                                     gate_job_from_process, live_process_arguments, process_arguments, read_step_names)
+                                     gate_job_from_process, live_process_arguments, process_arguments, process_command_job, read_step_names)
 from scripts.lib.build_steps import CommandUnreadable as CommandUnreadable
 from scripts.build_queue.slot_wait import QueueRowName as QueueRowName
 from scripts.build_queue.slot_wait import (NoNamedStep, QueueKind, command_programs, command_slot_name,
@@ -846,7 +846,8 @@ def repository_slot_row(slot: wire.RepositorySlotRow, names: StepNames, members:
     source = Path(legacy.source) if isinstance(legacy, CopiesRunCommand) else folder
     step = NoNamedStep.FOUND if legacy_gate else recorded_step(identity.step, names)
     if isinstance(step, NoNamedStep) and isinstance(legacy, CopiesRunCommand):
-        step = command_slot_name(legacy.arguments, names)
+        step = command_slot_name(legacy.arguments, names, job_reader=lambda argv: process_command_job(
+            argv, PROC / str(slot.owner.pid), start_time=slot.owner.start_time))
     current = (members.fixed_owner_labels(staff.StaffId(identity.session_id)) if folder.is_absolute()
                else members.labels_for(identity.session_id, slot.machine, source))
     label = current or unit_labels.UnitLabels("")
@@ -1422,7 +1423,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
 
 
 WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure",
-                    "AWS slot", "build hold", "Mac", "the build in the same Cargo folder"]
+                    "AWS slot", "build hold", "Mac", "the build in the same Cargo folder", "natemerge's merge test"]
 
 
 def wait_why(reason: admission_records.WaitReason) -> WaitCause:
@@ -1446,6 +1447,8 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
             return "memory"
         case admission_records.NatedevHeld():
             return "build hold"
+        case admission_records.LandingWait():
+            return "natemerge's merge test"
         case admission_records.ReadingUnavailable() | admission_records.PressureUnavailable():
             return "memory"
         case admission_records.ReadyForAdmission():

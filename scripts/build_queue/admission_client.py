@@ -7,7 +7,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Generator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -414,9 +414,22 @@ def _no_attempt_hook() -> None:
 
 
 @dataclass(frozen=True)
+class NoRouteCheck:
+    """The caller waits for local admission without checking AWS again."""
+
+
+NO_ROUTE_CHECK = NoRouteCheck()
+
+
+class CloudRouteTaken(Exception):
+    """The caller has an AWS result and needs no local grant."""
+
+
+@dataclass(frozen=True)
 class AdmissionHoldCheck:
     wait_until_free: Callable[[], None]
     admits: Callable[[], bool]
+    route_again: Callable[[], None] | NoRouteCheck = NO_ROUTE_CHECK
 
     def __call__(self) -> None:
         self.wait_until_free()
@@ -690,6 +703,24 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                 _ = release(reply.reservation, 1, reply.cleanup_timing)
                             raise
                         return reply
+                    if isinstance(reply, (wire.RouteAgain, wire.RouteGranted)):
+                        if not (isinstance(request, wire.AdmitRequest) and isinstance(attempt, AdmissionHoldCheck)
+                                and not isinstance(attempt.route_again, NoRouteCheck)):
+                            raise CheckerFailure("unexpected route reply")
+                        if isinstance(reply, wire.RouteGranted):
+                            # AWS fell back. Keep the first arrival in the new episode.
+                            last_valid = CLOCK.monotonic()
+                            first = request = replace(request, episode=uuid.uuid4().hex)
+                            break
+                        if attempt.admits():
+                            attempt.route_again()
+                        # Resume the wait if AWS did not take the place.
+                        last_valid = CLOCK.monotonic()
+                        connection.settimeout(configuration.silence_seconds)
+                        with suppress(BrokenPipeError, ConnectionResetError):
+                            declined = replace(request, route_check_answer=wire.RouteCheckDeclined())
+                            connection.sendall(wire.encode_request(declined).encode())
+                        continue
                     if not isinstance(reply, wire.Wait):
                         raise CheckerFailure("invalid admission answer")
                     if isinstance(cause, records.EstimateExpired) and cause.estimated_at <= answered_expiry:

@@ -155,6 +155,16 @@ NO_RUN = NoRun()
 
 
 @dataclass(frozen=True)
+class NoRouteCheckAnswer:
+    """The request carries no answer to a route check."""
+
+
+@dataclass(frozen=True)
+class RouteCheckDeclined:
+    """The gate finished its route check and wants to wait again."""
+
+
+@dataclass(frozen=True)
 class AdmitRequest(CallerCode):
     """The request holds the command, caller, run, and memory profile for admission."""
     episode: str
@@ -172,6 +182,7 @@ class AdmitRequest(CallerCode):
     run: RunIdentity | NoRun = NO_RUN
     place: LocalPlace | CloudPlace = LocalPlace()
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
+    route_check_answer: NoRouteCheckAnswer | RouteCheckDeclined = field(default=NoRouteCheckAnswer(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -337,6 +348,16 @@ class Wait:
     head: str
     text: str
     snapshot: records.AdmissionWaitSnapshot
+
+
+@dataclass(frozen=True)
+class RouteAgain:
+    """Check AWS while the service keeps the local queue place."""
+
+
+@dataclass(frozen=True)
+class RouteGranted:
+    """The AWS grant ended this local wait."""
 
 
 @dataclass(frozen=True)
@@ -635,7 +656,8 @@ Request = (RepositorySlotRequest | ServiceEstimateRequest | AdmitRequest | Launc
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
            | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
-Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
+Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | Wait | RouteAgain | RouteGranted
+         | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
          | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply)
 
 _GROUPED_CLOUD_ADMIT = "cloud_group_admit"
@@ -653,7 +675,8 @@ _REQUESTS: dict[str, type] = {
 REPLY_TYPES: dict[str, type] = {
     "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
     "repository_slot_expired": RepositorySlotExpired,
-    "wait": Wait, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
+    "wait": Wait, "route_again": RouteAgain, "route_granted": RouteGranted, "runner_admitted": RunnerAdmitted,
+    "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok,
     "placement_wait": PlacementWait, "assignment": Assignment,
     "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,
@@ -704,6 +727,8 @@ def _write_wire_record(value: object) -> object:
     if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
             and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
         del record["route"]
+    if record.get("kind") == "AdmitRequest" and record.get("route_check_answer") == {"kind": "NoRouteCheckAnswer"}:
+        del record["route_check_answer"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
         del record["group"]
     if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:

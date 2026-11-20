@@ -228,7 +228,8 @@ The launcher fixture replaces non-Git commands; the formatter still runs real ta
 
 ## What it is
 
-`scripts/production/merge_gate.py` merges a checkpoint into a production's merge branch and tests all modules before it pushes the merge.
+`scripts/production/merge_gate.py --tests-only` tests all modules in a checkout.
+`merge_checkpoint.py` manages the merge and starts the tests.
 It discovers every `scripts/**/test_*.py` module outside `__pycache__`.
 `scripts/production/targeted_test.py --checkout TREE [--full]` runs a unit's targeted tests through the same runner.
 Targeted tests select modules by direct imports, file tokens, changed test modules, and folders of changed Python source files.
@@ -254,9 +255,7 @@ Timing records retain test execution and interpreter startup costs; they exclude
 Other platforms retain the single-process runner.
 A SIGKILL of the parent prevents this cleanup.
 The module time limit sends SIGTERM first, so the cleanup runs.
-On success, the gate pushes the merge branch.
-With `--promote`, it also advances `~/.claude` main and the Mac.
-On failure, it undoes the merge and prints the failed suites' output.
+The gate returns the test result to the caller.
 
 **Build-hold guard tests.** `scripts/hooks/test_build_hold_guard.py` calls the real Python hook entry point in-process for command parsing and hold decisions, restoring stdin, environment and import paths for each call. `build_hold_guard_test_support.py` copies the existing hold fixture's class seed into a private case directory at the same path for each test. Real subprocess tests retain the shell front's no-Python fast paths, byte-for-byte stdin/output/status relay, lazy imports, malformed input, and shell-to-reader integration. No production hook or hold decision is replaced, and no clock or wait budget is shortened.
 
@@ -308,39 +307,27 @@ This record changes no selection and refuses no run.
 
 ### The gate: `scripts/production/merge_gate.py`
 
-**Invocation.** `merge_gate.py --merge-branch B --unit-branch U --checkpoint C --previous-checkpoint P --unit NAME --phase LABEL [--production <showrunner name>] [--change-review LIST] [--repo/--checkout DIR] [--body TEXT] [--type-dirs DIR...] [--promote] [--promote-only] [--main-repo ~/.claude] [--ssh ssh] [--mac-host mac] [--mac-repo ~/.claude] [--settings-blob b3466859] [--full] [--nightly]`.
-The six merge flags are required unless `--tests-only`, `--promote-only`, or `--nightly` is given.
-`--tests-only --module <suite>/<module>`, given once for each module, runs only the named modules, with the names the gate prints.
-This run uses the whole machine: it takes no admission, hold, time limit, passed-tree record or gate record, so it never certifies a tree.
-A red module runs once more alone, as in the gate.
-The merge checkpoint uses it to run a red merge test again on its base (see [showrunner automation](showrunner-automation.md)).
-`--module` without `--tests-only` is refused.
-`--promote-only --merge-branch B` promotes the pushed branch to main and the Mac without merging or testing.
-`--production` defaults to the calling showrunner's production, read from its update timer.
-The gate refuses a merge when it cannot find a production.
-After the last promotion step, it adds rows only for merges on `origin/main`.
-It prints `Change review: N row(s) added to <list>: C25–C27`, then each row.
-A line with `after <step>` waits for the completed `live` step.
-The session runs `change_review.py live --merged <hash> --step <step> --repo <checkout> --production <showrunner>`.
+**Invocation.** Use `merge_gate.py --checkout DIR --tests-only` to test a checkout.
 `--type-dirs` (alias `--type-dir`) defaults to no folders.
+`--tests-only --module <suite>/<module>` runs the named modules.
+Use one `--module` option for each module.
+Only natemerge's verified landing runs named modules with `WholeMachine`.
+Other callers take a shared queue place and can wait behind a local integrate job.
+Both paths skip the gate record and pass ledger.
+The gate reruns a failed module alone.
+`--module` requires `--tests-only`.
+
+`--promote-only --merge-branch B` promotes the pushed branch to main and the Mac.
+`--nightly --merge-branch B` tests the pushed branch in a shared clone.
 A refusal prints `REFUSED: <reason>` to stderr and exits 1.
-`GateArguments(argparse.Namespace)` defines the arguments; each refusal raises `GateRefused`.
 
-**Refusals before merging** (`merge_checkpoint`):
-- tracked uncommitted changes. Untracked files never block (`--untracked-files=no`), because each showrunner keeps a LOG there; a merge that would overwrite an untracked file fails and is aborted.
-- checkout not on the merge branch.
-- HEAD not `origin/<merge branch>` plus only local production doc commits after the fetch. `check_local_doc_commits` accepts a non-merge commit whose subject starts `production(` (`add_unit.commit_paths` makes them for add_unit and promote_showrunner, and leaves their push to the gate). Each one is printed, rolled back to on red, and pushed with the merge. Fetches use explicit `+refs/heads/X:refs/remotes/origin/X` refspecs.
-- checkpoint not an ancestor of `origin/<unit branch>`.
-- previous checkpoint not an ancestor of the checkpoint.
+**Landing tests.** The queue shows `integrate` for tests that belong to a natemerge landing.
+It checks the process lineage for a live land record with a matching PID and start time.
+It resolves the land process's session through the staff chain.
+The first full test run, the named-module check on the base, and the full batch retry each use this rule.
+Other runs use the test names for their requested modules.
 
-**Merge.** `git merge --no-ff` with subject `Merge <unit> <phase> (<checkpoint>) into <merge branch>` and `--body`. On a conflict the gate runs `merge --abort` and names the conflicting files.
-
-**Run, then check before push.** `run_suites` runs. Then `settings.json` at HEAD must match the approved blob prefix (`--settings-blob`, an 8–40 hex hash), and `origin/main` must be an ancestor of HEAD. Only then does the gate push the merge branch and print `Pushed <branch>: <short hash>`.
-A checkpoint rerun accepts its own recorded merge only for the same checkpoint, exact merge commit and original parents, with the remote branch still an ancestor of its base; it reruns the gate checks and pushes that commit, using a separate push recovery record rather than the test pass ledger.
-
-**Red, errors and signals.** Any exception after the merge, including red suites and `KeyboardInterrupt`, goes to `rollback_merge(repo, baseline)`. It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`. If tracked files changed during the gate block that reset, it restores them to the merge tree and retries once; if the retry also fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`. `rollback_signals()` turns SIGTERM and SIGHUP into `GateRefused`, so they roll back the same way; SIGINT arrives as `KeyboardInterrupt`.
-
-**Build holds.** SharedMachine waits before jobs, merging, and promotion while another session's natedev hold applies.
+**Build holds.** SharedMachine waits before jobs and promotion while another session's natedev hold applies.
 The gate uses `build_targets.caller_holds_only_own`, so the sole holder runs at once.
 The gate checks the hold before each new job.
 A job stopped by a signal during an applicable hold returns to the front of the queue.
@@ -350,13 +337,13 @@ An empty hold directory starts no subprocess.
 One line names the holder when a wait starts; another reports the wait when it ends.
 `Gate tests:` excludes hold wait; a separate line reports that wait when it exceeds zero.
 
-**Passed trees.** `${MERGE_GATE_PASSED_DIR:-~/.local/state/merge-gate}/passed-trees.jsonl` has one JSON line per passing run, with `kind: full` or `kind: affected` (a legacy record without `kind` is full). Fields are `tree` (`HEAD^{tree}`), `commit`, `at` (UTC), `host`, `checkout`, sorted `suites`, and `source` (`tests-only` or `checkpoint`). Full passes also record `reason`; older records without it remain valid. The checkout must have an empty `git status --porcelain`, including untracked files; ignored files do not count. It must still be clean with the same tree after the run. Failed runs and reused results add no record. Each append uses one write. A read or write error prints one reason and leaves the gate result unchanged; a ledger unavailable at lookup makes all modules run.
+**Passed trees.** `${MERGE_GATE_PASSED_DIR:-~/.local/state/merge-gate}/passed-trees.jsonl` has one JSON line per passing run, with `kind: full` or `kind: affected` (a legacy record without `kind` is full). Fields are `tree` (`HEAD^{tree}`), `commit`, `at` (UTC), `host`, `checkout`, sorted `suites`, and `source` (`tests-only` for new records). Full passes also record `reason`; older records without it remain valid. The checkout must have an empty `git status --porcelain`, including untracked files; ignored files do not count. It must still be clean with the same tree after the run. Failed runs and reused results add no record. Each append uses one write. A read or write error prints one reason and leaves the gate result unchanged; a ledger unavailable at lookup makes all modules run.
 
 Before modules start, a clean checkout can reuse the most recent full record for the same tree, host, and sorted suite names.
 Affected records certify neither reuse nor a selection base.
 Commits and checkout paths may differ.
 The runner prints `tests reused from <short tree> (<user-zone time>, <source>, <checkout>)` and marks each suite `OK reused`.
-Explicit type checks, settings, ancestry, production doc checks, and change-review checks still run.
+Explicit type checks still run.
 A dirty tree records no reusable pass.
 Without exact reuse, a targeted test selects affected modules as described below.
 `--full` bypasses reuse.
@@ -628,7 +615,6 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 **`--tests-only`** runs all modules through `run_suites` on `--repo`, with pass recording and reuse.
 It changes no Git refs or files.
 It exits 0 when all requested jobs pass, and 1 when any job fails.
-Checkpoint runs record their source as `checkpoint`.
 Workers check their changed Python files and caller modules.
 
 **Measured type cost.** On 2026-11-05, 214 gate runs each included a full type check.
@@ -636,7 +622,7 @@ The median type check took 164 seconds and reached 4.07 GiB.
 Type checks used 3.4% of gate CPU time.
 The daily rule removes these jobs from default gates.
 
-**`--promote`** runs after the merge-branch push.
+**`--promote-only`** promotes a pushed branch.
 
 1. Wait for `build-hold-release/release.lock` within the configured release wait.
 2. Verify that the promotion checkout uses main and has an eligible recorded tip.
@@ -685,7 +671,7 @@ A failed Mac advance names the published local commit and leaves retry to main s
 Tests use independent scratch repositories.
 The modules in `scripts/production/` cover these subjects:
 
-1. `test_merge_gate.py`: checkpoints and change review.
+1. `test_merge_gate.py` verifies suite execution and change review.
 2. `test_merge_gate_ledger.py`: certified passes.
 3. `test_targeted_test.py`: affected selection.
 4. `test_merge_gate_suites.py`: jobs, resources, reruns and types.

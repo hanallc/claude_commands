@@ -379,6 +379,7 @@ class MemoryFeedTests(unittest.TestCase):
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "STAFF_FILE": str(self.root / "staff.json"),
+            "MERGE_GATE_STATE_DIR": str(self.root / "merge-gate"),
             "USER_ZONE": "UTC",
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
             "BUILDLOG_USER_CGROUP": str(self.root / "user"),
@@ -644,7 +645,6 @@ process.stdout.write(JSON.stringify({
     def test_gate_rows_name_the_job_from_the_command_arguments(self) -> None:
         gate_command = ["python3", "/repo/scripts/production/merge_gate.py", "--merge-branch", "sdlc"]
         cases = (
-            (["--unit", "handler", "--checkpoint", "abc"], StepJob("integrate", unit="handler", branch="sdlc")),
             (["--tests-only", "--full"], StepJob("test-all", branch="")),
             (["--tests-only", "--module", "a", "--module=b"], StepJob("test-modules", modules=2)),
             (["--tests-only"], StepJob("test-all")),
@@ -662,7 +662,7 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(job, expected)
                     notes = memory_feed.job_notes(job, "report", names)
                     self.assertTrue(notes.get("about"))
-                    self.assertEqual(notes.get("changes"), "sdlc branch" if expected.step == "integrate" else "no branch")
+                    self.assertEqual(notes.get("changes"), "no branch")
             self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
             self.assertIsInstance(memory_feed.step_job("merge-gate", 99, proc), memory_feed.CommandUnreadable)
         for command, named in (
@@ -684,20 +684,7 @@ process.stdout.write(JSON.stringify({
         ):
             with self.subTest(command=command):
                 self.assertEqual(command_job(command), named)
-        about = names.about(StepJob("integrate", unit="handler", branch="sdlc"), "report")
-        self.assertIn("handler", about)
         self.assertEqual(names.about(StepJob("test-all"), "—"), "")
-        reading = reservation_reading()
-        integrate = StepJob("integrate", unit="handler", branch="sdlc")
-        with (mock.patch.object(admission_client, "view", return_value=reading),
-              mock.patch.object(memory_feed, "step_job", return_value=integrate)):
-            page = memory_feed.reading()
-        running, = [row for row in page["walk"] if row.get("queued")]
-        for row in (running, *page["waiters"]):
-            self.assertEqual(row.get("changes"), "sdlc branch")
-            self.assertIn("handler", row.get("about", ""))
-            self.assertIn("integrate", row["name"])
-
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
         for step in ("targeted-test", "merge-gate", "nextest", "test", "t"):
@@ -1640,6 +1627,7 @@ process.stdout.write(JSON.stringify({
             (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory", False),
             (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts", False),
             (placement.CargoFolderWait(), placement.CARGO_FOLDER_WAIT_REASON, False),
+            (admission_records.LandingWait(), admission_records.LANDING_WAIT_TEXT, False),
             (admission_records.BehindHead("first", 1, "head-session"), "behind", False),
             (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · second · nextest · compiler", True),
         )
@@ -2541,7 +2529,7 @@ process.stdout.write(JSON.stringify({
 
     def gate_job_page(self, step: str, argv: tuple[str, ...], *,
                       running_pid: int | admission_records.PidNotRecorded = 700000,
-                      showrunner: bool = False, unit_known: bool = True,
+                      parent_pid: int = 1, showrunner: bool = False, unit_known: bool = True,
                       job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
                       ) -> memory_feed.MemoryPage:
         """Render the same gate mode on both machines and in both tables."""
@@ -2558,7 +2546,7 @@ process.stdout.write(JSON.stringify({
                 process = self.root / "proc" / str(pid)
                 cmdline = process / "cmdline"
                 if argv:
-                    write_process(process.parent, pid, start=start or str(pid))
+                    write_process(process.parent, pid, parent=parent_pid, start=start or str(pid))
                     _ = cmdline.write_bytes(("\0".join(argv) + "\0").encode())
                 else:
                     cmdline.unlink(missing_ok=True)
@@ -2579,7 +2567,6 @@ process.stdout.write(JSON.stringify({
         for mode in sorted(modes):
             program = mode.replace("-", "_") + ".py"
             cases = ((), ("--full",), ("--module", "test_sample")) if mode == SuiteMode.TARGETED_TEST.value else (
-                ("--unit", "devtools", "--merge-branch", "sdlc"),
                 ("--tests-only", "--full"), ("--tests-only", "--module", "test_sample"),
                 ("--nightly", "--merge-branch", "sdlc"), ("--promote-only",))
             for arguments in (*cases, memory_feed.CommandUnreadable("missing cmdline"), admission_records.PidNotRecorded()):
@@ -2665,8 +2652,33 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(staff_names.parts_text(row.get("about_parts", [])), about)
                     self.assertEqual(row.get("changes"), "no branch")
 
-        integration = self.gate_job_page("merge-gate", ("python3", "merge_gate.py"), showrunner=True)
-        for rows in (integration["walk"], integration["waiters"]):
+    def test_landing_gate_rows_show_integrate_on_local_and_cloud_rows(self) -> None:
+        land_pid = 101
+        session = staff.StaffId("00000000-0000-4000-8000-000000000101")
+        owner = staff.StaffRow(gate.NATEMERGE_STAFF_ID, "producer", "natemerge", staff.StaffRoot(),
+                               current_session=session)
+        _ = (self.root / "staff.json").write_text(staff.StaffSnapshot((owner,)).encode())
+        proc = self.root / "proc"
+        write_process(proc, land_pid, parent=0, start="1")
+        _ = (proc / str(land_pid) / "environ").write_bytes(f"CLAUDE_CODE_SESSION_ID={session}\0".encode())
+        lands = self.root / "merge-gate" / "lands"
+        lands.mkdir(parents=True)
+        _ = (lands / f"{land_pid}.json").write_text(json.dumps({"pid": land_pid, "start": "1", "commits": ["abc123"]}))
+
+        page = self.gate_job_page("merge-gate", ("python3", "merge_gate.py", "--tests-only"), parent_pid=land_pid)
+        local_run, = [row for row in page["walk"] if row.get("queued")]
+        cloud_run, = [row for row in page["walk"] if row.get("kind") == "cloud"]
+        local_wait, = [row for row in page["waiters"] if not row.get("kind")]
+        cloud_wait, = [row for row in page["waiters"] if row.get("kind") == "cloud"]
+        for row in (local_run, cloud_run, local_wait, cloud_wait):
+            self.assertEqual(row["name"], "devtools integrate")
+            self.assertEqual(row["title"]["step"], "integrate")
+            self.assertEqual(row.get("about"), "Tests a checkpoint while natemerge merges it.")
+            self.assertEqual(row.get("changes"), "the landing branch")
+
+        page = self.gate_job_page("merge-gate", ("python3", "merge_gate.py", "--tests-only"),
+                                  parent_pid=land_pid, showrunner=True)
+        for rows in (page["walk"], page["waiters"]):
             row, = [row for row in rows if row.get("kind") == "cloud"]
             self.assertEqual(row["name"], "showrunner integrate")
 

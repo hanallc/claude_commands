@@ -477,7 +477,7 @@ QueueRequest = RefreshedRequest | wire.ServiceEstimateRequest
 QueueReply = wire.Admitted | wire.LaunchAdmitted | wire.Refused | admission_client.LeftQueue
 
 
-def request_place(request: QueueRequest | RefreshedLaunch, output: admission_client.WaitOutput, *,
+def request_place(request: QueueRequest | RefreshedLaunch, output: Callable[[wire.Wait], None], *,
                   before_check: Callable[[], None] = no_hold_wait) -> QueueReply:
     """Send a queue request and wait for its answer.
 
@@ -506,9 +506,12 @@ class HeldReservation:
 def held_reservation(request: QueueRequest, *,
                      before_check: Callable[[], None] = no_hold_wait) -> Generator[HeldReservation]:
     """Wait for admission, then release the grant with the holder's status."""
-    # service_admit sets the service estimate timing on the output.
     output = admission_client.WaitOutput()
-    reply = request_place(request, output, before_check=before_check)
+    try:
+        reply = request_place(request, output, before_check=before_check)
+    except BaseException:
+        output.end_status()
+        raise
     if isinstance(reply, wire.Refused):
         raise QueuePlaceRefused(reply.reason)
     if not isinstance(reply, wire.Admitted):
@@ -563,11 +566,14 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         if purpose == ProgramPurpose.BATCH:
             assert not isinstance(estimate, ConfiguredFirstPeak)
             profile = (estimate if isinstance(estimate, admission_records.InferFromArgv) else
-                       admission_records.ProgramProfile(name, str(Path.home() / ".claude"), str(repo.resolve()), estimate))
+                       admission_records.ProgramProfile(name, str(Path.home() / ".claude"), str(repo.resolve()), estimate,
+                           receive_route_notices=isinstance(before_check, admission_client.AdmissionHoldCheck)
+                           and not isinstance(before_check.route_again, admission_client.NoRouteCheck)))
             start = admission_records.process_start_time(pid)
             if start is None:
                 raise QueuePlaceRefused("owner no longer exists")
-            owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
+            owner, episode = wire.Owner(pid, start), uuid.uuid4().hex
+            since = time.time()
             def refresh() -> wire.AdmitRequest:
                 return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
             grant = reservation.enter_context(held_reservation(RefreshedRequest(refresh), before_check=before_check))

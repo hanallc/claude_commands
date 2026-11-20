@@ -149,24 +149,28 @@ class MergeGateLedgerTests(MergeGateFixture):
             ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
         self.assertIn(f"tests reused from {cast(str, record['tree'])[:12]} ({when}, tests-only, {self.checkout})", second.stdout)
 
-    def test_checkpoint_reuses_unit_tree_and_still_runs_types(self) -> None:
+    def test_landing_checkout_reuses_unit_tree_and_still_runs_types(self) -> None:
         first = self.run_gate("--tests-only", "--repo", str(self.unit))
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.clear_gate_events()
-        second = self.run_gate()
+        _ = self.git(self.checkout, "merge", "--no-ff", "--no-edit", "unit-phase")
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        second = self.run_gate("--tests-only")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertEqual(self.module_events(), [])
         self.assertTrue((self.state / "types-ran").exists())
         self.assertIn("tests reused from", second.stdout)
-        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.git(self.checkout, "rev-parse", "HEAD"))
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
+        self.assert_not_pushed()
 
     @gate_suites("lib", "hooks")
-    def test_checkpoint_full_pass_records_and_tests_only_reuses_it(self) -> None:
-        first = self.run_gate()
+    def test_tests_only_reuses_a_legacy_checkpoint_pass(self) -> None:
+        first = self.run_gate("--tests-only")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assert_all_modules_started()
         record, = self.pass_records()
-        self.assertEqual(record["source"], "checkpoint")
+        path = Path(self.environment["MERGE_GATE_PASSED_DIR"]) / "passed-trees.jsonl"
+        self.write(path, json.dumps({**record, "source": "checkpoint"}) + "\n")
         self.assertEqual(record["commit"], self.git(self.checkout, "rev-parse", "HEAD"))
         self.clear_gate_events()
         second = self.run_gate("--tests-only")
@@ -424,12 +428,14 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.clear_gate_events()
         self.write(self.state / "types-red", "red")
-        result = self.run_gate()
+        _ = self.git(self.checkout, "merge", "--no-ff", "--no-edit", "unit-phase")
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        result = self.run_gate("--tests-only")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("tests reused from", result.stdout)
         self.assertIn("basedpyright: RED", result.stdout)
         self.assertEqual(self.module_events(), [])
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
         self.assert_not_pushed()
 
 

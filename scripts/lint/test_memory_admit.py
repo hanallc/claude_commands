@@ -5873,6 +5873,26 @@ class StrictTargetLineTests(unittest.TestCase):
         self.assertEqual([row.admission for row in rows], [
             gate.ProposedAdmission(rank, admission_records.NextStartAt(NOW_EPOCH)) for rank in (1, 2, 3)])
 
+    def test_landing_wait_keeps_its_position_and_leaves_the_local_start_available(self) -> None:
+        held = self.waiter(1, 1, repository_name="claude_commands")
+        hana = self.waiter(2, 20, repository_name="hana")
+        inputs = admission_records.QueueInputs([(Path(str(row["pid"])), row) for row in (held, hana)],
+            (), (), admission_records.HostMemory(10 * GIB, 64 * GIB), admission_records.NoPressureHold(),
+            admission_records.ReadyToStart(), NOW_EPOCH,
+            landing_waiters=frozenset((admission_records.waiter_owner(held),)))
+        policy = admission_policy_fixture()
+        result = gate.admission_pass(inputs, NOW_EPOCH, policy)
+        self.assertEqual([row.owner for row in result.rows], [admission_records.waiter_owner(row) for row in (held, hana)])
+        self.assertIsInstance(result.rows[0].admission, gate.NotAdmitted)
+        reason = result.rows[0].reason
+        assert isinstance(reason, admission_records.HeadAdmissionStatus)
+        self.assertEqual(reason.cause, admission_records.LandingWait())
+        self.assertIsInstance(result.rows[1].admission, gate.ProposedAdmission)
+        self.assertEqual(result.rows[1].decision.room.basis, admission_records.StartsAlone())
+        released = gate.admission_pass(replace(inputs, landing_waiters=frozenset()), NOW_EPOCH, policy)
+        self.assertIsInstance(released.rows[0].admission, gate.ProposedAdmission)
+        self.assertIsInstance(released.rows[1].admission, gate.NotAdmitted)
+
     def test_zero_need_switch(self) -> None:
         for bypass in (False, True):
             with self.subTest(bypass=bypass), patch.object(gate, "ZERO_NEED_MAY_PASS", bypass, create=True):

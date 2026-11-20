@@ -536,7 +536,7 @@ class HeadStillHeld:
 
 
 HeadRelease = HeadAdmitsAfterEnd | HeadStartsAt
-HeadAfterEnd = HeadRelease | HeadStillHeld | EstimateExpired | TokenWaitersOnly | NoWaiter | ReadingUnavailable
+HeadAfterEnd = HeadRelease | HeadStillHeld | EstimateExpired | TokenWaitersOnly | NoWaiter | ReadingUnavailable | records.LandingWait
 
 
 @dataclass(frozen=True)
@@ -593,11 +593,17 @@ class UsableAdmissionConfiguration:
     peak_history_share_percent: int
     progress_profile_sweep_seconds: float
     remote_start_hold_seconds: int
+    hold_for_merge_test: bool = False
+    natedev_reroute_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
 class UnusableAdmissionConfiguration:
     reason: str
+
+
+MERGE_TEST_WAIT_KEY = "claude_commands_natedev_waits_for_landing"
+NATEDEV_REROUTE_KEY = "natedev_reroute_seconds"
 
 
 def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdmissionConfiguration:
@@ -611,11 +617,14 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             peak_history_share_percent = settings.whole("peak_history_share_percent")
             progress_profile_sweep_seconds = settings.number("progress_profile_sweep_seconds")
             remote_start_hold_seconds = settings.whole("remote_start_hold_seconds")
+            hold_for_merge_test = settings.value(MERGE_TEST_WAIT_KEY, conf.on_off, default=False)
+            natedev_reroute_seconds = settings.value(NATEDEV_REROUTE_KEY, float, default=60.0)
         config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
             cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent,
-            progress_profile_sweep_seconds, remote_start_hold_seconds)
+            progress_profile_sweep_seconds, remote_start_hold_seconds, hold_for_merge_test,
+            natedev_reroute_seconds)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
@@ -2054,7 +2063,8 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
         if claim_policy is ContinuationClaimPolicy.KEEP_FOR_OWNER or not inputs.slots:
             break
         held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
-                       if entry.decision.reused_slot and isinstance(entry.decision.order_hold, HeldBehindHead)}
+                       if entry.decision.reused_slot and isinstance(entry.decision.order_hold, HeldBehindHead)
+                       and not waits_for_landing(inputs, entry.waiter)}
         if not held_owners:
             break
         # Return the claim before checking the earlier row's room again.
@@ -2093,6 +2103,11 @@ def can_use_natedev(row: Waiter) -> bool:
     return not isinstance(route, MacOnly) and (not isinstance(route, PinnedTarget) or route.target == "natedev")
 
 
+def waits_for_landing(inputs: QueueInputs, row: Waiter) -> bool:
+    owner = records.waiter_owner(row)
+    return owner in inputs.landing_waiters and owner not in inputs.pending_remote_starts
+
+
 def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]],
                    room: MemoryRoom | ReadingUnavailable,
                    now: float, policy: AdmissionPolicy, kept: int, used: int, safety: int,
@@ -2106,7 +2121,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     decisions: list[WaiterAdmission] = []
     clear = isinstance(inputs.pressure, NoPressureHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
-    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)), inputs.pending_remote_starts)
+    local_head = first_queued_waiter((row for _, row in ordered
+        if can_use_natedev(row) and not waits_for_landing(inputs, row)
+        and records.waiter_owner(row) not in inputs.cloud_route_waiters_past_deadline), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
     head_can_start_alone = not inputs.reservations and all(
         not slot_in_force(slot, inputs.now)
@@ -2141,6 +2158,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         remote_start_pending = owner in inputs.pending_remote_starts
         state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
+        landing_wait = waits_for_landing(inputs, row)
+        keeps_order = not landing_wait and owner not in inputs.cloud_route_waiters_past_deadline
         local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
         folder = inputs.cargo_folders.get(owner) if local_route else None
@@ -2173,11 +2192,11 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             order_hold = HeldBehindHead(first_folder_wait)
         elif ready and not isinstance(earlier, NoWaiter):
             order_hold = HeldBehindHead(earlier)
-        if folder is not None and isinstance(earlier, NoWaiter):
+        if keeps_order and folder is not None and isinstance(earlier, NoWaiter):
             first_for_folder[folder] = records.stored_waiter(row)
-        can_start = (ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree)
-                     and isinstance(order_hold, NoOrderHold))
-        decision = AdmissionDecision("admit" if can_start else "hold",
+        admitted = (ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree)
+                    and isinstance(order_hold, NoOrderHold) and not landing_wait and owner not in inputs.cloud_route_waiters)
+        decision = AdmissionDecision("admit" if admitted else "hold",
             extra + kept + safety, kept, safety, used,
             NO_PRESSURE_HOLD if within else inputs.pressure,
             used + kept,
@@ -2185,12 +2204,12 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis), gpu=gpu_wait)
         cargo_folder = placement.CargoFolderWait() if folder_busy else placement.CargoFolderFree()
         decisions.append(WaiterAdmission(row, decision, state, cargo_folder))
-        if can_start:
+        if admitted:
             remaining += held + released - need
             gpu_used += gpu_step
             if not reused:
                 new_started = True
-        elif local or folder_busy:
+        elif keeps_order and (local or folder_busy):
             if folder_busy and isinstance(first_folder_wait, NoWaiter):
                 first_folder_wait = records.stored_waiter(row)
             if isinstance(first_held, NoWaiter):
@@ -2253,8 +2272,13 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *, 
         within = isinstance(decision.room.basis, WithinSlot)
         remote_start_pending = owner in inputs.pending_remote_starts
         local_wait = inputs.local_waits.get(owner)
-        if isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
-            reason: WaitReason = entry.state
+        landing_held = waits_for_landing(inputs, row)
+        if landing_held:
+            landing_wait = records.LandingWait()
+            reason: WaitReason = (HeadAdmissionStatus(decision, row["need"], available, cause=landing_wait)
+                                  if first else landing_wait)
+        elif isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
+            reason = entry.state
         else:
             if isinstance(entry.cargo_folder, placement.CargoFolderWait):
                 cause: HeadCause = entry.cargo_folder
@@ -2272,6 +2296,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *, 
                     cause = queue_order_reason(decision, RecordedQueueIdentities())
             elif remote_start_pending:
                 cause = BehindHead("remote startup", row["since"], "")
+            elif owner in inputs.cloud_route_waiters:
+                cause = BehindHead("AWS route check", row["since"], "")
             elif isinstance(local_wait, placement.EvidenceNeeded):
                 cause = ReadingUnavailable(local_wait.reason)
             elif estimate_expired(row, now, policy):
@@ -2287,7 +2313,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *, 
             rank += 1
             proposal = ProposedAdmission(rank, spacing)
         blocker: BlockingIndex | NoSingleBlocker | BlockerNotRequested = BlockerNotRequested()
-        if owner in inputs.blockers_for and decision.state == "hold" and isinstance(entry.state, QueuedWaiter):
+        if (owner in inputs.blockers_for and decision.state == "hold" and isinstance(entry.state, QueuedWaiter)
+                and not landing_held):
             if not endings:
                 endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,)), policy),
                                     now, policy, resolved_order=resolved_order, claim_policy=claim_policy)
@@ -2521,7 +2548,7 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
     owner = records.waiter_owner(candidate.waiter)
     row = next(row for row in result.rows if row.owner == owner)
     cause = cast(HeadAdmissionStatus, row.reason).cause
-    if isinstance(cause, (EstimateExpired, ReadingUnavailable)):
+    if isinstance(cause, (EstimateExpired, ReadingUnavailable, records.LandingWait)):
         return cause
     decision = row.decision
     freed = released_resident_bytes(explanation.decided_from.running, indices)

@@ -1,15 +1,36 @@
 """Read the display names, prose names and descriptions of build steps."""
+from __future__ import annotations
+
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path, PurePath
 from types import MappingProxyType
+from typing import TYPE_CHECKING, Protocol, cast
 
 from scripts.build_queue.admission_jobs import StepJob as StepJob
 from scripts.buildlog.parse import CARGO_BUILD_VERBS
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
 from scripts.message.owner_role import OwnerRole
+
+
+if TYPE_CHECKING:
+    from scripts.build_hold.build_hold import ProcessIdentity
+
+
+class ConfirmedLineage(Protocol):
+    @property
+    def processes(self) -> frozenset[ProcessIdentity]: ...
+
+
+class CallerLineageReader(Protocol):
+    @property
+    def ConfirmedCallerLineage(self) -> type[ConfirmedLineage]: ...
+
+    def read_caller_lineage(self, proc_root: Path, pid: int, start_time: str) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -61,7 +82,8 @@ class StepNames:
     def changes(self, job: StepJob) -> str:
         """What the job changes: a branch name, or the default text."""
         template = self.settings.get(f"changes.{job.step}", self.settings.get("changes.default", ""))
-        return template.format(branch=job.branch)
+        branch = job.branch or ("the landing" if job.step == "integrate" else "")
+        return template.format(branch=branch)
 
 
 @dataclass(frozen=True)
@@ -247,7 +269,37 @@ def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> 
     copied = copies_run_command(argv)
     command = copied.arguments if isinstance(copied, CopiesRunCommand) else argv
     expected = GATE_PROGRAMS.get(step)
-    return command_job(command) if expected and command_program(command) == expected else OTHER_COMMAND
+    return process_command_job(command, process, start_time=start_time) if (
+        expected and command_program(command) == expected) else OTHER_COMMAND
+
+
+def process_command_job(argv: Sequence[str], process: Path, *, start_time: str = "") -> StepJob | OtherCommand:
+    """Name a gate test as integrate when a checked ancestor owns the landing."""
+    job = command_job(argv)
+    if (not isinstance(job, StepJob) or job.step not in ("test-all", "test-modules")
+            or command_program(argv) != GATE_PROGRAMS["merge-gate"]):
+        return job
+
+    from scripts.build_hold.build_hold import process_start_time
+    from scripts.production.land_runs import NoNatemergeLand, natemerge_land
+
+    if not process.name.isdecimal():
+        return job
+    pid = int(process.name)
+    proc = process.parent
+    # Load the lineage reader after the command modules finish importing.
+    build_targets = cast(CallerLineageReader, cast(object, import_module("scripts.build_targets.build_targets")))
+    lineage = build_targets.read_caller_lineage(proc, pid, start_time or process_start_time(pid, proc))
+    if (isinstance(lineage, build_targets.ConfirmedCallerLineage)
+            and not isinstance(natemerge_land(proc, lineage.processes), NoNatemergeLand)):
+        return StepJob("integrate")
+    return job
+
+
+def current_command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
+    """Name the job that this process will start."""
+    proc = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
+    return process_command_job(argv, proc / str(os.getpid()))
 
 
 def _test_job(arguments: Sequence[str], *, affected: bool) -> StepJob:
@@ -277,7 +329,7 @@ def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
         return StepJob("promote", branch=branch)
     if "--tests-only" in arguments:
         return _test_job(arguments, affected=False)
-    return StepJob("integrate", unit=_option(arguments, "--unit"), branch=branch)
+    return OTHER_COMMAND
 
 
 # Show each step as the queue records it, for a caller that reads no configuration.

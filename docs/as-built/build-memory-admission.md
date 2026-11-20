@@ -91,6 +91,42 @@ The service reads the threshold at use.
 An unusable threshold logs once through the existing configuration diagnostics.
 Requests and cleanup continue when this logging setting is unusable.
 
+### Merge test hold on natedev
+
+A merge test that has the `integrate` job holds new `claude_commands` steps while it waits for or uses a local place.
+The merge gate tries AWS first and requests a local place when it falls back to natedev.
+An AWS merge test leaves the natedev queue open.
+AWS jobs and local jobs from other repositories can start during the hold.
+Running steps continue.
+
+`claude_commands_natedev_waits_for_landing=on` in `config/build_admission.conf` enables the rule.
+The service reads the setting for each admission pass.
+Set `claude_commands_natedev_waits_for_landing=off` to disable the rule.
+
+The wait line and the Builds page show this reason.
+
+> Waits for natedev: natemerge's integrate job runs there, and no other target can take this test now.
+
+The admission service checks for a local merge test each pass.
+The default interval is one second while steps wait (`waiting_pass_seconds`).
+An `integrate` job does not enter this hold.
+
+`merge_gate.py --tests-only --module` requests shared admission and can wait behind a local `integrate` job.
+When the shared landing check verifies natemerge's land, the named modules use the whole machine without admission.
+A named-module run writes no gate record or pass ledger entry.
+
+### Route checks for Python test gates on natedev
+
+A Python test gate that waits on natedev for any reason gets `RouteAgain` after `natedev_reroute_seconds`.
+The default is 60 seconds.
+The gate asks the other places again and keeps its local queue place during the check.
+The service defers the local grant while the check is open.
+If the check stays open for `natedev_reroute_seconds`, later local waiters can pass the gate.
+If AWS declines, the gate resumes admission on the same connection at its first arrival.
+When the service grants an AWS slot, it releases the gate's local place.
+If AWS later falls back to natedev, the gate requests a new episode with its first arrival.
+Cargo steps check placement again each admission pass while they wait.
+
 ### Placement status
 
 `PlacementStatusRequest(episode, attempt)` reads the saved assignment without changing state or launch permission.
@@ -1938,9 +1974,9 @@ Each later finalization attempt uses the same guard, so other admissions continu
 For a local `merge-gate` request, the service reads the PID from the socket credentials.
 The peer must be the request owner or one of its descendants.
 An ancestor of the peer must match a live land record by PID and process start time.
-The service also checks that the request session's staff chain reaches the fixed staff ID of `natemerge`.
+The shared check reads the land process's session and checks its staff chain for the fixed staff ID of `natemerge`.
 A unit trial without a matching land record keeps its normal place.
-The service checks the land record and process again before it changes the order.
+The service repeats the shared check for that land before it changes the order.
 
 The first eligible test from each land can move ahead in the natedev memory queue.
 It must fit within the normal memory limits with all current claims in place.

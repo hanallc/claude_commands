@@ -1050,6 +1050,27 @@ class ClientTests(unittest.TestCase):
             self.assertEqual((first.owner, first.since, first.profile),
                              (second.owner, second.since, second.profile))
 
+    def test_a_fallback_after_aws_admission_preserves_the_first_arrival(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            transport = self.use_transport(fixture,
+                Exchange(reply_bytes(wire.RouteAgain()), reply_bytes(wire.RouteGranted())),
+                Exchange(reply_bytes(GRANTED)))
+
+            def check_aws() -> None:
+                fixture.clock.advance(3)
+
+            hold = client.AdmissionHoldCheck(lambda: None, lambda: True, check_aws)
+            result = client.admit(request, lambda _reply: None, lambda: request, _attempt=hold)
+            self.assertEqual(result, GRANTED)
+            first, refresh, second = transport.requests
+            assert isinstance(first, wire.AdmitRequest)
+            self.assertEqual(replace(first, route_check_answer=wire.RouteCheckDeclined()), refresh)
+            assert isinstance(second, wire.AdmitRequest)
+            self.assertNotEqual(second.episode, request.episode)
+            self.assertEqual(second.since, request.since)
+            self.assertEqual(second.owner, request.owner)
+
     def test_program_request_uses_its_checkout_instead_of_the_launcher_directory(self) -> None:
         with AdmissionFixture() as fixture:
             original = fixture.request()

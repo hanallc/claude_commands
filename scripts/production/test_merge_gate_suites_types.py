@@ -198,20 +198,10 @@ class MergeGateTypesTests(GateSuitesFixture):
         history, = self.gate_history()
         self.assertEqual(history["shape"], "tests")
 
-    def test_merge_pushes_modules_without_a_default_type_check(self) -> None:
-        result = self.run_gate(type_dirs=())
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
-        self.assert_all_modules_started()
-        self.assertEqual(self.git(self.origin, "rev-parse", "integration"),
-                         self.git(self.checkout, "rev-parse", "HEAD"))
-        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
-
     @gate_suites("lib")
     def test_a_type_check_venv_that_cannot_be_built_is_red_and_names_the_command(self) -> None:
         self.write(self.state / "uv-fails", "fail")
-        result = self.run_gate()
+        result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("basedpyright: RED\ntype-check venv missing: stderr: fixture: no network; build it with: ", result.stdout)
         self.assertIn(" pip install --python ", result.stdout)
@@ -219,9 +209,9 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertRegex(result.stdout, r"(?m)^lib: OK \d+\.\d+s$")
         self.assert_not_pushed()
 
-    def test_type_failure_resets_merge_and_does_not_push(self) -> None:
+    def test_type_failure_keeps_the_tested_checkout(self) -> None:
         self.write(self.state / "types-red", "red")
-        result = self.run_gate()
+        result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("fixture type error", result.stdout + result.stderr)
         self.assert_not_pushed()

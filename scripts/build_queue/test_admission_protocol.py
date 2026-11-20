@@ -33,6 +33,14 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_route_replies_have_distinct_types(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire
+
+        for reply in (wire.RouteAgain(), wire.RouteGranted()):
+            with self.subTest(reply=reply):
+                self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+                self.assertEqual(status_wire.parse_reply(wire.encode_reply(reply)), reply)
+
     def test_placement_status_round_trips_without_launch_permission(self) -> None:
         from scripts.build_queue import admission_wire as status_wire
         from scripts.build_queue.test_placement import placement_request
@@ -472,7 +480,8 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
     def test_every_request_round_trips_with_profiles_width_and_call_states(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
-            requests: list[wire.Request] = [request, fixture.launch(),
+            declined = replace(request, route_check_answer=wire.RouteCheckDeclined())
+            requests: list[wire.Request] = [request, declined, fixture.launch(),
                 replace(request, profile=records.ProgramProfile("merge-gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
                 replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",
                     records.HistoryPeakSizing(18 * GIB, records.FirstProgramPeak(18 * GIB), NOW))),

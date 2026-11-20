@@ -45,7 +45,7 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.build_slots import SlotQueuePosition, NewSlotQueuePosition, NEW_SLOT_QUEUE_POSITION
 from scripts.build_queue import first_step, slot_wait
-from scripts.lib.build_steps import StepJob, VerifyCommand, command_job, command_program, read_step_names, verify_command
+from scripts.lib.build_steps import StepJob, VerifyCommand, command_program, current_command_job, read_step_names, verify_command
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
@@ -1458,7 +1458,7 @@ def slot_showrunner(owner: str) -> str:
 def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
                  merge: MergePolicy = NO_MERGE, step: str = "") -> Generator[Path]:
     """Admit a queue command before preparing its slot, then hold the slot through the caller scope."""
-    job = command_job(command)
+    job = current_command_job(command)
     label = step or (job.step if isinstance(job, StepJob) else "")
     try:
         with ExitStack() as scope:

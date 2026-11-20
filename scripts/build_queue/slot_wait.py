@@ -1,7 +1,7 @@
 """Wait for repository slot capacity through the build queue."""
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -16,8 +16,8 @@ from threading import Thread
 
 from scripts.lib import conf
 from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RAW_ID, RECORDED_STEP_NAMES, RECORDED_VERBS,
-                                     SHORT_OWNER_STEPS, VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
-                                     command_script, is_recorded_step, queue_identifier, script_file, verify_command)
+                                     SHORT_OWNER_STEPS, VERIFY_VERBS, OtherCommand, StepJob, StepNames, VerifyCommand, command_job,
+                                     command_script, current_command_job, is_recorded_step, queue_identifier, script_file, verify_command)
 from scripts.build_queue import admission_wire as wire
 from scripts.message.owner_role import OwnerRole
 
@@ -148,7 +148,7 @@ class SlotCaller:
     def step(self) -> QueueRowName | NoNamedStep:
         """Read the command only when the slot must wait."""
         if self.command:
-            return command_slot_name(self.command, RECORDED_STEP_NAMES)
+            return command_slot_name(self.command, RECORDED_STEP_NAMES, job_reader=current_command_job)
         return recorded_step(self.work, RECORDED_STEP_NAMES)
 
 
@@ -239,12 +239,14 @@ def verify_package(step: str, arguments: tuple[str, ...]) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
-def command_slot_name(command: Sequence[str], names: StepNames) -> QueueRowName | NoNamedStep:
+def command_slot_name(command: Sequence[str], names: StepNames, *,
+                      job_reader: Callable[[Sequence[str]], StepJob | OtherCommand] = command_job
+                      ) -> QueueRowName | NoNamedStep:
     """Name the first build job, or the first script in the command."""
     script = ""
     try:
         for argv in command_programs(command):
-            job = command_job(argv)
+            job = job_reader(argv)
             verify = verify_command(argv)
             if isinstance(job, StepJob):
                 if not isinstance(verify, VerifyCommand):

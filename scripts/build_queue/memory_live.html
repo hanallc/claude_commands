@@ -827,8 +827,10 @@ function stepTooltip(key, data) {
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
-    rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
-      row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
+    const waitField = row.why === "natemerge's merge test" ? field('Reason', row.reason)
+      : field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
+          row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn');
+    rows.push(waitField, ...routeFields(row));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
       let free = row.free ?? queueCapMemory(data).free / GIB;
       if (row.head_room?.rows?.length) {
@@ -1371,7 +1373,7 @@ function renderWalk(d) {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     const tip = `wait:${w.key}`;
     cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, `wait${i === 0 ? " wait-first" : ""}`);
-    const note = w.why === "the build in the same Cargo folder" ? w.reason : "";
+    const note = ["the build in the same Cargo folder", "natemerge's merge test"].includes(w.why) ? w.reason : "";
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true), note)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);

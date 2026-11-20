@@ -7,23 +7,28 @@ from scripts.build_queue import admission_records
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from collections.abc import Callable
+from enum import Enum, auto
 import unittest
 import io
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
+import sys
 import tempfile
 import threading
 from dataclasses import replace
 from typing import cast, final, override
 from contextlib import redirect_stdout, redirect_stderr
 from unittest import mock
-from scripts.production import merge_gate
+from scripts.production import land_runs, merge_gate
 from scripts.lib import build_folders
+from scripts.build_hold import build_hold
 from scripts.production.gate_modules import GateRefused
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import progress_profile as progress, step_estimator
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.admission_test_support import only_admitted, FakeClock, wait_reply, snapshot_with_head_cause
 from scripts.lint import memory_admit
@@ -69,9 +74,218 @@ class ServiceGateFixture(GateSuitesFixture):
         return Path(record.path), service.reservation_row(record)
 
 
+class AwsReroute(Enum):
+    DECLINES = auto()
+    COMPLETES = auto()
+    FALLS_BACK = auto()
+
 
 @final
 class SharedGateAdmissionTests(ServiceGateFixture):
+    def check_named_module_admission(self, *, landing: bool = False, integrate_running: bool = False) -> None:
+        self.configure_gate(f"# one of: on, off\n{memory_admit.MERGE_TEST_WAIT_KEY}=on\n")
+        fixture = self.admission
+        name = "hooks/test_first.py"
+        args = ["--tests-only", "--repo", str(self.checkout), "--module", name]
+        start_time = admission_records.process_start_time(os.getpid())
+        assert start_time is not None
+        owner = wire.Owner(os.getpid(), start_time)
+        with fixture.loop_turn():
+            fixture.proc.register(owner)
+            argv = ["python3", "merge_gate.py", *args]
+            _ = (fixture.proc.path / str(owner.pid) / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
+
+        start_job = merge_gate.start_gate_job
+
+        def start(suite: str, path: Path, argv: list[str], repo: Path,
+                  environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+            with fixture.loop_turn():
+                if landing:
+                    self.assertEqual(fixture.server.reservations, {})
+                else:
+                    _, row = self.reservation()
+                    self.assertEqual(row.get("job"), StepJob("test-modules", modules=1))
+            return start_job(suite, path, argv, repo, environment, log)
+
+        waits: list[wire.Wait] = []
+        if integrate_running:
+            with fixture.loop_turn():
+                request = fixture.request(step="merge-gate")
+                integrate = only_admitted(fixture.server.handle_request(
+                    replace(request, identity=replace(request.identity, job=StepJob("integrate")))))
+                fixture.allow_next_start()
+
+            def release_merge(_output: client.WaitOutput, reply: wire.Wait) -> None:
+                waits.append(reply)
+                with fixture.loop_turn():
+                    self.assertEqual(reply.text, admission_records.LANDING_WAIT_TEXT)
+                    self.assertEqual(self.module_events(), [])
+                    pending, = fixture.server.waiters.values()
+                    self.assertEqual(pending.row.get("job"), StepJob("test-modules", modules=1))
+                    fixture.release(integrate)
+                    _ = fixture.run_pass()
+
+            _ = self.enterContext(mock.patch.object(client.WaitOutput, "__call__", new=release_merge))
+
+        result = build_hold.ProcessIdentity(owner.pid, owner.start_time) if landing else land_runs.NoNatemergeLand()
+        repository = admission_records.RepositoryIdentity("fixture-repository", "claude_commands")
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(land_runs, "natemerge_land", return_value=result) as check,
+              mock.patch.object(step_estimator, "git_identity", return_value=(repository, "merge")),
+              mock.patch.object(merge_gate, "start_gate_job", side_effect=start),
+              mock.patch.object(merge_gate, "record_gate_run") as record):
+            self.assertEqual(merge_gate.main(args), 0)
+            self.assertEqual(sum(call.args[0] == build_hold.PROC_ROOT for call in check.call_args_list), 1)
+            record.assert_not_called()
+        self.assertEqual(self.pass_records(), [])
+        self.assertEqual([(row["suite"], row["module"]) for row in self.module_events()
+                          if row["event"] == "start"], [("hooks", "test_first.py")])
+        self.assertEqual(len(waits), int(integrate_running))
+        self.assert_gate_released()
+
+    def test_natemerge_named_modules_use_the_whole_machine(self) -> None:
+        self.check_named_module_admission(landing=True)
+
+    def test_unit_named_modules_take_a_queue_place(self) -> None:
+        self.check_named_module_admission()
+
+    def test_unit_named_modules_wait_while_a_local_merge_test_runs(self) -> None:
+        self.check_named_module_admission(integrate_running=True)
+
+    def check_merge_route_retry(self, outcome: AwsReroute, *, cli: bool = False) -> None:
+        from scripts.aws_target import cloud_gate, gate_box
+
+        interval = 60
+        self.configure_gate(f"# one of: on, off\n{memory_admit.MERGE_TEST_WAIT_KEY}=on\n"
+            + f"# range: 5e-324..\n{memory_admit.NATEDEV_REROUTE_KEY}={interval}\n")
+        fixture = self.admission
+        local_result = merge_gate.GateRun((), 1, 0, selection_certified=True)
+        jobs = (merge_gate.GateJobResult("hooks", "test_first.py", 1, 2, "AWS test failed"),) if cli else ()
+        remote_result = gate_box.decode_run(gate_box.encode_run(
+            merge_gate.GateRun(jobs, 2, 0, selection_certified=True)))
+        start = admission_records.process_start_time(os.getpid())
+        assert start is not None
+        owner = wire.Owner(os.getpid(), start)
+        with fixture.loop_turn():
+            merge = fixture.request(need=admission_records.GIB, step="merge-gate")
+            integrate = only_admitted(fixture.server.handle_request(
+                replace(merge, identity=replace(merge.identity, job=StepJob("integrate")))))
+            fixture.allow_next_start()
+            competitor = fixture.request(step="nextest")
+        assert isinstance(competitor.profile, admission_records.StepProfile)
+        competitor = replace(competitor, profile=replace(competitor.profile, repo="claude_commands"))
+        entries: list[wire.AdmitRequest] = []
+        attempts = 0
+        show_wait = client.WaitOutput.__call__
+
+        def observe(output: client.WaitOutput, reply: wire.Wait) -> None:
+            show_wait(output, reply)
+            cause = reply.reason.cause if isinstance(reply.reason, admission_records.HeadAdmissionStatus) else reply.reason
+            self.assertIsInstance(cause, admission_records.LandingWait)
+            assert isinstance(cause, admission_records.LandingWait)
+            if entries and (outcome is not AwsReroute.FALLS_BACK or len(entries) > 1):
+                return
+            with fixture.loop_turn():
+                local = next((waiting.request for waiting in fixture.server.waiters.values()
+                              if waiting.request.owner == owner), None)
+                if entries and (local is None or local.episode == entries[0].episode):
+                    return
+                assert isinstance(local, wire.AdmitRequest)
+                if entries:
+                    self.assertEqual(local.since, entries[0].since)
+                    self.assertEqual(fixture.queue_pids(), [owner.pid, competitor.owner.pid])
+                    entries.append(local)
+                    fixture.release(integrate)
+                    fixture.allow_next_start()
+                    _ = fixture.run_pass()
+                    return
+                entries.append(local)
+                later = replace(competitor, since=local.since + 0.1)
+                self.assertIsInstance(fixture.server.handle_request(later)[0], wire.Wait)
+                fixture.clock.advance(interval)
+                _ = fixture.run_pass()
+
+        def route(repo: Path, **_options: object) -> merge_gate.GateRun | str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return "AWS is busy"
+            self.assertEqual(attempts, 2)
+            with fixture.loop_turn():
+                entry, = entries
+                self.assertIsInstance(fixture.server.waiters[entry.episode].cloud_route_check, service.CloudRouteCheck)
+                if outcome is not AwsReroute.FALLS_BACK:
+                    fixture.release(integrate)
+                    fixture.allow_next_start()
+                    _ = fixture.run_pass()
+                self.assertEqual(fixture.queue_pids(), [owner.pid, competitor.owner.pid])
+                self.assertEqual(set(fixture.server.reservations),
+                                 {merge.episode} if outcome is AwsReroute.FALLS_BACK else set())
+            if outcome is not AwsReroute.DECLINES:
+                with cloud_gate.cloud_reservation(repo, self.state / "aws.cgroup", merge_gate.SuiteMode.MERGE_GATE) as aws:
+                    with fixture.loop_turn():
+                        record, = (record for record in fixture.server.reservations.values()
+                                   if isinstance(record.place, wire.CloudPlace))
+                        self.assertEqual(record.owner, owner)
+                        self.assertNotIn(entry.episode, fixture.server.waiters)
+                        self.assertNotIn(entry.episode, {place.episode for place in fixture.server.places.values()})
+                        self.assertNotIn(owner.pid, fixture.queue_pids())
+                        if outcome is AwsReroute.FALLS_BACK:
+                            self.assertIn(competitor.episode, fixture.server.waiters)
+                        else:
+                            self.assertIn(competitor.episode, fixture.server.reservations)
+                    aws.status = int(not remote_result.passed)
+                return "AWS fell back" if outcome is AwsReroute.FALLS_BACK else remote_result
+            return "AWS is still busy"
+
+        def local(repo: Path, *_args: object, route_again: Callable[[], None], **_options: object) -> merge_gate.GateRun:
+            with merge_gate.gate_reservation(repo, self.state, merge_gate.BuildHoldWait(), route_again=route_again) as place:
+                with fixture.loop_turn():
+                    self.assertIn(entries[-1].episode, fixture.server.reservations)
+                    self.assertIn(competitor.episode, fixture.server.waiters)
+                place.status = 0
+            return local_result
+
+        repository = admission_records.RepositoryIdentity("fixture-repository", "claude_commands")
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(client.CLOCK, "now", side_effect=fixture.clock.now),
+              mock.patch.object(step_estimator, "git_identity", return_value=(repository, "merge")),
+              mock.patch.object(client.WaitOutput, "__call__", new=observe),
+              mock.patch.object(cloud_gate, "route", side_effect=route),
+              mock.patch.object(merge_gate, "run_suites", side_effect=local)):
+            if cli:
+                script = str(Path(merge_gate.__file__))
+                argv = [script, "--tests-only", "--repo", str(self.checkout)]
+                with mock.patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as exit_code:
+                    _ = runpy.run_path(script, run_name="__main__")
+                self.assertEqual(exit_code.exception.code, 1)
+                self.assertEqual(self.module_events(), [])
+            else:
+                run = merge_gate.run_gate_suites(self.checkout)
+                self.assertEqual(run, remote_result if outcome is AwsReroute.COMPLETES else local_result)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(entries), 2 if outcome is AwsReroute.FALLS_BACK else 1)
+        with fixture.loop_turn():
+            for entry in entries:
+                self.assertNotIn(entry.episode, fixture.server.waiters)
+                self.assertNotIn(entry.episode, fixture.server.reservations)
+            self.assertNotIn(owner.pid, fixture.queue_pids())
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            self.assertIn(competitor.episode, fixture.server.reservations)
+
+    def test_the_aws_grant_releases_the_local_place_before_a_result(self) -> None:
+        self.check_merge_route_retry(AwsReroute.COMPLETES)
+
+    def test_the_cli_keeps_the_completed_aws_result(self) -> None:
+        self.check_merge_route_retry(AwsReroute.COMPLETES, cli=True)
+
+    def test_the_older_gate_starts_first_when_integrate_ends_during_the_aws_check(self) -> None:
+        self.check_merge_route_retry(AwsReroute.DECLINES)
+
+    def test_a_fallback_after_an_aws_grant_rejoins_ahead_of_a_later_held_gate(self) -> None:
+        self.check_merge_route_retry(AwsReroute.FALLS_BACK)
+
     @gate_suites("lib", "hooks")
     def test_suite_progress_counts_type_jobs_and_clears_the_counter_for_reruns(self) -> None:
         self.write(self.state / "fail-first-lib", "fail")
