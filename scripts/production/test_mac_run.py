@@ -903,6 +903,7 @@ cleanup_mac_run
         [checkout] = checkouts
         self.assertEqual((checkout / "source.txt").read_text(), "content\n")
         record = copy_record.read_record(checkout / copy_record.RECORD)
+        self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         self.assertTrue(scratch.task_has_end_evidence(record))
         expected = f"kept for a manual removal list: {checkout} (scratch, task {record.task} ended)"

@@ -32,7 +32,7 @@ from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
 from scripts.lib import build_folders, copy_record, nix_env, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
-from scripts.lint import folder_audit, sweep, tmp_sweep
+from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
 from textwrap import dedent
 from scripts.mac_test import floor_claims, offload
@@ -40,6 +40,7 @@ from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.message import sessions
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
+from scripts.lib import removal_guard
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
 
@@ -1194,14 +1195,19 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertFalse(task_mark.exists())
         self.assertFalse(cargo_mark.exists())
 
-    def test_temporary_sweep_clears_clone_trust(self) -> None:
+    def test_temporary_review_keeps_clone_trust(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:sweep-trust")
         self.add_clone_project_settings(checkout, paths)
+        before = tuple(path.read_bytes() for path in paths)
         entry = tmp_sweep.RemovableEntry(str(checkout), str(checkout.parent), time.time(), 1)
-        self.assertTrue(tmp_sweep.remove_entry(entry, tmp_sweep.Sweep(), False))
-        self.assertFalse(checkout.exists())
-        self.assert_clone_project_removed(checkout, paths)
+        result = tmp_sweep.Sweep()
+        plan = removal_guard.RemovalList(removal_guard.Tool.TEMPORARY)
+        self.assertFalse(tmp_sweep.remove_entry(entry, result, False, plan=plan))
+        self.assertEqual(list(plan.rows), [checkout])
+        self.assertTrue(checkout.is_dir())
+        self.assertEqual(result.kept.get("manual review"), [str(checkout)])
+        self.assertEqual(tuple(path.read_bytes() for path in paths), before)
 
     def test_folder_audit_clears_clone_trust(self) -> None:
         paths = self.clone_trust_files()
@@ -1336,7 +1342,7 @@ with patch.object(subprocess, 'run', pause_clone):
         for path in paths:
             self.assertNotIn(str(checkout.resolve()), self.trust_projects(path))
 
-    def test_removal_rechecks_unsaved_work_after_cargo_output_cleanup_refuses(self) -> None:
+    def test_removal_rechecks_unsaved_work_after_cargo_review_fails(self) -> None:
         task = "gate:retry-cargo-cleanup"
         checkout = copies.clone(self.source, task)
         cache = self.base / "external-cargo-output"
@@ -1344,30 +1350,19 @@ with patch.object(subprocess, 'run', pause_clone):
         _ = (cache / "output").write_text("saved build output")
         roots = CargoOutputRoots(checkout, checkout / "target", cache)
         _ = self.enterContext(fake_cargo_output_roots(roots))
-        self.enterContext(mock.patch.dict(os.environ, {"LINT_SWEEP_STATE_DIR": str(self.base / "cargo-state")}))
-        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((roots,)))
-
-        def clean(path: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
-            self.assertEqual(saved[0].roots, roots)
-            folder_audit.clean_checkout_cargo_output(path)
-
-        with (mock.patch.object(scratch, "cargo_checkout_peers", return_value=()),
-              mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])),
-              mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean)):
-            with (cache / ".cargo-lock").open("w") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                with self.assertRaisesRegex(OSError, "Cargo output is locked"):
-                    _ = scratch.remove_task_copy(checkout, task, time.time())
-                self.assertTrue(checkout.is_dir())
-                self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
-                work = checkout / "new-work.txt"
-                _ = work.write_text("work written after Cargo cleanup refused")
+        with mock.patch.object(scratch, "cargo_checkout_peers", return_value=()):
+            with (mock.patch.object(removal_guard.RemovalList, "publish", side_effect=OSError("Cargo review failed")),
+                  self.assertRaisesRegex(OSError, "Cargo review failed")):
+                _ = scratch.remove_task_copy(checkout, task, time.time())
+            self.assertTrue(checkout.is_dir())
+            self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
+            work = checkout / "new-work.txt"
+            _ = work.write_text("work written after Cargo review failed")
 
             result = scratch.remove_task_copy(checkout, task, time.time())
             self.assertIsInstance(result, scratch.KeptFolder)
             assert isinstance(result, scratch.KeptFolder)
-            self.assertTrue(work.is_file(), "The retry must retain work written after the refusal.")
-            self.assertEqual(work.read_text(), "work written after Cargo cleanup refused")
+            self.assertEqual(work.read_text(), "work written after Cargo review failed")
             self.assertIn("uncommitted changes", result.reason)
             self.assertFalse(scratch.removal_mark(checkout).exists())
             self.assertTrue(scratch.cargo_removal_mark(checkout).exists())
@@ -1376,7 +1371,11 @@ with patch.object(subprocess, 'run', pause_clone):
             work.unlink()
             self.assertTrue(scratch.end_copy(checkout, task, time.time()))
         self.assertFalse(checkout.exists())
-        self.assertFalse(cache.exists())
+        self.assertEqual((cache / "output").read_text(), "saved build output")
+        [plan] = (Path.home() / removal_guard.LIST_DIRECTORY).glob("*.jsonl")
+        [line] = plan.read_text().splitlines()
+        row = removal_guard.ListedEntry.parse(line)
+        self.assertEqual((row.tool, row.path, row.fingerprint), (removal_guard.Tool.CARGO, cache, ""))
         self.assertFalse(scratch.removal_mark(checkout).exists())
         self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
 
