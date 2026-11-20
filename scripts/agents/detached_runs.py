@@ -42,7 +42,7 @@ from importlib.machinery import ModuleSpec, SourceFileLoader
 from importlib.util import spec_from_file_location
 from pathlib import Path
 from types import CodeType, ModuleType
-from typing import IO, Literal, NotRequired, TypedDict, TypeGuard, cast, override
+from typing import IO, TYPE_CHECKING, Literal, NotRequired, TypedDict, TypeGuard, cast, override
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
@@ -51,6 +51,9 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
+
+if TYPE_CHECKING:
+    from scripts.accounts.session_state import RunEvidence
 
 # Exit status of `start` when no worker or director owns the run: run the command attached.
 NOT_A_DETACHED_WORKER = 3
@@ -548,6 +551,7 @@ def _retired_worker_result(record: RunRecord) -> bool:
 
 
 SUPERSEDED_ORPHAN_DELIVERY = "nothing delivered: the supervisor is gone and a newer run of the same command answers"
+OTHER_PASS_DELIVERY = "nothing delivered: the result belongs to a different pane pass"
 
 
 @dataclass
@@ -899,22 +903,34 @@ def _worker_result_pending(delivery: str) -> bool:
     return delivery.startswith((DEFERRED_WORKER_RESULT, FAILED_WORKER_SUBMISSION, UNCONFIRMED_WORKER_RESULT))
 
 
+def result_is_from_another_pass(record: Mapping[str, object], instance: object) -> bool:
+    """Require two known pass IDs before rejecting a result."""
+    linked = record.get("pane_dispatch_id")
+    return (isinstance(linked, str) and bool(linked)
+            and isinstance(instance, str) and bool(instance) and linked != instance)
+
+
 def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dispatch_id: str = "",
-                   include_legacy_pass: bool = False) -> dict[str, float | DeliveryTimeUnknown | WorkerResultDeferred]:
-    """Find finished results that the worker received or still needs."""
+                   include_legacy_pass: bool = False,
+                   ) -> tuple[dict[str, float | DeliveryTimeUnknown | WorkerResultDeferred], set[str]]:
+    """Find finished results and identify results from other passes."""
     results: dict[str, float | DeliveryTimeUnknown | WorkerResultDeferred] = {}
+    other_passes: set[str] = set()
     for record in _registered_runs(runs, worker.id):
-        if record.get("staff_id") != worker.id or record["started_at"] < since or record["status"] != "finished":
+        if record.get("staff_id") != worker.id:
             continue
-        dispatch = record.get("pane_dispatch_id")
-        if pane_dispatch_id and dispatch != pane_dispatch_id:
-            if not include_legacy_pass or (isinstance(dispatch, str) and dispatch):
-                continue
+        if result_is_from_another_pass(record, pane_dispatch_id):
+            other_passes.add(record["run_id"])
+            continue
+        if record["started_at"] < since or record["status"] != "finished":
+            continue
+        if pane_dispatch_id and not include_legacy_pass and record.get("pane_dispatch_id") != pane_dispatch_id:
+            continue
         if _worker_result_pending(record.get("delivery", "")):
             results[record["run_id"]] = WorkerResultDeferred.PENDING
         elif record.get("delivery", "").startswith((f"sent: worker {record['worker']} at ", f"sent: worker {worker.name} at ", "already delivered: ")):
             results[record["run_id"]] = record.get("delivered_at", DeliveryTimeUnknown.UNRECORDED)
-    return results
+    return results, other_passes
 
 
 @dataclass(frozen=True)
@@ -1001,6 +1017,10 @@ def live_run_evidence_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]
         found.extend(evidence.runs)
         errors.extend(evidence.read_errors)
     return LiveRunEvidence(tuple(found), tuple(errors))
+
+
+if TYPE_CHECKING:
+    _accounts_run_evidence: Callable[..., RunEvidence] = live_run_evidence_in_folders
 
 
 def _recover_indexed_stop(path: Path, raw: dict[str, object]) -> None:
@@ -1282,6 +1302,10 @@ class RunDeliveryFailed(RuntimeError):
     """The running record still needs result delivery."""
 
 
+class _WorkerPassDeliveryBlocked(RuntimeError):
+    """Stop pane input and save the delivery status."""
+
+
 def _result_received(member: staff.StaffRow, membership: staff.StaffSnapshot, marker: str) -> bool:
     from scripts.message import send
 
@@ -1347,13 +1371,43 @@ def deliver(record: RunRecord, result: CommandResult, *,
                 return _save_delivery(path, f"already delivered: {record['run_id']}")
         except (OSError, ValueError) as error:
             reason = f"worker transcript is unavailable: {error}"
-        if saved and not saved.startswith((DEFERRED_WORKER_RESULT, FAILED_WORKER_SUBMISSION)):
+        if saved and not _worker_result_pending(saved):
             return saved
+        worker = member
+        unconfirmed = saved.startswith(UNCONFIRMED_WORKER_RESULT)
+
+        def check_pass() -> None:
+            linked = record.get("pane_dispatch_id")
+            if isinstance(linked, str) and linked:
+                from scripts.direct import recorder_state
+                from scripts.herdr import worker_panes
+
+                try:
+                    run = worker_panes.worker_run(worker, record=membership)
+                    instance = worker_panes.worker_pass(worker, run, record=membership).get("instance_id")
+                except (OSError, ValueError, recorder_state.OldRecorderState) as error:
+                    raise _WorkerPassDeliveryBlocked(
+                        DEFERRED_WORKER_RESULT + f"worker pass is unavailable: {error}") from error
+                if result_is_from_another_pass(record, instance):
+                    raise _WorkerPassDeliveryBlocked(OTHER_PASS_DELIVERY)
+
+        def before_input() -> None:
+            check_pass()
+            _ = _save_delivery(path, UNCONFIRMED_WORKER_RESULT + "the prompt may have sent input")
+
         receipt = send.WorkerResultReceipt(marker, wait_for_idle=worker_input == WorkerResultInput.TURN_ENDED,
-            worker_only=self_stop,
-            before_input=lambda: _save_delivery(path, UNCONFIRMED_WORKER_RESULT + "the prompt may have sent input"))
-        delivery = send.deliver_worker_text(member, membership, marker + "\n" + text,
-            sender="detached-runs", timeout=send_budget.seconds(), reason=reason, receipt=receipt)
+            worker_only=self_stop, before_input=before_input)
+        try:
+            check_pass()
+            if unconfirmed:
+                return saved
+            delivery = send.deliver_worker_text(worker, membership, marker + "\n" + text,
+                sender="detached-runs", timeout=send_budget.seconds(), reason=reason, receipt=receipt)
+        except _WorkerPassDeliveryBlocked as blocked:
+            status = str(blocked)
+            if unconfirmed and status != OTHER_PASS_DELIVERY:
+                return saved
+            return _save_delivery(path, status)
         if isinstance(delivery, send.WorkerResultNotSubmitted):
             saved_delivery = FAILED_WORKER_SUBMISSION + delivery.detail
         elif isinstance(delivery, send.WorkerResultUnconfirmed):

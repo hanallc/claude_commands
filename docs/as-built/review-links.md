@@ -830,11 +830,9 @@ The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
 The chip rows wrap when the available width decreases.
 
-The Expand all and Collapse all buttons sit above the number column at the left of the item count row.
-They use the vendored Lucide icons `chevrons-up-down` and `chevrons-down-up`.
-Each button applies to all items that match the current filters.
-Each button applies the current text in the words box before it selects the items.
-Hidden items keep their open or closed state.
+Opening a row closes the previous row on both List and Review.
+The two pages use the same code to open a row.
+The List shows the item count above the table.
 
 A link under Links opens the target item in the console.
 The table can change Show to All to reveal the target.
@@ -844,7 +842,7 @@ The table scrolls to the target and highlights it briefly.
 The table leaves a gap below the sticky status banner when it shows.
 A missing target shows “Item #N is not on the List”.
 Changing a filter or the sort order clears this notice.
-Back restores the previous filters, open rows, and scroll position even when the address stays the same.
+Back restores the previous filters, open row, and scroll position even when the address stays the same.
 
 Each List record stores unique `ReviewItem.key` values in link order, without duplicates.
 `the_list.py link L<n> --review <id> [--review <id> ...] --source <who>` adds links.
@@ -919,6 +917,11 @@ The shared table names each linked key that the page cannot find.
 It keeps the found cards when another linked key is missing.
 Linked counts use only the selected cards, including selected parked cards.
 The List number column and the Review ID column use the shared no-wrap rule.
+
+On desktop, the List sizes the Owner column to the widest owner name within the available space.
+Item and Next step share the remaining width in their original proportion.
+On desktop and phone, owner names wrap at hyphens first.
+A segment wraps within a word only if the segment exceeds the available width.
 
 The Owner menu includes record owners without a current staff row.
 The Producer menu beside it lists each producer that a record names.
@@ -1076,7 +1079,6 @@ Opening an individual row with an unread answer uses the same signed read operat
 The List sends this request after the text of each unread answer enters the viewport while the row is open.
 This rule also applies to direct links and to answers that appear in linked details after refresh.
 The tab and console frame must also be visible.
-Expand all leaves answers unread.
 A newer update stays unread if it arrives before the read saves.
 With Unread only on, the row can stay visible after this read.
 The row counts toward its matching Owner and Producer chips and the selected Show chip.
@@ -1222,7 +1224,7 @@ It shows a save or send notice as soon as the user submits a form.
 An unread update shows a dot and marks the navigation entry as new.
 The navigation key includes the record ID and update time.
 The page uses `page_refresh_seconds` and the shared refresh helper.
-A refresh retains the search text, selection, focus, scroll position, open rows, and filters.
+A refresh retains the search text, selection, focus, scroll position, open row, and filters.
 An older response cannot replace a newer response.
 Phone layouts show each row as a card.
 The List uses the published Review snapshot for rows with all their linked records.
@@ -1475,6 +1477,7 @@ An older row without Kind shows no kind line.
 The page shows every row with its recorded kind.
 
 The Review address is `/console/review.html`.
+A link can name a row by its key or by the ID the row shows.
 Each Change card shows its check text and recorded proof as plain paragraphs that keep their line breaks.
 A showrunner Answer on a Change or Investigation card, and a Reply on a Question card, show code blocks with a copy control.
 A code block is fenced code or a line that holds only one backtick span.
