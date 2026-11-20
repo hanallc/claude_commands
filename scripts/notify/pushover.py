@@ -185,6 +185,15 @@ def sender_name(source: str) -> str:
     return " ".join(source.removeprefix(SESSION_SOURCE).split())[:SOURCE_MAX]
 
 
+def _phone_footer(sender: str, text_id: str) -> str:
+    return f"\n\nSent by: {sender} · Template: {text_id or FREE_TEXT}"
+
+
+def phone_message_limit(source: str, text_id: str) -> int:
+    """Return the message space before the phone footer."""
+    return MESSAGE_MAX - len(_phone_footer(sender_name(source), text_id))
+
+
 def log(source: str, priority: str, title: str, message: str, outcome: str, *,
         key: str = "", template: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE) -> None:
     entry: PushLogRecord = {"time": datetime.now().astimezone().replace(microsecond=0).isoformat(),
@@ -597,8 +606,7 @@ def post_message(source: str, priority: str, title: str, message: str,
         log(source, priority, title, message, f"{REFUSED_BEFORE_SENDING}: no sender" + suffix)
         print(f"pushover: {REFUSED_BEFORE_SENDING}: no sender. Name the sender with --source NAME.", file=sys.stderr)
         return 2
-    footer = f"\n\nSent by: {sender} · Template: {text_id or FREE_TEXT}"
-    message = message[:MESSAGE_MAX - len(footer)].rstrip() + footer
+    message = message[:phone_message_limit(source, text_id)].rstrip() + _phone_footer(sender, text_id)
     keys = read_keys(keys_file)
     if keys is None:
         log(source, priority, title, message, "keys missing" + suffix)

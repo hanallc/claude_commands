@@ -88,6 +88,7 @@ class HeldCellCorrectionTests(LedgerTestCase):
                     with self.assertRaisesRegex(style_ledger.LedgerError, finding.finding_id):
                         ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket=ticket)
                     self.assertEqual(ledger.database.read_bytes(), before)
+                ledger.ticket_drop(ticket)
 
     def test_newer_clean_with_changed_inputs_records_and_withdraws(self) -> None:
         for index, changed in enumerate(("file", "rule"), 1):

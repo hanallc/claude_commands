@@ -751,7 +751,9 @@ class GateRecovery:
                 try:
                     if descriptor >= 0:
                         status = os.fstat(descriptor)
-                        if (status.st_dev, status.st_ino) == (token.device, token.inode):
+                        # The jobserver device reclaims tokens from a dead owner.
+                        if (stat.S_ISFIFO(status.st_mode)
+                                and (status.st_dev, status.st_ino) == (token.device, token.inode)):
                             _ = os.write(descriptor, bytes.fromhex(token.value))
                     _ = self.tokens.pop()
                     self.save()
@@ -1074,7 +1076,7 @@ def stop_at_time_limit(running: Sequence[RunningGateJob], failed: Sequence[GateJ
 
 
 def one_minute_load() -> float:
-    return float(Path("/proc/loadavg").read_text().split()[0])
+    return os.getloadavg()[0]
 
 
 def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
@@ -1450,7 +1452,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     runner = module_runner(repo)
     tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
-        raise GateRefused(f"the test runner requires writable tmpfs at {tmpfs}")
+        raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     # Remove the free test folders that a run ended by a signal left; a held folder costs one lock try.
     build_folders.sweep_temporary_build_folders(gate_test_parent(tmpfs), wait=False)
     hold = BuildHoldWait() if shared else None

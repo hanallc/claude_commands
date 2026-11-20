@@ -8099,6 +8099,21 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertIn("Run result 42.", retained)
         self.assertEqual(self.fixture.world.commands, [])
 
+    def test_transcript_read_failure_after_input_keeps_the_worker_result_unconfirmed(self) -> None:
+        marker = "Detached run: fixture"
+        pane = "w1:p1"
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        receipt = send.WorkerResultReceipt(marker)
+        with mock.patch.object(send.WorkerResultReceipt, "received", side_effect=OSError("fixture read failure")):
+            result = send.deliver_worker_text(self.row, staff.snapshot(), marker,
+                sender="detached-runs", timeout=send.delivery_timeout(), receipt=receipt)
+        self.assertIsInstance(result, send.WorkerResultUnconfirmed)
+        self.assertEqual((result.outcome, result.detail),
+                         ("retry", "worker transcript is unavailable: fixture read failure"))
+        prompts = [command[:3] for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertEqual(prompts, [("agent", "prompt", pane)])
+        self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
+
     def test_unavailable_workers_route_the_original_message_and_one_reason_to_the_holder(self) -> None:
         for state in ("blocked", "stopped", "closed", "unknown", "uncertain", "unknown-status"):
             with self.subTest(state=state):
@@ -8128,11 +8143,29 @@ class PaneWorkerMessageTests(unittest.TestCase):
                     notes = [line for line in errors.getvalue().splitlines() if "process read unavailable" in line]
                     self.assertEqual(len(notes), 1, errors.getvalue())
                     self.assertIn("process read unavailable", retained)
-                    del self.fixture.world.unknown[pane]
                 elif state == "uncertain":
                     self.assertIn("terminal identity", retained)
                 elif state == "unknown-status":
                     self.assertIn("Worker unknown-status: worker is unknown", retained)
+                with mock.patch.object(send, "_send") as fallback, redirect_stderr(io.StringIO()):
+                    receipt = send.WorkerResultReceipt("Detached run: fixture", worker_only=True)
+                    result = send.deliver_worker_text(row, staff.snapshot(), "Detached run: fixture",
+                        sender="detached-runs", timeout=send.delivery_timeout(), receipt=receipt)
+                self.assertEqual(result.outcome, "retry", result.detail)
+                self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
+                fallback.assert_not_called()
+                if state == "unknown":
+                    del self.fixture.world.unknown[pane]
+
+        with self.subTest(state="holder row unavailable"):
+            row = self.fixture.worker("no-holder")
+            receipt = send.WorkerResultReceipt("Detached run: fixture", worker_only=True)
+            with mock.patch.object(send, "_send") as fallback:
+                result = send.deliver_worker_text(row, staff.StaffSnapshot(()), "Detached run: fixture",
+                    sender="detached-runs", timeout=send.delivery_timeout(), receipt=receipt)
+            self.assertEqual(result.outcome, "retry")
+            self.assertIn("worker holder is unavailable", result.detail)
+            fallback.assert_not_called()
 
 
 if __name__ == "__main__":

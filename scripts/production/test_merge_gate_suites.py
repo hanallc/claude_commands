@@ -291,6 +291,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         output = io.StringIO()
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(os, "cpu_count", return_value=2),
+              mock.patch.object(os, "getloadavg", side_effect=[(1.25, 4.0, 5.0), (2.5, 6.0, 7.0)]),
               mock.patch.object(merge_gate, "typecheck_python", return_value=Path(sys.executable)),
               contextlib.ExitStack() as blocked, contextlib.redirect_stdout(output)):
             for name in ("BuildHoldWait", "gate_reservation", "queue_place", "shared_cpu_pool",
@@ -302,6 +303,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         self.assertTrue(run.passed, output.getvalue())
         self.assertEqual(len(run.jobs), 3)
         self.assertIn("at most 2 modules at once", output.getvalue())
+        self.assertIn("One-minute load: start=1.25 max=2.50 end=2.50", output.getvalue())
         active: set[int] = set()
         peak = 0
         for event in self.module_events():

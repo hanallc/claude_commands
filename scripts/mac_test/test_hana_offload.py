@@ -1,6 +1,8 @@
 """Exercise Hana offload without SSH, AWS, live holds, or a local execution grant."""
 from __future__ import annotations
 
+import errno
+
 from contextlib import ExitStack, nullcontext, redirect_stdout
 from dataclasses import replace
 from functools import partial
@@ -27,7 +29,7 @@ from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_service, placement
 from scripts.build_queue import test_placement as queue_fixtures
 from scripts.build_targets import target_config
-from scripts.buildlog import record, treekey
+from scripts.buildlog import record, store, treekey
 from scripts.copies import copies
 from scripts.direct import runner_result
 from scripts.lib import conf, process_start
@@ -231,6 +233,30 @@ source_forbidden_paths=*.key
                        result: offload.ResultDestination = offload.NO_RESULT_FILE) -> int:
         with (mock.patch.object(offload, 'report_placement_result'), mock.patch.object(offload, 'persist_attempt')):
             return offload.finish_offload(self.controller, replace(self.request, result=result), outcome, time.monotonic())
+
+    def test_buildlog_write_failure_preserves_the_accepted_exit_status(self) -> None:
+        with (self.context(),
+              mock.patch.object(record, 'publish_hana_result', side_effect=OSError(errno.ENOSPC, 'disk full')),
+              mock.patch.object(store, 'note_error') as note):
+            outcome = self.run_claimed()
+            self.assertEqual(self.finish_claimed(outcome), 0)
+            note.assert_called_once()
+            self.assertIn('disk full', str(note.call_args))
+        self.assertIsInstance(self.controller.pending, offload.SettledDispatchOperations)
+        self.assertEqual(self.controller.attempt_evidence.completion, 'confirmed')
+
+    def test_cost_journal_write_failure_preserves_the_accepted_exit_status(self) -> None:
+        with (self.context(),
+              mock.patch.object(execution, 'record_attempt_charge', side_effect=OSError(errno.ENOSPC, 'disk full')),
+              mock.patch.object(record, 'publish_hana_result') as publish,
+              mock.patch.object(store, 'note_error') as note):
+            outcome = self.run_claimed()
+            self.assertEqual(self.finish_claimed(outcome), 0)
+            publish.assert_called_once()
+            note.assert_called_once()
+            self.assertIn('attempt charge: [Errno 28] disk full', str(note.call_args))
+        self.assertEqual(self.output.getvalue(), b'compiler output')
+        self.assertEqual(self.controller.attempt_evidence.completion, 'confirmed')
 
     def test_accepted_result_releases_the_claim_during_account_prepare(self) -> None:
         install_hana_spending_settings(self.transport.settings)
