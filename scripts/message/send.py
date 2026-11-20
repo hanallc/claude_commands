@@ -634,6 +634,7 @@ class Message:
     stamp: SenderStamp = UnavailableSender()
     claude_attempt: ClaudeDeliveryAttempt | NoClaudeDeliveryAttempt = field(
         default=NoClaudeDeliveryAttempt(), compare=False, repr=False)
+    review_delivery: bool = False
     sent_header: str = field(default_factory=lambda: sent_line(now()), compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -1034,6 +1035,7 @@ class Options(NamedTuple):
 
     recipient_identity: TransportRecipientIdentity | LogicalRecipientIdentity = TransportRecipientIdentity()
     silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE
+    review_delivery: bool = False
 
     @property
     def to(self) -> str:
@@ -1736,7 +1738,8 @@ def resolve_postmaster_claim(states: KeyStates, key: str, recipient: str,
     return resolved
 
 
-def postmaster_claim(states: KeyStates, key: str, recipient: str) -> ClaimGranted | RepeatAccepted | RepeatPending:
+def postmaster_claim(states: KeyStates, key: str, recipient: str, *,
+                     review_delivery: bool = False) -> ClaimGranted | RepeatAccepted | RepeatPending:
     """Advance only from the saved stage or a definite receipt."""
     state = states.get(key, {"last": {}})
     pending = pending_deliveries(state).get(recipient)
@@ -1751,6 +1754,8 @@ def postmaster_claim(states: KeyStates, key: str, recipient: str) -> ClaimGrante
             return ClaimGranted()
         return RepeatPending(POSTMASTER_UNCONFIRMED)
     if reservation["stage"] == "relaying" or reservation["stage"] == "relay-unconfirmed":
+        if review_delivery and reservation["stage"] == "relay-unconfirmed":
+            return RepeatUnconfirmed(POSTMASTER_UNCONFIRMED)
         if not _owner_released(reservation):
             return RepeatPending(POSTMASTER_UNCONFIRMED)
         target = pending.get("recipient")
@@ -1774,7 +1779,7 @@ def postmaster_claim(states: KeyStates, key: str, recipient: str) -> ClaimGrante
                 and receipt["session_id"] != recipient[8:]):
             return RepeatUnconfirmed(POSTMASTER_UNCONFIRMED)
         if receipt["outcome"] == "abandoned":
-            return RepeatPending(POSTMASTER_UNCONFIRMED)
+            return RepeatUnconfirmed(POSTMASTER_UNCONFIRMED) if review_delivery else RepeatPending(POSTMASTER_UNCONFIRMED)
         reservation = resolve_postmaster_claim(states, key, recipient, reservation, receipt["outcome"])
     if reservation["outcome"] in ("delivered", "queued"):
         state["last"][recipient] = pending["started"]
@@ -1812,7 +1817,7 @@ def _reserve_claude_delivery(message: Message, at: datetime, limit: float, entry
         return ClaimGranted()
     with key_states() as states:
         state = states.get(message.key, {"last": {}})
-        result = postmaster_claim(states, message.key, message.to)
+        result = postmaster_claim(states, message.key, message.to, review_delivery=message.review_delivery)
         if isinstance(result, ClaimGranted) and entry_id:
             owner = process_start.process_start(os.getpid())
             if not isinstance(owner, process_start.Started):
@@ -2009,7 +2014,7 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
         state: KeyState = states.get(message.key, {"last": {}})
         _finish_clearing(state)
         for alias in (postmaster_recipient, recipient.value, *legacy_aliases):
-            recorded = postmaster_claim(states, message.key, alias)
+            recorded = postmaster_claim(states, message.key, alias, review_delivery=message.review_delivery)
             if not isinstance(recorded, ClaimGranted):
                 return recorded
         if "acknowledged" in state:
@@ -3345,7 +3350,8 @@ class RelayRecipientWrite:
         default_factory=RelayRequestNotForwarded)
 
 
-def read_relay(observed: RelayTransportResponse, text: str) -> CheckedRelayAcceptance | Result:
+def read_relay(observed: RelayTransportResponse, text: str, *,
+               review_delivery: bool = False) -> CheckedRelayAcceptance | Result:
     """Check the approved call, its result, and the proxy forward together."""
     forward = observed.forward
     if isinstance(forward, RefusedRelayRequest):
@@ -3358,16 +3364,18 @@ def read_relay(observed: RelayTransportResponse, text: str) -> CheckedRelayAccep
     sends = [part for event in events if event.get("type") == "assistant"
              for value in as_list(as_dict(event.get("message")).get("content"))
              if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
+    if not sends:
+        said = next((as_str(event.get("result")) for event in reversed(events) if event.get("type") == "result"), "")
+        return _unaccepted_relay(forward, f"the relay made no SendMessage call: {one_line(said) or 'no output'}",
+                                 queue_if_unsent=True)
     if len(sends) == 1:
         call = sends[0]
-    elif sends and isinstance(forward, RelayRequestForwarded):
-        call = next((part for part in sends if part.get("id") == forward.tool_use_id), None)
-        if call is None:
-            return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
     else:
-        said = next((as_str(event.get("result")) for event in reversed(events) if event.get("type") == "result"), "")
-        reason = f"{len(sends)} SendMessage calls" if sends else f"the relay made no SendMessage call: {one_line(said) or 'no output'}"
-        return _unaccepted_relay(forward, reason, queue_if_unsent=not sends)
+        forwarded_calls = [call for call in sends if isinstance(forward, RelayRequestForwarded)
+                           and call.get("id") == forward.tool_use_id]
+        if len(forwarded_calls) != 1:
+            return _unaccepted_relay(forward, f"{len(sends)} SendMessage calls")
+        call = forwarded_calls[0]
     inputs = as_dict(call.get("input"))
     if inputs.get("to") != observed.target or inputs.get("message") != text:
         return _unaccepted_relay(forward, "SendMessage used a different target or payload")
@@ -3379,14 +3387,19 @@ def read_relay(observed: RelayTransportResponse, text: str) -> CheckedRelayAccep
         return _unaccepted_relay(forward, "SendMessage did not return one matching result")
     result = results[0]
     answer = result_text(result.get("content"))
-    if result.get("is_error") is True or as_dict(loads(answer)).get("success") is not True:
-        rejected = result.get("is_error") is True or as_dict(loads(answer)).get("success") is False
+    success = as_dict(loads(answer)).get("success")
+    if review_delivery and success is False and forward == RelayRequestForwarded(tool_id, text):
+        return Result("failed", describe(answer) or "SendMessage rejected the message")
+    if result.get("is_error") is True or success is not True:
+        rejected = result.get("is_error") is True or success is False
         return _unaccepted_relay(forward, describe(answer) or "SendMessage did not confirm success",
                                  queue_if_unsent=rejected)
     if forward != RelayRequestForwarded(tool_id, text):
         return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
-    note = ", duplicate relay call" if len(sends) > 1 else ""
-    return CheckedRelayAcceptance(tool_id, f"mode {mode}; verbatim; {describe(answer)}{note}")
+    detail = f"mode {mode}; verbatim; {describe(answer)}"
+    if len(sends) > 1:
+        detail += f"; forwarded 1 of {len(sends)} SendMessage calls"
+    return CheckedRelayAcceptance(tool_id, detail)
 
 
 def _unaccepted_relay(forward: RelayForward, reason: str, *, queue_if_unsent: bool = False) -> Result:
@@ -4036,7 +4049,7 @@ def relay(message: Message, timeout: float) -> Result:
         write_atomic(raw, out + err)
     except OSError as error:
         print(f"message relay log: {error}", file=sys.stderr)
-    result = read_relay(observed, agent_text(message, via_relay=True))
+    result = read_relay(observed, agent_text(message, via_relay=True), review_delivery=message.review_delivery)
     if isinstance(result, CheckedRelayAcceptance):
         return Result("sent", result.detail)
     if code is None:
@@ -4114,6 +4127,7 @@ def deliver_codex(
     timeout: float,
     *,
     selection: RecipientSelection,
+    review_recipient: str = "",
 ) -> Result:
     text = agent_text(message)
     if isinstance(selection, FixedStaffLookup):
@@ -4126,7 +4140,14 @@ def deliver_codex(
             return Result("sent", f"{recipient.address} at {recipient.place.session}:{recipient.place.pane}")
         except (herdr_types.HerdrFailure, OSError) as error:
             return Result("failed", str(error))
-    queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, text, timeout=timeout)
+    if message.review_delivery and message.key is not None:
+        digest = hashlib.sha256(json.dumps((message.key, review_recipient)).encode()).hexdigest()
+        queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, text, timeout=timeout,
+                                   message_id=f"message-review-{digest}")
+    else:
+        queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, text, timeout=timeout)
+    if isinstance(queued, codex_daemon.QueueUnconfirmed):
+        return UncertainRelayDelivery("failed", queued.reason)
     if isinstance(queued, codex_daemon.Queued):
         return Result("sent", f"queued on Codex session {recipient.name}")
     if isinstance(queued, codex_daemon.QueueTimedOut):
@@ -4336,6 +4357,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
         forwarded += action_arguments(options.action)
+    if options.review_delivery:
+        forwarded += ["--review-delivery"]
     if options.repeat_minutes is not None:
         forwarded += ["--repeat-minutes", f"{options.repeat_minutes:g}"]
     elif message.to == USER and options.need == "blocked" and message.key is not None:
@@ -4560,6 +4583,7 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
     _ = parser.add_argument("--human", action="store_true", help="the message was written by a person, including a verbatim human relay")
     _ = parser.add_argument("--no-accounting", action="store_true", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--review-delivery", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--report-recipient", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--forwarded-shown-sender", help=argparse.SUPPRESS)
     _ = parser.add_argument("--forwarded-sender-stamp", help=argparse.SUPPRESS)
@@ -4724,7 +4748,8 @@ def parse(argv: list[str]) -> Options:
                       sender_origin=origin, due=due, reference=reference,
                       silence_policy=(silence.SilencePolicy.SEND_THROUGH_SILENCE if attr(args, "through_silence") is True
                                       else silence.SilencePolicy.KEEP_DURING_SILENCE),
-                      recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity())
+                      recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity(),
+                      review_delivery=get["review_delivery"] is True)
     if options.to == USER and options.summary is None:
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -4733,6 +4758,8 @@ def parse(argv: list[str]) -> Options:
         parser.error(f"--need {options.need} requires --action. {FIX}")
     if isinstance(options.recipient_identity, LogicalRecipientIdentity) and options.key is None:
         parser.error("--recipient-key needs --key")
+    if options.review_delivery and (options.key is None or to == USER):
+        parser.error("--review-delivery requires a keyed session send")
     if options.repeat_minutes is not None and options.key is None:
         parser.error("--repeat-minutes needs --key")
     if get["clears_when"] is not None and not options.clears_when.strip():
@@ -4909,6 +4936,7 @@ class WorkerResultReceipt:
     marker: str
     wait_for_idle: bool = False
     before_input: Callable[[], object] = lambda: None
+    worker_only: bool = False
 
     def received(self, worker: staff.StaffRow, membership: staff.StaffSnapshot) -> bool:
         from scripts.production import worker_admission
@@ -4934,8 +4962,9 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
     from scripts.herdr import herdr
 
     holder = membership.parent_of(worker)
+    worker_only = isinstance(receipt, WorkerResultReceipt) and receipt.worker_only
     if holder is None:
-        return Result("failed", f"{worker.name}: worker holder is unavailable")
+        return Result("retry" if worker_only else "failed", f"{worker.name}: worker holder is unavailable")
     if not reason:
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker):
@@ -5018,6 +5047,8 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
             reason = "worker is stopped"
         else:
             reason = "worker pane is closed"
+    if worker_only:
+        return Result("retry", reason)
     if isinstance(selection, FixedStaffLookup):
         return Result("failed", reason)
     address = f"session:{holder.current_session}"
@@ -5127,7 +5158,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                else sender_shown_name(sender, stamp, observed) if options.to != USER else sender)
     started = now()
     message = Message(destination, sender, summary, text, key, display, options.human, stamp,
-                      sent_header=sent_line(started))
+                      review_delivery=options.review_delivery, sent_header=sent_line(started))
     claude_route = isinstance(route, (ClaudeRecipient, QueuedStaffRecipient))
     if claude_route and fixed:
         assert isinstance(mailbox, StaffClaudeRecipient)
@@ -5206,7 +5237,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     elif isinstance(claim_result, RepeatUnconfirmed):
         result = UnconfirmedPostmasterDelivery("failed", claim_result.reason)
     elif isinstance(claim_result, RepeatPending):
-        result = Result("pending", claim_result.reason)
+        result = Result("retry" if options.review_delivery else "pending", claim_result.reason)
     elif guarded.held:
         result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif isinstance(route, RecipientLookupFailed):
@@ -5224,7 +5255,8 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
             _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, (CodexSessionRecipient, CodexPaneRecipient)):
-        result = deliver_codex(message, route, options.timeout, selection=options.selection)
+        result = deliver_codex(message, route, options.timeout, selection=options.selection,
+                               review_recipient=stable.value)
     elif isinstance(route, QueuedStaffRecipient):
         result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
                         + " so it is kept for it")
@@ -5292,9 +5324,12 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                 raise
             if not isinstance(reservation, ClaimGranted):
                 claim_result = reservation
-                result = (UnconfirmedPostmasterDelivery("failed", reservation.reason)
-                          if isinstance(reservation, RepeatUnconfirmed)
-                          else Result("skipped" if isinstance(reservation, RepeatAccepted) else "pending", reservation.reason))
+                if isinstance(reservation, RepeatUnconfirmed):
+                    result = UnconfirmedPostmasterDelivery("failed", reservation.reason)
+                elif isinstance(reservation, RepeatAccepted):
+                    result = Result("skipped", reservation.reason)
+                else:
+                    result = Result("retry" if options.review_delivery else "pending", reservation.reason)
             elif isinstance(postmaster_recipient, postmaster.RegisteredClaudeRecipient):
                 try:
                     delivery = postmaster.attempt(STATE, postmaster_recipient.session, message.sender, entry_id,
@@ -5491,8 +5526,10 @@ def main(argv: list[str]) -> int:
                 print("not sent: probe sessions never push to the phone")
                 return 0
             result = send(options)
-            print(f"{result.outcome.upper()}: {result.detail}")
-            if result.outcome == "failed" and options.to.startswith("uds:"):
+            outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
+                       else result.outcome)
+            print(f"{outcome.upper()}: {result.detail}")
+            if outcome == "failed" and options.to.startswith("uds:"):
                 print(f"send.py: {result.detail}", file=sys.stderr)
             if isinstance(result.failure, FailedPush):
                 failed = result.failure
@@ -5504,7 +5541,7 @@ def main(argv: list[str]) -> int:
                     record["held_source"] = failed.hold.source
                     record["held_identity"] = failed.hold.identity
                 print("send.py: failed push JSON: " + json.dumps(record), file=sys.stderr)
-            return EXIT[result.outcome]
+            return EXIT[outcome]
     return 0
 
 
