@@ -338,7 +338,7 @@ class MacRunTests(unittest.TestCase):
             + "\nterminate_grace_seconds=3\n")
         copies_config = self.config_path.parent / "copies.conf"
         _ = write_config_fixture(copies_config, f"remote_registry={self.root / 'mirrors'}\n"
-                                 + "owner.verify=verify\nwait_seconds=0.01\n"
+                                 + "owner.verify=verify\n"
                                  + "git_timeout_seconds=10\nguard_timeout_seconds=10\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
@@ -375,7 +375,7 @@ class MacRunTests(unittest.TestCase):
 
     def write_production_config(self, **overrides: str) -> None:
         settings = MAC_RUN_CONFIG | overrides
-        _ = (self.config_path.parent / "production.conf").write_text(
+        _ = write_config_fixture(self.config_path.parent / "production.conf",
             "".join(f"{name}={value}\n" for name, value in settings.items())
         )
 
@@ -462,6 +462,15 @@ class MacRunTests(unittest.TestCase):
             output, errors = process.communicate()
             self.fail("mac_run exited before the build marker: " + output + errors)
         self.assertTrue(path.exists())
+
+    def test_mac_run_refuses_a_port_above_65535(self) -> None:
+        self.write_production_config(mac_run_port="65536")
+
+        result = self.mac_run()
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("mac_run_port='65536': outside range 1..65535", result.stderr)
+        self.assert_no_build_started()
 
     def test_blocked_mac_exits_nine_without_starting_build(self) -> None:
         blocked = self.state_command(

@@ -36,6 +36,7 @@ from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as p
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
+from scripts.build_queue import snapshot_codec
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.process_group import send_process_group
 from scripts.lib import cancellation
@@ -177,7 +178,8 @@ def module_request(trial: PairedTrialRequest, module: str, attempt: str, expires
             'commit': trial.changed.commit, 'tree': trial.changed.tree, 'head': trial.changed.commit,
             'origin': trial.clone_url, 'clone_url': trial.clone_url, 'mode': 'targeted-test',
             'module': module, 'modules': ['scripts/' + module], 'rounds': trial.rounds, 'source_key': '',
-            'expires': expires, 'module_time_limit_s': cloud_gate.settings().number('module_time_limit_s'),
+            'expires': expires, 'gate_job': snapshot_codec.snapshot_value(PAIRED_TRIAL_JOB),
+            'module_time_limit_s': cloud_gate.settings().number('module_time_limit_s'),
             'delivery_s': cloud_gate.settings().number('termination_timeout_s') + 2 * cloud_gate.settings().number('api_timeout_s')}
 
 

@@ -13,7 +13,6 @@ below is required; the implementation has no fallback values.
 
 | Key | Shipped value | Meaning |
 | --- | --- | --- |
-| `wait_seconds` | `1` | Required positive, finite value. The slot wait uses `slots.wait_seconds` in `build_folders.conf`. |
 | `git_timeout_seconds` | `600` | Positive, finite deadline in seconds for each Git subprocess. |
 | `guard_timeout_seconds` | `10` | Positive, finite deadline in seconds for the combined repository-copy and scratch guard. |
 
@@ -25,6 +24,7 @@ paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
 entries to the guard's scan. The guard does not read configuration separately.
 
 `config/build_folders.conf` sets the slot root and pool limits.
+The `slots.wait_seconds` setting limits the wait for a slot.
 The root uses `roots.slots.<machine>`, with `roots.slots` as the default.
 The limit uses `slots.<machine>.<repository>.max`, with `slots.<machine>.default_max` as the default.
 Owners on the same machine share the pool for a repository.
