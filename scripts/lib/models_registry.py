@@ -8,15 +8,13 @@ except FileNotFoundError:
 import argparse
 import json
 import os
-import platform
 import shlex
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Literal, NamedTuple, TypedDict, cast, final
-from uuid import uuid4
+from typing import Literal, NamedTuple, cast, final
 
 from scripts.lib import build_folders, file_lock
 from scripts.lib import conf, conf_reads, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
@@ -292,7 +290,7 @@ def _fetch(repo: Path, branch: str) -> str:
     return _git(repo, "rev-parse", "--verify", f"{tracking}^{{commit}}")
 
 
-def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_shared: bool = False,
+def _fast_forward(repo: Path, path: Path, target: str, *,
                   expected_head: str = "", published_registry: str | None = None) -> None:
     with waiting_rows.locked_checkout(repo):
         try:
@@ -300,8 +298,7 @@ def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_share
                                             expected_head=expected_head)
             if move.head == move.tip:
                 return
-            rows = waiting_rows.check_move(repo, move, replace_registry=registry_already_shared,
-                                           registry_move=True, published_registry=published_registry)
+            rows = waiting_rows.check_move(repo, move, registry_move=True, published_registry=published_registry)
         except OSError as error:
             raise FastForwardCheckFailed(str(error)) from error
         try:
@@ -312,7 +309,7 @@ def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_share
 
 def _reconcile_shared(repo: Path, path: Path, target: str, expected_head: str, published: str) -> bool:
     try:
-        _fast_forward(repo, path, target, registry_already_shared=True, expected_head=expected_head, published_registry=published)
+        _fast_forward(repo, path, target, expected_head=expected_head, published_registry=published)
     except OSError as error:
         raise OSError(f"{path} is shared, but local reconciliation failed: {error}") from error
     return True
@@ -396,69 +393,10 @@ def _on_main(target: SharedRegistry) -> bool:
     return _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main"
 
 
-class WaitingMacEdit(TypedDict):
-    receipt: str
-    before: str
-    after: str
-    description: str
-    additive_catalog: bool
-
-
-def _mac_edits_path(target: SharedRegistry) -> Path:
-    return target.git_directory / "models-config.forward.json"
-
-
-def _read_mac_edits(target: SharedRegistry) -> list[WaitingMacEdit]:
-    try:
-        return cast(list[WaitingMacEdit], json.loads(_mac_edits_path(target).read_text()))
-    except FileNotFoundError:
-        return []
-
-
-def _save_mac_edits(target: SharedRegistry, edits: list[WaitingMacEdit]) -> None:
-    write_text_atomic(_mac_edits_path(target), json.dumps(edits) + "\n", new_file_mode=0o600)
-
-
-def _forward_main_rows(target: SharedRegistry, path: Path, *, wait: bool) -> None:
-    """Send only the Mac edits that natedev has yet to accept."""
-    registry_lock = _publish_lock_path(target, path)
-    with file_lock.exclusive(target.git_directory / "models-config.forward.lock", wait=wait) as forwarding:
-        if forwarding is file_lock.LockResult.BUSY:
-            return
-        with file_lock.exclusive(registry_lock, wait=wait) as reading:
-            if reading is file_lock.LockResult.BUSY:
-                return
-            edits = _read_mac_edits(target)
-        for edit in edits:
-            arguments = ["receive", "--description", edit["description"], "--receipt", edit["receipt"],
-                         "--rows", json.dumps([edit["before"], edit["after"]])]
-            if edit["additive_catalog"]:
-                arguments.append("--additive-catalog")
-            command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/models_registry.py" '
-                       + shlex.join(arguments))
-            done = main_publish.ssh(command, ssh_program=os.environ.get("ZONE_SSH") or "ssh", host="natedev")
-            if not isinstance(done, str) and f'accepted {edit["receipt"]}' in done.stdout.splitlines():
-                with file_lock.exclusive(registry_lock):
-                    _save_mac_edits(target, [row for row in _read_mac_edits(target) if row["receipt"] != edit["receipt"]])
-            if isinstance(done, str) or done.returncode:
-                raise OSError(done if isinstance(done, str) else main_publish.first_line(done))
-            if done.stderr:
-                print(done.stderr, end="", file=sys.stderr)
-
-
-def _receipt_path(target: SharedRegistry, receipt: str) -> Path:
-    if len(receipt) != 32 or any(character not in "0123456789abcdef" for character in receipt):
-        raise ValueError("invalid Mac registry receipt")
-    return target.git_directory / "models-config.receipts" / receipt
-
-
 def _publish_when_ready(target: SharedRegistry, path: Path, description: str) -> bool:
     if not _on_main(target):
         with main_push_lock.main_push_lock(target.repository):
             return _publish(target.repository, path, description)
-    if platform.system() == "Darwin":
-        _forward_main_rows(target, path, wait=False)
-        return False
     with main_push_lock.settings_push(target.repository) as gap, ExitStack() as locks:
         if isinstance(gap, land_queue.SettingsGap):
             try:
@@ -478,8 +416,6 @@ def has_pending(registry: Path) -> bool:
     target = _publish_repository(path)
     if not isinstance(target, SharedRegistry):
         return False
-    if platform.system() == "Darwin" and _on_main(target):
-        return bool(_read_mac_edits(target))
     head = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
     return waiting_rows.move_marker(target.repository).exists() or bool(registry_rows.changes(head, registry_text(path)))
 
@@ -491,9 +427,6 @@ def publish_pending(registry: Path) -> bool:
     if (not isinstance(target, SharedRegistry) or path != DEFAULT_PATH.resolve()
             or os.environ.get("MODELS_CONFIG_PUBLISH") == "0"):
         return False
-    if platform.system() == "Darwin" and _on_main(target):
-        _forward_main_rows(target, path, wait=False)
-        return False
     head = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
     if not waiting_rows.move_marker(target.repository).exists() and not registry_rows.changes(head, registry_text(path)):
         return False
@@ -502,7 +435,7 @@ def publish_pending(registry: Path) -> bool:
 
 
 def store_registry(registry: Path, before: str, after: str, description: str, *,
-                   additive_catalog: bool = False, receipt: str = "") -> str:
+                   additive_catalog: bool = False) -> str:
     """Write the registry live before waiting for publication. Keep the live rows if publication fails."""
     path = registry.resolve()
     changes = [row for row in registry_rows.changes(before, after)
@@ -510,31 +443,16 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     target = _publish_repository(path)
     lock_path = _publish_lock_path(target, path)
     shared = isinstance(target, SharedRegistry) and path == DEFAULT_PATH.resolve()
-    forwards = (shared and isinstance(target, SharedRegistry) and platform.system() == "Darwin"
-                and _on_main(target) and os.environ.get("MODELS_CONFIG_PUBLISH") != "0")
-    receipt_path = _receipt_path(target, receipt) if receipt and isinstance(target, SharedRegistry) else None
     if isinstance(target, SharedRegistry):
         waiting_rows.recover_abandoned_move(target.repository)
     with file_lock.exclusive(lock_path):
-        if receipt_path is not None and receipt_path.exists():
-            print(f"accepted {receipt}", flush=True)
-            return registry_text(path)
         if changes:
             latest = registry_text(path)
             result = registry_rows.replay(latest, changes, additive_catalog)
             if registry_rows.values(latest) != registry_rows.values(result):
-                if forwards and isinstance(target, SharedRegistry):
-                    edits = _read_mac_edits(target)
-                    edits.append({"receipt": uuid4().hex, "before": latest, "after": result,
-                                  "description": description, "additive_catalog": additive_catalog})
-                    _save_mac_edits(target, edits)
                 if shared and isinstance(target, SharedRegistry):
                     waiting_rows.record_registry_edit(target.git_directory, latest, result, additive_catalog)
                 write_text_atomic(path, after if latest == before and not additive_catalog else result)
-        if receipt_path is not None:
-            receipt_path.parent.mkdir(parents=True, exist_ok=True)
-            write_text_atomic(receipt_path, "\n")
-            print(f"accepted {receipt}", flush=True)
     if (shared and isinstance(target, SharedRegistry)
             and os.environ.get("MODELS_CONFIG_PUBLISH") not in ("0", "later")):
         try:
@@ -597,8 +515,6 @@ class Arguments(argparse.Namespace):
     after: Path = Path()
     description: str = "update registry"
     additive_catalog: bool = False
-    rows: str = ""
-    receipt: str = ""
     launch: bool = False
     edit: bool = False
 
@@ -609,15 +525,13 @@ class Arguments(argparse.Namespace):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("command", choices=("store", "catalog", "shell", "receive"))
+    _ = parser.add_argument("command", choices=("store", "catalog", "shell"))
     _ = parser.add_argument("--launch", action="store_true")
     _ = parser.add_argument("--edit", action="store_true")
     _ = parser.add_argument("--registry", type=Path)
     _ = parser.add_argument("--before", type=Path, default=Path("/dev/stdin"))
     _ = parser.add_argument("--after", type=Path, default=Path())
     _ = parser.add_argument("--description", default="update registry")
-    _ = parser.add_argument("--rows", default="")
-    _ = parser.add_argument("--receipt", default="")
     _ = parser.add_argument("--additive-catalog", action="store_true")
     arguments = parser.parse_args(namespace=Arguments())
     try:
@@ -633,11 +547,6 @@ def main() -> int:
             print(configuration_shell(configuration), end="")
             return 0
         conf_reads.record("models")
-        if arguments.command == "receive":
-            before, after = cast(tuple[str, str], json.loads(arguments.rows))
-            _ = store_registry(arguments.registry, before, after, arguments.description,
-                               additive_catalog=arguments.additive_catalog, receipt=arguments.receipt)
-            return 0
         before = arguments.before.read_text(encoding="utf-8")
         after = arguments.after.read_text(encoding="utf-8")
         if arguments.command == "catalog":

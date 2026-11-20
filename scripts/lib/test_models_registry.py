@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import pwd
-import shlex
 import shutil
 import subprocess
 import tempfile
@@ -18,7 +17,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-from scripts.lib import land_main, live_settings, main_publish, main_push_lock, models_registry, registry_rows, waiting_rows
+from scripts.lib import land_main, live_settings, main_push_lock, models_registry, registry_rows, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
@@ -365,35 +364,6 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
             expected = after.replace("second=old", "second=new")
         self.assertEqual(registry.read_text(), expected)
         self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), target)
-
-    def test_mac_does_not_forward_an_accepted_edit_again_with_an_old_head(self) -> None:
-        self.seed()
-        before = "[fixture]\nx=A\ny=A\n"
-        path = self.write(self.repo / "config/models.conf", before)
-        _ = self.git("add", "config/models.conf")
-        _ = self.git("commit", "-m", "seed registry")
-        _ = self.git("push", "origin", "main")
-        head = self.git("rev-parse", "HEAD").stdout
-        accepted = before
-
-        def receive(command: str, *, ssh_program: str, host: str) -> subprocess.CompletedProcess[str]:
-            nonlocal accepted
-            self.assertEqual(host, "natedev")
-            args = shlex.split(command)
-            base, proposed = cast(tuple[str, str], json.loads(args[args.index("--rows") + 1]))
-            accepted = registry_rows.replay_pending(base, proposed, accepted)
-            receipt = args[args.index("--receipt") + 1]
-            return subprocess.CompletedProcess([ssh_program], 0, f"accepted {receipt}\n", "")
-
-        environment = {**self.environment, "XDG_STATE_HOME": str(self.root / "state"), "MODELS_CONFIG_PUBLISH": "1"}
-        with patch.dict(os.environ, environment, clear=True), patch("platform.system", return_value="Darwin"), \
-                patch.object(models_registry, "DEFAULT_PATH", path), patch.object(main_publish, "ssh", receive):
-            first = models_registry.store_registry(path, before, before.replace("x=A", "x=B"), "Change x")
-            self.assertIn("x=B", accepted)
-            accepted = accepted.replace("x=B", "x=C")
-            _ = models_registry.store_registry(path, first, first.replace("y=A", "y=B"), "Change y")
-        self.assertEqual(self.git("rev-parse", "HEAD").stdout, head)
-        self.assertEqual(accepted, "[fixture]\nx=C\ny=B\n")
 
     def test_registry_publication_runs_the_hook_with_the_landed_commit_under_the_lock(self) -> None:
         self.seed()

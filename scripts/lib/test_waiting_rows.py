@@ -211,7 +211,14 @@ class WaitingRowsTests(unittest.TestCase):
         self.edit(relative, "amount=2", "amount=3")
         target = self.peer_change(relative, "limit=5", "limit=7")
         give = waiting_rows.give
+        published_orders = waiting_rows.published_orders
         saved: list[live_settings.StagedSave | live_settings.UnchangedSave] = []
+
+        def read_orders(checkout: Path, commit: str) -> waiting_rows.SaveOrders:
+            if saved:
+                with waiting_rows.journal_path().with_suffix(".lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return published_orders(checkout, commit)
 
         def save_during_move(checkout: Path, rows: waiting_rows.WaitingRows,
                              environment: dict[str, str] | None = None) -> None:
@@ -220,7 +227,8 @@ class WaitingRowsTests(unittest.TestCase):
                     "example", "amount", "4", "tune(example): change amount")))
             give(checkout, rows, environment)
 
-        with mock.patch.object(waiting_rows, "give", save_during_move):
+        with (mock.patch.object(waiting_rows, "give", save_during_move),
+              mock.patch.object(waiting_rows, "published_orders", read_orders)):
             waiting_rows.move_to(self.checkout, target)
         self.assertEqual(len(saved), 1)
         self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
@@ -264,15 +272,51 @@ class WaitingRowsTests(unittest.TestCase):
         self.run_git(self.checkout, "push", "-q", "origin", "main")
         self.run_git(self.peer, "pull", "-q", "--ff-only")
         target = self.peer_change(name, '"incoming": 1', '"incoming": 2')
-        with waiting_rows.locked_checkout(self.checkout):
+
+        def clean(_checkout: Path, snapshot: str | None = None) -> str:
+            fields = cast(dict[str, object], json.loads(live.read_text() if snapshot is None else snapshot))
+            _ = fields.pop("theme", None)
+            return json.dumps(fields)
+
+        def smudge(_checkout: Path, shared: str) -> str:
+            fields = cast(dict[str, object], json.loads(shared))
+            local = cast(dict[str, object], json.loads(live.read_text()))
+            if "theme" in local:
+                fields["theme"] = local["theme"]
+            return json.dumps(fields)
+
+        with (mock.patch.object(waiting_rows, "clean_settings_json", clean),
+              mock.patch.object(live_settings, "clean_settings_json", clean),
+              mock.patch.object(waiting_rows, "smudge_settings_json", smudge),
+              waiting_rows.locked_checkout(self.checkout)):
             rows = waiting_rows.check_move(self.checkout, waiting_rows.move_target(
                 self.checkout, target, fast_forward=True))
-            _ = live.write_text('{"local": 2, "incoming": 1}\n')
+            _ = live.write_text('{"local": 2, "incoming": 1, "theme": "dark"}\n')
             with mock.patch.object(live_settings, "publish", return_value=[]):
                 self.assertEqual(live_settings.main(["publish-json", "--message", "Set local"]), 0)
             waiting_rows.apply_move(self.checkout, rows)
-        self.assertEqual(cast(object, json.loads(live.read_text())), {"local": 2, "incoming": 2})
+        self.assertEqual(cast(object, json.loads(live.read_text())), {"local": 2, "incoming": 2, "theme": "dark"})
         self.assertFalse(waiting_rows.move_marker(self.checkout).exists())
+
+    @unittest.skipIf(sys.platform == "darwin", "publish-json runs on natedev")
+    def test_a_pull_preserves_a_waiting_json_reversal_that_matches_head(self) -> None:
+        name = waiting_rows.SETTINGS_JSON
+        live = self.checkout / name
+        base = '{"shared": 1, "incoming": 1}\n'
+        _ = live.write_text(base)
+        self.run_git(self.checkout, "add", name)
+        self.run_git(self.checkout, "commit", "-qm", "Add settings")
+        self.run_git(self.checkout, "push", "-q", "origin", "main")
+        self.run_git(self.peer, "pull", "-q", "--ff-only")
+        with mock.patch.object(live_settings, "publish", return_value=[]):
+            _ = live.write_text('{"shared": 2, "incoming": 1}\n')
+            self.assertEqual(live_settings.main(["publish-json", "--message", "First Save"]), 0)
+            _ = live.write_text(base)
+            self.assertEqual(live_settings.main(["publish-json", "--message", "Reverse the Save"]), 0)
+        self.assertEqual(self.output("diff", "HEAD", "--", name), "")
+        target = self.peer_change(name, base, '{"shared": 2, "incoming": 2}\n')
+        waiting_rows.move_to(self.checkout, target)
+        self.assertEqual(cast(object, json.loads(live.read_text())), {"shared": 1, "incoming": 2})
 
     def test_the_registry_fast_forward_restores_a_save_after_its_check(self) -> None:
         path = "config/statusline.conf"
@@ -305,6 +349,28 @@ class WaitingRowsTests(unittest.TestCase):
         self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
         self.assertEqual((self.checkout / path).read_text(), "account.claude1=yellow\n" + published + pending)
         self.assertEqual(self.output("diff", "--cached", "--name-only", "HEAD"), "")
+
+    def test_a_model_color_save_during_preflight_keeps_the_pull_valid(self) -> None:
+        path = "config/statusline.conf"
+        incoming = "account.claude1=yellow\n"
+        target = self.peer_change(path, STATUSLINE, incoming)
+        tree_text = waiting_rows.tree_text
+        saved = False
+
+        def read_tree(checkout: Path, commit: str, relative: str) -> str | None:
+            nonlocal saved
+            if not saved and (commit, relative) == (target, path):
+                saved = True
+                with mock.patch.dict(os.environ, {live_settings.SAVE_ORDER_ENV: "1"}):
+                    self.assertEqual(live_settings.main([
+                        "--accepted-model-color", "statusline", "model.claude-opus-5-5", "#abcdef"]), 0)
+            return tree_text(checkout, commit, relative)
+
+        with mock.patch.object(waiting_rows, "tree_text", read_tree):
+            waiting_rows.move_to(self.checkout, target)
+        self.assertTrue(saved)
+        self.assertEqual(self.output("rev-parse", "HEAD").strip(), target)
+        self.assertEqual((self.checkout / path).read_text(), incoming + "model.claude-opus-5-5=#abcdef\n")
 
     def test_a_matching_new_model_color_without_a_receipt_allows_an_advancing_pull(self) -> None:
         path = "config/statusline.conf"

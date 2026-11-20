@@ -95,7 +95,7 @@ Pending rows replay onto the fetched registry, so a registry commit from another
 It never waits for main, so a landing that holds main never delays the caller.
 The quota alert's `edit_registry` uses this mode for its role routing.
 `sync_codex_catalog.sh` uses this mode on Linux.
-The Mac forwards its edits to natedev and records the acceptance of each edit.
+The Mac publishes registry edits through its local Git checkout.
 The notes timer starts one detached publisher through `live_settings.publish_waiting()`.
 The publisher waits until it can confirm that no land runs.
 `publish_pending(registry)` then commits and pushes the rows that HEAD does not have.

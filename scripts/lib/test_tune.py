@@ -805,13 +805,14 @@ class TuneTests(PublicationTestCase):
             _ = tune.main(arguments)
         self.assertEqual(repo.head(), repo.remote_tip())
         self.assertEqual(repo.mac_pulls(), 0)
-        self.assertFalse((repo.root / "state/mac.json").exists())
+        self.assertTrue((repo.root / "state/mac.json").exists())
         before = self.snapshot()
         repeated = self.run_tune(*arguments)
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(repeated.stdout, "already amount=3\n")
         self.assertEqual(self.snapshot(), before)
         self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
+        self.assertFalse((repo.root / "state/mac.json").exists())
 
     def test_same_value_rerun_retries_a_queued_mac_pull_and_clears_the_queue(self) -> None:
         repo = self.repository

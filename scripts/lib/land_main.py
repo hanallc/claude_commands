@@ -139,10 +139,13 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
                  + f"LANDED_BRANCH={shlex.quote(branch)} bash {shlex.quote(str(hook))}")
         try:
             result = subprocess.run(["bash", str(hook)], cwd=root,
-                                    env={**os.environ, "LANDED_SHA": sha, "LANDED_BRANCH": branch}, check=False)
+                                    env={**os.environ, "LANDED_SHA": sha, "LANDED_BRANCH": branch}, check=False,
+                                    timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
             if result.returncode:
                 return Landed(sha, branch, pushed, HookFailed(result.returncode, rerun))
             write_text_atomic(record, sha + "\n")
+        except subprocess.TimeoutExpired:
+            return Landed(sha, branch, pushed, HookFailed(124, rerun))
         except OSError:
             return Landed(sha, branch, pushed, HookFailed(1, rerun))
         return Landed(sha, branch, pushed, HookDone())

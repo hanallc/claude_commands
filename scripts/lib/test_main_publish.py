@@ -236,6 +236,20 @@ class MainPublishTests(PublicationTestCase):
         self.assertIn("main: pushed", live_settings.publish(repo.checkout))
         self.assertIn("mode=slow", repo.git(repo.origin, "show", "main:config/example.conf"))
 
+    def test_a_publisher_stop_before_the_mac_pull_keeps_the_pull_request(self) -> None:
+        repo = self.repository
+        change = live_settings.WaitingChange("example", "amount", "3", "tune(example): change amount")
+        _ = live_settings.stage_save(change)
+        with mock.patch.object(live_settings, "pull_mac", side_effect=RuntimeError("publisher stopped")):
+            with self.assertRaisesRegex(RuntimeError, "publisher stopped"):
+                _ = live_settings.publish(repo.checkout)
+        self.assertEqual(repo.head(), repo.remote_tip())
+        self.assertFalse(live_settings.waiting_rows_for_main())
+        request = main_publish.read_queue()
+        assert isinstance(request, main_publish.PendingMacPull)
+        self.assertEqual(request.pulls, (main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), repo.checkout),))
+        self.assertEqual(repo.mac_pulls(), 0)
+
     def test_push_refuses_to_publish_unrelated_local_commits(self) -> None:
         repo = self.repository
         remote = repo.remote_tip()
@@ -395,6 +409,19 @@ class MainPublishTests(PublicationTestCase):
         self.assertIn("network started", detail)
         self.assertIn("network stalled", detail)
         self.assertEqual((repo.head(), repo.remote_tip()), before)
+
+    def test_a_stalled_hook_reports_failure_after_the_push_succeeds(self) -> None:
+        repo = self.repository
+        hook = repo.checkout / ".claude/config/post_push.sh"
+        hook.parent.mkdir(parents=True)
+        _ = hook.write_text("exec sleep 3\n")
+        _ = repo.change()
+        _ = repo.git(repo.checkout, "commit", "-qam", "tune(example): change amount")
+        result = land_main.land(repo.checkout, repo.head(), time_limit=land_main.CommandTimeLimit(2))
+        self.assertIsInstance(result.push, land_main.Pushed)
+        self.assertIsInstance(result.hook, land_main.HookFailed)
+        self.assertFalse((repo.checkout / ".git/post-push-completed").exists())
+        self.assertEqual(repo.remote_tip(), repo.head())
 
     def test_ready_refuses_a_checkout_off_main_before_any_publication(self) -> None:
         repo = self.repository

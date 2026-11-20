@@ -194,6 +194,13 @@ def _publish_main(checkout: Path) -> PublishedSettings:
         detail += "; " + land_main.hook_report(landed.hook)
     if tip != head:
         apply_move(checkout, check_move(checkout, move_target(checkout, tip, fast_forward=True, expected_head=head)))
+    names = [f"{change.stem}.{change.key}" for change in changes]
+    if not isinstance(settings_json, NoSettingsJsonSave):
+        names.append(SETTINGS_JSON)
+    label = " ".join(names) or "main"
+    if names:
+        main_publish.queue_pull_only(label, "main has the Save",
+                                     pulls=(main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), checkout),))
     lines.append(f"main: {detail}")
     with locked_journal(journal_path()) as pending:
         retained = [change for change in pending.changes if change not in changes]
@@ -203,10 +210,6 @@ def _publish_main(checkout: Path) -> PublishedSettings:
         if retained != pending.changes or finished_json:
             pending.changes = retained
             pending.save()
-    names = [f"{change.stem}.{change.key}" for change in changes]
-    if not isinstance(settings_json, NoSettingsJsonSave):
-        names.append(SETTINGS_JSON)
-    label = " ".join(names) or "main"
     return PublishedSettings(checkout, label, lines)
 
 

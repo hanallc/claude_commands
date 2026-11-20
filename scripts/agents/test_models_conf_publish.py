@@ -82,12 +82,18 @@ class RegistryFixture(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="agents-registry-")))
         self.home = self.root / "home"
         self.home.mkdir()
+        binaries = self.root / "safety-bin"
+        binaries.mkdir()
+        ssh = binaries / "ssh"
+        _ = ssh.write_text("#!/bin/sh\necho 'Registry tests refuse SSH' >&2\nexit 1\n")
+        ssh.chmod(0o755)
         self.registry = self.root / relative_path
         self.registry.parent.mkdir(parents=True, exist_ok=True)
         _ = write_registry(self.registry, base_text=DEFAULTS)
         self.environment = {**git_fixture_environment(), **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.home),
                             "MODELS_CONFIG_FILE": str(self.registry),
-                            "CONF_DIR": str(self.registry.parent),
+                            "CONF_DIR": str(self.registry.parent), "ZONE_SSH": str(ssh),
+                            "PATH": str(binaries) + os.pathsep + os.environ.get("PATH", os.defpath),
                             "MERGE_GATE_STATE_DIR": str(self.root / "land-state"),
                             "XDG_STATE_HOME": str(self.root / "publication-state"), "TMPDIR": str(self.root),
                             "MODELS_CONFIG_PUBLISH": "1" if publishing else "0",
@@ -697,7 +703,7 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         registry_bytes, index_bytes = self.registry.read_bytes(), index.read_bytes()
         program = ("import sys; from pathlib import Path; from scripts.lib import models_registry; "
                    + "models_registry._fast_forward(Path.cwd(), models_registry.registry_path(), "
-                   + "sys.argv[1], registry_already_shared=True)")
+                   + "sys.argv[1], published_registry=models_registry.registry_text(models_registry.registry_path()))")
         self.assert_ok(self.command(sys.executable, "-c", program, self.initial))
         self.assertEqual(self.registry.read_bytes(), registry_bytes)
         self.assertEqual(index.read_bytes(), index_bytes)

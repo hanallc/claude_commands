@@ -489,22 +489,21 @@ def replay_registry_rows(checkout: Path, base: str, local: str, target: str) -> 
     return _replay_registry(_registry_git_directory(checkout), base, local, target)
 
 
-def _settled_saves(checkout: Path, target: str, stem: str, saves: dict[str, AcceptedOrder],
+def _settled_saves(incoming: str | None, saves: dict[str, AcceptedOrder],
                    published: dict[str, int]) -> dict[str, int]:
+    settings = conf.settings(incoming or "") if any(not save.order for save in saves.values()) else {}
     return {key: order for key, save in saves.items() if isinstance(save, AcceptedSave)
             and published_save(save, order := published.get(key, 0),
-                               tree_value(checkout, target, stem, key) if not (save.order or order) else None)}
+                               setting.value if not (save.order or order) and (setting := settings.get(key)) else None)}
 
 
-def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
-         replace_registry: bool, published_registry: str | None) -> MovePlan:
+def hold(checkout: Path, move: CheckoutMove, *, published_registry: str | None) -> MovePlan:
     """Plan writes for paths that Git must leave in place."""
     target = move.tip
     changed = changed_paths(checkout, move.head, target, *waiting_paths(checkout))
-    managed = pending_files(checkout, pending)
     orders = published_orders(checkout, target)
     plan = MovePlan(source=move.head, target=target, before={}, after={})
-    forced = {REGISTRY_PATH} if replace_registry or REGISTRY_PATH in changed else set[str]()
+    forced = {REGISTRY_PATH} if published_registry is not None or REGISTRY_PATH in changed else set[str]()
     changed_settings = changed - {SETTINGS_JSON}
     if (checkout / "config").resolve() == conf.directory().resolve():
         # A Save can arrive after preflight, even for a clean file.
@@ -512,38 +511,41 @@ def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
         changed_settings.update(f"config/{stem}.conf" for stem, keys in orders.items() if keys != old_orders.get(stem))
     else:
         changed_settings.intersection_update(waiting_files(checkout))
-    touched = changed_settings | managed.keys() | forced
+    with locked_journal(journal_path()) as pending:
+        managed = pending_files(checkout, pending)
+        touched = changed_settings | managed.keys() | forced
+        snapshots = {path: live_text(checkout / path) for path in touched | (changed & {SETTINGS_JSON})}
     for path in sorted(touched):
         stem, saves = Path(path).stem, managed.get(path, {})
-        settled = _settled_saves(checkout, target, stem, saves, orders.get(stem, {}))
+        incoming = tree_text(checkout, target, path)
+        settled = _settled_saves(incoming, saves, orders.get(stem, {}))
         if path not in changed_settings and not settled and path not in forced:
             continue
-        incoming = tree_text(checkout, target, path)
         head = tree_text(checkout, move.head, path)
-        local = live_text(checkout / path)
+        local = snapshots[path]
         plan["before"][path] = local
         if path == REGISTRY_PATH and incoming is not None:
             baseline = published_registry if published_registry is not None else head or ""
             plan["after"][path] = replay_registry_rows(checkout, baseline, local or "", incoming)
         else:
             plan["after"][path] = replay_settings(path, head or "", local or "", incoming, saves, settled)
-    if SETTINGS_JSON in changed:
-        _hold_settings_json(checkout, plan)
+    if (local_json := snapshots.get(SETTINGS_JSON)) is not None:
+        _hold_settings_json(checkout, plan, local_json, pending.settings_json)
     return plan
 
 
-def _hold_settings_json(checkout: Path, plan: MovePlan) -> None:
-    local = live_text(checkout / SETTINGS_JSON)
-    if local is None:
-        return
+def _hold_settings_json(checkout: Path, plan: MovePlan, local: str,
+                        saved: SettingsJsonSave | NoSettingsJsonSave) -> None:
     head = tree_text(checkout, plan["source"], SETTINGS_JSON)
     incoming = tree_text(checkout, plan["target"], SETTINGS_JSON)
-    edits = settings_json_edits(head or "{}\n", clean_settings_json(checkout))
+    edits = settings_json_edits(head or "{}\n", clean_settings_json(checkout, local))
     plan["before"][SETTINGS_JSON] = local
     if incoming is None:
         plan["after"][SETTINGS_JSON] = local
     else:
         merged = apply_settings_json_edits(incoming, edits)
+        if isinstance(saved, dict):
+            merged = apply_settings_json_edits(merged, saved["edits"])
         plan["after"][SETTINGS_JSON] = smudge_settings_json(checkout, merged)
 
 
@@ -693,6 +695,19 @@ def staged_overlap(path: str) -> OSError:
                    + f"Inspect it with git diff --cached -- {shlex.quote(path)}")
 
 
+def _recover_settings_json(checkout: Path, plan: MovePlan, current: str,
+                           saved: SettingsJsonSave | NoSettingsJsonSave) -> str | None:
+    before = clean_settings_json(checkout, plan["before"][SETTINGS_JSON] or "{}\n")
+    after = clean_settings_json(checkout, plan["after"][SETTINGS_JSON] or "{}\n")
+    shared = clean_settings_json(checkout, current)
+    if isinstance(saved, dict):
+        before = apply_settings_json_edits(before, saved["edits"])
+        after = apply_settings_json_edits(after, saved["edits"])
+    if all(has_settings_json_edits(settings_json_edits(expected, shared)) for expected in (before, after)):
+        return None
+    return smudge_settings_json(checkout, after)
+
+
 def recover_move(checkout: Path, head: str) -> None:
     """Recover only changes that the move recorded."""
     marker = move_marker(checkout)
@@ -712,40 +727,50 @@ def recover_move(checkout: Path, head: str) -> None:
     elif head == plan["source"]:
         rollback_move(checkout, plan, writes)
     else:
-        with ExitStack() as locks:
+        settings = {path for path in plan["after"] if path not in (REGISTRY_PATH, SETTINGS_JSON)}
+        target_orders = published_orders(checkout, head) if settings else {}
+        target_settings = {path: tree_text(checkout, head, path) for path in settings}
+        registry_dir = _registry_git_directory(checkout) if REGISTRY_PATH in plan["after"] else None
+        while True:
             restored = dict(plan["after"])
-            registry_dir = _registry_git_directory(checkout) if REGISTRY_PATH in restored else None
-            if registry_dir is not None:
-                _ = locks.enter_context(file_lock.exclusive(registry_writer_lock(registry_dir)))
-            pending = locks.enter_context(locked_journal(journal_path()))
-            saves = pending_files(checkout, pending)
-            target_orders: SaveOrders | None = None
-            for path, after in restored.items():
-                current = live_text(checkout / path)
-                before = plan["before"][path]
-                if current == after or (current == before and file_version(checkout / path) == writes["files_before"][path]):
+            json_path = checkout / SETTINGS_JSON
+            saved = read_journal(journal_path()).settings_json
+            current_json = live_text(json_path) if SETTINGS_JSON in restored else None
+            after_json = restored.get(SETTINGS_JSON)
+            if (current_json is not None and current_json != after_json
+                    and (current_json != plan["before"][SETTINGS_JSON] or isinstance(saved, dict))):
+                after_json = _recover_settings_json(checkout, plan, current_json, saved)
+            with ExitStack() as locks:
+                if registry_dir is not None:
+                    _ = locks.enter_context(file_lock.exclusive(registry_writer_lock(registry_dir)))
+                pending = locks.enter_context(locked_journal(journal_path()))
+                if SETTINGS_JSON in restored and (current_json != live_text(json_path) or saved != pending.settings_json):
                     continue
-                if path == REGISTRY_PATH and registry_dir is not None and current is not None:
-                    restored[path] = _replay_registry(registry_dir, before or "", current, after or "")
-                    continue
-                if path == SETTINGS_JSON and current is not None and isinstance(saved := pending.settings_json, dict):
-                    edits = saved["edits"]
-                    staged = apply_settings_json_edits(before or "{}\n", edits)
-                    if not has_settings_json_edits(settings_json_edits(staged, current)):
-                        restored[path] = apply_settings_json_edits(after or "{}\n", edits)
+                if current_json is not None:
+                    if after_json is None:
+                        raise worktree_edit(SETTINGS_JSON)
+                    restored[SETTINGS_JSON] = after_json
+                saves = pending_files(checkout, pending)
+                for path, after in restored.items():
+                    current = live_text(checkout / path)
+                    before = plan["before"][path]
+                    if current == after or (current == before and file_version(checkout / path) == writes["files_before"][path]):
                         continue
-                keys = saves.get(path)
-                if not keys or current != apply_accepted_values(before or "", keys):
-                    raise worktree_edit(path)
-                if target_orders is None:
-                    target_orders = published_orders(checkout, head)
-                stem = Path(path).stem
-                settled = _settled_saves(checkout, head, stem, keys, target_orders.get(stem, {}))
-                waiting = {key: save for key, save in keys.items()
-                           if isinstance(save, AcceptedSave) and key not in settled}
-                if waiting:
-                    restored[path] = apply_accepted_values(after or "", waiting)
-            write_files(checkout, restored)
+                    if path == REGISTRY_PATH and registry_dir is not None and current is not None:
+                        restored[path] = _replay_registry(registry_dir, before or "", current, after or "")
+                        continue
+                    if path == SETTINGS_JSON and current_json is not None:
+                        continue
+                    keys = saves.get(path)
+                    if not keys or current != apply_accepted_values(before or "", keys):
+                        raise worktree_edit(path)
+                    settled = _settled_saves(target_settings[path], keys, target_orders.get(Path(path).stem, {}))
+                    waiting = {key: save for key, save in keys.items()
+                               if isinstance(save, AcceptedSave) and key not in settled}
+                    if waiting:
+                        restored[path] = apply_accepted_values(after or "", waiting)
+                write_files(checkout, restored)
+                break
     marker.unlink()
 
 
@@ -859,10 +884,9 @@ def tree_without(checkout: Path, tree: str, paths: Iterable[str], environment: d
 
 
 def check_move(checkout: Path, move: CheckoutMove, *,
-               replace_registry: bool = False, registry_move: bool = False,
+               registry_move: bool = False,
                published_registry: str | None = None) -> WaitingRows:
     """Check the move on a private index before Git changes the checkout."""
-    pending = read_journal(journal_path())
     index = index_path(checkout)
     folder = (build_folders.tool_folder("models-ff-index") if registry_move
               else tempfile.TemporaryDirectory(prefix="waiting-rows-index-"))
@@ -872,7 +896,7 @@ def check_move(checkout: Path, move: CheckoutMove, *,
         git_index.private_copy(index, trial)
         index_before = git(checkout, "write-tree", environment=environment).strip()
         staged = changed_paths(checkout, move.head, index_before, *waiting_paths(checkout))
-        plan = hold(checkout, move, pending, replace_registry=replace_registry, published_registry=published_registry)
+        plan = hold(checkout, move, published_registry=published_registry)
         target_entries = {path: index_entry(checkout, move.tip, path) for path in plan["after"]}
         merged_entries: dict[str, str] = {}
         for path in sorted(staged & target_entries.keys()):
