@@ -119,7 +119,7 @@ def helper_lifeline_owner() -> None:
                                  pass_fds=(read_fd,), stdout=subprocess.PIPE)
         children.append(child)
         assert child.stdout is not None
-        if not select.select([child.stdout], [], [], 3)[0]:
+        if not select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0]:
             raise AssertionError("helper did not become ready")
         ready = cast(bytes, child.stdout.readline())
         if source in (BLOCKING_CHILD, TERM_RESISTANT_CHILD):
@@ -159,7 +159,7 @@ class HelperLifelineTests(unittest.TestCase):
         descriptors: list[int] = []
         try:
             assert owner.stdout is not None
-            self.assertTrue(select.select([owner.stdout], [], [], 10)[0], "helper owner did not become ready")
+            self.assertTrue(select.select([owner.stdout], [], [], TEST_HANG_GUARD_SECS)[0], "helper owner did not become ready")
             pids = cast(list[int], json.loads(cast(bytes, owner.stdout.readline())))
             descriptors = [os.pidfd_open(pid) for pid in pids]
             owner.kill()
@@ -325,7 +325,7 @@ class QueuePlaceFixture(ExitStack):
         stop_orphan_private_slices()
         prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
                   "--expand-environment=no", f"--slice={self.private_slice}", "--"]
-        probe = subprocess.run([*prefix, "true"], capture_output=True, timeout=10, check=False)
+        probe = subprocess.run([*prefix, "true"], capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         if probe.returncode:
             raise unittest.SkipTest("the user manager cannot create a private test slice")
         _ = self.enter_context(mock.patch.object(queue, "probe_scope_prefix", return_value=prefix))
@@ -699,7 +699,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                    + "QueuePlaceTests().assert_nested_scope_stops_unsampled_descendant("
                    + f"fork_during_scope_read={fork_during_scope_read!r}, private_slice={private_slice!r})"]
         try:
-            result = subprocess.run(command, capture_output=True, timeout=35, check=False,
+            result = subprocess.run(command, capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False,
                                     cwd=Path(__file__).resolve().parents[2])
             self.assertEqual(result.returncode, 0, result.stdout.decode() + result.stderr.decode())
         finally:
@@ -729,7 +729,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
 
             def hold_sampler(_tracking: object, stopped: threading.Event) -> None:
                 sampler_started.set()
-                if not stopped.wait(15):
+                if not stopped.wait(TEST_HANG_GUARD_SECS):
                     raise AssertionError("the sampler barrier exceeded its test deadline")
 
             def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
@@ -747,7 +747,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 nonlocal descendant, descendant_descriptor
                 assert child.stdout is not None
                 _ = os.write(fork_write, b"F")
-                self.assertTrue(select.select([child.stdout], [], [], 3)[0])
+                self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                 descendant = int(cast(bytes, child.stdout.readline()))
                 descendant_descriptor = os.pidfd_open(descendant)
                 self.assertEqual(os.getsid(descendant), descendant)
@@ -778,9 +778,9 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         child = place.popen([sys.executable, "-c", UNSAMPLED_DESCENDANT,
                                              str(fork_read), str(exit_read)],
                                             pass_fds=(fork_read, exit_read), stdout=subprocess.PIPE)
-                        self.assertTrue(sampler_started.wait(3), "the sampler never reached its barrier")
+                        self.assertTrue(sampler_started.wait(TEST_HANG_GUARD_SECS), "the sampler never reached its barrier")
                         assert child.stdout is not None
-                        self.assertTrue(select.select([child.stdout], [], [], 3)[0])
+                        self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                         leader = int(cast(bytes, child.stdout.readline()))
                         leader_descriptor = os.pidfd_open(leader)
                         _, row = fixture.reservation()
@@ -900,7 +900,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     TERM_RESISTANT_CHILD],
                     stdout=subprocess.PIPE)
                 assert child.stdout is not None
-                self.assertTrue(select.select([child.stdout], [], [], 3)[0])
+                self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                 self.assertEqual(child.stdout.readline(), b"ready\n")
                 _, row = fixture.reservation()
                 reservation_id = str(row.get("reservation_id", ""))
@@ -936,7 +936,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                                               "exit" if leader_exits else "term",
                                               "detach" if descendant_detaches else "group"], stdout=subprocess.PIPE)
                         assert leader.stdout is not None
-                        self.assertTrue(select.select([leader.stdout], [], [], 3)[0], "descendant never became ready")
+                        self.assertTrue(select.select([leader.stdout], [], [], TEST_HANG_GUARD_SECS)[0], "descendant never became ready")
                         descendant = int(cast(bytes, leader.stdout.readline()))
                         descriptor = os.pidfd_open(descendant)
                         if descendant_detaches:
@@ -944,7 +944,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                             self.assertEqual(os.getpgid(descendant), descendant)
                             self.assertNotEqual(os.getpgid(descendant), leader.pid)
                             fixture.supply_process(descendant, 2 * GIB, parent=leader.pid)
-                            self.assertTrue(sampled.wait(3), "sampler never recorded the detached descendant")
+                            self.assertTrue(sampled.wait(TEST_HANG_GUARD_SECS), "sampler never recorded the detached descendant")
                         else:
                             self.assertEqual(os.getpgid(descendant), leader.pid)
                         self.assertFalse(select.select([descriptor], [], [], 0)[0])
@@ -1213,7 +1213,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                             spawn = subprocess.Popen
                             def pause(process: subprocess.Popen[bytes]) -> None:
                                 assert process.stdout is not None
-                                if not select.select([process.stdout], [], [], 5)[0]:
+                                if not select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)[0]:
                                     raise AssertionError("the program did not start")
                                 if process.stdout.readline() != b"ready\n":
                                     raise AssertionError("the program did not announce readiness")
@@ -1246,7 +1246,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     os.close(exit_read)
                     program_pid = 0
                     try:
-                        self.assertTrue(select.select([ready_read], [], [], 8)[0], "the start window never opened")
+                        self.assertTrue(select.select([ready_read], [], [], TEST_HANG_GUARD_SECS)[0], "the start window never opened")
                         program_pid = int(os.read(ready_read, 64))
                         saved = list(queue.program_starts().glob("*.json"))
                         self.assertEqual(len(saved), 1)
@@ -1322,7 +1322,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     os._exit(99)
             os.close(write_fd)
             try:
-                self.assertTrue(select.select([read_fd], [], [], 5)[0])
+                self.assertTrue(select.select([read_fd], [], [], TEST_HANG_GUARD_SECS)[0],
+                                "the holder did not report readiness")
                 self.assertEqual(os.read(read_fd, 5), b"ready")
                 _, row = fixture.reservation()
                 program_pid = int((scope / "cgroup.procs").read_text())
@@ -1531,9 +1532,9 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 program_pid = 0
                 scope_name = ""
                 try:
-                    self.assertTrue(select.select([spawned_read], [], [], 10)[0], "OS Popen never returned")
+                    self.assertTrue(select.select([spawned_read], [], [], TEST_HANG_GUARD_SECS)[0], "OS Popen never returned")
                     program_pid = int(os.read(spawned_read, 64))
-                    self.assertTrue(select.select([ready_read], [], [], 10)[0], "scope startup never reached its barrier")
+                    self.assertTrue(select.select([ready_read], [], [], TEST_HANG_GUARD_SECS)[0], "scope startup never reached its barrier")
                     wrapper_pid = int(os.read(ready_read, 64))
                     descriptor = os.pidfd_open(wrapper_pid)
                     cgroup = Path(f"/proc/{wrapper_pid}/cgroup").read_text()
@@ -1616,7 +1617,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                                 assert isinstance(place.program, queue.StartedProgram)
                                 stream = place.program.process.stdout
                                 assert stream is not None
-                                if not select.select([stream], [], [], 5)[0] or stream.readline() != b"ready\n":
+                                if not select.select([stream], [], [], TEST_HANG_GUARD_SECS)[0] or stream.readline() != b"ready\n":
                                     raise AssertionError("the scoped program never became active")
                             place.on_started = started
                             _ = place.popen([sys.executable, "-c", BLOCKING_CHILD], stdout=subprocess.PIPE)
@@ -1629,7 +1630,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 for fd in (ready_write, resume_read, caught_write, exit_read):
                     os.close(fd)
                 try:
-                    self.assertTrue(select.select([ready_read], [], [], 10)[0], "the scope did not reach its barrier")
+                    self.assertTrue(select.select([ready_read], [], [], TEST_HANG_GUARD_SECS)[0], "the scope did not reach its barrier")
                     _ = int(os.read(ready_read, 64))
                     _, reservation = fixture.reservation()
                     self.assertEqual(Path(reservation["sidecar"]).read_text(), "")
@@ -1678,7 +1679,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                  mock.patch.object(queue.QueuePlace, "observe", autospec=True, side_effect=observed):
                 with queue.queue_place("rust-analyzer", fixture.root) as place:
                     child = fixture.start_blocked(place)
-                    self.assertTrue(sampled.wait(4), "sampler never found the transient scope")
+                    self.assertTrue(sampled.wait(TEST_HANG_GUARD_SECS), "sampler never found the transient scope")
                     _, row = fixture.reservation()
                     directory = Path(Path(row["sidecar"]).read_text().strip())
                     self.assertTrue(directory.is_relative_to("/sys/fs/cgroup"))
