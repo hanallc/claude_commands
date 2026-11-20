@@ -875,3 +875,34 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 **Constraints from prior phases:** the base is main. Phase 355 renames `merge_gate.py` to `gate.py`; it follows this change by rename at its next merge of main. The report unit's branch `builds-report-jobnames` changes one line in the merge gate test files; keep edits away from the first lines of those files. Tests read no tunable config value. Tests run on the Mac too. Focused modules inside the writer pass are allowed; any other test run needs natemerge's go.
 
 **Acceptance gate:** basedpyright gives zero errors and zero warnings on changed files; the changed test modules pass; 20 repeated runs of each changed test module pass after natemerge's go; one blind review; the gate route that builds names for the merge passes.
+
+### Phase 410 — a named module run on the AWS box or the Mac gets the short limit  · status: todo
+**Depends on:** Phase 409
+
+#### Work Order
+
+**Goal:** a rerun step or a bisect step that the cloud route or the Mac route runs stops a hanging module after the Phase 409 limit, not after 1800 s. Phase 409 gives the limit only to runs on natedev.
+
+**Spec:**
+1. State where a named module run goes when the cloud route is on: `merge_gate.py` near the `cloud.route` call, `scripts/aws_target/gate_box.py` and `scripts/mac_test/mac_gate.py`.
+2. The box and the Mac have no gate index. natedev makes the per-module limits with `read_rerun_module_time_limits` and sends them in the request. The key is the vCPU count of the machine that runs the modules.
+3. The box and the Mac read the limits when the request has them. A request without them keeps `module_time_limit_s`. The reader merges to main before the writer, because the box runs the candidate code and natedev runs main.
+4. A module with no limit in the request keeps `module_time_limit_s`. A full gate run sends no per-module limits.
+5. Tests: table rows in the existing request and box tests. Rows: a request with limits stops a hanging fixture module at its limit; a request without limits keeps the old limit; an old reader accepts a new request.
+
+**Files:**
+- `scripts/production/merge_gate.py` — the request for the cloud route
+- `scripts/aws_target/cloud_gate.py` — the request field
+- `scripts/aws_target/gate_box.py` — the reader on the box
+- `scripts/mac_test/mac_gate.py` — the reader on the Mac
+- `scripts/aws_target/test_gate_box.py` — the reader rows; the other test modules of these files as the writer finds them
+
+**Workers:** 2 writers. The split is reader and writer.
+- `impl` — `gate_box.py`, `mac_gate.py` and their tests (the reader commit).
+- `test` opens as impl — `merge_gate.py`, `cloud_gate.py` and their tests (the writer commit). hub: `cloud_gate.py`.
+
+**State:** one new optional request field. No stored record changes.
+
+**Constraints from prior phases:** Phase 409 made `ModuleTimeLimit`, `read_rerun_module_time_limits` and the two keys `rerun.module_time_factor` and `rerun.module_time_floor_seconds`. Phase 355 renames `merge_gate.py` to `gate.py`. Phase 406 is held and also adds request fields; merge-tree against `natest-affected406` before the hash.
+
+**Acceptance gate:** basedpyright gives zero errors and zero warnings on changed files; the changed test modules pass; one blind review; the reader hash goes to builds before the writer hash.
