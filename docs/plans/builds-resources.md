@@ -3073,3 +3073,14 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - The natedev subcase writes `sweep_build_floor_gib.natedev=733.29` and expects it. The two Mac floor tests set `free_floor_gib=100`. The phone rearm test sets `sweep_phone_rearm_gib=5`.
 - Module test: 368 tests pass with both layouts.
 - Blind review: 6 findings; 2 fixed in the row; 4 go to the next phase (growth alert keys, message limits, `sweep_proc_locks_reads`, `sweep_dep_info_head_bytes`).
+
+### Phase 177 — The folder audit never scans or removes a home folder  · status: done
+**Source:** builds, URGENT, 2026-11-19 20:24 EST. The audit removed top-level home folders on natedev (11-17 05:00) and on the Mac (11-18, 11-19 05:00); natedev disarmed it on both. Base main f5eb6c184.
+
+#### Work Order
+1. Scan only the configured roots, never a parent of one (`folder_audit.py:789` adds `copies_root().parent`, which is `$HOME` since `roots.workspace=~/worktrees`).
+2. Refuse `$HOME`, an ancestor of `$HOME` and `/` as a scan root, with a hard error.
+3. Find and fix why the Mac run on 11-19 removed `~/nixos` at 0.6 days idle (rule: 7 days).
+4. Tests: a home folder is never a candidate; the refusal; the 11-19 Mac case.
+5. Tests run when natemerge lifts the hold; the hash goes first after it. No re-arm: that needs the fix on main and nate's word.
+
