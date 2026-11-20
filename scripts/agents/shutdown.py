@@ -257,7 +257,7 @@ USAGE = f"""usage: agents COMMAND
   agents remove-stray NAME SESSION
   agents transfer NAME [--model MODEL --effort EFFORT]
   agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
-  agents {set_model.COMMAND} {set_model.ARGUMENTS}
+  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
 """
 
 
