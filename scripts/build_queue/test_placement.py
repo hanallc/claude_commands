@@ -2542,21 +2542,29 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             granted = only_admitted(fixture.server.handle_request(local))
             entered, finish = threading.Event(), threading.Event()
             read_started: list[float] = []
+            key = fixture.server.host_evidence_key(request, assignment.destination)
+
+            class FirstProbeWorker(service.HostEvidenceWorker):
+                @override
+                def _probe(self, current: placement.HostEvidenceKey, subscription: object) -> bool:
+                    if current == key and entered.is_set():
+                        return False
+                    return super()._probe(current, subscription)
 
             def blocked_probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
                 read_started.append(fixture.clock.now())
                 entered.set()
                 _ = finish.wait()
-                return placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a", placement.AllowedHost())
+                return placement.FreshHostEvidence(key, fixture.clock.now(), "late-generation", placement.AllowedHost())
 
             fixture.server.host_probe = blocked_probe
-            key = fixture.server.host_evidence_key(request, assignment.destination)
             fixture.clock.advance(0.09)
             self.assertIsInstance(fixture.server.host_evidence(key), placement.FreshHostEvidence)
             fixture.clock.advance(0.02)
             self.assertIsInstance(fixture.server.host_evidence(key), placement.StaleHostEvidence)
             waiter = placement_request(fixture)
-            with ThreadPoolExecutor(max_workers=1) as workers:
+            with (ThreadPoolExecutor(max_workers=1) as workers,
+                  mock.patch.object(service, "HostEvidenceWorker", FirstProbeWorker)):
                 try:
                     probe_guard = LauncherHangGuard("Remote evidence probe start")
                     reply, = probe_guard.result(workers.submit(fixture.connect(waiter).replies))
@@ -2581,6 +2589,10 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     if reader is not None:
                         reader.close()
                         LauncherHangGuard("Remote evidence probe cleanup").join(reader.thread)
+            assert reader is not None
+            published = reader.latest
+            assert isinstance(published, placement.FreshHostEvidence)
+            self.assertEqual(published.generation, "late-generation")
             observed = fixture.server.host_evidence(key)
             self.assertIsInstance(observed, placement.StaleHostEvidence)
             self.assertLessEqual(observed.observed_at, read_started[0])
