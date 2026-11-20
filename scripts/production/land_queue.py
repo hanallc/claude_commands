@@ -260,7 +260,7 @@ def remove(label: str) -> None:
 
 
 def take_next() -> str:
-    """Check the first item before removal and format its label and batch path."""
+    """Return the saved batch path unchanged so integration can resume the same batch."""
     with edited() as items:
         if not items:
             return ""

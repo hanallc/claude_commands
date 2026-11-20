@@ -44,6 +44,7 @@ class Production(NamedTuple):
 
 def read_production(path: Path, *, resolver: session_staff.RowResolver | None = None) -> Production:
     from scripts.production import unit_lookup
+    from scripts.production.production_doc import EnrolledPaths, ProductionPathsError, resolve_production_paths
 
     resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     try:
@@ -53,14 +54,16 @@ def read_production(path: Path, *, resolver: session_staff.RowResolver | None = 
     doc = resolver.production_doc(owner)
     if not isinstance(doc, session_staff.ProductionDoc):
         raise Refusal(f"cannot read production doc: {path}: {owner.name}: {doc.reason}")
-    try:
-        lines = doc.path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as error:
-        raise Refusal(f"cannot read production doc: {path}: {error}") from error
+    lines = doc.text.splitlines()
     _ = production_field(lines, "Merge branch")
-    _ = production_field(lines, "Showrunner checkout")
-    if Path(production_field(lines, "Log")).is_absolute():
-        raise Refusal("production Log must be relative to Showrunner checkout")
+    try:
+        enrolled = doc.machine == remote.local_machine() and isinstance(resolve_production_paths(doc.path), EnrolledPaths)
+    except ProductionPathsError as error:
+        raise Refusal(str(error)) from error
+    if not enrolled:
+        _ = production_field(lines, "Showrunner checkout")
+        if Path(production_field(lines, "Log")).is_absolute():
+            raise Refusal("production Log must be relative to Showrunner checkout")
     return Production(doc.path, owner.name, user_zone())
 
 
