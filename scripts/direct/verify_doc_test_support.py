@@ -1,7 +1,7 @@
 """Judge real Git trees with fake Cargo, without changing the caller's index."""
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import placement
@@ -172,12 +172,8 @@ class VerifyDocFixture(unittest.TestCase):
                              "manifest_path": str(member / "Cargo.toml"),
                              "targets": [{"name": name, "kind": ["lib"], "test": True,
                                           "src_path": str(source), "required-features": []}]})
-        self.environment = {
-            name: value for name, value in os.environ.items()
-            if name != "PYTHONDONTWRITEBYTECODE"
-            and not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_", "CARGO_", "RUST",
-                                    "NEXTEST_", "CLAUDE_CODE_", "CODEX_", "GIT_"))
-        }
+        self.environment = verify_test_environment()
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
         self.environment.update({
             "HOME": str(home), "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPYCACHEPREFIX": str(self.root / "bytecode"),
@@ -209,12 +205,11 @@ class VerifyDocFixture(unittest.TestCase):
         configuration = Path(self.environment["CONF_DIR"])
         _ = shutil.copy2(private.settings, configuration / "build_folders.conf")
         self.environment.update({key: value for key, value in private.environment.items() if key != "CONF_DIR"})
-        with mock.patch.dict(os.environ, self.environment):
+        with mock.patch.dict(os.environ, self.environment, clear=True):
             self.assertTrue(copies.gates_root().is_relative_to(self.root))
         # These tests use the interpreter cache. Exercise
         # the real shim's cache hit instead of revalidating Python every call.
         seed_interpreter_cache(self.root / "cache")
-        _ = self.environment.pop("CLAUDE_PYTHON", None)
         _ = self.git("init", "-q", "-b", "test")
         _ = self.git("add", "-A")
         _ = self.git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
