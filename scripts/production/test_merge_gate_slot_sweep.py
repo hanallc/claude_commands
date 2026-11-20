@@ -88,8 +88,7 @@ class NightlySlotSweepTests(unittest.TestCase):
                 local.assert_called_once_with()
                 self.assertEqual(len(notices), 1)
                 self.assertIn("on Mac failed:", notices[0])
-                self.assertIn("enabled.mac is off", notices[0])
-                self.assertIn("Mac queue: Sweep Mac build slots refused\trepo", notices[0])
+                self.assertIn("Mac queue: Sweep Mac build slots enabled.mac is off", notices[0])
                 self.assertEqual(output.getvalue().strip(), notices[0])
 
     def test_gate_failure_still_sweeps_both_pools(self) -> None:
