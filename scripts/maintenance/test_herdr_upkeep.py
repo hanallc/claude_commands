@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import io
 import os
+import subprocess
 import tempfile
 import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from contextlib import redirect_stderr
+from contextlib import ExitStack, redirect_stderr
 from typing import Literal, override
 from unittest.mock import patch
 
@@ -19,7 +20,7 @@ from scripts.herdr import herdr, detection_rules, herdr_types
 from scripts.lib import operation_deadline
 from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions
-from scripts.production import staff
+from scripts.production import gate, showrunners, staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.whoami import account
 
@@ -309,3 +310,35 @@ class UpkeepTests(unittest.TestCase):
                     job.upkeep()
                 self.assertEqual(set(attempts), {"alpha", "failed", "own-codex"})
                 self.assertLessEqual(max(start_deadlines), parent_deadline)
+
+            with self.subTest(case="stalled notice after producer restore"):
+                launches.clear()
+                attempts.clear()
+                restores.clear()
+                case.client.rows.clear()
+                pane_record.save("agents", {})
+                notice_deadline = clock.monotonic() + 60
+
+                def stall_notice(command: list[str], *, deadline: float) -> subprocess.CompletedProcess[str]:
+                    self.assertEqual(deadline, notice_deadline)
+                    self.assertEqual(restores, ["agents"])
+                    self.assertEqual(set(attempts), {"alpha", "failed", "own-codex"})
+                    clock.advance(deadline - clock.monotonic())
+                    raise subprocess.TimeoutExpired(command, 0)
+
+                def check_notices() -> int:
+                    layout.assert_called_once()
+                    deadline = showrunners.notice_deadline(193)
+                    delivery = showrunners.send_to_address("uds:/fixture", "fixture", "Fixture notice.",
+                                                          recipient="fixture", deadline=deadline)
+                    self.assertEqual(delivery.failed, ("fixture",))
+                    return 0
+
+                with ExitStack() as fixture:
+                    fixture.enter_context(patch.dict(os.environ, {"HERDR_UPKEEP_DEADLINE": str(notice_deadline)}))
+                    layout = fixture.enter_context(patch.object(herdr, "save_shared_layout", wraps=herdr.save_shared_layout))
+                    _ = fixture.enter_context(patch.object(showrunners, "monotonic", new=clock.monotonic))
+                    send = fixture.enter_context(patch.object(showrunners, "run_notice", side_effect=stall_notice))
+                    _ = fixture.enter_context(patch.object(gate, "check_nightly_assignments", side_effect=check_notices))
+                    job.upkeep()
+                send.assert_called_once()

@@ -11,14 +11,14 @@ import io
 import json
 import tempfile
 from collections.abc import Callable, Generator
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import ClassVar, TextIO, cast, final, override
+from typing import ClassVar, Literal, TextIO, cast, final, override
 from unittest import mock
 from datetime import UTC, datetime, timedelta, tzinfo
 from scripts.agents import remote
@@ -51,8 +51,8 @@ class MergeGateTypesTests(GateSuitesFixture):
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.object(gate, "push_nightly_result")))
 
-    def run_nightly(self, *, production: str = "") -> subprocess.CompletedProcess[str]:
-        arguments = ["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"]
+    def run_nightly(self, *, production: str = "", repo_subdirectory: str = ".") -> subprocess.CompletedProcess[str]:
+        arguments = ["--nightly", "--repo", str(self.checkout / repo_subdirectory), "--merge-branch", "integration"]
         if production:
             arguments.extend(["--production", production])
         owner = nullcontext() if production else mock.patch.object(gate, "nightly_owner", return_value="fixture-showrunner")
@@ -162,7 +162,8 @@ class MergeGateTypesTests(GateSuitesFixture):
             limit = gate.NIGHTLY_TYPE_DIAGNOSTIC_LINES
             byte_limit = gate.NIGHTLY_TYPE_LINE_BYTES
             long_line = f"{source}:1:1 - error: " + "漢" * byte_limit
-            for case in ("assigned", "unknown", "test red", "long report", "wide files", "notice failure", "recorded producer"):
+            for case in ("assigned", "repository subdirectory", "unknown", "test red",
+                         "long report", "wide files", "notice failure", "recorded producer"):
                 with self.subTest(case=case):
                     self.environment["GATE_STATE_DIR"] = str(self.root / case)
                     expected_author = receipt_author
@@ -192,7 +193,8 @@ class MergeGateTypesTests(GateSuitesFixture):
                                             return_value=showrunners.NoticeDelivery()) as deliver,
                           mock.patch.object(showrunners, "tell", return_value=notice_result) as notice,
                           mock.patch.object(gate, "send_nightly_red") as push):
-                        result = self.run_nightly(production=owner.name)
+                        result = self.run_nightly(production=owner.name,
+                                                  repo_subdirectory="scripts" if case == "repository subdirectory" else ".")
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     first, second = deliver.call_args_list
                     self.assertEqual(first.args[0], f"session:{expected_author.current_session}")
@@ -457,20 +459,58 @@ class NightlyPushTests(unittest.TestCase):
         return stalled_sender
 
     def test_stalled_author_notice_releases_nightly_result_lock(self) -> None:
+        with self.subTest(case="lookup and send after checkout release"):
+            self.check_stalled_author_notice()
+
+    def check_stalled_author_notice(self) -> None:
+        checkout = self.root / "checkout-slot"
         job = gate.GateJobResult("types", "basedpyright", 1, 0,
-            "scripts/fixture.py:1:1 - error: fixture", kind=gate.GateJobKind.TYPE_CHECK)
+            f"{checkout}/scripts/fixture.py:1:1 - error: fixture", kind=gate.GateJobKind.TYPE_CHECK)
         run = gate.GateRun((job,), 0, 0)
         budget = 2.0
         stalled_sender = self.stalled_notice(budget, "gate-nightly:")
         output = io.StringIO()
+        slot_held = False
+
+        @contextmanager
+        def slot() -> Generator[Path]:
+            nonlocal slot_held
+            slot_held = True
+            try:
+                yield checkout
+            finally:
+                slot_held = False
+
+        def blame(repo: Path, *arguments: str) -> bytes:
+            self.assertEqual(repo, self.root)
+            self.assertEqual(arguments[-1], "scripts/fixture.py")
+            self.assertFalse(slot_held)
+            with gate.nightly_red_lock():
+                return b"fixture-commit"
+
+        def send(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertFalse(slot_held)
+            return stalled_sender(command, **options)
+
+        lookup = mock.Mock(side_effect=blame)
+
+        def routing_git(repo: Path, *arguments: str) -> bytes:
+            if arguments == ("rev-parse", "--show-toplevel"):
+                self.assertFalse(slot_held)
+                return os.fsencode(self.root) + b"\n"
+            return cast(bytes, lookup(repo, *arguments))
+
         with (self.execution(run, mock_owner_notice=False) as sent,
+              mock.patch.object(copies, "standing", return_value=slot()),
+              mock.patch.object(copies, "git", side_effect=routing_git),
               mock.patch.object(gate, "_nightly_author", return_value=self.fixer),
               mock.patch.object(send_budget, "seconds", return_value=budget),
               mock.patch.object(showrunners, "current_address", return_value="uds:/fixture"),
               redirect_stdout(output)):
-            sent.side_effect = stalled_sender
+            sent.side_effect = send
             self.assertEqual(self.nightly(), 1)
 
+        lookup.assert_called_once()
         author, owner = sent.call_args_list
         self.assertIn("gate", cast(list[str], author.args[0]))
         failure = "could not tell fixes: the notice deadline expired"
@@ -657,9 +697,18 @@ class NightlyPushTests(unittest.TestCase):
                     self.assertEqual(cast(dict[str, str], saved["assignment"])["unit"], str(self.fixer.id))
 
     def test_upkeep_stop_saves_later_alerts_and_rotates_the_stalled_alert(self) -> None:
+        for stop in ("first send killed", "second send killed", "shared deadline expires"):
+            with (self.subTest(stop=stop),
+                  mock.patch.dict(os.environ, {"GATE_STATE_DIR": str(self.root / stop)})):
+                self.check_upkeep_stop_rotates_alerts(stop)
+
+    def check_upkeep_stop_rotates_alerts(
+            self, stop: Literal["first send killed", "second send killed", "shared deadline expires"]) -> None:
         class SupervisorStop(BaseException):
             """Stop the check before the notice budget expires."""
 
+        first_times_out = stop != "first send killed"
+        shared_deadline_expires = stop == "shared deadline expires"
         finished = datetime(2026, 11, 11, 8, tzinfo=UTC)
         NightlyClock.current = finished + timedelta(minutes=31)
         stalled = gate.NightlyRedResult("a-stalled", "main", "tree", finished.isoformat(), (), "passed", "failed")
@@ -669,32 +718,36 @@ class NightlyPushTests(unittest.TestCase):
             gate.save_nightly_red(directory, ready)
 
         elapsed = 50.0
-        supervisor_deadline = 60.0
         budget = 193.0
         lookup_seconds = 1.0
+        second_turn = 2 * lookup_seconds
+        supervisor_deadline = elapsed + budget + second_turn if first_times_out else 60.0
+        notice_seconds = budget
         attempts: list[str] = []
 
         def monotonic() -> float:
             return elapsed
 
         def owner(_args: gate.GateArguments) -> str:
-            nonlocal elapsed
+            nonlocal elapsed, notice_seconds
             with gate.nightly_red_lock() as unlocked:
                 later = gate.read_nightly_red(unlocked / "b-ready.json")
                 if not attempts:
                     self.assertTrue(later.alert_pending)
                     self.assertIsNone(later.last_tried)
-            self.assertEqual(operation_deadline.remaining(), budget)
+            notice_seconds = second_turn if shared_deadline_expires and len(attempts) == 1 else budget
+            self.assertEqual(operation_deadline.remaining(), notice_seconds)
             elapsed += lookup_seconds
             return "sdlc"
 
         def address(name: str, *, deadline: float) -> str:
             with gate.nightly_red_lock():
                 self.assertEqual(name, "sdlc")
-                self.assertEqual(deadline - elapsed, budget - lookup_seconds)
+                self.assertEqual(deadline - elapsed, notice_seconds - lookup_seconds)
             return "uds:/fixture"
 
         def send(command: list[str], *, timeout: float, **_options: object) -> subprocess.CompletedProcess[str]:
+            nonlocal elapsed
             key = command[command.index("--key") + 1]
             identity = key.split(":")[-1]
             attempts.append(identity)
@@ -702,9 +755,23 @@ class NightlyPushTests(unittest.TestCase):
                 record = gate.read_nightly_red(unlocked / f"{identity}.json")
                 self.assertEqual(record.last_tried, NightlyClock.current.isoformat())
                 self.assertTrue(record.alert_pending)
+            if shared_deadline_expires and len(attempts) == 2:
+                self.assertEqual(identity, ready.id)
+                self.assertLess(timeout, budget - lookup_seconds)
+                self.assertEqual(timeout, supervisor_deadline - elapsed)
+                elapsed += timeout
+                raise subprocess.TimeoutExpired(command, timeout)
             self.assertEqual(timeout, budget - lookup_seconds)
             if len(attempts) == 1:
                 self.assertEqual(identity, stalled.id)
+                if first_times_out:
+                    elapsed += timeout
+                    NightlyClock.current += timedelta(seconds=timeout)
+                    raise subprocess.TimeoutExpired(command, timeout)
+                self.assertLess(supervisor_deadline - elapsed, timeout)
+                raise SupervisorStop()
+            if first_times_out and len(attempts) == 2:
+                self.assertEqual(identity, ready.id)
                 self.assertLess(supervisor_deadline - elapsed, timeout)
                 raise SupervisorStop()
             if identity == stalled.id:
@@ -721,18 +788,31 @@ class NightlyPushTests(unittest.TestCase):
               mock.patch.object(showrunners, "current_address", side_effect=address),
               mock.patch.object(subprocess, "run", side_effect=send),
               redirect_stdout(output)):
-            with self.assertRaises(SupervisorStop):
-                _ = gate.main(["nightly-check"])
-            tried = NightlyClock.current.isoformat()
-            self.assertEqual(gate.read_nightly_red(directory / "a-stalled.json"),
-                             replace(stalled, alert_pending=True, last_tried=tried))
-            self.assertEqual(gate.read_nightly_red(directory / "b-ready.json"), replace(ready, alert_pending=True))
+            if shared_deadline_expires:
+                with operation_deadline.within(supervisor_deadline):
+                    self.assertEqual(gate.main(["nightly-check"]), 1)
+            else:
+                with self.assertRaises(SupervisorStop):
+                    _ = gate.main(["nightly-check"])
+            first_attempt = (finished + timedelta(minutes=31)).isoformat()
+            interrupted = gate.NightlyAttemptInProgress("")
+            self.assertEqual(gate.read_nightly_red(directory / "a-stalled.json"), replace(
+                stalled, alert_pending=True, last_tried=first_attempt,
+                attempt=gate.NightlyAttemptIdle() if first_times_out else interrupted))
+            later = replace(ready, alert_pending=True)
+            if first_times_out:
+                later = replace(later, last_tried=NightlyClock.current.isoformat(), attempt=interrupted)
+            self.assertEqual(gate.read_nightly_red(directory / "b-ready.json"), later)
             NightlyClock.current += timedelta(minutes=2)
             elapsed = supervisor_deadline
             with mock.patch.dict(os.environ, {"HERDR_UPKEEP_DEADLINE": str(elapsed + supervisor_deadline)}):
                 self.assertEqual(gate.main(["nightly-check"]), 0)
 
-        self.assertEqual(attempts, [stalled.id, ready.id, stalled.id])
+        expected = [stalled.id, ready.id, stalled.id]
+        if first_times_out:
+            expected.insert(1, ready.id)
+            self.assertIn("the notice deadline expired", output.getvalue())
+        self.assertEqual(attempts, expected)
         self.assertIn("QUEUED: fixture delivery paused", output.getvalue())
         with gate.nightly_red_lock() as directory:
             self.assertTrue(gate.read_nightly_red(directory / "a-stalled.json").alert_pending)
@@ -789,6 +869,77 @@ class NightlyPushTests(unittest.TestCase):
             sent.assert_not_called()
 
     def test_an_unassigned_red_alerts_the_production_owner_each_window_until_assigned(self) -> None:
+        with self.subTest(route="each alert window"):
+            self.check_alerts_each_window_until_assigned()
+        with (self.subTest(route="assignment during recipient lookup"),
+              mock.patch.dict(os.environ, {"GATE_STATE_DIR": str(self.root / "assignment-race")})):
+            self.check_assignment_during_recipient_lookup()
+        with (self.subTest(route="result lock held after recipient lookup"),
+              mock.patch.dict(os.environ, {"GATE_STATE_DIR": str(self.root / "held-result-lock")})):
+            self.check_alert_with_result_lock_held()
+
+    def check_alert_with_result_lock_held(self) -> None:
+        run = gate.GateRun((gate.GateJobResult("production", "test_staff.py", 1, 0, ""),), 0, 0)
+        finished = datetime(2026, 11, 11, 8, tzinfo=UTC)
+        budget = 2.0
+        locked = Event()
+        tell = showrunners.tell
+        with (self.execution(run) as sent, mock.patch.object(gate, "datetime", NightlyClock),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
+            NightlyClock.current = finished
+            self.assertEqual(self.nightly(), 1)
+            path, = (gate.gate_state_dir() / "nightly-red").glob("*.json")
+            NightlyClock.current = finished + timedelta(minutes=30)
+            with ThreadPoolExecutor(max_workers=1) as executor, ExitStack() as held:
+                def lookup(name: str, *, deadline: float) -> str:
+                    self.assertEqual(name, "sdlc")
+                    self.assertGreater(deadline, time.monotonic())
+                    _ = held.enter_context(gate.nightly_red_lock())
+                    locked.set()
+                    return "uds:/fixture"
+
+                with (mock.patch.object(showrunners, "tell", new=tell),
+                      mock.patch.object(showrunners, "current_address", side_effect=lookup),
+                      mock.patch.object(send_budget, "seconds", return_value=budget)):
+                    future = executor.submit(gate.main, ["nightly-check"])
+                    self.assertTrue(locked.wait(TEST_HANG_GUARD_SECS))
+                    self.assertEqual(future.result(timeout=budget * 5), 1)
+                sent.assert_not_called()
+                self.assertIn("timed out acquiring lock", errors.getvalue())
+                record = gate.read_nightly_red(path)
+                self.assertTrue(record.alert_pending)
+                self.assertIsInstance(record.alerted, gate.NightlyAlertUnsent)
+
+    def check_assignment_during_recipient_lookup(self) -> None:
+        run = gate.GateRun((gate.GateJobResult("production", "test_staff.py", 1, 0, ""),), 0, 0)
+        finished = datetime(2026, 11, 11, 8, tzinfo=UTC)
+        tell = showrunners.tell
+        with (self.execution(run) as sent, mock.patch.object(gate, "datetime", NightlyClock),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors):
+            NightlyClock.current = finished
+            self.assertEqual(self.nightly(), 1)
+            path, = (gate.gate_state_dir() / "nightly-red").glob("*.json")
+            NightlyClock.current = finished + timedelta(minutes=30)
+
+            def assign_during_lookup(name: str, *, deadline: float) -> str:
+                del deadline
+                self.assertEqual(name, "sdlc")
+                self.assertEqual(gate.main(["nightly-assigned", "--result", path.stem, "--unit", str(self.fixer.id)]), 1)
+                self.assertIn("another nightly notice delivery is running", errors.getvalue())
+                return "uds:/fixture"
+
+            with (mock.patch.object(showrunners, "tell", new=tell),
+                  mock.patch.object(showrunners, "current_address", side_effect=assign_during_lookup) as lookup):
+                self.assertEqual(gate.main(["nightly-check"]), 0)
+            lookup.assert_called_once()
+            sent.assert_not_called()
+            record = gate.read_nightly_red(path)
+            self.assertEqual(record.assignment, gate.NightlyFixAssigned(self.fixer.id, NightlyClock.current.isoformat()))
+            self.assertFalse(record.alert_pending)
+            self.assertEqual(gate.main(["nightly-check"]), 0)
+            sent.assert_called_once()
+
+    def check_alerts_each_window_until_assigned(self) -> None:
         run = gate.GateRun((gate.GateJobResult("production", "test_staff.py", 1, 0, ""),), 0, 0)
         finished = datetime(2026, 11, 11, 8, 0, tzinfo=UTC)
         with (self.execution(run) as sent, mock.patch.object(gate, "datetime", NightlyClock),

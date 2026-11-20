@@ -30,13 +30,8 @@ def upkeep() -> None:
     from scripts.accounts import accounts
     from scripts.agents import stop_resume
     from scripts.herdr import detection_rules, herdr
-    from scripts.production import merge_gate
+    from scripts.production import gate
     from scripts.production.gate_modules import GateRefused
-
-    try:
-        _ = merge_gate.check_nightly_assignments()
-    except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
-        print(f"herdr-upkeep: nightly result check: {error}", file=sys.stderr)
 
     cadence = _cadence()
     deadline = min(time.monotonic() + cadence.timeout_seconds,
@@ -66,6 +61,13 @@ def upkeep() -> None:
                     print(f"herdr-upkeep: {row.name}: session not found", file=sys.stderr)
             except Exception as error:
                 print(f"herdr-upkeep: {row.name}: {error}", file=sys.stderr)
+
+    try:
+        with operation_deadline.within(deadline):
+            operation_deadline.check()
+            _ = gate.check_nightly_assignments()
+    except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"herdr-upkeep: nightly result check: {error}", file=sys.stderr)
 
 
 def run_job() -> int:

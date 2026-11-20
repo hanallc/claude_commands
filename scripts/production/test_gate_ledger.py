@@ -566,6 +566,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         copies: list[Path] = []
         caches: list[Path] = []
         marker = Path(self.environment["GATE_STATE_DIR"]) / "full-required"
+        push_result = gate.push_nightly_result
         for red in (True, False):
             with self.subTest(red=red):
                 def suite_run(repo: Path, type_dirs: tuple[str, ...], *, module_time_limit_s: float,
@@ -582,10 +583,21 @@ class MergeGateLedgerTests(MergeGateFixture):
                     caches.append((repo / "target").resolve())
                     return gate.GateRun((gate.GateJobResult("hooks", "test_first.py", int(red), 0, "fixture"),), 0, 0)
 
+                def red_notice(*args: object, **options: object) -> gate.NightlyNoticeUnreceived:
+                    del args, options
+                    self.assertEqual(build_folders.build_folder_state(copies[-1]), "free")
+                    with gate.nightly_red_lock():
+                        return gate.NightlyNoticeUnreceived()
+
+                def result_push(args: gate.GateArguments, result: gate.GateRun | Exception) -> None:
+                    self.assertEqual(build_folders.build_folder_state(copies[-1]), "free")
+                    push_result(args, result)
+
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
                         mock.patch.object(gate, "run_suites", side_effect=suite_run), \
-                        mock.patch.object(gate, "tell_nightly_red", return_value=gate.NightlyNoticeUnreceived()) as notice, \
+                        mock.patch.object(gate, "tell_nightly_red", side_effect=red_notice) as notice, \
+                        mock.patch.object(gate, "push_nightly_result", side_effect=result_push), \
                         mock.patch.object(gate, "nightly_owner", return_value="quiet"), redirect_stdout(output):
                     code = gate.main(["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"])
                 self.assertEqual(code, int(red), output.getvalue())

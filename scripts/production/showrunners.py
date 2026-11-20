@@ -23,6 +23,7 @@ from typing import NamedTuple, TypedDict, cast, override
 from scripts.lib.atomic_file import write_bytes_atomic
 
 from scripts.lib import conf as tunables
+from scripts.lib import operation_deadline
 from scripts.message import session_send
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or tunables.path("showrunners"))
@@ -522,7 +523,7 @@ class NoticeDelivery:
 def notice_deadline(seconds: float) -> float:
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError("The notice budget must be finite and positive.")
-    return monotonic() + seconds
+    return monotonic() + operation_deadline.remaining(seconds)
 
 
 def run_notice(command: Sequence[str], *, deadline: float | None) -> subprocess.CompletedProcess[str]:
@@ -548,19 +549,22 @@ def send_to_address(address: str, key: str, text: str, *, recipient: str,
 
 
 def deliver(production_name: str, key: str, text: str, *,
-            sender: str = "showrunners", deadline: float | None = None) -> NoticeDelivery:
+            sender: str = "showrunners", deadline: float | None = None,
+            before_send: Callable[[], bool] = lambda: True) -> NoticeDelivery:
     """Resolve a production's current address and report whether its notice failed."""
     options = {} if deadline is None else {"deadline": deadline}
     address = current_address(production_name, **options)
     if not address:
         return NoticeDelivery((f"{production_name} is not running: tell it when it starts",))
+    if not before_send():
+        return NoticeDelivery((f"skipped {production_name}: the notice is no longer needed",))
     return send_to_address(address, key, text, recipient=production_name, sender=sender, **options)
 
 
 def tell(production_name: str, key: str, text: str, *, sender: str = "showrunners",
-         deadline: float | None = None) -> str:
+         deadline: float | None = None, before_send: Callable[[], bool] = lambda: True) -> str:
     """Send one line and preserve the existing human-readable delivery report."""
-    return deliver(production_name, key, text, sender=sender, deadline=deadline).lines[0]
+    return deliver(production_name, key, text, sender=sender, deadline=deadline, before_send=before_send).lines[0]
 
 
 def tell_others(texts: dict[str, str], key: str) -> NoticeDelivery:
