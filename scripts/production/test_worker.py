@@ -337,9 +337,17 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(config, config.read_text()
                                       + "# range: 1..600\nWORKER_SETTLE_SECONDS=30\n")
         atomic_file.write_text_atomic(config.with_name("send.conf"),
-                                      (Path(__file__).resolve().parents[2] / "config/send.conf").read_text())
+            "# range: 0.001..\nwaits_review_seconds=1\n"
+            + "# range: 0.001..\ndelivery_timeout=5\n"
+            + "# range: 0.001..\nkill_grace=1\n"
+            + "# range: 0.001..\ncaller_margin_seconds=2\n"
+            + "# range: 0.001..\nremote_transport_seconds=2\n"
+            + "# one of: on, off\nreview_hold=off\n")
         atomic_file.write_text_atomic(config.with_name("scratch.conf"),
-                                      (Path(__file__).resolve().parents[2] / "config/scratch.conf").read_text())
+            "# whole: 1..\nsuffix_length=6\n"
+            + "# whole: 1..\nrecord_lock_attempts=3\n"
+            + "# whole: 1..\nrepo_depth=3\n"
+            + "repo_skip=target node_modules .git\n")
         root = self.fixture.root
         (root / "worker-tmp").mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
@@ -439,7 +447,6 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(config / "postmaster.conf",
             "# range: 0.001..\nwait_seconds=1\n"
             + "# range: 0.001..\nclaim_grace_seconds=1\n")
-        atomic_file.write_text_atomic(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n")
         opened = self.opened()
         _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
