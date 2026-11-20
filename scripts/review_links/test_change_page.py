@@ -44,7 +44,7 @@ from scripts.production.cli_fixture import invoke_cli, process_boundary, process
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_events, review_link
-from scripts.review_links import new_item_dialog, question_record, review_actions, review_items, review_submissions
+from scripts.review_links import new_item_dialog, question_record, review_actions, review_items, review_later, review_submissions
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -4348,6 +4348,28 @@ class ChangePageTests(unittest.TestCase):
         text = re.sub(r'alt="[^"]*"', "", body)
         self.assertEqual(text.count("Numbered moves"), 1)
         self.assertEqual(text.count("Internal comments clarified"), 1)
+
+    def test_change_feedback_writes_nothing_when_the_later_file_is_unreadable(self) -> None:
+        later = review_later.path()
+        later.parent.mkdir(parents=True, exist_ok=True)
+        _ = later.write_bytes(b'{')
+        status = change_page.DeliveryStatus(self.root)
+        delivery = status.path(self.page, 'C1')
+        before = self.review_list.read_bytes()
+        body = urlencode(self.answer(outcome='feedback', feedback='Adjust the spacing.'))
+
+        with self.assertRaisesRegex(review_later.LaterSaveRefused,
+                                    r'^The Later file cannot be read\. Nothing was saved\.$'):
+            _ = change_page.submit(self.page, body, status)
+
+        reply = self.request(self.page_path, self.answer(outcome='feedback', feedback='Adjust the spacing.'))
+        self.assertEqual(reply.status, 400)
+        self.assertIn('The Later file cannot be read. Nothing was saved.', reply.body)
+        self.assertEqual(self.messages, [])
+        self.assertEqual(self.review_list.read_bytes(), before)
+        self.assertEqual(later.read_bytes(), b'{')
+        self.assertFalse(delivery.exists())
+        self.assertFalse(status.request_attempts)
 
     def test_feedback_that_starts_with_works_still_requests_action_and_retries(self) -> None:
         with self.subTest(request="fine through Send feedback"):

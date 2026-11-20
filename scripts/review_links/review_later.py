@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +35,12 @@ def stored_times(target: Path) -> dict[str, object]:
         return {}
 
 
+def _parse_time(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise TypeError('A Later time must be text.')
+    return datetime.fromisoformat(value)
+
+
 def times(sources: list[Path] | None = None, *,
           skipped: Callable[[Path, str, Exception], None] | None = None) -> dict[str, datetime]:
     target = path()
@@ -42,9 +50,7 @@ def times(sources: list[Path] | None = None, *,
     zone = user_zone()
     for key, value in stored_times(target).items():
         try:
-            if not isinstance(value, str):
-                raise TypeError('A Later time must be text.')
-            until = datetime.fromisoformat(value)
+            until = _parse_time(value)
             valid[key] = until if until.tzinfo is not None else until.replace(tzinfo=zone)
         except (TypeError, ValueError) as error:
             if skipped is not None:
@@ -55,21 +61,83 @@ def times(sources: list[Path] | None = None, *,
 
 
 @dataclass(frozen=True)
+class KnownLaterTimes:
+    values: dict[str, datetime]
+
+
+@dataclass(frozen=True)
+class UnreadableLaterTimes:
+    path: Path
+    error: OSError | ValueError | RecursionError
+
+
+LaterTimesRead = KnownLaterTimes | UnreadableLaterTimes
+
+
+def read_times(sources: list[Path] | None = None, *,
+               skipped: Callable[[Path, str, Exception], None] | None = None) -> LaterTimesRead:
+    """Read Later times for display."""
+    try:
+        return KnownLaterTimes(times(sources, skipped=skipped))
+    except (OSError, ValueError, RecursionError) as error:
+        return UnreadableLaterTimes(path(), error)
+
+
+@dataclass(frozen=True)
 class MissingLaterFile:
     """No deadline file existed before the save."""
+
+
+class LaterSaveRefused(ValueError):
+    """The save cannot read the previous Later file."""
+
+    def __init__(self) -> None:
+        super().__init__('The Later file cannot be read. Nothing was saved.')
+
+
+def _read_for_save(target: Path) -> tuple[bytes | MissingLaterFile, dict[str, object]]:
+    try:
+        previous = target.read_bytes()
+        return previous, decode_times(previous.decode('utf-8'))
+    except FileNotFoundError:
+        return MissingLaterFile(), {}
+    except (OSError, ValueError, RecursionError) as error:
+        raise LaterSaveRefused() from error
+
+
+_page_write_checked = ContextVar('page_write_checked', default=False)
+
+
+@contextmanager
+def page_write() -> Generator[None]:
+    """Check the Later file before the first write in this page action."""
+    if _page_write_checked.get():
+        yield
+        return
+    _, stored = _read_for_save(path())
+    try:
+        for value in stored.values():
+            _ = _parse_time(value)
+    except (TypeError, ValueError) as error:
+        raise LaterSaveRefused() from error
+    token = _page_write_checked.set(True)
+    try:
+        yield
+    finally:
+        _page_write_checked.reset(token)
 
 
 def save(key: str, until: datetime, *, record_log: Callable[[Callable[[], None]], None] | None = None) -> None:
     """Let the log writer publish the deadline after its revision check."""
     target = path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock.exclusive(target.with_suffix('.lock')):
-        previous: bytes | MissingLaterFile
+    with ExitStack() as lock:
         try:
-            previous = target.read_bytes()
-        except FileNotFoundError:
-            previous = MissingLaterFile()
-        stored = {} if isinstance(previous, MissingLaterFile) else decode_times(previous.decode('utf-8'))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = lock.enter_context(file_lock.exclusive(target.with_suffix('.lock')))
+        except OSError:
+            _ = _read_for_save(target)
+            raise
+        previous, stored = _read_for_save(target)
         stored[key] = until.isoformat()
         published = False
         confirmed = False

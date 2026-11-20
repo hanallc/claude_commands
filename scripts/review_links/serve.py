@@ -43,7 +43,7 @@ from scripts.build_queue import memory_files
 from scripts.lib import conf, scratch
 from scripts.production import change_routing, change_review, staff, the_list
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import new_item_dialog, page_frame, question_record, review_actions, review_submissions, staff_names
+from scripts.review_links import new_item_dialog, page_frame, question_record, review_actions, review_later, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -857,6 +857,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             finally:
                 change_page.recover_pending(server.delivery_status, only=error.cleanup)
             return
+        except review_later.LaterSaveRefused as error:
+            self.failed_answer(page, body, 400, str(error), error)
+            return
         except (ValueError, change_page.change_review.ChangeReviewError) as error:
             self.failed_answer(page, body, 400, "Check the answer and submit it again.", error)
             return
@@ -923,15 +926,19 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if length <= 0:
                 raise ValueError("empty answer")
             body = self.rfile.read(length).decode("utf-8")
-            delivery, answer = change_browser.submit(browser, body, server.delivery_status)
+            with review_later.page_write():
+                delivery, answer = change_browser.submit(browser, body, server.delivery_status)
         except change_review.VerdictDurabilityUnconfirmed as error:
             try:
                 self.browser_failure(503, "The verdict was written. Durability is unconfirmed.", error)
             finally:
                 change_page.recover_pending(server.delivery_status, only=error.cleanup)
             return
+        except (change_page.QuestionAnswerRefused, review_later.LaterSaveRefused) as error:
+            self.browser_failure(400, str(error), error)
+            return
         except (ValueError, change_page.change_review.ChangeReviewError) as error:
-            self.browser_failure(400, str(error) if isinstance(error, change_page.QuestionAnswerRefused) else "Check the answer and submit it again.", error)
+            self.browser_failure(400, "Check the answer and submit it again.", error)
             return
         except change_page.FeatureLogFailed as error:
             self.browser_failure(503, "The feature log could not be updated.", error)
@@ -1050,7 +1057,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(400, {"error": "Could not read the New item request."})
             return
         try:
-            created = server.review_cache.create_submission(request)
+            with review_later.page_write():
+                created = server.review_cache.create_submission(request)
             response = {"id": created.saved.id, "key": created.key, "version": created.version}
             if request.page == "list":
                 response["list_key"] = list_page.add_submission(created).key
@@ -1067,7 +1075,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except new_item_dialog.SubmissionConflict as error:
             self.json_response(409, {"error": str(error)})
             return
-        except new_item_dialog.SubmissionError as error:
+        except (new_item_dialog.SubmissionError, review_later.LaterSaveRefused) as error:
             self.json_response(400, {"error": str(error)})
             return
         except (OSError, ValueError, RuntimeError, TypeError) as error:
@@ -1287,7 +1295,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             fields = parse_qs(body)
             if server.mode is ServerMode.LIST_FIXTURE and fields.get("action") != ["remove"]:
                 raise ValueError("Only Remove is available in this demo.")
-            with server.list_store_access():
+            with server.list_store_access(), review_later.page_write():
                 submission = list_page.submit(server.root, body, server.delivery_status)
                 fixture_reply = ({"state": "saved",
                     **list_page.saved_action_state(fields["keeper"][0], fields["id"][0], status=server.delivery_status)}

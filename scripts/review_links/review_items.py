@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 import json
@@ -165,6 +165,7 @@ class ReviewTimes:
     filed: datetime
     updated: datetime
     later: datetime | NoLaterTime = NoLaterTime()
+    later_read_failed: bool = field(default=False, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -366,8 +367,8 @@ def normalize_times(item: ReviewItem, zone: ZoneInfo) -> ReviewItem:
             and (rank.marked is None or rank.marked.tzinfo is not None)
             and all(event.time.tzinfo is not None for event in item.log)):
         return item
-    return replace(item, times=ReviewTimes(aware(times.filed, zone), aware(times.updated, zone),
-        aware(times.later, zone) if isinstance(times.later, datetime) else times.later),
+    return replace(item, times=replace(times, filed=aware(times.filed, zone), updated=aware(times.updated, zone),
+        later=aware(times.later, zone) if isinstance(times.later, datetime) else times.later),
         log=tuple(replace(event, time=aware(event.time, zone)) for event in item.log),
         urgency=replace(rank, due=None if rank.due is None else aware(rank.due, zone),
                         marked=None if rank.marked is None else aware(rank.marked, zone)))
@@ -1142,16 +1143,22 @@ class ReviewRecordMissing(ReviewRecordChanged):
     """The source no longer contains the displayed record."""
 
 
-def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> ReviewItem:
+class LaterReadMode(StrEnum):
+    DISPLAY = 'display'
+    STRICT = 'strict'
+
+
+def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot, *,
+                 later_mode: LaterReadMode = LaterReadMode.STRICT) -> ReviewItem:
     """Reread the exact record. Use the snapshot owner for an Efficiency ledger."""
     source = item.source
     prerequisite = Path(item.queue_after) if isinstance(source, ProposalSource) and item.queue_after else None
     selection = ExactReviewRecord(source_path(item), item.key, item.owner, prerequisite)
     if isinstance(source, ProposalSource) and 'review_submission' in source.record.fields:
-        return read_sent_proposal(selection, source.record, members)
+        return read_sent_proposal(selection, source.record, members, later_mode=later_mode)
     kinds = QUESTION_TYPES if item.type in QUESTION_TYPES else (item.type,)
     try:
-        records = project(root, members, kinds, REVIEW_STATES, None, [], selection)
+        records = project(root, members, kinds, REVIEW_STATES, None, [], selection, later_mode=later_mode)
     except FileNotFoundError:
         records = []
     for record in records:
@@ -1160,7 +1167,8 @@ def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> 
     raise ReviewRecordMissing('This item is no longer on the list.')
 
 
-def read_sent_proposal(selection: ExactReviewRecord, previous: Issue, members: staff.StaffSnapshot) -> ReviewItem:
+def read_sent_proposal(selection: ExactReviewRecord, previous: Issue, members: staff.StaffSnapshot, *,
+                       later_mode: LaterReadMode) -> ReviewItem:
     """Read a sent proposal and its named prerequisite directly."""
     path = selection.path
     sources: list[Path] = []
@@ -1179,7 +1187,8 @@ def read_sent_proposal(selection: ExactReviewRecord, previous: Issue, members: s
         proposers = {owner, *(member.id for member in members.find(kind='unit', parent=owner))}
         return read_proposal_prerequisite(path, dependency, owner, proposers, selection.prerequisite, sources)
 
-    item, = with_later([issue_item(issue, owner, members, sources=sources, prerequisite=prerequisite)], sources)
+    item, = with_later([issue_item(issue, owner, members, sources=sources, prerequisite=prerequisite)],
+                       sources, mode=later_mode)
     return normalize_times(item, user_zone())
 
 
@@ -1246,7 +1255,8 @@ def read(root: Path, *, members: staff.StaffSnapshot | None = None,
 
 def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, ...], states: tuple[ReviewState, ...],
             owner_options: dict[staff.StaffId, str] | None, sources: list[Path] | None,
-            selection: ReviewSelection, *, assign_ids: bool = False) -> list[ReviewItem]:
+            selection: ReviewSelection, *, assign_ids: bool = False,
+            later_mode: LaterReadMode = LaterReadMode.DISPLAY) -> list[ReviewItem]:
     """Select the requested records and apply the shared projection."""
     documents = tuple(dict.fromkeys(doc for member in members.rows if isinstance(member.doc, staff.LiveDoc)
                                     if (doc := record_store.local_document(member)) is not None))
@@ -1264,7 +1274,7 @@ def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, .
         items.extend(proposal_items(members,documents,states=states,owner_options=owner_options,sources=sources,include_registered=True,selection=selection))
     if ReviewType.EFFICIENCY in kinds:
         items.extend(efficiency_items(members,documents,states=states,owner_options=owner_options,sources=sources,selection=selection))
-    return ordered(with_later(items,sources), sources)
+    return ordered(with_later(items, sources, mode=later_mode), sources)
 
 
 def read_open(root: Path) -> list[ReviewItem]:
@@ -1272,7 +1282,8 @@ def read_open(root: Path) -> list[ReviewItem]:
     return read(root, show='open')
 
 
-def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> list[ReviewItem]:
+def with_later(items: list[ReviewItem], sources: list[Path] | None = None, *,
+               mode: LaterReadMode = LaterReadMode.STRICT) -> list[ReviewItem]:
     if not items:
         return []
     selected = {item.key for item in items}
@@ -1285,13 +1296,23 @@ def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> li
         elif key in selected:
             raise error
 
-    try:
-        times = review_later.times(sources, skipped=skip_time if sources is not None else None)
-    except (OSError, UnicodeError) as error:
-        if sources is not None:
-            raise
-        logging.getLogger(__name__).warning('Review source %s: %s', review_later.path(), error)
-        return items
+    if mode is LaterReadMode.DISPLAY:
+        later = review_later.read_times(sources, skipped=skip_time if isinstance(sources, ReviewSourceStamps) else None)
+        if isinstance(later, review_later.UnreadableLaterTimes):
+            if isinstance(sources, ReviewSourceStamps):
+                sources.skipped(later.path, '', later.error)
+            else:
+                logging.getLogger(__name__).warning('Review source %s: %s', later.path, later.error)
+            return [replace(item, times=replace(item.times, later_read_failed=True)) for item in items]
+        times = later.values
+    else:
+        try:
+            times = review_later.times(sources, skipped=skip_time if sources is not None else None)
+        except (OSError, UnicodeError) as error:
+            if sources is not None:
+                raise
+            logging.getLogger(__name__).warning('Review source %s: %s', review_later.path(), error)
+            return items
     return [replace(item, times=replace(item.times, later=times.get(item.key, item.times.later)))
             if item.state != ReviewState.VALIDATING else item
             for item in items if item.key not in invalid or item.state == ReviewState.VALIDATING]

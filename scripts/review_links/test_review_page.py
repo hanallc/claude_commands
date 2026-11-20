@@ -914,7 +914,6 @@ window.fetch=(url,options)=>{
         item = next(item for item in review_items.read(self.root) if item.key == efficiency)
         assert isinstance(item.source, review_items.EfficiencySource)
         _ = efficiency_reviews.path(item.source.path).write_text('{"E1":{"log":[],"mark":"waiting"}}')
-        review_later.save(question, datetime.now(user_zone())+timedelta(days=1))
         snapshot = review_page.build_snapshot(self.root)
         queue = snapshot.records[change].queue
         urgency.pin(queue, snapshot.records[change].queue_key)
@@ -928,19 +927,14 @@ window.fetch=(url,options)=>{
         for target, key, unaffected in (
             (change_routing.delivery_path(self.root, self.fixture.review_list, 'C1'), change, question),
             (efficiency_reviews.path(item.source.path), efficiency, question),
-            (review_later.path(), question, ''),
             (urgency.state_dir()/(queue+'.json'), change, question),
             (Path(proposal.removeprefix('proposal/')), proposal, question),
         ):
             with self.subTest(path=target), patch.object(Path, 'open', unreadable):
-                if target == review_later.path():
-                    with self.assertRaises(PermissionError):
-                        _ = review_page.build_snapshot(self.root)
-                else:
-                    fresh = review_page.build_snapshot(self.root)
-                    self.assertNotIn(key, fresh.records)
-                    self.assertIn(unaffected, fresh.records)
-                    self.assertTrue(any(str(target) in notice for notice in fresh.notices), fresh.notices)
+                fresh = review_page.build_snapshot(self.root)
+                self.assertNotIn(key, fresh.records)
+                self.assertIn(unaffected, fresh.records)
+                self.assertTrue(any(str(target) in notice for notice in fresh.notices), fresh.notices)
                 with self.assertRaises(PermissionError):
                     _ = review_items.read_current(self.root, snapshot.records[key], staff.snapshot())
 
@@ -1078,34 +1072,156 @@ window.fetch=(url,options)=>{
         cache.synchronize()
         self.assertIn(key, cache.get().records)
 
-    def test_snapshot_worker_keeps_rows_when_a_shared_source_is_unreadable(self) -> None:
+    def test_snapshot_worker_keeps_rows_when_the_change_folder_is_unreadable(self) -> None:
         cache = review_page.ReviewSnapshotCache(self.root)
         self.addCleanup(cache.close)
         original = cache.get()
-        read_text = Path.read_text
         iterdir = Path.iterdir
-
-        def read(path: Path, *args: str, **kwargs: str) -> str:
-            if path == review_later.path():
-                raise PermissionError('The shared Later file is unreadable.')
-            return read_text(path, *args, **kwargs)
 
         def list_folder(path: Path) -> Iterator[Path]:
             if path == change_review.lists_directory():
                 raise PermissionError('The shared Change folder is unreadable.')
             return iterdir(path)
 
-        for method, failure, message in (
-            ('read_text', read, 'The shared Later file is unreadable.'),
-            ('iterdir', list_folder, 'The shared Change folder is unreadable.'),
+        with patch.object(Path, 'iterdir', list_folder), self.assertLogs(level='WARNING') as notices:
+            for _ in range(2):
+                cache.invalidate()
+                cache.synchronize()
+                self.assertTrue(cache.get() is original, 'The snapshot changed.')
+        self.assertEqual(len(notices.output), 1)
+        self.assertIn('The shared Change folder is unreadable.', notices.output[0])
+
+    def test_snapshot_and_list_links_skip_an_unreadable_later_file(self) -> None:
+        key = self.question()
+        path = review_later.path()
+        until = datetime.fromisoformat('2030-12-01T12:00:00+00:00')
+        review_later.save(key, until)
+        original = review_page.build_snapshot(self.root)
+        self.assertEqual(original.records[key].times.later, until)
+        valid = path.read_text()
+        opening = cast(Callable[..., TextIO], Path.open)
+
+        def deny_later(path_to_read: Path, *args: str, **kwargs: str) -> TextIO:
+            if path_to_read == path:
+                raise PermissionError('The shared Later file is unreadable.')
+            return opening(path_to_read, *args, **kwargs)
+
+        for failure, contents, open_file in (
+            ('malformed JSON', '{', opening),
+            ('permission error', valid, deny_later),
         ):
-            with self.subTest(method=method), patch.object(Path, method, failure), self.assertLogs(level='WARNING') as notices:
-                for _ in range(2):
-                    cache.invalidate()
-                    cache.synchronize()
-                    self.assertTrue(cache.get() is original, 'The snapshot changed.')
-            self.assertEqual(len(notices.output), 1)
-            self.assertIn(message, notices.output[0])
+            _ = path.write_text(contents)
+            with self.subTest(failure=failure), patch.object(Path, 'open', open_file):
+                with self.assertLogs(review_items.__name__, level='WARNING') as snapshot_log:
+                    snapshot = review_page.build_snapshot(self.root)
+                self.assertEqual(len(snapshot_log.output), 1)
+                self.assertIn(f'Review source {path}:', snapshot_log.output[0])
+                self.assertIn(f'Could not load {path}.', snapshot.notices)
+                self.assertIn(path, snapshot.source_stamps)
+                self.assertEqual(snapshot.records.keys(), original.records.keys())
+                self.assertIsInstance(snapshot.records[key].times.later, review_items.NoLaterTime)
+                entry = next(entry for entry in snapshot.entries if entry['key'] == key)
+                self.assertEqual(entry['hiddenUntil'], 0)
+
+                with self.assertLogs(level='WARNING') as list_log:
+                    linked = list_page.read_linked_reviews(self.root, members=snapshot.members)
+                self.assertEqual(len(list_log.output), 1)
+                self.assertIn(f'Review source {path}:', list_log.output[0])
+                item = next(item for item in linked if item.key == key)
+                self.assertIsInstance(item.times.later, review_items.NoLaterTime)
+
+    def test_review_actions_refuse_before_writing_when_later_data_is_malformed(self) -> None:
+        owner = self.ready_submission_recipient()
+        question = self.question()
+        response = self.file_response(owner.id)
+        change = 'page-owner/C1'
+        validating = 'page-owner/C2'
+        validation, _ = review_page.submit(self.root, self.body(validating, 'validate', 'Check this.'), self.status)
+        assert isinstance(validation, change_page.MessageDelivery)
+        change_page.deliver(validation, self.status)
+        self.fixture.messages.clear()
+        delivery = self.status.path(validation.page, validation.row)
+        before_delivery = delivery.read_bytes()
+        until = datetime.now(user_zone()) + timedelta(days=1)
+        review_later.save(change, until)
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        snapshot = cache.get()
+        self.assertEqual(snapshot.records[validating].state, review_items.ReviewState.VALIDATING)
+        queue = snapshot.records[change].queue
+        before_queue = urgency.read_queue_state(queue)
+        later = review_later.path()
+        valid = later.read_bytes()
+        invalid_timestamp = json.dumps({change: until.isoformat(), validating: 'invalid timestamp'}).encode()
+
+        for key, outcome, contents in (
+            (change, 'validate', b'{'),
+            (change, 'works', b'{'),
+            (validating, 'question', b'{'),
+            (question, 'question', b'{'),
+            (question, 'feedback', b'{'),
+            (response, 'question', b'{'),
+            (validating, 'question', invalid_timestamp),
+        ):
+            with self.subTest(key=key, outcome=outcome, contents=contents):
+                _ = later.write_bytes(contents)
+                body = self.card_body(snapshot, key, outcome, 'Check the spacing.')
+                record = review_items.source_path(snapshot.records[key])
+                before = record.read_bytes()
+                with patch.object(self.status, 'write_slots', wraps=self.status.write_slots) as write:
+                    with self.assertRaisesRegex(review_later.LaterSaveRefused,
+                                                r'^The Later file cannot be read\. Nothing was saved\.$'):
+                        _ = cache.save(body, self.status)
+                    write.assert_not_called()
+                self.assertEqual(record.read_bytes(), before)
+                self.assertEqual(urgency.read_queue_state(queue), before_queue)
+                self.assertEqual(later.read_bytes(), contents)
+                self.assertEqual(delivery.read_bytes(), before_delivery)
+                self.assertFalse(self.status.request_attempts)
+                self.assertEqual(self.fixture.messages, [])
+                self.assertIs(cache.get(), snapshot)
+
+        _ = later.write_bytes(valid)
+        read_bytes = Path.read_bytes
+        with patch.object(Path, 'read_bytes', autospec=True, side_effect=read_bytes) as read:
+            saved = cache.save(self.card_body(snapshot, validating, 'question', 'Which check passed?'), self.status)
+            self.assertEqual(sum(call.args == (later,) for call in read.call_args_list), 1)
+        self.assertEqual(saved.answer, 'question saved')
+
+    def test_delivery_park_waits_for_readable_later_times(self) -> None:
+        from scripts.production import the_list
+        from scripts.review_links import serve
+
+        keeper = fixture_member('producer', name='morty').id
+        key = 'page-owner/C1'
+        ready = review_page.build_snapshot(self.root)
+        item = the_list.add(keeper, 'Read the delivered change', owner=ready.records[key].owner,
+                            source='morty', changes={})
+        _ = the_list.link(keeper, item.id, (key,), source='morty')
+        parked = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source='nate')
+        now = the_list.now()
+        review_later.save(key, now + timedelta(days=1))
+        target = review_later.path()
+        valid = target.read_bytes()
+        _ = target.write_bytes(b'{')
+        unreadable = review_page.build_snapshot(self.root)
+        self.assertTrue(unreadable.records[key].for_you(now))
+        for snapshot in (unreadable, ready):
+            with patch.object(review_items, 'read_current', wraps=review_items.read_current) as reread:
+                serve.release_delivery_parks(self.root, snapshot)
+                reread.assert_called_once_with(self.root, snapshot.records[key], snapshot.members)
+            self.assertEqual(the_list.load(keeper, item.id), parked)
+        _ = target.write_bytes(valid)
+        serve.release_delivery_parks(self.root, review_page.build_snapshot(self.root))
+        self.assertEqual(the_list.load(keeper, item.id), parked)
+
+        review_later.save(key, now - timedelta(days=1))
+        serve.release_delivery_parks(self.root, review_page.build_snapshot(self.root))
+        delivered = the_list.load(keeper, item.id)
+        self.assertEqual(delivered.state, the_list.ItemState.DELIVERED)
+        self.assertIs(delivered.parked_until, the_list.NoTimestamp.UNSET)
+        self.assertEqual(delivered.log[-1].what,
+                         the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(key)))
 
     def test_exact_efficiency_read_and_save_use_the_snapshot_owner(self) -> None:
         _, key = self.decisions()
@@ -2279,9 +2395,13 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == key),review_items.ReviewState.VALIDATING)
         assert isinstance(delivery, change_page.MessageDelivery)
         now = datetime.now(user_zone())
-        review_later.save(key, now + timedelta(days=1))
-        _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'not works: the spacing differs',
-                                       self.fixture.production, validation_id=delivery.attempt)
+        until = now + timedelta(days=1)
+        review_later.save(key, until)
+        _ = review_later.path().write_text(json.dumps({key:until.isoformat(), 'page-owner/C2':None}))
+        with self.assertLogs(review_later.__name__, level='WARNING') as later_log:
+            _ = change_review.save_verdict(self.fixture.review_list, 'C1', 'not works: the spacing differs',
+                                           self.fixture.production, validation_id=delivery.attempt)
+        self.assertIn('page-owner/C2', later_log.output[0])
         returned = next(item for item in review_items.read(self.root) if item.key == key)
         self.assertEqual(returned.state, review_items.ReviewState.OPEN)
         self.assertIn('the spacing differs', returned.log[-1].words)
@@ -3778,6 +3898,38 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertEqual(len(self.fixture.messages), 1)
                 recovered = self.status.slots(delivery.page, row).question
                 self.assertEqual(recovered, replace(pending, delivery=change_page.NoDelivery()))
+
+    def test_later_refuses_to_replace_an_unreadable_file(self) -> None:
+        key = self.question()
+        question = self.question_path(key)
+        until = datetime.now(user_zone()) + timedelta(days=1)
+        review_later.save(key, until + timedelta(days=1))
+        snapshot = review_page.build_snapshot(self.root)
+        path = review_later.path()
+        before = question.read_bytes()
+        body = self.card_body(snapshot, key, 'later', 'Read this tomorrow.')+'&'+urlencode({'later':until.isoformat()})
+        opening = cast(Callable[..., TextIO], Path.open)
+
+        def deny_later(target: Path, *args: str, **kwargs: str) -> TextIO:
+            if target == path:
+                raise PermissionError('The shared Later file is unreadable.')
+            return opening(target, *args, **kwargs)
+
+        valid = path.read_bytes()
+        for failure, contents, read in (
+            ('malformed JSON', b'{', opening),
+            ('permission error', valid, deny_later),
+        ):
+            with self.subTest(failure=failure):
+                _ = path.write_bytes(contents)
+                message = r'^The Later file cannot be read\. Nothing was saved\.$'
+                with patch.object(Path, 'open', read):
+                    with self.assertRaisesRegex(review_later.LaterSaveRefused, message):
+                        _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
+                    with self.assertRaisesRegex(review_later.LaterSaveRefused, message):
+                        review_later.save(key, until)
+                self.assertEqual(path.read_bytes(), contents)
+                self.assertEqual(question.read_bytes(), before)
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,

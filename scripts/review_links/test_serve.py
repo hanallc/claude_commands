@@ -2829,9 +2829,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         before = path.read_bytes()
 
         def insert_later_after_read(root: Path, item: review_items.ReviewItem,
-                                    members: staff.StaffSnapshot) -> review_items.ReviewItem:
+                                    members: staff.StaffSnapshot, *,
+                                    later_mode: review_items.LaterReadMode) -> review_items.ReviewItem:
             nonlocal changed
-            current = read(root, item, members)
+            current = read(root, item, members, later_mode=later_mode)
             if not changed:
                 changed = True
                 review_later.save(key, until)
@@ -2849,6 +2850,53 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(review_later.times().get(key), until)
         self.assertEqual(cache.get().records[key].state, snapshot.records[key].state)
+
+    def test_page_writes_show_the_later_refusal_before_saving(self) -> None:
+        case = self.review_fixture(changes=1)
+        owner = case.ready_submission_recipient()
+        morty = fixture_member('producer', name='morty').id
+        item = the_list.add(morty, 'Read the linked change', owner=owner.id, source='nate', changes={})
+        key = 'page-owner/C1'
+        _ = the_list.link(morty, item.id, (key,), source='nate')
+        before_item = the_list.load(morty, item.id)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        snapshot = cache.get()
+        before_change = case.fixture.review_list.read_bytes()
+        later = review_later.path()
+        later.parent.mkdir(parents=True, exist_ok=True)
+        _ = later.write_bytes(b'{')
+        message = 'The Later file cannot be read. Nothing was saved.'
+        request = list_page.ListFormRequestPrefix(uuid4().hex, the_list.unread_update(before_item)).format()
+        list_body = urlencode({
+            'keeper': morty, 'id': item.id, 'request': request,
+            'token': list_page.request_token(case.root, morty, item.id, request),
+            'action': 'tell', 'words': 'Keep the check.', 'until': '',
+        })
+        new_item = case.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id)
+        with (patch.object(self.server, 'root', case.root),
+              patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'),
+              patch.object(review_submissions, 'submit', wraps=review_submissions.submit) as submit,
+              patch.object(case.status, 'write_slots', wraps=case.status.write_slots) as write):
+            for path, body in (
+                (review_page.PAGE_PATH, case.card_body(snapshot, key, 'validate')),
+                ('/console/changes.html', case.body(key, 'feedback', 'Keep the check.')),
+                (list_page.PAGE_PATH, list_body),
+            ):
+                with self.subTest(path=path):
+                    status, response = self.post(path, body)
+                    self.assertEqual((status, json.loads(response)), (400, {'reason': message}))
+            response = self.new_item_http(self.new_item_body(new_item), finished=True)
+            self.assertEqual((response.status, json.loads(response.body)), (400, {'error': message}))
+            submit.assert_not_called()
+            write.assert_not_called()
+        self.assertEqual(case.fixture.review_list.read_bytes(), before_change)
+        self.assertEqual(the_list.load(morty, item.id), before_item)
+        self.assertEqual(later.read_bytes(), b'{')
+        self.assertIs(cache.get(), snapshot)
+        self.assertEqual(case.fixture.messages, [])
 
     def test_review_accepts_later_on_an_open_question(self) -> None:
         case = self.review_fixture()

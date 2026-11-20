@@ -53,7 +53,7 @@ from scripts.production.production_doc import (
 )
 from scripts.feature_log import feature_log
 from scripts.review_links import (console_theme, image_store, new_item_dialog, page_frame, question_record, review_events,
-                                  review_link)
+                                  review_later, review_link)
 from scripts.review_links.question_record import AnswerRefused as AnswerRefused
 from scripts.review_links.review_items import (
     CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback,
@@ -1862,6 +1862,7 @@ def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str,
         raise FeatureLogFailed(message) from error
 
 
+@review_later.page_write()
 def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
            prepared: change_review.ChangeQueue | next_item.ReadChangeLists = next_item.READ_CHANGE_LISTS,
            feedback_closes: bool = False, defer_verdict_cleanup: bool = False) -> MessageDelivery | NoMessageDelivery:

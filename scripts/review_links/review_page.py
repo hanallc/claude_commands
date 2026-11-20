@@ -27,7 +27,7 @@ from scripts.production.record_store import FileStamp, state_root
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import new_item_dialog, review_submissions
-from scripts.review_links import question_record, review_actions, staff_names
+from scripts.review_links import question_record, review_actions, review_later, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
 
@@ -515,7 +515,7 @@ class ReviewSnapshotCache:
         with self._save_lock:
             current = self.get()
             try:
-                delivery, answer = submit_snapshot(self.root, current, fields, status)
+                delivery, answer = submit(self.root, body, status, snapshot=current)
             except review_items.ReviewRecordChanged:
                 try:
                     if key in current.records:
@@ -544,7 +544,8 @@ class ReviewSnapshotCache:
         if members is None:
             members = staff.snapshot()
         try:
-            item: ReviewItem | ReviewRecordNotPublished = review_items.read_current(self.root, current.records[key], members)
+            item: ReviewItem | ReviewRecordNotPublished = review_items.read_current(
+                self.root, current.records[key], members, later_mode=review_items.LaterReadMode.DISPLAY)
         except (FileNotFoundError, review_items.ReviewRecordMissing):
             item = ReviewRecordNotPublished()
         return self.publish_item(current, key, item, members), item
@@ -568,7 +569,8 @@ class ReviewSnapshotCache:
                 previous = current.records.get(previous_key)
                 if isinstance(projected.source, review_items.ProposalSource) and previous is not None:
                     projected = replace(projected, queue_after=previous.queue_after)
-                item = review_items.read_current(self.root, projected, members)
+                item = review_items.read_current(
+                    self.root, projected, members, later_mode=review_items.LaterReadMode.DISPLAY)
                 origin = review_items.submission_origin(item)
                 if not isinstance(origin, new_item_dialog.ReviewSubmission) or origin.request_id != saved.request_id:
                     raise review_items.ReviewRecordChanged('The saved Review item changed.')
@@ -1011,15 +1013,22 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     if retained is None:
         raise review_items.ReviewRecordMissing('This item is no longer on the list.')
     def validate() -> ReviewItem:
-        current = review_items.read_current(root, retained, staff.snapshot())
+        current = review_items.read_current(
+            root, retained, staff.snapshot(), later_mode=review_items.LaterReadMode.DISPLAY)
         if current.state == ReviewState.DONE:
             raise review_items.ReviewRecordChanged('This item is already Done.')
+        if outcome == 'later' and current.times.later_read_failed:
+            raise review_later.LaterSaveRefused()
         assets: dict[str, str] = {}
         try:
             retain_asset(current, assets)
         except FileNotFoundError:
             raise review_items.ReviewRecordMissing('This item is no longer on the list.') from None
-        if fields.get('revision', [''])[0] != record_revision(current, assets):
+        revision_item = current
+        if current.times.later_read_failed:
+            # Use the retained Later time to check the native record.
+            revision_item = replace(current, times=replace(current.times, later=retained.times.later))
+        if fields.get('revision', [''])[0] != record_revision(revision_item, assets):
             raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
         return current
 
@@ -1072,6 +1081,7 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     return delivery, 'feedback sent' if outcome == 'feedback' else answer
 
 
+@review_later.page_write()
 def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
            snapshot: ReviewSnapshot | None = None) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     fields = review_fields(body)
@@ -1089,7 +1099,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
             raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
         if question_item is not None and question_item.type == ReviewType.RESPONSE:
             def validate_response() -> ReviewItem:
-                current = review_items.read_current(root, question_item, staff.snapshot())
+                current = review_items.read_current(
+                    root, question_item, staff.snapshot(), later_mode=review_items.LaterReadMode.DISPLAY)
                 if current != question_item:
                     raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
                 return current
