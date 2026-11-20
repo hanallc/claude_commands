@@ -252,17 +252,15 @@ class AppendLockTimeout(TimeoutError):
 
 
 @contextmanager
-def locked_append(path: Path, *, deadline: float | None = None, wait: bool = True) -> Generator[BinaryIO]:
+def locked_append(path: Path, *, deadline: float | None = None) -> Generator[BinaryIO]:
     """Keep tail repair, any recovery scan and publication under one file lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
     with os.fdopen(fd, "r+b", buffering=0) as handle:
         try:
-            scratch.lock_copy_descriptor(fd, fcntl.LOCK_EX, deadline=deadline, wait=wait)
+            scratch.lock_copy_descriptor(fd, fcntl.LOCK_EX, deadline=deadline)
         except scratch.CopyLockTimeout as error:
             raise AppendLockTimeout(f"the append lock deadline passed for {path}") from error
-        except BlockingIOError as error:
-            raise AppendLockTimeout(f"the append lock is busy for {path}") from error
         end = last_whole_row_end(handle)
         if end != os.fstat(fd).st_size:
             os.ftruncate(fd, end)

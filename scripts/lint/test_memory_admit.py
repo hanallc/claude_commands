@@ -3184,38 +3184,6 @@ class BuildShapePromiseTests(BuildPromiseFixture):
 
 
 class BuildFinalizerTests(BuildPromiseFixture):
-    def test_release_without_a_deadline_skips_busy_peak_history(self) -> None:
-        with AdmissionFixture() as fixture:
-            request = fixture.request()
-            sidecar = fixture.scope(request.owner)
-            request = replace(request, sidecar=str(sidecar))
-            grant = only_admitted(fixture.server.handle_request(request))
-            fixture.scoped_peak(grant)
-            path = fixture.state_dir / "anon_peaks.jsonl"
-            previous = b'{"id":"old"}\n{"id":"unfinished"'
-            _ = path.write_bytes(previous)
-            flock = fcntl.flock
-            history_stat = path.stat()
-
-            def try_lock(fd: int, operation: int) -> None:
-                target = os.fstat(fd)
-                if os.path.samestat(target, history_stat):
-                    self.assertEqual(operation, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                flock(fd, operation)
-
-            with path.open("rb") as held:
-                flock(held.fileno(), fcntl.LOCK_EX)
-                with (patch.object(fcntl, "flock", side_effect=try_lock),
-                      contextlib.redirect_stderr(io.StringIO()) as errors):
-                    fixture.release(grant)
-            line, = errors.getvalue().splitlines()
-            self.assertIn("skipped peak history", line)
-            self.assertIn(str(path), line)
-            self.assertEqual(path.read_bytes(), previous)
-            self.assertNotIn(request.episode, fixture.server.reservations)
-            self.assertFalse(Path(grant.max_path).exists())
-            self.assertFalse(sidecar.exists())
-
     def test_failed_peak_refresh_precedes_indexing_and_zero_compile_evidence_removes_it(self) -> None:
         with AdmissionFixture() as fixture, patch.object(self, "root", fixture.state_dir.parent):
             fixture.clock.epoch = NOW_EPOCH
