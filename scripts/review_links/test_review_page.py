@@ -1485,6 +1485,11 @@ window.fetch=(url,options)=>{
    row('page-owner/C399').querySelector('.list-toggle').getAttribute('aria-expanded')==='true',
    'An Open item opens directly from its key.');
   check(document.querySelectorAll('[data-list-item]').length<=100,'The first window mounts at most 100 summaries.');
+  const firstToggle=row('page-owner/C399').querySelector('.list-toggle');
+  const secondToggle=row('page-owner/C381').querySelector('.list-toggle');
+  secondToggle.click();
+  check(firstToggle.getAttribute('aria-expanded')==='false' && secondToggle.getAttribute('aria-expanded')==='true',
+   'Opening the second Review row closes the first row.');
   await open(DRAFT_KEY);
   const draft=form(DRAFT_KEY),choice=row(DRAFT_KEY).querySelector('input[name=choice]');
   choice.checked=true;choice.dispatchEvent(new Event('change'));
@@ -1827,8 +1832,11 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
                 server.shutdown()
                 thread.join(5)
         self.assertEqual(results,[[]])
-        self.assertEqual(set(requested_bodies), {'page-owner/C399', key, 'page-owner/C2', 'page-owner/C4', 'page-owner/C6'},
-                         'Only opened keys request a body.')
+        self.assertEqual(
+            set(requested_bodies),
+            {'page-owner/C399', 'page-owner/C381', key, 'page-owner/C2', 'page-owner/C4', 'page-owner/C6'},
+            'Only opened keys request a body.',
+        )
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_tab_reaches_adjacent_rows_after_a_distant_scroll(self) -> None:
@@ -5127,6 +5135,20 @@ window.fetch=(url,options={})=>{
   if(selectedOwner()!==owner) document.querySelector('[data-owner-chip="'+CSS.escape(owner)+'"]').click();
   check(expanded(await follow({}),'Open') && review.dataset.show==='open' && selectedOwner()===owner,
    'F003: A bare link preserves the matching Show and Owner filters.');
+  const jump=document.createElement('a');
+  jump.dataset.recordJump='';
+  review.append(jump);
+  jump.href='#item=page-owner%2FC99';jump.click();
+  const missing=review.querySelector('[data-missing-item]'),missingHash=location.hash;
+  jump.href='#item=page-owner%2FC2';jump.click();
+  jump.remove();
+  check(expanded(change('page-owner/C2'),'Open') && missing.hidden,'A valid review link clears the notice.');
+  const restored=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  history.back();await restored;
+  check(location.hash===missingHash && expanded(change('page-owner/C1'),'Open') &&
+   !expanded(change('page-owner/C2'),'Open') && !missing.hidden &&
+   missing.textContent==='This review is no longer on the Review page.',
+   'Back restores the open review and the notice for the missing review.');
   change('page-owner/C1').querySelector('.list-toggle').click();
 
   for(const key of ['page-owner/C2','page-owner/C1']){
