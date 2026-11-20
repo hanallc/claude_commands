@@ -203,24 +203,25 @@ def sync(checkout: Path) -> Outcome:
             advice = ("GitHub credentials are warm. GitHub refused the fetch. This is likely a GitHub incident; "
                       + "the job retries" if warm else f"run github-warmup at a terminal on {socket.gethostname()}")
             return Outcome("fetch-failed", f"git fetch origin main failed in {checkout}: {_first_line(fetched)}; {advice}")
-        with waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
-            move = waiting_rows.move_target(checkout, "origin/main", pending, fast_forward=True)
-            return _advance(checkout, move, pending)
+        with waiting_rows.locked_checkout(checkout):
+            move = waiting_rows.move_target(checkout, "origin/main", fast_forward=True)
+            return _advance(checkout, move)
     except waiting_rows.Diverged:
         return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")
     except (OSError, UnicodeError, ValueError) as error:
         return Outcome("ff-failed", f"the move to origin/main failed in {checkout}: {' '.join(str(error).split())}")
 
 
-def _advance(checkout: Path, move: waiting_rows.CheckoutMove, pending: waiting_rows.LockedJournal) -> Outcome:
+def _advance(checkout: Path, move: waiting_rows.CheckoutMove) -> Outcome:
     if move.head == move.tip:
         return Outcome(CURRENT, move.head[:8])
     blocking_details: list[str] = []
+    pending = waiting_rows.read_journal(waiting_rows.journal_path())
     waiting = set(waiting_rows.waiting_files(checkout)) | waiting_rows.pending_files(checkout, pending).keys()
     interrupted = _finish_interrupted_update(checkout, move, blocking_details, waiting)
     if blocking_details:
         return Outcome("dirty", f"{checkout} has local changes that block the update ({', '.join(blocking_details)})")
-    waiting_rows.apply_move(checkout, waiting_rows.check_move(checkout, move, pending), pending)
+    waiting_rows.apply_move(checkout, waiting_rows.check_move(checkout, move))
     suffix = "; finished an interrupted update" if interrupted else ""
     return Outcome(ADVANCED, f"{move.head[:8]}..{move.tip[:8]}{suffix}")
 

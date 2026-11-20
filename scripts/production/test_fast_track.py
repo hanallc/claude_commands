@@ -15,6 +15,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import pwd
 import select
 import shutil
 import subprocess
@@ -24,7 +25,7 @@ from typing import ClassVar, cast, final, override
 import unittest
 from unittest.mock import patch
 
-from scripts.lib import build_folders, user_zone, zone
+from scripts.lib import build_folders, live_settings, models_registry, tune, user_zone, waiting_rows, zone
 from scripts.lint.memory_test_support import config_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -40,6 +41,7 @@ COMMAND = REPOSITORY / "scripts/production/fast_track.py"
 MODULE = '''import json
 import os
 from pathlib import Path
+import pwd
 
 VALUE = "before"
 if os.environ.get("FAST_TRACK_TEST_EVENTS"):
@@ -51,6 +53,7 @@ if os.environ.get("FAST_TRACK_TEST_EVENTS"):
 DIRECT_TEST = '''import json
 import os
 from pathlib import Path
+import pwd
 import subprocess
 import unittest
 from scripts.sample import item
@@ -75,6 +78,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import pwd
 import subprocess
 import sys
 
@@ -187,6 +191,7 @@ FETCH_RACE_LOGIC = '''#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
+import pwd
 import subprocess
 import sys
 
@@ -459,6 +464,90 @@ class FastTrackTests(MergeCheckpointFixture):
             self.assertEqual(land_queue.take_next(), "")
         self.assertEqual(self.git("show", f"main:{path}", cwd=self.origin), "amount=3")
         self.assertEqual(len(self.records()), 1)
+
+    def test_settings_publish_paths_leave_the_live_land_line_unchanged(self) -> None:
+        live_line = Path(pwd.getpwuid(os.getuid()).pw_dir, ".local/state/merge-gate/land_queue.json")
+        try:
+            with live_line.open("rb") as source:
+                before = (source.read(), os.fstat(source.fileno()).st_mtime_ns)
+        except FileNotFoundError:
+            pass
+        else:
+            self.addCleanup(lambda: self.assertEqual((live_line.read_bytes(), live_line.stat().st_mtime_ns), before))
+
+        checkout = self.promote
+        config = checkout / "config"
+        self.write(checkout, "config/example.conf", "# whole: 1..10\namount=2\n")
+        self.write(checkout, "config/user_zone.conf", "zone=America/New_York\n")
+        registry = config / "models.conf"
+        self.write(checkout, "config/models.conf", "[fixture]\nmodel=old\n")
+        self.write(checkout, "settings.json", '{"autoCompactWindow": 208800}\n')
+        _ = config_environment(config)
+        for name in ("fast_track.conf", "build_folders.conf"):
+            _ = shutil.copyfile(self.config.parent / name, config / name)
+        _ = self.git("add", "config", "settings.json", cwd=checkout)
+        _ = self.git("commit", "-qm", "Start settings proof", cwd=checkout)
+        _ = self.git("push", "-q", "origin", "main", cwd=checkout)
+        base = self.git("rev-parse", "HEAD", cwd=checkout)
+
+        zone_file = str(config / "user_zone.conf")
+        self.write(self.root, "broadcast.py", "print('fixture - sent')\n")
+        self.executable(self.bin / "settings-ssh", "#!/bin/sh\nexit 0\n")
+        (Path(self.env["HOME"]) / ".claude/config").symlink_to(config, target_is_directory=True)
+        self.env.update({
+            "CONF_DIR": str(config), "USER_ZONE_CONF": zone_file, "MODELS_CONFIG_FILE": str(registry),
+            "MODELS_CONFIG_PUBLISH": "1", "PUSH_TARGET_BRANCH": "main",
+            "ZONE_SSH": str(self.bin / "settings-ssh"), "ZONE_BROADCAST": str(self.root / "broadcast.py"),
+            "ZONE_STATE": str(self.root / "zone-state"),
+        })
+        with (patch.dict(os.environ, self.env, clear=True),
+              patch.object(user_zone, "CONF", zone_file), patch.object(models_registry, "DEFAULT_PATH", registry),
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as output):
+            with land_runs.landing([base]):
+                self.assertEqual(tune.main(["example", "amount", "4", "--why", "fixture", "--user-words", "yes"]), 0)
+                self.assertEqual(zone.main(["set", "Europe/Paris"]), 0)
+                pending = waiting_rows.read_journal(waiting_rows.journal_path())
+                self.assertEqual([(change.stem, change.value) for change in pending.changes],
+                                 [("example", "4"), ("user_zone", "Europe/Paris")])
+
+                land_queue.remove(land_queue.SETTINGS_LABEL)
+                self.assertIn("main: waits for the land that runs now", live_settings.publish_waiting())
+                land_queue.remove(land_queue.SETTINGS_LABEL)
+                previous = registry.read_text()
+                contents = previous.replace("model=old", "model=new")
+                self.assertEqual(models_registry.store_registry(registry, previous, contents, "Set fixture model"),
+                                 contents)
+                self.assertIn(land_queue.SETTINGS_LABEL, land_queue.listing())
+
+                self.write(checkout, "settings.json", '{"autoCompactWindow": 308800}\n')
+                _ = self.git("commit", "-qm", "Approve the window", "--", "settings.json", cwd=checkout)
+                candidate = self.git("rev-parse", "HEAD", cwd=checkout)
+                command = REPOSITORY / "scripts/validate_and_push/push_direct.sh"
+                direct = subprocess.run(["bash", str(command), "--publish-only", candidate], cwd=checkout,
+                                        env=self.env, capture_output=True, text=True, check=False,
+                                        timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+                self.assertIn(f"{candidate} queued", direct.stdout)
+
+                self.write(self.unit, "config/proof.conf", "fixture=queued\n")
+                fast = self.fast_track("config/proof.conf")
+                self.assertEqual(fast.returncode, 0, fast.stdout + fast.stderr)
+                self.assertIn("main: waits for the land that runs now", fast.stdout)
+                land_queue.add("fixture phase", batch="", commits=[base], first=False, before=None)
+                self.assertEqual(land_queue.line_path(), Path(self.env["MERGE_GATE_STATE_DIR"]) / "land_queue.json")
+                self.assertEqual([entry["kind"] for entry in land_queue.deferred_pushes()], ["direct", "fast-track"])
+                items = land_queue.read_items()
+                self.assertIsInstance(items, list)
+                assert isinstance(items, list)
+                self.assertEqual([item["label"] for item in items], [land_queue.SETTINGS_LABEL, "fixture phase"])
+                self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), base)
+
+            self.assertEqual(land_queue.take_next(), "fixture phase", output.getvalue())
+        for path, expected in (("config/example.conf", "amount=4"), ("config/user_zone.conf", "zone=Europe/Paris"),
+                               ("config/models.conf", "model=new"), ("settings.json", "308800"),
+                               ("config/proof.conf", "fixture=queued")):
+            with self.subTest(path=path):
+                self.assertIn(expected, self.git("show", f"main:{path}", cwd=self.origin), output.getvalue())
 
     def test_reconciliation_releases_the_record_lock_before_promotion(self) -> None:
         self.change_module()
@@ -1260,6 +1349,7 @@ class FastTrackTests(MergeCheckpointFixture):
         self.env["FAST_TRACK_FIXTURE_ALARM_SECS"] = str(2 * TEST_HANG_GUARD_SECS)
         self.write(self.unit, "scripts/sample/test_item.py", '''import os
 from pathlib import Path
+import pwd
 import signal
 import subprocess
 import sys

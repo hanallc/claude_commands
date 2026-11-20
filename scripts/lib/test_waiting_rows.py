@@ -180,17 +180,20 @@ class WaitingRowsTests(unittest.TestCase):
         path = "config/statusline.conf"
         self.edit(path, STATUSLINE, "account.claude1=#112233\n")
         target = self.peer_change(path, STATUSLINE, STATUSLINE + "account.claude2=yellow\n")
-        save_lock = waiting_rows.journal_path().with_suffix(".lock")
-        save_lock.parent.mkdir(parents=True, exist_ok=True)
+        journal_lock = waiting_rows.journal_path().with_suffix(".lock")
+        journal_lock.parent.mkdir(parents=True, exist_ok=True)
+        checkout_lock = waiting_rows.move_marker(self.checkout).with_suffix(".lock")
         give = waiting_rows.give
 
-        def check_save_lock(checkout: Path, rows: waiting_rows.WaitingRows,
-                            environment: dict[str, str] | None = None) -> None:
-            with save_lock.open("a") as lock, self.assertRaises(BlockingIOError):
+        def check_locks(checkout: Path, rows: waiting_rows.WaitingRows,
+                        environment: dict[str, str] | None = None) -> None:
+            with checkout_lock.open("a") as lock, self.assertRaises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with journal_lock.open("a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             give(checkout, rows, environment)
 
-        with mock.patch.object(waiting_rows, "give", check_save_lock):
+        with mock.patch.object(waiting_rows, "give", check_locks):
             waiting_rows.move_to(self.checkout, target)
         self.assertEqual(live_settings.main(["statusline", "account.claude1", "#445566"]), 0)
         self.assertEqual((self.checkout / path).read_text(), "account.claude1=#445566\naccount.claude2=yellow\n")
@@ -205,10 +208,10 @@ class WaitingRowsTests(unittest.TestCase):
         path = "config/statusline.conf"
         self.edit(path, "brown", "#112233")
         target = self.peer_change(path, STATUSLINE, "account.claude1=#445566\naccount.claude2=yellow\n")
-        with waiting_rows.locked_journal(waiting_rows.journal_path()) as journal:
-            move = waiting_rows.move_target(self.checkout, target, journal, fast_forward=True)
-            rows = waiting_rows.check_move(self.checkout, move, journal, registry_move=True)
-            waiting_rows.apply_move(self.checkout, rows, journal)
+        with waiting_rows.locked_checkout(self.checkout):
+            move = waiting_rows.move_target(self.checkout, target, fast_forward=True)
+            rows = waiting_rows.check_move(self.checkout, move, registry_move=True)
+            waiting_rows.apply_move(self.checkout, rows)
         self.assertEqual(live_settings.main(["statusline", "account.claude1", "#667788"]), 0)
         self.assertEqual((self.checkout / path).read_text(), "account.claude1=#667788\naccount.claude2=yellow\n")
         target = self.peer_change(path, "#445566", "#667788")

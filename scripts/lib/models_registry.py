@@ -295,18 +295,18 @@ def _fetch(repo: Path, branch: str) -> str:
 
 def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_shared: bool = False,
                   expected_head: str = "", replay_registry: waiting_rows.RegistryReplay = registry_rows.replay_pending) -> None:
-    with waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
+    with waiting_rows.locked_checkout(repo):
         try:
-            move = waiting_rows.move_target(repo, target, pending, fast_forward=True, allow_contained=True,
+            move = waiting_rows.move_target(repo, target, fast_forward=True, allow_contained=True,
                                             expected_head=expected_head)
             if move.head == move.tip:
                 return
-            rows = waiting_rows.check_move(repo, move, pending, replace_registry=registry_already_shared,
+            rows = waiting_rows.check_move(repo, move, replace_registry=registry_already_shared,
                                            registry_move=True, replay_registry=replay_registry)
         except OSError as error:
             raise FastForwardCheckFailed(str(error)) from error
         try:
-            waiting_rows.apply_move(repo, rows, pending)
+            waiting_rows.apply_move(repo, rows)
         except OSError as error:
             raise OSError(f"registry fast-forward failed for {path}: {error}") from error
 
@@ -367,8 +367,8 @@ def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_
                       + f"origin/{branch}: {' '.join(foreign[:5])}")
     last_error = ""
     for attempt in range(3):
-        with waiting_rows.locked_journal(waiting_rows.journal_path()) as journal:
-            journal.restore(repo, "HEAD")
+        with waiting_rows.locked_checkout(repo):
+            waiting_rows.restore_checkout(repo, "HEAD")
             base = _git(repo, "rev-parse", "HEAD")
             contents = registry_text(path)
         previous = _git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n"
@@ -541,8 +541,8 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
             print(f"accepted {receipt}", flush=True)
             return registry_text(path)
         if isinstance(target, SharedRegistry):
-            journal = locks.enter_context(waiting_rows.locked_journal(waiting_rows.journal_path()))
-            journal.restore(target.repository, "HEAD")
+            locks.enter_context(waiting_rows.locked_checkout(target.repository))
+            waiting_rows.restore_checkout(target.repository, "HEAD")
         if changes:
             latest = registry_text(path)
             result = registry_rows.replay(latest, changes, additive_catalog)

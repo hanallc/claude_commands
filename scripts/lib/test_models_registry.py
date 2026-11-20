@@ -336,7 +336,7 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         flock = fcntl.flock
 
         def observe_lock(lock: TextIO, operation: int) -> None:
-            if Path(lock.name).name == "waiting.lock" and get_ident() != caller:
+            if Path(lock.name).name == "waiting-rows.lock" and get_ident() != caller:
                 try:
                     flock(lock, operation | fcntl.LOCK_NB)
                 except BlockingIOError:
@@ -349,14 +349,14 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         caller = get_ident()
         with patch.dict(os.environ, environment, clear=True), patch.object(fcntl, "flock", observe_lock), \
                 ThreadPoolExecutor(max_workers=1) as executor:
-            with waiting_rows.locked_journal(waiting_rows.journal_path()) as journal:
-                move = waiting_rows.move_target(self.repo, target, journal, fast_forward=True)
-                rows = waiting_rows.check_move(self.repo, move, journal)
+            with waiting_rows.locked_checkout(self.repo):
+                move = waiting_rows.move_target(self.repo, target, fast_forward=True)
+                rows = waiting_rows.check_move(self.repo, move)
                 writer = executor.submit(models_registry.store_registry, registry, local, after, "deferred fixture")
                 self.assertTrue(attempted.wait(TEST_HANG_GUARD_SECS))
                 self.assertEqual(blocked, [True])
                 self.assertEqual(registry.read_text(), local)
-                waiting_rows.apply_move(self.repo, rows, journal)
+                waiting_rows.apply_move(self.repo, rows)
             expected = after.replace("second=old", "second=new")
             self.assertEqual(writer.result(timeout=TEST_HANG_GUARD_SECS), expected)
         self.assertEqual(registry.read_text(), expected)

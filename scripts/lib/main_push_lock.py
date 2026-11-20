@@ -165,6 +165,20 @@ class LockCommand(argparse.Namespace):
     command: list[str] = []
 
 
+def _queue_direct(request: land_queue.DirectSettingsPush) -> int:
+    script = Path(__file__).resolve().with_name("live_settings.py")
+    result = subprocess.run([sys.executable, str(script), "queue-direct", json.dumps(request)], check=False)
+    return result.returncode
+
+
+def _live_hand_commit(checkout: Path, request: land_queue.DirectSettingsPush) -> bool:
+    if not request.get("settings_json_only") or (checkout / "config").resolve() != conf.directory().resolve():
+        return False
+    branch = subprocess.run(["git", "-C", str(checkout), "branch", "--show-current"],
+                            capture_output=True, text=True, check=False)
+    return branch.returncode == 0 and branch.stdout.strip() == "main"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--checkout", type=Path, required=True)
@@ -176,15 +190,15 @@ def main() -> int:
     if not command:
         parser.error("supply a command after --")
     request = _settings_candidate(args.checkout)
+    if request is not None and _live_hand_commit(args.checkout, request):
+        return _queue_direct(request)
     with ExitStack() as locks:
         if request is None:
             locks.enter_context(main_push_lock(args.checkout, Path(command[0]).name))
         else:
             admission = locks.enter_context(settings_push(args.checkout, wait=False))
             if not isinstance(admission, MainPushReady):
-                script = Path(__file__).resolve().with_name("live_settings.py")
-                result = subprocess.run([sys.executable, str(script), "queue-direct", json.dumps(request)], check=False)
-                return result.returncode
+                return _queue_direct(request)
         result = subprocess.run(command, check=False, env=held_environment(args.checkout))
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 

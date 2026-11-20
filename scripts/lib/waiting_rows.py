@@ -204,42 +204,31 @@ class LockedJournal:
         self.last_order = max(self.last_order, save.order)
         return True
 
-    def restore(self, checkout: Path, head: str) -> None:
-        """Recover the move and apply pending values to the live files."""
-        recover_move(checkout, head)
-        if (checkout / "config").resolve() != conf.directory().resolve():
-            return
-        orders = published_orders(checkout, head)
-        changed = self._migrate(checkout, head)
-        files: dict[str, str] = {}
+    def settle(self, orders: SaveOrders, legacy: dict[tuple[str, str], str | None]) -> None:
+        """Reconcile the accepted and published orders."""
+        changed = self._migrate(legacy)
         for stem in self.accepted.keys() | orders.keys():
-            path = f"config/{stem}.conf"
             keys = self.accepted.setdefault(stem, {})
             published = orders.get(stem, {})
             for key in dict.fromkeys((*keys, *published)):
                 save = keys.get(key, AcceptedOrder(0))
                 order = published.get(key, 0)
-                if not isinstance(save, AcceptedSave) or published_save(checkout, head, stem, key, save, order):
+                if not isinstance(save, AcceptedSave) or published_save(save, order, legacy.get((stem, key))):
                     current = AcceptedOrder(max(save.order, order))
                     changed = changed or current != keys.get(key)
                     keys[key] = current
                     self.last_order = max(self.last_order, current.order)
-                else:
-                    text = files[path] if path in files else live_text(conf.path(stem)) or ""
-                    setting = conf.settings(text).get(key)
-                    files[path] = replace_value(text, setting.line, save.value) if setting else append_setting(text, key, save.value)
         if changed or self.migrating:
             self.save()
-        write_files(checkout, files)
 
-    def _migrate(self, checkout: Path, head: str) -> bool:
+    def _migrate(self, legacy: dict[tuple[str, str], str | None]) -> bool:
         """Move old Mac receipts into the register and assign orders to old publication rows."""
         old = self.changes
         self.changes = []
         for row in old:
             if not row.publish_on_main:
                 if row.save_order >= self.order(row.stem, row.key):
-                    base = tree_value(checkout, head, row.stem, row.key) if not row.save_order else None
+                    base = legacy.get((row.stem, row.key)) if not row.save_order else None
                     self.accepted.setdefault(row.stem, {})[row.key] = AcceptedSave(row.save_order, row.value, base)
                     self.last_order = max(self.last_order, row.save_order)
                 continue
@@ -277,11 +266,11 @@ def read_journal(path: Path) -> LockedJournal:
 
 
 @contextmanager
-def locked_journal(path: Path, *, wait: bool = True) -> Generator[LockedJournal]:
-    """Share one lock between live Saves and checkout moves."""
+def locked_journal(path: Path) -> Generator[LockedJournal]:
+    """Serialize journal updates after any Git work has finished."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        fcntl.flock(lock, fcntl.LOCK_EX)
         yield read_journal(path)
 
 
@@ -437,10 +426,9 @@ def tree_value(checkout: Path, commit: str, stem: str, key: str) -> str | None:
     return setting.value if setting else None
 
 
-def published_save(checkout: Path, commit: str, stem: str, key: str, save: AcceptedSave, order: int) -> bool:
+def published_save(save: AcceptedSave, order: int, value: str | None) -> bool:
     if save.order or order > 0:
         return order >= save.order
-    value = tree_value(checkout, commit, stem, key)
     return value == save.value or value != save.legacy_base
 
 
@@ -473,7 +461,8 @@ def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
         stem, saves = Path(path).stem, managed.get(path, {})
         published = orders.get(stem, {})
         settled = {key: order for key, save in saves.items() if isinstance(save, AcceptedSave)
-                   and published_save(checkout, target, stem, key, save, order := published.get(key, 0))}
+                   and published_save(save, order := published.get(key, 0),
+                                      tree_value(checkout, target, stem, key) if not (save.order or order) else None)}
         if path not in changed and not settled and path not in forced:
             continue
         incoming = tree_text(checkout, target, path)
@@ -566,15 +555,15 @@ class Diverged(OSError):
     """The target does not descend from the required parent."""
 
 
-def move_target(checkout: Path, target: str, pending: LockedJournal, *, fast_forward: bool,
+def move_target(checkout: Path, target: str, *, fast_forward: bool,
                 allow_contained: bool = False, expected_head: str = "") -> CheckoutMove:
-    """Check the target against HEAD while the caller holds the journal lock."""
+    """Check the target against HEAD while the caller holds the checkout lock."""
     if Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").strip()).exists():
         raise OSError("an unfinished merge must be completed first")
     if git(checkout, "ls-files", "--unmerged").strip():
         raise OSError("unmerged index entries must be resolved first")
     head = git(checkout, "rev-parse", "HEAD").strip()
-    pending.restore(checkout, head)
+    restore_checkout(checkout, head)
     if expected_head and head != expected_head:
         raise Diverged("HEAD changed while the publisher prepared the move")
     tip = head if target == "HEAD" else git(checkout, "rev-parse", f"{target}^{{commit}}").strip()
@@ -779,10 +768,11 @@ def tree_without(checkout: Path, tree: str, paths: Iterable[str], environment: d
     return write_index_tree(checkout, tree, dict.fromkeys(paths, ""), environment)
 
 
-def check_move(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
+def check_move(checkout: Path, move: CheckoutMove, *,
                replace_registry: bool = False, registry_move: bool = False,
                keep_live_json: bool = False, replay_registry: RegistryReplay = registry_rows.replay_pending) -> WaitingRows:
     """Check the move on a private index before Git changes the checkout."""
+    pending = read_journal(journal_path())
     index = index_path(checkout)
     folder = (build_folders.tool_folder("models-ff-index") if registry_move
               else tempfile.TemporaryDirectory(prefix="waiting-rows-index-"))
@@ -820,8 +810,8 @@ def check_move(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
     return replace(rows, index_after_give=gave, index_after_git=written)
 
 
-def apply_move(checkout: Path, rows: WaitingRows, pending: LockedJournal) -> None:
-    """Move HEAD and restore settings while the caller holds the journal lock."""
+def apply_move(checkout: Path, rows: WaitingRows) -> None:
+    """Move HEAD and restore settings while the caller holds the checkout lock."""
     plan = rows.plan
     source, target = plan["source"], plan["target"]
     marker = move_marker(checkout)
@@ -847,19 +837,54 @@ def apply_move(checkout: Path, rows: WaitingRows, pending: LockedJournal) -> Non
         write_text_atomic(marker, json.dumps(plan) + "\n")
         _ = git(checkout, "update-ref", "-m", f"waiting_rows: move to {target}", "HEAD", target, source)
     finally:
-        pending.restore(checkout, "HEAD")
+        restore_checkout(checkout, "HEAD")
+
+
+@contextmanager
+def locked_checkout(checkout: Path) -> Generator[None]:
+    """Serialize changes to the live files and the checkout index."""
+    path = move_marker(checkout).with_suffix(".lock")
+    with path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def move_to(checkout: Path, target: str, *, fast_forward: bool = False, expected_head: str = "") -> None:
-    with locked_journal(journal_path()) as pending:
-        move = move_target(checkout, target, pending, fast_forward=fast_forward, expected_head=expected_head)
+    with locked_checkout(checkout):
+        move = move_target(checkout, target, fast_forward=fast_forward, expected_head=expected_head)
         if move.head != move.tip:
-            apply_move(checkout, check_move(checkout, move, pending), pending)
+            apply_move(checkout, check_move(checkout, move))
+
+
+def restore_checkout(checkout: Path, head: str) -> None:
+    """Recover the checkout and restore the live values under the checkout lock."""
+    recover_move(checkout, head)
+    if (checkout / "config").resolve() != conf.directory().resolve():
+        return
+    orders = published_orders(checkout, head)
+    path = journal_path()
+    snapshot = read_journal(path)
+    old_keys = {(stem, key) for stem, keys in snapshot.accepted.items() for key, save in keys.items()
+                if isinstance(save, AcceptedSave) and not save.order and not orders.get(stem, {}).get(key)}
+    old_keys.update((row.stem, row.key) for row in snapshot.changes if not row.publish_on_main and not row.save_order)
+    legacy = {(stem, key): tree_value(checkout, head, stem, key) for stem, key in old_keys}
+    with locked_journal(path) as pending:
+        pending.settle(orders, legacy)
+    files: dict[str, str] = {}
+    for relative, keys in pending_files(checkout, pending).items():
+        contents = live_text(checkout / relative) or ""
+        for key, save in keys.items():
+            if isinstance(save, AcceptedSave):
+                setting = conf.settings(contents).get(key)
+                contents = (replace_value(contents, setting.line, save.value) if setting
+                            else append_setting(contents, key, save.value))
+        files[relative] = contents
+    write_files(checkout, files)
 
 
 def restore_live(checkout: Path) -> None:
-    with locked_journal(journal_path()) as pending:
-        pending.restore(checkout, "HEAD")
+    with locked_checkout(checkout):
+        restore_checkout(checkout, "HEAD")
 
 
 def main(arguments: list[str] | None = None) -> int:

@@ -27,8 +27,9 @@ from scripts.lib.waiting_rows import (
     ORDER_PATH, SETTINGS_JSON, AcceptedSave, LockedJournal, MacSettingsBaseline, MacSettingsUntracked, NoSettingsJsonSave, SaveOrders, SettingsJsonEdits, SettingsJsonSave,
     WaitingChange as WaitingChange, apply_settings_json_edits, clean_settings_json, settings_json_edits, smudge_settings_json,
     append_setting, apply_move, check_move, git, has_settings_json_edits,
-    journal_path as journal_path, locked_journal, model_color_host, model_color_key, model_color_value, move_target,
-    published_orders, read_journal, replace_value, tree_text, tree_value, waiting_paths,
+    journal_path as journal_path, locked_checkout, locked_journal, model_color_host, model_color_key, model_color_value,
+    move_target, move_to, published_orders, read_journal, replace_value, restore_checkout, restore_live, tree_text,
+    tree_value, waiting_paths,
 )
 
 SAVE_ORDER_ENV = "LIVE_SETTINGS_SAVE_ORDER"
@@ -57,7 +58,7 @@ class StagedSave:
 
 @dataclass(frozen=True)
 class UnchangedSave:
-    """The requested value is already live under the journal lock."""
+    """The requested value is already live."""
 
 
 def editable_setting(stem: str, key: str, value: str, *, accepted: bool = False) -> ExistingSetting | NewModelColor:
@@ -96,23 +97,23 @@ def stage_save(change: WaitingChange, *, describe: Callable[[str], str] | None =
     """Validate the requested value, then decide and issue its order under the lock."""
     stem, key, value = change.stem, change.key, change.value
     checkout = main_publish.checkout_of(conf.path(stem))
-    with locked_journal(journal_path()) as pending:
-        pending.restore(checkout, "HEAD")
+    with locked_checkout(checkout):
+        restore_checkout(checkout, "HEAD")
         setting = editable_setting(stem, key, value, accepted=False)
         if isinstance(setting, ExistingSetting) and setting.value == value:
             return UnchangedSave()
         old = setting.value if isinstance(setting, ExistingSetting) else "<missing>"
-        order = pending.last_order + 1
-        _ = pending.accept(stem, key, AcceptedSave(order, value))
         message = change.message if describe is None else describe(old)
-        pending.changes.append(replace(change, message=message, save_order=order))
-        pending.save()
+        with locked_journal(journal_path()) as pending:
+            order = pending.last_order + 1
+            _ = pending.accept(stem, key, AcceptedSave(order, value))
+            pending.changes.append(replace(change, message=message, save_order=order))
+            pending.save()
         return StagedSave(_write_setting(stem, key, value, setting), order)
 
 
-def _commit_settings(checkout: Path, files: dict[str, str], message: str, pending: LockedJournal) -> None:
-    """Commit only these files while the other live values stay in place."""
-    parent = git(checkout, "rev-parse", "HEAD").strip()
+def _settings_commit(checkout: Path, parent: str, files: dict[str, str], message: str) -> str:
+    """Create a commit without changing the live files or the checkout index."""
     with tempfile.TemporaryDirectory(prefix="live-settings-index-") as directory:
         environment = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index")}
         _ = git(checkout, "read-tree", parent, environment=environment)
@@ -122,20 +123,20 @@ def _commit_settings(checkout: Path, files: dict[str, str], message: str, pendin
             blob = git(checkout, "hash-object", "-w", "--stdin", input_text=contents).strip()
             _ = git(checkout, "update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}", environment=environment)
         tree = git(checkout, "write-tree", environment=environment).strip()
-    commit = git(checkout, "commit-tree", tree, "-p", parent, input_text=message).strip()
-    move = move_target(checkout, commit, pending, fast_forward=True)
-    apply_move(checkout, check_move(checkout, move, pending), pending)
+    return git(checkout, "commit-tree", tree, "-p", parent, input_text=message).strip()
 
 
-def _commit_row(checkout: Path, relative: str, change: WaitingChange, orders: SaveOrders, pending: LockedJournal) -> None:
+def _commit_row(checkout: Path, relative: str, change: WaitingChange, orders: SaveOrders) -> None:
     """Commit one waiting configuration row onto HEAD."""
-    head = tree_text(checkout, "HEAD", relative) or ""
+    parent = git(checkout, "rev-parse", "HEAD").strip()
+    head = tree_text(checkout, parent, relative) or ""
     setting = conf.settings(head).get(change.key)
     text = (replace_value(head, setting.line, change.value) if setting
             else append_setting(head, change.key, change.value))
     orders.setdefault(change.stem, {})[change.key] = change.save_order
-    _commit_settings(checkout, {relative: text, ORDER_PATH: json.dumps(orders, indent=2, sort_keys=True) + "\n"},
-                     change.message, pending)
+    files = {relative: text, ORDER_PATH: json.dumps(orders, indent=2, sort_keys=True) + "\n"}
+    commit = _settings_commit(checkout, parent, files, change.message)
+    move_to(checkout, commit, fast_forward=True, expected_head=parent)
 
 
 def _publish_rows(checkout: Path, pending: LockedJournal, changes: list[WaitingChange]) -> list[str]:
@@ -148,7 +149,7 @@ def _publish_rows(checkout: Path, pending: LockedJournal, changes: list[WaitingC
             lines.append(f"main: {change.key}={change.value} has a newer live value; no commit")
         elif change.save_order > committed:
             relative = str(conf.path(change.stem).resolve().relative_to(checkout.resolve()))
-            _commit_row(checkout, relative, change, orders, pending)
+            _commit_row(checkout, relative, change, orders)
     return lines
 
 
@@ -163,18 +164,23 @@ class PublishedSettings(NamedTuple):
 
 def _publish_main(checkout: Path) -> PublishedSettings:
     """Move the waiting Saves to main and return the label for the Mac pull."""
+    restore_live(checkout)
     main_publish.ready(checkout, fetch_limit=main_publish.CommandTimeLimit(_seconds("fetch_seconds")))
-    with locked_journal(journal_path()) as pending:
-        pending.restore(checkout, "HEAD")
-        changes = list(pending.changes)
-        lines = _publish_rows(checkout, pending, changes)
-        settings_json = pending.settings_json
-        saved_through = pending.last_order
+    pending = read_journal(journal_path())
+    changes = pending.changes
+    lines = _publish_rows(checkout, pending, changes)
+    with locked_checkout(checkout):
+        json_snapshot = read_journal(journal_path())
+        settings_json = json_snapshot.settings_json
+        saved_through = json_snapshot.last_order
         if not isinstance(settings_json, NoSettingsJsonSave):
-            head = tree_text(checkout, "HEAD", SETTINGS_JSON) or "{}\n"
+            parent = git(checkout, "rev-parse", "HEAD").strip()
+            head = tree_text(checkout, parent, SETTINGS_JSON) or "{}\n"
             settings = apply_settings_json_edits(head, settings_json["edits"])
             if has_settings_json_edits(settings_json_edits(head, settings)):
-                _commit_settings(checkout, {SETTINGS_JSON: settings}, settings_json["message"], pending)
+                commit = _settings_commit(checkout, parent, {SETTINGS_JSON: settings}, settings_json["message"])
+                move = move_target(checkout, commit, fast_forward=True, expected_head=parent)
+                apply_move(checkout, check_move(checkout, move))
     pushed, detail = main_publish.push(checkout, time_limit=main_publish.CommandTimeLimit(_seconds("push_seconds")))
     if not pushed:
         raise main_publish.Refusal(f"main: {detail}")
@@ -230,10 +236,10 @@ def publish(checkout: Path, *, wait: bool) -> list[str] | None:
     return [land_queue.enqueue_settings().report()] if wait else None
 
 
-def _waiting_checkout(*, wait: bool) -> Path | None:
-    with locked_journal(journal_path(), wait=wait) as pending:
-        first = next((change for change in pending.changes if change.publish_on_main), None)
-        has_settings_json = not isinstance(pending.settings_json, NoSettingsJsonSave)
+def _waiting_checkout() -> Path | None:
+    pending = read_journal(journal_path())
+    first = next((change for change in pending.changes if change.publish_on_main), None)
+    has_settings_json = not isinstance(pending.settings_json, NoSettingsJsonSave)
     if first is not None:
         return main_publish.checkout_of(conf.path(first.stem).resolve())
     if has_settings_json:
@@ -256,14 +262,12 @@ def _publish_waiting_settings(lines: list[str], *, gap: land_queue.SettingsGap |
                               ) -> PublishedSettings | None:
     try:
         wait = isinstance(gap, land_queue.SettingsGap)
-        if (checkout := _waiting_checkout(wait=wait)) is not None:
+        if (checkout := _waiting_checkout()) is not None:
             published = _publish(checkout, wait=wait, gap=gap)
             if isinstance(published, PublishedSettings):
                 return published
             if isinstance(published, land_queue.SettingsWaiting):
                 lines.append(published.report())
-    except BlockingIOError:
-        pass
     except (OSError, main_publish.Refusal, conf.Unusable) as error:
         lines.append(f"settings not on main yet: {' '.join(str(error).split())}")
     return None
@@ -272,6 +276,8 @@ def _publish_waiting_settings(lines: list[str], *, gap: land_queue.SettingsGap |
 def _publish_direct(request: land_queue.DirectSettingsPush, gap: land_queue.SettingsGap, *, wait: bool) -> bool:
     checkout = Path(request["checkout"])
     if "journal_order" in request:
+        with locked_checkout(checkout):
+            _retire_hand_commit(request)
         return False
     with main_push_lock.settings_push(checkout, wait=wait, gap=gap) as admission:
         if not isinstance(admission, main_push_lock.MainPushReady):
@@ -372,13 +378,14 @@ def _settings_checkout() -> Path:
 
 
 def _accept_settings_json(checkout: Path, order: int, edits: SettingsJsonEdits) -> None:
-    with locked_journal(journal_path()) as pending:
-        if order <= pending.settings_json_order:
+    with locked_checkout(checkout):
+        if order <= read_journal(journal_path()).settings_json_order:
             return
         shared = apply_settings_json_edits(clean_settings_json(checkout), edits)
         write_text_atomic(checkout / SETTINGS_JSON, smudge_settings_json(checkout, shared))
-        pending.settings_json_order = order
-        pending.save()
+        with locked_journal(journal_path()) as pending:
+            pending.settings_json_order = order
+            pending.save()
 
 
 class MacSettingsDelivery(NamedTuple):
@@ -404,14 +411,15 @@ def _write_settings_json_mac(saved: MacSettingsDelivery) -> str:
 
 
 def _stage_settings_json(checkout: Path, message: str, forwarded: str) -> MacSettingsDelivery | NoSettingsJsonSave:
-    with locked_journal(journal_path()) as pending:
-        pending.restore(checkout, "HEAD")
+    with locked_checkout(checkout):
+        restore_checkout(checkout, "HEAD")
         head = tree_text(checkout, "HEAD", SETTINGS_JSON) or "{}\n"
         shared = clean_settings_json(checkout)
         if forwarded:
             shared = apply_settings_json_edits(shared, cast(SettingsJsonEdits, json.loads(forwarded)))
             write_text_atomic(checkout / SETTINGS_JSON, smudge_settings_json(checkout, shared))
-        return _record_settings_json(pending, message, head, shared)
+        with locked_journal(journal_path()) as pending:
+            return _record_settings_json(pending, message, head, shared)
 
 
 def _record_settings_json(pending: LockedJournal, message: str, head: str,
@@ -433,39 +441,47 @@ def _record_settings_json(pending: LockedJournal, message: str, head: str,
     return MacSettingsDelivery(saved["order"], mac_edits, shared)
 
 
-def _stage_hand_commit(request: land_queue.DirectSettingsPush) -> land_queue.DirectSettingsPush:
+def _retire_hand_commit(request: land_queue.DirectSettingsPush) -> None:
     checkout = Path(request["checkout"])
-    if not request.get("settings_json_only") or SETTINGS_JSON not in waiting_paths(checkout):
-        return request
-    try:
-        with main_push_lock.main_push_lock(checkout, wait=False), locked_journal(journal_path(), wait=False) as pending:
-            if (git(checkout, "rev-parse", "HEAD").strip() != request["commit"]
-                    or git(checkout, "branch", "--show-current").strip() != "main"):
-                return request
-            baseline = tree_text(checkout, request["base"], SETTINGS_JSON) or "{}\n"
-            approved = tree_text(checkout, request["commit"], SETTINGS_JSON) or "{}\n"
-            message = git(checkout, "show", "-s", "--format=%B", request["commit"]).strip()
-            delivery = _record_settings_json(pending, message, baseline, approved)
-            move = move_target(checkout, request["base"], pending, fast_forward=False, expected_head=request["commit"])
-            apply_move(checkout, check_move(checkout, move, pending, keep_live_json=True), pending)
-    except BlockingIOError:
-        return request
-    if not isinstance(delivery, NoSettingsJsonSave):
-        print(_write_settings_json_mac(delivery))
-    return {**request, "journal_order": pending.last_order}
+    if git(checkout, "rev-parse", "HEAD").strip() != request["commit"]:
+        return
+    move = move_target(checkout, request["base"], fast_forward=False, expected_head=request["commit"])
+    apply_move(checkout, check_move(checkout, move, keep_live_json=True))
 
 
 def _queue_direct(request: land_queue.DirectSettingsPush) -> int:
-    staged = _stage_hand_commit(request)
-    admission = land_queue.enqueue_settings(staged)
+    checkout = Path(request["checkout"])
+    delivery: MacSettingsDelivery | NoSettingsJsonSave = NoSettingsJsonSave()
+    admission: land_queue.SettingsWaiting
+    with locked_checkout(checkout):
+        # The line claim never waits while this lock is held.
+        retry = next((entry for entry in land_queue.deferred_pushes()
+                      if entry["kind"] == "direct" and entry["checkout"] == request["checkout"]
+                      and entry["commit"] == request["commit"] and "journal_order" in entry), None)
+        if retry is not None:
+            request = retry
+        elif (request.get("settings_json_only") and SETTINGS_JSON in waiting_paths(checkout)
+              and git(checkout, "rev-parse", "HEAD").strip() == request["commit"]
+              and git(checkout, "branch", "--show-current").strip() == "main"):
+            baseline = tree_text(checkout, request["base"], SETTINGS_JSON) or "{}\n"
+            approved = tree_text(checkout, request["commit"], SETTINGS_JSON) or "{}\n"
+            message = git(checkout, "show", "-s", "--format=%B", request["commit"]).strip()
+            with locked_journal(journal_path()) as pending:
+                delivery = _record_settings_json(pending, message, baseline, approved)
+                request = {**request, "journal_order": pending.last_order}
+        admission = land_queue.enqueue_settings(request)
+        if "journal_order" in request:
+            _retire_hand_commit(request)
+    if not isinstance(delivery, NoSettingsJsonSave):
+        print(_write_settings_json_mac(delivery))
     print(admission.report())
     print(f"{request['commit']} queued")
     return 0
 
 
 def _forward_settings_json(checkout: Path, message: str) -> int:
-    with locked_journal(journal_path()) as pending:
-        pending.restore(checkout, "HEAD")
+    with locked_checkout(checkout):
+        restore_checkout(checkout, "HEAD")
         head = tree_text(checkout, "HEAD", SETTINGS_JSON) or "{}\n"
         edits = settings_json_edits(head, clean_settings_json(checkout))
     command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/live_settings.py" '
@@ -552,9 +568,9 @@ def main(arguments: list[str] | None = None) -> int:
         if order < 0 or (order == 0 and platform.system() == "Darwin"):
             raise ValueError("the Mac needs a positive Save order from natedev")
         checkout = main_publish.checkout_of(conf.path(stem))
-        with locked_journal(journal_path()) as pending:
-            pending.restore(checkout, "HEAD")
-            current = pending.order(stem, key)
+        with locked_checkout(checkout):
+            restore_checkout(checkout, "HEAD")
+            current = read_journal(journal_path()).order(stem, key)
             if order < current:
                 print(MacWriteSuperseded.NEWER_SAVE)
             elif not current or order > current:
@@ -562,8 +578,9 @@ def main(arguments: list[str] | None = None) -> int:
                 if not order and isinstance(setting, ExistingSetting) and setting.value == value:
                     return 0
                 base = tree_value(checkout, "HEAD", stem, key) if not order else None
-                _ = pending.accept(stem, key, AcceptedSave(order, value, base))
-                pending.save()
+                with locked_journal(journal_path()) as pending:
+                    _ = pending.accept(stem, key, AcceptedSave(order, value, base))
+                    pending.save()
                 _ = _write_setting(stem, key, value, setting)
     except (OSError, ValueError, main_publish.Refusal) as error:
         print(f"live_settings: {error}", file=sys.stderr)
