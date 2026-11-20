@@ -755,10 +755,7 @@ class AccountSpendParityTests(SpendReferenceFixture):
         other = self.root / 'report-settings.conf'
         _ = other.write_text(self.original_settings)
         self.record('66')
-        report = spend.read_spend(other, self.book.directory, self.now, utc_day(self.now))
-        assert isinstance(report, spend.Spend)
-        day, = (row for row in report.days if row.day == utc_day(self.now))
-        self.assertEqual(day.usd, Decimal(1))
+        self.assertEqual(spend.read_spend(other, self.book.directory, self.now, utc_day(self.now)), self.page())
 
         jan15 = JAN1 + 14 * DAY
         self.scene('67', now=jan15 + DAY + 12 * HOUR)
