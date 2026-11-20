@@ -54,7 +54,10 @@ class NotifierTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"__ETC_ZSHENV_SOURCED": "1"})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "__ETC_ZSHENV_SOURCED": "1",
+            "NOTIFIER_PLATFORM": "linux",
+        })))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.owned = OwnedTestProcesses()
         self.addCleanup(self.owned.finish)
@@ -560,7 +563,7 @@ class NotifierTests(unittest.TestCase):
             ["zsh", str(SCRIPT), "tick"],
             env=self.owned.environment({
                 **os.environ,
-                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "PATH": os.pathsep.join((str(fake_bin), str(self.launcher_dir), os.environ["PATH"])),
                 "NOTIFIER_STATE_DIR": str(self.state_dir),
                 "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
                 "NOTIFIER_SEND": str(self.fake_send),

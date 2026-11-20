@@ -7,6 +7,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import tempfile
 import threading
@@ -269,6 +270,13 @@ class ReleaseDeadlineTests(unittest.TestCase):
 
 class OpenLogWaitTests(unittest.TestCase):
     def test_shared_wait_reads_a_line_before_the_writer_closes(self) -> None:
+        cases = (("open log", self.assert_wait_reads_open_log),
+                 ("guardian status", self.assert_wait_reads_guardian_status))
+        for source, check in cases:
+            with self.subTest(source=source):
+                check()
+
+    def assert_wait_reads_open_log(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             log = directory / "output.log"
@@ -297,6 +305,41 @@ class OpenLogWaitTests(unittest.TestCase):
             finally:
                 close.set()
                 worker.join(TEST_HANG_GUARD_SECS)
+
+    def assert_wait_reads_guardian_status(self) -> None:
+        command = ["sh", "-c", "exit 7"]
+        report_after_check = """
+"$@" &
+child=$!
+wait "$child"
+status=$?
+printf '%s\\n' "$child"
+read -r release
+printf '%s\\n' "$status"
+"""
+        with tempfile.TemporaryDirectory() as temporary, subprocess.Popen(
+                ["sh", "-c", report_after_check, "guardian", *command],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=False) as guardian:
+            directory = Path(temporary) / "state"
+            directory.mkdir()
+            release, reports = guardian.stdin, guardian.stdout
+            assert release is not None and reports is not None
+            self.assertTrue(select.select([reports], [], [], TEST_HANG_GUARD_SECS)[0],
+                            "The guardian must report the reaped child.")
+            pid = int(cast(bytes, reports.readline()))
+            status = process_supervisor.StatusPipe(os.dup(reports.fileno()))
+            with process_supervisor.ManagedProcess(command, guardian, process_supervisor.OwnershipWriter(-1),
+                                                   status, pid, text=False) as process:
+                def exited() -> bool:
+                    exit_status = process.poll()
+                    release.close()
+                    return exit_status is not None
+
+                try:
+                    wait_until(exited, directory, timeout=5, processes=(process,))
+                    self.assertEqual(process.returncode, 7)
+                finally:
+                    release.close()
 
 
 if __name__ == "__main__":

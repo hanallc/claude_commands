@@ -333,6 +333,15 @@ class StopTests(unittest.TestCase):
 
 
 class StoppedCopyReleaseTests(unittest.TestCase):
+    @staticmethod
+    def reap_copy_process(process: subprocess.Popen[bytes]) -> None:
+        try:
+            process.kill()
+            _ = process.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        finally:
+            if process.stdin is not None:
+                process.stdin.close()
+
     def test_a_stopped_copy_releases_its_kept_claim_and_settles_its_assignment(self) -> None:
         from scripts.build_queue import admission_client
 
@@ -358,7 +367,11 @@ class StoppedCopyReleaseTests(unittest.TestCase):
             admission_client.write_assignment(assignment_file, wire.Assignment(assignment))
             for name, (released, reports) in cases.items():
                 with self.subTest(name):
-                    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+                    # The pipe closes if the test process exits.
+                    process = subprocess.Popen(
+                        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"], stdin=subprocess.PIPE,
+                    )
+                    self.addCleanup(self.reap_copy_process, process)
                     copy = copy_watch.RunningCopy(process, root / "copy.result", time.monotonic(), assignment_file)
                     with mock.patch.object(mac_test, "release_exact_claims", return_value=released) as release, \
                          mock.patch.object(admission_client, "report_execution") as report, \
