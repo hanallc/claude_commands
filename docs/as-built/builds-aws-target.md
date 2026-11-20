@@ -859,7 +859,7 @@ Failure reports that bwrap or unprivileged user namespaces do not work for `gate
 The boot log and the boot error record include this reason.
 A failed check prevents the gate box from running tests.
 The production EXIT handler attempts to send any boot error before it requests poweroff.
-The handler keeps the boot session exit status.
+The handler requests poweroff and keeps the boot session exit status even if it cannot write the boot error record.
 Cloud gates and paired trials use this boot script.
 GPU size trials use their own boot script and prepared system.
 The live `gate_box.GUEST` program contains the bootstrap code.

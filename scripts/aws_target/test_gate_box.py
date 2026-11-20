@@ -266,6 +266,9 @@ subprocess.run = fail_log_put
     def test_shell_boot_error_filters_the_completed_record(self) -> None:
         self.production_boot_stubs(('boot error record',))
 
+    def test_production_boot_powers_off_when_the_error_record_write_fails(self) -> None:
+        self.production_boot_stubs(('boot error write',))
+
     def test_signed_shell_transfers_suppress_curl_output_and_shell_traces(self) -> None:
         signed = 'https://fixture.invalid/artifact?signature=' + TRANSFER_MARKER
         links = {**dict.fromkeys(('guest', 'request', 'log', 'result', 'boot_error'), signed), 'step': 'size'}
@@ -321,6 +324,8 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                 tools, box, repo = root / 'bin', root / 'box', root / 'repo'
                 tools.mkdir()
                 (root / 'home').mkdir()
+                if failure == 'boot error write':
+                    (box / 'boot-error.json').mkdir(parents=True)
                 for name in ('scripts', 'scripts/production', 'scripts/aws_target', 'scripts/lib', 'config'):
                     folder = repo / name
                     folder.mkdir(parents=True, exist_ok=True)
@@ -460,6 +465,7 @@ elif name == 'git' and 'rev-parse' in args:
 elif name == 'loginctl':
     fail('boot')
     fail('boot error record')
+    fail('boot error write')
 elif name == 'shutdown':
     assert args == ['-h', 'now'], args
     event('shutdown -h now')
@@ -511,6 +517,13 @@ else:
                 uploads = [ledger.mapping(cast(object, json.loads(line))) for line in uploaded.splitlines()]
                 results = [ledger.mapping(cast(object, json.loads(ledger.text(row, 'body'))))
                            for row in uploads if ledger.text(row, 'destination').endswith(('/result.json', '/boot-error.json'))]
+                trace = (root / 'trace').read_text().splitlines()
+                if failure == 'boot error write':
+                    self.assertIn('boot-error.json:', log)
+                    self.assertIn('shutdown -h now', trace)
+                    self.assertEqual(reply.returncode, 7, log + reply.stderr)
+                    self.assertEqual(results, [])
+                    continue
                 self.assertTrue(results, log + reply.stderr)
                 expected_error = failure not in ('', 'final log upload', 'shell log signal') or candidate_change in (
                     'missing', 'old transfer')
@@ -542,7 +555,6 @@ else:
                     detail = ledger.text(results[-1], field)
                     self.assertIn(f'{stage} failed (curl exit 7, HTTP 403)', detail)
                     self.assertNotIn('CalledProcessError', detail)
-                trace = (root / 'trace').read_text().splitlines()
                 if failure in ('bwrap unavailable', 'result upload'):
                     self.assertEqual(reply.returncode, 1, log + reply.stderr)
                     self.assertIn('shutdown -h now', trace)

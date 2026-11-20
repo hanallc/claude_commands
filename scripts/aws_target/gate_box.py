@@ -575,6 +575,7 @@ def boot_trap(cold: str, warm: str, *, production: bool) -> str:
     poweroff = '    shutdown -h now || :\n' if production else ''
     return fr'''boot_failed() {{
     status=$?
+    set +e
     trap - EXIT
     if [ -n "${{log_push_pid:-}}" ]; then kill "$log_push_pid" 2>/dev/null || :; fi
     if [ "$status" -ne 0 ]; then
@@ -591,8 +592,10 @@ def boot_trap(cold: str, warm: str, *, production: bool) -> str:
         message=$(printf '%s' "$message" | LC_ALL=C tr -d '[:cntrl:]' | sed 's/[\\"]/\\&/g')
         file="${{box_dir:-/var/lib/gate-trial}}/boot-error.json"
         printf '{{"verdict":"error","error":"%s (exit %s)"}}' "$message" "$status" > "$file"
-        safe_gate_record < "$file" |
-            gate_curl 'PUT boot error' --config "$destination" {shlex.join(BOX_CURL_RETRY)} --max-time 30 -X PUT --data-binary @- -o /dev/null || :
+        if [ "$?" -eq 0 ]; then
+            safe_gate_record < "$file" |
+                gate_curl 'PUT boot error' --config "$destination" {shlex.join(BOX_CURL_RETRY)} --max-time 30 -X PUT --data-binary @- -o /dev/null || :
+        fi
     fi
 {poweroff}    exit "$status"
 }}
