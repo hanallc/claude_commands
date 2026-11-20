@@ -8,12 +8,13 @@ from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
-from typing import override
+from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_trial, cloud_gate, deploy, ledger, plan_identity
-from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, deployment_record, save_deployment_record
+from scripts.aws_target import aws_trial, cloud_gate, deploy, ledger, plan_identity, remote
+from scripts.aws_target.config import deployment_record, save_deployment_record
+from scripts.aws_target.ledger_test_support import install_cost_settings, override_fixture_settings
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -58,8 +59,9 @@ class DeploymentRecoveryTests(unittest.TestCase):
         self.manifest = self.state / 'gate-deployment.json'
         self.output = root / 'output'
         write_text_atomic(self.output / 'template.json', '{}\n')
-        write_text_atomic(self.output / 'parameters.json', '[]\n')
-        write_text_atomic(self.output / 'preflight.json', json.dumps({'fingerprint': FINGERPRINT}) + '\n')
+        write_text_atomic(self.output / 'parameters.json', json.dumps([
+            {'ParameterKey': 'DeploymentId', 'ParameterValue': DEPLOYMENT}]) + '\n')
+        write_text_atomic(self.output / 'preflight.json', remote.record_text({'at': 0, 'fingerprint': FINGERPRINT}))
         write_text_atomic(self.settings, f'region={HOME}\nstack_name={STACK}\ndeployment_timeout_s=3\n')
         gates = root / 'recovery-gates.conf'
         write_text_atomic(gates, f'regions={HOME} {FALLBACK}\n')
@@ -70,6 +72,17 @@ class DeploymentRecoveryTests(unittest.TestCase):
 
     def deployment(self) -> deploy.Deployment:
         return deploy.Deployment(self.settings, self.state, self.output, execute=self.execute)
+
+    def configure_preparation(self) -> None:
+        root = self.state.parent
+        notification = root / 'notification-email'
+        write_text_atomic(notification, 'fixture@example.invalid\n')
+        install_cost_settings(self.settings)
+        override_fixture_settings(self.settings,
+            f'region={HOME}\navailability_zone={HOME}a\nstack_name={STACK}\ndeployment_timeout_s=3\n'
+            + f'scaler_user_name={SCALER}\nnotification_email_file={notification}\nadmin_secret_file={root / "admin.gpg"}\n')
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ,
+            {'AWS_SHARED_CREDENTIALS_FILE': str(root / 'credentials')})))
 
     @staticmethod
     def stack_arn(region: str, name: str) -> str:
@@ -176,8 +189,7 @@ class DeploymentRecoveryTests(unittest.TestCase):
         publish.assert_not_called()
 
     def test_foundation_equals_the_record_written_by_apply(self) -> None:
-        settings = DeploymentSettings(HOME, 'fixture-admin', STACK, 'fixture-image', 'fixture-owner',
-            'fixture-release', f'{HOME}a', 'fixture-vpc', 'fixture-subnet', '/dev/xvda', 10, 20, 30, 3, 300, SCALER)
+        self.configure_preparation()
         identity: dict[str, object] = {'account_id': OWNER.account, 'region': HOME, 'stack': STACK,
             'deployment_id': DEPLOYMENT, 'stack_id': self.stack_arn(HOME, STACK),
             'scaler_user': {'name': SCALER, 'arn': SCALER_ARN, 'user_id': SCALER_ID}}
@@ -186,19 +198,70 @@ class DeploymentRecoveryTests(unittest.TestCase):
         outputs = {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue')
                    for row in ledger.rows(self.stack(HOME, STACK), 'Outputs')}
         subject = self.deployment()
+        prepared = subject.prepare()
         with (mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs'),
-              mock.patch.object(subject, '_load', return_value=(settings, {})),
               mock.patch.object(subject, '_stack', return_value=outputs), mock.patch.object(subject, '_deploy'),
-              mock.patch.object(subject, 'scaler_key'), mock.patch.object(deploy, 'read_budget_notification_address',
-                                                                         return_value=BudgetNotificationAddress('fixture'))):
+              mock.patch.object(subject, 'scaler_key')):
             self.assertEqual(subject.apply(approve_resources=True), outputs)
         applied = self.foundation.read_bytes()
-        self.assertEqual(deployment_record(self.state), {**identity, 'fingerprint': FINGERPRINT,
+        self.assertEqual(deployment_record(self.state), {**identity, 'fingerprint': prepared.fingerprint,
             'budget_name': outputs['BudgetName'], 'outputs': {**outputs, 'RetainedOutput': 'fixture-retained'}})
         save_deployment_record(self.state, previous)
         status, output = self.recover('--write')
         self.assertEqual(status, 0, output)
         self.assertEqual(self.foundation.read_bytes(), applied)
+
+    def test_recovery_rebuilds_preparation_for_apply_after_a_wipe(self) -> None:
+        self.configure_preparation()
+        subject = self.deployment()
+        prepared = subject.prepare()
+        provisional_id = prepared.parameters['DeploymentId']
+        self.assertNotEqual(provisional_id, DEPLOYMENT)
+        self.assertEqual(deployment_record(self.state)['deployment_id'], provisional_id)
+        files = (self.foundation, self.output / 'template.json', self.output / 'parameters.json',
+                 self.output / 'preflight.json')
+        original = [path.read_bytes() for path in files]
+
+        status, output = self.recover()
+        self.assertEqual(status, 1, output)
+        self.assertIn('The preparation bundle has a different deployment ID.', output)
+        self.assertNotIn(provisional_id, output)
+        self.assertEqual([path.read_bytes() for path in files], original)
+        self.assertFalse(self.manifest.exists())
+
+        replace_file = os.replace
+
+        def fail_manifest(source: Path, target: Path) -> None:
+            if target == self.manifest:
+                raise OSError('fixture manifest replacement failure')
+            replace_file(source, target)
+
+        with mock.patch.object(os, 'replace', side_effect=fail_manifest):
+            status, output = self.recover('--write')
+        self.assertEqual(status, 1, output)
+        self.assertEqual([path.read_bytes() for path in files], original)
+        self.assertFalse(self.manifest.exists())
+
+        status, output = self.recover('--write')
+        self.assertEqual(status, 0, output)
+        written = cast(object, json.loads((self.output / 'parameters.json').read_text()))
+        self.assertEqual(deploy.stack_parameter_values({'Parameters': written}),
+                         {**prepared.parameters, 'DeploymentId': DEPLOYMENT})
+        preflight = remote.read_record(self.output / 'preflight.json')
+        recovered = deployment_record(self.state)
+        self.assertEqual(recovered['deployment_id'], DEPLOYMENT)
+        self.assertEqual(recovered['fingerprint'], preflight['fingerprint'])
+        self.assertNotEqual(recovered['fingerprint'], prepared.fingerprint)
+        self.assertEqual(preflight['at'], prepared.at)
+
+        outputs = {ledger.text(row, 'OutputKey'): ledger.text(row, 'OutputValue')
+                   for row in ledger.rows(self.stack(HOME, STACK), 'Outputs')}
+        recovered_files = [path.read_bytes() for path in files]
+        with (mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs'),
+              mock.patch.object(subject, '_stack', return_value=outputs), mock.patch.object(subject, '_deploy'),
+              mock.patch.object(subject, 'scaler_key')):
+            self.assertEqual(subject.apply(approve_resources=True), outputs)
+        self.assertEqual([path.read_bytes() for path in files], recovered_files)
 
     def test_missing_preparation_refuses_before_aws_or_record_publication(self) -> None:
         (self.output / 'preflight.json').unlink()

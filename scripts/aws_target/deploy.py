@@ -214,6 +214,9 @@ class IncompleteRecoveryStack(RecoveryStackRefused):
 class PreparationRequired(DeploymentRefused):
     """The local deployment preparation bundle is missing or incomplete."""
 
+    def __init__(self) -> None:
+        super().__init__('Run deploy.py prepare first to save the deployment preparation bundle.')
+
 
 class HanaControlRefused(DeploymentRefused):
     """Another command holds exclusive control of Hana."""
@@ -486,6 +489,12 @@ class PreparedDeployment:
 
 
 @dataclass(frozen=True)
+class PreparedDeploymentBundle:
+    prepared: PreparedDeployment
+    files: dict[Path, str]
+
+
+@dataclass(frozen=True)
 class HanaSpotCandidate:
     instance_type: str
     zone: str
@@ -635,7 +644,10 @@ class Deployment:
 
     def _parameters(self, settings: DeploymentSettings, notification: BudgetNotificationAddress) -> dict[str, str]:
         deployment_id = self._deployment_id()
-        saved = deployment_record(self.directory)
+        return self._foundation_parameters(settings, notification, deployment_id, deployment_record(self.directory))
+
+    def _foundation_parameters(self, settings: DeploymentSettings, notification: BudgetNotificationAddress,
+                               deployment_id: str, saved: dict[str, object]) -> dict[str, str]:
         parameters = deployment_parameters(self.settings_path, settings, notification, deployment_id)
         parameters['BudgetName'] = str(saved.get('budget_name', '')) if saved.get('preserve_budget_name') else ''
         return parameters
@@ -2081,18 +2093,26 @@ class Deployment:
 
     def _write_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
                            decision: ledger.SpendingAllowed, resources: tuple[ledger.PricedResource, ...] = ()) -> PreparedDeployment:
-        prepared = PreparedDeployment(int(self.clock()), fingerprint(settings, parameters, template), parameters)
-        self.output.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(self.output / 'template.json', template.decode())
-        write_text_atomic(self.output / 'parameters.json', json.dumps([
-            {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
-        ], sort_keys=True) + '\n')
-        write_text_atomic(self.output / 'preflight.json', json.dumps({
-            'at': prepared.at, 'fingerprint': prepared.fingerprint,
+        bundle = self._preparation_bundle(settings, parameters, template, {
+            'at': int(self.clock()),
             'decision': ledger.decision_record(decision),
             'inventory': [{'name': resource.name, 'usd_per_month': str(resource.usd_per_month)} for resource in resources],
-        }, sort_keys=True) + '\n')
-        return prepared
+        })
+        for path, content in bundle.files.items():
+            write_text_atomic(path, content)
+        return bundle.prepared
+
+    def _preparation_bundle(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
+                            preflight: dict[str, object]) -> PreparedDeploymentBundle:
+        prepared = PreparedDeployment(ledger.instant(preflight, 'at'), fingerprint(settings, parameters, template),
+                                      parameters)
+        return PreparedDeploymentBundle(prepared, {
+            self.output / 'template.json': template.decode(),
+            self.output / 'parameters.json': json.dumps([
+                {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
+            ], sort_keys=True) + '\n',
+            self.output / 'preflight.json': remote.record_text({**preflight, 'fingerprint': prepared.fingerprint}),
+        })
 
     def prepare(self) -> PreparedDeployment:
         admin_secrets.refuse_plain_admin(self.settings_path)
@@ -2298,18 +2318,26 @@ class Deployment:
         saved = deployment_record(self.directory)
         save_deployment_record(self.directory, merge_foundation_outputs(saved, outputs))
 
-    def _prepared_fingerprint(self) -> str:
+    def _prepared_preflight(self) -> dict[str, object]:
         try:
             for name in ('template.json', 'parameters.json'):
                 if not (self.output / name).is_file():
                     raise FileNotFoundError(name)
             preflight = remote.read_record(self.output / 'preflight.json')
             digest = ledger.text(preflight, 'fingerprint')
+            _ = ledger.instant(preflight, 'at')
             if re.fullmatch(r'[a-f0-9]{64}', digest):
-                return digest
+                return preflight
         except (OSError, ValueError):
             pass
-        raise PreparationRequired('Run deploy.py prepare first to save the deployment preparation bundle.')
+        raise PreparationRequired()
+
+    def _prepared_deployment_id(self) -> str:
+        try:
+            parameters = cast(object, json.loads((self.output / 'parameters.json').read_text()))
+            return ledger.text(stack_parameter_values({'Parameters': parameters}), 'DeploymentId')
+        except (OSError, ValueError):
+            raise PreparationRequired() from None
 
     def _confirm_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], *, renew: bool = False) -> None:
         current = read_deployment_settings(self.settings_path)
@@ -2376,7 +2404,8 @@ class Deployment:
             self._deploy(settings, parameters)
             outputs = self._stack(settings)
             saved = deployment_record(self.directory)
-            save_deployment_record(self.directory, prepared_foundation_record(saved, outputs, self._prepared_fingerprint()))
+            digest = ledger.text(self._prepared_preflight(), 'fingerprint')
+            save_deployment_record(self.directory, prepared_foundation_record(saved, outputs, digest))
             self.scaler_key()
             return outputs
 
@@ -3054,29 +3083,29 @@ class Deployment:
         regions = gate_regions(home)
         plan = plan_run.PlanRun(plan_identity.plan_credentials, self.execute, self.pause)
         with self._require_account_stack('recover'):
-            prepared_fingerprint = self._prepared_fingerprint()
+            preflight = self._prepared_preflight()
+            prepared_deployment_id = self._prepared_deployment_id()
             owner = plan.credential.owner
             api = plan.api(home, timeout)
             with recovery_stack_evidence(home, name):
                 stack = read_recovery_stack(plan, api, name)
                 stack_id = ledger.text(stack, 'StackId')
-                parameters = recovery_stack_parameters(stack)
+                parameters = stack_parameter_values(stack)
                 outputs = self._stack_outputs(stack, require_outputs=False)
                 deployment = ledger.text(parameters, 'DeploymentId')
                 if not re.fullmatch(r'[a-f0-9]{32}', deployment):
                     raise IncompleteRecoveryStack(f'Stack {name} in {home} has no valid deployment identity.')
                 identity = recover_scaler_identity(api, owner, stack_id, outputs)
-                _ = ledger.text(outputs, 'BudgetName')
+                budget_name = ledger.text(outputs, 'BudgetName')
                 try:
                     saved = deployment_record(self.directory)
                 except ValueError:
                     saved = {}
                 foundation = saved if saved.get('stack_id') == stack_id else {}
                 foundation.update(account_id=owner.account, region=home, stack=name, stack_id=stack_id,
-                                  deployment_id=deployment, scaler_user=identity)
+                                  deployment_id=deployment, scaler_user=identity, budget_name=budget_name)
                 if parameters.get('BudgetName'):
                     _ = foundation.setdefault('preserve_budget_name', True)
-                foundation = prepared_foundation_record(foundation, outputs, prepared_fingerprint)
                 launch_regions = [recover_gate_region(api, parameters, outputs)]
                 types = recovery_instance_types(ledger.text(parameters, 'GateInstanceTypes'))
                 if not types:
@@ -3089,7 +3118,7 @@ class Deployment:
                 target = api.in_region(region)
                 with recovery_stack_evidence(region, regional_name):
                     stack = read_recovery_stack(plan, target, regional_name)
-                    parameters = recovery_stack_parameters(stack)
+                    parameters = stack_parameter_values(stack)
                     if parameters.get('DeploymentId') != deployment or parameters.get('HomeGateProfileArn') != profile:
                         raise IncompleteRecoveryStack(f'Stack {regional_name} in {region} belongs to a different deployment.')
                     regional_outputs = self._stack_outputs(stack, require_outputs=False)
@@ -3099,7 +3128,22 @@ class Deployment:
             revision = aws_trial.host_nixpkgs_revision()
             print(f'nixpkgs revision from host lock {aws_trial.NIXOS_LOCK} is {revision}.')
             manifest = gate_launch_manifest(deployment, revision, types, gpu_types, outputs, launch_regions)
-            return save_recovered_deployment(self.directory, foundation, manifest, write=write)
+            preparation_files: dict[Path, str] = {}
+            digest = ledger.text(preflight, 'fingerprint')
+            if prepared_deployment_id != deployment:
+                print('The preparation bundle has a different deployment ID.')
+                if not write:
+                    print('Run deploy.py recover --write to replace the preparation bundle and deployment records.')
+                    return False
+                current = read_deployment_settings(self.settings_path)
+                notification = read_budget_notification_address(self.settings_path)
+                parameters = self._foundation_parameters(current, notification, deployment, foundation)
+                # Keep the original preparation time and spending evidence.
+                bundle = self._preparation_bundle(current, parameters, TEMPLATE.read_bytes(), preflight)
+                preparation_files = bundle.files
+                digest = bundle.prepared.fingerprint
+            foundation = prepared_foundation_record(foundation, outputs, digest)
+            return save_recovered_deployment(self.directory, foundation, manifest, preparation_files, write=write)
 
     def _gate_scaler_api(self, settings: DeploymentSettings, timeout: float) -> AwsCli:
         # Use the GPU worker's profile and credential file without inherited admin credentials.
@@ -3378,7 +3422,7 @@ def read_recovery_stack(plan: plan_run.PlanRun, api: AwsCli, name: str) -> dict[
     return stack
 
 
-def recovery_stack_parameters(stack: dict[str, object]) -> dict[str, str]:
+def stack_parameter_values(stack: dict[str, object]) -> dict[str, str]:
     parameters: dict[str, str] = {}
     for row in ledger.rows(stack, 'Parameters'):
         key = ledger.text(row, 'ParameterKey')
@@ -3459,7 +3503,7 @@ def review_recovery_record(path: Path, recovered: dict[str, object],
     return ChangedRecoveryRecord(changes)
 
 
-def publish_recovery_records(directory: Path, records: dict[Path, str]) -> None:
+def publish_recovery_records(records: dict[Path, str]) -> None:
     """Stage each replacement and restore the prior files if publication fails."""
     with ExitStack() as staging:
         replacements: list[tuple[Path, Path, Callable[[], None]]] = []
@@ -3477,21 +3521,24 @@ def publish_recovery_records(directory: Path, records: dict[Path, str]) -> None:
             replacements.append((path, replacement, restore))
 
         with ExitStack() as rollback:
-            _ = rollback.callback(sync_folder, directory)
+            folders = dict.fromkeys(path.parent for path in records)
+            for folder in folders:
+                _ = rollback.callback(sync_folder, folder)
             for path, replacement, restore in replacements:
                 os.replace(replacement, path)
                 _ = rollback.callback(restore)
-            sync_folder(directory)
+            for folder in folders:
+                sync_folder(folder)
             _ = rollback.pop_all()
 
 
 def save_recovered_deployment(directory: Path, foundation: dict[str, object], manifest: dict[str, object],
-                              *, write: bool) -> bool:
+                              preparation_files: dict[Path, str], *, write: bool) -> bool:
     foundation_path = directory / 'deployment.json'
     manifest_path = directory / 'gate-deployment.json'
     proposed = ((foundation_path, foundation, FOUNDATION_RECOVERY_FIELDS),
                 (manifest_path, manifest, GATE_RECOVERY_FIELDS))
-    records: dict[Path, str] = {}
+    records = dict(preparation_files)
     differs = False
     for path, record, fields in proposed:
         match review_recovery_record(path, record, fields):
@@ -3508,7 +3555,7 @@ def save_recovered_deployment(directory: Path, foundation: dict[str, object], ma
         print('Run deploy.py recover --write to replace the deployment records.')
         return False
     if records:
-        publish_recovery_records(directory, records)
+        publish_recovery_records(records)
         for path in records:
             print(f'Saved {path.name}.')
     return True
