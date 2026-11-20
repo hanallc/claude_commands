@@ -4759,7 +4759,15 @@ done
                 self.landing_first_places = {key: award for key, award in self.landing_first_places.items()
                                             if isinstance(started := process_start(award.land.pid), Unreadable)
                                             or started == Started(award.land.start_time)}
-            self.waiters[key] = WaitingAdmission(request, row, connection, landing=landing)
+            previous = self.waiters.get(key)
+            waiting = WaitingAdmission(request, row, connection, landing=landing)
+            if (previous is not None and isinstance(connection, Connection)
+                    and previous.connection is connection and _refreshes(previous.request, request)):
+                waiting.route_retry_at = previous.route_retry_at
+                # The gate repeats the same request when its route check ends without a grant.
+                if request != previous.request:
+                    waiting.cloud_route_check = previous.cloud_route_check
+            self.waiters[key] = waiting
             self._save_place(self.waiters[key])
             self._watch_owner(request.owner)
             if (isinstance(request, wire.AdmitRequest) and request.token_back_at

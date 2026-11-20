@@ -900,10 +900,19 @@ class LandingWaitTests(unittest.TestCase):
         return replace(request, profile=records.ProgramProfile("merge-gate", "claude_commands",
             str(fixture.root), sizing, receive_route_notices=True))
 
+    def refresh_gate_estimate(self, fixture: AdmissionFixture, request: wire.AdmitRequest) -> wire.AdmitRequest:
+        profile = request.profile
+        assert isinstance(profile, records.ProgramProfile)
+        return replace(request, profile=replace(profile, sizing=replace(profile.sizing, estimated_at=fixture.clock.now())))
+
     def test_a_wait_receives_a_route_notice_and_keeps_its_place(self) -> None:
-        for reason in ("landing", "memory"):
-            with self.subTest(reason=reason), AdmissionFixture() as fixture:
-                self.configure_wait(fixture, retry_seconds=2.5)
+        cases = (("landing", "none", 2.5), ("memory", "none", 2.5),
+                 ("memory", "periodic", 60.0), ("memory", "in_flight", 60.0))
+        for reason, refresh, interval in cases:
+            with self.subTest(reason=reason, refresh=refresh), AdmissionFixture() as fixture:
+                self.configure_wait(fixture, retry_seconds=interval)
+                if refresh != "none":
+                    _ = write_config_fixture(fixture.root / "build_admission.conf", "estimate_refresh_seconds=30\n")
                 if reason == "landing":
                     _ = only_admitted(fixture.server.handle_request(self.gate_request(fixture, self.INTEGRATE)))
                     fixture.allow_next_start()
@@ -920,7 +929,22 @@ class LandingWaitTests(unittest.TestCase):
                     self.assertNotEqual(first.text, records.LANDING_WAIT_TEXT)
                     self.assertIsInstance(first.snapshot.decision.room.basis, records.DoesNotFit)
                 places = fixture.server.places.copy()
-                fixture.clock.advance(2)
+                retry_at = fixture.clock.monotonic() + interval
+                if refresh != "none":
+                    fixture.clock.advance(30)
+                    _ = fixture.run_pass()
+                    expired, = peer.replies()
+                    assert isinstance(expired, wire.Wait)
+                    reason_at_expiry = expired.reason
+                    self.assertIsInstance(reason_at_expiry.cause if isinstance(reason_at_expiry, records.HeadAdmissionStatus)
+                                          else reason_at_expiry, records.EstimateExpired)
+                    request = self.refresh_gate_estimate(fixture, request)
+                    peer.socket.sendall(wire.encode_request(request).encode())
+                    refreshed, = peer.replies()
+                    self.assertIsInstance(refreshed, wire.Wait)
+                    self.assertEqual(fixture.server.waiters[request.episode].route_retry_at, retry_at)
+
+                fixture.clock.advance(retry_at - fixture.clock.monotonic() - 0.5)
                 _ = fixture.run_pass()
                 self.assertNotIn(wire.RouteAgain(), peer.replies())
                 self.assertIn(request.episode, fixture.server.waiters)
@@ -928,13 +952,23 @@ class LandingWaitTests(unittest.TestCase):
 
                 fixture.clock.advance(0.5)
                 _ = fixture.run_pass()
+                if refresh == "in_flight":
+                    fixture.free(60 * GIB)
+                    request = self.refresh_gate_estimate(fixture, request)
+                    peer.socket.sendall(wire.encode_request(request).encode())
                 self.assertEqual(peer.replies(), [wire.RouteAgain()])
                 waiter = fixture.server.waiters[request.episode]
-                self.assertEqual(waiter.cloud_route_check, service.CloudRouteCheck(fixture.clock.monotonic() + 2.5))
+                self.assertEqual(waiter.cloud_route_check, service.CloudRouteCheck(fixture.clock.monotonic() + interval))
                 self.assertEqual(fixture.server.places, places)
                 self.assertNotIn(request.episode, fixture.server.reservations)
                 self.assertIn(request.owner.pid, fixture.queue_pids())
 
+                if refresh == "in_flight":
+                    self.assertEqual(waiter.request.profile.estimated_at, request.profile.estimated_at)
+                    peer.socket.sendall(wire.encode_request(request).encode())
+                    _ = only_admitted(peer.replies())
+                    self.assertEqual(fixture.server.reservations[request.episode].queue_waiter["since"], request.since)
+                    continue
                 peer.socket.sendall(wire.encode_request(request).encode())
                 resumed, = peer.replies()
                 self.assertIsInstance(resumed, wire.Wait)
