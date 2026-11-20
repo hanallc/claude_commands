@@ -1879,6 +1879,55 @@ assert scratch.removal_mark(path).is_file()
             self.assertTrue(step.target.path.is_dir())
             journal.path.unlink()
 
+        with self.subTest(adoption_journal_changed=True):
+            task = "gate:journal-primary"
+            adoption_task = "gate:journal-adoption"
+            copies_root = self.base / "copies"
+            source = copies_root / "adoption-source"
+            source.mkdir(parents=True)
+            empty_pair = copies_root / "unrelated-pair"
+            empty_pair.mkdir()
+            _ = scratch.hold(source, task, "copy pair")
+            later = self.base / "z-later"
+            later.mkdir()
+            self.git(later, "init", "-q")
+            _ = (later / "work").write_text("keep")
+            _ = scratch.hold(later, task, "unfinished work")
+
+            nonce = "a" * 32
+            stage = self.base / (scratch.ADOPTION_STAGE_PREFIX + nonce)
+            stage.mkdir()
+            hidden = self.base / "scratch" / scratch.ADOPTION_LEFTOVERS / (scratch.MOVED_FOLDER_PREFIX + nonce)
+            destination = scratch.AdoptionDestination(self.base / "destination", adoption_task, 0.0)
+            paths = scratch.CopyAdoptionPaths(hidden, stage, destination)
+            journal = scratch.operation_journal(source, conf.read("scratch"))
+            journal.save(scratch.FolderOperation(source, scratch.directory_id(source.stat()),
+                         scratch.PublishAdoption(paths, scratch.directory_id(stage.stat()))))
+            list_folders = scratch.folders
+
+            def end_adoption_task(*, scratch_settings: conf.ConfigRead) -> list[scratch.Folder]:
+                with mock.patch.object(scratch, "folders", list_folders):
+                    _ = scratch.end(adoption_task, scratch_settings=scratch_settings)
+                return list_folders(scratch_settings=scratch_settings)
+
+            moment = time.time()
+            with (mock.patch.object(scratch, "folders", side_effect=end_adoption_task),
+                  mock.patch.object(scratch, "read_operation_fields", wraps=scratch.read_operation_fields) as read):
+                result = scratch.end(task, now=moment)
+
+            self.assertEqual(read.call_args_list, [mock.call(journal.path)] * 3)
+            self.assertIsInstance(journal.read().step, scratch.PublishAdoptionAfterTaskEnd)
+            reasons = {item.path: item.reason for item in result.kept}
+            self.assertIn("changed during task cleanup", reasons[journal.path])
+            self.assertIn("needs recovery", reasons[source])
+            self.assertTrue(source.is_dir())
+            self.assertFalse(empty_pair.exists())
+            holds = scratch.holds()
+            self.assertEqual(holds[str(source)]["ended"], moment)
+            self.assertEqual(holds[str(later)]["ended"], moment)
+            self.assertEqual((later / "work").read_text(), "keep")
+            journal.path.unlink()
+
         with self.subTest(unreadable_journal=True):
             task = "gate:other"
             other = self.base / "other"

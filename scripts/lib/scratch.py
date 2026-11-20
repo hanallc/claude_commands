@@ -2092,7 +2092,7 @@ class FolderOperationScope(Enum):
 
 
 class UnreadableFolderOperation(RemovalRefused):
-    """Task cleanup could not read this journal in its first scan."""
+    """Task cleanup could not read this version of the journal."""
 
 
 @dataclass(frozen=True)
@@ -2105,17 +2105,25 @@ class TaskEndJournalReading:
 class TaskEndJournals:
     root: Path
     readings: dict[Path, TaskEndJournalReading]
+    diagnostics: dict[Path, str] = field(default_factory=dict, init=False)
 
     def checked_operation(self, journal: OperationJournal) -> FolderOperation:
-        """Use the first reading only while the journal still matches it."""
+        """Read each version of a journal once during task cleanup."""
         reading = self.readings.get(journal.path)
-        if reading is None:
-            return journal.read()
         current = journal.path.lstat()
-        if (not os.path.samestat(reading.status, current)
+        if reading is None or (not os.path.samestat(reading.status, current)
                 or reading.status.st_ctime_ns != current.st_ctime_ns
                 or reading.status.st_mtime_ns != current.st_mtime_ns):
-            raise FolderRecoveryRequired(f"{journal.path}: a folder operation changed during task cleanup")
+            if reading is not None:
+                self.diagnostics[journal.path] = "folder operation changed during task cleanup"
+            try:
+                operation = journal.read()
+            except RemovalRefused as error:
+                self.diagnostics[journal.path] = str(error)
+                reading = TaskEndJournalReading(current, UnreadableFolderOperation(str(error)))
+            else:
+                reading = TaskEndJournalReading(current, operation)
+            self.readings[journal.path] = reading
         if isinstance(reading.operation, UnreadableFolderOperation):
             raise UnreadableFolderOperation(str(reading.operation))
         return reading.operation
@@ -3141,7 +3149,12 @@ def remove_folder(path: Path,
         ending_task = request.expected.task
     sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
     sweep.refuse_live_test_roots((path,))
-    require_no_folder_operations((path,), scratch_settings=scratch_settings)
+    try:
+        require_no_folder_operations((path,), scratch_settings=scratch_settings)
+    except FolderRecoveryRequired as error:
+        if not isinstance(request, EmptyFolderRemoval):
+            raise
+        return KeptFolder(path, str(error))
     with ExitStack() as locks:
         CoordinatedRemoval.check_tree(path)
         if source_deletion is SourceDeletion.SWEEP:
@@ -3972,7 +3985,8 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
                 readings[path] = TaskEndJournalReading(status, operation)
             except (OSError, ScratchError) as error:
                 kept[path] = str(error)
-    with TaskEndJournals(operation_journal_root(scratch_settings), readings).use():
+    journals = TaskEndJournals(operation_journal_root(scratch_settings), readings)
+    with journals.use():
         removed = TaskCleanup()
         attempted: dict[Path, Path] = {}
 
@@ -4060,6 +4074,7 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
                 del found[path]
             if changed:
                 write_holds(found, scratch_settings=scratch_settings)
+        kept.update(journals.diagnostics)
         removed.kept = [KeptFolder(path, reason) for path, reason in kept.items()]
         return removed
 
