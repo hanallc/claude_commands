@@ -1103,24 +1103,12 @@ class AssignLauncherTests(HookAssignmentFixture):
 
         with self.subTest(behavior="test rules by role"):
             prompts = {"implement": prompt}
-            old_rules = "Keep the old fixture rule."
-            inline_tags = "See <TestRules> for test rules </TestRules> and <WhenYouWriteNoTest> for limits </WhenYouWriteNoTest>."
-            for role, filename, source_rules, options in (
-                ("fix", "fix_prompt.txt", "", ("--fix-cause", "Repair the fixture")),
-                ("test", "test_prompt.txt", f"\n  <TestRules> \n{old_rules}\n  </TestRules> \n", ()),
-                ("test", "inline_prompt.txt", f"\n{inline_tags}\n", ("--new-worker", "inline")),
-            ):
-                self.write_phase_prompt("7", "Assignment core", f"Continue the fixture work.{source_rules}")
+            for role, options in (("fix", ("--fix-cause", "Repair the fixture")), ("test", ())):
                 _ = self.successful(role, *options)
-                prompts[filename] = (manifest.parent / filename).read_text()
-            self.assertIn(inline_tags, prompts["inline_prompt.txt"])
-            for name, dispatched in prompts.items():
-                lines = [line.strip() for line in dispatched.splitlines()]
+                prompts[role] = (manifest.parent / f"{role}_prompt.txt").read_text()
+            for role, dispatched in prompts.items():
                 for tag, body in (("TestRules", rules), ("WhenYouWriteNoTest", limits)):
-                    self.assertEqual(lines.count(f"<{tag}>"), 1, name)
-                    self.assertEqual(lines.count(f"</{tag}>"), 1, name)
-                    self.assertEqual(dispatched.count(f"<{tag}>\n{body}\n</{tag}>"), 1, name)
-                self.assertNotIn(old_rules, dispatched, name)
+                    self.assertEqual(dispatched.count(f"<{tag}>\n{body}\n</{tag}>"), 1, role)
 
     def test_review_is_read_only_and_thread_board_and_summary_use_the_shown_context(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")

@@ -121,12 +121,7 @@ def with_test_rules(prompt: str) -> str:
         rules = dedent(section[1]).strip() if section else ""
         if not rules:
             refuse(f"missing {tag} section in {PROMPT_CONTRACT}")
-        block = f"<{tag}>\n{rules}\n</{tag}>"
-        existing = pattern.search(prompt)
-        if existing:
-            prompt = prompt[:existing.start()] + block + prompt[existing.end():]
-        else:
-            prompt += f"\n\n{block}\n"
+        prompt += f"\n\n<{tag}>\n{rules}\n</{tag}>\n"
     return prompt
 
 
