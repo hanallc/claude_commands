@@ -135,7 +135,7 @@ check(checkLine(2).textContent==='Check overdue Nov 16 12:00 EST' && checkLine(2
  'An unparked item shows the overdue check in the same date form.');
 check(row(8).querySelector('[data-parked-note]').textContent==='Parked until Nov 20 09:00 EST',
  'The parked time uses the ETA date form.');
-check(!checkLine(8).getClientRects().length,'A parked item hides its overdue check.');
+check(!checkLine(8),'A date park omits the overdue check.');
 check(etaLine(9).textContent==='Paused','The cell shows the status as stored.');
 check(etaLine(10).textContent==='Dec 3 03:30 EST','The cell omits the leading zero from the day.');
 check(etaLine(11).textContent==='Nov 20' && eta(11).title==='2026-11-20',
@@ -186,6 +186,18 @@ document.body.append(result);
         for width in (1440, 500):
             with self.subTest(width=width):
                 self.browser_actions(markup, "", probe, window_size=(width, 900))
+
+    def test_delivery_park_omits_the_overdue_check(self) -> None:
+        item = self.add("Publish the reviewed change", number=123, next_check=NOW - timedelta(hours=1))
+        _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        row = markup.split('data-number="123"', 1)[1].split("</tbody>", 1)[0]
+        self.assertIn("Parked until delivered", row)
+        self.assertNotIn("<small data-list-check>", row)
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["check_html"], "")
+        _ = the_list.unpark(MORTY.id, item.id, source="nate")
+        check = list_page.saved_action_state(MORTY.id, item.id)["check_html"]
+        self.assertIn('<span class="warning">Check overdue Nov 16 12:00 EST</span>', check)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_new_item_opens_the_dialog_and_reveals_the_saved_row(self) -> None:
@@ -2921,9 +2933,7 @@ window.fetch=async(_path,options={})=>{
  }
  const unpark=form.querySelector('[value=unpark]');
  show('parked');
- const hiddenCheck=row.querySelector('[data-list-check]');
- check(!hiddenCheck.getClientRects().length && hiddenCheck.textContent==='Check Nov 16 14:00 EST',
-  'The parked row hides the check before it is overdue.');
+ check(!row.querySelector('[data-list-check]'),'The parked row omits the future check.');
  unpark.focus();
  const first=submit('unpark');
  losePost();await flush();
@@ -2944,9 +2954,10 @@ window.fetch=async(_path,options={})=>{
  form.elements.words.value='Keep these words.';
  form.elements.until.value='2026-12-03';
  submit('park');
- finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST'});await flush();
+ check(!nextCheck.getClientRects().length,'The row hides the check while Park is pending.');
+ finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 00:00 EST',check_html:''});await flush();
  show('parked');
- check(!nextCheck.getClientRects().length,'Park hides the saved check without a refresh.');
+ check(!row.querySelector('[data-list-check]'),'The Park response removes the check before a refresh.');
  document.querySelector('[data-sort="3"]').click();
  unpark.focus();
  submit('unpark');
