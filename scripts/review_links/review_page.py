@@ -43,7 +43,7 @@ TYPE_CHIPS = (*review_items.QUESTION_TYPES, *(kind for kind in TYPES if kind not
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
          ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap', ReviewType.BUG: 'bug', ReviewType.RESPONSE: 'inbox'}
 INDEX_STATES = (ReviewState.OPEN, ReviewState.WAITING, ReviewState.VALIDATING)
-SHOWS = (('open', 'Open'), (ReviewState.VALIDATING, ReviewState.VALIDATING), ('all', 'All'))
+SHOWS = (('all', 'All'), ('open', 'Open'), (ReviewState.WAITING, 'Waiting'), (ReviewState.VALIDATING, 'Validating'))
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
           ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies', ReviewType.BUG: 'Bugs',
           ReviewType.RESPONSE: 'Responses'}
@@ -184,7 +184,7 @@ class ReviewSnapshot:
         return self.payload
 
     def render(self, *, show: str = 'open') -> bytes:
-        selected = 'all' if show == 'Waiting' else show if show in dict(SHOWS) else 'open'
+        selected = next((value for value, _ in SHOWS if value.lower() == show.lower()), 'open')
         page = self.page.replace(b'data-show="open"', ('data-show="'+selected+'"').encode(), 1)
         if selected != 'open':
             page = page.replace(b'data-show-chip="open" aria-pressed="true"',b'data-show-chip="open" aria-pressed="false"',1)
@@ -1140,7 +1140,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
                      {'validate':'asked the showrunner to check', 'question':'question sent'}.get(outcome,'answer'))
 
 
-STYLE = '''<style>
+QUESTION_COLOR_RULE = '.question{--type-color:#b99aff}'
+STYLE = '<style>' + QUESTION_COLOR_RULE + '''
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-waiting-why{display:block;color:var(--ink-3);font-size:.85em}
 .review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
@@ -1152,7 +1153,7 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
-.question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
+.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
 .proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}.bug{--type-color:#ed876b}.response{--type-color:#edc46d}
 .review-icon{color:var(--type-color)}.review-panel{border-left-color:var(--type-color);grid-template-columns:1.25fr 1fr;padding:0 20px 18px 58px;gap:4px 28px}
 .response-answer time{display:block;margin-bottom:8px;color:var(--ink-3);font-size:12px}
@@ -1542,6 +1543,7 @@ try{
  }
 }catch{}
 storeSavedVerdicts();
+const showValues=[...content.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip);
 const view=createRecordTable({content:()=>content,single:true,
  entries:allEntries,mount:entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
   content.querySelector('[data-type-chip="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
@@ -1549,8 +1551,8 @@ const view=createRecordTable({content:()=>content,single:true,
  unmount:row=>{if(!saved.has(row.dataset.key)) rememberForm(row.querySelector('[data-review-form]'));},
  place:params=>{
   reviewPlace(params);
-  if(params.get('show')==='Waiting') params.set('show','all');
-  if(params.get('type')==='response' && params.get('show')==='Validating') params.set('show','open');
+  const show=showValues.find(value=>value.toLowerCase()===params.get('show')?.toLowerCase());
+  if(show) params.set('show',params.get('type')==='response' && show==='Validating' ? 'open' : show);
  },
  persistLinkedTarget:true,
  missingItem:()=> 'This review is no longer on the Review page.',
@@ -1561,7 +1563,7 @@ const view=createRecordTable({content:()=>content,single:true,
  },
  selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
  hasKey:key=>allEntries().some(entry=>entry.key===key),
-  shows:['open','Validating','all'],
+ shows:showValues,
  visible:(data,filters)=>{
   const key=data.key,entry=index.get(key),departure=saved.get(key);
   if(!entry || pendingSaves.get(key)?.departing) return false;
@@ -1579,10 +1581,13 @@ const view=createRecordTable({content:()=>content,single:true,
    button.hidden=Boolean(id) && id!==owner && !eligibleOwners.some(entry=>matchesOwner(entry,id));
    button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,id)).length;
   });
+  const eligible=matching({type,owner,query,sourceOwner,keys});
+  const stateCounts=new Map();
+  for(const {state} of eligible) stateCounts.set(state,(stateCounts.get(state) ?? 0)+1);
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
    const show=button.dataset.showChip;
    button.hidden=type==='response' && show==='Validating';
-   const count=matching({type,owner,query,sourceOwner,keys,show}).length;
+   const count=show==='all' ? eligible.length : stateCounts.get(show==='open' ? 'Open' : show) ?? 0;
    button.querySelector('b').textContent=count;
    button.toggleAttribute('data-empty-count',count===0);
   });
