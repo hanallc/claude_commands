@@ -12,10 +12,13 @@ import subprocess
 import tempfile
 from typing import override
 import unittest
+from unittest import mock
 
 from scripts.aws_target import cloud_gate, ledger, machines_data, run_cost
 from scripts.aws_target.aws_cli import AwsCli
-from scripts.lib import conf
+from scripts.build_queue import snapshot_codec
+from scripts.build_queue.admission_jobs import StepJob
+from scripts.lib import build_steps, conf
 
 SMALL = ledger.GateRateCandidate('c7a.4xlarge', 'fixture-home')
 FAST = ledger.GateRateCandidate('c7a.8xlarge', 'fixture-fast')
@@ -65,8 +68,18 @@ faster_box_max_cost_ratio=1.50
 """)
         self.account_path = self.directory / 'aws_target.conf'
         _ = self.account_path.write_text('region=fixture-home\n# whole: 1..\nprice_max_age_seconds=7200\n')
+        _ = (self.directory / 'build_steps.conf').write_text("""[names]
+names.merge-gate=fixture gate
+names.targeted-test=fixture targeted
+names.test-affected=fixture affected
+names.integrate=fixture integration
+names.test-modules=fixture named
+names.test-all=fixture all
+""")
+        with mock.patch.dict('os.environ', {'CONF_DIR': str(self.directory)}):
+            names = build_steps.read_step_names()
         self.configuration = machines_data.MachinesConfiguration(
-            conf.read(page_path), conf.read(gate_path), conf.read(self.account_path))
+            conf.read(page_path), conf.read(gate_path), conf.read(self.account_path), names)
         self.write_deployment(SMALL.region, FAST.region, FASTER.region)
         self.book = ledger.CostLedger(self.directory)
         self.spot = tuple(ledger.RegionalSpotPrice(machine.region, 'zone-a', machine.instance_type, Decimal(price), READ_AT)
@@ -126,7 +139,7 @@ faster_box_max_cost_ratio=1.50
         self.assertEqual(result.price_read, machines_data.SavedSpotPriceRead(READ_AT, False))
         merge = result.workloads[0]
         assert isinstance(merge, machines_data.MeasuredWorkload)
-        self.assertEqual((merge.name, merge.checks, merge.checks_per_month), ('Merge checks', 3, Decimal(13)))
+        self.assertEqual((merge.name, merge.checks, merge.checks_per_month), ('fixture gate', 3, Decimal(13)))
         self.assertEqual(merge.concurrent_starts, ((1, 2), (2, 1)))
         self.assertEqual(merge.live_ratio, Decimal('1.50'))
         fast = next(row for row in merge.choices if row.machine == FAST)
@@ -137,6 +150,8 @@ faster_box_max_cost_ratio=1.50
         self.assertTrue(fast.quota_assumed)
         self.assertAlmostEqual(fast.free_share, Decimal(1) / 3)
         self.assertTrue(any('32 vCPUs' in assumption for assumption in merge.assumptions))
+        self.assertIn('The measured run rate, overlap, and share of Spot refusals repeat for fixture gate.',
+                      merge.assumptions)
 
     def test_ratios_add_each_choice_at_its_first_slider_value(self) -> None:
         off, first, second = self.merge().steps
@@ -154,11 +169,38 @@ faster_box_max_cost_ratio=1.50
         self.assertEqual(tuple(row.machine for row in second.shares), (FAST, FASTER, SMALL))
 
     def test_one_size_workloads_report_the_recorded_count(self) -> None:
-        for workload, name in zip(self.read().workloads[1:], ('Named tests', 'Affected tests'), strict=True):
+        workloads = {workload.mode: workload for workload in self.read().workloads}
+        for mode, name in (('targeted-test', 'fixture targeted'), ('test-affected', 'fixture affected')):
+            workload = workloads[mode]
             assert isinstance(workload, machines_data.WorkloadWithoutComparison)
             self.assertEqual(workload.name, name)
-            self.assertEqual(workload.mode, 'targeted-test' if name == 'Named tests' else 'test-affected')
-            self.assertEqual(workload.sentence, 'The records hold 1 completed check on 1 machine size in this period.')
+            self.assertEqual(workload.sentence,
+                             f'The records for {name} hold 1 completed run on 1 machine size in this period.')
+
+    def test_recorded_steps_take_precedence_over_modes(self) -> None:
+        jobs = {'fixture-1': StepJob('integrate'), 'fixture-2': StepJob('test-modules', modules=1),
+                'fixture-3': StepJob('test-all')}
+        rows = self.book.launches()
+        for row in rows:
+            if (attempt := str(row['attempt'])) in jobs:
+                row['gate_job'] = snapshot_codec.snapshot_value(jobs[attempt])
+            elif attempt == 'fixture-0':
+                row['mode'] = 'gate'
+        _ = self.book.launch_history_path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+
+        workloads = {workload.mode: workload for workload in self.read().workloads}
+        for mode, name, machine, cost in (
+                ('merge-gate', 'fixture gate', SMALL, '.06'), ('integrate', 'fixture integration', FAST, '.075'),
+                ('test-modules', 'fixture named', FASTER, '.09'), ('test-all', 'fixture all', SMALL, '.06')):
+            with self.subTest(mode=mode):
+                workload = workloads[mode]
+                self.assertEqual(workload.name, name)
+                choice, = (choice for choice in workload.choices if choice.checks or choice.launched)
+                self.assertEqual((choice.machine, choice.checks, choice.launched, choice.usd_per_check),
+                                 (machine, 1, 1, Decimal(cost)))
+        targeted = workloads['targeted-test']
+        assert isinstance(targeted, machines_data.WorkloadWithoutComparison)
+        self.assertEqual(targeted.sentence, 'The records for fixture targeted hold 0 completed runs in this period.')
 
     def test_removed_deployment_region_stays_measured_and_leaves_the_projection(self) -> None:
         self.write_deployment(SMALL.region, FASTER.region)
