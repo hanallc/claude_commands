@@ -851,6 +851,14 @@ Reconciliation and the expiry sweep retain their existing end times.
 Results include `kernel_boot_at` from `/proc/stat` and `user_data_started_at` from the first user data command.
 Each timestamp is a UTC epoch time from the box.
 Results include `instance_running_at` when a cached instance identity document supplies `pendingTime`.
+The gate box gets `packages` from `config/cloud_gate.conf` at the deployment host's locked nixpkgs revision.
+The list includes bubblewrap.
+Before `guest.py` starts, the boot script runs `bwrap --ro-bind / / true` as `gate-trial`.
+Success writes `stage=bwrap ready` to the boot log.
+Failure writes `stage=bwrap unavailable` and sends the reason through the boot error link.
+A failed check prevents the gate box from running tests.
+Cloud gates and paired trials use this boot script.
+GPU size trials use their own boot script and prepared system.
 The live `gate_box.GUEST` program contains the bootstrap code.
 The bootstrap downloads or clones the candidate and verifies its requested tree.
 It prepares the environment and calls the candidate's `scripts.aws_target.gate_box.run_guest` entry point.

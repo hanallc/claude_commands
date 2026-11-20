@@ -579,6 +579,8 @@ def boot_trap(cold: str, warm: str) -> str:
         stage=$(sed -n 's/^[0-9T:Z-]\{{20\}} stage=//p' "$box_dir/boot.log" | tail -n 1)
         if [ "$stage" = 'tool preparation' ]; then
             message='Tool preparation failed'
+        elif [ "$stage" = 'bwrap unavailable' ]; then
+            message='bwrap or unprivileged user namespaces are not available for gate-trial'
         else
             message="The box failed at stage ${{stage:-boot}}"
         fi
@@ -635,6 +637,11 @@ tool_path=$PATH
 unset __NIXOS_SET_ENVIRONMENT_DONE __ETC_PROFILE_SOURCED
 . /etc/profile
 export PATH="$tool_path:$PATH"
+if ! bwrap --ro-bind / / true; then
+    printf "%s stage=bwrap unavailable\\n" "$(date -u +%FT%TZ)" >&2
+    exit 1
+fi
+printf "%s stage=bwrap ready\\n" "$(date -u +%FT%TZ)" >&2
 exec python3 "$box_dir/guest.py"'
 {('shutdown -h now' if links.get('production') else '')}
 '''
