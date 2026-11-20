@@ -214,10 +214,15 @@ class HanaSetupTests(CostFixture):
         book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private setup inventory', True))
         book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'private setup account'))
 
+    def save_image(self) -> None:
+        _ = hana_image.save(self.state, hana_image.RegisteredImage(
+            'fixture-name', 'fixture-image', 'fixture-owner', 'fixture-vpc', 'fixture-subnet', FIXTURE_GUEST_DIGEST))
+
     def subject(self, fake: FakeAws) -> deploy.Deployment:
         return deploy.Deployment(self.settings, self.state, self.root / 'output', execute=fake, clock=self.clock, notify=lambda _event: True)
 
     def test_prepare_is_local_and_saves_separate_configuration_evidence(self) -> None:
+        self.save_image()
         fake = FakeAws(self.clock)
         subject = self.subject(fake)
         # The existing validator reads account metadata before Hana replaces resource inputs.
@@ -237,11 +242,12 @@ class HanaSetupTests(CostFixture):
 
     def base_settings(self) -> DeploymentSettings:
         return DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gates', 'fixture-image',
-            '000000000000', 'fixture-release', 'us-east-2b', 'fixture-vpc', 'fixture-subnet', '/dev/xvda',
+            '000000000000', 'fixture-release', 'us-east-2b', '/dev/xvda',
             1, 2, 3, conf.read(self.workload).whole('aws_timeout_s'),
             conf.read(self.settings).whole('preflight_max_age_s'), 'fixture-scaler')
 
     def test_setup_requires_current_preparation_before_any_aws_call(self) -> None:
+        self.save_image()
         fake = FakeAws(self.clock)
         subject = self.subject(fake)
         with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
@@ -797,6 +803,7 @@ class HanaSetupTests(CostFixture):
         return digest
 
     def test_setup_reserves_costs_before_creating_resources_and_registers_only_after_stop(self) -> None:
+        self.save_image()
         fake = FakeAws(self.clock, state='pending')
         subject = self.subject(fake)
         limits = hana_spend.read_settings(conf.read(self.workload))
@@ -882,6 +889,7 @@ class HanaSetupTests(CostFixture):
 
     @contextmanager
     def prepared_stop_setup(self, fake: FakeAws, calls: list[str]) -> Generator[tuple[deploy.Deployment, StringIO]]:
+        self.save_image()
         subject = self.subject(fake)
         ceiling = hana_spend.read_settings(conf.read(self.workload)).spot_max_usd_per_hour
         api_call = self.setup_api(fake, calls, lambda: ceiling, stop_state='stopping')
@@ -968,6 +976,7 @@ class HanaSetupTests(CostFixture):
         ])
 
     def test_setup_attaches_when_the_instance_stops_during_volume_creation(self) -> None:
+        self.save_image()
         fake = FakeAws(self.clock, state='pending')
         calls: list[str] = []
         subject = self.subject(fake)
@@ -989,6 +998,7 @@ class HanaSetupTests(CostFixture):
         self.assertNotIn('stop-instances', calls)
 
     def test_setup_updates_the_launch_template_after_refusals_and_a_ceiling_change(self) -> None:
+        self.save_image()
         key = 'spot_max_usd_per_hour'
         ceiling = conf.read(self.workload).text(key)
         _ = self.workload.write_text(self.workload.read_text().replace(f'{key}={ceiling}\n', f'{key}=0.09\n'))
@@ -1044,6 +1054,7 @@ class HanaSetupTests(CostFixture):
         self.assertEqual(len(attempts), 2)
 
     def assert_requested_setup_recovers(self, retry_price: Callable[[], Decimal]) -> None:
+        self.save_image()
         fake = FakeAws(self.clock, state='running', lose_response='describe-instances')
         subject = self.subject(fake)
         limits = hana_spend.read_settings(conf.read(self.workload))
@@ -1166,6 +1177,8 @@ class HanaSetupTests(CostFixture):
         def api_call(operation: str, *arguments: str, service: str = 'ec2', timeout_s: float | None = None) -> dict[str, object]:
             _ = service, timeout_s
             calls.append((operation, arguments))
+            if operation == 'describe-stacks':
+                return {'Stacks': [{'Parameters': [{'ParameterKey': 'VpcId', 'ParameterValue': 'fixture-vpc'}]}]}
             if operation == 'describe-route-tables':
                 return {'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
                     {'DestinationCidrBlock': '0.0.0.0/0', 'State': 'active', 'GatewayId': 'igw-fixture'}]}]}
@@ -1397,4 +1410,4 @@ class HanaSetupTests(CostFixture):
         with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()):
             settings, parameters, _ = subject._hana_inputs()  # pyright: ignore[reportPrivateUsage]
         self.assertEqual((settings.ami_id, settings.ami_owner_id), ('saved-image', 'saved-owner'))
-        self.assertEqual((settings.vpc_id, parameters['SubnetId']), ('fixture-vpc', 'fixture-subnet'))
+        self.assertEqual((parameters['VpcId'], parameters['SubnetId']), ('saved-vpc', 'saved-subnet'))

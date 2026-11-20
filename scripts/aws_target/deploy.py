@@ -199,6 +199,10 @@ class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
 
 
+class DeploymentNetworkUnavailable(DeploymentRefused):
+    """AWS does not provide a usable network for deployment."""
+
+
 class HanaControlRefused(DeploymentRefused):
     """Another command holds exclusive control of Hana."""
 
@@ -455,6 +459,19 @@ def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool
 
 
 @dataclass(frozen=True)
+class DeploymentNetwork:
+    region: str
+    vpc: str
+    subnets: list[dict[str, object]]
+
+    def subnet_in(self, zone: str) -> str:
+        for subnet in self.subnets:
+            if subnet['zone'] == zone:
+                return ledger.text(subnet, 'id')
+        raise DeploymentNetworkUnavailable(f'{self.region}: no available public subnet in {zone}')
+
+
+@dataclass(frozen=True)
 class RegionalNetwork:
     region: str
     vpc: str
@@ -565,10 +582,10 @@ def _hana_wait_status(registration: dict[str, object], lock_busy: bool) -> str:
 
 
 def deployment_parameters(path: Path, settings: DeploymentSettings,
-                          notification: BudgetNotificationAddress, deployment_id: str) -> dict[str, str]:
+                          notification: BudgetNotificationAddress, deployment_id: str, vpc: str) -> dict[str, str]:
     spending = read_settings(path)
     return {
-        'VpcId': settings.vpc_id, 'NotificationEmail': notification.value, 'RootDeviceName': settings.root_device_name,
+        'VpcId': vpc, 'NotificationEmail': notification.value, 'RootDeviceName': settings.root_device_name,
         'MonthlyLimitUsd': str(spending.monthly_limit_usd),
         'NoticeLowPercent': str(settings.notice_low), 'NoticeHighPercent': str(settings.notice_high),
         'StopPercent': str(settings.stop_percent), 'CostTagKey': spending.cost_explorer_tag_key,
@@ -617,10 +634,11 @@ class Deployment:
             write_text_atomic(self.directory / 'deployment.json', json.dumps(saved, sort_keys=True) + '\n')
         return ledger.text(saved, 'deployment_id')
 
-    def _parameters(self, settings: DeploymentSettings, notification: BudgetNotificationAddress) -> dict[str, str]:
+    def _parameters(self, settings: DeploymentSettings, notification: BudgetNotificationAddress,
+                    vpc: str) -> dict[str, str]:
         deployment_id = self._deployment_id()
         saved = deployment_record(self.directory)
-        parameters = deployment_parameters(self.settings_path, settings, notification, deployment_id)
+        parameters = deployment_parameters(self.settings_path, settings, notification, deployment_id, vpc)
         parameters['BudgetName'] = str(saved.get('budget_name', '')) if saved.get('preserve_budget_name') else ''
         return parameters
 
@@ -749,8 +767,11 @@ class Deployment:
     def _load(self, notification: BudgetNotificationAddress
               ) -> tuple[DeploymentSettings, dict[str, str]]:
         settings = read_deployment_settings(self.settings_path)
-        parameters = self._parameters(settings, notification)
-        self._before_request(settings, parameters)
+        _ = self._guard()
+        network = self._deployment_network(settings, self._api(settings))
+        _ = network.subnet_in(settings.availability_zone)
+        parameters = self._parameters(settings, notification, network.vpc)
+        self._confirm_preparation(settings, parameters)
         return settings, parameters
 
     def _before_request(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
@@ -758,7 +779,7 @@ class Deployment:
         self._confirm_preparation(settings, parameters)
 
     def prepare_hana(self) -> PreparedDeployment:
-        """Save local preparation without accessing AWS or changing placement."""
+        """Save preparation evidence without changing placement."""
         admin_secrets.refuse_plain_admin(self.settings_path)
         with self._require_hana_control('prepare --workload hana'):
             self._refuse_hana_replacement()
@@ -894,8 +915,9 @@ class Deployment:
                     saved['spot_max_price'] = previous_ceiling
                     update_ceiling = True
             with step('hana-setup', 'checking the image and subnet', self.settings_path):
-                self._validate_inputs(settings)
-                candidates = (() if saved.get('instance') else self._hana_spot_candidates(api, settings, limits, workload))
+                self._validate_inputs(settings, parameters)
+                candidates = (() if saved.get('instance') else self._hana_spot_candidates(
+                    api, settings, parameters, limits, workload))
             launch_deadline = 0
             if not saved.get('instance'):
                 if update_ceiling:
@@ -1337,7 +1359,7 @@ class Deployment:
             ScalerProbe('get-object', lambda api: get_probe_object(api, provider.bucket, key, content)),
         ]).failures
 
-    def _hana_spot_candidates(self, api: AwsCli, settings: DeploymentSettings,
+    def _hana_spot_candidates(self, api: AwsCli, settings: DeploymentSettings, parameters: dict[str, str],
                               limits: hana_spend.PermitSettings, workload: conf.ConfigRead) -> tuple[HanaSpotCandidate, ...]:
         try:
             margin = conf.decimal(workload.text('spot_ceiling_margin', recover_invalid=False))
@@ -1347,11 +1369,12 @@ class Deployment:
             raise DeploymentRefused('Hana setup requires a positive spot_ceiling_margin.')
         sizes = (limits.instance_type, *limits.fallback_instance_types)
         primary = settings.availability_zone
-        subnets = {primary: settings.subnet_id}
-        reply = api.call('describe-subnets', '--filters', 'Name=vpc-id,Values=' + settings.vpc_id)
+        vpc = parameters['VpcId']
+        subnets = {primary: parameters['SubnetId']}
+        reply = api.call('describe-subnets', '--filters', 'Name=vpc-id,Values=' + vpc)
         for row in sorted(ledger.rows(reply, 'Subnets'), key=lambda subnet: ledger.text(subnet, 'SubnetId')):
             zone = ledger.text(row, 'AvailabilityZone')
-            if (zone != primary and zone.startswith(api.region) and row.get('VpcId') == settings.vpc_id
+            if (zone != primary and zone.startswith(api.region) and row.get('VpcId') == vpc
                     and row.get('State') == 'available' and row.get('DefaultForAz') is True):
                 _ = subnets.setdefault(zone, ledger.text(row, 'SubnetId'))
         try:
@@ -1561,9 +1584,8 @@ class Deployment:
             return False
         self._authorize(True)
         limits = hana_spend.read_settings(workload)
-        settings = replace(read_deployment_settings(self.settings_path), region=limits.region,
-                           timeout_s=workload.whole('aws_timeout_s'))
-        zone = workload.text('availability_zone')
+        account = read_deployment_settings(self.settings_path)
+        settings = self._hana_settings(account, workload, limits)
         upload_timeout = workload.whole('image_upload_timeout_s')
         wait_interval = max(workload.whole('image_wait_interval_s'),
                             (upload_timeout + hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS - 1)
@@ -1575,9 +1597,8 @@ class Deployment:
             description = 'Hana guest digest ' + digest.value
             api = self._api(settings)
             _ = self._guard()
-            subnets = [row for row in gate_subnets(api, settings.vpc_id) if row['zone'] == zone]
-            if not subnets:
-                raise DeploymentRefused(f'The gate VPC has no available public subnet in {zone}')
+            network = self._deployment_network(account, api)
+            subnet = network.subnet_in(settings.availability_zone)
             images = ledger.rows(api.call('describe-images', '--owners', 'self',
                                           '--filters', 'Name=name,Values=' + built.name), 'Images')
             if not images:
@@ -1648,7 +1669,7 @@ class Deployment:
                 raise DeploymentRefused('The registered Hana image lacks the matching guest digest. Build a fresh Hana image.')
             path = hana_image.save(self.directory, hana_image.RegisteredImage(
                 built.name, ledger.text(images[0], 'ImageId'), ledger.text(images[0], 'OwnerId'),
-                settings.vpc_id, str(subnets[0]['id']), digest))
+                network.vpc, subnet, digest))
         print(f'Hana image ready. The record is in {path}.')
         return True
 
@@ -1848,7 +1869,8 @@ class Deployment:
                 return True
             saved = remote.read_record(path)
             workload = conf.read_or_repository('hana_aws')
-            settings, _, _ = self._hana_inputs(workload)
+            settings = self._hana_settings(read_deployment_settings(self.settings_path), workload,
+                                           hana_spend.read_settings(workload))
             if 'region' in saved:
                 settings = replace(settings, region=ledger.text(saved, 'region'))
             api = self._api(settings)
@@ -2020,38 +2042,52 @@ class Deployment:
                          'Name=tag:HanaDeployment,Values=' + ledger.text(saved, 'deployment'))
         return frozenset(ledger.text(row, 'VolumeId') for row in ledger.rows(reply, 'Volumes'))
 
+    @staticmethod
+    def _hana_settings(account: DeploymentSettings, workload: conf.ConfigRead,
+                       limits: hana_spend.PermitSettings) -> DeploymentSettings:
+        settings = replace(account, stack_name=workload.text('stack_name'), region=limits.region,
+                           availability_zone=workload.text('availability_zone'), timeout_s=workload.whole('aws_timeout_s'))
+        if settings.stack_name == account.stack_name:
+            raise DeploymentRefused('The Hana stack must differ from the gate stack')
+        if not settings.availability_zone.startswith(settings.region):
+            raise DeploymentRefused('The Hana zone must belong to its region')
+        return settings
+
+    def _deployment_network(self, account: DeploymentSettings, api: AwsCli) -> DeploymentNetwork:
+        foundation = describe_regional_stack(api, account.stack_name) if api.region == account.region else {}
+        return resolve_deployment_network(api, foundation)
+
     def _hana_inputs(self, workload: conf.ConfigRead | None = None) -> tuple[DeploymentSettings, dict[str, str], bytes]:
         """Share the existing deployment validation and use only Hana sizes and prices."""
         if workload is None:
             workload = conf.read_or_repository('hana_aws')
         limits = hana_spend.read_settings(workload)
-        # Empty identity values are allowed here; text() refuses an empty value.
-        present = workload.values('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')
-        names = {key: workload.text(key) for key in ('stack_name', 'availability_zone')}
-        names.update({key: present.get(key, '') for key in ('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')})
+        account = read_deployment_settings(self.settings_path)
+        settings = self._hana_settings(account, workload, limits)
+        image_values = workload.values('ami_id', 'ami_owner_id')
+        image = image_values.get('ami_id', '')
+        owner = image_values.get('ami_owner_id', '')
         registered = hana_image.saved(self.directory)
         if isinstance(registered, hana_image.RegisteredImage):
-            # Configured values win; the saved registration keeps cloud identities out of the repository.
-            for key, value in (('ami_id', registered.image), ('ami_owner_id', registered.owner),
-                               ('vpc_id', registered.vpc), ('subnet_id', registered.subnet)):
-                names[key] = names[key] or value
-        if not all(names.values()):
-            raise DeploymentRefused('Configure the reviewed Hana image, owner, VPC, and subnet before prepare')
-        settings = replace(read_deployment_settings(self.settings_path), **names,
-            region=limits.region, timeout_s=workload.whole('aws_timeout_s'))
-        if settings.stack_name == conf.read(self.settings_path).text('stack_name'):
-            raise DeploymentRefused('The Hana stack must differ from the gate stack')
-        if not settings.availability_zone.startswith(settings.region):
-            raise DeploymentRefused('The Hana zone must belong to its region')
+            image = image or registered.image
+            owner = owner or registered.owner
+        if not image or not owner:
+            raise DeploymentRefused('Configure the reviewed Hana image and owner before prepare')
+        settings = replace(settings, ami_id=image, ami_owner_id=owner)
         identity_path = self.directory / 'hana' / 'setup.json'
         saved = remote.read_record(identity_path) if identity_path.exists() else {}
         identity = ledger.text(saved, 'deployment') if saved else uuid4().hex
         if saved and saved.get('stack') != settings.stack_name:
             raise DeploymentRefused('The saved Hana stack differs; review replacement before setup')
+        if isinstance(registered, hana_image.RegisteredImage):
+            vpc, subnet = registered.vpc, registered.subnet
+        else:
+            network = self._deployment_network(account, self._api(settings))
+            vpc, subnet = network.vpc, network.subnet_in(settings.availability_zone)
         parameters = {
             'DeploymentId': identity, 'Image': settings.ami_id, 'InstanceType': limits.instance_type,
             'FallbackInstanceTypes': ','.join(limits.fallback_instance_types),
-            'AvailabilityZone': settings.availability_zone, 'VpcId': settings.vpc_id, 'SubnetId': settings.subnet_id,
+            'AvailabilityZone': settings.availability_zone, 'VpcId': vpc, 'SubnetId': subnet,
             'RootDevice': settings.root_device_name, 'RootGiB': str(limits.root_gib), 'DataGiB': str(limits.data_gib),
             'SpotMaxPrice': str(limits.spot_max_usd_per_hour), 'ScalerUser': settings.scaler_user_name,
         }
@@ -2085,13 +2121,15 @@ class Deployment:
             settings = read_deployment_settings(self.settings_path)
             now = int(self.clock())
             notification = read_budget_notification_address(self.settings_path)
-            parameters = self._parameters(settings, notification)
             book = ledger.CostLedger(self.directory)
             state = book.read_snapshot() if book.path.exists() else ledger.LedgerEvidence()
             resources = state.inventories[-1].resources if state.inventories else ()
             if not state.inventories:
                 book.record_inventory(ledger.ResourceInventory(now, resources, 'Budget foundation', builder_removed=True))
             decision = self._guard()
+            network = self._deployment_network(settings, self._api(settings))
+            _ = network.subnet_in(settings.availability_zone)
+            parameters = self._parameters(settings, notification, network.vpc)
             template = TEMPLATE.read_bytes()
             return self._write_preparation(settings, parameters, template, decision, resources)
 
@@ -2129,7 +2167,7 @@ class Deployment:
             raise DeploymentRefused('The existing Hana stack has no outputs. Reconcile it before setup.')
         return outputs
 
-    def _validate_inputs(self, settings: DeploymentSettings) -> None:
+    def _validate_image(self, settings: DeploymentSettings) -> None:
         reply = self._api(settings).call('describe-images', '--image-ids', settings.ami_id,
                            '--owners', settings.ami_owner_id)
         images = ledger.rows(reply, 'Images')
@@ -2142,9 +2180,12 @@ class Deployment:
                 or settings.nixos_release not in str(image.get('Name', ''))
                 or image.get('RootDeviceName') != settings.root_device_name):
             raise DeploymentRefused('the image identity, release, architecture or root device does not match')
-        subnet = self._api(settings).call('describe-subnets', '--subnet-ids', settings.subnet_id)
+
+    def _validate_inputs(self, settings: DeploymentSettings, parameters: dict[str, str]) -> None:
+        self._validate_image(settings)
+        subnet = self._api(settings).call('describe-subnets', '--subnet-ids', parameters['SubnetId'])
         rows = ledger.rows(subnet, 'Subnets')
-        if len(rows) != 1 or rows[0].get('VpcId') != settings.vpc_id or rows[0].get('AvailabilityZone') != settings.availability_zone:
+        if len(rows) != 1 or rows[0].get('VpcId') != parameters['VpcId'] or rows[0].get('AvailabilityZone') != settings.availability_zone:
             raise DeploymentRefused('the subnet does not match the VPC and availability zone')
 
     @staticmethod
@@ -2289,7 +2330,7 @@ class Deployment:
     def _confirm_preparation(self, settings: DeploymentSettings, parameters: dict[str, str], *, renew: bool = False) -> None:
         current = read_deployment_settings(self.settings_path)
         notification = BudgetNotificationAddress(parameters['NotificationEmail'])
-        current_parameters = self._parameters(current, notification)
+        current_parameters = self._parameters(current, notification, parameters['VpcId'])
         self.confirm_preparation_evidence(settings, parameters, TEMPLATE.read_bytes(), renew=renew,
             current_fingerprint=fingerprint(current, current_parameters, TEMPLATE.read_bytes()))
 
@@ -2341,7 +2382,7 @@ class Deployment:
                         raise DeploymentRefused('delete the old stack before replacement')
                 elif not stack:
                     raise DeploymentRefused('use a new stack_name to preserve the retained Budget')
-            self._validate_inputs(settings)
+            self._validate_image(settings)
             if not stack:
                 self._deploy(settings, parameters)
                 stack = self._stack(settings)
@@ -2577,16 +2618,9 @@ class Deployment:
     def regional_network(self, api: AwsCli, settings: DeploymentSettings, region: str,
                          *, home_image: dict[str, object] | None = None) -> RegionalNetwork:
         """Read the default VPC and public subnets of a gate region, and find or copy its gate image."""
-        target = api.in_region(region)
-        vpcs = ledger.rows(target.call('describe-vpcs', '--filters', 'Name=is-default,Values=true'), 'Vpcs')
-        if not vpcs:
-            raise DeploymentRefused(region + ': no default VPC is available')
-        vpc = ledger.text(vpcs[0], 'VpcId')
-        try:
-            subnets = gate_subnets(target, vpc)
-        except DeploymentRefused as error:
-            raise DeploymentRefused(region + ': ' + str(error)) from error
-        return RegionalNetwork(region, vpc, subnets, self.regional_image(api, settings, region, home_image=home_image))
+        network = resolve_deployment_network(api.in_region(region), {})
+        return RegionalNetwork(region, network.vpc, network.subnets,
+                               self.regional_image(api, settings, region, home_image=home_image))
 
     def _regional_gate_values(self, settings: DeploymentSettings, parameters: dict[str, str],
                               network: RegionalNetwork, deployment: str, profile: str) -> dict[str, str]:
@@ -2810,7 +2844,6 @@ class Deployment:
                                for row in ledger.rows(stack, 'Parameters')}
             if (not re.fullmatch(r'[a-f0-9]{32}', deployment)
                     or live_parameters.get('DeploymentId') != deployment
-                    or live_parameters.get('VpcId') != settings.vpc_id
                     or live_parameters.get('ScalerUserName') != settings.scaler_user_name
                     or outputs.get('ScalerUserName') != settings.scaler_user_name):
                 raise DeploymentRefused('The home gate deployment parameters differ from the saved identity.')
@@ -2848,15 +2881,18 @@ class Deployment:
         for region in regions:
             try:
                 if region == settings.region:
-                    networks[region] = RegionalNetwork(region, settings.vpc_id, gate_subnets(api, settings.vpc_id),
-                                                       settings.ami_id)
+                    network = resolve_deployment_network(api, stack)
+                    _ = network.subnet_in(settings.availability_zone)
+                    networks[region] = RegionalNetwork(region, network.vpc, network.subnets, settings.ami_id)
                 else:
                     networks[region] = self.regional_network(api, settings, region, home_image=home_image)
             except plan_run.PLAN_ERRORS as error:
                 failures[region] = plan_run.safe_reason(error)
 
         try:
-            parameters = gate_parameters(settings, values, owner.partition, owner.account,
+            if settings.region not in networks:
+                raise DeploymentNetworkUnavailable(failures[settings.region])
+            parameters = gate_parameters(settings, networks[settings.region].vpc, values, owner.partition, owner.account,
                                          [networks[region] for region in regions[1:] if region in networks], gpu_types)
             proposed = live_parameters | parameters
             regional_template = region_gate_template()
@@ -2968,7 +3004,8 @@ class Deployment:
             _ = self._stack(settings)
             stack = ledger.rows(api.call('describe-stacks', '--stack-name', stack_id,
                                        service='cloudformation'), 'Stacks')[0]
-            subnets = gate_subnets(api, settings.vpc_id)
+            network = resolve_deployment_network(api, stack)
+            _ = network.subnet_in(settings.availability_zone)
             revision = aws_trial.host_nixpkgs_revision()
             account = ledger.text(api.call('get-caller-identity', service='sts'), 'Account')
             partition = stack_id.split(':')[1]
@@ -2984,7 +3021,7 @@ class Deployment:
             comparison_caps = gpu_size_trial.settings().spot_max_usd_per_hour
             gpu_types = sorted(comparison_caps.keys() | set(values.words('hana_gpu_instance_types')))
             gpu_caps = comparison_caps | gpu_size_trial.price_caps(values.text('hana_gpu_spot_max_usd_per_hour'))
-            parameters = gate_parameters(settings, values, partition, account, networks, gpu_types)
+            parameters = gate_parameters(settings, network.vpc, values, partition, account, networks, gpu_types)
             book = ledger.CostLedger(self.directory)
             inventory = book.read_snapshot().inventories
             resources = tuple(resource for resource in inventory[-1].resources if resource.name != 'gate-shared') if inventory else ()
@@ -3001,7 +3038,7 @@ class Deployment:
                     self._gate_change(api, stack_id, template, changes)
             outputs = self._stack(settings)
             deployment_id = ledger.text(saved, 'deployment_id')
-            home: dict[str, object] = {'region': settings.region, 'image': settings.ami_id, 'subnets': subnets,
+            home: dict[str, object] = {'region': settings.region, 'image': settings.ami_id, 'subnets': network.subnets,
                 'template': outputs['GateLaunchTemplate'], 'version': outputs['GateLaunchVersion'],
                 'security_group': outputs['GateSecurityGroup']}
             manifest: dict[str, object] = {
@@ -3248,11 +3285,11 @@ class Deployment:
                 self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
 
 
-def gate_parameters(settings: DeploymentSettings, values: conf.ConfigRead, partition: str, account: str,
+def gate_parameters(settings: DeploymentSettings, home_vpc: str, values: conf.ConfigRead, partition: str, account: str,
                     networks: list[RegionalNetwork], gpu_types: list[str]) -> dict[str, str]:
     return {
         'EnableGates': 'true', 'GateImage': settings.ami_id,
-        'GateVpcs': ','.join([f'arn:{partition}:ec2:{settings.region}:{account}:vpc/{settings.vpc_id}',
+        'GateVpcs': ','.join([f'arn:{partition}:ec2:{settings.region}:{account}:vpc/{home_vpc}',
                               *(f'arn:{partition}:ec2:{network.region}:{account}:vpc/{network.vpc}' for network in networks)]),
         'GateRegionImages': ','.join(f'arn:{partition}:ec2:{network.region}::image/{network.image}' for network in networks),
         'GateInstanceTypes': ','.join(values.words('instance_types')),
@@ -3349,10 +3386,25 @@ def describe_regional_stack(api: AwsCli, stack: str) -> dict[str, object]:
     try:
         stacks = ledger.rows(api.call('describe-stacks', '--stack-name', stack, service='cloudformation'), 'Stacks')
     except AwsUnavailable as error:
-        if 'does not exist' in str(error):
+        if 'ValidationError' in str(error) and 'does not exist' in str(error):
             return {}
         raise
     return stacks[0] if stacks else {}
+
+
+def resolve_deployment_network(api: AwsCli, foundation: dict[str, object]) -> DeploymentNetwork:
+    """Use the foundation VPC when present and the default VPC otherwise."""
+    if foundation:
+        parameters = ledger.rows(foundation, 'Parameters') if 'Parameters' in foundation else ()
+        vpc = next((row.get('ParameterValue') for row in parameters if row.get('ParameterKey') == 'VpcId'), None)
+        if not isinstance(vpc, str) or not vpc:
+            raise DeploymentNetworkUnavailable(f'{api.region}: the foundation stack has no VpcId parameter')
+    else:
+        vpcs = ledger.rows(api.call('describe-vpcs', '--filters', 'Name=is-default,Values=true'), 'Vpcs')
+        if not vpcs:
+            raise DeploymentNetworkUnavailable(f'{api.region}: no default VPC is available')
+        vpc = ledger.text(vpcs[0], 'VpcId')
+    return DeploymentNetwork(api.region, vpc, gate_subnets(api, vpc))
 
 
 def gate_subnets(api: AwsCli, vpc: str) -> list[dict[str, object]]:
@@ -3376,7 +3428,7 @@ def gate_subnets(api: AwsCli, vpc: str) -> list[dict[str, object]]:
             zone = ledger.text(subnet, 'AvailabilityZone')
             _ = zones.setdefault(zone, {'zone': zone, 'id': ledger.text(subnet, 'SubnetId')})
     if not zones:
-        raise DeploymentRefused('The gate VPC has no available public subnet')
+        raise DeploymentNetworkUnavailable(f'{api.region}: the VPC has no available public subnet')
     return [zones[zone] for zone in sorted(zones)]
 
 

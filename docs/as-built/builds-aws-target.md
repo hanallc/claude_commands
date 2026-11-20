@@ -459,7 +459,9 @@ The stack creates the launch template, security group, private control bucket, a
 The launch template uses persistent Spot and stops the instance when AWS interrupts it.
 Before a launch, setup reads Spot prices for the configured type and its fallback types.
 If the instance is already recorded, setup resumes without a Spot price check.
-It checks the registered subnet and each available default subnet in another zone of the same VPC.
+It uses the subnet in the saved image record when available.
+Otherwise it finds a public subnet in the configured zone with the deployment network resolver.
+It also checks each available default subnet in another zone of the same VPC.
 Setup prints one reason for each candidate with no price or a price above the ceiling.
 If the price read fails or no candidate qualifies, setup exits before it changes the stack.
 If all priced candidates exceed the ceiling, setup shows the cheapest candidate.
@@ -1494,8 +1496,6 @@ Existing configuration values remain unchanged.
 | `availability_zone` | `us-east-2c` | Use this zone for the first launch candidate. |
 | `ami_id` | Empty | Use the reviewed image from the registration. |
 | `ami_owner_id` | Empty | Use the owner from the registration. |
-| `vpc_id` | Empty | Use the VPC from the registration. |
-| `subnet_id` | Empty | Use the subnet from the registration. |
 | `aws_timeout_s` | `10` | Bound small provider and receiver requests. |
 | `result_transfer_timeout_s` | `120` | Allow time to transfer up to 32 MiB of result JSON in either direction. |
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |

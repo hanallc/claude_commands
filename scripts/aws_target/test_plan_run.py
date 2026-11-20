@@ -101,7 +101,7 @@ class PlanSetupTests(CostFixture):
         self.credentials_path.chmod(0o600)
         self.setup_path = self.state / 'hana/setup.json'
         account = DeploymentSettings(self.region, 'fixture-admin', 'fixture-home', 'fixture-image',
-            'fixture-owner', 'fixture-release', self.region + 'a', 'fixture-vpc', 'fixture-subnet',
+            'fixture-owner', 'fixture-release', self.region + 'a',
             '/dev/xvda', 1, 2, 3, 1, 300, 'fixture-scaler')
         self.replace('stack_wait_timeout_s', '15')
         _ = self.enterContext(mock.patch.object(deploy, 'read_deployment_settings', return_value=account))
@@ -720,7 +720,7 @@ class GatePlanTests(CostFixture):
         self.credentials_path.chmod(0o600)
         self.template = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_bytes())))
         account = DeploymentSettings(GATE_HOME, 'fixture-admin', 'fixture-home', 'ami-home',
-            'fixture-owner', 'fixture-release', GATE_HOME + 'a', 'vpc-' + GATE_HOME, 'subnet-' + GATE_HOME,
+            'fixture-owner', 'fixture-release', GATE_HOME + 'a',
             '/dev/xvda', 1, 2, 3, 30, 300, 'fixture-scaler')
         self.replace('stack_wait_timeout_s', '15')
         _ = self.enterContext(mock.patch.object(deploy, 'read_deployment_settings', return_value=account))

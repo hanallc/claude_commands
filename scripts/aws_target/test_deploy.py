@@ -23,7 +23,7 @@ import threading
 import time
 from types import CodeType, SimpleNamespace
 from typing import ClassVar, Literal, cast, override
-from unittest import mock
+from unittest import TestCase, mock
 
 
 from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gate_probe, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote
@@ -151,7 +151,10 @@ elif service == 'iam' and operation == 'delete-access-key':
     reply({})
 elif service == 'cloudformation' and operation == 'describe-stacks':
     if not state and ((root / 'review-stack').exists() or (root / 'change-set.json').exists()):
-        reply({'Stacks': [{'StackStatus': 'REVIEW_IN_PROGRESS', 'StackId': (root / 'reserved-stack').read_text() if (root / 'reserved-stack').exists() else ''}]})
+        parameters = json.loads((root / 'review-stack').read_text()) if (root / 'review-stack').exists() else []
+        reply({'Stacks': [{'StackStatus': 'REVIEW_IN_PROGRESS',
+            'StackId': (root / 'reserved-stack').read_text() if (root / 'reserved-stack').exists() else '',
+            'Parameters': parameters}]})
         sys.exit(0)
     if not state or args[args.index('--stack-name') + 1] not in (state.get('stack_name'), state.get('stack_id')):
         print('ValidationError: Stack does not exist', file=sys.stderr)
@@ -200,8 +203,15 @@ elif operation == 'describe-images' and '--owners' in args and args[args.index('
 elif operation == 'describe-images':
     reply({'Images': [{'ImageId': 'ami-fixture', 'OwnerId': '123456789012', 'Architecture': 'x86_64',
                        'State': 'available', 'Name': 'nixos-26.05-x86_64', 'RootDeviceName': '/dev/xvda'}]})
+elif operation == 'describe-vpcs':
+    reply({'Vpcs': [{'VpcId': 'vpc-fixture'}]})
+elif operation == 'describe-route-tables':
+    reply({'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
+        {'DestinationCidrBlock': '0.0.0.0/0', 'State': 'active', 'GatewayId': 'igw-fixture'}]}]})
 elif operation == 'describe-subnets':
-    reply({'Subnets': [{'VpcId': 'vpc-fixture', 'AvailabilityZone': 'us-east-1a'}]})
+    region = args[args.index('--region') + 1]
+    reply({'Subnets': [{'SubnetId': 'subnet-fixture', 'VpcId': 'vpc-fixture',
+                        'AvailabilityZone': region + 'a', 'State': 'available'}]})
 elif operation == 'create-tags':
     (root / 'volume-owner').write_text(args[args.index('--tags') + 1].split('Value=', 1)[1]); reply({})
 elif operation == 'describe-volumes':
@@ -473,10 +483,13 @@ class HanaSetupFailureTests(CostFixture):
 
         _ = self.enterContext(mock.patch.object(conf, 'path', side_effect=configuration_path))
         settings = aws_config.DeploymentSettings('us-east-2', 'fixture-admin', 'fixture-gate', 'image',
-            'owner', 'fixture-release', 'us-east-2b', 'vpc', 'subnet', '/dev/xvda', 1, 2, 3, 10, 300, 'fixture-scaler')
+            'owner', 'fixture-release', 'us-east-2b', '/dev/xvda', 1, 2, 3, 10, 300, 'fixture-scaler')
         _ = self.enterContext(mock.patch.object(deploy, 'read_deployment_settings', return_value=settings))
         _ = self.enterContext(mock.patch.object(deploy.Deployment, '_check_credentials'))
         _ = self.enterContext(mock.patch.object(deploy.Deployment, '_validate_inputs'))
+        _ = hana_image.save(self.state, hana_image.RegisteredImage(
+            'fixture-name', 'fixture-image', 'fixture-owner', 'fixture-vpc', 'fixture-subnet',
+            hana_render.GuestDigest('a' * 64)))
 
     def subject(self, fake: FakeEc2, *, waiter_timeout: bool = False, retain_on_delete: bool = False,
                 spot_prices: tuple[tuple[str, str], ...] = (('us-east-2b', '0.10'),),
@@ -495,7 +508,7 @@ class HanaSetupFailureTests(CostFixture):
             offset = arguments.index('--region') + 2
             operation = arguments[offset + 1]
             if operation == 'describe-subnets':
-                vpc = conf.read(self.workload).text('vpc_id')
+                vpc = 'fixture-vpc'
                 self.assertIn(f'Name=vpc-id,Values={vpc}', arguments)
                 return subprocess.CompletedProcess(arguments, 0, json.dumps({'Subnets': [
                     {'SubnetId': 'fixture-subnet-' + suffix, 'AvailabilityZone': 'us-east-2' + suffix,
@@ -582,7 +595,7 @@ class HanaSetupFailureTests(CostFixture):
             self.clock.now, self.clock.now + limits.permit_max_seconds)
         assert isinstance(reservation, hana_spend.StartReserved)
         generation = reservation.exposure.generation
-        self.setup_path.parent.mkdir()
+        self.setup_path.parent.mkdir(exist_ok=True)
         saved = {'version': 1, 'deployment': HANA_TAG[1], 'stack': conf.read(self.workload).text('stack_name'),
                  'region': limits.region, 'requested': True, 'generation': generation,
                  'template_sha256': 'old-template', 'parameters_sha256': 'old-parameters'}
@@ -789,7 +802,7 @@ class HanaSetupFailureTests(CostFixture):
         workload = conf.read(self.workload)
         fake.image = workload.text('ami_id')
         _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture', fake.image,
-            workload.text('ami_owner_id'), workload.text('vpc_id'), workload.text('subnet_id'),
+            workload.text('ami_owner_id'), 'fixture-vpc', 'fixture-subnet',
             hana_render.guest_digest(self.workload)))
         _ = subject.prepare_hana()
         with redirect_stdout(StringIO()), self.assertRaises(subprocess.TimeoutExpired):
@@ -2003,7 +2016,7 @@ class HanaSetupFailureTests(CostFixture):
         _ = self.write_leftover(subject, instance=instance)
         workload = conf.read(self.workload)
         _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture', workload.text('ami_id'),
-            workload.text('ami_owner_id'), workload.text('vpc_id'), workload.text('subnet_id'),
+            workload.text('ami_owner_id'), 'fixture-vpc', 'fixture-subnet',
             hana_render.guest_digest(self.workload)))
         saved = self.setup_path.read_bytes()
         evidence = self.book.read_snapshot()
@@ -2013,6 +2026,59 @@ class HanaSetupFailureTests(CostFixture):
         self.assertEqual(fake.operations, [])
         self.assertEqual(self.setup_path.read_bytes(), saved)
         self.assertEqual(self.book.read_snapshot(), evidence)
+
+
+class DeploymentNetworkTests(TestCase):
+    def discover(self, foundation: str, default: str = 'vpc-default') -> deploy.DeploymentNetwork:
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            operation = arguments[arguments.index('--region') + 3]
+            if operation == 'describe-stacks':
+                self.assertIn('fixture-foundation', arguments)
+                if foundation == 'absent':
+                    return subprocess.CompletedProcess(arguments, 1, '', 'ValidationError: stack does not exist')
+                if foundation == 'denied':
+                    return subprocess.CompletedProcess(arguments, 1, '', 'AccessDenied: DescribeStacks denied')
+                parameters = [{'ParameterKey': 'VpcId', 'ParameterValue': foundation}] if foundation else []
+                reply: dict[str, object] = {'Stacks': [{'StackStatus': 'UPDATE_COMPLETE', 'Parameters': parameters}]}
+            elif operation == 'describe-vpcs':
+                self.assertEqual(foundation, 'absent')
+                self.assertIn('Name=is-default,Values=true', arguments)
+                reply = {'Vpcs': [{'VpcId': default}] if default else []}
+            elif operation == 'describe-route-tables':
+                self.assertIn('Name=vpc-id,Values=' + (default if foundation == 'absent' else foundation), arguments)
+                reply = {'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
+                    {'DestinationCidrBlock': '0.0.0.0/0', 'State': 'active', 'GatewayId': 'igw-fixture'}]}]}
+            elif operation == 'describe-subnets':
+                self.assertIn('Name=vpc-id,Values=' + (default if foundation == 'absent' else foundation), arguments)
+                reply = {'Subnets': [{'SubnetId': subnet, 'State': 'available', 'AvailabilityZone': 'us-east-2b'}
+                                    for subnet in ('subnet-second', 'subnet-first')]}
+            else:
+                self.fail(f'Unexpected network test operation {operation}')
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        api = aws_cli.AwsCli('fixture-admin', 'us-east-2', 1, execute=execute)
+        return deploy.resolve_deployment_network(api, deploy.describe_regional_stack(api, 'fixture-foundation'))
+
+    def test_foundation_vpc_takes_precedence(self) -> None:
+        self.assertEqual(self.discover('vpc-foundation').vpc, 'vpc-foundation')
+
+    def test_missing_foundation_uses_default_vpc(self) -> None:
+        self.assertEqual(self.discover('absent').vpc, 'vpc-default')
+
+    def test_missing_default_vpc_is_a_typed_refusal(self) -> None:
+        with self.assertRaisesRegex(deploy.DeploymentNetworkUnavailable, 'us-east-2: no default VPC'):
+            _ = self.discover('absent', default='')
+
+    def test_two_public_subnets_use_id_order_in_the_configured_zone(self) -> None:
+        self.assertEqual(self.discover('vpc-foundation').subnet_in('us-east-2b'), 'subnet-first')
+
+    def test_stack_with_no_vpc_is_a_typed_refusal(self) -> None:
+        with self.assertRaisesRegex(deploy.DeploymentNetworkUnavailable, 'foundation stack has no VpcId'):
+            _ = self.discover('')
+
+    def test_access_denied_refuses_discovery(self) -> None:
+        with self.assertRaisesRegex(aws_cli.AwsUnavailable, 'AccessDenied'):
+            _ = self.discover('denied')
 
 
 class DeploymentTests(CostFixture):
@@ -2048,7 +2114,7 @@ class DeploymentTests(CostFixture):
         values = {
             'admin_secret_file': str(self.root / 'admin.gpg'), 'deployment_profile': 'build-admin', 'stack_name': 'fixture-build',
             'ami_id': 'ami-fixture', 'ami_owner_id': '123456789012', 'nixos_release': '26.05',
-            'availability_zone': 'us-east-1a', 'vpc_id': 'vpc-fixture', 'subnet_id': 'subnet-fixture',
+            'availability_zone': 'us-east-1a',
             'root_device_name': '/dev/xvda', 'scaler_user_name': 'build-scaler',
         }
         values.update({
@@ -2574,14 +2640,17 @@ sys.exit(7)
                     regional_stack['StackStatus'] = 'CREATE_COMPLETE'
                 _ = regional_stack.setdefault('StackId', 'fixture-stack-' + region)
             elif operation == 'describe-stacks':
-                reply = {'Stacks': [{'Parameters': [{'ParameterKey': key} for key in
-                    ('VpcId', 'NotificationEmail')]}]}
+                reply = {'Stacks': [{'Parameters': [
+                    {'ParameterKey': 'VpcId', 'ParameterValue': 'vpc-fixture'},
+                    {'ParameterKey': 'NotificationEmail'}]}]}
             elif operation == 'describe-route-tables':
                 reply = {'RouteTables': [{'Associations': [{'Main': True}], 'Routes': [
                     {'DestinationCidrBlock': '0.0.0.0/0', 'State': 'active', 'GatewayId': 'igw-fixture'}]}]}
             elif operation == 'describe-subnets':
-                reply = {'Subnets': [{'SubnetId': 'fixture-' + zone, 'AvailabilityZone': zone, 'State': 'available'}
-                                    for zone in ('a', 'b')]}
+                subnet_region = 'us-east-2' if region == 'us-east-1' else region
+                reply = {'Subnets': [
+                    {'SubnetId': 'fixture-' + zone, 'AvailabilityZone': subnet_region + zone, 'State': 'available'}
+                    for zone in ('a', 'b')]}
             elif operation == 'get-caller-identity':
                 reply = {'Account': 'fixture-account'}
             elif operation == 'describe-change-set':
@@ -2656,8 +2725,9 @@ sys.exit(7)
                 self.assertEqual(service, 'ec2')
                 if operation == 'describe-instance-type-offerings':
                     types = args[-3].removeprefix('Name=instance-type,Values=').split(',')
-                    reply = {'InstanceTypeOfferings': [{'InstanceType': size,
-                        'Location': 'c' if size == unoffered_gpu_type else 'b' if size == 'g4dn.2xlarge' else 'a'}
+                    reply = {'InstanceTypeOfferings': [
+                        {'InstanceType': size, 'Location': 'us-east-2' + (
+                            'c' if size == unoffered_gpu_type else 'b' if size == 'g4dn.2xlarge' else 'a')}
                         for size in types]}
             elif operation == 'get-service-quota':
                 self.assertEqual(service, 'service-quotas')
@@ -4175,7 +4245,7 @@ sys.exit(7)
         saved = remote.read_record(self.state / 'gate-deployment.json')
         self.assertEqual(saved['artifact_prefix'], 'artifacts/fixture-role:')
         self.assertEqual(saved['revision'], 'fixture-revision')
-        self.assertEqual([row['zone'] for row in ledger.rows(ledger.rows(saved, 'regions')[0], 'subnets')], ['a', 'b'])
+        self.assertEqual([row['zone'] for row in ledger.rows(ledger.rows(saved, 'regions')[0], 'subnets')], ['us-east-2a', 'us-east-2b'])
         after = ledger.CostLedger(self.state).read_snapshot().inventories[-1].resources
         self.assertEqual(after, before + (ledger.PricedResource('gate-shared', Decimal(1)),))
         self.assertTrue(any('execute-change-set' in args for args in commands))
@@ -5244,7 +5314,8 @@ else: raise AssertionError(args)
 
 
     def test_review_in_progress_stack_has_no_resources_to_reconcile(self) -> None:
-        _ = (self.root / 'review-stack').write_text('empty change set')
+        _ = (self.root / 'review-stack').write_text(json.dumps([
+            {'ParameterKey': 'VpcId', 'ParameterValue': 'vpc-fixture'}]))
         _ = self.update_fixture()
         state = remote.read_record(self.root / 'fake-stack.json')
         outputs = ledger.mapping(state['outputs'])
@@ -5326,7 +5397,8 @@ else: raise AssertionError(args)
         self.replace('daily_limit_usd', '1')
         with self.assertRaises(deploy.DeploymentRefused):
             _ = subject.apply(approve_resources=True)
-        self.assertEqual(self.commands(), [])
+        self.assertEqual(self.commands('create-change-set'), [])
+        self.assertEqual(self.commands('deploy'), [])
 
     def test_a_limit_change_during_the_foundation_deploy_refuses_the_next_change(self) -> None:
         subject = self.deployment()
@@ -5352,9 +5424,10 @@ else: raise AssertionError(args)
         with self.assertRaises(deploy.DeploymentRefused):
             _ = subject.apply()
         self.credentials.chmod(0o644)
+        before_apply = self.commands()
         with self.assertRaises(deploy.DeploymentRefused):
             _ = subject.apply(approve_resources=True)
-        self.assertEqual(self.commands(), [])
+        self.assertEqual(self.commands(), before_apply)
 
 
     def test_prepare_preserves_existing_cost_and_claim_evidence(self) -> None:

@@ -235,8 +235,6 @@ class DeploymentSettings:
     ami_owner_id: str
     nixos_release: str
     availability_zone: str
-    vpc_id: str
-    subnet_id: str
     root_device_name: str
     notice_low: int
     notice_high: int
@@ -267,6 +265,6 @@ def read_deployment_settings(path: Path) -> DeploymentSettings:
     if not 0 < low < high < stop:
         raise ValueError('Budget thresholds must increase')
     return DeploymentSettings(region, text('deployment_profile'), text('stack_name'),
-                              text('ami_id'), owner, text('nixos_release'), zone, text('vpc_id'), text('subnet_id'),
+                              text('ami_id'), owner, text('nixos_release'), zone,
                               text('root_device_name'), low, high, stop,
                               whole('deployment_timeout_s'), whole('preflight_max_age_s'), text('scaler_user_name'))
