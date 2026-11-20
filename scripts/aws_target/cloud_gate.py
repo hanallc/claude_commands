@@ -34,7 +34,7 @@ from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
 from scripts.lib import cancellation
-from scripts.build_targets import target_config
+from scripts.build_targets import machine_switch, target_config
 from scripts.buildlog import store
 from scripts.lib import conf, git_index
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
@@ -98,9 +98,7 @@ def retryable_cloud_failure(outcome: dict[str, object]) -> RetryableCloudFailure
     return RetryableCloudFailure.NONE
 
 
-class CloudGateSwitch(StrEnum):
-    ON = 'on'
-    OFF = 'off'
+CLOUD_GATE_OFF = 'Cloud gates are off (build_targets.conf enabled.aws-gate=off)'
 
 
 def settings() -> conf.ConfigRead:
@@ -706,7 +704,8 @@ class GateWorker:
         stop = max(index + 1, len(variants)) if launch.get('arguments') else len(variants)
         unreachable: set[str] = set()
         for offset in range(index, stop):
-            if launch.get('arguments') and offset == index:
+            saved_arguments = bool(launch.get('arguments')) and offset == index
+            if saved_arguments:
                 arguments = ledger.mapping(launch['arguments'])
                 self.box_region = str(launch.get('region', self.api.region))
                 size = ledger.text(arguments, 'InstanceType')
@@ -782,6 +781,25 @@ class GateWorker:
             launch_json = json.dumps(arguments)
             try:
                 for retry in range(settings().whole('launch_reply_tries')):
+                    if request.get('task') != 'paired':
+                        try:
+                            switch = machine_switch.read(machine_switch.Machine.AWS_GATE)
+                            refusal = CLOUD_GATE_OFF if switch is machine_switch.MachineSwitch.OFF else ''
+                        except machine_switch.MachineSwitchError as error:
+                            refusal = str(error)
+                        if refusal:
+                            if not saved_arguments and retry == 0:
+                                self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
+                                return LocalFallback(refusal)
+                            # A previous request may have launched this box. Look it up without another launch.
+                            observed = api.call('describe-instances', '--filters',
+                                'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
+                            matches = [row for group in ledger.rows(observed, 'Reservations')
+                                       for row in ledger.rows(group, 'Instances')]
+                            if len(matches) != 1:
+                                return LocalFallback(refusal)
+                            reply = {'Instances': matches}
+                            break
                     try:
                         if retry == 0:
                             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
@@ -1216,8 +1234,8 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
-    if settings().value('enabled', CloudGateSwitch, recover_invalid=False) is CloudGateSwitch.OFF:
-        return LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')
+    if machine_switch.read(machine_switch.Machine.AWS_GATE) is machine_switch.MachineSwitch.OFF:
+        return LocalFallback(CLOUD_GATE_OFF)
     directory = attempt.directory
     command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'
@@ -1323,6 +1341,10 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                         request['retry_launch'] = retry_launch
                     save(folder / 'request.json', request)
                     save(folder / 'deployment.json', deployment)
+                    if (not (folder / 'launch.json').exists()
+                            and machine_switch.read(machine_switch.Machine.AWS_GATE) is machine_switch.MachineSwitch.OFF):
+                        reservation.status = 0
+                        return LocalFallback(CLOUD_GATE_OFF)
                     outcome = run_service(repo, folder, request, command, service)
                     result = read(result_path) if result_path.exists() else {}
                     failure = retryable_cloud_failure(result)

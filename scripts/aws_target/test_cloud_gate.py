@@ -202,9 +202,9 @@ class CloudGateTests(CostFixture):
         override_fixture_settings(self.root / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
         override_fixture_settings(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
+        override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=on')
         override_fixture_settings(self.root / 'cloud_gate.conf',
-            '# one of: on, off\nenabled=on\n'
-            + 'instance_types=m7a.8xlarge m7a.4xlarge\nspot_max_usd_per_hour=0.8\n'
+            'instance_types=m7a.8xlarge m7a.4xlarge\nspot_max_usd_per_hour=0.8\n'
             + 'attempt_allowance_usd=0.02\nlaunch_reply_tries=2\n')
         self.now = float(instant('2026-01-15T01:00:00+00:00'))
         self.book = ledger.CostLedger(self.state)
@@ -852,6 +852,22 @@ class CloudGateTests(CostFixture):
         self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
         self.record_running_gate('replacement', west.instance_type, west.region)
         self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
+
+    def test_switch_off_after_capacity_refusal_prevents_the_next_variant(self) -> None:
+        worker, _ = self.steering_fixture()
+        self.fake.refusals = ['InsufficientInstanceCapacity']
+
+        def turn_off_after_launch(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            reply = self.fake(arguments, **options)
+            if 'run-instances' in arguments:
+                override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=off')
+            return reply
+
+        with mock.patch.object(worker.api, 'execute', side_effect=turn_off_after_launch):
+            outcome = worker.launch(self.folder, self.request, self.deployment)
+        self.assertEqual(outcome, cloud_gate.LocalFallback(cloud_gate.CLOUD_GATE_OFF))
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[-1].state, ledger.GateAbsent)
 
     def test_quota_refusal_at_zero_live_vcpus_expires_at_the_cooldown(self) -> None:
         worker, variants = self.steering_fixture()
@@ -2620,8 +2636,9 @@ class CloudRouteTests(CostFixture):
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(cloud_gate, 'account_settings_path', side_effect=lambda: Path(os.environ.get('AWS_TARGET_CONFIG', str(self.settings)))))
+        override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=on')
         override_fixture_settings(self.root / 'cloud_gate.conf',
-            '# one of: on, off\nenabled=on\ncredential_file=~/.config/aws-build/credentials\n')
+            'credential_file=~/.config/aws-build/credentials\n')
         self.repo = self.root / 'repo'
         folder = self.repo / 'scripts/fixture'
         folder.mkdir(parents=True)
@@ -2644,6 +2661,7 @@ class CloudRouteTests(CostFixture):
 
     def run_spot_route(self, interruptions: int, *, box_failures: int = 0, log_error: str = '',
                        status: int = 0, one_choice: bool = False, limit_after_first: bool = False,
+                       disable_after_first: bool = False,
                        crash_after: int | None = None,
                        crash_on_retry_save: bool = False,
                        lower_limit_on_resume: bool = False) -> tuple[cloud_gate.LocalFallback | cloud_gate.CloudCompleted,
@@ -2713,6 +2731,8 @@ class CloudRouteTests(CostFixture):
             fakes.append(fake)
             if limit_after_first:
                 self.costs({'daily_limit_usd': '0'})
+            if disable_after_first:
+                override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=off')
             if len(folders) == crash_after:
                 crashed = True
                 raise SystemExit('fixture controller crash')
@@ -2814,6 +2834,13 @@ class CloudRouteTests(CostFixture):
         outcome, folders, _ = self.run_spot_route(1, one_choice=True)
         self.assertEqual(len(folders), 1)
         self.assertEqual(outcome, cloud_gate.LocalFallback('Spot interruption on 1 attempts; No cloud capacity choice remains'))
+
+    def test_switch_off_after_a_spot_interruption_skips_the_next_service(self) -> None:
+        outcome, folders, fakes = self.run_spot_route(1, disable_after_first=True)
+        self.assertEqual(outcome, cloud_gate.LocalFallback('Spot interruption on 1 attempts; ' + cloud_gate.CLOUD_GATE_OFF))
+        self.assertEqual(len(folders), 1)
+        self.assertEqual(len(fakes[0].launches), 1)
+        self.assertTrue(fakes[0].terminated)
 
     def test_zero_spot_retries_keeps_the_first_interruption_as_the_limit(self) -> None:
         path = self.root / 'cloud_gate.conf'
@@ -3650,7 +3677,7 @@ class CloudRouteTests(CostFixture):
         service.assert_not_called()
 
     def test_disabled_cloud_gate_skips_deployment_and_aws(self) -> None:
-        _ = (self.root / 'cloud_gate.conf').write_text('# one of: on, off\nenabled=off\n')
+        override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=off')
         fake = FakeGateAws()
         api = AwsCli('fixture', 'us-east-2', 1, fake)
         service = mock.Mock(side_effect=AssertionError('A disabled cloud gate must not start a service'))
@@ -3659,7 +3686,7 @@ class CloudRouteTests(CostFixture):
               mock.patch.object(cloud_gate, 'gate_deployment') as deployment):
             outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
                                      module_time_limit_s=1800, service=service)
-        reason = 'cloud gates are off (cloud_gate.conf enabled=off)'
+        reason = 'Cloud gates are off (build_targets.conf enabled.aws-gate=off)'
         self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
         lock.assert_not_called()
         deployment.assert_not_called()
@@ -3668,10 +3695,10 @@ class CloudRouteTests(CostFixture):
         self.assertEqual([row['reason'] for row in self.fallback_rows()], [reason])
 
     def test_invalid_cloud_gate_switch_reports_config_error(self) -> None:
-        _ = (self.root / 'cloud_gate.conf').write_text('# one of: on, off\nenabled=invalid\n')
+        override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=invalid')
         service = mock.Mock(side_effect=AssertionError('An invalid switch must not start a service'))
         mode = gate.SuiteMode.MERGE_GATE
-        with self.assertRaisesRegex(conf.Unusable, r"cloud_gate\.conf: enabled='invalid':"):
+        with self.assertRaisesRegex(conf.Unusable, r"build_targets\.conf: enabled\.aws-gate='invalid':"):
             _ = cloud_gate.run_cloud(self.repo, mode=mode, full=False, module_time_limit_s=1800,
                                      service=service, attempt=cloud_gate.CloudAttempt(self.state, mode))
 

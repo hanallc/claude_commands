@@ -823,8 +823,9 @@ The gate ranks deployed types and public zones by the expected USD per run befor
 Equal costs retain the configured region, type, and zone order.
 Capacity refusals and unsupported types select the next variant.
 A normal gate uses natedev after all capacity choices refuse.
-With `enabled=off` in `cloud_gate.conf`, the route sends merge gates and targeted tests to natedev.
-For each request, the route reads this setting before it reads deployment state or calls AWS.
+With `enabled.aws-gate=off` in `build_targets.conf`, the route sends new merge gates and targeted tests to natedev.
+The route checks the switch at entry and before each new attempt. The worker checks it before each launch request.
+Running gates and status reads continue. Manual AWS gate commands do not read the switch.
 A confirmed Spot interruption before a final result starts another cloud attempt.
 `spot_interruption_retries=2` permits two retries, which can reach another zone and then another region.
 The retry uses the next choice in the saved launch order.
