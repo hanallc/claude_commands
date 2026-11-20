@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from collections.abc import Sequence
+from datetime import date
 from decimal import Decimal
 import json
 import os
@@ -47,19 +48,17 @@ class MeasurementTests(MeasurementFixture):
         self.assertEqual(len(self.book().read_snapshot().reconciliations), 1)
         self.assertEqual(older.read_text(), "{broken")
 
-    def test_report_day_cost_uses_local_history_without_a_saved_bill(self) -> None:
+    def test_report_day_cost_matches_full_history_with_whole_day_reconciliation(self) -> None:
         self.costs({"cost_explorer_read_usd": "0.01"})
         self.seed_previous_day()
         self.seed_cost()
         self.book().reconcile(ledger.CostReconciliation(NOW, MIDNIGHT - 86400, MIDNIGHT, Decimal(3), "actual"))
         settings = aws_config.read_settings(self.settings)
         full = ledger.costs_from_evidence(self.book().read_snapshot(), settings, NOW, current_window=False)
-        local = tuple(charge for charge in full.intervals if charge.kind != 'reconciliation')
-        self.assertGreater(full.monthly.usd, sum((charge.usd for charge in local), Decimal(0)))
         for day, start, end in (("2026-01-14", MIDNIGHT - 86400, MIDNIGHT), (DAY, MIDNIGHT, NOW)):
             with self.subTest(day=day):
                 result = narrow(self, measurement.daily_usage(self.settings, self.state, day, NOW), measurement.DailyUsage)
-                self.assertEqual(result.usd, ledger.period_cost(local, start, end))
+                self.assertEqual(result.usd, ledger.period_cost(full.intervals, start, end))
 
     def test_concurrent_charge_refresh_uses_one_query_and_one_reconciliation(self) -> None:
         self.seed_previous_day()
@@ -73,7 +72,7 @@ class MeasurementTests(MeasurementFixture):
         self.assertEqual(len(self.book().read_snapshot().reconciliations), 1)
         self.assertFalse((self.state / "charges.lock").exists())
 
-    def test_utc_bill_prices_both_overlapping_new_york_days(self) -> None:
+    def test_utc_reconciliation_prices_both_overlapping_new_york_days(self) -> None:
         self.text_setting("accounting_zone", "America/New_York")
         self.costs({"fallback_usd_per_hour": "0", "price_max_age_seconds": "86400"})
         start, end = MIDNIGHT, MIDNIGHT + 86400
@@ -86,12 +85,16 @@ class MeasurementTests(MeasurementFixture):
         book.observe(ledger.InstanceObservation(start + 12 * 3600, "stopped", "fixture"))
         book.observe(ledger.InstanceObservation(end, "stopped", "fixture"))
         book.reconcile(ledger.CostReconciliation(now, start, end, Decimal(24), "actual"))
+        settings = aws_config.read_settings(self.settings)
+        full = ledger.costs_from_evidence(book.read_snapshot(), settings, now, current_window=False)
         with read_only_evidence(self, self.state):
-            for day, expected in (("2026-01-14", Decimal(5)), (DAY, Decimal(7))):
+            for day, expected in (("2026-01-14", Decimal("7.5")), (DAY, Decimal("16.5"))):
                 with self.subTest(day=day):
                     result = narrow(self, measurement.daily_usage(
                         self.settings, self.state, day, now), measurement.DailyUsage)
                     self.assertEqual(result.usd, expected)
+                    left, right = ledger.period_bounds(date.fromisoformat(day), settings.accounting_zone)
+                    self.assertEqual(result.usd, ledger.period_cost(full.intervals, left, right))
 
         reading = ledger.ChargeRead(DAY, now, start, end, Decimal(24), Decimal(0), Decimal(1),
                                    (ledger.UsageTypeCost('storage', Decimal(24)),))

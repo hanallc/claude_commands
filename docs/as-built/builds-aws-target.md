@@ -939,7 +939,7 @@ The check rejects duplicate JSON fields and invalid amount histories.
 The history times must increase and the last entry must match the newest read.
 A legacy file without a history supplies one read.
 The page and daily usage use an accepted bill for its UTC day.
-Estimates exclude saved reconciliation adjustments.
+If a refused bill names a day, its estimate excludes saved reconciliation adjustments for that day.
 For a refused day, estimates include local charges such as Hana storage that starts before the newest bill.
 The spend view includes an earlier refused day when it has local charges.
 The page shows one notice when a displayed amount includes a refused day.

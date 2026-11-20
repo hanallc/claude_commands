@@ -142,14 +142,25 @@ def daily_usage_from(source: MeasurementInputs, book: ledger.CostLedger, day: st
             return MeasurementUnavailable('report day is in the future')
         costs = ledger.costs_from_evidence(source.state, source.settings, end, window=accounting_day)
         uptime = sum(row.confirmed_uptime_s for row in costs.intervals)
-        usd = ledger.period_cost(ledger.local_charge_intervals(costs.intervals), start, end)
+        usd = ledger.period_cost(costs.intervals, start, end)
         first_utc_day = datetime.fromtimestamp(start, UTC).date()
         last_utc_day = datetime.fromtimestamp(max(start, end - 1), UTC).date()
-        estimate_days = tuple(day for record in refused for day in record.days
-                              if first_utc_day <= day <= last_utc_day)
-        if estimate_days or source.state.gate_reservations or book.validated_bills(now):
-            spends = book.spend_days(source.settings, now, estimate_days=estimate_days)
-            usd = ledger.period_cost((charge for spend in spends for charge in spend.intervals), start, end)
+        estimate_days = {day.isoformat(): day for record in refused for day in record.days
+                         if first_utc_day <= day <= last_utc_day}
+        use_spend_days = bool(source.state.gate_reservations or book.validated_bills(now))
+        if use_spend_days or estimate_days:
+            spends = book.spend_days(source.settings, now, estimate_days=tuple(estimate_days.values()))
+            if use_spend_days:
+                usd = ledger.period_cost((charge for spend in spends for charge in spend.intervals), start, end)
+            else:
+                # A local accounting day can overlap two UTC days.
+                for spend in spends:
+                    if (estimate_day := estimate_days.get(spend.day)) is None:
+                        continue
+                    left, right = ledger.period_bounds(estimate_day, ZoneInfo('UTC'))
+                    left, right = max(left, start), min(right, end)
+                    usd += (ledger.period_cost(spend.intervals, left, right)
+                            - ledger.period_cost(costs.intervals, left, right))
         return DailyUsage(uptime, usd)
     except (OSError, ValueError, ArithmeticError) as error:
         return MeasurementUnavailable(str(error))

@@ -20,60 +20,65 @@ import unittest
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import aws_trial, config, ledger, measurement, run_cost, spend
-from scripts.aws_target.ledger_test_support import FIXTURES, CostFixture, charge_readings, git_only, instant
+from scripts.aws_target.ledger_test_support import CostFixture, charge_readings, git_only, instant
 from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
 
 
-class RefusedBillEstimateTests(unittest.TestCase):
-    def test_refused_day_keeps_query_fees_with_local_storage_in_spend_and_usage(self) -> None:
-        state_folder = Path(self.enterContext(TemporaryDirectory()))
-        settings = FIXTURES / 'aws_target.conf'
-        book = ledger.CostLedger(state_folder)
-        day = '2026-01-15'
-        start = instant(day + 'T00:00:00Z')
+class RefusedBillEstimateTests(CostFixture):
+    day: str = '2026-01-15'
+    query_usd: Decimal = Decimal('.07')
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        start = instant(self.day + 'T00:00:00Z')
         end = start + 86400
-        now = end + 3600
-        query_usd = Decimal('.07')
-        bill = ledger.ChargeRead(day, end, start, end, Decimal(5), Decimal(0), query_usd)
-        with book.transaction() as state:
+        self.now = end + 3600
+        self.bill = ledger.ChargeRead(self.day, end, start, end, Decimal(5), Decimal(0), self.query_usd)
+        with ledger.CostLedger(self.state).transaction() as state:
             state.inventories.append(ledger.ResourceInventory(start, (), 'fixture', builder_removed=True))
             state.observations.append(ledger.InstanceObservation(start, 'terminated', 'fixture'))
             state.hana_storage.append(ledger.HanaStorageExposure(start, Decimal(90), ledger.HanaExposureClosed(end)))
-            state.reconciliations.append(ledger.CostReconciliation(end, start, end, Decimal(5), 'Cost Explorer', query_usd))
+            state.reconciliations.append(ledger.CostReconciliation(
+                end, start, end, Decimal(5), 'Cost Explorer', self.query_usd))
             state.charge_refresh_at = end
-        charges = state_folder / 'charges'
+
+    def check_amounts(self, page: spend.Spend, page_usd: Decimal, usage_usd: Decimal) -> None:
+        estimate = next(row for row in page.days if row.day == self.day)
+        self.assertEqual((estimate.usd, estimate.query_usd), (page_usd, self.query_usd))
+        self.assertEqual(measurement.daily_usage(self.settings, self.state, self.day, self.now),
+                         measurement.DailyUsage(0, usage_usd))
+
+    def test_refused_day_keeps_query_fees_with_local_storage_in_spend_and_usage(self) -> None:
+        charges = self.state / 'charges'
         charges.mkdir()
-        expected = Decimal(3) + query_usd
-        for name, dates in (('alias.json', (date(2026, 1, 15),)),
-                            ('2026-01-14.json', (date(2026, 1, 14), date(2026, 1, 15)))):
+        january_15 = date(2026, 1, 15)
+        for name, bill, dates, reason in (
+            ('alias.json', self.bill, (january_15,), ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+            ('2026-01-14.json', self.bill, (date(2026, 1, 14), january_15), ledger.BillRecordRejection.UTC_DAY_MISMATCH),
+            ('2026-01-15.json', replace(self.bill, at=self.now + 1), (january_15,), ledger.BillRecordRejection.FUTURE_READ),
+        ):
             with self.subTest(name=name):
                 path = charges / name
                 _ = path.write_text(json.dumps(ledger.charge_record(bill)))
-                page = spend.read_spend(settings, state_folder, now, '2026-01-16')
+                page = spend.read_spend(self.settings, self.state, self.now, '2026-01-16')
                 assert isinstance(page, spend.Spend)
-                self.assertEqual(page.refused_bills, (
-                    ledger.RefusedBillRecord(dates, ledger.BillRecordRejection.UTC_DAY_MISMATCH),))
-                estimate = next(row for row in page.days if row.day == day)
-                self.assertEqual((estimate.usd, estimate.query_usd), (expected, query_usd))
-                self.assertEqual(measurement.daily_usage(settings, state_folder, day, now),
-                                 measurement.DailyUsage(0, expected))
+                self.assertEqual(page.refused_bills, (ledger.RefusedBillRecord(dates, reason),))
+                expected = Decimal(3) + self.query_usd
+                self.check_amounts(page, expected, expected)
                 path.unlink()
 
-        page = spend.read_spend(settings, state_folder, now, '2026-01-16')
+        _ = (charges / (self.day + '.json')).write_text(json.dumps(ledger.charge_record(self.bill)))
+        page = spend.read_spend(self.settings, self.state, self.now, '2026-01-16')
         assert isinstance(page, spend.Spend)
-        estimate = next(row for row in page.days if row.day == day)
-        self.assertEqual((estimate.usd, estimate.query_usd), (Decimal(3), query_usd))
-        self.assertEqual(measurement.daily_usage(settings, state_folder, day, now),
-                         measurement.DailyUsage(0, expected))
+        self.check_amounts(page, Decimal(5), Decimal(5) + self.query_usd)
 
-        _ = (charges / (day + '.json')).write_text(json.dumps(ledger.charge_record(bill)))
-        page = spend.read_spend(settings, state_folder, now, '2026-01-16')
+    def test_day_without_bill_file_keeps_saved_reconciliation(self) -> None:
+        page = spend.read_spend(self.settings, self.state, self.now, '2026-01-16')
         assert isinstance(page, spend.Spend)
-        accepted = next(row for row in page.days if row.day == day)
-        self.assertEqual((accepted.usd, accepted.query_usd), (Decimal(5), query_usd))
-        self.assertEqual(measurement.daily_usage(settings, state_folder, day, now),
-                         measurement.DailyUsage(0, Decimal(5) + query_usd))
+        self.assertEqual(page.refused_bills, ())
+        self.check_amounts(page, Decimal(8), Decimal(5) + self.query_usd)
 
 
 class LedgerTests(CostFixture):

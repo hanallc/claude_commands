@@ -1238,11 +1238,6 @@ def costs_from_evidence(state: LedgerEvidence, settings: SpendingSettings, now: 
                     window=window, pricing_end=pricing_end)
 
 
-def local_charge_intervals(intervals: Sequence[ChargedInterval]) -> tuple[ChargedInterval, ...]:
-    """Keep local charges and Cost Explorer query fees for an estimate."""
-    return tuple(charge for charge in intervals if charge.kind != 'reconciliation')
-
-
 def period_cost(intervals: Sequence[ChargedInterval] | Iterator[ChargedInterval], start: int, end: int) -> Decimal:
     """Return the sum of charges inside the requested period."""
     return sum((_overlap(charge, start, end) for charge in intervals), Decimal(0))
@@ -1936,10 +1931,10 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
     latest = max(bills.values(), key=lambda row: row.day, default=None)
     base = _charges(replace(state, gate_reservations=[], hana_compute=[], hana_storage=[]), replace(settings, accounting_zone=zone), now,
                     require_fresh=False)
-    base_intervals = base.intervals if reserve else local_charge_intervals(base.intervals)
-    older = tuple(row for row in base_intervals if row.kind == 'instance')
-    query_charges = tuple(row for row in base_intervals if row.kind == 'explorer')
-    storage_costs = tuple(row for row in base_intervals if row.kind in ('fixed', 'reconciliation'))
+    older = tuple(row for row in base.intervals if row.kind == 'instance')
+    query_charges = tuple(row for row in base.intervals if row.kind == 'explorer')
+    storage_costs = tuple(row for row in base.intervals if row.kind in ('fixed', 'reconciliation'))
+    local_storage_costs = tuple(row for row in storage_costs if row.kind == 'fixed')
     if latest is not None:
         older = older_compute_intervals(older, readings, settings, now)
     gate_compute: dict[str, list[ChargedInterval]] = {}
@@ -2011,8 +2006,9 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             else:
                 if use_local_charges:
                     groups['other'] += query_usd
-                groups['storage'] += period_cost(storage_costs, start, end)
-                for charge in storage_costs:
+                storage = local_storage_costs if use_local_charges else storage_costs
+                groups['storage'] += period_cost(storage, start, end)
+                for charge in storage:
                     include(charge)
             groups[spend_group('SpotUsage:' + settings.instance_type)] += period_cost(older, start, end)
             for charge in older:
