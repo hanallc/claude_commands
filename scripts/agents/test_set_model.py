@@ -194,7 +194,10 @@ class SetModelTests(unittest.TestCase):
         (config / "machines.conf").symlink_to(source / "machines.conf")
         (config / "script_prompts.conf").symlink_to(source / "script_prompts.conf")
         _ = (config / "set_model.conf").write_text(
-            "default_effort=high\nscreen_wait_seconds=0\nscreen_reads=1\npane_timeout_seconds=30\n")
+            "default_effort=high\n"
+            + "# range: 0..10\nscreen_wait_seconds=0\n"
+            + "# whole: 1..10\nscreen_reads=1\n"
+            + "# range: 0.1..120\npane_timeout_seconds=30\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "MODELS_CONFIG_FILE": str(self.registry), "MODELS_CONFIG_PUBLISH": "0", "MODELS_CONFIG_TIER_ONLY": "0",
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models-cache.json"),

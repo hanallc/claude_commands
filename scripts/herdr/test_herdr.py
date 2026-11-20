@@ -3803,7 +3803,7 @@ class TargetCatastropheTests(StaffTestCase):
             {"pane_id": "w1:p1", "terminal_id": "terminal-one", "session_id": self.row.current_session}]
         cast(Mock, self.client.pane_activity).return_value = herdr.PaneRunning(("claude",))
         cast(Mock, self.client.native_session).return_value = self.row.current_session
-        cast(Mock, self.client.run).return_value = ""
+        self.client.configure_mock(**{"_visible_screen.return_value": ""})
         cast(Mock, self.client.result).return_value = {"process_info": {
             "shell_pid": 998042, "foreground_process_group_id": 998043,
             "foreground_processes": [{"pid": 998043, "name": "claude", "argv": ["claude"]}]}}
@@ -3865,7 +3865,7 @@ class TargetCatastropheTests(StaffTestCase):
                                place=herdr.HerdrPlace("fixture", "w1:p1"))
 
     def test_target_check_refuses_overwriting_unsaved_input(self) -> None:
-        cast(Mock, self.client.run).return_value = "──────────\n❯ keep my draft\n──────────"
+        self.client.configure_mock(**{"_visible_screen.return_value": "──────────\n❯ keep my draft\n──────────"})
         with self.assertRaisesRegex(herdr_types.HerdrFailure, "unsaved input"):
             _ = herdr.check_target(self.row.id, action="keys", text="replacement",
                                place=herdr.HerdrPlace("fixture", "w1:p1"))
@@ -4019,9 +4019,9 @@ class HerdrTests(unittest.TestCase):
         text = "/model gpt-6.2-sol --reasoning=high"
         conversation = session
 
-        def read_history(*arguments: str, deadline: float = math.inf) -> str:
+        def read_history(pane: str, lines: int, *, joined: bool, ansi: bool, deadline: float = math.inf) -> str:
             nonlocal conversation
-            del arguments, deadline
+            del pane, lines, joined, ansi, deadline
             conversation = "replacement"
             return "Earlier output\n  › \n\n  gpt-6.1-sol medium"
 
