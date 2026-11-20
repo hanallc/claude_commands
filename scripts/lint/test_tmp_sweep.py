@@ -9,8 +9,11 @@ from scripts.agents import remote
 import io
 import fcntl
 import json
+import ast
 import os
+import pwd
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -25,22 +28,26 @@ from functools import cached_property
 from typing import TextIO, cast, override
 from unittest import mock
 
-from scripts.lint import tmp_sweep
+from scripts.lint import folder_audit, sweep, tmp_sweep
+from scripts.disks import measure
 from scripts.mac_test import nextest_log
-from scripts.direct import recorder_state
+from scripts.direct import recorder_state, remove_run_scratch
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lib import build_folders, copy_record, scratch, test_hang_guard, time_limit
+from scripts.lib import build_folders, cargo_output, copy_record, scratch, test_hang_guard, time_limit
 from scripts.message import sessions
 from scripts.production import staff
-from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
-from scripts.lib import conf, unit_runs
+from scripts.lib import conf, session_folder, unit_runs
 from scripts.herdr import worker_panes
-from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
+# The staff fixture creates an account folder when it loads.
+with mock.patch.object(tempfile, "tempdir", "/tmp"):
+    from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
+    from scripts.herdr.test_worker_panes import PaneWorld
 
 DAY = 86_400
 LIVE_SESSION = "11111111-2222-3333-4444-555555555555"
@@ -50,7 +57,19 @@ PROJECT = "-home-natepiano-rust-hana"
 
 
 def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(dir="/tmp"))).resolve()
+    configuration = root / "config"
+    _ = unittest.enterModuleContext(mock.patch.object(tempfile, "tempdir", str(root)))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        **config_environment(configuration),
+        "TMPDIR": str(root), "BUILDLOG_DIR": str(root / "buildlog"),
+        scratch.HOLDS_ENV: str(root / "holds.json"),
+        "SESSION_TEMP_ROOT": str(root / "session"), "SESSION_PREVIOUS_ROOT": "",
+        "SESSION_FORMER_ROOT": str(root / "former"), "PYTHONDONTWRITEBYTECODE": "1",
+    })))
     _ = unittest.enterModuleContext(fake_cargo_output_roots())
+    settings = configuration / "build_folders.conf"
+    _ = unittest.enterModuleContext(mock.patch.object(tmp_sweep, "protected_root_configs", return_value=(settings,)))
 
 
 def write(path: Path, text: str = "x" * 4096) -> Path:
@@ -332,6 +351,197 @@ class CopyTests(TmpSweepCase):
         self.assertEqual(result.kept, {tmp_sweep.CARGO_OUTPUT_KEPT: [str(checkout)]})
         self.assertIn(f"tmp sweep: keep {checkout}: Cargo output kept", output.getvalue())
 
+    def test_cargo_cleanup_keeps_a_checkout_with_a_held_output_directory(self) -> None:
+        checkout = self.tmp / "checkout"
+        checkout.mkdir()
+        target = self.tmp.parent / "target"
+        target.mkdir()
+        build = self.tmp.parent / "external-build"
+        payload = write(build / "debug" / "output", "build result")
+        roots = cargo_output.CargoOutputRoots(checkout, target, build)
+        saved = (scratch.SavedCargoOutput(roots, ()),)
+        entry = tmp_sweep.RemovableEntry(str(checkout), str(self.tmp), self.now, 0)
+        with (mock.patch.object(scratch, "save_cargo_outputs", return_value=saved),
+              mock.patch.object(sweep, "saved_cargo_output_roots", return_value=sweep.CargoOutputIndex((roots,))),
+              mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([]))):
+            for directory in (build, target, checkout):
+                with self.subTest(directory=directory):
+                    _ = scratch.hold(directory, "phase:demo/1", "The task needs this directory.")
+                    with self.assertRaisesRegex(scratch.CargoOutputKept, scratch.HELD_FOLDER_REASON):
+                        folder_audit.clean_checkout_cargo_output(checkout)
+                    self.assertTrue(payload.is_file())
+                    if directory != checkout:
+                        result = tmp_sweep.Sweep()
+                        with mock.patch.object(scratch, "clean_cargo_outputs") as clean:
+                            self.assertFalse(tmp_sweep.remove_idle_entry(entry, result, False))
+                        clean.assert_not_called()
+                        self.assertEqual(result.kept, {tmp_sweep.CARGO_OUTPUT_KEPT: [str(checkout)]})
+                    self.assertTrue(checkout.is_dir())
+                    self.assertTrue(scratch.release(directory))
+
+    def test_held_external_target_keeps_checkout_with_local_cargo_build_directory(self) -> None:
+        checkout = self.tmp / "checkout"
+        local_output = write(checkout / "build" / "output", "local build result")
+        external_output = write(self.tmp.parent / "target" / "output", "external target result")
+        target = external_output.parent
+        roots = cargo_output.CargoOutputRoots(checkout, target, local_output.parent)
+        saved = (scratch.SavedCargoOutput(roots, ()),)
+        _ = scratch.hold(target, "phase:demo/1", "Keep the external target.")
+        entry = tmp_sweep.RemovableEntry(str(checkout), str(self.tmp), self.now, 0)
+        result = tmp_sweep.Sweep()
+        with mock.patch.object(scratch, "save_cargo_outputs", return_value=saved):
+            self.assertFalse(tmp_sweep.remove_idle_entry(entry, result, False))
+        self.assertTrue(local_output.is_file())
+        self.assertTrue(external_output.is_file())
+        self.assertEqual(result.kept, {tmp_sweep.CARGO_OUTPUT_KEPT: [str(checkout)]})
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux mountinfo")
+    def test_child_hold_through_a_bind_alias_keeps_the_source_parent(self) -> None:
+        source = self.tmp / "source"
+        child = source / "child"
+        payload = write(child / "note", "held data")
+        alias = self.tmp.parent / "alias"
+        alias.mkdir()
+        device = source.stat().st_dev
+        number = f"{os.major(device)}:{os.minor(device)}"
+        table = write(self.tmp.parent / "mountinfo",
+                      f"1 0 {number} / / rw - ext4 fixture rw\n"
+                      + f"2 1 {number} {child} {alias} rw - ext4 fixture rw\n")
+        _ = scratch.hold(alias, "phase:demo/1", "Keep the child through its bind mount.")
+        entry = tmp_sweep.RemovableEntry(str(source), str(self.tmp), self.now, 0)
+        parent = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, parent)
+        with mock.patch.object(measure, "read_mounts", return_value=measure.read_mounts(table)):
+            result = tmp_sweep.Sweep()
+            self.assertFalse(tmp_sweep.remove_idle_entry(entry, result, False))
+            with scratch.coordinate_removals() as removal:
+                with self.assertRaisesRegex(scratch.RemovalRefused, scratch.HELD_FOLDER_REASON):
+                    removal.check(scratch.AnchoredRemoval(parent, source.name))
+        self.assertEqual(result.kept, {scratch.HELD_FOLDER_REASON: [str(source)]})
+        self.assertEqual(payload.read_text(), "held data")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux mountinfo")
+    def test_nested_mount_of_a_held_folder_keeps_the_entire_tree(self) -> None:
+        source = self.tmp / "source"
+        outside = self.tmp.parent / "held"
+        mounted = source / "bound"
+        payload = write(outside / "data", "held data")
+        sibling = write(source / "unmounted", "other data")
+        mounted.mkdir()
+        device = source.stat().st_dev
+        number = f"{os.major(device)}:{os.minor(device)}"
+        table = write(self.tmp.parent / "mountinfo",
+                      f"1 0 {number} / / rw - ext4 fixture rw\n"
+                      + f"2 1 {number} {outside} {mounted} rw - ext4 fixture rw\n")
+        _ = scratch.hold(outside, "phase:demo/1", "Keep the bound folder.")
+        entry = tmp_sweep.RemovableEntry(str(source), str(self.tmp), self.now, 0)
+        result = tmp_sweep.Sweep()
+        reason = f"tree contains a mount point at {mounted}"
+        with (mock.patch.object(measure, "read_mounts", return_value=measure.read_mounts(table)),
+              redirect_stdout(io.StringIO()) as log):
+            self.assertFalse(tmp_sweep.remove_idle_entry(entry, result, False))
+        self.assertEqual(log.getvalue().splitlines(), [f"tmp sweep: keep {source}: {reason}"])
+        self.assertEqual(result.kept, {reason: [str(source)]})
+        self.assertEqual(result.failed, [])
+        self.assertEqual(payload.read_text(), "held data")
+        self.assertEqual(sibling.read_text(), "other data")
+        self.assertTrue(mounted.is_dir())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux mount IDs")
+    def test_run_cleanup_keeps_a_bind_mount_that_appears_after_preflight(self) -> None:
+        run = self.tmp / "run"
+        source = run / "verify_cache"
+        payload = write(source / "bound" / "data", "mounted data")
+        mounted = payload.parent.stat()
+        self.assertEqual(source.stat().st_dev, mounted.st_dev)
+        real_mount_identity = scratch.mount_identity
+        real_preflight = scratch.CoordinatedRemoval.check_tree
+        checked = False
+
+        def preflight(path: Path) -> None:
+            nonlocal checked
+            real_preflight(path)
+            checked = True
+
+        def mount_identity(fd: int) -> int:
+            identity = real_mount_identity(fd)
+            if os.path.samestat(os.fstat(fd), mounted):
+                self.assertTrue(checked)
+                return identity + 1
+            return identity
+
+        with (mock.patch.object(scratch.CoordinatedRemoval, "check_tree", side_effect=preflight),
+              mock.patch.object(scratch, "mount_identity", side_effect=mount_identity),
+              mock.patch.object(scratch, "require_quiescent"),
+              mock.patch.object(remove_run_scratch, "scratch_folders", return_value=[source]),
+              mock.patch.object(remove_run_scratch, "remove", side_effect=remove_run_scratch.remove_tree),
+              mock.patch.object(sys, "argv", ["remove_run_scratch.py", str(run)]),
+              redirect_stderr(io.StringIO()) as log):
+            self.assertEqual(remove_run_scratch.main(), 1)
+        self.assertEqual(log.getvalue().splitlines(), [
+            f"remove_run_scratch: could not remove {source}: tree contains a mount point at bound"])
+        journals = list(scratch.operation_journal_root(conf.read("scratch")).glob("*.json"))
+        self.assertEqual(len(journals), 1)
+        deleting = scratch.OperationJournal(journals[0]).read().step
+        assert isinstance(deleting, scratch.DeleteRemoval)
+        self.assertEqual((deleting.target.path / payload.relative_to(source)).read_text(), "mounted data")
+
+    def test_worktree_prune_refuses_a_symlink_into_a_held_folder(self) -> None:
+        git_dir = self.tmp.parent / "repository" / ".git"
+        git_dir.mkdir(parents=True)
+        held = self.tmp.parent / "held-worktrees"
+        payload = write(held / "checkout" / "gitdir", "worktree metadata")
+        (git_dir / "worktrees").symlink_to(held, target_is_directory=True)
+        record = write(self.state / "held.prune", "pending prune")
+        pending = folder_audit.PendingWorktreePrune(self.tmp / "removed-worktree", [git_dir])
+        _ = scratch.hold(held, "phase:demo/1", "Keep the worktree metadata.")
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("prune ran")) as command:
+            with self.assertRaisesRegex(scratch.RemovalRefused, scratch.HELD_FOLDER_REASON):
+                folder_audit.finish_pending_prune(record, pending)
+        command.assert_not_called()
+        self.assertEqual(payload.read_text(), "worktree metadata")
+        self.assertTrue(record.is_file())
+
+    def test_held_record_directory_keeps_pending_prune_and_removal_records(self) -> None:
+        directory = self.tmp.parent / "held-records"
+        checkout = directory / "checkout"
+        checkout.mkdir(parents=True)
+        removal_record = write(scratch.removal_mark(checkout), "removal record")
+        prune_record = write(directory / "pending.prune", "prune record")
+        _ = scratch.hold(directory, "phase:demo/1", "Keep these records.")
+        with self.assertRaisesRegex(scratch.RemovalRefused, scratch.HELD_FOLDER_REASON):
+            scratch.finish_removal(checkout, source_replaced=True)
+        with self.assertRaisesRegex(scratch.RemovalRefused, scratch.HELD_FOLDER_REASON):
+            folder_audit.finish_pending_prune(prune_record, folder_audit.PendingWorktreePrune(checkout, []))
+        self.assertEqual(removal_record.read_text(), "removal record")
+        self.assertEqual(prune_record.read_text(), "prune record")
+
+    def test_expired_worktree_keeps_metadata_in_its_held_repository(self) -> None:
+        source = self.tmp.parent / "repository"
+        source.mkdir()
+        worktree = self.tmp / "expired-worktree"
+        commands = (("init", "-q"), ("commit", "-q", "--allow-empty", "-m", "fixture"),
+                    ("worktree", "add", "-q", "--detach", str(worktree), "HEAD"),
+                    ("config", "gc.worktreePruneExpire", "now"))
+        for arguments in commands:
+            _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@fixture",
+                                *arguments], check=True, capture_output=True)
+        git_dir = source / ".git"
+        metadata = git_dir / "worktrees" / worktree.name / "gitdir"
+        os.utime(metadata, (1, 1))
+        scratch.delete_entry(worktree, scratch.RemovalKind.TREE)
+        record = write(self.state / "expired.prune", "pending prune")
+        pending = folder_audit.PendingWorktreePrune(worktree, [git_dir])
+        _ = scratch.hold(source, "phase:demo/1", "Keep the repository metadata.")
+        with self.assertRaisesRegex(scratch.RemovalRefused, scratch.HELD_FOLDER_REASON):
+            folder_audit.finish_pending_prune(record, pending)
+        self.assertTrue(metadata.is_file())
+        self.assertTrue(record.is_file())
+        self.assertTrue(scratch.release(source))
+        folder_audit.finish_pending_prune(record, pending)
+        self.assertFalse(metadata.exists())
+        self.assertFalse(record.exists())
+
     def test_private_root_never_selects_the_live_copies_authority(self) -> None:
         authority_root = self.tmp.parent / "authority copies"
         with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:
@@ -341,13 +551,15 @@ class CopyTests(TmpSweepCase):
         authority.assert_not_called()
 
     def test_default_root_reads_the_current_copies_authority(self) -> None:
+        former = self.tmp.parent / "former copies"
         for name in ("first copies", "second copies"):
             authority_root = self.tmp.parent / name
-            with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:
-                roots = tmp_sweep.default_roots(run_roots=(), session_roots=(), temp_roots=(),
+            with (mock.patch.object(tmp_sweep, "TMP_ROOT", str(self.tmp)),
+                  mock.patch.object(copy_record, "FORMER_COPIES_ROOT", former),
+                  mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority):
+                roots = tmp_sweep.default_roots(str(self.tmp), run_roots=(), session_roots=(), temp_roots=(),
                                                scratch_roots=(), wide_roots=(), session_temp_roots=())
-            # The live sweep also drains natedev's former copies root.
-            self.assertEqual(roots.copies, (str(authority_root), os.path.realpath(copy_record.FORMER_COPIES_ROOT)))
+            self.assertEqual(roots.copies, (str(authority_root), os.path.realpath(former)))
             authority.assert_called_once_with()
 
     def copy(self, name: str, **fields: object) -> Path:
@@ -374,6 +586,28 @@ class CopyTests(TmpSweepCase):
         self.assertFalse(live.parent.exists())
         self.assertTrue((self.tmp / "copies").is_dir())
 
+    def test_empty_copy_pair_stays_with_a_hold_or_unreadable_hold_file(self) -> None:
+        copies = self.tmp / "copies"
+        pair = copies / "held"
+        pair.mkdir(parents=True)
+        unheld = copies / "unheld"
+        unheld.mkdir()
+        self.enterContext(mock.patch.dict(os.environ, {"SCRATCH_COPIES_ROOT": str(copies)}))
+        _ = scratch.hold(pair, "phase:demo/1", "The task needs this folder.")
+
+        result = self.sweep()
+
+        self.assertTrue(pair.is_dir())
+        self.assertFalse(unheld.exists())
+        self.assertIn(str(pair), result.kept[scratch.HELD_FOLDER_REASON])
+        self.assertTrue(scratch.release(pair))
+        hold_file = write(scratch.holds_file(), '{"partial":')
+
+        result = self.sweep()
+
+        self.assertTrue(pair.is_dir())
+        self.assertIn(str(pair), result.kept[f"cannot read scratch hold file {hold_file}"])
+
     def test_dry_run_does_not_add_a_busy_mark_to_an_unregistered_copy(self) -> None:
         path = self.copy("unknown")
         (path / copy_record.RECORD).unlink()
@@ -395,6 +629,41 @@ class CopyTests(TmpSweepCase):
         _ = self.sweep()
         self.assertFalse(child.exists())
         self.assertFalse(parent.exists())
+
+    def test_interrupted_removal_uses_the_callers_hold_file(self) -> None:
+        copy = self.copy("pending-held")
+        with mock.patch.object(tmp_sweep, "delete_tree", side_effect=OSError("stopped after intent")):
+            self.assertTrue(self.sweep().failed)
+        mark = scratch.removal_mark(copy)
+        self.assertTrue(mark.is_file())
+        base = self.tmp.parent
+        default_file = base / "default-holds.json"
+        caller_file = base / "caller-holds.json"
+        _ = write_config_fixture(conf.path("scratch"), f"holds_file={default_file}\n")
+        caller_config = base / "caller" / "scratch.conf"
+        _ = write_config_fixture(caller_config, f"holds_file={caller_file}\n")
+        settings = conf.read(caller_config)
+        roots = self.roots()
+        remove_entry = tmp_sweep.remove_entry
+
+        def hold_before_removal(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool, *,
+                                scratch_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> bool:
+            if entry.path == str(copy):
+                _ = scratch.hold(copy, "phase:demo/1", "Keep the copy.", scratch_settings=settings)
+            return remove_entry(entry, result, dry_run, scratch_settings=scratch_settings)
+
+        with mock.patch.dict(os.environ):
+            _ = os.environ.pop(scratch.HOLDS_ENV, None)
+            _ = scratch.hold(copy, "phase:demo/1", "Keep the copy.", scratch_settings=settings)
+            result = tmp_sweep.sweep(False, roots, self.now, str(self.proc), scratch_settings=settings)
+            self.assertIn(str(copy), result.kept[scratch.HELD_FOLDER_REASON])
+            self.assertTrue(mark.is_file())
+            self.assertTrue(scratch.release(copy, scratch_settings=settings))
+            with mock.patch.object(tmp_sweep, "remove_entry", side_effect=hold_before_removal):
+                result = tmp_sweep.sweep(False, roots, self.now, str(self.proc), scratch_settings=settings)
+        self.assertIn(str(copy), result.kept[scratch.HELD_FOLDER_REASON])
+        self.assertTrue(mark.is_file())
+        self.assertTrue(copy.is_dir())
 
     def test_failed_resumed_removal_keeps_its_borrowed_parent(self) -> None:
         parent = self.copy("parent")
@@ -625,6 +894,147 @@ class CopyTests(TmpSweepCase):
 
 
 class IdleTests(TmpSweepCase):
+    ADOPTION_TASK: str = "row:cargo-liner-C54"
+
+    def adopt_cross_disk(self, source: Path, task: str = ADOPTION_TASK, *, visible: bool = True) -> tuple[Path, Path]:
+        scratch_root = self.tmp / "scratch"
+        environment = {copy_record.ROOT_ENV: str(scratch_root), scratch.VISIBLE_ROOT_ENV: str(self.tmp.parent / "visible")}
+        with (mock.patch.dict(os.environ, environment),
+              mock.patch.object(scratch, "rename_adoption", return_value=False),
+              mock.patch.object(scratch, "require_quiescent")):
+            destination = scratch.adopt(source, task, "moved", visible=visible)
+        hidden, = (scratch_root / scratch.ADOPTION_LEFTOVERS).iterdir()
+        return destination, hidden
+
+    def test_cargo_cleanup_keeps_a_held_source_moved_out_of_its_output_root(self) -> None:
+        build = self.tmp.parent / "external-build"
+        source = write(build / "loose" / "note", "source data").parent
+        _ = write(build / "output", "build data")
+        checkout = self.tmp / "checkout"
+        checkout.mkdir()
+        destination, hidden = self.adopt_cross_disk(source)
+        self.assertFalse(hidden.is_relative_to(build))
+        self.assertEqual(scratch.read_holds()[str(hidden)]["task"], self.ADOPTION_TASK)
+        roots = cargo_output.CargoOutputRoots(checkout, checkout / "target", build)
+        saved = (scratch.SavedCargoOutput(roots, ()),)
+        with (mock.patch.object(scratch, "save_cargo_outputs", return_value=saved),
+              mock.patch.object(sweep, "saved_cargo_output_roots", return_value=sweep.CargoOutputIndex((roots,))),
+              mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([]))):
+            folder_audit.clean_checkout_cargo_output(checkout)
+        self.assertFalse(build.exists())
+        self.assertEqual((hidden / "note").read_text(), "source data")
+        self.assertEqual((destination / "note").read_text(), "source data")
+
+    def test_scoped_sweep_leaves_an_ended_leftover_outside_its_roots(self) -> None:
+        source = write(self.tmp.parent / "loose" / "note", "source data").parent
+        _, hidden = self.adopt_cross_disk(source)
+        _ = scratch.end(self.ADOPTION_TASK)
+        self.assertNotIn(str(hidden), scratch.read_holds())
+        elsewhere = self.tmp.parent / "elsewhere"
+        elsewhere.mkdir()
+        self.now += 30 * DAY
+        roots = tmp_sweep.Roots((str(elsewhere),), (), ())
+
+        with mock.patch.object(tmp_sweep, "last_change", wraps=tmp_sweep.last_change) as inspect:
+            result = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
+
+        inspect.assert_not_called()
+        self.assertEqual(result.failed, [])
+        self.assertEqual(result.deleted, [])
+        self.assertEqual((hidden / "note").read_text(), "source data")
+
+    def test_sweep_keeps_a_leftover_with_a_live_git_registration(self) -> None:
+        repo = self.tmp.parent / "repository"
+        repo.mkdir()
+        source = self.tmp.parent / "loose"
+        commands = (("init", "-q"), ("commit", "-q", "--allow-empty", "-m", "fixture"),
+                    ("remote", "add", "origin", str(repo)), ("worktree", "add", "-q", "--detach", str(source)))
+        for command in commands:
+            _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@fixture",
+                                *command], check=True, capture_output=True)
+        _, hidden = self.adopt_cross_disk(source)
+        registration = repo / ".git" / "worktrees" / source.name / "gitdir"
+        _ = registration.write_text(str(hidden / ".git") + "\n")
+        _ = scratch.end(self.ADOPTION_TASK)
+        self.assertNotIn(str(hidden), scratch.read_holds())
+        self.now += 30 * DAY
+        self.assertIs(tmp_sweep.git_work(hidden), tmp_sweep.GitWork.SAVED)
+
+        result = self.sweep()
+
+        self.assertIn(str(hidden), result.kept[tmp_sweep.GitWork.REGISTERED_WORKTREE.value])
+        self.assertTrue((hidden / ".git").is_file())
+        self.assertTrue(registration.is_file())
+
+    def test_sweep_removes_a_cross_disk_source_after_its_task_ends_and_its_hold_releases(self) -> None:
+        source = write(self.tmp.parent / "loose" / "note", "source data").parent
+        destination, hidden = self.adopt_cross_disk(source)
+        self.now += 30 * DAY
+        self.assertFalse(source.exists())
+        self.assertEqual((hidden / "note").read_text(), "source data")
+        self.assertIn(str(hidden), self.sweep().kept[scratch.HELD_FOLDER_REASON])
+        _ = scratch.hold(hidden.parent, "gate:reader", "Keep the source.")
+        _ = scratch.end(self.ADOPTION_TASK)
+        self.assertNotIn(str(hidden), scratch.read_holds())
+        self.assertIn(str(hidden), self.sweep().kept[scratch.HELD_FOLDER_REASON])
+        self.assertTrue(scratch.release(hidden.parent))
+        self.assertTrue(hidden.is_dir())
+
+        result = self.sweep()
+
+        self.assertIn(str(hidden), [entry["path"] for entry in result.deleted])
+        self.assertFalse(hidden.exists())
+        self.assertEqual((destination / "note").read_text(), "source data")
+
+    def test_sweep_removes_a_cross_disk_source_after_the_default_task_deadline(self) -> None:
+        source = write(self.tmp.parent / "loose" / "note", "source data").parent
+        target = self.tmp.parent / "target"
+        target.mkdir()
+        with mock.patch.object(session_folder, "caller_folder", return_value=target):
+            destination, hidden = self.adopt_cross_disk(source, "", visible=False)
+        held = scratch.read_holds()[str(hidden)]
+        task = scratch.task_of(destination)
+        assert isinstance(task, copy_record.Registered)
+        self.assertEqual(held["task"], task.task)
+        deadline = scratch.task_end(task.task, float("inf"))
+        assert isinstance(deadline, scratch.Ended)
+        self.now = deadline.at - 1
+        with mock.patch.object(time, "time", return_value=self.now):
+            self.assertIn(str(hidden), self.sweep().kept[scratch.HELD_FOLDER_REASON])
+        self.now = deadline.at
+        with mock.patch.object(time, "time", return_value=self.now):
+            result = self.sweep()
+
+        self.assertIn(str(hidden), [entry["path"] for entry in result.deleted])
+        self.assertFalse(hidden.exists())
+        self.assertNotIn(str(hidden), scratch.read_holds())
+        self.assertEqual((destination / "note").read_text(), "source data")
+
+    def test_blocked_git_registration_does_not_stop_other_sweep_candidates(self) -> None:
+        self.now += 30 * DAY
+        source = self.tmp / "checkout"
+        hidden = self.tmp / ".scratch-operation-deleted"
+        common = self.tmp.parent / "repository" / ".git"
+        metadata = common / "worktrees" / "checkout"
+        backlink = write(metadata / "gitdir", str(source / ".git"))
+        unrelated = write(self.tmp / "unrelated" / "note").parent
+        registration = scratch.WorktreeRegistration(common, metadata, scratch.directory_id(metadata.stat()))
+        journal = scratch.operation_journal(source, conf.read("scratch"))
+        journal.save(scratch.FolderOperation(source, (1, 2), scratch.DeleteRemoval(
+            scratch.HiddenRemoval(hidden, registration))))
+        _ = scratch.hold(metadata, "gate:fixture", "Keep the registration.")
+
+        with redirect_stdout(io.StringIO()) as log:
+            result = self.sweep()
+
+        self.assertEqual(result.failed, [])
+        self.assertIn(str(source), result.kept[scratch.HELD_FOLDER_REASON])
+        self.assertEqual(log.getvalue().splitlines(), [f"tmp sweep: keep {source}: {scratch.HELD_FOLDER_REASON}"])
+        self.assertFalse(unrelated.exists())
+        self.assertIn(str(unrelated), [entry["path"] for entry in result.deleted])
+        self.assertTrue(backlink.is_file())
+        self.assertTrue(journal.path.is_file())
+
     def test_unrecorded_folder_uses_the_shared_removal_age(self) -> None:
         _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "lint.conf",
                                  "folder_remove_after_seconds=86400\n")
@@ -782,6 +1192,27 @@ class NextestLogRetentionTests(TmpSweepCase):
             tmp_sweep.remove_expired_nextest_logs(logs, self.now, False, result)
         self.assertTrue(expired.is_file())
         self.assertEqual(result.kept, {tmp_sweep.NO_PROC: [str(expired)]})
+
+    def test_holds_protect_expired_cache_entries_and_nextest_logs(self) -> None:
+        base = self.tmp.parent
+        cache = base / "cache"
+        cache.mkdir(mode=0o700)
+        cached = write(cache / "cpython-0" / "old")
+        log = write(base / "logs" / "nextest.00000001")
+        old = self.now - 20 * DAY
+        _ = write_config_fixture(conf.path("mac_test"))
+        for path in (cached, log):
+            os.utime(path, (old, old))
+            _ = scratch.hold(path.parent, "phase:demo/1", "The task needs this folder.")
+
+        self.assertEqual(tmp_sweep.prune_dataclass_code(str(cache), self.now, 14), 0)
+        result = tmp_sweep.Sweep()
+        with mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([])):
+            tmp_sweep.remove_expired_nextest_logs(log.parent, self.now, False, result)
+
+        self.assertTrue(cached.is_file())
+        self.assertTrue(log.is_file())
+        self.assertEqual(result.kept, {scratch.HELD_FOLDER_REASON: [str(log)]})
 
 
 class OwnerEndTests(TmpSweepCase):
@@ -1237,7 +1668,208 @@ class TempFolderTests(TmpSweepCase):
         self.assertEqual(roots.temp, (str(self.tmp.parent),))
 
 
+class LiveRootGuardTests(unittest.TestCase):
+    def test_sweep_mover_and_scratch_leave_delete_calls_to_the_coordinator(self) -> None:
+        scripts = Path(__file__).resolve().parents[1]
+        delete_functions = {"unlink", "rmdir", "rmtree", "remove", "move", "replace"}
+        state_calls = {
+            ("lib/scratch.py", "write_holds", "staged.replace(path)"),
+            ("lint/folder_audit.py", "main", "marker.unlink(missing_ok=True)"),
+        }
+        non_filesystem_calls = {
+            "datetime.strptime(text.strip(), form).replace(tzinfo=user_zone())",
+            "datetime.strptime(until_stamp(match['name']), UNTIL_FORMAT).replace(tzinfo=timezone.utc)",
+            "match['name'].replace('/', '-')",
+            "directories.remove('.git')",
+            "value.replace('${TMPDIR}', temporary)",
+            "found.group(1).decode().replace('Z', '+00:00')",
+        }
+        for name in ("lint/tmp_sweep.py", "lib/session_move.py", "lib/scratch.py", "lint/folder_audit.py",
+                     "direct/remove_run_scratch.py"):
+            path = scripts / name
+            with self.subTest(path=path):
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                imported = {item.asname or item.name for node in ast.walk(tree)
+                            if isinstance(node, ast.ImportFrom) and node.module in ("os", "shutil")
+                            for item in node.names if item.name in delete_functions}
+                coordinator_lines = {line.lineno for node in tree.body
+                                     if isinstance(node, ast.ClassDef) and node.name == "CoordinatedRemoval"
+                                     for method in node.body
+                                     if isinstance(method, ast.FunctionDef)
+                                     and method.name in ("delete", "delete_directory", "replace")
+                                     for line in ast.walk(method) if isinstance(line, ast.Call)}
+                functions = {node.lineno: function.name for function in tree.body if isinstance(function, ast.FunctionDef)
+                             for node in ast.walk(function) if isinstance(node, ast.Call)}
+                calls: list[int] = []
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Call):
+                        function = node.func
+                        raw = (isinstance(function, ast.Attribute) and function.attr in delete_functions
+                               and ast.unparse(function) != "removal.replace"
+                               or isinstance(function, ast.Name) and function.id in imported)
+                        if (raw and node.lineno not in coordinator_lines and ast.unparse(node) not in non_filesystem_calls
+                                and (name, functions.get(node.lineno, ""), ast.unparse(node)) not in state_calls):
+                            calls.append(node.lineno)
+                self.assertEqual(calls, [])
+
+    def test_sweep_refuses_the_session_bind_mount_before_listing(self) -> None:
+        alias = Path("/build/session")
+        identity = os.stat_result((0o40700, 765, 123, 1, os.getuid(), os.getgid(), 0, 0, 0, 0))
+        real_stat = Path.stat
+
+        def stat_path(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if path in (alias, Path("/session")):
+                return identity
+            return real_stat(path, follow_symlinks=follow_symlinks)
+
+        with (mock.patch.object(Path, "stat", stat_path),
+              mock.patch.object(tmp_sweep, "listing", side_effect=AssertionError("listed a root")) as listing,
+              mock.patch.object(os, "scandir", side_effect=AssertionError("listed a root")) as scandir,
+              mock.patch.object(tmp_sweep, "read_pane_runs", side_effect=AssertionError("read pane state"))):
+            for path in (alias, alias / "unused-test-root"):
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(ValueError, "test cannot use live root /build/session"):
+                        _ = tmp_sweep.sweep(False, tmp_sweep.Roots((str(path),), (), ()), time.time())
+            listing.assert_not_called()
+            scandir.assert_not_called()
+
+    def test_direct_removal_refuses_live_paths_before_the_removal_coordinator(self) -> None:
+        path = "/tmp/claude/unit/unused-test-root"
+        entry = tmp_sweep.RemovableEntry(path, "/tmp/claude/unit", 0.0, 0)
+        with (mock.patch.object(scratch, "remove_folder", side_effect=AssertionError("started removal")) as remove,
+              mock.patch.object(os, "scandir", side_effect=AssertionError("listed a root")) as scandir,
+              mock.patch.object(os, "unlink", side_effect=AssertionError("unlinked a live path")) as unlink,
+              mock.patch.object(shutil, "rmtree", side_effect=AssertionError("deleted a live path")) as rmtree):
+            with self.assertRaisesRegex(ValueError, f"test cannot use live root {path}"):
+                _ = tmp_sweep.remove_idle_entry(entry, tmp_sweep.Sweep(), False)
+            with self.assertRaisesRegex(ValueError, f"test cannot use live root {path}"):
+                tmp_sweep.delete_tree(path)
+            remove.assert_not_called()
+            scandir.assert_not_called()
+            unlink.assert_not_called()
+            rmtree.assert_not_called()
+
+    def test_sweep_refuses_live_roots_before_listing(self) -> None:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        roots = ("/tmp/claude", "/tmp/claude/unit", "/session", "~/session", str(home / "session"),
+                 "/build", "/build/claude/copies", str(home / "rust" / "mirrors"), "/tmp",
+                 f"/var/tmp/dataclass-code-{os.getuid()}", str(home / nextest_log.DIRECTORY))
+        with (mock.patch.object(tmp_sweep, "listing") as listing,
+              mock.patch.object(os, "scandir") as scandir,
+              mock.patch.object(tmp_sweep, "read_pane_runs") as panes,
+              mock.patch.object(tmp_sweep, "remove_entry") as remove):
+            for root in roots:
+                with self.subTest(root=root):
+                    with self.assertRaisesRegex(ValueError, "test cannot use live root"):
+                        _ = tmp_sweep.sweep(False, tmp_sweep.Roots((root,), (), ()), time.time())
+            with (mock.patch.object(unit_runs, "RUN_ROOT", Path("/tmp/claude/unit")),
+                  mock.patch.object(unit_runs, "run_roots") as run_roots,
+                  mock.patch.object(session_folder, "configured_roots", return_value=())):
+                with self.assertRaisesRegex(ValueError, "test cannot use live root /tmp/claude/unit"):
+                    _ = tmp_sweep.default_roots("/unused-test-root", session_roots=())
+            run_roots.assert_not_called()
+        listing.assert_not_called()
+        scandir.assert_not_called()
+        panes.assert_not_called()
+        remove.assert_not_called()
+
+
 class OwnerTests(TmpSweepCase):
+    def test_former_session_folder_stays_while_a_descendant_has_a_scratch_hold(self) -> None:
+        previous = self.tmp.parent / "previous"
+        folder = previous / "ended"
+        payload = write(folder / "result" / "nested" / "file")
+        session_folder.write_record(folder, {"owner": "ended", "session_id": ENDED_SESSION})
+        _ = scratch.hold(payload.parent, "phase:demo/1", "The task needs this result.")
+        roots = tmp_sweep.Roots((), (), (), former_sessions=(str(previous),))
+
+        dry = tmp_sweep.sweep(True, roots, self.now, str(self.proc))
+        live = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
+        self.assertEqual(dry.deleted, [])
+        self.assertEqual(live.deleted, [])
+        self.assertEqual(dry.kept, {scratch.HELD_FOLDER_REASON: [str(folder)]})
+        self.assertEqual(live.kept, dry.kept)
+        self.assertTrue(payload.is_file())
+        self.assertTrue(scratch.release(payload.parent))
+        self.assertEqual([entry["path"] for entry in tmp_sweep.sweep(False, roots, self.now, str(self.proc)).deleted],
+                         [str(folder)])
+
+    def test_former_session_removal_rechecks_a_scratch_hold_added_after_the_scan(self) -> None:
+        previous = self.tmp.parent / "previous"
+        folder = previous / "ended"
+        payload = write(folder / "result" / "file")
+        session_folder.write_record(folder, {"owner": "ended", "session_id": ENDED_SESSION})
+        roots = tmp_sweep.Roots((), (), (), former_sessions=(str(previous),))
+        [entry] = [entry for entry in tmp_sweep.timed_entries(roots, self.now, str(self.proc))
+                   if isinstance(entry, tmp_sweep.FormerSessionEntry)]
+
+        _ = scratch.hold(payload.parent, "phase:demo/1", "The task needs this result.")
+        result = tmp_sweep.Sweep()
+        self.assertFalse(tmp_sweep.remove_entry(entry, result, False))
+        self.assertEqual(result.kept, {scratch.HELD_FOLDER_REASON: [str(folder)]})
+        self.assertTrue(payload.is_file())
+
+    def test_unreadable_hold_file_keeps_a_former_session_folder(self) -> None:
+        previous = self.tmp.parent / "previous"
+        folder = previous / "ended"
+        payload = write(folder / "result" / "file")
+        session_folder.write_record(folder, {"owner": "ended", "session_id": ENDED_SESSION})
+        roots = tmp_sweep.Roots((), (), (), former_sessions=(str(previous),))
+        [entry] = [entry for entry in tmp_sweep.timed_entries(roots, self.now, str(self.proc))
+                   if isinstance(entry, tmp_sweep.FormerSessionEntry)]
+
+        hold_file = scratch.holds_file()
+        _ = write(hold_file, '{"partial":')
+        reason = f"cannot read scratch hold file {hold_file}"
+        dry = tmp_sweep.sweep(True, roots, self.now, str(self.proc))
+        self.assertEqual(dry.deleted, [])
+        self.assertEqual(dry.kept, {reason: [str(folder)]})
+        result = tmp_sweep.Sweep()
+        self.assertFalse(tmp_sweep.remove_entry(entry, result, False))
+        self.assertEqual(result.kept, {reason: [str(folder)]})
+        self.assertTrue(payload.is_file())
+
+    def test_run_entries_below_a_former_session_keep_held_results(self) -> None:
+        previous = self.tmp.parent / "previous"
+        folder = previous / "ended"
+        run = folder / session_folder.RUN / "run-id"
+        payload = write(run / "result" / "nested" / "file")
+        session_folder.write_record(folder, {"owner": "ended", "session_id": ENDED_SESSION})
+        _ = scratch.hold(payload.parent, "phase:demo/1", "The task needs this result.")
+        now = self.now + 8 * DAY
+        roots = tmp_sweep.Roots((), (str(run.parent),), (), former_sessions=(str(previous),))
+        result = tmp_sweep.sweep(False, roots, now, str(self.proc))
+        self.assertEqual(result.deleted, [])
+        self.assertEqual(set(result.kept[scratch.HELD_FOLDER_REASON]), {str(folder), str(run)})
+
+        entry = tmp_sweep.RemovableEntry(str(run), str(run.parent), time.time(), 0)
+        self.assertFalse(tmp_sweep.remove_idle_entry(entry, tmp_sweep.Sweep(), False))
+        self.assertTrue(payload.is_file())
+
+    def test_sweep_judges_ended_former_folders_and_keeps_live_and_open_folders(self) -> None:
+        previous = self.tmp.parent / "previous"
+        ended = write(previous / "ended" / "file").parent
+        live = write(previous / "live" / "file").parent
+        opened = write(previous / "opened" / "run" / "demo" / "file").parents[2]
+        for folder, session_id in ((ended, ENDED_SESSION), (live, LIVE_SESSION), (opened, ENDED_SESSION)):
+            _ = write(folder / ".session.json", json.dumps({"owner": folder.name, "session_id": session_id}))
+        _ = self.open_run(opened / "run" / "demo", ENDED_SESSION)
+        with (mock.patch.dict(os.environ, {"SESSION_TEMP_ROOT": str(self.tmp.parent / "session"),
+                                          "SESSION_PREVIOUS_ROOT": str(previous)}),
+              mock.patch.object(tmp_sweep, "TMP_ROOT", str(self.tmp)),
+              mock.patch.object(unit_runs, "RUN_ROOT", self.unit),
+              mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.delegate),
+              mock.patch.object(copy_record, "FORMER_COPIES_ROOT", self.tmp / "former-copies"),
+              mock.patch.object(tmp_sweep, "dataclass_code_root", return_value=str(self.tmp / "dataclass-code"))):
+            roots = tmp_sweep.default_roots(str(self.tmp), temp_roots=(), session_roots=(),
+                                            scratch_roots=(), wide_roots=())
+            result = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
+        self.assertIn(str(ended), [entry["path"] for entry in result.deleted])
+        self.assertFalse(ended.exists())
+        self.assertTrue(live.is_dir())
+        self.assertTrue(opened.is_dir())
+        self.assertIn(str(live), result.kept.get(tmp_sweep.SESSION_RUNS, []))
+
     def test_a_run_folder_stays_while_its_director_runs(self) -> None:
         self.now: float = time.time() + 8 * DAY
         live = write(self.unit / "live" / "board.log").parent
@@ -1330,6 +1962,24 @@ class OwnerTests(TmpSweepCase):
         self.assertFalse(self.project.exists())
         self.assertTrue(self.session_root.is_dir())
 
+    def test_project_stays_when_held_after_its_last_entry_is_removed(self) -> None:
+        child = write(self.project / ENDED_SESSION / "scratchpad" / "a").parents[1]
+        remove_entry = tmp_sweep.remove_entry
+
+        def remove_then_hold(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool, *,
+                             scratch_settings: conf.ConfigRead) -> bool:
+            removed = remove_entry(entry, result, dry_run, scratch_settings=scratch_settings)
+            if removed and Path(entry.path) == child:
+                _ = scratch.hold(self.project, "phase:demo/1", "The task needs this folder.")
+            return removed
+
+        with mock.patch.object(tmp_sweep, "remove_entry", side_effect=remove_then_hold):
+            result = self.sweep()
+
+        self.assertFalse(child.exists())
+        self.assertTrue(self.project.is_dir())
+        self.assertIn(str(self.project), result.kept[scratch.HELD_FOLDER_REASON])
+
     def test_only_dash_folders_are_projects(self) -> None:
         agent = write(self.session_root / "bash-edit-diff" / "a")
         self.assertEqual(self.roots().projects, (str(self.project),))
@@ -1338,6 +1988,30 @@ class OwnerTests(TmpSweepCase):
 
 
 class LogTests(TmpSweepCase):
+    def test_refused_mac_nextest_root_leaves_the_due_stamp_unchanged(self) -> None:
+        stamp = write(self.state / tmp_sweep.STAMP_NAME)
+        before = stamp.stat().st_mtime_ns
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        roots = self.roots()
+        with (mock.patch.object(tmp_sweep, "default_roots", return_value=roots),
+              mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(Path, "home", return_value=home),
+              mock.patch.object(tmp_sweep, "run", side_effect=ValueError("test cannot use live root")) as run):
+            with self.assertRaisesRegex(ValueError, "test cannot use live root"):
+                _ = tmp_sweep.run_if_due(False, self.now)
+            self.assertEqual(stamp.stat().st_mtime_ns, before)
+            run.assert_not_called()
+
+    def test_refused_sweep_leaves_the_due_stamp_unchanged(self) -> None:
+        stamp = write(self.state / tmp_sweep.STAMP_NAME)
+        before = stamp.stat().st_mtime_ns
+        with (mock.patch.object(tmp_sweep, "default_roots", return_value=tmp_sweep.Roots(("/session",), (), ())),
+              mock.patch.object(tmp_sweep, "run", side_effect=ValueError("test cannot use live root /session")) as run):
+            with self.assertRaisesRegex(ValueError, "test cannot use live root /session"):
+                _ = tmp_sweep.run_if_due(False, self.now)
+            self.assertEqual(stamp.stat().st_mtime_ns, before)
+            run.assert_not_called()
+
     def test_log_retention_keeps_the_boundary_and_newer_records_in_order(self) -> None:
         # Whole seconds keep the boundary exact after the ISO timestamp round trip.
         now = float(int(self.now))
@@ -1351,6 +2025,15 @@ class LogTests(TmpSweepCase):
         tmp_sweep.append_log(path, current, now)
 
         self.assertEqual(self.log(), [*records[1:], current])
+
+    def test_held_log_directory_keeps_the_log_and_staging_files_unchanged(self) -> None:
+        path = write(self.state / tmp_sweep.LOG_NAME, "previous log\n")
+        _ = scratch.hold(self.state, "phase:demo/1", "Keep the log directory.")
+        entry = tmp_sweep.record(tmp_sweep.Sweep(), False, self.now)
+        with self.assertRaisesRegex(scratch.RemovalRefused, scratch.HELD_FOLDER_REASON):
+            tmp_sweep.append_log(path, entry, self.now)
+        self.assertEqual(path.read_text(), "previous log\n")
+        self.assertEqual(list(self.state.glob(f".{path.name}.*")), [])
 
     def log_settings(self, sample: int, max_mib: int) -> conf.ConfigRead:
         return conf.read(write(self.state / "log-settings.conf",
@@ -1409,8 +2092,8 @@ class LogTests(TmpSweepCase):
         payload = write(self.tmp / "idle-file")
         unlink = os.unlink
 
-        def refuse_payload(path: str, *, dir_fd: int | None = None) -> None:
-            if path == str(payload):
+        def refuse_payload(path: str | Path, *, dir_fd: int | None = None) -> None:
+            if Path(path) == payload:
                 raise PermissionError("private removal failed")
             unlink(path, dir_fd=dir_fd)
 
@@ -1434,15 +2117,9 @@ class LogTests(TmpSweepCase):
     def test_a_run_waits_an_hour_after_the_last(self) -> None:
         self.now = time.time() + 8 * DAY
         idle = write(self.tmp / "shots" / "1.png")
-        run = tmp_sweep.run
-
-        def fixture_run(dry_run: bool, now: float, *, lint_settings: conf.ConfigRead,
-                        scratch_settings: conf.ConfigRead) -> int:
-            return run(dry_run, now, self.roots(), str(self.proc),
-                       lint_settings=lint_settings, scratch_settings=scratch_settings)
 
         with (mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
-              mock.patch.object(tmp_sweep, "run", side_effect=fixture_run),
+              mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc)),
               redirect_stdout(io.StringIO())):
             self.assertEqual(tmp_sweep.run_if_due(False, self.now), tmp_sweep.CompletedSweepAssessment(0))
             self.assertFalse(idle.exists())
@@ -1540,6 +2217,35 @@ class RunFolderTests(TmpSweepCase):
 
 
 class HandCleanupTests(TmpSweepCase):
+    def test_missing_cleanup_plan_leaves_pending_deletion_intact(self) -> None:
+        source = self.tmp / "checkout"
+        hidden = self.tmp / ".scratch-operation-pending"
+        payload = write(hidden / "note", "keep the pending source")
+        journal = scratch.operation_journal(source, conf.read("scratch"))
+        journal.save(scratch.FolderOperation(source, scratch.directory_id(hidden.stat()), scratch.DeleteRemoval(
+            scratch.HiddenRemoval(hidden, scratch.NoWorktreeRegistration()))))
+        plan = self.tmp.parent / "missing-plan.json"
+        with mock.patch.object(scratch, "require_quiescent"):
+            with self.assertRaisesRegex(FileNotFoundError, "cleanup plan does not exist"):
+                _ = tmp_sweep.apply_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertEqual(payload.read_text(), "keep the pending source")
+        self.assertTrue(journal.path.is_file())
+        self.assertFalse((self.state / tmp_sweep.LOG_NAME).exists())
+
+    def test_apply_refuses_a_live_log_directory_before_reading_the_plan(self) -> None:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        live_state = home / Path(tmp_sweep.DEFAULT_STATE_DIR).relative_to("~")
+        plan = write(self.tmp.parent / "plan.json", '{"version": 1, "entries": []}')
+        roots = self.roots()
+        with (mock.patch.object(tmp_sweep, "state_dir", return_value=live_state),
+              mock.patch.object(tmp_sweep, "planned_removals", return_value=[]) as read_plan,
+              mock.patch.object(tmp_sweep, "cleanup_entries", return_value=iter(())),
+              mock.patch.object(tmp_sweep, "append_log") as append):
+            with self.assertRaisesRegex(ValueError, "test cannot use live root"):
+                _ = tmp_sweep.apply_cleanup_plan(plan, roots, self.now, str(self.proc))
+            read_plan.assert_not_called()
+            append.assert_not_called()
+
     def test_stopped_plan_write_can_be_planned_again(self) -> None:
         ended = self.ended_run("ended")
         plan = self.tmp.parent / "plan.json"
@@ -1547,12 +2253,34 @@ class HandCleanupTests(TmpSweepCase):
             with self.assertRaisesRegex(RuntimeError, "stopped during serialization"):
                 _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
         self.assertFalse(plan.exists())
+        self.assertEqual(list(plan.parent.glob(f".{plan.name}.*")), [])
         self.assertEqual(tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc)), 0)
         self.assertEqual(tmp_sweep.planned_removals(plan), [str(ended)])
         before = plan.read_bytes()
         with self.assertRaises(FileExistsError):
             _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
         self.assertEqual(plan.read_bytes(), before)
+
+    def test_held_plan_directory_refuses_publication(self) -> None:
+        directory = self.tmp.parent / "plans"
+        directory.mkdir()
+        plan = directory / "plan.json"
+        _ = scratch.hold(directory, "phase:demo/1", "Keep the plan directory.")
+        with self.assertRaisesRegex(scratch.RemovalRefused, scratch.HELD_FOLDER_REASON):
+            _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertEqual(list(directory.iterdir()), [])
+
+    def test_relative_plan_path_inherits_a_hold_on_its_ancestor(self) -> None:
+        held = self.tmp.parent / "held-plans"
+        directory = held / "subfolder"
+        directory.mkdir(parents=True)
+        _ = scratch.hold(held, "phase:demo/1", "Keep the plan folders.")
+        with (mock.patch.object(os, "getcwd", return_value=str(directory)),
+              mock.patch.object(tempfile, "NamedTemporaryFile", side_effect=AssertionError("started staging")) as staging):
+            with self.assertRaisesRegex(scratch.RemovalRefused, scratch.HELD_FOLDER_REASON):
+                _ = tmp_sweep.write_cleanup_plan(Path("plan.json"), self.roots(), self.now, str(self.proc))
+        staging.assert_not_called()
+        self.assertEqual(list(directory.iterdir()), [])
 
     def test_incomplete_legacy_plan_names_file_and_clear_action(self) -> None:
         plan = self.tmp.parent / "plan.json"

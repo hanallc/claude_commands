@@ -166,11 +166,13 @@ def remove_clone_targets(path: Path, removing: bool, *,
     if not removing:
         return WOULD_REMOVE_TARGET
     try:
-        scratch.clean_cargo_outputs(path, saved)
-        for target in targets:
-            tmp_sweep.delete_tree(str(target))
-        scratch.cargo_removal_mark(path.resolve()).unlink(missing_ok=True)
-    except OSError as error:
+        with scratch.coordinate_removals(scratch_settings=scratch_settings, wait_for_hold_lock=False) as removal:
+            scratch.check_cargo_cleanup(removal, path, saved, targets)
+            scratch.clean_cargo_outputs(path, saved)
+            for target in targets:
+                tmp_sweep.delete_tree(str(target))
+            scratch.delete_entry(scratch.cargo_removal_mark(path.resolve()), scratch.RemovalKind.FILE, missing_ok=True)
+    except (OSError, scratch.ScratchHoldsUnreadable) as error:
         return f"target removal failed: {error}"
     return TARGET_REMOVED
 
@@ -318,13 +320,6 @@ def _live_socket(path: Path, bound: frozenset[str] | None, limits: FolderScanLim
     return False
 
 
-def held(path: Path, holds: dict[str, scratch.Hold]) -> bool:
-    inside = str(path) + os.sep
-    return any(not hold["ended"] and (held_path == str(path) or held_path.startswith(inside)
-                                      or str(path).startswith(held_path + os.sep))
-               for held_path, hold in holds.items())
-
-
 def process_uses(paths: list[Path], proc: str = tmp_sweep.PROC_DIR) -> tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable:
     """Process paths from /proc, or lsof where /proc is missing; unavailable when neither can run."""
     if not paths:
@@ -380,18 +375,23 @@ def read_pending_prune(record: Path) -> PendingWorktreePrune:
     raise ValueError(f"invalid pending prune record: {record}")
 
 
-def finish_pending_prune(record: Path, pending: PendingWorktreePrune) -> None:
-    for source in pending.sources:
-        try:
-            _ = source.stat()
-        except FileNotFoundError:
-            continue
-        _ = subprocess.run(["git", "--git-dir", str(source), "worktree", "prune"],
-                           capture_output=True, check=True)
-    record.unlink()
+def finish_pending_prune(record: Path, pending: PendingWorktreePrune, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> None:
+    with scratch.coordinate_removals(scratch_settings=scratch_settings) as removal:
+        scratch.require_no_folder_operations((pending.removed_path, *pending.sources), scratch_settings=scratch_settings)
+        removal.check_worktree_prune(pending.sources, records=(record,))
+        for source in pending.sources:
+            try:
+                _ = source.stat()
+            except FileNotFoundError:
+                continue
+            removal.prune_worktrees(source)
+        removal.delete(record, scratch.RemovalKind.FILE)
 
 
-def resume_pending_prunes(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+def resume_pending_prunes(*, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                          scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
     directory = state_dir(lint_settings=lint_settings)
     if not directory.exists():
         return
@@ -402,8 +402,8 @@ def resume_pending_prunes(*, lint_settings: conf.ConfigRead | UseConfiguredValue
                 pending = read_pending_prune(record)
                 # A partial delete must pass the normal removal checks again.
                 if not os.path.lexists(pending.removed_path):
-                    scratch.remove_marked(pending.removed_path)
-                    finish_pending_prune(record, pending)
+                    scratch.remove_marked(pending.removed_path, scratch_settings=scratch_settings)
+                    finish_pending_prune(record, pending, scratch_settings=scratch_settings)
             except (OSError, ValueError, scratch.ScratchError, subprocess.SubprocessError) as error:
                 print(f"folder audit: pending prune {record}: {error}", file=sys.stderr)
 
@@ -415,6 +415,10 @@ def remove(path: Path, changed: float, now: float, *,
     """Remove path and prune its worktrees; REMOVED, or why it stays."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
+    try:
+        scratch.require_no_folder_operations((path,), scratch_settings=scratch_settings)
+    except OSError as error:
+        return f"removal failed: {error}"
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     directory = state_dir(lint_settings=lint_settings)
@@ -431,14 +435,17 @@ def remove(path: Path, changed: float, now: float, *,
                 sources = list(dict.fromkeys(previous.sources + sources))
             if sources:
                 temporary = record.with_suffix(".tmp")
-                try:
-                    _ = temporary.write_text(json.dumps({"path": str(path), "sources": [str(source) for source in sources]}))
-                    os.replace(temporary, record)
-                finally:
-                    temporary.unlink(missing_ok=True)
+                fields = {"path": str(path), "sources": [str(source) for source in sources]}
+                with scratch.coordinate_removals(scratch_settings=scratch_settings) as removal:
+                    removal.check_paths((record, temporary))
+                    try:
+                        _ = temporary.write_text(json.dumps(fields))
+                        removal.replace(temporary, record)
+                    finally:
+                        scratch.delete_entry(temporary, scratch.RemovalKind.FILE, missing_ok=True)
             scratch.remove_marked(path, source_deletion=scratch.SourceDeletion.SWEEP, scratch_settings=scratch_settings)
             if sources:
-                finish_pending_prune(record, PendingWorktreePrune(path, sources))
+                finish_pending_prune(record, PendingWorktreePrune(path, sources), scratch_settings=scratch_settings)
         except (OSError, ValueError, scratch.ScratchError, subprocess.SubprocessError) as error:
             return f"removal failed: {error}"
 
@@ -477,7 +484,11 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
     outcomes = {path: listed_outcome for path, _ in found}
     if not due:
         return outcomes
-    holds = scratch.holds(scratch_settings=scratch_settings)
+    try:
+        holds = scratch.HeldScratchFolders.from_holds(scratch.read_holds(scratch_settings=scratch_settings))
+    except scratch.ScratchHoldsUnreadable as error:
+        outcomes.update((path, str(error)) for path in due)
+        return outcomes
     uses = process_uses(due, proc)
     used_entries = (tmp_sweep.entry_uses(uses.paths, sorted({str(path.parent) for path in due}))
                     if isinstance(uses, tmp_sweep.ProcessUsesKnown) else {})
@@ -491,8 +502,12 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
             continue
         if path in clones and now - changed[path] < policy.max_idle_seconds and not below_floor and path not in pending:
             continue
-        if held(path, holds):
-            outcomes[path] = HELD
+        try:
+            if holds.protects(path):
+                outcomes[path] = HELD
+                continue
+        except scratch.ScratchHoldsUnreadable as error:
+            outcomes[path] = str(error)
             continue
         if isinstance(uses, tmp_sweep.ProcessUsesUnavailable):
             outcomes[path] = tmp_sweep.NO_PROC
@@ -640,7 +655,7 @@ def audit(rust: Path, temps: list[Path], expected: frozenset[str] | None, now: f
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     if removing:
-        resume_pending_prunes(lint_settings=lint_settings)
+        resume_pending_prunes(lint_settings=lint_settings, scratch_settings=scratch_settings)
     changes: dict[Path, float | str] = {}
     limits = folder_scan_limits(lint_settings=lint_settings, scratch_settings=scratch_settings)
     listed_outcome = listed(lint_settings=lint_settings)
@@ -679,9 +694,17 @@ def message(folders: list[Loose], *,
 
 
 def clean_checkout_cargo_output(path: Path) -> None:
-    """Remove external output only after ownership, use stamps, locks and processes permit removal."""
+    """Check the checkout and its outputs under the scratch hold lock."""
     attempt_started = time.time()
     saved = scratch.save_cargo_outputs(path)
+    with scratch.coordinate_removals(wait_for_hold_lock=False) as removal:
+        scratch.check_cargo_cleanup(removal, path, saved)
+        clean_external_cargo_output(path, saved, attempt_started, removal)
+
+
+def clean_external_cargo_output(path: Path, saved: tuple[scratch.SavedCargoOutput, ...], attempt_started: float,
+                               removal: scratch.CoordinatedRemoval) -> None:
+    """Check ownership, use stamps, locks, and processes before removing external output."""
     if not any(not output.roots.build_directory.is_relative_to(path)
                and output.roots.build_directory.exists()
                and not output.borrows_build_directory()
@@ -731,13 +754,13 @@ def clean_checkout_cargo_output(path: Path) -> None:
             stamp = root / scratch.USE_STAMP
             if stamp.exists() and stamp.stat().st_mtime > attempt_started:
                 raise OSError(f"Cargo output was used after cleanup started: {root}")
-            shutil.rmtree(root)
-            remove_empty_mirror_parents(root, output.roots.workspace_root, path)
+            removal.delete(root, scratch.RemovalKind.TREE, repair_permissions=False)
+            remove_empty_mirror_parents(root, output.roots.workspace_root, path, removal)
         finally:
             sweep.release(locked.held)
 
 
-def remove_empty_mirror_parents(root: Path, workspace: Path, path: Path) -> None:
+def remove_empty_mirror_parents(root: Path, workspace: Path, path: Path, removal: scratch.CoordinatedRemoval) -> None:
     """Remove the empty folders above a build-dir that mirror the removal tree, so no empty gate folder stays."""
     tail = workspace.parts[1:]
     if not tail or root.parts[-len(tail):] != tail:
@@ -748,7 +771,8 @@ def remove_empty_mirror_parents(root: Path, workspace: Path, path: Path) -> None
     folder = root.parent
     while folder.is_relative_to(top):
         try:
-            folder.rmdir()
+            tmp_sweep.refuse_live_test_roots((folder,))
+            removal.delete(folder, scratch.RemovalKind.EMPTY_DIRECTORY)
         except OSError:
             return
         folder = folder.parent
@@ -759,7 +783,7 @@ def main(argv: list[str]) -> int:
         try:
             clean_checkout_cargo_output(Path(argv[1]).resolve())
             return 0
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, scratch.ScratchHoldsUnreadable) as error:
             print(f"Cargo output kept: {error}", file=sys.stderr)
             return scratch.CARGO_OUTPUT_KEPT_STATUS
     lint_settings = conf.read("lint")

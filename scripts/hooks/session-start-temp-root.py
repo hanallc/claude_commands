@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Give each Claude session its own folder and point its Bash commands' TMPDIR at it.
+"""Set TMPDIR for each Claude session.
 
-Test runs, mktemp and tempfile left their folders loose in /tmp, and nothing named their maker
-(user, 2026-10-27). Each session gets its session folder at start (and again at resume, clear and
-compact, should it be gone): /session/<shown name> (scripts/lib/session_folder.py), or
-/tmp/claude/session/<session id> until the session root exists. Claude Code reads the
-`export TMPDIR=...` line this hook writes to $CLAUDE_ENV_FILE before each Bash command. The path
-stays short, so a Unix socket made in TMPDIR fits the 104-byte limit on the Mac.
+The hook uses the current session root or a folder that remains in the former root.
+Claude Code reads the export from CLAUDE_ENV_FILE before each Bash command.
 """
 
 from __future__ import annotations
@@ -50,13 +46,16 @@ def main() -> int:
     if not isinstance(session_id, str) or not session_folder.SESSION_ID.fullmatch(session_id) or not env_file:
         return 0
     try:
-        # The session uses this TMPDIR after the startup hook exits.
-        path = session_folder.session_folder(session_id, cwd if isinstance(cwd, str) else "") or build_folders.create_build_folder(
-            build_folders.StableOwnerFolder(
-                session_id, build_folders.ExplicitBuildParent(session_folder.former_root()), mode=0o700))
+        path = session_folder.session_folder(session_id, cwd if isinstance(cwd, str) else "",
+                                             starting=fields.get("source") in ("startup", "resume"))
+        if path is None:
+            path = build_folders.create_build_folder(
+                build_folders.StableOwnerFolder(
+                    session_id, build_folders.ExplicitBuildParent(session_folder.former_root()), mode=0o700))
         line = export_line(path)
         env = Path(env_file)
-        if line not in (env.read_text(encoding="utf-8") if env.exists() else ""):
+        lines = env.read_text(encoding="utf-8").splitlines(keepends=True) if env.exists() else []
+        if next((item for item in reversed(lines) if item.startswith("export TMPDIR=")), "") != line:
             with env.open("a", encoding="utf-8") as handle:
                 _ = handle.write(line)
     except OSError as error:

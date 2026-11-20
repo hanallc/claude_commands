@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import hashlib
 import json
 import os
@@ -20,6 +19,7 @@ from typing import cast
 
 from scripts.disks import measure
 from scripts.lib import conf, copy_record, scratch, session_folder, transcripts
+from scripts.lib.scratch import mount_identity
 from scripts.lint import tmp_sweep
 from scripts.message import session_records
 from scripts.production import staff
@@ -27,8 +27,6 @@ from scripts.production import staff
 
 CLAUDE_TREE = re.compile(r"claude-[0-9]+")
 FOLDER_NAME = re.compile(r"[A-Za-z0-9._-]+")
-RENAME_NOREPLACE = 1
-RENAME_EXCL = 4
 DIRECTORY_OPEN = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 NO_ATIME = os.O_NOATIME if sys.platform == "linux" else 0
 JOURNAL = ".session-move"
@@ -140,6 +138,7 @@ class DestinationNames:
 
     def __init__(self, root: Path) -> None:
         self.root: Path = root
+        self.reservations: dict[Path, str] = {}
         try:
             self.staff: staff.StaffSnapshot = staff.local_snapshot()
         except staff.StaffAbsent:
@@ -162,6 +161,8 @@ class DestinationNames:
                 indexed = self.root / name
                 if not FOLDER_NAME.fullmatch(name) or name.startswith(".") or not is_directory(indexed):
                     raise MoveRefused(f"{index_path / session_id}: unsafe session index target {indexed}")
+                with open_directory(indexed) as folder:
+                    check_session_record(folder, indexed, session_id)
                 return SessionDestination(indexed, NamingRule.INDEX, session_id)
         row = self.staff.by_current_session(session_id) or self.staff.by_member_reference(session_id)
         if row is not None:
@@ -177,8 +178,16 @@ class DestinationNames:
                 rule = NamingRule.TRANSCRIPT
         base = session_folder.folder_name(member, session_id, cwd)
         owner = member.id if member is not None else session_id
-        folder = session_folder.select_folder(self.root, base, session_id)
-        return SessionDestination(folder, rule, session_id, owner)
+        number = 1
+        while True:
+            folder = self.root / (base if number == 1 else f"{base}-{number}")
+            reserved = self.reservations.get(folder, session_id)
+            if reserved == session_id:
+                record = session_folder.read_record(folder) if is_directory(folder) else None
+                if not os.path.lexists(folder) or (record is not None and record["session_id"] == session_id):
+                    self.reservations[folder] = session_id
+                    return SessionDestination(folder, rule, session_id, owner)
+            number += 1
 
     def remember(self, name: SessionDestination, root_fd: int) -> None:
         session_id = name.session_id
@@ -186,11 +195,16 @@ class DestinationNames:
         with child_directory(root_fd, session_folder.INDEX, create=True, mount=mount) as index:
             if name.rule is NamingRule.INDEX or stat_at(index, session_id) is not None:
                 check_index_link(index, session_id, name.folder)
+                with child_directory(root_fd, name.folder.name, mount=mount) as folder:
+                    check_session_record(folder, name.folder, session_id)
             if name.rule is NamingRule.INDEX:
                 return
             record = session_folder.FolderRecord(owner=name.owner, session_id=session_id)
             with child_directory(root_fd, name.folder.name, create=True, mount=mount) as folder:
-                write_record_at(folder, session_folder.RECORD, record)
+                if stat_at(folder, session_folder.RECORD) is None:
+                    write_record_at(folder, session_folder.RECORD, record)
+                else:
+                    check_session_record(folder, name.folder, session_id)
             try:
                 os.symlink(name.folder.name, session_id, dir_fd=index)
             except FileExistsError:
@@ -205,6 +219,12 @@ def check_index_link(index: int, session_id: str, folder: Path) -> None:
         matches = False
     if not matches:
         raise MoveRefused(f"{session_id}: session index entry conflicts with {folder}")
+
+
+def check_session_record(folder: int, path: Path, session_id: str) -> None:
+    record = session_folder.read_record_at(folder)
+    if record is None or record["session_id"] != session_id:
+        raise MoveRefused(f"{path}: session record does not name {session_id}")
 
 
 @dataclass(frozen=True)
@@ -257,17 +277,6 @@ class PlannedCopy:
     target: Path
     rule: NamingRule
     session_id: str
-
-
-def mount_identity(fd: int) -> int:
-    """Include bind mounts even when the device number stays the same."""
-    if sys.platform == "linux":
-        for line in Path(f"/proc/self/fdinfo/{fd}").read_text().splitlines():
-            key, _, value = line.partition(":")
-            if key == "mnt_id":
-                return int(value)
-        raise MoveRefused("cannot read directory mount identity")
-    return os.fstat(fd).st_dev
 
 
 def require_mount(fd: int, mount: int, name: str) -> None:
@@ -339,10 +348,7 @@ def stat_at(parent: int, name: str) -> os.stat_result | None:
 
 
 def unlink_at(parent: int, name: str) -> None:
-    try:
-        os.unlink(name, dir_fd=parent)
-    except FileNotFoundError:
-        pass
+    scratch.delete_entry(scratch.AnchoredRemoval(parent, name), scratch.RemovalKind.FILE, missing_ok=True)
 
 
 def write_record_at(parent: int, name: str, value: object) -> None:
@@ -353,27 +359,14 @@ def write_record_at(parent: int, name: str, value: object) -> None:
         _ = output.write(json.dumps(value) + "\n")
         output.flush()
         os.fsync(output.fileno())
-    os.replace(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+    scratch.replace_entry(scratch.AnchoredRemoval(parent, temporary), scratch.AnchoredRemoval(parent, name))
     os.fsync(parent)
 
 
 def rename_exclusive(source_parent: int, source: str, target_parent: int, target: str) -> None:
     """Publish through the checked directories and refuse an existing name."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    try:
-        if sys.platform == "darwin":
-            rename = cast(Callable[[int, bytes, int, bytes, int], int], libc.renameatx_np)
-            result = rename(source_parent, os.fsencode(source), target_parent, os.fsencode(target), RENAME_EXCL)
-        elif sys.platform == "linux":
-            rename = cast(Callable[[int, bytes, int, bytes, int], int], libc.renameat2)
-            result = rename(source_parent, os.fsencode(source), target_parent, os.fsencode(target), RENAME_NOREPLACE)
-        else:
-            raise MoveRefused("this platform does not support an exclusive rename")
-    except AttributeError as error:
-        raise MoveRefused("this platform does not support an exclusive rename") from error
-    if result != 0:
-        number = ctypes.get_errno()
-        raise OSError(number, os.strerror(number), source, None, target)
+    with scratch.coordinate_removals() as removal:
+        removal.rename_new(scratch.AnchoredRemoval(source_parent, source), scratch.AnchoredRemoval(target_parent, target))
     os.fsync(target_parent)
     os.fsync(source_parent)
 
@@ -564,7 +557,7 @@ def copy_entry(source: int, target: int, name: str, info: os.stat_result, kind: 
                 output.flush()
                 copy_metadata(entry, copied, info)
                 os.fsync(copied)
-            os.replace(PARTIAL_FILE, name, src_dir_fd=journal, dst_dir_fd=target)
+            scratch.replace_entry(scratch.AnchoredRemoval(journal, PARTIAL_FILE), scratch.AnchoredRemoval(target, name))
     else:
         if kind is HashedEntry.LINK:
             os.symlink(os.readlink(name, dir_fd=source), name, dir_fd=target)
@@ -631,35 +624,11 @@ class CopyDeletion:
             raise MoveRefused(f"{path}: source directory metadata changed before deletion")
 
 
-def remove_tree(parent: int, name: str, fd: int, mount: int, proof: CopyDeletion | None = None,
-                relative: Path = TREE_ROOT) -> None:
-    if not os.path.samestat(os.fstat(fd), os.stat(name, dir_fd=parent, follow_symlinks=False)):
-        raise MoveRefused(f"{name}: directory changed before deletion")
-    if proof is None:
-        os.fchmod(fd, 0o700)
-    else:
-        proof.check(fd if relative == TREE_ROOT else parent, relative, os.fstat(fd), mount)
-    for entry in tree_names(fd):
-        info = os.stat(entry, dir_fd=fd, follow_symlinks=False)
-        path = relative / entry
-        if stat.S_ISDIR(info.st_mode):
-            with child_directory(fd, entry, mount=mount) as child:
-                if entry_stamp(os.fstat(child)) != entry_stamp(info):
-                    raise MoveRefused(f"{path}: directory changed before deletion")
-                remove_tree(fd, entry, child, mount, proof, path)
-        else:
-            if proof is not None:
-                proof.check(fd, path, info, mount)
-                proof.check_parent_metadata(fd, relative)
-            os.unlink(entry, dir_fd=fd)
-    if proof is not None:
-        proof.check(fd if relative == TREE_ROOT else parent, relative, os.fstat(fd), mount)
-        if relative != TREE_ROOT:
-            proof.check_parent_metadata(parent, relative.parent)
-        if not os.path.samestat(os.fstat(fd), os.stat(name, dir_fd=parent, follow_symlinks=False)):
-            raise MoveRefused(f"{name}: directory changed before deletion")
-    os.rmdir(name, dir_fd=parent)
-    os.fsync(parent)
+def remove_tree(parent: int, name: str, fd: int, mount: int, proof: CopyDeletion | None = None) -> None:
+    require_mount(fd, mount, name)
+    with scratch.coordinate_removals() as removal:
+        removal.delete_at(scratch.AnchoredRemoval(parent, name), repair_permissions=proof is None,
+                          expected=os.fstat(fd), proof=proof, sync=True)
 
 
 def discard_stage(journal: int, stage: int) -> None:
@@ -692,34 +661,6 @@ def require_idle(source: Path, uses: SourceProcessUses) -> None:
 
 
 @dataclass(frozen=True)
-class OpenScratchHold:
-    path: Path
-    owner: str
-
-
-def open_scratch_holds(path: Path) -> tuple[OpenScratchHold, ...]:
-    """Read the ledger and refuse malformed records before moving a tree."""
-    try:
-        data = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except FileNotFoundError:
-        return ()
-    if not isinstance(data, dict):
-        raise MoveRefused(f"{path}: expected a map of scratch holds")
-    holds: list[OpenScratchHold] = []
-    for name, record in sorted(cast(dict[str, object], data).items()):
-        folder = Path(name)
-        if not folder.is_absolute() or ".." in folder.parts or not isinstance(record, dict):
-            raise MoveRefused(f"{name}: invalid scratch hold")
-        fields = cast(dict[str, object], record)
-        ended, owner = fields.get("ended", 0.0), fields.get("maker", "")
-        if not isinstance(ended, (int, float)) or not ended >= 0 or not isinstance(owner, str):
-            raise MoveRefused(f"{name}: invalid scratch hold fields")
-        if ended == 0:
-            holds.append(OpenScratchHold(folder, owner or "unknown"))
-    return tuple(holds)
-
-
-@dataclass(frozen=True)
 class FolderIdentity:
     device: int
     inode: int
@@ -730,45 +671,6 @@ class FolderIdentity:
 
     def matches(self, info: os.stat_result | None) -> bool:
         return info is not None and stat.S_ISDIR(info.st_mode) and self == self.of(info)
-
-
-def directory_chain(path: Path) -> dict[Path, FolderIdentity]:
-    identities: dict[Path, FolderIdentity] = {}
-    for folder in (*reversed(path.parents), path):
-        try:
-            info = folder.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            break
-        if not stat.S_ISDIR(info.st_mode):
-            raise MoveRefused(f"{folder}: expected a directory while checking scratch holds")
-        identities[folder] = FolderIdentity.of(info)
-    return identities
-
-
-def directory_ancestors(path: Path, chain: dict[Path, FolderIdentity],
-                        mounts: Sequence[measure.Mount]) -> set[FolderIdentity]:
-    identities = set(chain.values())
-    if sys.platform != "linux":
-        return identities
-    last = next(reversed(chain))
-    inode = chain[last]
-    device = f"{os.major(inode.device)}:{os.minor(inode.device)}"
-    visible = max(((len(mount.point.parts), index, mount) for index, mount in enumerate(mounts)
-                   if last.is_relative_to(mount.point)), default=None)
-    if visible is None or visible[2].device != device:
-        raise MoveRefused(f"{path}: cannot identify its mount")
-    mount = visible[2]
-    position = mount.root / last.relative_to(mount.point)
-    # A bind mount hides its original parents. Check each visible alias of its root.
-    for other in mounts:
-        if other.device != device or not position.is_relative_to(other.root):
-            continue
-        alias = Path(other.point / position.relative_to(other.root))
-        if alias != last:
-            physical = directory_chain(alias)
-            if physical.get(alias) == inode:
-                identities.update(physical.values())
-    return identities
 
 
 @dataclass(frozen=True)
@@ -964,10 +866,19 @@ def prepare_copy(job: MoveJournal, journal: int, source: int, session_pids: froz
 def resume_copy(job: MoveJournal, journal: int, roots: MoveRoots, root_fd: int,
                 session_pids: frozenset[int]) -> int:
     move = job.move
+    folder = roots.sessions / move.target.relative_to(roots.sessions).parts[0]
+    mount = mount_identity(root_fd)
+    with child_directory(root_fd, session_folder.INDEX, mount=mount) as index:
+        check_index_link(index, move.session_id, folder)
+    with child_directory(root_fd, folder.name, mount=mount) as directory:
+        check_session_record(directory, folder, move.session_id)
     with source_parent(roots, move) as source:
         old = stat_at(source, move.source.name)
         if old is not None and not job.source.matches(old):
             raise MoveRefused("source is no longer the journaled directory")
+        if old is not None:
+            with scratch.coordinate_removals() as removal:
+                removal.check(move.source)
         with destination_parent(root_fd, roots.sessions, move.target, create=False) as target:
             new = stat_at(target, move.target.name)
         if isinstance(job.state, CopyInProgress):
@@ -1080,7 +991,7 @@ def start_copy(move: PlannedCopy, roots: MoveRoots, root_fd: int, session_pids: 
             raise JournaledLiveSource(str(error)) from error
 
 
-def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, holds: tuple[OpenScratchHold, ...],
+def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, holds: dict[str, scratch.Hold],
                     mounts: Sequence[measure.Mount], summary: MoveSummary, *, dry_run: bool) -> None:
     session_pids = frozenset(row["pid"] for row in names.live.values())
     entries = tuple(scratchpad_leaves(roots))
@@ -1091,18 +1002,12 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
         pending = read_journal(journal, roots)
         if isinstance(pending, MoveJournal):
             sources.add(pending.move.source)
-        source_chains = {source: directory_chain(source) for source in sources} if holds else {}
-        source_ancestors = {source: directory_ancestors(source, chain, mounts)
-                            for source, chain in source_chains.items()}
-        scratch_chain = directory_chain(roots.scratch) if holds else {}
-        for hold in holds:
-            chain = directory_chain(hold.path)
-            ancestors = directory_ancestors(hold.path, chain, mounts)
-            held_folder = chain.get(hold.path)
-            overlaps = {source for source, source_chain in source_chains.items()
-                        if source_chain.get(source) in ancestors or held_folder in source_ancestors[source]}
-            if overlaps or scratch_chain.get(roots.scratch) in ancestors:
-                kept(hold.path, f"open scratch hold, owner {hold.owner}")
+        for name, hold in sorted(holds.items()):
+            protection = scratch.HeldScratchFolders.from_holds({name: hold}, mounts=mounts)
+            overlaps = {source for source in sources if protection.protects(source)}
+            if overlaps or protection.protects(roots.scratch):
+                owner = hold["maker"] or "unknown"
+                kept(Path(name), f"open scratch hold, owner {owner}")
                 blocked.update(overlaps)
                 summary.refused_other += 1
         if summary.refused_other:
@@ -1162,13 +1067,17 @@ def moves(roots: MoveRoots, summary: MoveSummary, *, dry_run: bool) -> None:
     if any(roots.sessions.is_relative_to(path) or path.is_relative_to(roots.sessions)
            for path in (roots.scratch, roots.former_sessions)):
         raise MoveRefused("the session root overlaps a source root")
-    scratch_settings = conf.read("scratch")
-    holds_path = scratch.holds_file(scratch_settings=scratch_settings)
+    tmp_sweep.refuse_live_test_roots((roots.sessions, roots.former_sessions, roots.former_temp))
+    paths = (roots.sessions, roots.scratch, roots.former_sessions, roots.former_temp)
+    settings = conf.read("scratch")
+    scratch.require_no_folder_operations(paths, scratch_settings=settings)
     with (open_directory(roots.sessions) as root,
           nullcontext() if dry_run else session_folder.root_lock(roots.sessions),
-          nullcontext() if dry_run else scratch.locked_holds(scratch_settings=scratch_settings)):
+          scratch.coordinate_removals(dry_run=dry_run, scratch_settings=settings) as removal):
+        scratch.require_no_folder_operations(paths, scratch_settings=settings)
+        holds = {name: hold for name, hold in removal.holds.items() if hold["ended"] == 0}
         move_candidates(
-            roots, root, DestinationNames(roots.sessions), open_scratch_holds(holds_path),
+            roots, root, DestinationNames(roots.sessions), holds,
             measure.read_mounts(), summary, dry_run=dry_run,
         )
 
@@ -1181,7 +1090,7 @@ def main(argv: list[str]) -> int:
     summary = MoveSummary()
     try:
         moves(MoveRoots.configured(), summary, dry_run=dry_run)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, scratch.ScratchHoldsUnreadable) as error:
         print(f"session_move: {error}", file=sys.stderr)
         summary.refused_other += 1
     action = "would move" if dry_run else "moved"

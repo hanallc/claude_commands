@@ -160,11 +160,12 @@ def phone_calls(send: mock.Mock) -> list[str]:
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     forbid_real_sender()
-    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    _ = unittest.enterModuleContext(fake_cargo_output_roots())
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(dir="/tmp"))).resolve()
+    _ = unittest.enterModuleContext(mock.patch.object(tempfile, "tempdir", str(root)))
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
-        **config_environment(root), "USER_ZONE": "America/Los_Angeles",
+        **config_environment(root), "TMPDIR": str(root), "USER_ZONE": "America/Los_Angeles",
     }))
+    _ = unittest.enterModuleContext(fake_cargo_output_roots())
 
 
 @contextmanager
@@ -5245,8 +5246,14 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
 
     def test_temporary_sweep_failure_episode_survives_not_due_and_recovers(self) -> None:
         base = self.base()
+        state = base / "state"
+        home = base / "home"
+        roots = tmp_sweep.Roots((str(base / "sweep-input"),), (), ())
         now = time.time()
         with (mock.patch.object(sweep, "hold_floor", return_value=0),
+              mock.patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(state)}),
+              mock.patch.object(Path, "home", return_value=home),
+              mock.patch.object(tmp_sweep, "default_roots", return_value=roots),
               mock.patch.object(tmp_sweep, "run", return_value=2) as assess,
               mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send,
               mock.patch.object(time, "time", return_value=now) as clock,
@@ -5265,7 +5272,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
             clock.return_value += tmp_sweep.RUN_INTERVAL_SECONDS
             self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 2)
         self.assertEqual(send.call_count, 2)
-        self.assertTrue((base / tmp_sweep.STAMP_NAME).is_file())
+        self.assertTrue((state / tmp_sweep.STAMP_NAME).is_file())
         self.assertTrue(all("status 2" in cast(str, call.args[0]) for call in send.call_args_list))
         cast(mock.Mock, sweep.send_phone_push).assert_not_called()
         self.assertTrue(all("phone" not in call.kwargs for call in send.call_args_list))

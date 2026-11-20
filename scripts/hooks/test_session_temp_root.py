@@ -17,8 +17,14 @@ HOOK = Path(__file__).resolve().parent / "session-start-temp-root.py"
 
 class SessionTempRootTests(unittest.TestCase):
     def run_hook(self, base: Path, payload: object, env_file: Path | None, **extra: str) -> None:
-        environment = {**os.environ, "SESSION_FORMER_ROOT": str(base / "former"),
-                       "SESSION_TEMP_ROOT": str(base / "session")}
+        staff = base / "staff.json"
+        _ = staff.write_text('{"schema": 2, "rows": []}', encoding="utf-8")
+        config = base / "config"
+        config.mkdir(exist_ok=True)
+        _ = (config / "build_folders.conf").write_text(f"roots.session={base / 'session'}\n", encoding="utf-8")
+        environment = {**os.environ, "TMPDIR": str(base), "CONF_DIR": str(config), "STAFF_FILE": str(staff),
+                       "PYTHONDONTWRITEBYTECODE": "1", "SESSION_FORMER_ROOT": str(base / "former"),
+                       "SESSION_TEMP_ROOT": str(base / "session"), "SESSION_PREVIOUS_ROOT": str(base / "previous")}
         for name in ("CLAUDE_ENV_FILE", "CLAUDE_SESSION_FOLDER"):
             _ = environment.pop(name, None)
         environment.update(extra)
@@ -34,7 +40,7 @@ class SessionTempRootTests(unittest.TestCase):
         self.assertEqual(shown, str(root))
 
     def test_without_the_session_root_the_former_root_is_made_and_exported_once(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(dir="/tmp") as folder:
             base = Path(folder)
             env_file = base / "env.sh"
             for _ in range(2):
@@ -46,7 +52,7 @@ class SessionTempRootTests(unittest.TestCase):
             self.assert_exported(env_file, root)
 
     def test_with_the_session_root_a_session_without_staff_takes_its_working_folder_name(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(dir="/tmp") as folder:
             base = Path(folder)
             (base / "session").mkdir()
             env_file = base / "env.sh"
@@ -58,8 +64,22 @@ class SessionTempRootTests(unittest.TestCase):
             self.assertFalse((base / "former").exists())
             self.assert_exported(env_file, root)
 
+    def test_a_running_session_keeps_the_former_tmpdir(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as folder:
+            base = Path(folder)
+            (base / "session").mkdir()
+            old = base / "previous" / "verify"
+            old.mkdir(parents=True)
+            _ = (old / ".session.json").write_text(json.dumps({"owner": "m1", "session_id": "live-id"}))
+            (old.parent / ".id").mkdir()
+            (old.parent / ".id" / "live-id").symlink_to(old.name)
+            env_file = base / "env.sh"
+            self.run_hook(base, {"session_id": "live-id", "source": "compact"}, env_file, TMPDIR=str(old))
+            self.assert_exported(env_file, old)
+            self.assertEqual(list((base / "session").iterdir()), [])
+
     def test_a_launcher_folder_is_adopted(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(dir="/tmp") as folder:
             base = Path(folder)
             made = base / "session" / "verify"
             made.mkdir(parents=True)
@@ -71,7 +91,7 @@ class SessionTempRootTests(unittest.TestCase):
             self.assertEqual(record, {"owner": "member-1", "session_id": "new-id"})
 
     def test_a_bad_session_id_or_no_env_file_does_nothing(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(dir="/tmp") as folder:
             base = Path(folder)
             self.run_hook(base, {"session_id": "../x"}, base / "env.sh")
             self.run_hook(base, {"session_id": "abc"}, None)

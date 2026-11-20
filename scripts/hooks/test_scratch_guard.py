@@ -48,14 +48,31 @@ class ScratchGuardTests(unittest.TestCase):
         self.home, self.temp = base / "home", base / "temp"
         # session_root is the former root; new_root is the session root, absent until a test makes it.
         self.session_root, self.new_root = base / "sessions", base / "session"
-        self.enterContext(mock.patch.dict(os.environ, {"SESSION_FORMER_ROOT": str(self.session_root),
-                                                       "SESSION_TEMP_ROOT": str(self.new_root)}))
+        staff = base / "staff.json"
+        _ = staff.write_text('{"schema": 2, "rows": []}', encoding="utf-8")
+        config = base / "config"
+        config.mkdir()
+        _ = (config / "build_folders.conf").write_text(
+            f"roots.scratch={base / 'scratch' / 'tasks'}\nroots.workspace={base / 'scratch' / 'copies'}\n",
+            encoding="utf-8",
+        )
+        self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(config), "TMPDIR": str(self.temp), "STAFF_FILE": str(staff),
+            "SESSION_FORMER_ROOT": str(self.session_root), "SESSION_TEMP_ROOT": str(self.new_root),
+            "SESSION_PREVIOUS_ROOT": "", "PYTHONDONTWRITEBYTECODE": "1",
+        }))
         # The home folders a real home holds; a new folder directly in home is refused.
         (self.home / "rust" / "hana").mkdir(parents=True)
         (self.home / "worktrees").mkdir()
         self.temp.mkdir()
         # A name no real folder in /tmp holds, so the real /tmp root judges it as new.
         self.name = f"scratch-guard-{secrets.token_hex(6)}"
+
+    def test_hook_uses_fixture_configuration_under_the_private_root(self) -> None:
+        config = Path(os.environ["CONF_DIR"])
+        self.assertEqual(config.parent, self.temp.parent)
+        self.assertTrue((config / "build_folders.conf").is_file())
+        self.assert_refused(f"mkdir {self.temp / 'new'}", str(self.temp / "new"))
 
     def run_hook(self, command: str | list[str], cwd: Path | None = None, tool: str = "Bash",
                  temp: Path | None = None) -> str:
@@ -130,6 +147,18 @@ class ScratchGuardTests(unittest.TestCase):
             remake_session_temp(json.dumps({"session_id": "scratch-session"}))
             mkdir.assert_not_called()
         self.assertEqual(stat.S_IMODE(own.stat().st_mode), 0o750)
+
+    def test_a_live_former_session_can_make_a_folder_in_its_tmpdir(self) -> None:
+        previous = self.new_root.parent / "previous"
+        own = previous / "verify"
+        own.mkdir(parents=True)
+        _ = (own / ".session.json").write_text(json.dumps({"owner": "m1", "session_id": "scratch-session"}))
+        (previous / ".id").mkdir()
+        (previous / ".id" / "scratch-session").symlink_to(own.name)
+        with mock.patch.dict(os.environ, {"SESSION_PREVIOUS_ROOT": str(previous)}):
+            self.assertEqual(self.run_hook("mkdir \"$TMPDIR/test-output\"", temp=own), "")
+            self.assert_refused(f"mkdir {previous}/loose", str(previous / "loose"))
+        self.assertFalse(self.session_root.exists())
 
     def test_a_deleted_session_folder_in_the_session_root_is_made_again(self) -> None:
         own = self.new_root / "verify"

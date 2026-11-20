@@ -95,8 +95,8 @@ except FileNotFoundError:
 import json
 from importlib import import_module
 import os
+import pwd
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -110,8 +110,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
-from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
+from scripts.lib import build_folders, conf, copy_record, git_files, scratch, session_folder, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
+from scripts.lib.testing_folders import RUN_FOLDER_ENV
 from scripts.lib.python_startup.sitecustomize import dataclass_code_root, dataclass_code_usable  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -132,6 +133,7 @@ SESSION_ENTRY_MIN_BYTES = GIB
 RUN_INTERVAL_SECONDS = HOUR_SECONDS
 LOG_KEEP_SECONDS = 7 * 24 * HOUR_SECONDS
 TMP_ROOT = "/tmp/claude"
+TEST_SWEEP_ENV = "TMP_SWEEP_TEST"
 # Each Claude session's TMPDIR is SESSION_TEMP_ROOT/<session id> (hooks/session-start-temp-root.py),
 # and each run's is <run folder>/RUN_TEMP_NAME; the entries in both are judged with the 4 h rule.
 class SessionTemporaryRoot(Protocol):
@@ -268,10 +270,16 @@ class Roots:
     copies: tuple[str, ...] = ()
     # Dataclass code cache roots; prune_dataclass_code judges each entry of each cache tag folder.
     dataclass_code: tuple[str, ...] = ()
+    former_sessions: tuple[str, ...] = field(default=(), kw_only=True)
     verify_temp_name: re.Pattern[str] = field(default_factory=verify_temp_name, kw_only=True)
+    recover_all_folder_operations: bool = field(default=False, kw_only=True)
+
+    def scratch_roots(self) -> tuple[str, ...]:
+        return self.scratch + tuple(os.path.join(root, scratch.ADOPTION_LEFTOVERS) for root in self.scratch)
 
     def all(self) -> tuple[str, ...]:
-        return self.plain + self.runs + self.projects + self.temp + self.scratch + self.sessions + self.copies
+        return (self.plain + self.runs + self.projects + self.temp + self.scratch_roots() + self.sessions
+                + self.former_sessions + self.copies)
 
     def entries(self, root: str, *,
         scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
@@ -279,6 +287,8 @@ class Roots:
         """The entries of root the sweep judges, without retaining the directory."""
         if isinstance(scratch_settings, UseConfiguredValue):
             scratch_settings = conf.read("scratch")
+        if Path(root).name == scratch.ADOPTION_LEFTOVERS and Path(root).is_symlink():
+            return
         if root in self.copies:
             for pair in listing(root):
                 if pair.is_dir(follow_symlinks=False):
@@ -330,7 +340,7 @@ class Roots:
                 made = now
             running = verify_running(int(verify.group(1)), made, now, proc)
             return Limit(float("-inf"), VERIFY_RUNS) if running else Limit(float("inf"), RECENT)
-        if root in self.scratch:
+        if root in self.scratch_roots():
             record = scratch.task_of(Path(entry.path), scratch_settings=scratch_settings)
             if isinstance(record, copy_record.Registered) and scratch.ended(record.task, now):
                 return Limit(float("inf"), RECENT)
@@ -378,6 +388,77 @@ class Sweep:
         self.kept.setdefault(reason, []).append(path)
 
 
+def under_test() -> bool:
+    """Detect a test process or a child that a test starts."""
+    return (any(name in sys.modules for name in ("unittest", "pytest"))
+            or any(os.environ.get(name) for name in (TEST_SWEEP_ENV, RUN_FOLDER_ENV, "PYTEST_CURRENT_TEST")))
+
+
+def protected_root_configs(home: Path) -> tuple[Path, ...]:
+    return (Path(__file__).absolute().parents[2] / "config" / "build_folders.conf",
+            home / ".claude" / "config" / "build_folders.conf")
+
+
+type FileIdentity = tuple[int, int]
+
+
+def file_identity(path: Path) -> FileIdentity | None:
+    try:
+        info = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return info.st_dev, info.st_ino
+
+
+def refuse_live_test_roots(roots: Sequence[str | Path]) -> None:
+    """Refuse live roots before a test can list them."""
+    if not roots or not under_test():
+        return
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+    def absolute(path: str | Path) -> Path:
+        name = os.fspath(path)
+        expanded = home / name[2:] if name.startswith("~/") else Path(name).expanduser()
+        return Path(os.path.abspath(expanded))
+
+    mounts = {Path(name) for name in ("/tmp", "/private/tmp", "/build", "/dev/shm")}
+    live = {Path("/tmp/claude"), Path("/private/tmp/claude"), Path("/session"), home / "session",
+            Path(f"/tmp/claude-{os.getuid()}"), Path(f"/private/tmp/claude-{os.getuid()}"),
+            Path(f"/var/tmp/dataclass-code-{os.getuid()}"), home / nextest_log.DIRECTORY,
+            home / Path(DEFAULT_STATE_DIR).relative_to("~"), home / ".local/state/scratch"}
+    temporary = os.environ.get("TMPDIR") or "/tmp"
+    test_folder = os.environ.get(RUN_FOLDER_ENV)
+    if test_folder and absolute(temporary).is_relative_to(absolute(test_folder)):
+        temporary = "/tmp"
+    for file in protected_root_configs(home):
+        if file.is_file():
+            live.update(absolute(value.replace("${TMPDIR}", temporary))
+                        for key, value in conf.read(file).values().items() if key.startswith("roots.") and value)
+    live.difference_update(mounts)
+
+    def blocked(path: Path, mount_roots: set[Path], live_roots: set[Path]) -> bool:
+        return (any(path == root or path in root.parents for root in mount_roots)
+                or any(path.is_relative_to(root) or path in root.parents for root in live_roots))
+
+    paths = tuple(absolute(root) for root in roots)
+    for path in paths:
+        if blocked(path, mounts, live):
+            raise ValueError(f"tmp sweep: test cannot use live root {path}")
+    real_mounts = {root.resolve() for root in mounts}
+    real_live = {root.resolve() for root in live} - real_mounts
+    resolved = tuple(path.resolve() for path in paths)
+    for path, real in zip(paths, resolved, strict=True):
+        if blocked(real, real_mounts, real_live):
+            raise ValueError(f"tmp sweep: test cannot use live root {path}")
+
+    # A bind mount keeps its own path but has the same file identity.
+    live_ids = {key for root in real_live if (key := file_identity(root)) is not None}
+    mount_ids = {key for root in real_mounts if (key := file_identity(root)) is not None}
+    for path, real in zip(paths, resolved, strict=True):
+        if file_identity(real) in mount_ids or any(file_identity(parent) in live_ids for parent in (real, *real.parents)):
+            raise ValueError(f"tmp sweep: test cannot use live root {path}")
+
+
 def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = None,
                   session_roots: Sequence[str] | None = None, temp_roots: Sequence[str] | None = None,
                   scratch_roots: Sequence[str] | None = None, wide_roots: Sequence[str] | None = None,
@@ -386,7 +467,13 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = No
     adds the dataclass code cache root. The Mac's /tmp is a link to
     /private/tmp, and lsof prints real paths. The wide root is /tmp alone: $TMPDIR and the Mac's
     temp folder hold app state, and macOS clears its own."""
+    if under_test():
+        project_parents = ("/tmp",) if session_roots is None else session_roots
+        run_parents = ((*session_folder.configured_roots(), unit_runs.RUN_ROOT, unit_runs.FORMER_RUN_ROOT)
+                       if run_roots is None else run_roots)
+        refuse_live_test_roots((tmp_root, *run_parents, *project_parents))
     runs = tuple(str(root) for root in unit_runs.run_roots()) if run_roots is None else run_roots
+    refuse_live_test_roots(runs)
     sessions_at = session_scratch_roots() if session_roots is None else session_roots
     projects = tuple(entry.path for root in sessions_at for entry in listing(os.path.realpath(root))
                      if entry.name.startswith("-") and entry.is_dir(follow_symlinks=False))
@@ -399,12 +486,16 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = No
     session_parent = str(_session_temp.temp_parent()) if SESSION_TEMP_ROOT == _session_temp.ROOT else SESSION_TEMP_ROOT
     session_temp = (session_parent,) if session_temp_roots is None else session_temp_roots
     copies = (copy_record.copies_root(), copy_record.FORMER_COPIES_ROOT) if live else (Path(tmp_root) / "copies",)
+    former_roots = session_folder.configured_roots()[1:] if live else ()
+    refuse_live_test_roots((*session_temp, *former_roots))
+    former_sessions = tuple(os.path.realpath(root) for root in former_roots if root.is_dir())
     return Roots((os.path.realpath(tmp_root),), tuple(os.path.realpath(root) for root in runs), projects,
                  temp_real, tuple(dict.fromkeys(os.path.realpath(root) for root in task_roots if os.path.isdir(root))),
                  tuple(real for root in wide if (real := os.path.realpath(root)) in temp_real),
                  tuple(os.path.realpath(root) for root in session_temp if os.path.isdir(root)),
                  tuple(dict.fromkeys(os.path.realpath(root) for root in copies)),
-                 (dataclass_code_root(),) if live else ())
+                 (dataclass_code_root(),) if live else (), former_sessions=former_sessions,
+                 recover_all_folder_operations=live)
 
 
 def session_scratch_roots() -> tuple[str, ...]:
@@ -527,32 +618,62 @@ class ProcessUsesUnavailable:
     """Process use cannot be checked; candidates must stay."""
 
 
-def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
-    """Read matching process paths and report processes with unreadable working directories.
-
-    Ignore processes that end during the scan.
-    """
-    if not os.path.isdir(proc):
+def process_paths(proc: str, prefix: str | tuple[str, ...], *,
+                  quiesce_fds: frozenset[int] | None = None) -> ProcessUsesKnown | ProcessUsesUnavailable:
+    """Read matching process paths. Report unreadable processes during a quiesce check."""
+    try:
+        with os.scandir(proc) as entries:
+            processes = list(entries)
+    except OSError:
         return ProcessUsesUnavailable()
     found: list[tuple[str, int, str]] = []
-    unreadable: list[int] = []
-    for entry in listing(proc):
+    unreadable: set[int] = set()
+    for entry in processes:
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
+        if quiesce_fds is None:
+            own = True
+        else:
+            try:
+                own = entry.stat(follow_symlinks=False).st_uid == os.geteuid()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                unreadable.add(pid)
+                continue
+        links = (("cwd", WORKS_IN),) if quiesce_fds is None else (("cwd", WORKS_IN), ("root", "uses root"))
+        for name, how in links:
+            try:
+                target = os.readlink(os.path.join(entry.path, name))
+            except PermissionError:
+                if own:
+                    unreadable.add(pid)
+                continue
+            except OSError:
+                continue
+            if target.startswith(prefix):
+                found.append((target, pid, how))
+        if quiesce_fds is None and pid in unreadable:
+            continue
         try:
-            cwd = os.readlink(os.path.join(entry.path, "cwd"))
+            with os.scandir(os.path.join(entry.path, "fd")) as entries:
+                fds = list(entries)
         except PermissionError:
-            unreadable.append(pid)
-            continue
+            if own and quiesce_fds is not None:
+                unreadable.add(pid)
+            fds = []
         except OSError:
-            continue
-        if cwd.startswith(prefix):
-            found.append((cwd, pid, WORKS_IN))
-        fds = os.path.join(entry.path, "fd")
-        for fd in listing(fds):
+            fds = []
+        for fd in fds:
+            if quiesce_fds is not None and pid == os.getpid() and fd.name.isdigit() and int(fd.name) in quiesce_fds:
+                continue
             try:
                 target = os.readlink(fd.path)
+            except PermissionError:
+                if own and quiesce_fds is not None:
+                    unreadable.add(pid)
+                continue
             except OSError:
                 continue
             if target.startswith(prefix):
@@ -573,10 +694,31 @@ def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown 
                         found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, MAPS_FILE))
         except OSError:
             continue
-    return ProcessUsesKnown(found, tuple(unreadable))
+    return ProcessUsesKnown(found, tuple(sorted(unreadable)))
 
 
-def lsof_paths(prefix: str | tuple[str, ...], *, require_complete: bool = False) -> ProcessUsesKnown | ProcessUsesUnavailable:
+def require_quiescent(aliases: scratch.MountAliases, lock_fds: frozenset[int]) -> None:
+    """Check cwd, root, open files, and mapped files through all mount aliases."""
+    path = aliases.source
+    prefix = tuple(str(alias) for alias in aliases.paths)
+    if sys.platform == "linux":
+        uses = process_paths(PROC_DIR, prefix, quiesce_fds=lock_fds)
+    else:
+        uses = lsof_paths(prefix, require_complete=True, lock_fds=lock_fds)
+    if isinstance(uses, ProcessUsesUnavailable):
+        raise scratch.RemovalRefused(f"{path}: cannot check process use")
+    for target, pid, how in uses.paths:
+        if aliases.contains(Path(target.removesuffix(DELETED_SUFFIX))):
+            raise scratch.RemovalRefused(f"{path}: process {pid} {how}")
+    if uses.unreadable_cwd_pids:
+        raise scratch.RemovalRefused(f"{path}: cannot check process {uses.unreadable_cwd_pids[0]}")
+
+
+_NO_PROCESS_LOCK_FDS: frozenset[int] = frozenset()
+
+
+def lsof_paths(prefix: str | tuple[str, ...], *, require_complete: bool = False,
+               lock_fds: frozenset[int] = _NO_PROCESS_LOCK_FDS) -> ProcessUsesKnown | ProcessUsesUnavailable:
     """Process paths from one lsof scan; unavailable when lsof cannot run or prints nothing."""
     try:
         completed = subprocess.run(LSOF, capture_output=True, text=True, errors="replace",
@@ -586,11 +728,12 @@ def lsof_paths(prefix: str | tuple[str, ...], *, require_complete: bool = False)
     # lsof exits 1 when it cannot read some process; the lines it printed still hold.
     if completed.returncode != 0 and (require_complete or completed.returncode != 1):
         return ProcessUsesUnavailable()
-    return (ProcessUsesKnown(parse_lsof(completed.stdout, prefix))
+    return (ProcessUsesKnown(parse_lsof(completed.stdout, prefix, lock_fds=lock_fds))
             if completed.stdout else ProcessUsesUnavailable())
 
 
-def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]]:
+def parse_lsof(text: str, prefix: str | tuple[str, ...], *,
+               lock_fds: frozenset[int] = _NO_PROCESS_LOCK_FDS) -> list[tuple[str, int, str]]:
     """Read each process path and its access from `lsof -F pfan` output."""
     found: list[tuple[str, int, str]] = []
     pid = 0
@@ -600,7 +743,10 @@ def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int,
         if field == "p" and value.isdigit():
             pid = int(value)
         elif field == "f":
-            how = WORKS_IN if value == LSOF_CWD else MAPS_FILE if value in LSOF_MAPPED else HOLDS_FILE
+            if pid == os.getpid() and value.isdigit() and int(value) in lock_fds:
+                how = ""
+            else:
+                how = WORKS_IN if value == LSOF_CWD else MAPS_FILE if value in LSOF_MAPPED else HOLDS_FILE
         elif field == "a" and value in ("w", "u") and how == HOLDS_FILE:
             how = WRITES_FILE
         elif field == "n" and pid and how and value.startswith(prefix):
@@ -663,18 +809,11 @@ def last_change(path: str, limit: Limit) -> tuple[float, int] | str:
 
 
 def delete_tree(path: str) -> None:
-    """Delete a file, a link or a folder. A folder goes through shutil.rmtree, then once more after
-    making each folder writable: a copy of a read-only tree (a nix store path, a Go module cache)
-    keeps its modes, and rmtree cannot empty such a folder."""
-    if os.path.islink(path) or not os.path.isdir(path):
-        os.unlink(path)
-        return
+    """Remove a file, link, or tree through the hold check."""
     try:
-        shutil.rmtree(path)
-    except PermissionError:
-        for folder, _, _ in os.walk(path):
-            os.chmod(folder, 0o700)
-        shutil.rmtree(path)
+        scratch.delete_entry(Path(path), scratch.RemovalKind.TREE)
+    except scratch.ScratchHoldsUnreadable as error:
+        raise scratch.RemovalRefused(str(error)) from error
 
 
 class RunKeepReason(Enum):
@@ -904,6 +1043,7 @@ class GitWork(Enum):
     SAVED = "all git work is saved"
     UNSAVED = UNSAVED_WORK
     UNREADABLE = UNREADABLE
+    REGISTERED_WORKTREE = "a Git worktree registration still exists"
 
 
 def checked_git(repo: Path, *arguments: str) -> str:
@@ -952,7 +1092,8 @@ def repo_git_work(repo: Path) -> GitWork:
     return GitWork.UNSAVED if remaining.strip() else GitWork.SAVED
 
 
-def git_work(path: Path, depth: int = GIT_DEPTH, *, verified_repos: tuple[Path, ...] = ()) -> GitWork:
+def git_work(path: Path, depth: int = GIT_DEPTH, *, verified_repos: tuple[Path, ...] = (),
+             keep_worktree_registrations: bool = False) -> GitWork:
     """Check all worktrees down to a fixed depth. Never follow links."""
     try:
         if path.is_symlink() or not path.is_dir():
@@ -963,15 +1104,21 @@ def git_work(path: Path, depth: int = GIT_DEPTH, *, verified_repos: tuple[Path, 
             result = repo_git_work(path)
             if result is not GitWork.SAVED:
                 return result
+        if keep_worktree_registrations and (path / ".git").is_file():
+            checkout = git_files.at(path)
+            if (checkout.git_dir.parent == (checkout.common_dir / "worktrees").resolve()
+                    and os.path.lexists(checkout.git_dir / "gitdir")):
+                return GitWork.REGISTERED_WORKTREE
         if depth:
             for entry in path.iterdir():
                 if entry.name == ".git":
                     continue
-                result = git_work(entry, depth - 1, verified_repos=verified_repos)
+                result = git_work(entry, depth - 1, verified_repos=verified_repos,
+                                  keep_worktree_registrations=keep_worktree_registrations)
                 if result is not GitWork.SAVED:
                     return result
         return GitWork.SAVED
-    except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired):
+    except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired, git_files.UnreadableGitFiles):
         return GitWork.UNREADABLE
 
 
@@ -988,11 +1135,22 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
     owns it by the entry's own record."""
     if entry.path in roots.all():
         return ROOT
-    if root in roots.scratch:
+    if root in roots.scratch_roots():
         task = scratch.task_of(Path(entry.path), scratch_settings=scratch_settings)
         if isinstance(task, copy_record.UnreadableRecord):
             return task.reason
         return ROW_WAITS if isinstance(task, copy_record.Registered) and task.task.startswith("row:") else None
+    if root in roots.former_sessions:
+        if entry.name in (session_folder.INDEX, session_folder.LOCK):
+            return ROOT
+        if live is None:
+            return NO_SESSIONS
+        if entry.is_dir(follow_symlinks=False):
+            holder = session_folder.read_record(Path(entry.path))
+            if holder is None:
+                return UNREADABLE
+            if holder["session_id"] in live:
+                return SESSION_RUNS
     if root in roots.projects or root in roots.sessions:
         if live is None:
             return NO_SESSIONS
@@ -1046,6 +1204,10 @@ class RemovableEntry:
     reason: str = "idle and unused"
 
 
+class FormerSessionEntry(RemovableEntry):
+    """A former session folder that the sweep must check under its root lock."""
+
+
 class ClosedPhaseEntry(RemovableEntry):
     """The phase is closed under a director or session worktree guard."""
 
@@ -1057,6 +1219,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     inspection: scratch.RemoteInspection = scratch.RemoteInspection.LOCAL_ONLY,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Apply the ownership, use and idle checks shared by timed and hand cleanup."""
+    refuse_live_test_roots(roots.all())
     from scripts.production import staff
 
     if isinstance(scratch_settings, UseConfiguredValue):
@@ -1065,8 +1228,8 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
         lint_settings = conf.read("lint")
     if not roots.all():
         return
-    # The scan keeps only paths under the roots' common folder (/tmp), which entry_uses then sorts.
-    prefix = os.path.join(os.path.commonpath(roots.all()), "")
+    # Scan once and keep paths below the roots.
+    prefix = tuple(os.path.join(root, "") for root in roots.all())
     paths = process_paths(proc, prefix)
     if isinstance(paths, ProcessUsesUnavailable):
         paths = lsof_paths(prefix)
@@ -1110,11 +1273,22 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     judged = roots.all() + inner + temp_parents(roots, temp_live) + tuple(phase_parents)
     pairs = tuple(pair.path for root in roots.copies for pair in listing(root) if pair.is_dir(follow_symlinks=False))
     uses = entry_uses(paths.paths, judged + pairs)
+    held: scratch.HeldScratchFolders | scratch.ScratchHoldsUnreadable
+    try:
+        held = scratch.HeldScratchFolders.from_holds(scratch.read_holds(scratch_settings=scratch_settings), now=now)
+    except scratch.ScratchHoldsUnreadable as error:
+        held = error
     for root in judged:
         for entry in roots.entries(root, scratch_settings=scratch_settings):
             reason = owner_reason(entry, root, roots, temp_live,
                                   record=pane_use.record if isinstance(pane_use, PaneRunUse) else pane_use,
                                   scratch_settings=scratch_settings)
+            if reason is None and root in roots.former_sessions and isinstance(pane_use, PaneRunUse):
+                try:
+                    if session_folder.holds_run(Path(entry.path), now, pane_use.record):
+                        reason = RunKeepReason.OPEN_RUN.value
+                except (OSError, ValueError):
+                    reason = UNREADABLE
             landed_remote_check = False
             if root in roots.copies and reason is None:
                 state = scratch.lifetime(Path(entry.path), now, scratch_settings=scratch_settings)
@@ -1141,8 +1315,16 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                         break
                 if any(path == folder or folder.startswith(path + os.sep) for folder in workers.folders):
                     reason = WORKER_USES
-                elif workers.unreadable_records and root in roots.scratch + roots.plain and reason is None:
+                elif workers.unreadable_records and root in roots.scratch_roots() + roots.plain and reason is None:
                     reason = UNREADABLE
+            if reason is None:
+                try:
+                    if isinstance(held, scratch.ScratchHoldsUnreadable):
+                        reason = str(held)
+                    elif held.protects(Path(entry.path)):
+                        reason = scratch.HELD_FOLDER_REASON
+                except scratch.ScratchHoldsUnreadable as error:
+                    reason = str(error)
             if reason is None and entry.path in uses:
                 yield KeptEntry(entry.path, IN_USE, uses[entry.path])
                 continue
@@ -1157,12 +1339,14 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
             pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path), scratch_settings=scratch_settings), copy_record.Registered)
             # The coordinator checks pending sources and reads remote tips for landed copies under the removal lock.
             git = (GitWork.SAVED if landed_remote_check or pending or scratch.is_throwaway(Path(entry.path))
-                   else git_work(Path(entry.path)))
+                   else git_work(Path(entry.path), keep_worktree_registrations=True))
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
                 continue
             if root in phase_parents:
                 yield ClosedPhaseEntry(entry.path, root, newest, size, CleanupEndReason.CLOSED_PHASE.value)
+            elif root in roots.former_sessions and entry.is_dir(follow_symlinks=False):
+                yield FormerSessionEntry(entry.path, root, newest, size)
             else:
                 yield RemovableEntry(entry.path, root, newest, size)
 
@@ -1170,14 +1354,39 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
 def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> bool:
-    if isinstance(scratch_settings, UseConfiguredValue):
-        scratch_settings = conf.read("scratch")
+    if isinstance(entry, FormerSessionEntry) and not dry_run:
+        refuse_live_test_roots((entry.path, entry.root))
+        from scripts.production import staff
+
+        folder = Path(entry.path)
+        try:
+            with session_folder.root_lock(Path(entry.root)):
+                holder = session_folder.read_record(folder)
+                if holder is None or folder.is_symlink():
+                    result.keep(entry.path, UNREADABLE)
+                    return False
+                if session_folder.held_by_another(holder, ""):
+                    result.keep(entry.path, SESSION_RUNS)
+                    return False
+                state = (folder / session_folder.RECORD).stat()
+                if max(state.st_ctime, state.st_mtime) > entry.newest:
+                    result.keep(entry.path, RECENT)
+                    return False
+                if (folder / session_folder.RUN).is_dir() and session_folder.holds_run(
+                        folder, time.time(), staff.local_snapshot()):
+                    result.keep(entry.path, RunKeepReason.OPEN_RUN.value)
+                    return False
+                return remove_idle_entry(entry, result, False, scratch_settings=scratch_settings)
+        except (OSError, ValueError):
+            result.keep(entry.path, UNREADABLE)
+            return False
     return remove_idle_entry(entry, result, dry_run, scratch_settings=scratch_settings)
 
 
 def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> bool:
+    refuse_live_test_roots((entry.path,))
     if isinstance(entry, ClosedPhaseEntry):
         parent = Path(entry.path).parent
         if parent.is_symlink() or not parent.is_dir() or os.path.realpath(parent) != entry.root:
@@ -1191,11 +1400,15 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
             reason = "busy: .claude-busy is locked" if outcome.reason == scratch.BUSY_REASON else outcome.reason
             result.keep(entry.path, reason)
             return False
+    except scratch.MountRemovalRefused as error:
+        print(f"tmp sweep: keep {entry.path}: {error}")
+        result.keep(entry.path, str(error))
+        return False
     except scratch.CargoOutputKept as error:
         print(f"tmp sweep: keep {entry.path}: {error}")
         result.keep(entry.path, CARGO_OUTPUT_KEPT)
         return False
-    except scratch.ScratchError as error:
+    except (scratch.FolderRecoveryRequired, scratch.ScratchError) as error:
         result.keep(entry.path, str(error))
         return False
     except OSError as error:
@@ -1208,34 +1421,57 @@ def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
     return True
 
 
+def report_blocked_operations(result: Sweep, blocked: Sequence[scratch.BlockedFolderOperation]) -> None:
+    for operation in blocked:
+        source = str(operation.source)
+        if source not in result.kept.get(operation.reason, ()):
+            print(f"tmp sweep: keep {source}: {operation.reason}")
+            result.keep(source, operation.reason)
+
+
 def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Sweep:
     """Delete every idle entry no process uses, and record why each other entry stays."""
+    refuse_live_test_roots(roots.all() + roots.dataclass_code)
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     result = Sweep()
+    try:
+        scope = (scratch.FolderOperationScope.ALL if roots.recover_all_folder_operations else
+                 tuple(Path(root) for root in (*roots.all(), *roots.dataclass_code)))
+        recovered = scratch.recover_sweep_operations(scope, dry_run=dry_run, scratch_settings=scratch_settings)
+        blocked = recovered.blocked + scratch.remove_orphaned_registrations(recovered.registrations, scratch_settings)
+    except (OSError, scratch.ScratchError) as error:
+        result.failed.append(FailedEntry(path="folder operation recovery", error=str(error)))
+        return result
+    report_blocked_operations(result, blocked)
+
+    def blocked_path(path: str | Path) -> bool:
+        return any(operation.protects(Path(path)) for operation in blocked)
+
     pane_use = read_pane_runs()
     resumed: set[str] = set()
     if not dry_run:
         pending = {str(path) for root in roots.copies for path in scratch.pending_copy_paths(Path(root))}
         if pending:
-            interrupted = [entry for entry in timed_entries(roots, now, proc, pane_use=pane_use)
-                           if isinstance(entry, RemovableEntry) and entry.path in pending]
+            interrupted = [entry for entry in timed_entries(
+                roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings, pane_use=pane_use)
+                           if isinstance(entry, RemovableEntry) and entry.path in pending and not blocked_path(entry.path)]
             # Finish interrupted removals before judging their borrowed parents.
             # A failed removal keeps its parent protected during the normal scan.
             for entry in interrupted:
                 resumed.add(entry.path)
-                _ = remove_entry(entry, result, False)
+                _ = remove_entry(entry, result, False, scratch_settings=scratch_settings)
     emptied: set[str] = set()
     removals: list[RemovableEntry] = []
     inspection = scratch.RemoteInspection.LOCAL_ONLY if dry_run else scratch.RemoteInspection.ADVERTISE
     for entry in timed_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings,
                                pane_use=pane_use, inspection=inspection):
-        if entry.path in resumed:
+        if entry.path in resumed or blocked_path(entry.path):
             continue
         if isinstance(entry, KeptEntry):
             path = f"{entry.path}: {entry.use}" if entry.use else entry.path
@@ -1248,43 +1484,61 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
         if remove_entry(entry, result, dry_run, scratch_settings=scratch_settings) and not dry_run:
             emptied.add(entry.root)
     for root in emptied.intersection(roots.projects):
+        if blocked_path(root):
+            continue
         try:
-            os.rmdir(root)
+            scratch.delete_entry(Path(root), scratch.RemovalKind.EMPTY_DIRECTORY, scratch_settings=scratch_settings)
+        except (scratch.RemovalRefused, scratch.ScratchHoldsUnreadable) as error:
+            result.keep(root, str(error))
         except OSError:
             pass
     if not dry_run:
         for root in roots.copies:
-            for kept in scratch.clear_finished_copy_removals(Path(root), scratch_settings=scratch_settings):
+            skipped = {path for path in scratch.pending_copy_paths(Path(root)) if blocked_path(path)} if blocked else ()
+            for kept in scratch.clear_finished_copy_removals(
+                    Path(root), skip=skipped, source_deletion=scratch.SourceDeletion.SWEEP, scratch_settings=scratch_settings):
                 result.keep(str(kept.path), kept.reason)
-            scratch.remove_empty_copy_pairs(Path(root))
+            for kept in scratch.remove_empty_copy_pairs(Path(root), source_deletion=scratch.SourceDeletion.SWEEP,
+                                                        scratch_settings=scratch_settings, blocked=blocked):
+                result.keep(str(kept.path), kept.reason)
         for root in roots.dataclass_code:
-            result.dataclass_code_removed += prune_dataclass_code(root, now, lint_settings.whole("dataclass_code_days"))
+            result.dataclass_code_removed += prune_dataclass_code(
+                root, now, lint_settings.whole("dataclass_code_days"), blocked=blocked, scratch_settings=scratch_settings)
     return result
 
 
-def prune_dataclass_code(root: str, now: float, days: int) -> int:
-    """Remove each cache entry that no process read in days days, then each emptied cache tag folder.
-
-    An old Python's cache tag folder empties and goes by the same rule. Return the count of removed entries.
-    """
+def prune_dataclass_code(root: str, now: float, days: int, *,
+    blocked: Sequence[scratch.BlockedFolderOperation] = (),
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> int:
+    """Remove old cache entries and return the number of entries removed."""
+    refuse_live_test_roots((root,))
     if not dataclass_code_usable(root, os.getuid()):
         return 0
     limit = now - days * 86400
     removed = 0
-    for tag in listing(root):
-        if not tag.is_dir(follow_symlinks=False):
-            continue
-        for entry in listing(tag.path):
-            try:
-                if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < limit:
-                    os.unlink(entry.path)
-                    removed += 1
-            except OSError:
-                continue
-        try:
-            os.rmdir(tag.path)
-        except OSError:
-            pass
+    try:
+        with scratch.coordinate_removals(scratch_settings=scratch_settings):
+            for tag in listing(root):
+                if not tag.is_dir(follow_symlinks=False):
+                    continue
+                for entry in listing(tag.path):
+                    if any(operation.protects(Path(entry.path)) for operation in blocked):
+                        continue
+                    try:
+                        if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < limit:
+                            scratch.delete_entry(Path(entry.path), scratch.RemovalKind.FILE)
+                            removed += 1
+                    except OSError:
+                        continue
+                if any(operation.protects(Path(tag.path)) for operation in blocked):
+                    continue
+                try:
+                    scratch.delete_entry(Path(tag.path), scratch.RemovalKind.EMPTY_DIRECTORY)
+                except OSError:
+                    pass
+    except (OSError, scratch.ScratchHoldsUnreadable):
+        pass
     return removed
 
 
@@ -1323,7 +1577,7 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
                 owner = run_pane_owner(run, pane_use)
                 if isinstance(owner, staff.StaffRow) and owner.id in pane_use.ended:
                     return CleanupEndReason.WORKERS_ENDED
-        if entry.root in roots.scratch:
+        if entry.root in roots.scratch_roots():
             record = scratch.task_of(Path(entry.path), scratch_settings=scratch_settings)
             if isinstance(record, copy_record.Registered) and scratch.ended(record.task, now):
                 return CleanupEndReason.TASK_ENDED
@@ -1414,28 +1668,35 @@ def write_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> int:
+    plan = plan.absolute()
+    refuse_live_test_roots((plan,))
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
+    refuse_live_test_roots(roots.all() + roots.dataclass_code)
+    scratch.require_no_folder_operations((Path(root) for root in (*roots.all(), *roots.dataclass_code)),
+                                         scratch_settings=scratch_settings)
     rows: list[PlanEntry] = []
     for entry in cleanup_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings):
         action = "keep" if isinstance(entry, KeptEntry) else "remove"
         reason = entry.reason if isinstance(entry, KeptEntry) else entry.reason.value
         path = entry.path if isinstance(entry, KeptEntry) else entry.entry.path
         rows.append(PlanEntry(path=path, action=action, reason=reason))
-    # An existing plan is never replaced; apply uses exactly the reviewed remove list.
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=plan.parent,
-                                     prefix=f".{plan.name}.", delete=False) as handle:
-        temporary = Path(handle.name)
-        try:
-            _ = handle.write(json.dumps({"version": 1, "entries": rows}, indent=2) + "\n")
-            handle.close()
-            os.link(temporary, plan)
-        except FileExistsError:
-            raise FileExistsError(f"plan {plan} already exists; inspect it and remove it before making a new plan") from None
-        finally:
-            temporary.unlink(missing_ok=True)
+    # Keep the hold lock through publication and removal of the staging file.
+    with scratch.coordinate_removals(scratch_settings=scratch_settings) as removal:
+        removal.check(plan)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=plan.parent,
+                                         prefix=f".{plan.name}.", delete=False) as handle:
+            temporary = Path(handle.name)
+            try:
+                _ = handle.write(json.dumps({"version": 1, "entries": rows}, indent=2) + "\n")
+                handle.close()
+                os.link(temporary, plan)
+            except FileExistsError:
+                raise FileExistsError(f"plan {plan} already exists; inspect it and remove it before making a new plan") from None
+            finally:
+                scratch.delete_entry(temporary, scratch.RemovalKind.FILE, missing_ok=True)
     for row in rows:
         print(f"{row['action']} {row['path']}: {row['reason']}")
     print(f"tmp sweep: plan {plan}")
@@ -1444,7 +1705,9 @@ def write_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
 
 def planned_removals(plan: Path) -> list[str]:
     record = record_object(plan)
-    if not isinstance(record, dict) or record.get("version") != 1 or not isinstance(record.get("entries"), list):
+    if record is MissingRecord.ABSENT:
+        raise FileNotFoundError(f"{plan}: cleanup plan does not exist")
+    if record.get("version") != 1 or not isinstance(record.get("entries"), list):
         raise ValueError("invalid cleanup plan")
     paths: list[str] = []
     for value in cast(list[object], record["entries"]):
@@ -1463,12 +1726,16 @@ def apply_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> int:
+    log_path = checked_state_dir() / LOG_NAME
+    refuse_live_test_roots((log_path,))
+    removals = planned_removals(plan)
+    refuse_live_test_roots((*removals, *roots.all(), *roots.dataclass_code))
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
+    scratch.require_no_folder_operations((Path(path) for path in removals), scratch_settings=scratch_settings)
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     result = Sweep()
-    removals = planned_removals(plan)
     # Judge every candidate again once, after the plan; the timed sweep has the same window.
     current = {entry.path if isinstance(entry, KeptEntry) else entry.entry.path: entry
                for entry in cleanup_entries(roots, now, proc, lint_settings=lint_settings, scratch_settings=scratch_settings)}
@@ -1484,8 +1751,8 @@ def apply_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
             print(f"tmp sweep: deleted {path} ({removed['gib']:.1f} GiB), last changed {removed['last_change']}")
     for failure in result.failed:
         print(f"tmp sweep: could not delete {failure['path']}: {failure['error']}", file=sys.stderr)
-    append_log(state_dir() / LOG_NAME, record(result, False, now, lint_settings=lint_settings), now,
-               lint_settings=lint_settings)
+    append_log(log_path, record(result, False, now, lint_settings=lint_settings), now,
+               lint_settings=lint_settings, scratch_settings=scratch_settings)
     return 1 if result.failed else 0
 
 
@@ -1498,6 +1765,12 @@ def wide_idle_seconds(*, lint_settings: conf.ConfigRead | UseConfiguredValue = U
 
 def state_dir() -> Path:
     return Path(os.path.expanduser(os.environ.get(STATE_ENV) or DEFAULT_STATE_DIR))
+
+
+def checked_state_dir() -> Path:
+    directory = state_dir()
+    refuse_live_test_roots((directory,))
+    return directory
 
 
 def record(result: Sweep, dry_run: bool, now: float, *,
@@ -1519,38 +1792,42 @@ def record(result: Sweep, dry_run: bool, now: float, *,
 
 
 def append_log(path: Path, entry: RunRecord, now: float, *,
-               lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+               lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+               scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
     """Add entry to the log. Drop each line older than LOG_KEEP_SECONDS, then the oldest lines
     while the log is larger than lint.conf tmp_sweep_log_max_mib."""
+    refuse_live_test_roots((path,))
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     limit = lint_settings.whole("tmp_sweep_log_max_mib") << 20
     added = (json.dumps(entry, sort_keys=True) + "\n").encode()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # The first pass measures the lines that stay by age; the second writes the newest that fit.
-    sizes: list[int] = []
-    try:
-        with path.open("rb") as source:
-            sizes = [len(line.rstrip(b"\n")) + 1 if logged_at(line.decode(errors="replace")) >= now - LOG_KEEP_SECONDS else 0
-                     for line in source]
-    except FileNotFoundError:
-        pass
-    total, first = len(added), len(sizes)
-    while first > 0 and total + sizes[first - 1] <= limit:
-        first -= 1
-        total += sizes[first]
     staged = path.with_name(f".{path.name}.{os.getpid()}")
-    try:
-        with staged.open("wb") as output:
-            if first < len(sizes):
-                with path.open("rb") as source:
-                    for number, line in enumerate(source):
-                        if number >= first and sizes[number]:
-                            _ = output.write(line.rstrip(b"\n") + b"\n")
-            _ = output.write(added)
-        _ = staged.replace(path)
-    finally:
-        staged.unlink(missing_ok=True)
+    with scratch.coordinate_removals(scratch_settings=scratch_settings) as removal:
+        removal.check_paths((path, staged))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Measure the lines that meet the age limit. Then write the newest lines that fit.
+        sizes: list[int] = []
+        try:
+            with path.open("rb") as source:
+                sizes = [len(line.rstrip(b"\n")) + 1 if logged_at(line.decode(errors="replace")) >= now - LOG_KEEP_SECONDS else 0
+                         for line in source]
+        except FileNotFoundError:
+            pass
+        total, first = len(added), len(sizes)
+        while first > 0 and total + sizes[first - 1] <= limit:
+            first -= 1
+            total += sizes[first]
+        try:
+            with staged.open("wb") as output:
+                if first < len(sizes):
+                    with path.open("rb") as source:
+                        for number, line in enumerate(source):
+                            if number >= first and sizes[number]:
+                                _ = output.write(line.rstrip(b"\n") + b"\n")
+                _ = output.write(added)
+            removal.replace(staged, path)
+        finally:
+            scratch.delete_entry(staged, scratch.RemovalKind.FILE, missing_ok=True)
 
 
 def logged_at(line: str) -> float:
@@ -1575,13 +1852,20 @@ def summary(result: Sweep, dry_run: bool) -> str:
             + f" kept {sum(len(paths) for paths in result.kept.values())}: {kept or 'none'}")
 
 
-def remove_expired_nextest_logs(root: Path, now: float, dry_run: bool, result: Sweep) -> None:
+def remove_expired_nextest_logs(root: Path, now: float, dry_run: bool, result: Sweep, *,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> None:
     """Remove closed Mac nextest logs after their retention period."""
+    refuse_live_test_roots((root,))
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
     try:
+        blocked = scratch.recover_sweep_operations((root,), dry_run=True, scratch_settings=scratch_settings).blocked
+        report_blocked_operations(result, blocked)
         folder = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
         return
-    except OSError as error:
+    except (OSError, scratch.ScratchError) as error:
         result.failed.append(FailedEntry(path=str(root), error=str(error)))
         return
     try:
@@ -1593,6 +1877,8 @@ def remove_expired_nextest_logs(root: Path, now: float, dry_run: bool, result: S
         with os.scandir(folder) as entries:
             for entry in entries:
                 if not nextest_log.LOG_NAME.fullmatch(entry.name):
+                    continue
+                if any(operation.protects(Path(entry.path)) for operation in blocked):
                     continue
                 try:
                     info = entry.stat(follow_symlinks=False)
@@ -1617,13 +1903,20 @@ def remove_expired_nextest_logs(root: Path, now: float, dry_run: bool, result: S
                 result.keep(path, IN_USE)
                 continue
             try:
-                with nextest_log.locked_log(folder, name, nextest_log.LogAccess.REMOVE) as descriptor:
+                with (scratch.coordinate_removals(dry_run=dry_run, scratch_settings=scratch_settings) as removal,
+                      nextest_log.locked_log(folder, name, nextest_log.LogAccess.REMOVE) as descriptor):
                     current = os.fstat(descriptor)
                     if current != info or current.st_ctime_ns != info.st_ctime_ns:
                         result.keep(path, "the nextest log changed during the process scan")
                         continue
-                    if not dry_run:
-                        os.unlink(name, dir_fd=folder)
+                    target = scratch.AnchoredRemoval(folder, name)
+                    if dry_run:
+                        removal.check(target)
+                    else:
+                        removal.delete(target, scratch.RemovalKind.FILE)
+            except (scratch.RemovalRefused, scratch.ScratchHoldsUnreadable) as error:
+                result.keep(path, str(error))
+                continue
             except BlockingIOError:
                 result.keep(path, IN_USE)
                 continue
@@ -1642,17 +1935,27 @@ def remove_expired_nextest_logs(root: Path, now: float, dry_run: bool, result: S
         os.close(folder)
 
 
+def check_sweep_roots(roots: Roots, *paths: Path) -> tuple[Path, ...]:
+    """Check every root for this run. Return the Mac log roots."""
+    nextest_roots = (Path.home() / nextest_log.DIRECTORY,) if sys.platform == "darwin" else ()
+    refuse_live_test_roots(roots.all() + roots.dataclass_code + paths + nextest_roots)
+    return nextest_roots
+
+
 def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, proc: str = PROC_DIR, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> int:
     """Sweep once, print each deletion and a summary, and log the run unless it is a dry run."""
+    roots = roots or default_roots()
+    log_paths = () if dry_run else (checked_state_dir() / LOG_NAME,)
+    nextest_roots = check_sweep_roots(roots, *log_paths)
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     moment = time.time() if now is None else now
-    result = sweep(dry_run, roots or default_roots(), moment, proc, lint_settings=lint_settings, scratch_settings=scratch_settings)
-    if sys.platform == "darwin":
-        remove_expired_nextest_logs(Path.home() / nextest_log.DIRECTORY, moment, dry_run, result)
+    result = sweep(dry_run, roots, moment, proc, lint_settings=lint_settings, scratch_settings=scratch_settings)
+    for root in nextest_roots:
+        remove_expired_nextest_logs(root, moment, dry_run, result, scratch_settings=scratch_settings)
     verb = "would delete" if dry_run else "deleted"
     for entry in result.deleted:
         print(f"tmp sweep: {verb} {entry['path']} ({entry['gib']:.1f} GiB), last changed {entry['last_change']}")
@@ -1661,9 +1964,9 @@ def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, pro
     if result.dataclass_code_removed:
         print(f"tmp sweep: removed {result.dataclass_code_removed} dataclass code entries")
     print(summary(result, dry_run))
-    if not dry_run:
-        append_log(state_dir() / LOG_NAME, record(result, dry_run, moment, lint_settings=lint_settings), moment,
-                   lint_settings=lint_settings)
+    for log_path in log_paths:
+        append_log(log_path, record(result, dry_run, moment, lint_settings=lint_settings), moment,
+                   lint_settings=lint_settings, scratch_settings=scratch_settings)
     return 1 if result.failed else 0
 
 
@@ -1690,19 +1993,23 @@ def run_if_due(dry_run: bool, now: float | None = None, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> SweepAssessment:
-    """Assess only a due sweep. Move the stamp before the attempt."""
+    """Assess only a due sweep. Check its roots before moving the stamp."""
     moment = time.time() if now is None else now
-    stamp = state_dir() / STAMP_NAME
+    directory = checked_state_dir()
+    stamp = directory / STAMP_NAME
     try:
         if stamp.stat().st_mtime > moment - RUN_INTERVAL_SECONDS:
             return SkippedSweepAssessment()
     except FileNotFoundError:
         pass
+    roots = default_roots()
+    _ = check_sweep_roots(roots, stamp, *((directory / LOG_NAME,) if not dry_run else ()))
     if not dry_run:
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.touch()
         os.utime(stamp, (moment, moment))
-    return CompletedSweepAssessment(run(dry_run, moment, lint_settings=lint_settings, scratch_settings=scratch_settings))
+    return CompletedSweepAssessment(run(dry_run, moment, roots, PROC_DIR,
+                                        lint_settings=lint_settings, scratch_settings=scratch_settings))
 
 
 def main(argv: list[str]) -> int:
@@ -1710,7 +2017,7 @@ def main(argv: list[str]) -> int:
         operation = write_cleanup_plan if argv[0] == "--plan" else apply_cleanup_plan
         try:
             return operation(Path(argv[1]), default_roots(), time.time(), PROC_DIR)
-        except (OSError, UnicodeError, ValueError) as error:
+        except (OSError, UnicodeError, ValueError, scratch.ScratchHoldsUnreadable) as error:
             print(f"tmp sweep: {error}", file=sys.stderr)
             return 1
     if any(arg != DRY_RUN_FLAG for arg in argv):

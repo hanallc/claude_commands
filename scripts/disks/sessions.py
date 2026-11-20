@@ -69,9 +69,21 @@ def read_sessions(root: Path, data: DisksData | None, holds: Mapping[str, scratc
 
 
 def session_report() -> SessionReport | None:
-    """The session folders on this machine, or None until the session root exists."""
-    root = session_folder.session_root()
-    if root is None:
+    """Report the session folders in both configured roots."""
+    current = session_folder.session_root()
+    former = tuple(root for root in session_folder.configured_roots()[1:] if root.is_dir())
+    roots = former if current is None else (current, *former)
+    if not roots:
         return None
-    return read_sessions(root, measure.read_data(), scratch.holds(), measure.read_mounts(),
-                         session_states(session_records.read_registry()))
+    data, holds, mounts = measure.read_data(), scratch.holds(), measure.read_mounts()
+    state = session_states(session_records.read_registry())
+    rows: list[SessionRow] = []
+    names: set[str] = set()
+    for root in roots:
+        for row in read_sessions(root, data, holds, mounts, state)["sessions"]:
+            if row["name"] in names:
+                row["name"] = str(root / row["name"])
+            names.add(row["name"])
+            rows.append(row)
+    rows.sort(key=lambda row: (-(row["size"] or 0), row["name"]))
+    return {"root": ", ".join(str(root) for root in roots), "sessions": rows}

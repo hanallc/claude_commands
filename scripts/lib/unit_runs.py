@@ -92,10 +92,8 @@ def session_run_roots() -> tuple[Path, ...]:
     """The run root of each session folder that has one, read at each call."""
     from scripts.lib import session_folder
 
-    root = session_folder.session_root()
-    if root is None:
-        return ()
-    return tuple(sorted(path for path in root.glob(f"[!.]*/{session_folder.RUN}") if path.is_dir()))
+    return tuple(path for root in session_folder.configured_roots()
+                 for path in sorted(root.glob(f"[!.]*/{session_folder.RUN}")) if path.is_dir())
 
 
 def run_roots(override: str | Path | None = None) -> tuple[Path, ...]:
@@ -114,11 +112,13 @@ def new_run_root() -> Path:
 def _in_session_run_root(folder: Path) -> bool:
     from scripts.lib import session_folder
 
-    root = session_folder.session_root()
-    if root is None or not folder.is_relative_to(resolved := root.resolve()):
-        return False
-    parts = folder.relative_to(resolved).parts
-    return len(parts) > 2 and not parts[0].startswith(".") and parts[1] == session_folder.RUN
+    for root in session_folder.configured_roots():
+        resolved = root.resolve()
+        if folder.is_relative_to(resolved):
+            parts = folder.relative_to(resolved).parts
+            if len(parts) > 2 and not parts[0].startswith(".") and parts[1] == session_folder.RUN:
+                return True
+    return False
 
 
 def is_unit_run(folder: Path) -> bool:

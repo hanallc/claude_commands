@@ -96,9 +96,9 @@ def real(path: str) -> Path:
 
 
 @functools.cache
-def session_root() -> Path:
-    """The configured session root, as a real path, whether or not it exists yet."""
-    return real(str(session_folder.configured_root()))
+def session_roots() -> tuple[Path, ...]:
+    """Read the real paths of the configured session roots."""
+    return tuple(real(str(root)) for root in session_folder.configured_roots())
 
 
 def own_temp(temp: str) -> bool:
@@ -106,7 +106,7 @@ def own_temp(temp: str) -> bool:
     scratchpad (a sandbox can point it there)."""
     path = real(temp)
     return (any(real(parent) in path.parents for parent in OWN_TEMP_PARENTS)
-            or session_root() in path.parents
+            or any(root in path.parents for root in session_roots())
             or any(SESSION_SCRATCHPAD.fullmatch(part) for part in path.parts))
 
 
@@ -118,7 +118,7 @@ def configured_roots() -> tuple[Path, Path]:
 
 def roots() -> list[Path]:
     """The folders in which a new loose folder is refused, as real paths, nested ones included."""
-    found = [real("~"), real("/tmp"), real("/tmp/claude"), real("~/rust"), real("~/rust/scratch"), session_root(),
+    found = [real("~"), real("/tmp"), real("/tmp/claude"), real("~/rust"), real("~/rust/scratch"), *session_roots(),
              *(root.parent for root in configured_roots())]
     temp = os.environ.get("TMPDIR")
     if temp and not own_temp(temp):
@@ -409,7 +409,7 @@ def repository_copy(words: list[str], cwd: Path) -> bool:
 
 def nested_build_copy(path: Path) -> bool:
     """Refuse repository copies below unit and session temporary roots."""
-    parents = [*(real(parent) for parent in OWN_TEMP_PARENTS), real(str(session_folder.former_root())), session_root()]
+    parents = [*(real(parent) for parent in OWN_TEMP_PARENTS), real(str(session_folder.former_root())), *session_roots()]
     return any(parent in path.parents for parent in parents) or any(
         SESSION_SCRATCHPAD.fullmatch(part) for part in path.parts[:-1])
 

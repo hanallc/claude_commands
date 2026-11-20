@@ -1,22 +1,10 @@
-"""One folder per Claude session in the session root, named for the session's shown name.
+"""Select a named folder for each session.
 
-The session root is build_folders.conf roots.session (/session on natedev, ~/session on the Mac).
-A session folder holds the session's TMPDIR, its Claude Code scratchpad (claude-<uid>), its tool
-folders, its scratch folders (scripts/lib/scratch.py) and, in `run`, a unit's run folders. The folder name is the staff member's name (`verify`, `builds`);
-a worker adds its unit (`demo-impl`); a session with no staff row takes its working folder's name.
-A name gets `-2`, `-3` and so on only while a live session holds the plain name (user decision 2,
-2026-11-15).
-
-The name, not the conversation, keeps the folder: a new conversation of the same member uses the
-same folder, so a unit's run folder stays in place. `.session.json` in the folder names the owner
-and the latest session id. `<root>/.id/<session id>` is a link to the folder name, so a hook finds
-its session's folder with one readlink.
-
-A launcher that knows the member makes the folder first and starts Claude Code with TMPDIR set to
-it and CLAUDE_SESSION_FOLDER set to its name; the session-start hook then adopts that folder.
-
-Until the session root exists (before the nixos lines are live), sessions keep the former root,
-/tmp/claude/session/<session id>.
+The folder holds TMPDIR, scratch folders and the unit's run folders.
+The `.session.json` record names the owner and the latest session ID.
+The `.id` index links session IDs to folder names within each root.
+The launcher sets TMPDIR and CLAUDE_SESSION_FOLDER for the session-start hook.
+The former named root keeps live sessions and open runs.
 """
 
 from __future__ import annotations
@@ -25,9 +13,12 @@ import fcntl
 import json
 import os
 import re
-from collections.abc import Generator
+import stat
+import time
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -35,7 +26,9 @@ if TYPE_CHECKING:
     from scripts.production import staff
 
 ROOT_ENV = "SESSION_TEMP_ROOT"
-# Tests point the former root elsewhere.
+# Tests can select a private former named root.
+PREVIOUS_ROOT_ENV = "SESSION_PREVIOUS_ROOT"
+# Tests can select a private legacy root for folders named by session ID.
 FORMER_ROOT_ENV = "SESSION_FORMER_ROOT"
 FORMER_ROOT = Path("/tmp/claude/session")
 # Set by a launcher to the folder name it made; read by the session-start hook.
@@ -62,20 +55,42 @@ class FolderRecord(TypedDict):
     session_id: str
 
 
-def configured_root() -> Path:
-    """The session root from the environment or build_folders.conf, not yet checked."""
-    from_environment = os.environ.get(ROOT_ENV)
-    if from_environment:
-        return Path(from_environment)
+def configured_roots() -> tuple[Path, ...]:
+    """Read the current root first and the former named root when configured."""
     from scripts.lib import conf
 
-    return Path(conf.read_or_repository("build_folders").text("roots.session")).expanduser()
+    current = os.environ.get(ROOT_ENV)
+    previous = os.environ.get(PREVIOUS_ROOT_ENV)
+    if current:
+        root = Path(current)
+    else:
+        settings = conf.read_or_repository("build_folders")
+        root = Path(settings.text("roots.session")).expanduser()
+        if previous is None:
+            previous = settings.values("roots.session_former").get("roots.session_former")
+    return tuple(dict.fromkeys((root, Path(previous).expanduser()))) if previous else (root,)
+
+
+def configured_root() -> Path:
+    """Read the configured destination for new session folders."""
+    return configured_roots()[0]
+
+
+def available_root(root: Path) -> Path | None:
+    """Return the root when the session can write to it."""
+    return root if root.is_dir() and os.access(root, os.W_OK | os.X_OK) else None
 
 
 def session_root() -> Path | None:
-    """The session root when it can take folders, else None (the former root applies)."""
-    root = configured_root()
-    return root if root.is_dir() and os.access(root, os.W_OK | os.X_OK) else None
+    """Find the current root when it can take folders."""
+    return available_root(configured_root())
+
+
+def allocation_root(root: Path) -> Path | None:
+    """Create a missing configured root when a session needs it."""
+    if not os.environ.get(ROOT_ENV) and not root.is_dir():
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return available_root(root)
 
 
 def former_root() -> Path:
@@ -133,6 +148,22 @@ def read_record(folder: Path) -> FolderRecord | None:
         raw = cast(object, json.loads((folder / RECORD).read_text(encoding="utf-8")))
     except (OSError, ValueError):
         return None
+    return folder_record(raw)
+
+
+def read_record_at(folder: int) -> FolderRecord | None:
+    """Read the record in an open directory without following a link."""
+    try:
+        fd = os.open(RECORD, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+        with os.fdopen(fd, encoding="utf-8") as source:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            return folder_record(cast(object, json.load(source)))
+    except (OSError, ValueError):
+        return None
+
+
+def folder_record(raw: object) -> FolderRecord | None:
     if not isinstance(raw, dict):
         return None
     fields = cast(dict[str, object], raw)
@@ -156,13 +187,18 @@ def root_lock(root: Path) -> Generator[None]:
 
 
 def folder_for(root: Path, session_id: str) -> Path | None:
-    """The folder the index names for this session, when it still exists."""
+    """Return the indexed folder only when its record names this session."""
+    if not SESSION_ID.fullmatch(session_id):
+        return None
     try:
         name = os.readlink(root / INDEX / session_id)
     except OSError:
         return None
+    if name in ("", ".", "..") or "/" in name:
+        return None
     folder = root / name
-    return folder if "/" not in name and folder.is_dir() else None
+    holder = read_record(folder) if not folder.is_symlink() and folder.is_dir() else None
+    return folder if holder is not None and holder["session_id"] == session_id else None
 
 
 def link(root: Path, session_id: str, folder: Path) -> None:
@@ -186,59 +222,145 @@ def select_folder(root: Path, base: str, session_id: str) -> Path:
         number += 1
 
 
-def claim(root: Path, owner: str, base: str, session_id: str) -> Path:
+def claim(folder: Path, owner: str, session_id: str) -> Path:
     """Create or take over the selected folder. Hold the root lock."""
-    folder = select_folder(root, base, session_id)
     if not os.path.lexists(folder):
         folder.mkdir(mode=0o700)
     elif folder.is_symlink() or not folder.is_dir():
         raise FileExistsError(f"{folder}: selected session folder changed")
     record = FolderRecord(owner=owner, session_id=session_id)
-    if read_record(folder) != record:
-        write_record(folder, record)
+    previous = read_record(folder)
+    if previous == record:
+        return folder
+    old_id = previous["session_id"] if previous is not None else ""
+    old_link = folder_for(folder.parent, old_id) if old_id != session_id else None
+    write_record(folder, record)
+    if old_link == folder:
+        (folder.parent / INDEX / old_id).unlink(missing_ok=True)
     return folder
 
 
+def holds_run(folder: Path, now: float, record: staff.StaffSnapshot) -> bool:
+    """Check the staff pointers and the heartbeat for runs in this folder."""
+    from scripts.production import staff
+
+    unit_runs = import_module("scripts.lib.unit_runs")
+    live_run_folders = cast(Callable[[float, tuple[Path, ...]], list[Path]], unit_runs.live_run_folders)
+    runs = (folder / RUN).resolve()
+    return (any(isinstance(row.run, staff.OpenRun) and row.run.path.resolve().is_relative_to(runs)
+                for row in record.rows)
+            or bool(live_run_folders(now, (runs,))))
+
+
+def owned_folders(root: Path, owner: str, session_id: str) -> Iterator[Path]:
+    """Find this member's folders that no other live session holds."""
+    for folder in sorted(root.iterdir()):
+        if folder.name.startswith(".") or folder.is_symlink() or not folder.is_dir():
+            continue
+        holder = read_record(folder)
+        if holder is not None and holder["owner"] == owner and not held_by_another(holder, session_id):
+            yield folder
+
+
+def claim_at_start(root: Path, former_roots: tuple[Path, ...], owner: str, base: str, session_id: str) -> Path:
+    """Claim the new folder or retain a former folder with an open run. Hold the current root lock."""
+    from scripts.production import staff
+
+    folder = select_folder(root, base, session_id)
+    current = read_record(folder)
+    owned = (folder if current is not None and current["owner"] == owner
+             else next(owned_folders(root, owner, session_id), None))
+    if owned is not None:
+        folder = owned
+    else:
+        for former in former_roots:
+            if not former.is_dir() or former.samefile(root):
+                continue
+            with root_lock(former):
+                for candidate in owned_folders(former, owner, session_id):
+                    if not (candidate / RUN).is_dir():
+                        continue
+                    try:
+                        keep = holds_run(candidate, time.time(), staff.local_snapshot())
+                    except (OSError, ValueError):
+                        keep = True
+                    if keep:
+                        claimed = claim(candidate, owner, session_id)
+                        if session_id:
+                            link(former, session_id, claimed)
+                        return claimed
+    claimed = claim(folder, owner, session_id)
+    if session_id:
+        link(root, session_id, claimed)
+    return claimed
+
+
 def launch_folder(member: Member, session_id: str = "") -> Path | None:
-    """The member's folder for a launch, made when absent; None before the session root exists."""
-    root = session_root()
+    """Find or create the member's folder before the launcher sets TMPDIR."""
+    current, *former_roots = configured_roots()
+    root = allocation_root(current)
     if root is None:
         return None
     with root_lock(root):
-        folder = claim(root, member.id, folder_name(member, session_id), session_id)
-        if session_id:
-            link(root, session_id, folder)
+        folder = folder_for(root, session_id) if session_id else None
+        if folder is None:
+            folder = claim_at_start(root, tuple(former_roots), member.id, folder_name(member, session_id), session_id)
     return folder
 
 
 def adopted(root: Path) -> Path | None:
     """The folder a launcher made for this session: TMPDIR names it and FOLDER_ENV matches."""
     name, temporary = os.environ.get(FOLDER_ENV, ""), os.environ.get("TMPDIR", "")
-    if not name or not temporary or Path(temporary) != root / name or read_record(root / name) is None:
+    if not name or Path(name).name != name or not temporary or Path(temporary) != root / name:
         return None
-    return root / name
+    folder = root / name
+    return folder if not folder.is_symlink() and folder.is_dir() else None
 
 
-def session_folder(session_id: str, cwd: str = "") -> Path | None:
-    """Find or make this session's folder; None until the session root exists."""
-    root = session_root()
-    if root is None:
+def adopt_launch(root: Path, folder: Path, session_id: str) -> Path | None:
+    """Claim the launcher folder if its record permits this session. Hold the root lock."""
+    holder = read_record(folder)
+    if holder is None or holder["session_id"] not in ("", session_id):
         return None
-    found = folder_for(root, session_id)
+    claimed = claim(folder, holder["owner"], session_id)
+    link(root, session_id, claimed)
+    return claimed
+
+
+def session_folder(session_id: str, cwd: str = "", *, starting: bool = False) -> Path | None:
+    """Find or make this session's folder. Evaluate the former folder's runs at startup."""
+    current, *former_roots = configured_roots()
+    found = folder_for(current, session_id)
+    temp = os.environ.get("TMPDIR", "")
+    previous_owner = None
+    for former in former_roots:
+        previous = folder_for(former, session_id)
+        if previous is not None:
+            holder = read_record(previous)
+            if holder is not None and holder["session_id"] == session_id:
+                if temp == str(previous) or (found is None and not starting):
+                    return previous
+                previous_owner = Member(holder["owner"], previous.name)
+        launched = adopted(former)
+        if launched is not None:
+            with root_lock(former):
+                if (folder := adopt_launch(former, launched, session_id)) is not None:
+                    return folder
     if found is not None:
         return found
+    root = allocation_root(current)
+    if root is None:
+        return None
     with root_lock(root):
+        found = folder_for(root, session_id)
+        if found is not None:
+            return found
         launched = adopted(root)
-        if launched is not None:
-            record = read_record(launched)
-            holder = record["owner"] if record is not None else session_id
-            write_record(launched, FolderRecord(owner=holder, session_id=session_id))
-            folder = launched
-        else:
-            owner = member_of(session_id)
-            folder = claim(root, owner.id if owner is not None else session_id,
-                           folder_name(owner, session_id, cwd), session_id)
-        link(root, session_id, folder)
+        if launched is not None and (folder := adopt_launch(root, launched, session_id)) is not None:
+            return folder
+        owner = member_of(session_id) or previous_owner
+        holder = owner.id if owner is not None else session_id
+        folder = claim_at_start(root, tuple(former_roots), holder, folder_name(owner, session_id, cwd), session_id)
     return folder
 
 
@@ -251,17 +373,20 @@ def caller_folder() -> Path | None:
 def restore(session_id: str) -> None:
     """Make this session's folder again when something removed it; an error changes nothing."""
     try:
-        root = session_root()
-        index = root / INDEX / session_id if root is not None else None
-        if root is not None and index is not None and os.path.lexists(index):
-            if folder_for(root, session_id) is None:
-                with root_lock(root):
-                    folder = root / os.readlink(index)
-                    if folder.parent == root and not os.path.lexists(folder):
-                        owner = member_of(session_id)
-                        folder.mkdir(mode=0o700)
-                        write_record(folder, FolderRecord(owner=owner.id if owner is not None else session_id,
-                                                          session_id=session_id))
+        current, *former_roots = configured_roots()
+        for root in (current, *former_roots):
+            index = root / INDEX / session_id
+            if not index.is_symlink():
+                continue
+            if folder_for(root, session_id) is not None:
+                return
+            with root_lock(root):
+                folder = root / os.readlink(index)
+                if root != current and os.environ.get("TMPDIR") != str(folder):
+                    continue
+                if folder.parent == root and not os.path.lexists(folder):
+                    owner = member_of(session_id)
+                    _ = claim(folder, owner.id if owner is not None else session_id, session_id)
             return
         folder = former_folder(session_id)
         if not os.path.lexists(folder):

@@ -28,7 +28,11 @@ per-run JSONL files under:
 ```
 
 The live session cache remains in
-`<run root>/<run-id>/progress_history_state.json`. The run root is `/session/<name>/run` for a run made in a session folder, else `/tmp/claude/unit` (`/tmp/claude/delegate` for a run started before the folder rename). Deleting `/tmp`
+`<run root>/<run-id>/progress_history_state.json`.
+The usual run root is `~/session/<name>/run`.
+On natedev, a director that retains its former session folder uses `/session/<name>/run`.
+The legacy roots are `/tmp/claude/unit` and `/tmp/claude/delegate`.
+Deleting `/tmp`
 does not remove the durable event stream.
 
 The guard refuses recorder state with a root `phase_last_percent` key and names the conversion script, `run_conversion.sh`.

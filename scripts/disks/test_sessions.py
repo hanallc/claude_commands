@@ -22,7 +22,7 @@ def folder(name: str, size: int, children: list[Folder] | None = None) -> Folder
 
 class ReadSessionsTests(unittest.TestCase):
     def test_sessions_show_largest_first_with_held_folders_and_state(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             root = Path(os.path.realpath(directory)) / "session"
             for name, session_id in (("fps", "a1"), ("lfo", "b2"), ("demo-impl", ""), ("bare", None)):
                 (root / name).mkdir(parents=True)
@@ -58,13 +58,15 @@ class ReadSessionsTests(unittest.TestCase):
         self.assertEqual([row["held"] for row in report["sessions"][1:]], [[], [], []])
 
     def test_a_report_reads_the_session_registry_once(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             root = Path(directory)
             for name in ("fps", "lfo"):
                 (root / name).mkdir()
                 session_folder.write_record(root / name, {"owner": name, "session_id": name + "-id"})
             with (mock.patch.object(session_folder, "session_root", return_value=root),
+                  mock.patch.object(session_folder, "configured_roots", return_value=(root,)),
                   mock.patch.object(measure, "read_data", return_value=None),
+                  mock.patch.object(measure, "read_mounts", return_value=()),
                   mock.patch.object(scratch, "holds", return_value={}),
                   mock.patch.object(session_records, "read_registry",
                                     return_value=session_records.RegistryRead((), ())) as registry):
@@ -73,8 +75,26 @@ class ReadSessionsTests(unittest.TestCase):
         self.assertEqual([(row["name"], row["state"]) for row in report["sessions"]] if report else None,
                          [("fps", "ended"), ("lfo", "ended")])
 
+    def test_a_report_includes_folders_in_both_roots(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            base = Path(directory)
+            root, previous = base / "session", base / "previous"
+            for parent, name in ((root, "current"), (previous, "older")):
+                (parent / name).mkdir(parents=True)
+            with (mock.patch.dict(os.environ, {session_folder.ROOT_ENV: str(root),
+                                              "SESSION_PREVIOUS_ROOT": str(previous)}),
+                  mock.patch.object(measure, "read_data", return_value=None),
+                  mock.patch.object(measure, "read_mounts", return_value=()),
+                  mock.patch.object(scratch, "holds", return_value={}),
+                  mock.patch.object(session_records, "read_registry",
+                                    return_value=session_records.RegistryRead((), ()))):
+                report = sessions.session_report()
+        assert report is not None
+        self.assertEqual([row["name"] for row in report["sessions"]], ["current", "older"])
+
     def test_no_session_root_gives_no_report(self) -> None:
-        with mock.patch.object(session_folder, "session_root", return_value=None):
+        with (mock.patch.object(session_folder, "session_root", return_value=None),
+              mock.patch.object(session_folder, "configured_roots", return_value=(Path("/unused-test-root"),))):
             self.assertIsNone(sessions.session_report())
 
 
