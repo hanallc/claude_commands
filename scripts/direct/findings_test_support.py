@@ -140,7 +140,7 @@ class FindingsLedgerFixture(unittest.TestCase):
         """Stand in for progress_history.py: the ledger reads phase identity from it."""
         state = {
             "history_file": str(self.history_file),
-            "phase": {"instance_id": instance_id, "id": phase_id, "title": phase_id},
+            "open_phases": [{"instance_id": instance_id, "id": phase_id, "title": phase_id, "status": "active"}],
         }
         _ = (self.session_dir / "progress_history_state.json").write_text(
             json.dumps(state), encoding="utf-8"
@@ -244,9 +244,10 @@ class FindingsLedgerFixture(unittest.TestCase):
         """Phase 15 started first and stays open while Phase 16 is the newest."""
         state = {
             "history_file": str(self.history_file),
-            "phase": {"instance_id": "phase-sixteen", "id": "16", "title": "16", "status": "active"},
-            "open_phases": [{"instance_id": "phase-fifteen", "id": "15", "title": "15",
-                             "status": "active"}],
+            "open_phases": [
+                {"instance_id": "phase-fifteen", "id": "15", "title": "15", "status": "active"},
+                {"instance_id": "phase-sixteen", "id": "16", "title": "16", "status": "active"},
+            ],
         }
         _ = (self.session_dir / "progress_history_state.json").write_text(
             json.dumps(state), encoding="utf-8"

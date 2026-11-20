@@ -9,7 +9,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Generator, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from functools import partial
 from importlib import import_module
@@ -3105,7 +3105,8 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                                       if result_transfer_lost else PendingHanaOperation(reason=settlement.reason))
     terminal = settlement.command if isinstance(settlement, execution.HanaCleanupPending) else settlement
     completed = isinstance(terminal, execution.HanaSettled) and isinstance(terminal.outcome, placement.AttemptCompleted)
-    context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '')
+    context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '',
+                                     dict(request.environment))
     charge = OffloadRecordWrite('the Hana attempt charge', partial(
         execution.record_attempt_charge, lifecycle.directory, prepared, evidence.traffic.transfers,
         remote_started_at, time.time()))
@@ -3538,7 +3539,10 @@ def write_attempt_records(controller: ProcessController, request: OffloadRequest
         try:
             _ = entry.write()
         except Exception as error:
-            print(f'offload: Cannot record {entry.name} ({type(error).__name__}).', file=sys.stderr)
+            if entry in hana_writes:
+                store.note_error(f'Could not record {entry.name}: {error}')
+            with suppress(OSError):
+                print(f'offload: Cannot record {entry.name} ({type(error).__name__}).', file=sys.stderr)
 
 
 def finish_offload(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult, started: float) -> int:
