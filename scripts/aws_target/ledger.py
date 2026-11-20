@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
 from scripts.aws_target import hana_result, remote
-from scripts.message import session_send
+from scripts.message import send_result, session_send
 from scripts.aws_target.config import (
     LimitSettingEvidence, MeasurementUnavailable, SpendingConfigurationUnavailable, SpendingSettings, money, read_settings,
 )
@@ -2145,7 +2145,7 @@ def send_limit_event(event: LimitEvent) -> bool:
                              f"The AWS spending guard refused new work. The {event.period} limit for {period_key} applies. "
                              + f"Drain the target. Estimate ${event.estimate_usd}. Limit ${event.limit_usd}."),
                             capture_output=True, text=True, timeout=event.timeout_s, check=False)
-    return result.returncode == 0 and result.stdout.startswith(("SENT:", "SKIPPED:"))
+    return send_result.delivered_or_kept(result.returncode, result.stdout, accept_skipped=True)
 
 
 def decision_record(decision: SpendingDecision) -> dict[str, object]:
