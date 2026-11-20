@@ -1357,19 +1357,24 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                  mock.patch.object(queue, "in_builds_slice", return_value=False), \
                  mock.patch.object(queue.QueuePlace, "_sample", return_value=None):
                 read_fd, write_fd = os.pipe()
+                program_ready_read, program_ready_write = os.pipe()
                 holder = os.fork()
                 if holder == 0:
                     os.close(fixture.lifeline_write)
                     _ = signal.alarm(TEST_HANG_GUARD_SECS)
                     os.close(read_fd)
+                    os.close(program_ready_read)
                     try:
                         fixture.supply_process(os.getpid(), 0, parent=1)
                         with queue.queue_place("rust-analyzer", fixture.root) as place:
-                            program = ("import os; pid=os.fork(); os._exit(0) if pid else " + LIFELINE_WAIT
-                                       if leader_exits else "import os; " + LIFELINE_WAIT)
+                            program_start = "import os; "
+                            if leader_exits:
+                                program_start += "pid=os.fork(); os._exit(0) if pid else None; "
+                            program = program_start + "os.write(1, b'R'); " + LIFELINE_WAIT
                             child = place.popen([sys.executable, "-c", program],
-                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                                stdout=program_ready_write, stderr=subprocess.DEVNULL)
                             scope_at_return = place.sidecar.read_text().strip()
+                            os.close(program_ready_write)
                             place.observe(GIB, GIB)
                             _ = os.write(write_fd, json.dumps({"pid": child.pid, "scope": scope_at_return,
                                                                "status": child.poll()}).encode())
@@ -1377,10 +1382,12 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     finally:
                         os._exit(99)
                 os.close(write_fd)
+                os.close(program_ready_write)
                 program_pid = 0
                 scope_name = ""
                 try:
-                    self.assertTrue(select.select([read_fd], [], [], 10)[0], "holder never returned from popen")
+                    self.assertTrue(select.select([read_fd], [], [], TEST_HANG_GUARD_SECS)[0],
+                                    "the holder did not return from popen")
                     message = cast(dict[str, object], json.loads(os.read(read_fd, 4096)))
                     program_pid = cast(int, message["pid"])
                     scope_name = cast(str, message["scope"])
@@ -1391,6 +1398,9 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     self.assertEqual(message["status"], 0 if leader_exits else None)
                     _, row = fixture.reservation()
                     self.assertEqual(Path(row["sidecar"]).read_text().strip(), scope_name)
+                    self.assertTrue(select.select([program_ready_read], [], [], TEST_HANG_GUARD_SECS)[0],
+                                    "the scoped program did not report readiness")
+                    self.assertEqual(os.read(program_ready_read, 1), b"R", "the scoped program exited before readiness")
                     os.kill(holder, signal.SIGKILL)
                     _ = os.waitpid(holder, 0)
                     shutil.rmtree(fixture.proc / str(holder))
@@ -1412,6 +1422,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     fixture.assert_released(self, reservation_id, outcome="owner_gone")
                 finally:
                     os.close(read_fd)
+                    os.close(program_ready_read)
                     try:
                         os.kill(holder, signal.SIGKILL)
                         _ = os.waitpid(holder, 0)
