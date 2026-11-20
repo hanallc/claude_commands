@@ -222,7 +222,8 @@ class VerifyLinuxStagedDocTests(doc_support.VerifyDocFixture):
         for holder in Path(self.environment["BUILD_HOLD_DIR"]).iterdir():
             holder.unlink()
         self.environment["TEST_SOURCE_REPO"] = str(Path(__file__).resolve().parents[2])
-        targets = Path(self.environment["BUILD_TARGETS_SCRIPT"])
+        targets = self.root / "bin/build-targets.py"
+        self.environment["BUILD_TARGETS_SCRIPT"] = str(targets)
         self.executable(targets, r'''
 import os
 from pathlib import Path

@@ -354,14 +354,15 @@ gate_wait_usd_per_minute=0
         merge_gates = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).runs[0]
         tables = {table.title: table for table in merge_gates.tables}
 
-        # The fixture lowest zone price is 0.25 USD/h, so 6 minutes cost 0.0250 and 12 minutes 0.0500.
+        # At 0.25 USD/h, 6 minutes cost 0.0250 USD and 12 minutes cost 0.0500 USD.
+        # The other region adds the configured transfer charge of 0.00015 USD before rounding.
         # One refused request came before one launch of the fast type at home; the other region has no requests.
         # No bill covers the runs yet; the other region has no runs of its own.
         self.assertEqual(tables[fast].rows, (
             (home, '0.2500', '6.0', '1', '0.0250', 'bill due', '1 bill due', '0'),
-            (other, '0.2500', '6.0', '1 elsewhere', '0.0250', 'no runs', 'no runs', '0')))
+            (other, '0.2500', '6.0', '1 elsewhere', '0.0252', 'no runs', 'no runs', '0')))
         self.assertEqual([row[:5] for row in tables[slow].rows], [(home, '0.2500', '12.0', '1', '0.0500'),
-                                                                 (other, '0.2500', '12.0', '1 elsewhere', '0.0500')])
+                                                                 (other, '0.2500', '12.0', '1 elsewhere', '0.0502')])
         for size in self.compare:
             self.assertEqual([row[2:] for row in tables[size].rows], [('—', '0', '—', 'no runs', 'no runs', '0')]
                              * len(self.regions))
@@ -660,6 +661,20 @@ gate_wait_usd_per_minute=0
             with self.subTest(action=action):
                 self.assertTrue(any(action in cast(list[str], row['Action']) and row['Resource'] == '*'
                                     and row['Effect'] == 'Allow' and 'Condition' not in row for row in statements))
+
+    def test_scaler_policy_reads_quota_request_history_for_only_the_spot_quotas(self) -> None:
+        document = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))
+        resources = ledger.mapping(document['Resources'])
+        policy = ledger.mapping(ledger.mapping(resources['GateGpuTrialScalerPolicy'])['Properties'])
+        statements = [row for row in ledger.rows(ledger.mapping(policy['PolicyDocument']), 'Statement')
+                      if 'servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota' in cast(list[str], row['Action'])]
+        self.assertEqual(len(statements), 1)
+        statement, = statements
+        self.assertEqual((statement['Effect'], statement['Action']),
+                         ('Allow', ['servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota']))
+        codes = sorted({code for _regions, code, _desired, _label in deploy.quota_targets('us-east-2')})
+        self.assertEqual(statement['Resource'], [
+            {'Fn::Sub': 'arn:${AWS::Partition}:servicequotas:*:${AWS::AccountId}:ec2/' + code} for code in codes])
 
     def test_initial_failure_saves_each_error_and_the_table_names_its_time(self) -> None:
         self.failure = 'describe-spot-price-history'

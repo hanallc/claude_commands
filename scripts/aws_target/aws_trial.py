@@ -92,7 +92,7 @@ def checked_git(repo: Path, *arguments: str) -> str:
 
 
 def network_git(repo: Path, *arguments: str) -> str:
-    """Bound network Git calls and stop their process groups on cancellation."""
+    """Bound network Git calls and stop unreaped Git groups on failure."""
     command = ['git', '-C', str(repo), *arguments]
     timeout = cloud_gate.settings().number('git_network_timeout_s')
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -100,11 +100,13 @@ def network_git(repo: Path, *arguments: str) -> str:
         try:
             output, errors = process.communicate(timeout=timeout)
         except BaseException:
-            try:
-                send_process_group(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            _ = process.communicate()
+            if process.returncode is None:
+                with cancellation.defer_cleanup_signals():
+                    try:
+                        send_process_group(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _ = process.wait()
             raise
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)

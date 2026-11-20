@@ -139,7 +139,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         finding_id = self.open_finding("blocker", "The byte split hides a cast")
         self.close_round([finding_id])
         state = {"history_file": str(self.history_file),
-                 "phase": {"instance_id": "phase-sixty-three", "id": "63", "title": "63", "status": "active"}}
+                 "open_phases": [{"instance_id": "phase-sixty-three", "id": "63", "title": "63", "status": "active"}]}
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
         return finding_id
 
@@ -275,6 +275,15 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         result = self.run_failing_command("landed", "--phase", "14")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Phase 14 is not open (open phases: 15, 16)", result.stderr)
+
+    def test_an_unnamed_finding_ignores_the_last_finished_phase(self) -> None:
+        state: dict[str, object] = {
+            "history_file": str(self.history_file), "open_phases": [],
+            "phase": {"id": "14", "instance_id": "phase-fourteen", "status": "completed"},
+        }
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps(state), encoding="utf-8")
+        _ = self.open_finding("minor", "A finding outside a phase")
+        self.assertEqual(self.events()[-1]["phase_instance_id"], "")
 
     # Keep process persistence coverage.
     @process_boundary
