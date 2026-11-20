@@ -309,16 +309,21 @@ def require_drained(roots: RecordRoots) -> None:
             raise Refused(f"a process holds admission records: {detail}")
 
 
-def convert(value: JsonValue, fields: frozenset[str], names: Mapping[str, str]) -> int:
+def convert(value: JsonValue, fields: frozenset[str], names: Mapping[str, str], *,
+            in_gate_job: bool = False) -> int:
     """Convert only exact values of named schema fields."""
     count = 0
     if isinstance(value, dict):
+        is_job = in_gate_job or value.get("kind") == "StepJob"
         for key, item in value.items():
+            # Both revisions use the same names for StepJob steps.
+            if key == "step" and is_job:
+                continue
             if key in fields and isinstance(item, str) and item in names:
                 value[key] = names[item]
                 count += 1
             else:
-                count += convert(item, fields, names)
+                count += convert(item, fields, names, in_gate_job=key == "gate_job")
     elif isinstance(value, list):
         for item in value:
             count += convert(item, fields, names)
@@ -403,10 +408,13 @@ def record_paths(roots: RecordRoots) -> dict[Path, frozenset[str]]:
         if directory.is_dir() and not directory.is_symlink() and directory.name not in ("admission", "pending-steps"):
             paths.update((path, frozenset({"step"})) for path in directory.iterdir() if MONTH.fullmatch(path.name))
     mode_fields = frozenset({"mode"})
-    # Both cloud writers use the same StepJob values.
-    for name in ("cloud-gate-launches.jsonl", "cost-ledger.json"):
-        if os.path.lexists(roots.aws / name):
-            paths[roots.aws / name] = mode_fields
+    cloud_fields = frozenset({"mode", "step"})
+    launches = roots.aws / "cloud-gate-launches.jsonl"
+    if os.path.lexists(launches):
+        paths[launches] = cloud_fields
+    costs = roots.aws / "cost-ledger.json"
+    if os.path.lexists(costs):
+        paths[costs] = mode_fields
     for directory in roots.buildlog.iterdir():
         if directory.is_dir() and not directory.is_symlink():
             paths.update((path, frozenset({"step"})) for path in directory.glob("results/????-??/*.json.gz"))
@@ -419,7 +427,7 @@ def record_paths(roots: RecordRoots) -> dict[Path, frozenset[str]]:
                 if name in CLOUD_REQUEST_FILES:
                     paths[Path(directory) / name] = mode_fields
                 elif name in {"remote-result.json", "outcome.json"}:
-                    paths[Path(directory) / name] = frozenset({"mode", "step"})
+                    paths[Path(directory) / name] = cloud_fields
     paths.update((path, steps) for path in wait_files(roots))
     return paths
 
