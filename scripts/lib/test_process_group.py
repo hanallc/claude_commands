@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable
 from contextlib import redirect_stderr
 import io
 import json
@@ -18,10 +17,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from typing import cast, override
-from unittest.mock import MagicMock, call, patch
+from typing import override
+from unittest.mock import MagicMock, patch
 
-from scripts.direct import group_cleanup
 from scripts.lib import process_group
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -242,18 +240,25 @@ class ShellProcessGroupTests(PrivateGroupFixture):
             cwd=self.root, env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
 
-    def forward(self, child_pid: int) -> Callable[[int, object], None]:
-        """Load the real embedded handler without executing its fork or signals."""
+    def forward(self, child_pid: int, assertions: str) -> subprocess.CompletedProcess[str]:
+        """Run the bootstrap and the forwarding function in the private checkout."""
         source = (self.root / "scripts/direct/verify.sh").read_text()
         embedded = source.split("STEP_OWNER_PY='", 1)[1].split("\n'\n", 1)[0]
+        bootstrap = embedded.split("\nchild = os.fork()\n", 1)[0]
         tree = ast.parse(embedded)
-        statements = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
         handlers = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "forward"]
         self.assertEqual(len(handlers), 1)
-        module = ast.Module(body=[*statements, handlers[0]], type_ignores=[])
-        namespace: dict[str, object] = {"child": child_pid}
-        exec(compile(module, str(self.root / "scripts/direct/verify.sh"), "exec"), namespace)
-        return cast(Callable[[int, object], None], namespace["forward"])
+        driver = "\n".join((bootstrap, ast.unparse(handlers[0]), """
+from scripts.direct import group_cleanup
+from unittest.mock import call, patch
+
+assert Path(group_cleanup.__file__).resolve().parent == Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]).parent / "direct"
+child = int(sys.argv[3])
+""", assertions))
+        return subprocess.run(
+            [sys.executable, "-I", "-c", driver, str(self.root / "lock"), "fixture", str(child_pid)],
+            cwd=self.root, env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
 
     def fake_group_sender(self, *, refuse: bool = False) -> Path:
         signals = self.root / "group-signals"
@@ -346,30 +351,43 @@ stop_interrupted_run_log() { :; }
                 shutil.rmtree(self.root / "session")
 
     def test_verify_forward_uses_its_local_helper_without_an_individual_signal(self) -> None:
-        group = self.private_child().pid
-        forward = self.forward(group)
-        with patch.object(group_cleanup, "send_process_group") as send, patch.object(os, "kill") as individual:
-            forward(signal.SIGTERM, None)
-        individual.assert_not_called()
-        self.assertEqual(send.call_args_list, [call(group, signal.SIGTERM), call(group, signal.SIGCONT)])
+        result = self.forward(self.private_child().pid, """
+with patch.object(group_cleanup, "send_process_group") as send, patch.object(os, "kill") as individual:
+    forward(signal.SIGTERM, None)
+individual.assert_not_called()
+assert send.call_args_list == [call(child, signal.SIGTERM), call(child, signal.SIGCONT)]
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_verify_forward_refuses_a_copy_without_the_group_helper(self) -> None:
+        (self.root / "scripts/direct/group_cleanup.py").unlink()
+        result = self.forward(self.private_child().pid, "")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No module named 'scripts.direct.group_cleanup'", result.stderr)
 
     def test_verify_helper_failure_reports_the_cause_without_individual_fallback(self) -> None:
-        forward = self.forward(self.private_child().pid)
-        error = PermissionError("fixture refused the group signal")
-        with (patch.object(group_cleanup, "send_process_group", side_effect=error),
-              patch.object(os, "kill") as individual,
-              self.assertRaisesRegex(PermissionError, str(error))):
-            forward(signal.SIGTERM, None)
-        individual.assert_not_called()
+        result = self.forward(self.private_child().pid, """
+error = PermissionError("fixture refused the group signal")
+with patch.object(group_cleanup, "send_process_group", side_effect=error), patch.object(os, "kill") as individual:
+    try:
+        forward(signal.SIGTERM, None)
+    except PermissionError as raised:
+        assert raised is error
+    else:
+        raise AssertionError("the group signal failure did not reach the caller")
+individual.assert_not_called()
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_verify_only_uses_individual_fallback_for_a_missing_group(self) -> None:
-        group = self.private_child().pid
-        forward = self.forward(group)
-        with (patch.object(group_cleanup, "send_process_group", side_effect=ProcessLookupError) as send,
-              patch.object(os, "kill") as individual):
-            forward(signal.SIGTERM, None)
-        send.assert_called_once_with(group, signal.SIGTERM)
-        self.assertEqual(individual.call_args_list, [call(group, signal.SIGTERM), call(group, signal.SIGCONT)])
+        result = self.forward(self.private_child().pid, """
+with (patch.object(group_cleanup, "send_process_group", side_effect=ProcessLookupError) as send,
+      patch.object(os, "kill") as individual):
+    forward(signal.SIGTERM, None)
+send.assert_called_once_with(child, signal.SIGTERM)
+assert individual.call_args_list == [call(child, signal.SIGTERM), call(child, signal.SIGCONT)]
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class ProcessGroupSourceTests(unittest.TestCase):

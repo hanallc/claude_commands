@@ -327,13 +327,16 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
 
 
 _locks: dict[int, Path] = {}
+_supervisor_cleanup: set[int] = set()
 # A folder's lock file, lease record, or unfinished lease record.
 _METADATA = re.compile(r"(.+)\.(?:lock|lease\.json(?:\.[0-9a-f]{16}\.tmp)?)")
 
 
 def _probe_timing(*, wait: bool = True) -> build_folder_lock.ProbeTiming:
+    if not wait:
+        return build_folder_lock.ProbeTiming(wait_seconds=0.0, retry_seconds=0.0)
     settings = _settings()
-    return build_folder_lock.ProbeTiming(settings.number("locks.probe_wait_seconds") if wait else 0.0,
+    return build_folder_lock.ProbeTiming(settings.number("locks.probe_wait_seconds"),
                                         settings.number("locks.probe_retry_seconds"))
 
 
@@ -356,6 +359,11 @@ def held_build_folder_descriptors() -> tuple[int, ...]:
     return tuple(_locks)
 
 
+def leave_inherited_cleanup_to_supervisor() -> None:
+    """Keep inherited leases when the supervisor will remove their folders."""
+    _supervisor_cleanup.update(_locks)
+
+
 def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
     if descriptor is None:
         try:
@@ -366,6 +374,7 @@ def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
         return
     try:
         _ = _locks.pop(descriptor, None)
+        _supervisor_cleanup.discard(descriptor)
     finally:
         # Closing preserves a child's inherited hold on the same lock.
         os.close(descriptor)
@@ -487,8 +496,9 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                 new_folder = False
                 new_branch_start = ""
                 try:
-                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind != "slot" and not editable_repository else fcntl.LOCK_EX,
-                                      wait=spec.kind != "slot"):
+                    mode = fcntl.LOCK_SH if stable and spec.kind != "slot" and not editable_repository else fcntl.LOCK_EX
+                    timing = _probe_timing(wait=spec.kind != "slot")
+                    if not build_folder_lock.take_lock(descriptor, mode, timing):
                         if renamed:
                             continue
                         raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
@@ -531,7 +541,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
                                 _ = git_rescue.rescue(path, f"{path.name}-recovery-{stamp}", generated=[path / "target"],
                                                      pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors))
-                            if not _remove_leased_folder(path, directory, None, temporary=False, allocated=existing):
+                            if not _remove_leased_folder(path, directory, None, temporary=False,
+                                                         allocated=_AllocatedFolderIdentity.from_stat(existing)):
                                 raise BlockingIOError(errno.EWOULDBLOCK, "cannot repair an incomplete slot", str(path))
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
                                                check=True, capture_output=True,
@@ -595,13 +606,15 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                     _locks[descriptor] = path
                     if isinstance(request, _TemporaryFolderRequest):
                         _ = request.cleanup.callback(_finish_temporary, path, directory, allocated,
-                                                     descriptor=descriptor, temporary=not stable)
+                                                     descriptor=descriptor, temporary=not stable,
+                                                     timing=_probe_timing() if spec.kind == "slot" else timing)
                     return path
                 except BaseException:
                     _ = _locks.pop(descriptor, None)
                     if (made_inode is not None or (new_folder and not stable)) and _take_lock(descriptor, fcntl.LOCK_EX):
                         cleanup = None if made_inode is not None else lambda: None
-                        _ = _remove_leased_folder(path, directory, cleanup, temporary=True, allocated=made_inode)
+                        identity = _AllocatedFolderIdentity.from_stat(made_inode) if made_inode is not None else None
+                        _ = _remove_leased_folder(path, directory, cleanup, temporary=True, allocated=identity)
                         if isinstance(original, LinkedEditableRepository):
                             import subprocess
 
@@ -802,20 +815,33 @@ def cleanup_incomplete(descriptor: int, *, active: ForegroundMarker = Foreground
 class _RemovalLockState(Enum):
     ACQUIRED = "the lease permits removal"
     HELD = "another holder has the lease"
-    UNSAFE = "the lease changed or cleanup is incomplete"
+    REPLACED = "the lock no longer names this lease"
+    UNSAFE = "the lease cannot be checked or cleanup is incomplete"
+
+
+class _DeferredRemovalWait(Enum):
+    LEASE_RELEASE = "wait for the lease to become free"
+
+
+_RemovalWait = bool | build_folder_lock.ProbeTiming | _DeferredRemovalWait
 
 
 def _take_removal_lock(path: Path, directory: int, descriptor: int, *,
-                       wait: bool | build_folder_lock.ProbeTiming) -> _RemovalLockState:
-    timing = _probe_timing(wait=wait) if isinstance(wait, bool) else wait
-    if not build_folder_lock.take_lock(descriptor, fcntl.LOCK_EX, timing):
-        return _RemovalLockState.HELD
-    if not build_folder_lock.lock_current(path, directory, descriptor) or cleanup_incomplete(descriptor):
+                       wait: _RemovalWait) -> _RemovalLockState:
+    if isinstance(wait, _DeferredRemovalWait):
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    else:
+        timing = _probe_timing(wait=wait) if isinstance(wait, bool) else wait
+        if not build_folder_lock.take_lock(descriptor, fcntl.LOCK_EX, timing):
+            return _RemovalLockState.HELD
+    if not build_folder_lock.lock_current(path, directory, descriptor):
+        return _RemovalLockState.REPLACED
+    if cleanup_incomplete(descriptor):
         return _RemovalLockState.UNSAFE
     return _RemovalLockState.ACQUIRED
 
 
-def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True,
+def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: _RemovalWait = True,
                      create: bool = False, unpaired: bool = False) -> FolderRemovalLease:
     """Hold the lock if it is free. The stack owns the descriptor."""
     try:
@@ -838,7 +864,11 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
             return UnreservedRemovalFolder()
         if info.st_nlink > 1:
             return RefusedRemovalLease()
-    if _take_removal_lock(path, directory, descriptor, wait=wait) is not _RemovalLockState.ACQUIRED:
+    state = _take_removal_lock(path, directory, descriptor, wait=wait)
+    if state is _RemovalLockState.REPLACED and isinstance(wait, _DeferredRemovalWait):
+        if not _folder_exists(path.with_name(path.name + ".lock"), directory):
+            return UnreservedRemovalFolder()
+    if state is not _RemovalLockState.ACQUIRED:
         return RefusedRemovalLease()
     _ = stack.callback(_locks.pop, descriptor, None)
     _locks[descriptor] = path
@@ -846,7 +876,7 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
 
 
 def _hold_child_leases(path: Path, stack: ExitStack, *, dir_fd: int | None = None,
-                       wait: bool = True, repair_permissions: bool = False) -> bool:
+                       wait: _RemovalWait = True, repair_permissions: bool = False) -> bool:
     """Hold the child leases without following links."""
     def unreadable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
@@ -945,6 +975,16 @@ def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
             _release_build_folder(path)
 
 
+@dataclass(frozen=True)
+class _AllocatedFolderIdentity:
+    device: int
+    inode: int
+
+    @classmethod
+    def from_stat(cls, current: os.stat_result) -> _AllocatedFolderIdentity:
+        return cls(current.st_dev, current.st_ino)
+
+
 def remove_build_folder(path: Path, cleanup: Callable[[], object] | None = None, *, temporary: bool = True,
                         dir_fd: int | None = None, wait: bool | build_folder_lock.ProbeTiming = True,
                         allocated: os.stat_result | None = None) -> bool:
@@ -955,24 +995,30 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object] | None = None,
                 build_folder_lock.folder_parent(path, path.parent, create=False))
         except FileNotFoundError:
             return cleanup is None or cleanup() is not False
+        identity = _AllocatedFolderIdentity.from_stat(allocated) if allocated is not None else None
+        defer = identity is not None and cleanup is None
         try:
             descriptor = build_folder_lock.open_lock(path, directory, create=True)
             _ = locks.callback(os.close, descriptor)
             state = _take_removal_lock(path, directory, descriptor, wait=wait)
         except (OSError, ValueError):
             state = _RemovalLockState.UNSAFE
-        if state is _RemovalLockState.HELD and allocated is not None:
-            # Another process can still hold the allocation after a fork.
-            # The last context to release the lease can remove the folder.
-            return False
-        if state is not _RemovalLockState.ACQUIRED:
-            print(f"build folders: kept {path}; its lease is held or incomplete", file=sys.stderr)
-            return False
-        return _remove_leased_folder(path, directory, cleanup, temporary=temporary, allocated=allocated)
+        else:
+            if state is _RemovalLockState.ACQUIRED:
+                removed = _remove_leased_folder(path, directory, cleanup, temporary=temporary, allocated=identity,
+                                                report_busy=not defer)
+                if removed or not defer:
+                    return removed
+            if identity is not None and cleanup is None and state in (_RemovalLockState.HELD, _RemovalLockState.ACQUIRED):
+                _defer_temporary_removal(path, directory, descriptor, identity, temporary)
+                return False
+        print(f"build folders: kept {path}; its lease is held or incomplete", file=sys.stderr)
+        return False
 
 
 def _remove_leased_folder(path: Path, directory: int, cleanup: Callable[[], object] | None, *,
-                          temporary: bool, allocated: os.stat_result | None = None) -> bool:
+                          temporary: bool, allocated: _AllocatedFolderIdentity | None = None,
+                          child_wait: bool | _DeferredRemovalWait = False, report_busy: bool = True) -> bool:
     with ExitStack() as children:
         current = None
         try:
@@ -980,14 +1026,15 @@ def _remove_leased_folder(path: Path, directory: int, cleanup: Callable[[], obje
                 current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
             except FileNotFoundError:
                 current = None
-            if allocated is not None and current is not None and not os.path.samestat(allocated, current):
+            if allocated is not None and current is not None and allocated != _AllocatedFolderIdentity.from_stat(current):
                 return False
-            free = _hold_child_leases(path, children, dir_fd=directory, wait=False,
+            free = _hold_child_leases(path, children, dir_fd=directory, wait=child_wait,
                                       repair_permissions=allocated is not None)
         except (OSError, ValueError):
             free = False
         if not free:
-            print(f"build folders: kept {path}; a child lease is held or incomplete", file=sys.stderr)
+            if report_busy:
+                print(f"build folders: kept {path}; a child lease is held or incomplete", file=sys.stderr)
             return False
         if cleanup is None:
             if current is not None:
@@ -999,6 +1046,42 @@ def _remove_leased_folder(path: Path, directory: int, cleanup: Callable[[], obje
         if temporary:
             _unlink_metadata(path, directory)
         return True
+
+
+def _defer_temporary_removal(path: Path, directory: int, descriptor: int,
+                             identity: _AllocatedFolderIdentity, temporary: bool) -> None:
+    """Give the open lock and parent to a process that can wait for the lease."""
+    import subprocess
+    import threading
+
+    try:
+        worker = subprocess.Popen(
+            [sys.executable, "-I", str(Path(__file__).resolve()), "_remove-when-free", str(path),
+             str(directory), str(descriptor), str(identity.device), str(identity.inode), str(int(temporary))],
+            pass_fds=(directory, descriptor), start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        print(f"build folders: kept {path}; could not start deferred removal: {error}", file=sys.stderr)
+        return
+    threading.Thread(target=worker.wait, daemon=True).start()
+
+
+def _remove_when_free(arguments: Sequence[str]) -> int:
+    path = Path(arguments[0])
+    directory, descriptor, device, inode, temporary = map(int, arguments[1:])
+    try:
+        wait = _DeferredRemovalWait.LEASE_RELEASE
+        state = _take_removal_lock(path, directory, descriptor, wait=wait)
+        if state is _RemovalLockState.REPLACED:
+            return 0
+        if state is not _RemovalLockState.ACQUIRED:
+            return 1
+        return 0 if _remove_leased_folder(path, directory, None, temporary=bool(temporary),
+                                          allocated=_AllocatedFolderIdentity(device, inode), child_wait=wait) else 1
+    finally:
+        os.close(descriptor)
+        os.close(directory)
 
 
 class FolderPairRelease(Enum):
@@ -1043,11 +1126,13 @@ def release_removed_folder(path: Path) -> FolderPairRelease:
 
 
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
-                      descriptor: int, temporary: bool) -> None:
+                      descriptor: int, temporary: bool, timing: build_folder_lock.ProbeTiming) -> None:
     if _locks.get(descriptor) != path:
         return
+    supervisor_owns_cleanup = descriptor in _supervisor_cleanup
     _release_build_folder(path, descriptor=descriptor)
-    _ = remove_build_folder(path, temporary=temporary, dir_fd=directory, allocated=allocated)
+    if not supervisor_owns_cleanup:
+        _ = remove_build_folder(path, temporary=temporary, dir_fd=directory, allocated=allocated, wait=timing)
 
 
 def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
@@ -1338,4 +1423,6 @@ def main(argv: Sequence[str]) -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["_remove-when-free"]:
+        raise SystemExit(_remove_when_free(sys.argv[2:]))
     raise SystemExit(main(sys.argv[1:]))

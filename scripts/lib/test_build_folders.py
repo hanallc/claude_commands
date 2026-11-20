@@ -18,8 +18,9 @@ import threading
 import unittest
 from typing import Never, cast, override
 from unittest import mock
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 
+from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1306,31 +1307,46 @@ with path.with_name(path.name + '.lock').open('a') as lock:
             self.assertEqual(lease["work"], "abc")
 
     def test_temporary_context_keeps_the_folder_while_a_child_holds_the_lock(self) -> None:
+        self.check_deferred_removal(nested=False)
+
+    def test_deferred_removal_waits_for_an_independent_nested_lease(self) -> None:
+        self.check_deferred_removal(nested=True)
+
+    def check_deferred_removal(self, *, nested: bool) -> None:
         child: subprocess.Popen[str] | None = None
         try:
-            with folders.temporary_build_folder(folders.UniqueBuildFolder("child-")) as path:
+            with ExitStack() as lifetime:
+                path = lifetime.enter_context(folders.temporary_build_folder(folders.UniqueBuildFolder("child-")))
+                held = path
+                if nested:
+                    held = folders.create_build_folder(folders.UniqueBuildFolder(
+                        "nested-", folders.ExplicitBuildParent(path)))
+                    _ = lifetime.callback(_release_folder, held)
                 child = subprocess.Popen([sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
-                                         pass_fds=(folders.build_folder_lock_fd(path),),
+                                         pass_fds=(folders.build_folder_lock_fd(held),),
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
                 assert child.stdout is not None
+                self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                 self.assertEqual(child.stdout.readline(), "ready\n")
+                with mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as launch:
+                    lifetime.close()
+                launch.assert_called_once()
             self.assertTrue(path.is_dir())
             lock = path.with_name(path.name + ".lock")
             lease = path.with_name(path.name + ".lease.json")
             self.assertTrue(lock.is_file())
             self.assertTrue(lease.is_file())
-            self.assertEqual(folders.build_folder_state(path), "held")
-            self.assertFalse(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+            self.assertEqual(folders.build_folder_state(held), "held")
+            self.assertFalse(folders.remove_build_folder(path, wait=False))
             self.assertTrue(path.is_dir() and lock.is_file() and lease.is_file())
-            _ = child.communicate(input="end", timeout=10)
+            _ = child.communicate(input="end", timeout=TEST_HANG_GUARD_SECS)
+            wait_until(lambda: not (path.exists() or lock.exists() or lease.exists()), path.parent)
             self.assertEqual(folders.build_folder_state(path), "free")
-            self.assertTrue(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
-            self.assertFalse(path.exists() or lock.exists() or lease.exists())
         finally:
             if child is not None:
                 if child.poll() is None:
                     child.kill()
-                _ = child.communicate(timeout=10)
+                _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_lock_and_lease_symlinks_cannot_modify_another_file(self) -> None:
         outside = self.root / "unrelated"

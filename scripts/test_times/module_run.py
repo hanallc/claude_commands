@@ -590,6 +590,7 @@ def private_run_roots() -> Generator[Callable[[], None]]:
 def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
     """Use kernel events while the supervisor reaps every adopted descendant."""
     global startup_cpu_s
+    from scripts.lib import build_folders
     from scripts.lib.descendants import adopt_descendants
 
     if not adopt_descendants():
@@ -623,6 +624,7 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
             raise OSError(ctypes.get_errno(), "cannot set the test parent death signal")
         if os.getppid() != supervisor:
             os.kill(os.getpid(), signal.SIGKILL)
+        build_folders.leave_inherited_cleanup_to_supervisor()
         startup_cpu_s = usage.ru_utime + usage.ru_stime
         _ = signal.signal(signal.SIGCHLD, previous_sigchld)
         _ = signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
