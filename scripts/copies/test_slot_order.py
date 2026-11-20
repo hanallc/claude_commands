@@ -17,7 +17,7 @@ import tempfile
 from textwrap import dedent
 import threading
 import time
-from typing import NotRequired, TypedDict, cast, override
+from typing import ClassVar, NotRequired, TypedDict, cast, override
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 import unittest
@@ -31,23 +31,22 @@ from scripts.build_targets import target_config
 from scripts.copies import copies
 from scripts.copies.copies_test_support import AdmissionWaitReached, copies_environment, stop_before_slot
 from scripts.build_queue import step_estimator
-from scripts.mac_test import eligibility
+from scripts.mac_test import eligibility, offload
 from scripts.disks import slots
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, reap
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
-from scripts.lib import build_folders, build_slots, conf
+from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture, write_pressure_reading
 from scripts.production.cli_fixture import ImmutableGitSeed, locked_environment
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 from scripts.production import bump_gate, checkpoint_gate, staff, waiting
 from scripts.production.production_doc import Production
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
-SESSION_VARIABLES = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 GATE_COMMAND = """from pathlib import Path
 import json, os, sys, time
 sys.path.insert(0, os.environ['SLOT_ORDER_CHECKOUT'])
@@ -60,6 +59,52 @@ for phase in range(2):
             break
 """
 
+# Use the real placement and slot APIs for the callers that only fill the pool.
+CAPACITY_CALLER = """from pathlib import Path
+import os
+from socket import AF_UNIX, SOCK_STREAM, socket
+import sys
+import time
+
+from scripts.build_queue import admission_client as client, admission_protocol as wire, slot_wait
+from scripts.buildlog import store
+from scripts.lib import build_slots
+
+endpoint, caller, owner, source_key, limit, folder = sys.argv[1:]
+source = Path(folder)
+os.chdir(source)
+episode = f"capacity-{os.getpid()}"
+since = time.time()
+assignment = Path(os.environ["TMPDIR"]) / "assignment.json"
+command = ["cargo", "nextest", "run"]
+while True:
+    status = client.main(["place-step", "--pid", str(os.getpid()), "--episode", episode, "--since", str(since),
+        "--repo-root", str(source), "--source-key", source_key,
+        "--kind", "test", "--package", "sample", "--local-only", "--assignment-file", str(assignment),
+        "--", *command])
+    if status:
+        raise SystemExit(status)
+    try:
+        with build_slots.take_slot(source, "HEAD", showrunner="builds", unit=owner, work="test",
+                purpose="pool capacity", wait_policy=build_slots.SlotWaitPolicy.REFUSE) as slot:
+            with socket(AF_UNIX, SOCK_STREAM) as ready:
+                ready.connect(endpoint)
+                ready.sendall(f"{caller}\\t{slot.path}\\n".encode())
+                ready.recv(1)
+    except build_slots.SlotsFull:
+        pass
+    else:
+        client.finish_step(assignment, 0)
+        break
+    grant = client.read_assignment(assignment)
+    assert isinstance(grant, wire.LocalPlacementGranted)
+    assert isinstance(client.release(grant.grant.reservation, 75, grant.grant.cleanup_timing), wire.Ok)
+    slot_wait.wait_for_slot(source.name, store.host_name(), build_slots.configured_slot_root(), int(limit),
+        episode=episode, since=since, showrunner="builds", unit=owner, work="test", purpose="pool capacity")
+    client.finish_step(assignment, 75, "repository slot capacity")
+    assignment.unlink()
+"""
+
 
 class StartedStep(TypedDict):
     phase: int
@@ -70,11 +115,12 @@ class StartedStep(TypedDict):
 
 
 class SlotOrderTests(unittest.TestCase):
+    repository_seed: ClassVar[ImmutableGitSeed]
     root: Path = Path()
     source: Path = Path()
     slot_root: Path = Path()
     owner: str = ""
-    session_environment: dict[str, str] = {}
+    build_sessions: dict[str, str] = {}
     queue: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     processes: list[subprocess.Popen[str]] = []
     requests: list[wire.Request] = []
@@ -83,12 +129,19 @@ class SlotOrderTests(unittest.TestCase):
     waiting: threading.Event = threading.Event()
     slot_waiting: threading.Event = threading.Event()
 
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="slot-order-seed-")))
+        cls.repository_seed = ImmutableGitSeed.create(seed, "main", "Slot Tests", "slots@example.invalid",
+            {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "merge_gate.py": GATE_COMMAND,
+             ".gitignore": "target/\n"})
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="slot-order-"))).resolve()
-        runner_session = staff.caller_identity()
-        self.session_environment = {key: os.environ.get(key, "") for key in SESSION_VARIABLES}
-        environment = {**copies_environment(self.root, repository="origin"), **self.session_environment}
+        environment = {**copies_environment(self.root, repository="origin"), **build_fixture_sessions("")}
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.queue = self.enterContext(AdmissionFixture(root=Path(environment["CONF_DIR"])))
         self.queue.clock.epoch = time.time()
@@ -99,15 +152,12 @@ class SlotOrderTests(unittest.TestCase):
             _ = os.environ.pop(key, None)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         parent = fixture_member("showrunner", name="builds")
-        member = fixture_member("unit", name="slot-order", parent=parent.id, runtime_id=runner_session)
+        member = fixture_member("unit", name="slot-order", parent=parent.id, runtime_id=staff.caller_identity())
         self.owner = str(member.id)
-        if not runner_session:
-            self.session_environment["CLAUDE_CODE_SESSION_ID"] = member.current_session
-            os.environ.update(self.session_environment)
-        seed = ImmutableGitSeed.create(self.root / "repository", "main", "Slot Tests", "slots@example.invalid",
-            {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "merge_gate.py": GATE_COMMAND,
-             ".gitignore": "target/\n"})
-        self.source = seed.checkout
+        self.build_sessions = build_fixture_sessions(member.current_session)
+        os.environ.update(self.build_sessions)
+        self.source = self.root / "repository" / "checkout"
+        self.repository_seed.copy_to(self.source, self.source.parent / "origin.git")
         self.slot_root = self.root / "slots"
         self.processes = []
         self.requests = []
@@ -357,11 +407,14 @@ placement_once
         scripts = self.root / "bin"
         scripts.mkdir()
         wrapper = scripts / "git"
-        _ = wrapper.write_text(f"#!{sys.executable}\nimport os,sys\n"
-            + "if 'worktree' in sys.argv and 'add' in sys.argv:\n"
-            + f" with open({str(ready)!r}, 'w') as notice: notice.write('ready\\n')\n"
-            + f" with open({str(proceed)!r}, 'rb') as permission: permission.read(1)\n"
-            + f"os.execv({binary!r}, [{binary!r}, *sys.argv[1:]])\n")
+        _ = wrapper.write_text("#!/bin/sh\n"
+            + "worktree=0 add=0\n"
+            + 'for word do case "$word" in worktree) worktree=1;; add) add=1;; esac; done\n'
+            + 'if [ "$worktree$add" = 11 ]; then\n'
+            + f"  printf 'ready\\n' > {shlex.quote(str(ready))}\n"
+            + f"  read -r permission < {shlex.quote(str(proceed))} || :\n"
+            + "fi\n"
+            + f'exec {shlex.quote(binary)} "$@"\n')
         wrapper.chmod(0o755)
         with mock.patch.dict(os.environ, {"PATH": str(scripts) + os.pathsep + os.environ["PATH"]}):
             process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"),
@@ -382,7 +435,7 @@ placement_once
         # Keep the held slot alive across the handoff, independent of scheduling.
         with mock.patch.object(self.queue.clock, "advance", return_value=None):
             self.waiting.clear()
-            _ = os.write(proceed_fd, b"x")
+            _ = os.write(proceed_fd, b"x\n")
             first = self.next_step(process)
         self.assertEqual(first["phase"], 0)
         self.assertFalse(self.waiting.is_set(), "the first command step entered the memory queue again")
@@ -489,7 +542,7 @@ placement_once
             f"# whole: 1..\nslots.{self.queue.server.host}.{tools.root.name}.max=1\nslots.wait_seconds=120\n")
         environment.update(fake_memory_readings(self.queue.root, available_kib=60 * 1024**2))
         _ = write_config_fixture(self.queue.root / "build_admission.conf",
-            "recovery_start_seconds=1\nwaiting_pass_seconds=0.05\nrunning_pass_seconds=0.1\n"
+            "recovery_start_seconds=1\nwaiting_pass_seconds=0.25\nrunning_pass_seconds=0.5\n"
             + "program_first_peak_gib.merge-gate=4\nslot_gap_seconds=1\n")
         gate = self.root / "merge_gate.py"
         held = self.root / "gate-holds-folder"
@@ -561,18 +614,18 @@ placement_once
 
     def test_snapshot_command_inherits_the_runner_session(self) -> None:
         program = ("import json, os\n"
-                   f"print(json.dumps({{key: os.getenv(key, '') for key in {SESSION_VARIABLES!r}}}))")
+                   f"print(json.dumps({{key: os.getenv(key, '') for key in {tuple(self.build_sessions)!r}}}))")
         process = self.start((sys.executable, "-c", program))
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
-        self.assertEqual(output.strip(), json.dumps(self.session_environment))
+        self.assertEqual(output.strip(), json.dumps(self.build_sessions))
 
     def verify_source(self) -> VerifyMacOffloadFixture:
         tools = VerifyMacOffloadFixture()
         tools.root = self.root / "verify"
         tools.root.mkdir()
         tools.build_fixture()
-        tools.environment.update(self.session_environment)
+        tools.environment.update(self.build_sessions)
         real_git = shutil.which("git")
         assert real_git is not None
         shutil.rmtree(tools.root / ".git")
@@ -721,7 +774,7 @@ placement_once
         maximum = 7
         _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
             f"# whole: 1..\nslots.{self.queue.server.host}.{tools.root.name}.max={maximum}\nslots.wait_seconds=120\n")
-        self.queue.configure(recovery_start_seconds=1, waiting_pass_seconds=0.05, running_pass_seconds=0.1)
+        self.queue.configure(recovery_start_seconds=1, waiting_pass_seconds=1, running_pass_seconds=1)
         memory = fake_memory_readings(self.queue.root, available_kib=256 * 1024**2, total_kib=256 * 1024**2)
         hold = Path(environment["BUILD_HOLD_DIR"])
         hold.mkdir(exist_ok=True)
@@ -788,28 +841,47 @@ placement_once
 
         def wait_for_callers(callers: set[str], count: int) -> None:
             with condition:
-                self.assertTrue(condition.wait_for(lambda: len(callers) >= count, timeout=60),
-                    f"Only {len(callers)} of {count} callers entered the wait.")
+                ready = condition.wait_for(lambda: len(callers) >= count, timeout=60)
+            if not ready:
+                self.fail(f"Only {len(callers)} of {count} callers entered the wait. " + caller_diagnostics())
 
         verify = str(CHECKOUT / "scripts/direct/verify.sh")
         boards: dict[int, Path] = {}
+        capacity_caller = self.root / "capacity-caller.py"
+        _ = capacity_caller.write_text(CAPACITY_CALLER)
+        source_key = treekey.committed_tree_key(copies.git(tools.root, "rev-parse", "HEAD^{tree}").strip())
 
-        def start_verify(variant: str = "") -> subprocess.Popen[str]:
+        def caller_diagnostics() -> str:
+            statuses = [process.poll() for process in self.processes]
+            errors = {}
+            for number, process in enumerate(self.processes):
+                if statuses[number] is not None:
+                    output, errors[number] = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    errors[number] += output
+            return f"Callers: {statuses}. Output: {errors}. Waits: {memory_waiters}, {hold_waiters}, {mac_waiters}."
+
+        def start_caller(variant: str) -> subprocess.Popen[str]:
             caller = len(self.processes)
             board = boards[caller] = self.root / f"board-{caller}"
             temporary = self.root / f"caller-{caller}-tmp"
             temporary.mkdir()
-            local = ("test", "sample", "--local", "fixture", "--no-cache")
-            command = ("bash", verify, *local)
-            if variant == "env":
-                command = ("env", "MODE=ci", *command)
+            capacity_command = ("env", f"PYTHONPATH={CHECKOUT}", sys.executable, str(capacity_caller), str(endpoint), str(caller),
+                                self.owner, source_key, str(maximum), str(tools.root))
+            caller_environment = {**os.environ, "COPY_SLOT_TEST_CALLER": str(caller), "UNIT_RUN_DIR": str(board),
+                                  "TMPDIR": str(temporary)}
+            if variant == "capacity":
+                process = subprocess.Popen(capacity_command,
+                    cwd=tools.root, env=caller_environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.processes.append(process)
+                return process
             if variant == "mac":
-                remote = 'bash "$VERIFY_SCRIPT" test sample --mac fixture --no-cache'
-                local_command = 'bash "$VERIFY_SCRIPT" ' + shlex.join(local)
-                command = ("bash", "-c", remote + " && " + local_command)
-            options = ("--publish", "report.txt") if caller == 0 else ()
-            with locked_environment({**os.environ, "COPY_SLOT_TEST_CALLER": str(caller), "UNIT_RUN_DIR": str(board),
-                                     "VERIFY_SCRIPT": verify, "TMPDIR": str(temporary)}, self.queue.loop_access):
+                remote = shlex.join(("bash", verify, "test", "sample", "--mac", "fixture", "--no-cache"))
+                command = ("bash", "-c", remote + " && exec " + shlex.join(capacity_command))
+                options = ()
+            else:
+                command = ("env", "MODE=ci", "bash", verify, "test", "sample", "--local", "fixture", "--no-cache")
+                options = ("--publish", "report.txt")
+            with locked_environment(caller_environment, self.queue.loop_access):
                 return self.start(command, *options)
 
         def held_folders() -> set[Path]:
@@ -825,7 +897,10 @@ placement_once
             listener.settimeout(60)
 
             def next_running_step() -> tuple[Path, tuple[socket.socket, subprocess.Popen[str]]]:
-                connection = steps.enter_context(listener.accept()[0])
+                try:
+                    connection = steps.enter_context(listener.accept()[0])
+                except TimeoutError:
+                    self.fail("A caller did not reach Cargo. " + caller_diagnostics())
                 connection.settimeout(60)
                 with connection.makefile("r") as response:
                     caller, folder = response.readline().rstrip("\n").split("\t", 1)
@@ -838,21 +913,27 @@ placement_once
             peer = [str(first_board), "peer", "cargo", "--pid", str(os.getpid())]
             _ = subprocess.run(["bash", board_helper, "acquire", *peer], env=environment,
                 capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
-            token_caller = start_verify()
+            self.queue.hold_starts()
+            token_caller = start_caller("env")
             try:
+                wait_for_callers(memory_waiters, 1)
+                self.assertEqual(len(held_folders()), 0, "the env caller holds a folder during its memory wait")
+                write_pressure_reading(self.queue.root / "pressure")
+                self.queue.server.wake_loop()
                 wait_until(lambda: any(first_waiters.iterdir()), first_waiters, processes=(token_caller,))
                 with self.subTest(wait="Cargo token"):
                     self.assertEqual(len(held_folders()), 0, "the Cargo token waiter holds a folder")
+                with condition:
+                    memory_waiters.clear()
                 self.queue.hold_starts()
-                _ = start_verify("env")
-                for _ in range(2):
-                    _ = start_verify()
+                for _ in range(3):
+                    _ = start_caller("capacity")
                 wait_for_callers(memory_waiters, 3)
                 with self.subTest(wait="memory"):
                     self.assertEqual(len(held_folders()), 0, "a memory waiter holds a folder")
                 _ = local_hold.write_text(json.dumps({"holder": "other", "for": "fixture",
                     "since": "2026-11-18T00:00:00Z", "release_eta": "unknown"}))
-                _ = start_verify("mac")
+                _ = start_caller("mac")
                 wait_for_callers(mac_waiters, 1)
                 with self.queue.loop_turn():
                     mac_request = next(request for request in self.requests
@@ -861,7 +942,7 @@ placement_once
                     self.assertNotIn(Path(mac_request.constraints.repository), held_folders(),
                                      "the bash -c caller holds a folder during its Mac wait")
                 for _ in range(4):
-                    _ = start_verify()
+                    _ = start_caller("capacity")
                 wait_for_callers(hold_waiters, 7)
                 waiting_folders = held_folders()
                 print(f"Waiting: {len(waiting_folders)} of {maximum} held; {len(slot_requests)} slot waiters.", flush=True)
@@ -900,16 +981,8 @@ placement_once
                     changed = condition.wait_for(lambda: slot_request_count != observed_count,
                                                  timeout=deadline - time.monotonic())
                     if not changed:
-                        statuses = [process.poll() for process in self.processes]
-                        errors: dict[int, str] = {}
-                        for number, process in enumerate(self.processes):
-                            if statuses[number] is None or process.stderr is None:
-                                continue
-                            descriptor = process.stderr.fileno()
-                            if select.select([descriptor], [], [], 0)[0]:
-                                errors[number] = os.read(descriptor, 8192).decode(errors="replace")
                         self.fail(f"Expected two live slot waiters, saw {len(waiters)}. "
-                                  + f"Slot requests: {slot_requests}. Caller statuses: {statuses}. Errors: {errors}.")
+                                  + f"Slot requests: {slot_requests}. " + caller_diagnostics())
             print("Capacity: two waiters hold no memory, token or folder.", flush=True)
 
             def finish_caller(process: subprocess.Popen[str]) -> None:
@@ -971,6 +1044,12 @@ placement_once
                     ready.recv(1)
             ''').strip()
         _ = cargo.write_text(cargo.read_text().replace('if arguments[:2] == ["nextest", "run"]:', pause))
+        tree = copies.staged_tree(tools.root)
+        copies_path = CHECKOUT / "scripts/copies/copies.py"
+        hold_command = (sys.executable, str(copies_path), "hold", "--repo", "{tree}", "--tree", tree,
+                        "--step", "test", "--capacity-file", str(self.root / "capacity"),
+                        "--", "cargo", "nextest", "run")
+        verify_command = ("bash", str(CHECKOUT / "scripts/direct/verify.sh"), "test", "sample", "--local", "fixture")
         with (mock.patch.dict(os.environ, environment),
               socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener):
             listener.bind(str(endpoint))
@@ -979,8 +1058,7 @@ placement_once
             for stop in ("launcher SIGKILL", "copies TERM"):
                 with self.subTest(stop=stop):
                     with mock.patch.dict(os.environ, {"TEST_COPY_STOP": stop}):
-                        process = self.start(("bash", str(CHECKOUT / "scripts/direct/verify.sh"), "test", "sample",
-                                              "--local", "fixture"))
+                        process = self.start(hold_command if stop == "launcher SIGKILL" else verify_command)
                     with listener.accept()[0] as connection:
                         connection.settimeout(TEST_HANG_GUARD_SECS)
                         with connection.makefile("r") as data:
@@ -1090,6 +1168,42 @@ placement_once
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["open", "dispatch", "close"])
 
+    def assert_ssh_source(self, source: Path, caller: Path, revision: str, scenario: str) -> None:
+        with copies.requested_source(source, copies.WorktreeSource("HEAD", str(source)),
+                                     copies.MergeRevision(revision)) as snapshot:
+            self.assertEqual((snapshot / "src/lib.rs").read_text(), "pub fn changed() {}\n")
+            self.assertEqual((snapshot / "src/merged.rs").read_text(), "pub fn merged() {}\n")
+            self.assertFalse((source / "src/merged.rs").exists())
+            if scenario != "clean-linux":
+                _ = (snapshot / "src/main.rs").write_text("fn main() { let _ = 1; }\n")
+            if scenario == "source-record":
+                _ = (snapshot / copy_record.RECORD).write_text("{}")
+                _ = copies.git(snapshot, "add", "-f", copy_record.RECORD)
+            tree = copies.staged_tree(snapshot, include_worktree=True)
+            trust = copies.SshSourceTrust(offload.trusted_linux_source, nix_env.trusted_root, nix_env.registered_worktree)
+            if scenario == "source-record":
+                with self.assertRaisesRegex(copies.CopyError, r"the admitted tree contains \.scratch\.json") as refused:
+                    with copies.remote_step_source(snapshot, tree, caller, trust):
+                        self.fail("the admitted source record reached the runner")
+                self.assertEqual(refused.exception.exit_code, 2)
+            else:
+                trusted = scenario in ("clean-linux", "trusted-linux", "trusted-envrc")
+                self.assertEqual(offload.trusted_linux_source(caller), trusted or scenario == "mismatched-linux")
+                with copies.remote_step_source(snapshot, tree, caller, trust) as checkout:
+                    self.assertEqual(checkout.parent, copy_record.root().resolve())
+                    record = copy_record.read_record(checkout / copy_record.RECORD)
+                    self.assertIsInstance(record, copy_record.Registered)
+                    assert isinstance(record, copy_record.Registered)
+                    self.assertEqual("generated_source" in record.fields, trusted)
+                    self.assertEqual(offload.trusted_linux_source(checkout), trusted)
+                    if scenario in ("trusted-envrc", "untrusted-envrc"):
+                        self.assertIsNotNone(copy_record.record_path(checkout))
+                        self.assertEqual(record.fields.get("source_commit"), copies.commit_at(source, "HEAD") if trusted else None)
+                    self.assertEqual((checkout / "src/lib.rs").read_text(), "pub fn changed() {}\n")
+                    self.assertEqual((checkout / "src/merged.rs").read_text(), "pub fn merged() {}\n")
+                    self.assertEqual(treekey.tree_key(str(checkout)), treekey.committed_tree_key(tree.encode("ascii")))
+            self.assertFalse(self.slot_root.exists())
+
     def test_remote_grant_source_key_matches_the_prepared_slot(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
@@ -1135,7 +1249,8 @@ placement_once
                 request = original(arguments)
                 root = request.source_root
                 row = [str(Path.cwd()), str(root), treekey.tree_key(str(root)),
-                       (root / "src/lib.rs").read_text(), (root / "src/merged.rs").read_text()]
+                       (root / "src/lib.rs").read_text(), (root / "src/merged.rs").read_text(),
+                       (root / "src/main.rs").read_text()]
                 if "TEST_REMOTE_ASSIGNMENT" in os.environ:
                     observed.with_suffix(".assignment").write_bytes(Path(arguments.assignment_file).read_bytes())
                 if "TEST_TRUST_CALLER" in os.environ:
@@ -1155,10 +1270,6 @@ placement_once
                             str(repo), isinstance(request.source, offload.StagedDocSnapshot),
                             (root / "src/main.rs").read_text(),
                         ]))
-                    if (root / ".envrc").exists():
-                        marker = copy_record.record_path(root)
-                        commit = record.fields.get("source_commit") if isinstance(record, copy_record.Registered) else None
-                        observed.with_suffix(".record").write_text(json.dumps([marker is not None, commit]))
                     if not accepted:
                         os.environ.update(TEST_RUNNER_MAC="declined", TEST_RUNNER_STATUS="75", TEST_RUNNER_REASON="repo")
                 temporary = observed.with_suffix(".tmp")
@@ -1178,7 +1289,7 @@ placement_once
         other = self.root / "other-trusted"
         _ = copies.git(tools.root, "clone", "-q", str(tools.root), str(other))
         tools.write_executable(tools.bin_directory / "direnv", "#!/bin/sh\nexit 1\n")
-        for scenario in ("prepared", "modified", "clean-linux", "linux-doc", "trusted-linux",
+        for scenario in ("prepared", "clean-linux", "linux-doc", "trusted-linux",
                          "untrusted-linux", "trusted-envrc",
                          "untrusted-envrc", "mismatched-linux", "source-record", "retry"):
             with self.subTest(source=scenario):
@@ -1201,15 +1312,11 @@ placement_once
                 ready = self.root / f"remote-{scenario}-ready"
                 words = ("bash", str(verify), "doc" if doc else "check", "sample",
                          "--target", "peer" if linux else "mac")
-                if scenario == "modified" or (linux and scenario != "clean-linux"):
-                    dirty_command = "printf '%s\\n' 'fn main() { let _ = 1; }' > src/main.rs"
-                    if mismatch:
-                        dirty_command += "; export COPIES_STEP_REPOSITORY=" + shlex.quote(str(other))
-                    if source_record:
-                        dirty_command += "; printf '{}' > .scratch.json && git add -f .scratch.json"
-                    words = ("bash", "-c", dirty_command + ' && exec "$@"', "verify", *words)
-                elif scenario == "retry":
+                if scenario == "retry":
                     words = words[:-2]
+                if linux or scenario == "retry":
+                    dirty_command = "printf '%s\\n' 'fn main() { let _ = 1; }' > src/main.rs"
+                    words = ("bash", "-c", dirty_command + ' && exec "$@"', "verify", *words)
                 case_environment = {**environment, "VERIFY_MAC_RUNNER": str(parser_runner),
                                     "TEST_REMOTE_SOURCE": str(observed), "SLOT_ORDER_CHECK": str(started),
                                     "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"}
@@ -1221,6 +1328,10 @@ placement_once
                     case_environment.update(HOME=str(self.root), TMPDIR=str(remote_tmp),
                                             TEST_TRUST_CALLER=str(other if mismatch else tools.root))
                     ready.touch()
+                if scenario in ("clean-linux", "trusted-linux", "trusted-envrc", "untrusted-envrc", "mismatched-linux") or source_record:
+                    with locked_environment({**os.environ, **case_environment}, self.queue.loop_access):
+                        self.assert_ssh_source(tools.root, other if mismatch else tools.root, revision, scenario)
+                    continue
                 if scenario == "retry":
                     case_environment.update(TEST_RUNNER_MAC="declined", TEST_RUNNER_STATUS="75",
                         TEST_RUNNER_REASON="source_changed", TEST_PROVIDER_ALLOW_RUNNER_REFUSALS="1",
@@ -1241,13 +1352,6 @@ placement_once
                 with (mock.patch.object(self.queue.server, "host_probe", side_effect=provider),
                       mock.patch.dict(os.environ, case_environment)):
                     process = self.start(words, "--apply-uncommitted", str(tools.root), "--merge", revision)
-                    if source_record:
-                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                        self.assertEqual(process.returncode, 2, stdout + stderr)
-                        self.assertIn("the admitted tree contains .scratch.json", stderr)
-                        self.assertFalse(observed.exists())
-                        self.assertFalse(self.slot_root.exists())
-                        continue
                     if scenario == "retry" or linux:
                         wait_until(lambda: observed.exists() or process.poll() is not None, self.root,
                                    timeout=45, processes=(process,))
@@ -1281,11 +1385,6 @@ placement_once
                         self.assertEqual(runner_trusted, trusted, "Linux source approval changed in the copy")
                         self.assertTrue(under_scratch and registered, "The SSH checkout needs a scratch record")
                         self.assertEqual(marked, trusted)
-                        if envrc:
-                            record_found, pinned = cast(
-                                tuple[bool, str | None], json.loads(observed.with_suffix(".record").read_text()))
-                            self.assertTrue(record_found, "The envrc proof needs a discoverable clone record")
-                            self.assertEqual(pinned, copies.commit_at(tools.root, "HEAD") if trusted else None)
                         self.assertEqual(process.returncode, 0 if trusted else 2, stdout + stderr)
                         if not trusted:
                             self.assertIn("target peer refused: repo", stderr)
@@ -1303,8 +1402,11 @@ placement_once
                                             for row in records), records)
                     else:
                         self.assertFalse(self.slot_root.exists())
-                    cwd, supplied_root, executed_key, library, merged = cast(list[str], json.loads(observed.read_text()))
+                    cwd, supplied_root, executed_key, library, merged, binary = cast(
+                        list[str], json.loads(observed.read_text()))
                     self.assertEqual(cwd, supplied_root)
+                    if scenario == "retry":
+                        self.assertEqual(binary, "fn main() { let _ = 1; }\n")
                     if doc:
                         repo, staged, main = cast(
                             tuple[str, bool, str], json.loads(observed.with_suffix(".doc").read_text()))
