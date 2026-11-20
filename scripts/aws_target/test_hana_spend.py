@@ -53,36 +53,6 @@ class HanaSpendTests(CostFixture):
         self.assertEqual(result.exposure.expires, self.start + self.workload.permit_max_seconds)
         self.assertEqual(state.hana_storage[0].usd_per_month, self.workload.storage_usd_per_month)
 
-    def test_demand_start_accrues_only_after_acceptance(self) -> None:
-        reserved = self.controller.reserve_start(self.start, self.start + self.workload.permit_max_seconds)
-        assert isinstance(reserved, hana_spend.StartReserved)
-        now = self.start + 60
-        pending = self.book.read_snapshot()
-        self.assertFalse(any(row.kind == 'instance' for row in ledger.hana_intervals(pending, now, 60)))
-        self.assertTrue(any(row.kind == 'instance' for row in ledger.hana_intervals(pending, now, 60, reserve=True)))
-        journal = self.state / 'hana' / 'provider'
-        journal.mkdir(parents=True)
-        _ = (journal / 'bootstrap.json').write_text(json.dumps({
-            'action': 'bootstrap', 'generation': reserved.exposure.generation, 'dispatched': True, 'accepted': True,
-            'accepted_at': now,
-        }))
-        self.controller.reconcile(now, 'running', generation=reserved.exposure.generation)
-        state = self.book.read_snapshot()
-        self.assertFalse(any(row.kind == 'instance' for row in ledger.hana_intervals(state, now, 60)))
-        _ = (journal / 'start.json').write_text(json.dumps({
-            'action': 'start', 'generation': reserved.exposure.generation, 'dispatched': True, 'accepted': True,
-            'accepted_at': now,
-        }))
-        self.controller.reconcile(now + 60, 'running', generation=reserved.exposure.generation)
-        state = self.book.read_snapshot()
-        compute, = (row for row in ledger.hana_intervals(state, now + 60, 60) if row.kind == 'instance')
-        self.assertEqual(compute.start, now)
-        renewed = self.issued(now + 60, generation=reserved.exposure.generation)
-        self.assertGreater(renewed.exposure.generation, reserved.exposure.generation)
-        state = self.book.read_snapshot()
-        compute, = (row for row in ledger.hana_intervals(state, now + 60, 60) if row.kind == 'instance')
-        self.assertEqual(compute.start, now)
-
     def test_fallback_types_reject_empty_items_and_duplicates(self) -> None:
         configuration = self.root / 'hana_aws.conf'
         for value in ('c7a.4xlarge,', ',m7i.4xlarge', 'c7a.4xlarge,c7a.4xlarge',
@@ -155,6 +125,21 @@ class HanaSpendTests(CostFixture):
         self.assertEqual(first.exposure.region, self.workload.region)
         self.assertEqual(renewed.exposure.region, first.exposure.region)
         self.assertEqual(renewed.exposure.instance_type, first.exposure.instance_type)
+
+    def test_observed_hana_keeps_its_exposure_after_renewal_and_cancellation(self) -> None:
+        first = self.issued(self.start)
+        self.controller.reconcile(self.start, 'running', generation=first.exposure.generation)
+        renewed = self.issued(self.start + 1, generation=first.exposure.generation)
+        journal = self.state / 'hana' / 'provider'
+        journal.mkdir(parents=True)
+        _ = (journal / 'publish.json').write_text(json.dumps({
+            'generation': renewed.exposure.generation, 'cancelled': True,
+        }))
+        stop = self.start + 120
+        self.controller.reconcile(stop, 'stopped', generation=renewed.exposure.generation)
+        state = self.book.read_snapshot()
+        interval, = (row for row in ledger.hana_intervals(state, stop, 60) if row.kind == 'instance')
+        self.assertEqual((interval.start, interval.end), (self.start, stop))
 
     def test_unconfirmed_stop_retains_full_exposure_after_expiry(self) -> None:
         issued = self.issued(self.start)

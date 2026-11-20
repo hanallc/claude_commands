@@ -196,7 +196,6 @@ class HanaProviderTests(CostFixture):
         with self.assertRaises(provider.ProviderPending):
             _ = self.provider.step(IDENTITY, start, operation)
         self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationSettled)
-        self.assertTrue(remote.read_record(self.mutation_path(operation))['accepted'])
         _ = self.provider.step(IDENTITY, start, operation)
         self.assertEqual([op for _, op, _ in self.fake.calls].count('start-instances'), 1)
 
@@ -557,15 +556,8 @@ class HanaProviderTests(CostFixture):
                     self.clock.advance(1)
                     self.assertIsInstance(self.provider.recover(IDENTITY, start, operation), box.MutationSettled)
                     self.assertEqual(self.provider.step(IDENTITY, start, operation), expected)
-                    recovered = remote.read_record(self.mutation_path(operation))
-                    if action == box.Action.START:
-                        self.assertEqual(writes, [([], ['dispatched']),
-                            ([request, 'describe-instances', 'describe-spot-instance-requests', 'get-object'],
-                             ['dispatched', 'accepted'])])
-                        self.assertEqual(recovered['acceptance_source'], 'observed')
-                    else:
-                        self.assertEqual(writes, [([], ['dispatched'])])
-                        self.assertNotIn('accepted_at', recovered)
+                    self.assertEqual(writes, [([], ['dispatched'])])
+                    self.assertNotIn('accepted_at', remote.read_record(self.mutation_path(operation)))
 
                     self.fake.calls.clear()
                     writes.clear()

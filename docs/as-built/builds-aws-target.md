@@ -910,19 +910,16 @@ The hourly charges use each UTC day's rate across midnight.
 These rates use the same bill day rule as compute rates.
 The ledger stores the selected cost and its bill source.
 Paired trials use this booked cost for completed gates.
-A gate keeps `attempt_allowance_usd` until AWS supplies a bill for its launch day.
-Admission reserves the allowance before the launch time.
-A bill for the launch day corrects saved estimates that include configured allowances.
-The Spend tiles show the AWS amount for a day with a bill.
-For an unbilled day, the estimate carries storage from the most recent earlier bill.
-It adds pending and accepted gate compute and the configured gate allowance.
-Hana has no configured activity allowance.
-Unknown usage, public IPv4, requests, and transfer have no carry-forward amount.
-The guard uses this estimate for unbilled days after the first bill when it covers established and possible costs.
-The guard accounts for query fees, reserves, and headroom separately.
-A Hana demand start accrues compute from the provider's acceptance time.
-Approved Hana setup and image replacement accrue compute from reservation time.
-An unaccepted open start still reserves the projected cost.
+Open reservations retain `attempt_allowance_usd`.
+Admission includes these allowances when bills exist.
+An own-day bill corrects saved estimates that still include configured allowances.
+An unbilled day with an accepted or pending run keeps the usual prices and carry from the bill.
+After the latest bill, an unbilled idle day carries retained resource costs and unknown usage types.
+It skips usage linked to runs and uses the usual accounting for Cost Explorer fees.
+The page and guard use the same idle-day carry.
+The guard keeps any higher established charges.
+The ledger and hours table exclude a closed Hana exposure when the journal proves cancellation before a possible start.
+A dispatched start or an observed acceptance in any generation of that exposure keeps the full exposure.
 Reports keep the existing reconciliation floors.
 The account checks adjust the existing total for each qualifying UTC day inside the limit window.
 They subtract that day's existing usage and add the newest qualifying AWS amount.

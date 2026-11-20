@@ -11,7 +11,6 @@ import time
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import hana_guest, ledger, remote
-from scripts.aws_target.remote import HanaStartAcceptance, HanaStartAccepted
 from scripts.lib import conf
 
 
@@ -266,7 +265,7 @@ class HanaSpending[Settings: StartPermitSettings]:
 
     def reserve_start(self, now: int, expires: int) -> StartReserved | PermitRefused:
         """Reserve a demand start before its boot identity exists."""
-        return self._reserve_compute(now, expires, expected_generation=0, demand_start=True)
+        return self._reserve_compute(now, expires, expected_generation=0)
 
     def preview_start(self, now: int, expires: int) -> StartAffordable | PermitRefused:
         """Check the same projected exposure without changing account evidence."""
@@ -284,7 +283,7 @@ class HanaSpending[Settings: StartPermitSettings]:
             decision = self._check(candidate, now, placement_preview=True)
             return decision if isinstance(decision, PermitRefused) else StartAffordable(expires)
 
-    def _project_compute(self, state: ledger.LedgerEvidence, now: int, expires: int, *, demand_start: bool = False
+    def _project_compute(self, state: ledger.LedgerEvidence, now: int, expires: int
                          ) -> tuple[ledger.LedgerEvidence, ledger.HanaComputeExposure]:
         active = [row for row in state.hana_compute if isinstance(row.state, ledger.HanaExposureOpen)]
         generation = max((row.generation for row in state.hana_compute), default=0) + 1
@@ -292,8 +291,7 @@ class HanaSpending[Settings: StartPermitSettings]:
             max(active[0].usd_per_hour, self.settings.spot_max_usd_per_hour) if active else self.settings.spot_max_usd_per_hour,
             instance_type=active[0].instance_type if active else self._provisioned_instance_type(),
             region=active[0].region if active else self.settings.region,
-            start_acceptance=ledger.hana_compute_start(state, active[0]) if active else
-            HanaStartAcceptance.AWAITING if demand_start else HanaStartAcceptance.LEGACY)
+            observed_active=active[0].observed_active if active else False)
         compute = [row for row in state.hana_compute if isinstance(row.state, ledger.HanaExposureClosed)]
         storage = list(state.hana_storage)
         if not any(isinstance(row.state, ledger.HanaExposureOpen) for row in storage):
@@ -331,8 +329,7 @@ class HanaSpending[Settings: StartPermitSettings]:
         return PermitIssued(hana_guest.WorkPermit(float(expires), str(result.exposure.generation), boot_id), result.exposure)
 
     def _reserve_compute(self, now: int, expires: int, *, expected_generation: int, approved_setup: bool = False,
-                         before_commit: Callable[[ledger.HanaComputeExposure], None] | None = None,
-                         demand_start: bool = False
+                         before_commit: Callable[[ledger.HanaComputeExposure], None] | None = None
                          ) -> StartReserved | PermitRefused:
         if not self.settings.enabled and not approved_setup:
             return PermitRefused('Hana is disabled')
@@ -354,7 +351,7 @@ class HanaSpending[Settings: StartPermitSettings]:
                     return PermitRefused('The permit expired or its deadline did not increase')
             elif active:
                 return PermitRefused('Confirm the previous stop before another start')
-            candidate, proposed = self._project_compute(state, now, expires, demand_start=demand_start)
+            candidate, proposed = self._project_compute(state, now, expires)
             if active and approved_setup:
                 proposed = replace(proposed, generation=active[0].generation)
                 candidate.hana_compute[-1] = proposed
@@ -378,7 +375,11 @@ class HanaSpending[Settings: StartPermitSettings]:
             if generation != current_generation:
                 return
             fence = state.hana_lifecycle_fence
+            active = observed in ('pending', 'running', 'stopping', 'shutting-down')
             if isinstance(fence, ledger.HanaLifecycleFence) and now <= fence.at:
+                if now == fence.at and active:
+                    state.hana_compute = [replace(row, observed_active=True)
+                        if isinstance(row.state, ledger.HanaExposureOpen) else row for row in state.hana_compute]
                 return
             latest = max((row.at for row in (*state.hana_compute, *state.hana_storage)), default=0)
             latest = max([latest, *(row.state.at for row in (*state.hana_compute, *state.hana_storage)
@@ -391,16 +392,14 @@ class HanaSpending[Settings: StartPermitSettings]:
                     return
                 state.hana_compute = [replace(row, state=ledger.HanaExposureClosed(now))
                     if isinstance(row.state, ledger.HanaExposureOpen) else row for row in state.hana_compute]
-            elif observed in ('pending', 'running', 'stopping', 'shutting-down'):
-                state.hana_compute = [replace(row, start_acceptance=ledger.hana_compute_start(state, row))
-                    if isinstance(row.state, ledger.HanaExposureOpen)
-                    and row.start_acceptance == HanaStartAcceptance.AWAITING else row for row in state.hana_compute]
+            elif active:
+                state.hana_compute = [replace(row, observed_active=True)
+                    if isinstance(row.state, ledger.HanaExposureOpen) else row for row in state.hana_compute]
                 if not any(isinstance(row.state, ledger.HanaExposureOpen) for row in state.hana_compute):
                     current_generation += 1
                     state.hana_compute.append(ledger.HanaComputeExposure(now, now + self.settings.guard_grace_seconds,
                         current_generation, self.settings.spot_max_usd_per_hour,
-                        instance_type=self._provisioned_instance_type(), region=self.settings.region,
-                        start_acceptance=HanaStartAccepted(now)))
+                        instance_type=self._provisioned_instance_type(), region=self.settings.region, observed_active=True))
                 if not any(isinstance(row.state, ledger.HanaExposureOpen) for row in state.hana_storage):
                     state.hana_storage.append(ledger.HanaStorageExposure(now, self.settings.storage_usd_per_month))
             state.hana_lifecycle_fence = ledger.HanaLifecycleFence(now, current_generation)
