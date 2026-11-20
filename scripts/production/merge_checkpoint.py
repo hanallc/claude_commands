@@ -926,6 +926,7 @@ def push_git(production: ProductionDocument, may_undo: bool) -> str:
     before_merge_tip = good(git(checkout, "rev-parse", "HEAD^1"), "push") if may_undo else ""
     with push_rollback(production, before_merge_tip):
         tip = good(git(checkout, "rev-parse", "HEAD"), "push")
+        require_live_files_clear(checkout, tip, "push")
         _ = good(git(checkout, "push", "origin", production.merge_branch), "push")
     checkpoint_gate.report("push", "ok", f"{production.merge_branch} pushed at {tip}")
     end_pushed_worktrees(production)
@@ -1003,6 +1004,11 @@ def pushed_state(production: ProductionDocument, checkpoint: str) -> PushedTip |
     return PushedTip(good(git(checkout, "rev-parse", remote), "push"))
 
 
+def require_live_files_clear(checkout: Path, tip: str, step: str) -> None:
+    if refusal := merge_gate.live_file_refusal(checkout, tip):
+        raise checkpoint_gate.Stop(step, "held", refusal, "remove the listed conflicts before publication")
+
+
 def push_validate(production: ProductionDocument, fix_commit: str, may_undo: bool, cancel_prior: bool = False) -> str:
     script = checkpoint_gate.tool("validate_and_push.sh", Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh",
                   "MERGE_CHECKPOINT_VALIDATE_AND_PUSH")
@@ -1012,6 +1018,7 @@ def push_validate(production: ProductionDocument, fix_commit: str, may_undo: boo
         command.append("--cancel-prior")
     before_merge_tip = good(git(production.checkout, "rev-parse", "HEAD^1"), "push") if may_undo else ""
     with push_rollback(production, before_merge_tip):
+        require_live_files_clear(production.checkout, "HEAD", "push")
         result = subprocess.run(command, cwd=production.checkout,
                                 env=main_push_lock.held_environment(production.checkout),
                                 capture_output=True, text=True, check=False)
@@ -1035,6 +1042,9 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
                        "switch the promotion checkout to main and rerun this checkpoint")
         current = good(git(checkout, "rev-parse", "main"), "promote")
         _ = good(git(checkout, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"), "promote")
+        require_live_files_clear(checkout, tip, "promote")
+        if current != tip:
+            require_live_files_clear(checkout, current, "promote")
         if current == tip:
             unpushed = good(git(checkout, "rev-list", "refs/remotes/origin/main..main"), "promote")
             foreign = good(git(checkout, "rev-list", "main", "^refs/remotes/origin/main", f"^refs/remotes/origin/{merge_branch}"),

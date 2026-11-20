@@ -1873,6 +1873,20 @@ def promotion_edit_conflict(repo: Path, target: str, waiting: str = "") -> str:
     return ""
 
 
+def live_file_refusal(repo: Path, target: str) -> str:
+    """Report all conflicts between the incoming tree and enrolled live files."""
+    from scripts.lib.main_sync import live_file_conflicts
+    from scripts.production.production_doc import ProductionPathsError
+
+    try:
+        conflicts = live_file_conflicts(repo, target)
+    except ProductionPathsError as error:
+        return f"cannot verify live files: {error}"
+    if conflicts:
+        return "incoming tree conflicts with live production files\n" + "\n".join(map(str, conflicts))
+    return ""
+
+
 def live_state_refusal(repo: Path, target: str) -> str:
     """Run the target tree's live state checks before its code is installed."""
     with tempfile.TemporaryDirectory(prefix="promotion-state-") as temporary:
@@ -2010,6 +2024,8 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             target = record.commit
         if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
+        if refusal := live_file_refusal(main_repo, target):
+            raise GateRefused(refusal)
         if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
             raise GateRefused(conflict)
         if refusal := live_state_refusal(main_repo, target):
@@ -2178,6 +2194,8 @@ def merge_checkpoint(args: GateArguments) -> int:
         if git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
             raise GateRefused("origin/main is not an ancestor of the merge branch")
         hold.wait_until_free()
+        if refusal := live_file_refusal(repo, checked_git(repo, "rev-parse", "HEAD")):
+            raise GateRefused(refusal)
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
