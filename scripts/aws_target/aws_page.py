@@ -216,11 +216,23 @@ class QuotaHistoryData(TypedDict):
     gpu_summary: GpuQuotaSummary
 
 
+HoursDifferenceKind = Literal['difference', 'no-difference']
+
+
+class HoursDifferenceKinds(TypedDict):
+    by_tenths: dict[str, HoursDifferenceKind]
+    default: HoursDifferenceKind
+
+
+HOURS_DIFFERENCE_KINDS: HoursDifferenceKinds = {'by_tenths': {'0': 'no-difference'}, 'default': 'difference'}
+
+
 class ComparedHoursRowData(TypedDict):
     size: str
     region: str
     billed_tenths: int
     recorded_tenths: int
+    difference_kind: HoursDifferenceKind
     first_utc_day: str
     last_utc_day: str
     hana_reserved_tenths: NotRequired[int]
@@ -232,6 +244,7 @@ class HoursComparisonData(TypedDict):
     rows: list[ComparedHoursRowData]
     limit_percent: str
     open_row_limit: int
+    difference_kinds: HoursDifferenceKinds
 
 
 class HoursComparisonUnavailableData(TypedDict):
@@ -274,9 +287,13 @@ def hours_row_data(row: spot_table.ComparedMachineHoursRow) -> ComparedHoursRowD
     limit_result: Literal['within_limit', 'higher_bill', 'lower_bill'] = 'within_limit'
     if check.hours_gap_over:
         limit_result = 'higher_bill' if billed > check.box_hours else 'lower_bill'
+    billed_tenths = round(billed * 10)
+    recorded_tenths = round(check.box_hours * 10)
+    difference_kind = HOURS_DIFFERENCE_KINDS['by_tenths'].get(
+        str(billed_tenths - recorded_tenths), HOURS_DIFFERENCE_KINDS['default'])
     compared: ComparedHoursRowData = {
         'size': row.size, 'region': row.region, 'limit_result': limit_result,
-        'billed_tenths': round(billed * 10), 'recorded_tenths': round(check.box_hours * 10),
+        'billed_tenths': billed_tenths, 'recorded_tenths': recorded_tenths, 'difference_kind': difference_kind,
         'first_utc_day': check.first_utc_day.isoformat(), 'last_utc_day': check.last_utc_day.isoformat(),
     }
     if billed >= check.box_hours and check.hana_reserved_hours > 0:
@@ -554,6 +571,7 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
             'rows': [hours_row_data(row) for row in sorted(
                 tables.hours.rows, key=lambda row: row.check.box_hours - row.check.billed_hours)],
             'open_row_limit': hours_table_open_row_limit,
+            'difference_kinds': HOURS_DIFFERENCE_KINDS,
         }
     else:
         hours = {'kind': 'unavailable', 'reason': tables.hours.reason}

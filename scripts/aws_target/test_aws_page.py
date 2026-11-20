@@ -19,6 +19,7 @@ from scripts.aws_target.aws_cli import AwsCli
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.review_links import page_frame
+from scripts.review_links.test_accounts_page import firefox_probe_results
 
 
 class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
@@ -668,7 +669,7 @@ class AwsCombinedTableTests(PageCostFixture):
     check(section.querySelector(".answer + .note").textContent.includes("Jan 12")
           && section.querySelector(".answer + .note").textContent.includes("14, 2026 (UTC)"),
           "The date range covers the bills used by the displayed rows");
-    check(table().parentElement.nextElementSibling.textContent
+    check(section.querySelector(".hours-legend").nextElementSibling.textContent
           === "A positive difference means AWS billed more than our records.", "The note explains the sign");
     check(table().tHead.rows[0].cells[5].title ===
           "The check adds these hours reserved for Hana in this region to our recorded hours when it checks for a higher bill.",
@@ -760,6 +761,73 @@ class AwsCombinedTableTests(PageCostFixture):
           + "3 rows are more than 4% above their recorded hours plus the hours reserved for Hana.",
           "The summary uses 3.0 against 3.0 and the limits use full precision");
 """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_hours_color_marks_rounded_differences_and_the_filtered_total(self) -> None:
+        limit = Decimal('.20')
+        self.costs({'billed_hours_gap_max_ratio': str(limit)})
+        self.configure('hours_table_open_row_limit=5')
+        readings = (
+            ('us-east-1', '2.0', '1.0', 'difference', '+1.0'),
+            ('us-east-2', '1.0', '2.0', 'difference', '-1.0'),
+            ('eu-west-1', '1.0', '1.0', 'no-difference', '0.0'),
+            ('us-west-1', '1.049', '1.0', 'no-difference', '0.0'),
+            ('us-west-2', '1.2', '1.0', 'difference', '+0.2'),
+        )
+        checks = {('c7a.4xlarge', region, '2026-01-14'): run_cost.hours_check(Decimal(billed), Decimal(box), limit)
+                  for region, billed, box, _kind, _text in readings}
+        with mock.patch.object(run_cost, 'day_hours_checks', return_value=checks):
+            page = self.fixture_page().read_text()
+        payload = page.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
+        hours = cast(aws_page.PageData, json.loads(payload))['hours']
+        assert hours['kind'] == 'comparison'
+        self.assertEqual({row['region']: row['difference_kind'] for row in hours['rows']},
+                         {region: kind for region, _billed, _box, kind, _text in readings})
+
+        expected = json.dumps([(region, kind, value) for region, _billed, _box, kind, value in readings])
+        probe = '<script>\nconst expected = ' + expected + r''';
+const failures = [];
+const section = document.getElementById("hours");
+const check = (condition, message) => { if (!condition) throw new Error(message); };
+const total = () => section.querySelector("tfoot tr").cells[3];
+const expectedColor = value => {
+  const reference = document.body.appendChild(document.createElement("span"));
+  reference.style.color = value;
+  const color = getComputedStyle(reference).color;
+  reference.remove();
+  return color;
+};
+try {
+  for (const theme of ["dark", "light"]) {
+    document.documentElement.dataset.theme = theme;
+    const yellow = expectedColor("var(--warning)");
+    const blue = expectedColor("color-mix(in srgb, var(--accent) 80%, var(--ink))");
+    check(yellow !== blue, `${theme}: both colors are distinct`);
+    for (const [region, kind, text] of expected) {
+      const row = [...section.querySelectorAll("tbody tr")].find(row => row.cells[1].textContent === region);
+      const cell = row.cells[4];
+      const color = kind === "difference" ? yellow : blue;
+      check(cell.classList.contains(`hours-${kind}`) && cell.textContent === text, `${theme}: ${region} class and value`);
+      check(getComputedStyle(cell).color === color, `${theme}: ${region} computed color`);
+    }
+    const legend = section.querySelector(".hours-legend");
+    check(legend.textContent === "Yellow: AWS and our records differ. Blue: they agree.", `${theme}: legend text`);
+    check(getComputedStyle(legend.children[0]).color === yellow && getComputedStyle(legend.children[1]).color === blue,
+          `${theme}: legend colors`);
+    check(total().classList.contains("hours-difference") && total().textContent === "+0.2"
+          && getComputedStyle(total()).color === yellow, `${theme}: total differs`);
+    const extra = document.querySelector("#regions [data-region='us-west-2']");
+    extra.click();
+    check(total().classList.contains("hours-no-difference") && total().textContent === "0.0"
+          && getComputedStyle(total()).color === blue, `${theme}: the filtered total agrees`);
+    extra.click();
+  }
+} catch (error) {
+  failures.push(String(error));
+}
+fetch("/probe", {method: "POST", body: JSON.stringify(failures)});
+</script>'''
+        self.assertEqual(firefox_probe_results(page.replace('</body>', probe + '</body>', 1).encode()), [[]])
 
     def test_hours_exclude_unbilled_rows_and_keep_their_regions_in_the_filter(self) -> None:
         limit = Decimal('.2')

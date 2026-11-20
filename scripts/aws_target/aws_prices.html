@@ -97,6 +97,8 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 #spend .note { margin-top: 12px; }
 #quota-help, #hours details { margin-top: 10px; font-size: 0.86rem; }
 #quota-help summary, #hours summary { font-weight: 600; cursor: pointer; }
+#hours .hours-difference { color: var(--warning); }
+#hours .hours-no-difference { color: color-mix(in srgb, var(--accent) 80%, var(--ink)); }
 @media (max-width: 560px) {
   #hours th, #hours td { padding-inline: 2px; white-space: normal; overflow-wrap: anywhere; }
   #hours thead th span { white-space: normal; }
@@ -559,6 +561,7 @@ function signedHoursText(tenths) {
 function hoursTable(rows, totals, hasReserved) {
   const headers = ["Instance type", "Region", "AWS billed (hours)", "Our records (hours)",
     "AWS minus our records (hours)"];
+  const differenceColumn = headers.length - 1;
   if (hasReserved) headers.push("Reserved for Hana (hours)");
   const cells = rows.map(row => {
     const line = [row.size, row.region, hoursText(row.billed_tenths),
@@ -570,17 +573,22 @@ function hoursTable(rows, totals, hasReserved) {
     headers, right: headers.map((_header, index) => index).slice(2), rows: cells, region_axis: "type-region-rows",
   }], false);
   const table = wrap.querySelector("table");
+  for (const [index, row] of rows.entries()) {
+    table.tBodies[0].rows[index].cells[differenceColumn].classList.add(`hours-${row.difference_kind}`);
+  }
   if (hasReserved) {
     table.querySelector("thead th:last-child").title =
       "The check adds these hours reserved for Hana in this region to our recorded hours when it checks for a higher bill.";
   }
-  const values = [hoursText(totals.billed), hoursText(totals.recorded), signedHoursText(totals.difference)];
-  if (hasReserved) values.push("—");
   const total = table.createTFoot().insertRow();
   const label = element("th", "Total");
   label.colSpan = 2;
   label.scope = "row";
-  total.append(label, ...values.map(value => element("td", value, "n")));
+  const kinds = data.hours.difference_kinds;
+  const kind = kinds.by_tenths[totals.difference] ?? kinds.default;
+  total.append(label, element("td", hoursText(totals.billed), "n"), element("td", hoursText(totals.recorded), "n"),
+    element("td", signedHoursText(totals.difference), `n hours-${kind}`));
+  if (hasReserved) total.appendChild(element("td", "—", "n"));
   return wrap;
 }
 
@@ -635,8 +643,11 @@ function drawHours() {
   section.appendChild(element("p", `Bills compared ${span} (UTC).`, "note"));
   const hasReserved = rows.some(row => row.hana_reserved_tenths !== undefined);
   const table = hoursTable(rows, totals, hasReserved);
+  const legend = element("p", undefined, "note hours-legend");
+  legend.append(element("span", "Yellow: AWS and our records differ.", "hours-difference"), " ",
+    element("span", "Blue: they agree.", "hours-no-difference"));
   const sign = element("p", "A positive difference means AWS billed more than our records.", "note");
-  const content = [table, sign];
+  const content = [table, legend, sign];
   if (hasReserved) {
     content.push(element("p", "Hours reserved for Hana can appear on several rows for the same region.", "note"));
   }
