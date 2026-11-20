@@ -47,7 +47,7 @@ def numeric_settings(path: Path, values: dict[str, str]) -> None:
         else:
             lines.append(line)
     for key, value in values.items():
-        whole = key == "bill_settled_equal_reads" or key.endswith(("_seconds", "_timeout_s", "_days"))
+        whole = key == "cost_explorer_unchanged_reads" or key.endswith(("_seconds", "_timeout_s", "_days"))
         form = "whole" if whole else "range"
         if key in ("connect_timeout_s", "leftover_timeout_s"):
             form = "range"

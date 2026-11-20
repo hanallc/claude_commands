@@ -906,7 +906,7 @@ The bill must exclude credits and give at least USD 0.01 before rounding.
 The newest read time must be valid and cannot be in the future.
 The charge file keeps each read time and amount. A legacy file without a list supplies one read.
 Known limit. Concurrent refreshes can record one USD 0.01 fee for two Cost Explorer reads.
-Within the lookback, the last `bill_settled_equal_reads` reads after the UTC day ends must agree.
+Within the lookback, the last `cost_explorer_unchanged_reads` reads after the UTC day ends must report the same amount.
 Reads less than `cost_explorer_interval_seconds` apart count once.
 A different amount starts a new count. The AWS service logs the day and both amounts when the day becomes unsettled.
 Outside the lookback, the latest valid amount qualifies.

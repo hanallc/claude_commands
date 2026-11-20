@@ -376,7 +376,7 @@ An old saved format without the account mark requires an immediate read.
 An empty daily reply is an error for both callers.
 The guard and gate cap adjust the total for full UTC days that qualify for the account amount.
 The latest valid amount must be at least USD 0.01 before rounding.
-Within the lookback, the last `bill_settled_equal_reads` reads after the day ends must agree.
+Within the lookback, the last `cost_explorer_unchanged_reads` reads after the UTC day ends must report the same amount.
 Reads less than `cost_explorer_interval_seconds` apart count once.
 Outside the lookback, use the latest valid amount.
 For an unbilled day, each box uses the newest positive billed Spot rate for its instance type.

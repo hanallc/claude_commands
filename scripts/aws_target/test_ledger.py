@@ -1028,7 +1028,7 @@ class LedgerTests(CostFixture):
         self.assertIsInstance(self.book.reserve_gate(self.settings, proposed), ledger.GateReserved)
 
     def test_bill_settles_after_configured_equal_reads_and_a_change_restores_the_estimate(self) -> None:
-        self.costs({'bill_settled_equal_reads': '3', 'cost_explorer_lookback_days': '7',
+        self.costs({'cost_explorer_unchanged_reads': '3', 'cost_explorer_lookback_days': '7',
                     'observation_max_age_seconds': '259200', 'monthly_limit_usd': '7',
                     'cost_explorer_interval_seconds': '3600'})
         start = self.start
@@ -1148,7 +1148,7 @@ class LedgerTests(CostFixture):
         ))
 
     def test_bill_settlement_requires_a_positive_whole_live_setting(self) -> None:
-        key = 'bill_settled_equal_reads'
+        key = 'cost_explorer_unchanged_reads'
         for value in ('0', '-1', '1.5'):
             self.replace(key, value)
             with self.subTest(value=value), self.assertRaisesRegex(config.SpendingConfigurationUnavailable, key):

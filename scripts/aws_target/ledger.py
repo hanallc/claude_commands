@@ -1271,7 +1271,7 @@ def _bill_is_complete(history: _ChargeReadHistory, settings: SpendingSettings, n
     first = charge_period_day(now) - timedelta(days=settings.cost_explorer_lookback_days - 1)
     if date.fromisoformat(reading.day) < first:
         return True
-    count = settings.bill_settled_equal_reads
+    count = settings.cost_explorer_unchanged_reads
     next_at = reading.at
     for amount in reversed(history.amounts):
         if amount.at < reading.period_end or amount.actual_usd != reading.actual_usd:
