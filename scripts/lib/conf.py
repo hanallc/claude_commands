@@ -167,7 +167,7 @@ class ConfigRead:
 
     def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool,
                  default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
-                 recover_invalid: bool = True
+                 recover_invalid: bool = True, live_only: bool = False
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         bad = "<missing>"
 
@@ -194,6 +194,8 @@ class ConfigRead:
         except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
             repository_allowed = repository_allowed or isinstance(error, _MissingKey)
             reason = f"{self.source}: {key}={bad!r}: {error}"
+        if live_only:
+            return UnavailableValue(reason)
         if not recover_invalid and not repository_allowed:
             return UnavailableValue(reason)
         if repository_allowed and self.repository_allowed and isinstance(self.file, str):
@@ -234,6 +236,13 @@ class ConfigRead:
                ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         """Distinguish live values from recovered values without a warning."""
         return self._resolve(key, convert, warn=False)
+
+    def live_value(self, key: str, convert: Callable[[str], Result]) -> Result:
+        """Read one key from the live file."""
+        result = self._resolve(key, convert, warn=False, live_only=True)
+        if not isinstance(result, UsableLiveValue):
+            raise Unusable(result.reason)
+        return result.value
 
     def value(self, key: str, convert: Callable[[str], Result], *,
               default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,

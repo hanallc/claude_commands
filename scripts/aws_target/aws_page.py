@@ -602,9 +602,18 @@ def publish_configured() -> int:
     from scripts.build_targets.target_config import ssh_target_state_directory
 
     directory, now, folder = ssh_target_state_directory('aws'), int(time.time()), output_folder()
-    _ = publish(directory, now, folder, settings_path=conf.path('aws_target'))
-    _ = machines_page.publish(directory, now, folder)
-    return 0
+    status = 0
+    try:
+        _ = publish(directory, now, folder, settings_path=conf.path('aws_target'))
+    except Exception as error:
+        print(f'AWS page publication failed: {type(error).__name__}: {error}', file=sys.stderr)
+        status = 1
+    try:
+        _ = machines_page.publish(directory, now, folder)
+    except Exception as error:
+        print(f'AWS Machines page publication failed: {type(error).__name__}: {error}', file=sys.stderr)
+        status = 1
+    return status
 
 
 def page_url() -> str:
@@ -624,7 +633,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Publish the AWS page, or print its link.')
     _ = parser.add_argument('command', choices=('publish', 'link'))
     if parser.parse_args(argv, namespace=Arguments()).command == 'publish':
-        _ = publish_configured()
+        status = publish_configured()
+        if status:
+            return status
     print(page_url())
     return 0
 

@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from http.server import ThreadingHTTPServer
+import json
 from pathlib import Path
 import os
 import shutil
@@ -24,6 +25,12 @@ END = datetime(2026, 11, 20, tzinfo=UTC)
 NOW = int(END.timestamp()) + 12 * 3600
 PRICE_READ = NOW - 3600
 RATIO_KEY = 'faster_box_max_cost_ratio'
+WORKLOAD_NAME = 'Landing validation'
+PAGE_SETTINGS = """# range: 1..10
+machines.ratio_max=3.00
+# range: 0.01..1
+machines.ratio_step=0.05
+"""
 CONSOLE_SETTINGS = """# range: 0..60
 status.round_trip_limit_seconds=1
 # range: 0..60
@@ -62,7 +69,7 @@ def fixture_data(*, aws_closed: bool = False) -> machines_data.MachinesPageData:
             machines_data.MachineRunShare(large, D('.978')), machines_data.MachineRunShare(reserve, D('.014')),
             machines_data.MachineRunShare(small, D('.008'))), D('15.10'), D('222'), D('.068'), limits[2]),
     )
-    workload = machines_data.MeasuredWorkload('Merge checks', 'merge-gate', choices, small, 1075, D(4658),
+    workload = machines_data.MeasuredWorkload(WORKLOAD_NAME, 'merge-gate', choices, small, 1075, D(4658),
         D('62.72'), ((1, 611), (2, 272), (3, 125), (4, 43), (5, 19), (6, 5)), D('1.50'), D('14.14'), steps,
         ('A month has 52 weeks divided by 12.', 'The measured check rate and share of Spot refusals repeat.',
          'The estimate uses a quota of 136 vCPUs for Sweden.'))
@@ -87,11 +94,7 @@ class MachinesPageTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {'CONF_DIR': str(self.root), 'USER_ZONE': 'UTC'})))
         _ = (self.root / 'console.conf').write_text(CONSOLE_SETTINGS)
-        _ = (self.root / 'aws_page.conf').write_text("""# range: 1..10
-machines.ratio_max=3.00
-# range: 0.01..1
-machines.ratio_step=0.05
-""")
+        _ = (self.root / 'aws_page.conf').write_text(PAGE_SETTINGS)
         self.gate = self.root / 'cloud_gate.conf'
         _ = self.gate.write_text(f'{RATIO_KEY}=1.50\n')
 
@@ -106,13 +109,22 @@ machines.ratio_step=0.05
 
     def test_page_with_no_comparison_shows_the_recorded_reason(self) -> None:
         data = fixture_data()
-        unavailable = machines_data.WorkloadWithoutComparison('Merge checks', 'merge-gate',
+        unavailable = machines_data.WorkloadWithoutComparison(WORKLOAD_NAME, 'merge-gate',
             'No eligible measured choice has a saved price.')
         page = machines_page.render(replace(data, workloads=(unavailable, *data.workloads[1:]),
             price_read=machines_data.NoSavedSpotPriceRead()), NOW)
         self.assertIn(unavailable.sentence, page)
         self.assertIn('No saved Spot prices', page)
         self.assertNotIn('id="machine-controls"', page)
+
+    def test_page_uses_the_workload_name_in_the_heading_button_and_measurements(self) -> None:
+        data = fixture_data()
+        workload = replace(data.workloads[0], name='Landing & validation')
+        page = machines_page.render(replace(data, workloads=(workload, *data.workloads[1:])), NOW)
+        self.assertIn('<h2>Landing &amp; validation</h2>', page)
+        self.assertIn('Set the limit for Landing &amp; validation</button>', page)
+        self.assertIn('1,075 completed runs for Landing &amp; validation', page)
+        self.assertNotRegex(page.lower(), r'merge[- ](?:check|gate)')
 
     def test_registry_reads_the_limits_from_private_settings(self) -> None:
         _ = (self.root / 'aws_page.conf').write_text("""# range: 1..10
@@ -129,6 +141,20 @@ machines.ratio_step=0.25
                     outcome = console_tune.save('aws_machines', RATIO_KEY, value)
                     self.assertEqual(outcome.result, accounts_page.Refused(reason))
             run.assert_not_called()
+
+    def test_registry_refuses_missing_or_invalid_live_limits(self) -> None:
+        with (patch('scripts.lib.conf._committed_files', return_value=iter((PAGE_SETTINGS,))) as history,
+              patch.object(console_tune, 'run') as run):
+            for key, value in (('machines.ratio_max', '3.00'), ('machines.ratio_step', '0.05')):
+                for replacement in ('', f'{key}=invalid\n'):
+                    with self.subTest(key=key, replacement=replacement):
+                        _ = (self.root / 'aws_page.conf').write_text(
+                            PAGE_SETTINGS.replace(f'{key}={value}\n', replacement))
+                        outcome = console_tune.save('aws_machines', RATIO_KEY, '1.50')
+                        self.assertEqual(outcome.result, accounts_page.Refused(
+                            f'Set a valid {key} in aws_page.conf.'))
+            run.assert_not_called()
+            history.assert_not_called()
 
     def test_fixed_slider_can_lower_a_higher_live_limit(self) -> None:
         data = fixture_data()
@@ -158,6 +184,10 @@ machines.ratio_step=0.25
   check(document.querySelector('.other-workloads').innerText.includes('38 completed checks on 1 machine size'), 'Affected tests');
   check(document.querySelectorAll('.sample').length === 2, 'Small samples');
   check(slider.valueAsNumber === 1.5 && amount.value === '31.36', 'Live ratio and ceiling');
+  check(go.textContent === 'Set the limit to 1.50 for Landing validation', 'Go uses the workload name');
+  go.dispatchEvent(new Event('click'));
+  document.querySelector('[data-setting-save]').click();
+  check(document.querySelector('[data-setting-confirm]').hidden, 'An unchanged value has no confirmation');
   check(document.getElementById('extra-cost').textContent === '$14.14', 'The tile uses the estimate');
   check(document.getElementById('saved-hour-cost').textContent ===
         document.querySelector('[data-step="1"]').lastElementChild.textContent, 'The table and tile use the same price rounding');
@@ -184,15 +214,72 @@ machines.ratio_step=0.25
   await saved;
   check(document.querySelector('.setting-slider-now').textContent === 'Now 2.15', 'The confirmed setting is live');
   check(go.disabled, 'The live value has no pending change');
+  go.dispatchEvent(new Event('click'));
+  document.querySelector('[data-setting-save]').click();
+  check(document.querySelector('[data-setting-confirm]').hidden, 'The saved value has no confirmation');
  } catch (error) {
   result = String(error);
  }
  await fetch('/probe?result=' + encodeURIComponent(result));
 })();
-</script><img src="/finish" alt="" width="1" height="1">"""
+</script>"""
+        self.browser(markup, probe, expected_saves=('2.15',))
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for the Machines page checks')
+    def test_browser_uses_the_exact_live_text_and_its_step_for_confirmation(self) -> None:
+        data = fixture_data()
+        workload = data.workloads[0]
+        assert isinstance(workload, machines_data.MeasuredWorkload)
+        for live, monthly_change in (('1.249', '+$14.14'), ('1.2750', '$0.00'), ('1.25000000000000001', '$0.00')):
+            with self.subTest(live=live):
+                live_workload = replace(workload, live_ratio=D(live), live_extra_usd_per_month=D('9.99'))
+                markup = machines_page.render(replace(data, workloads=(live_workload, *data.workloads[1:])), NOW)
+                expected = json.dumps(f'Change from {live} to 1.25. The estimate changes by {monthly_change} a month.')
+                probe = """<script>
+const sliderInput = document.getElementById('cost-limit-value');
+const untouched = previewOpen() === '';
+sliderInput.value = '1.25';
+sliderInput.dispatchEvent(new Event('input', {bubbles:true}));
+const edited = previewOpen() === 'The cost limit preview is open.';
+document.querySelector('[data-setting-go]').click();
+const summary = document.querySelector('[data-setting-summary]').textContent;
+const passed = untouched && edited && !document.querySelector('[data-setting-confirm]').hidden &&
+ summary === EXPECTED;
+void fetch('/probe?result=' + encodeURIComponent(passed ? 'passed' : JSON.stringify({untouched, edited, summary})));
+</script>""".replace('EXPECTED', expected)
+                self.browser(markup, probe)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for the Machines page checks')
+    def test_browser_refreshes_an_untouched_off_step_preview(self) -> None:
+        data = fixture_data()
+        workload = data.workloads[0]
+        assert isinstance(workload, machines_data.MeasuredWorkload)
+        live_workload = replace(workload, live_ratio=D('1.249'))
+        data = replace(data, workloads=(live_workload, *data.workloads[1:]))
+        probe = """<script>
+(async()=>{
+ const readAt = pageRefreshFacts().readAt;
+ if (readAt === INITIAL) {
+  if (previewOpen()) {
+   await fetch('/probe?result=An+untouched+page+reports+a+preview');
+   return;
+  }
+  await fetch('/publish-newer');
+  document.dispatchEvent(new Event('visibilitychange'));
+ } else {
+  await fetch('/probe?result=' + (readAt === INITIAL + 1 ? 'passed' : 'Wrong+publication'));
+ }
+})();
+</script>""".replace('INITIAL', str(NOW))
+        self.browser(machines_page.render(data, NOW), probe, newer_markup=machines_page.render(data, NOW + 1))
+
+    def browser(self, markup: str, probe: str, *, expected_saves: tuple[str, ...] = (), newer_markup: str = '') -> None:
         page = markup.replace('</body>', probe + '</body>').encode()
+        newer = newer_markup.replace('</body>', probe + '</body>').encode()
+        published_newer = threading.Event()
         done = threading.Event()
         results: list[str] = []
+        saves: list[str] = []
 
         class Handler(serve.ReviewLinksHandler):
             @override
@@ -201,6 +288,14 @@ machines.ratio_step=0.25
                 match route.path:
                     case console_tune.PAGE_PATH:
                         self.tune_token(route.query)
+                    case '/':
+                        self.html_response(200, b'<!doctype html><iframe src="/machines.html" '
+                                                + b'style="width:100%;height:1000px;border:0"></iframe>'
+                                                + b'<img src="/finish" alt="" width="1" height="1">')
+                    case '/publish-newer':
+                        published_newer.set()
+                        self.send_response(204)
+                        self.end_headers()
                     case '/probe':
                         results.extend(parse_qs(route.query)['result'])
                         self.send_response(204)
@@ -211,10 +306,7 @@ machines.ratio_step=0.25
                         self.send_response(204)
                         self.end_headers()
                     case '/machines.html':
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/html; charset=utf-8')
-                        self.end_headers()
-                        _ = self.wfile.write(page)
+                        self.html_response(200, newer if published_newer.is_set() else page)
                     case _:
                         self.send_error(404)
 
@@ -235,23 +327,23 @@ machines.ratio_step=0.25
         def tune(command: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
             document, key, value = command[tune_fields]
             self.assertEqual((document, key), ('cloud_gate', RATIO_KEY))
+            saves.append(value)
             _ = self.gate.write_text(f'{key}={value}\n')
             return subprocess.CompletedProcess(command, 0)
 
-        profile = self.root / 'profile'
-        profile.mkdir()
+        profile = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.root)))
         with (_PageServer(('127.0.0.1', 0), Handler) as server,
-              patch.object(console_tune, 'run', side_effect=tune) as run):
+              patch.object(console_tune, 'run', side_effect=tune)):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
                 result = subprocess.run(('firefox', '--headless', '--no-remote',
                     '--profile', str(profile), '--window-size', '1300,900',
-                    '--screenshot', str(self.root / 'browser.png'), f'http://127.0.0.1:{server.server_port}/machines.html'),
+                    '--screenshot', str(self.root / 'browser.png'), f'http://127.0.0.1:{server.server_port}/'),
                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             finally:
                 server.shutdown()
                 thread.join()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(results, ['passed'])
-        self.assertEqual(run.call_args.args[0][tune_fields], ('cloud_gate', RATIO_KEY, '2.15'))
+        self.assertEqual(tuple(saves), expected_saves)

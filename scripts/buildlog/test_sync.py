@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from functools import partial
 from io import StringIO
 from pathlib import Path
@@ -406,6 +406,26 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(publish.call_args.args[::2], (folder, self.root / "page"))
         self.assertEqual(publish.call_args.kwargs, {"settings_path": conf.path("aws_target")})
         machines.assert_called_once_with(*publish.call_args.args)
+
+    def test_aws_page_reports_errors_after_attempting_both_pages(self) -> None:
+        from scripts.aws_target import aws_page, machines_page
+        from scripts.build_targets import target_config
+
+        for aws_fails, machines_fails in ((True, False), (False, True), (True, True)):
+            with (self.subTest(aws_fails=aws_fails, machines_fails=machines_fails),
+                  mock.patch.object(target_config, "ssh_target_state_directory", return_value=self.root),
+                  mock.patch.object(aws_page, "output_folder", return_value=self.root / "page"),
+                  mock.patch.object(aws_page, "publish", side_effect=OSError("AWS write") if aws_fails else None) as aws,
+                  mock.patch.object(machines_page, "publish",
+                                    side_effect=ValueError("Machines write") if machines_fails else None) as machines,
+                  mock.patch.object(aws_page, "page_url") as page_url, redirect_stderr(StringIO()) as stderr):
+                self.assertEqual(aws_page.main(["publish"]), 1)
+                aws.assert_called_once()
+                machines.assert_called_once_with(*aws.call_args.args)
+                page_url.assert_not_called()
+                self.assertEqual("AWS page publication failed: OSError: AWS write" in stderr.getvalue(), aws_fails)
+                self.assertEqual("AWS Machines page publication failed: ValueError: Machines write" in stderr.getvalue(),
+                                 machines_fails)
 
     def test_screenshot_hourly_invokes_report_hourly_once(self) -> None:
         commands: list[tuple[list[str], bool, int]] = []

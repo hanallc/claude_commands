@@ -100,7 +100,7 @@ def _table(labels: tuple[str, ...], rows: str, identity: str) -> str:
 
 
 def _where_checks_run(workload: machines_data.MeasuredWorkload) -> str:
-    labels = ('Machine', 'Time', 'Cost per check', 'Cost ratio', 'Allowed', 'Free machine', 'Share of checks')
+    labels = ('Machine', 'Time', 'Cost per run', 'Cost ratio', 'Allowed', 'Free machine', 'Share of runs')
     reference = next(choice for choice in workload.choices if choice.machine == workload.reference)
     base = reference.usd_per_check
     rows: list[str] = []
@@ -115,12 +115,13 @@ def _where_checks_run(workload: machines_data.MeasuredWorkload) -> str:
         rows.append(_row((_machine_name(choice.machine, workload.reference), _duration(choice.median_seconds),
                           _usd(cost, 4), ratio, '<span data-allowed>—</span>', f'{choice.free_share:.1%}',
                           '<strong data-share>—</strong>'), labels, attributes=f' data-choice="{index}"'))
-    return ('<section class="card"><h2>Where the checks run at <span id="where-ratio"></span></h2>'
+    return (f'<section class="card"><h2>Where the jobs run · {escape(workload.name)}'
+            + ' at <span id="where-ratio"></span></h2>'
             + _table(labels, ''.join(rows), 'machine-shares') + '</section>')
 
 
 def _measurements(workload: machines_data.MeasuredWorkload, data: machines_data.MachinesPageData) -> str:
-    labels = ('Machine', 'Checks', 'Median time', 'Price per hour', 'Cost per check', 'Capacity refusals', 'Quota')
+    labels = ('Machine', 'Runs', 'Median time', 'Price per hour', 'Cost per run', 'Capacity refusals', 'Quota')
     rows: list[str] = []
     for choice in workload.choices:
         count = f'{choice.checks:,}'
@@ -132,9 +133,10 @@ def _measurements(workload: machines_data.MeasuredWorkload, data: machines_data.
                           str(choice.capacity_refusals), quota), labels))
     end = data.window_end - timedelta(days=1)
     notes = ''.join(f'<li>{escape(note)}</li>' for note in workload.assumptions)
-    return ('<section class="card"><h2>What we measured</h2>'
-            + f'<p class="note">{workload.checks:,} completed merge checks from {data.window_start:%d %b %Y}'
-            + f' to {end:%d %b %Y} UTC. The estimate uses {workload.checks_per_month:,.0f} checks per month.'
+    name = escape(workload.name)
+    return (f'<section class="card"><h2>What we measured for {name}</h2>'
+            + f'<p class="note">{workload.checks:,} completed runs for {name} from {data.window_start:%d %b %Y}'
+            + f' to {end:%d %b %Y} UTC. The estimate uses {workload.checks_per_month:,.0f} runs per month.'
             + f' The lowest-cost machine costs {_usd(workload.reference_usd_per_month)} a month at that rate.</p>'
             + _table(labels, ''.join(rows), 'machine-measurements')
             + f'<h3>What the estimate assumes</h3><ul class="assumptions">{notes}</ul></section>')
@@ -172,22 +174,25 @@ def _projection_data(workload: machines_data.MeasuredWorkload) -> tuple[list[_Sl
 
 
 def _controls(data: machines_data.MachinesPageData, workload: machines_data.MeasuredWorkload) -> str:
-    limits = [limit for step in workload.steps for limit in step.limits]
-    initial = max((limit for limit in limits if limit.ratio <= workload.live_ratio),
-                  key=lambda limit: limit.ratio, default=limits[0])
+    live = workload.live_ratio
+    live_step = next((step for step in reversed(workload.steps) if step.first_ratio <= live), workload.steps[0])
+    initial = next((limit for limit in reversed(live_step.limits) if limit.ratio <= live), live_step.limits[0])
+    live_extra = (live_step.extra_usd_per_month if _MINIMUM <= live <= data.ratio_max
+                  else workload.live_extra_usd_per_month)
     decimals = max(2, len(format(data.ratio_step.normalize(), 'f').partition('.')[2]))
     ceiling = initial.ceiling_extra_usd_per_month.quantize(_CENT, rounding=ROUND_CEILING)
-    slider = setting_controls.slider('cost-limit', 'Cost limit for one check', minimum=_MINIMUM,
-        maximum=data.ratio_max, step=data.ratio_step, value=initial.ratio, live=workload.live_ratio,
-        decimals=decimals, live_note='off' if workload.live_ratio == _MINIMUM else '')
+    slider = setting_controls.slider('cost-limit', 'Cost limit for one run', minimum=_MINIMUM,
+        maximum=data.ratio_max, step=data.ratio_step, value=initial.ratio, live=live,
+        decimals=decimals, live_note='off' if live == _MINIMUM else '')
     amount = setting_controls.amount_box('monthly-limit', 'I am willing to pay up to', 'more a month to go faster.',
         minimum=Decimal(0), step=_CENT, value=ceiling)
-    go = setting_controls.go_button('save-limit', 'Set the limit for merge checks',
+    go = setting_controls.go_button('save-limit', f'Set the limit for {workload.name}',
         page=console_tune.AWS_MACHINES_PAGE, key=console_tune.FASTER_BOX_RATIO_KEY)
     choices, projections = _projection_data(workload)
-    model = json.dumps({'choices': choices, 'projections': projections, 'liveExtra': float(workload.live_extra_usd_per_month)})
+    model = json.dumps({'choices': choices, 'projections': projections, 'liveExtra': float(live_extra)})
+    name = escape(workload.name)
     return (
-        f'<div id="machine-controls" class="machine-controls">{slider}{amount}</div>'
+        f'<div id="machine-controls" class="machine-controls" data-workload-name="{name}">{slider}{amount}</div>'
         + ('<div class="machine-tiles" aria-live="polite">'
         '<div><span>Extra cost for a month, estimate</span><strong id="extra-cost">—</strong></div>'
         '<div><span>Time saved for a month</span><strong id="saved-hours">—</strong></div>'
@@ -196,7 +201,7 @@ def _controls(data: machines_data.MachinesPageData, workload: machines_data.Meas
         + f'<script type="application/json" id="machines-model">{model}</script>'
         + ('<div class="machine-breakdown"><figure><figcaption>Extra cost for a month</figcaption>'
         '<canvas id="machine-chart" aria-hidden="true"></canvas>'
-        '<div class="chart-key"><span>Estimate</span><span>Ceiling at this check count</span></div></figure>')
+        '<div class="chart-key"><span>Estimate</span><span>Ceiling at this run count</span></div></figure>')
         + _steps(workload, decimals) + '</div>')
 
 
@@ -206,13 +211,14 @@ def render(data: machines_data.MachinesPageData, now: int) -> str:
     merge = next(workload for workload in data.workloads if workload.mode == 'merge-gate')
     others = ''.join(f'<p><strong>{escape(workload.name)}</strong> · {escape(workload.sentence)}</p>'
                      for workload in data.workloads if workload.mode != 'merge-gate')
+    control_section = f'<section class="card"><h2>{escape(merge.name)}</h2>'
     if isinstance(merge, machines_data.MeasuredWorkload):
-        control_section = _controls(data, merge) + '</section>' + _where_checks_run(merge) + _measurements(merge, data)
+        control_section += _controls(data, merge) + '</section>' + _where_checks_run(merge) + _measurements(merge, data)
     else:
-        control_section = f'<p class="note">{escape(merge.sentence)}</p></section>'
+        control_section += f'<p class="note">{escape(merge.sentence)}</p></section>'
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     body = page_frame.template(source, 'AWS Machines', console_tune.AWS_MACHINES_PAGE, action=_price_pill(data.price_read))
-    page = body.replace('__MERGE_CHECKS__', control_section, 1).replace('__OTHER_WORKLOADS__', others, 1)
+    page = body.replace('__PRIMARY_WORKLOAD__', control_section, 1).replace('__OTHER_WORKLOADS__', others, 1)
     return page_frame.rendered(page.encode(), started, now).decode()
 
 

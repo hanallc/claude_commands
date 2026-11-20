@@ -40,10 +40,24 @@ FASTER_BOX_RATIO_KEY = "faster_box_max_cost_ratio"
 
 
 def _machines_ratio_setting() -> TunableSetting:
-    page = conf.read_or_repository("aws_page")
-    return TunableSetting("cloud_gate", "AWS Machines", Decimal("1.00"),
-                          page.value("machines.ratio_max", conf.decimal),
-                          page.value("machines.ratio_step", conf.decimal))
+    page = conf.read("aws_page")
+
+    def limit(key: str) -> Decimal:
+        try:
+            return page.live_value(key, conf.decimal)
+        except conf.Unusable:
+            raise conf.Unusable(f"Set a valid {key} in aws_page.conf.") from None
+
+    minimum = Decimal("1.00")
+    maximum = limit("machines.ratio_max")
+    step = limit("machines.ratio_step")
+    if maximum < minimum:
+        raise conf.Unusable("Set machines.ratio_max to 1.00 or more in aws_page.conf.")
+    if step <= 0:
+        raise conf.Unusable("Set machines.ratio_step above zero in aws_page.conf.")
+    if (Fraction(maximum) - Fraction(minimum)) % Fraction(step):
+        raise conf.Unusable("Set machines.ratio_max to a multiple of machines.ratio_step above 1.00.")
+    return TunableSetting("cloud_gate", "AWS Machines", minimum, maximum, step)
 
 
 SETTINGS: dict[tuple[str, str], TunableSetting | Callable[[], TunableSetting]] = {
@@ -67,7 +81,8 @@ def save(page: str, key: str, value: str) -> TuneOutcome:
     try:
         setting = entry() if callable(entry) else entry
     except conf.Unusable as error:
-        return TuneOutcome(Refused("The limit range is unavailable."), conf.UnavailableValue(str(error)))
+        reason = str(error)
+        return TuneOutcome(Refused(reason), conf.UnavailableValue(reason))
     checked = setting.validate(value)
     result = checked if isinstance(checked, Refused) else _publish(setting, key, format(checked, "f"))
     live = conf.read(setting.document).origin(key, _live_decimal)

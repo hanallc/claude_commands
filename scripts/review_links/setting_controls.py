@@ -9,7 +9,7 @@ def slider(identity: str, label: str, *, minimum: Decimal, maximum: Decimal, ste
     """Render the choice and the current setting on the same scale."""
     identity = escape(identity)
     chosen = f"{value:.{decimals}f}"
-    current = f"{live:.{decimals}f}" + (f", {live_note}" if live_note else "")
+    current = f"{live:f}" + (f", {live_note}" if live_note else "")
     fill = _position(value, minimum, maximum)
     mark = _position(live, minimum, maximum)
     return (
@@ -103,12 +103,21 @@ border-color:var(--filter-selected-bg);--button-hover-tint:rgb(255 255 255 / 10%
 
 SCRIPT = r'''
 const pageSettingControls=(()=>{
+ function decimalIdentity(value){
+  const match=/^([+-]?)(\d*)(?:\.(\d*))?$/.exec(value);
+  if(!match) return value;
+  const [,sign,whole,fraction='']=match;
+  const integer=whole.replace(/^0+/,'') || '0';
+  const tail=fraction.replace(/0+$/,'');
+  return (sign==='-' && (integer!=='0' || tail) ? '-' : '')+integer+'.'+tail;
+ }
+
  function connectSlider(root){
   const input=root.querySelector('input');
   const output=root.querySelector('[data-slider-value]');
   const now=root.querySelector('.setting-slider-now');
   const min=Number(input.min),max=Number(input.max),decimals=Number(root.dataset.decimals);
-  let live=Number(root.dataset.live);
+  let liveText=root.dataset.live;
   const format=value=>Number(value).toFixed(decimals);
   const position=value=>max===min ? '0%' : Math.min(100,Math.max(0,(value-min)/(max-min)*100))+'%';
   function draw(){
@@ -122,12 +131,14 @@ const pageSettingControls=(()=>{
   return {
    input,format,
    get value(){return input.valueAsNumber;},
-   get live(){return live;},
+   get live(){return Number(liveText);},
+   get liveText(){return liveText;},
+   get atLive(){return decimalIdentity(input.value)===decimalIdentity(liveText);},
    setValue(value){input.valueAsNumber=value;draw();},
    setLive(value,note=''){
-    live=Number(value);
-    now.textContent='Now '+format(live)+(note ? ', '+note : '');
-    root.style.setProperty('--setting-live',position(live));
+    liveText=typeof value==='string' ? value : format(value);
+    now.textContent='Now '+liveText+(note ? ', '+note : '');
+    root.style.setProperty('--setting-live',position(Number(liveText)));
    }
   };
  }
@@ -153,9 +164,10 @@ const pageSettingControls=(()=>{
    }
   }
   go.addEventListener('click',()=>{
+   if(saving || go.disabled || slider.atLive) return;
    const {newValue,monthlyChange,liveNote}=describe();
-   chosen={value:slider.input.value,live:slider.live,amount:amount.value,liveNote};
-   summary.textContent='Change from '+slider.format(chosen.live)+' to '+newValue+'. The estimate changes by '+
+   chosen={value:slider.input.value,live:slider.liveText,amount:amount.value,liveNote};
+   summary.textContent='Change from '+chosen.live+' to '+newValue+'. The estimate changes by '+
     currency.format(monthlyChange)+' a month.';
    error.textContent='';
    line.hidden=false;
@@ -170,7 +182,7 @@ const pageSettingControls=(()=>{
   amount.addEventListener('input',cancelConfirmation);
   confirm.addEventListener('click',async()=>{
    if(saving || line.hidden) return;
-   if(chosen.value!==slider.input.value || chosen.live!==slider.live || chosen.amount!==amount.value){
+   if(chosen.value!==slider.input.value || chosen.live!==slider.liveText || chosen.amount!==amount.value || slider.atLive){
     cancelConfirmation();
     return;
    }
@@ -188,9 +200,10 @@ const pageSettingControls=(()=>{
      body:new URLSearchParams({page:root.dataset.page,key:root.dataset.key,value:chosen.value,token})
     });
     const result=await response.json();
-    const live=typeof result.live_value==='string' && result.live_value.trim() ? Number(result.live_value) : NaN;
-    if(Number.isFinite(live) && live!==slider.live){
-     slider.setLive(live,live===Number(chosen.value) ? chosen.liveNote : '');
+    const liveText=result.live_value;
+    const live=typeof liveText==='string' && liveText.trim() ? Number(liveText) : NaN;
+    if(Number.isFinite(live) && liveText!==slider.liveText){
+     slider.setLive(liveText,decimalIdentity(liveText)===decimalIdentity(chosen.value) ? chosen.liveNote : '');
     }
     if(!response.ok || result.state!=='saved'){
      throw new Error(typeof result.reason==='string' ? result.reason : '');

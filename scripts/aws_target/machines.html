@@ -68,11 +68,9 @@ __PAGE_SETTING_CONTROLS__
 <body>
 <main>
 __PAGE_TITLE__
-<p class="rule">The limit compares the cost of one merge check with the lowest-cost measured machine.
- A check takes the cheapest allowed faster machine that is free. At 1.00, the faster machine rule is off.</p>
-<section class="card">
-<h2>Merge checks</h2>
-__MERGE_CHECKS__
+<p class="rule">The limit compares the cost of one run with the lowest-cost measured machine.
+ A run uses the cheapest allowed faster machine that is free. At 1.00, the faster machine rule is off.</p>
+__PRIMARY_WORKLOAD__
 <section class="card other-workloads">
 <h2>Other workloads</h2>
 __OTHER_WORKLOADS__
@@ -97,8 +95,10 @@ if (model) {
  const {choices, projections, liveExtra} = JSON.parse(model.textContent);
  const slider = pageSettingControls.connectSlider(document.getElementById('cost-limit'));
  const amount = document.getElementById('monthly-limit');
+ const workloadName = document.getElementById('machine-controls').dataset.workloadName;
  const goRoot = document.getElementById('save-limit');
  const goButton = goRoot.querySelector('[data-setting-go]');
+ const confirmation = goRoot.querySelector('[data-setting-confirm]');
  const steps = [...document.querySelectorAll('[data-step]')];
  const machines = [...document.querySelectorAll('[data-choice]')];
  const chart = document.getElementById('machine-chart');
@@ -111,18 +111,23 @@ if (model) {
  const stop = ratio => choices.find(item => item.ratio === ratio);
  const projection = item => projections[item.step_index];
  const monthlyCeiling = item => (item.ceiling_cents / 100).toFixed(2);
- const originalLive = slider.live;
+ const originalLive = slider.liveText;
  const estimateAtLive = () => {
-  const live = stop(slider.live);
-  return live ? projection(live).extra : slider.live === originalLive ? liveExtra : NaN;
+  if (slider.liveText === originalLive) return liveExtra;
+  const ratio = slider.live;
+  if (ratio < first || ratio > last) return NaN;
+  return projection(choices.findLast(item => item.ratio <= ratio)).extra;
  };
  const go = pageSettingControls.connectGo(goRoot, slider, amount, () => ({
   newValue:slider.format(slider.value),
   monthlyChange:projection(stop(slider.value)).extra - estimateAtLive(),
   liveNote:slider.value === first ? 'off' : '',
  }));
- previewOpen = () => slider.input.disabled || slider.value !== slider.live ||
-  amount.value !== monthlyCeiling(stop(slider.value)) ? 'The cost limit preview is open.' : '';
+ let previewEdited = false;
+ previewOpen = () => {
+  const changed = !slider.atLive || amount.value !== monthlyCeiling(stop(slider.value));
+  return !confirmation.hidden || (previewEdited && changed) ? 'The cost limit preview is open.' : '';
+ };
 
  function chartBounds() {
   return {left:66, right:chart.clientWidth - 15, top:13, bottom:chart.clientHeight - 28};
@@ -193,8 +198,8 @@ if (model) {
   document.getElementById('saved-hours').textContent = decimal.format(hours) + ' h';
   document.getElementById('saved-hour-cost').textContent =
    cost_per_hour === null ? '—' : currency.format(cost_per_hour);
-  document.getElementById('monthly-cap').textContent = 'At this check count, the limit allows up to ' +
-   currency.format(item.ceiling_cents / 100) + ' more a month. More checks can raise the monthly cost.';
+  document.getElementById('monthly-cap').textContent = 'At this run count, the limit allows up to ' +
+   currency.format(item.ceiling_cents / 100) + ' more a month. More runs can raise the monthly cost.';
   document.getElementById('where-ratio').textContent = ratio;
   steps.forEach((row, index) => {
    const selected = index === item.step_index;
@@ -206,12 +211,13 @@ if (model) {
    row.querySelector('[data-allowed]').textContent = allowed ? 'Yes' : 'No';
    row.querySelector('[data-share]').textContent = percent.format(allowed ? shares[index] : 0);
   });
-  go.setLabel('Set the limit to ' + ratio + ' for merge checks');
-  goButton.disabled = slider.value === slider.live || !Number.isFinite(estimateAtLive()) || !amount.validity.valid;
+  go.setLabel('Set the limit to ' + ratio + ' for ' + workloadName);
+  goButton.disabled = slider.atLive || !Number.isFinite(estimateAtLive()) || !amount.validity.valid;
   drawChart();
  }
 
  function select(item) {
+  previewEdited = true;
   go.cancelConfirmation();
   slider.setValue(item.ratio);
   amount.value = monthlyCeiling(item);
@@ -220,6 +226,7 @@ if (model) {
  slider.input.addEventListener('input', () => select(stop(slider.value)));
  amount.required = true;
  amount.addEventListener('input', () => {
+  previewEdited = true;
   if (amount.validity.valid) {
    const cents = Math.round(amount.valueAsNumber * 100);
    const item = choices.findLast(item => item.ceiling_cents <= cents);
