@@ -1100,6 +1100,87 @@ frame.addEventListener('load',async()=>{
         self.assertIn("Read the <strong>new</strong> result &lt;first&gt;.", next_step)
         self.assertIn(f"Next step</dt><dd>{next_step}</dd>", log)
 
+    def test_updated_log_omits_values_that_match_the_previous_update(self) -> None:
+        item = self.add("Show changed fields")
+        initial_step = item.next_step
+        _ = the_list.update(MORTY.id, item.id, {"next_step": "Read the new result."}, source="morty")
+        _ = the_list.update(MORTY.id, item.id, {"next_step": "Read the new result.",
+                                                "latest_status": "The result is ready."}, source="morty")
+        _ = the_list.update(MORTY.id, item.id, {"next_step": initial_step, "latest_status": "The result is ready."},
+                            source="morty")
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        log = body.split('<ol class="list-log">', 1)[1]
+        first, second, third = (log.split(f'<li data-log-index="{index}">', 1)[1].split('</li>', 1)[0]
+                                for index in (1, 2, 3))
+        self.assertIn('<dt>Next step</dt>', first)
+        self.assertIn('<dt>Latest status</dt>', second)
+        self.assertNotIn('<dt>Next step</dt>', second)
+        self.assertIn(f'<dt>Next step</dt><dd><p>{initial_step}</p></dd>', third)
+        self.assertNotIn('<dt>Latest status</dt>', third)
+        self.assertIn(f'<time datetime="{NOW.isoformat()}">13:00 EST</time>', second)
+        self.assertIn('morty</small>', without_role_colors(second))
+
+    def test_updated_log_keeps_the_time_and_source_when_no_fields_change(self) -> None:
+        log = self.legacy_log(
+            '- 2026-11-16 18:00:00+00:00 Added; state: "Working" — nate',
+            '- 2026-11-16 18:10:00+00:00 Updated state: "Working" — morty')
+        update = log.split('<li data-log-index="1">', 1)[1].split('</li>', 1)[0]
+        self.assertIn('<time datetime="2026-11-16T18:10:00+00:00">13:10 EST</time>', update)
+        self.assertIn('<strong>Updated <small>— morty</small></strong>', without_role_colors(update))
+        self.assertNotIn('<dl>', update)
+
+    def test_log_keeps_added_evidence_and_shows_only_new_evidence_in_closed_details(self) -> None:
+        item = self.add("Show the Evidence history")
+        added = item.evidence
+        appended = "\nThe <check> passed."
+        replacement = "A different result."
+        _ = the_list.update(MORTY.id, item.id, {"evidence": added + appended}, source="morty")
+        _ = the_list.update(MORTY.id, item.id, {"evidence": replacement}, source="morty")
+        _ = the_list.update(MORTY.id, item.id, {"evidence": replacement, "next_step": "Read the result."}, source="morty")
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        log = body.split('<ol class="list-log">', 1)[1]
+        added_html = "Read https://example.invalid/proof?x=1&amp;y=2."
+        for index, expected in enumerate((added_html, "The &lt;check&gt; passed.", replacement)):
+            with self.subTest(index=index):
+                row = log.split(f'<li data-log-index="{index}">', 1)[1].split('</li>', 1)[0]
+                self.assertIn('<dt>Evidence</dt><dd><details class="log-evidence">'
+                              + f'<summary id="list-evidence-{MORTY.id}-{item.id}-{index}">Details</summary>'
+                              + f'<div>{expected}</div></details></dd>', row)
+        unchanged = log.split('<li data-log-index="3">', 1)[1].split('</li>', 1)[0]
+        self.assertNotIn('<dt>Evidence</dt>', unchanged)
+
+    def test_log_shows_when_an_update_clears_evidence(self) -> None:
+        item = self.add("Clear the Evidence")
+        _ = the_list.update(MORTY.id, item.id, {"evidence": ""}, source="morty")
+        _ = the_list.update(MORTY.id, item.id, {"evidence": "", "next_step": "Check the log."}, source="morty")
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        log = body.split('<ol class="list-log">', 1)[1]
+        cleared = log.split('<li data-log-index="1">', 1)[1].split('</li>', 1)[0]
+        unchanged = log.split('<li data-log-index="2">', 1)[1].split('</li>', 1)[0]
+        self.assertIn('<dt>Evidence</dt><dd><details class="log-evidence">', cleared)
+        self.assertIn('<div>Not recorded</div></details>', cleared)
+        self.assertNotIn('<dt>Evidence</dt>', unchanged)
+
+    def test_log_marks_historical_question_events_with_bold_labels_and_the_question_class(self) -> None:
+        item = self.add("Show historical questions")
+        question = question_record.Question("Q2", NOW.isoformat(), "Which check failed?")
+        item = replace(item, log=(*item.log,
+            the_list.ItemChange(NOW, the_list.QuestionAnswered("Q1"), "morty"),
+            the_list.ItemChange(NOW, the_list.QuestionClosed(question), "nate")))
+        log = list_page.item_log_html(list_page.ListRecord(MORTY.id, item), NOW.astimezone(user_zone()),
+                                      staff_names.read(), frozenset())
+        self.assertIn('<li class="question" data-log-index="1">', log)
+        self.assertIn('<div><strong>Answer</strong> to question Q1', log)
+        self.assertIn('<li class="question" data-log-index="2">', log)
+        self.assertIn('<div><strong>Question</strong> Q2 closed with the item', log)
+
+    def test_list_and_review_emit_the_question_color_rule(self) -> None:
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        rule = '.question{--type-color:#b99aff}'
+        self.assertIn(rule, review_page.STYLE)
+        self.assertIn(rule, body)
+        self.assertIn('.list-log>li.question{border-inline-start:3px solid var(--type-color);', body)
+
     def test_latest_status_shows_the_update_time_in_the_user_zone(self) -> None:
         item = self.add("Status time")
         updated = NOW + timedelta(minutes=20)
@@ -1292,11 +1373,18 @@ document.body.append(result);
     def test_browser_log_refresh_preserves_the_visible_entry_and_keeps_the_top_at_zero(self) -> None:
         self.browser_log_refresh('''
  open(1);open(2);
+ const evidence=(number,index)=>log(number).querySelector('[data-log-index="'+index+'"] .log-evidence');
+ evidence(1,0).open=true;
  log(1).scrollTop=239;
  const before=firstVisible(log(1));
  check(before.offset<0 && log(1).scrollTop>0,'The first item starts partway through an entry.');
  check(log(2).scrollTop===0,'The second item starts at the top.');
+ evidence(1,0).querySelector('summary').focus({preventScroll:true});
  await refresh();
+ check(evidence(1,0).open && !evidence(1,1).open && !evidence(2,0).open,
+  'Evidence stays open only for the same item and log entry.');
+ check(document.activeElement===evidence(1,0).querySelector('summary'),
+  'Keyboard focus stays on the same Evidence summary.');
  const after=firstVisible(log(1));
  check(after.text===before.text && Math.abs(after.offset-before.offset)<=1,
   'The first item keeps the same entry and offset after the new entry arrives.');
@@ -1326,7 +1414,9 @@ document.body.append(result);
     def browser_log_refresh(self, steps: str) -> None:
         for number in (1, 2):
             item = self.add(f"Log for item {number}", number=number)
-            for update in range(18):
+            _ = the_list.update(MORTY.id, item.id, {"next_step": "Check result 0.",
+                                                    "evidence": "The first check passed."}, source="morty")
+            for update in range(1, 18):
                 _ = the_list.update(MORTY.id, item.id, {"next_step": f"Check result {update}."}, source="morty")
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()
@@ -3358,7 +3448,7 @@ observer.observe(original.parentNode,{childList:true});
         self.assertIn('value="read">Mark read</button>', answered)
         panel, log = answered.split('<ol class="list-log">', 1)
         self.assertIn("Marked read <small>", log)
-        self.assertNotIn("Answered question Q1 <small>", log)
+        self.assertNotIn("<strong>Answer</strong> to question Q1 <small>", log)
         self.assertNotIn('What changed in &lt;List&gt;?', log)
         self.assertNotIn('The &lt;filter&gt; changed.', log)
         self.assertIn('Question Q1</h3>' + asked_time + '<p>What changed in &lt;List&gt;?</p>', panel)
@@ -3374,9 +3464,11 @@ observer.observe(original.parentNode,{childList:true});
         self.assertNotIn('data-question="Q1"', panel)
         self.assertNotIn('class="question-unread"', panel)
         log = re.sub(r'<span class="staff-name"[^>]*>(.*?)</span>', r'\1', log)
-        question_row = '<li data-log-index="Q1-asked">' + asked_time + '<div>Question Q1 <small>— nate</small>'
+        question_row = ('<li class="question" data-log-index="Q1-asked">' + asked_time
+                        + '<div><strong>Question</strong> Q1 <small>— nate</small>')
         logged_time = f'<time datetime="{answer_logged_at.isoformat()}">12:36 EST</time>'
-        answer_row = '<li data-log-index="Q1-answered">' + logged_time + '<div>Answer <small>— morty</small>'
+        answer_row = ('<li class="question" data-log-index="Q1-answered">' + logged_time
+                      + '<div><strong>Answer</strong> <small>— morty</small>')
         self.assertIn(question_row + '<p>What changed in &lt;List&gt;?</p></div></li>', log)
         self.assertIn(answer_row + '<p>The &lt;filter&gt; changed.</p></div></li>', log)
         self.assertEqual(log.count('12:36 EST'), 1)
@@ -3386,8 +3478,9 @@ observer.observe(original.parentNode,{childList:true});
         saved = the_list.load(MORTY.id, item.id)
         legacy = replace(saved, log=tuple(entry for entry in saved.log
                                          if entry.what != the_list.QuestionAnswered("Q1")))
-        legacy_log = list_page.item_log_html(legacy, NOW.astimezone(user_zone()), staff_names.read(), frozenset())
-        self.assertIn('<li data-log-index="Q1-answered">' + answer_time, legacy_log)
+        legacy_log = list_page.item_log_html(list_page.ListRecord(MORTY.id, legacy), NOW.astimezone(user_zone()),
+                                             staff_names.read(), frozenset())
+        self.assertIn('<li class="question" data-log-index="Q1-answered">' + answer_time, legacy_log)
         self.assertEqual(legacy_log.count('12:35 EST'), 1)
 
     def test_stale_mark_read_keeps_the_newer_answer_in_the_panel(self) -> None:

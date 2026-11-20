@@ -1137,7 +1137,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
                      {'validate':'asked the showrunner to check', 'question':'question sent'}.get(outcome,'answer'))
 
 
-STYLE = '''<style>
+QUESTION_COLOR_RULE = '.question{--type-color:#b99aff}'
+STYLE = '<style>' + QUESTION_COLOR_RULE + '''
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-waiting-why{display:block;color:var(--ink-3);font-size:.85em}
 .review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
@@ -1149,7 +1150,7 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
-.question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
+.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
 .proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}.bug{--type-color:#ed876b}.response{--type-color:#edc46d}
 .review-icon{color:var(--type-color)}.review-panel{border-left-color:var(--type-color);grid-template-columns:1.25fr 1fr;padding:0 20px 18px 58px;gap:4px 28px}
 .response-answer time{display:block;margin-bottom:8px;color:var(--ink-3);font-size:12px}
