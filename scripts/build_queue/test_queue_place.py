@@ -1460,13 +1460,22 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     queue.stop_scope(scope, 2, 0.5)
 
     def test_scope_recovery_keeps_the_record_when_events_is_a_fifo(self) -> None:
+        self.assert_scope_recovery_keeps_record(fifo=True)
+
+    def test_scope_recovery_keeps_the_record_when_events_has_invalid_utf8(self) -> None:
+        self.assert_scope_recovery_keeps_record(fifo=False)
+
+    def assert_scope_recovery_keeps_record(self, *, fifo: bool) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             scope = root / "scope"
             scope.mkdir()
             _ = (scope / "cgroup.procs").write_text("")
             events = scope / "cgroup.events"
-            os.mkfifo(events)
+            if fifo:
+                os.mkfifo(events)
+            else:
+                _ = events.write_bytes(b"populated 0\n\xff")
             sidecar = root / "program.cgroup"
             _ = sidecar.write_text(str(scope))
             owner = wire.Owner(101, "100")
@@ -1487,10 +1496,13 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                   mock.patch.object(queue, "program_starts", return_value=root),
                   mock.patch.object(records, "process_start_time", return_value=None),
                   redirect_stderr(errors)):
-                with self.assertRaisesRegex(snapshot_codec.SnapshotParseError, "expected a regular file"):
-                    _ = gate.scope_populated(scope)
+                if fifo:
+                    with self.assertRaisesRegex(snapshot_codec.SnapshotParseError, "expected a regular file"):
+                        _ = gate.scope_populated(scope)
                 self.assertEqual(queue.cleanup_program_starts(timing), {sidecar})
             self.assertIn(f"UNRESOLVED: recovery kept {record}", errors.getvalue())
+            if not fifo:
+                self.assertIn("'utf-8' codec can't decode", errors.getvalue())
             self.assertEqual(record.read_text(), saved)
             self.assertEqual(sidecar.read_text(), str(scope))
 

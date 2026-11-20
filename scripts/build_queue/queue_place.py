@@ -390,7 +390,7 @@ def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequenc
 def _scope_is_empty(scope: Path) -> bool:
     try:
         return not memory_admit.scope_populated(scope, require_events=True)
-    except snapshot_codec.SnapshotParseError as error:
+    except ValueError as error:
         raise CleanupUnresolved(str(error)) from error
     except OSError as error:
         if error.errno not in (errno.ENOENT, errno.ENODEV):
