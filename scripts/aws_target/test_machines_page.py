@@ -247,7 +247,7 @@ machines.ratio_step=0.25
   check(document.querySelector('[data-choice="2"] [data-share]').textContent === '1.4%', 'The distribution uses the saved share');
   go.click();
   check(document.querySelector('[data-setting-summary]').textContent ===
-        'Change from 1.50 to 2.15. The estimate changes by +$0.96 a month.', 'Go confirmation');
+        'Change from 1.50 to 2.15. gate +$0.96 a month. Total +$0.96 a month.', 'Go confirmation');
   check(document.querySelector('.setting-slider-now').textContent === 'Now 1.50', 'Go leaves the live value until confirmation');
   const saved = new Promise(resolve => document.getElementById('save-limit').addEventListener('setting-saved', resolve, {once:true}));
   document.querySelector('[data-setting-save]').click();
@@ -269,10 +269,12 @@ machines.ratio_step=0.25
     def test_browser_shows_the_total_and_updates_both_jobs(self) -> None:
         markup = machines_page.render(fixture_two_jobs(), NOW)
         probe = """<script>
+(async () => {
 const jobs = [...document.querySelectorAll('[data-job-projection]')];
 const slider = document.getElementById('cost-limit-value');
 const amount = document.getElementById('monthly-limit');
 const go = document.querySelector('[data-setting-go]');
+const summary = document.querySelector('[data-setting-summary]');
 const jobValues = selector => jobs.map(job => job.querySelector(selector).textContent);
 function check(condition, label) { if (!condition) throw new Error(label); }
 let result = 'passed';
@@ -293,16 +295,32 @@ try {
  check(jobValues('[data-job-ratio]').join('|') === '1.25|1.25', 'Both jobs follow the slider');
  check(jobValues('[data-job-extra]').join('|') === '$14.14|$0.00', 'The targeted test has no extra cost at 1.25');
  check(jobValues('[data-choice="1"] [data-share]').join('|') === '97.8%|0%', 'Both jobs use their saved shares');
+ go.click();
+ check(summary.textContent === 'Change from 1.50 to 1.25. targeted test -$5.08 a month. Total -$5.08 a month.',
+       'Confirmation names the one job that changes');
+ slider.value = '1.55';
+ slider.dispatchEvent(new Event('input', {bubbles:true}));
+ go.click();
+ check(summary.textContent === 'Change from 1.50 to 1.55. Total $0.00 a month.',
+       'Confirmation names no job when the estimate stays the same');
  steps[0].querySelector('button').click();
  go.click();
- check(document.querySelector('[data-setting-summary]').textContent ===
-       'Change from 1.50 to 1.00. The estimate changes by -$19.22 a month.', 'Confirmation uses the total change');
+ check(summary.textContent === 'Change from 1.50 to 1.00. gate -$14.14 a month, targeted test -$5.08 a month. '
+       + 'Total -$19.22 a month.', 'Confirmation names both jobs and the total');
+ const saved = new Promise(resolve => document.getElementById('save-limit').addEventListener('setting-saved', resolve, {once:true}));
+ document.querySelector('[data-setting-save]').click();
+ await saved;
+ steps[2].querySelector('button').click();
+ go.click();
+ check(summary.textContent === 'Change from 1 to 1.35. gate +$14.14 a month, targeted test +$5.08 a month. '
+       + 'Total +$19.22 a month.', 'Confirmation after save: ' + summary.textContent);
 } catch (error) {
  result = String(error);
 }
-void fetch('/probe?result=' + encodeURIComponent(result));
+await fetch('/probe?result=' + encodeURIComponent(result));
+})();
 </script>"""
-        self.browser(markup, probe)
+        self.browser(markup, probe, expected_saves=('1',))
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for the Machines page checks')
     def test_browser_uses_the_exact_live_text_and_its_step_for_confirmation(self) -> None:
@@ -315,7 +333,8 @@ void fetch('/probe?result=' + encodeURIComponent(result));
             with self.subTest(live=live):
                 live_workload = replace(workload, live_ratio=D(live), live_extra_usd_per_month=D(live_extra))
                 markup = machines_page.render(replace(data, workloads=(live_workload, *data.workloads[1:])), NOW)
-                expected = json.dumps(f'Change from {live} to 1.25. The estimate changes by {monthly_change} a month.')
+                parts = f'gate {monthly_change} a month. ' if monthly_change != '$0.00' else ''
+                expected = json.dumps(f'Change from {live} to 1.25. {parts}Total {monthly_change} a month.')
                 probe = """<script>
 const sliderInput = document.getElementById('cost-limit-value');
 const untouched = previewOpen() === '';

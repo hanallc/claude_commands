@@ -50,6 +50,12 @@ class _JobStepProjection(TypedDict):
     shares: dict[int, float]
 
 
+class _JobProjection(TypedDict):
+    name: str
+    live_extra: float
+    steps: list[_JobStepProjection]
+
+
 def page_url() -> str:
     """Return the Machines page URL after the page exists."""
     page = output_folder().resolve() / PAGE_NAME
@@ -179,11 +185,12 @@ def _projection_data(total: machines_data.AllJobsProjection) -> tuple[list[_Slid
     return choices, projections
 
 
-def _job_projection(workload: machines_data.MeasuredWorkload) -> list[_JobStepProjection]:
+def _job_projection(workload: machines_data.MeasuredWorkload) -> _JobProjection:
     machines = {choice.machine: index for index, choice in enumerate(workload.choices)}
-    return [_JobStepProjection(first_ratio=float(step.first_ratio), extra=float(step.extra_usd_per_month),
-                              shares={machines[row.machine]: float(row.share) for row in step.shares})
-            for step in workload.steps]
+    steps = [_JobStepProjection(first_ratio=float(step.first_ratio), extra=float(step.extra_usd_per_month),
+                                shares={machines[row.machine]: float(row.share) for row in step.shares})
+             for step in workload.steps]
+    return _JobProjection(name=workload.name, live_extra=float(workload.live_extra_usd_per_month), steps=steps)
 
 
 def _controls(data: machines_data.MachinesPageData, total: machines_data.AllJobsProjection,
@@ -203,7 +210,7 @@ def _controls(data: machines_data.MachinesPageData, total: machines_data.AllJobs
     choices, projections = _projection_data(total)
     model = json.dumps({'choices': choices, 'projections': projections,
                         'jobProjections': [_job_projection(job) for job in jobs],
-                        'liveExtra': float(total.live_extra_usd_per_month)})
+                        'liveExtra': float(total.live_extra_usd_per_month)}).replace('<', r'\u003c')
     return (
         f'<div id="machine-controls" class="machine-controls">{slider}{amount}</div>'
         + ('<div class="machine-tiles" aria-live="polite">'

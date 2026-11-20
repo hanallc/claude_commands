@@ -165,10 +165,16 @@ const pageSettingControls=(()=>{
   }
   go.addEventListener('click',()=>{
    if(saving || go.disabled || slider.atLive) return;
-   const {newValue,monthlyChange,liveNote}=describe();
+   const {newValue,monthlyChange,liveNote,monthlyChangeParts}=describe();
    chosen={value:slider.input.value,live:slider.liveText,amount:amount.value,liveNote};
-   summary.textContent='Change from '+chosen.live+' to '+newValue+'. The estimate changes by '+
-    currency.format(monthlyChange)+' a month.';
+   const change='Change from '+chosen.live+' to '+newValue+'. ';
+   const total=currency.format(monthlyChange)+' a month.';
+   if(monthlyChangeParts===undefined){
+    summary.textContent=change+'The estimate changes by '+total;
+   }else{
+    const parts=monthlyChangeParts.map(part=>part.name+' '+currency.format(part.monthlyChange)+' a month');
+    summary.textContent=change+(parts.length ? parts.join(', ')+'. ' : '')+'Total '+total;
+   }
    error.textContent='';
    line.hidden=false;
    go.setAttribute('aria-expanded','true');

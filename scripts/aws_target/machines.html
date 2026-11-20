@@ -112,6 +112,7 @@ if (model) {
  const last = choices.at(-1).ratio;
  const stop = ratio => choices.find(item => item.ratio === ratio);
  const projection = item => projections[item.step_index];
+ const jobStep = (job, ratio) => job.steps.findLast(step => step.first_ratio <= ratio);
  const monthlyCeiling = item => (item.ceiling_cents / 100).toFixed(2);
  const originalLive = slider.liveText;
  const estimateAtLive = () => {
@@ -123,6 +124,11 @@ if (model) {
  const go = pageSettingControls.connectGo(goRoot, slider, amount, () => ({
   newValue:slider.format(slider.value),
   monthlyChange:projection(stop(slider.value)).extra - estimateAtLive(),
+  monthlyChangeParts:jobProjections.map(job => ({
+   name:job.name,
+   monthlyChange:jobStep(job, slider.value).extra -
+    (slider.liveText === originalLive ? job.live_extra : jobStep(job, slider.live).extra),
+  })).filter(part => part.monthlyChange !== 0),
   liveNote:slider.value === first ? 'off' : '',
  }));
  let previewEdited = false;
@@ -208,7 +214,7 @@ if (model) {
    row.querySelector('button').setAttribute('aria-pressed', String(selected));
   });
   jobs.forEach((job, index) => {
-   const {extra, shares} = jobProjections[index].findLast(step => step.first_ratio <= item.ratio);
+   const {extra, shares} = jobStep(jobProjections[index], item.ratio);
    job.querySelector('[data-job-ratio]').textContent = ratio;
    job.querySelector('[data-job-extra]').textContent = currency.format(extra);
    job.querySelectorAll('[data-choice]').forEach(row => {
