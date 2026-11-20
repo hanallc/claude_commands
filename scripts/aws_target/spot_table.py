@@ -96,7 +96,7 @@ class RunCosts:
     tables: tuple[Table, ...]
     # The gate estimate of each standard type, with one row per region.
     gate_prices: Table
-    # Every estimate of a placement candidate, cheapest first; equal estimates keep the table order.
+    # Estimates for deployed types, cheapest first. Equal estimates keep the table order.
     estimates: tuple[Cheapest, ...]
     refused: Table
     launched: Table
@@ -107,7 +107,7 @@ class RunCosts:
 
     def summary_of(self, cheapest: Cheapest | None) -> str:
         if cheapest is None:
-            return f'Cheapest {self.scope.noun}: no estimate; the snapshot has no price or the ledger has no runs'
+            return f'Cheapest {self.scope.noun}: no eligible type with a current price and run evidence.'
         return f'Cheapest {self.scope.noun}: {cheapest.size} in {cheapest.region}, {cheapest.usd:.4f} USD (estimate)'
 
 
@@ -132,12 +132,14 @@ class SpotTables:
         return tuple((read.region, f'{read.region}: {read.detail}') for read in self.regions)
 
 
-def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None) -> SpotTables:
+def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None,
+                gate_pricing: run_cost.GatePricingInputs | None = None) -> SpotTables:
     """Read prices, quotas, run costs, billed hours, and the reason for each unavailable value."""
     values = conf.read_or_repository('cloud_gate')
     configuration = conf.read(settings_path) if settings_path else conf.read_or_repository('aws_target')
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
-    standard = tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'))))
+    gate_types = values.words('instance_types')
+    standard = tuple(dict.fromkeys((*gate_types, *values.words('price_compare_instance_types'))))
     gpu = tuple(size for size in gpu_price_sizes(values) if size not in standard)
     document = read_snapshot(directory)
     readings = {ledger.text(row, 'region'): row for row in ledger.rows(document, 'regions')} if 'regions' in document else {}
@@ -148,17 +150,20 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None)
         price = conf.decimal(ledger.text(row, 'usd_per_hour'))
         minimum[key] = min(minimum.get(key, price), price)
     reads: list[RegionRead] = []
+    max_age = configuration.whole('price_max_age_seconds')
     for region in regions:
         reading = readings.get(region)
         failure = failures.get(region)
         age = now - ledger.instant(reading, 'read_at') if reading else None
-        stale = age is not None and (age < 0 or age > configuration.whole('price_max_age_seconds'))
+        stale = age is not None and (age < 0 or age > max_age)
         reads.append(RegionRead(region, age, stale, failure, now - failure.at if failure else 0))
     notes = {read.region: read.note for read in reads}
     not_sold = frozenset((region, size) for region in regions for size in (*standard, *gpu)
                          if (region, size) not in minimum and not notes[region])
     days = configuration.whole('run_cost_days')
     home = configuration.text('region')
+    inputs = gate_pricing if gate_pricing is not None else run_cost.read_gate_pricing_inputs(
+        directory, now, values, configuration)
     hours, hours_note = billed_hours(directory, now, regions, gate_sizes(values), days, home,
                                      configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
     return SpotTables(
@@ -166,8 +171,7 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None)
         (price_table(standard, regions, minimum, notes, not_sold), price_table(gpu, regions, minimum, notes, not_sold)),
         (quota_table('Standard quota', 'standard_vcpus', standard, regions, readings, notes),
          quota_table('G and VT quota', 'gpu_vcpus', gpu, regions, readings, notes)),
-        run_costs(directory, now, standard, frozenset(values.words('instance_types')), regions, minimum, not_sold,
-                  days, home),
+        run_costs(directory, now, standard, regions, minimum, values, configuration, inputs),
         hours, hours_note)
 
 
@@ -209,39 +213,43 @@ def quota_table(label: str, field: str, sizes: tuple[str, ...], regions: tuple[s
                  frozenset(range(1, 2 + len(fits))), tuple(rows), 'rows')
 
 
-def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: frozenset[str],
-              regions: tuple[str, ...], minimum: Mapping[tuple[str, str], Decimal], not_sold: frozenset[tuple[str, str]],
-              days: int, home: str) -> tuple[RunCosts, ...]:
+def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[str, ...],
+              minimum: Mapping[tuple[str, str], Decimal], values: conf.ConfigRead,
+              policy: conf.ConfigRead, gate_pricing: run_cost.GatePricingInputs) -> tuple[RunCosts, ...]:
     """Build the run tables and gate estimates for standard types in each scope."""
+    days = policy.whole('run_cost_days')
+    home = policy.text('region')
     end = datetime.fromtimestamp(now, UTC)
     start = end - timedelta(days=days)
     book = ledger.CostLedger(directory)
-    rows = book.launches()
-    runs = run_cost.runs_from_rows(rows, start, end, home).runs
-    evidence = run_cost.run_evidence(rows, start, end, home)
+    history = run_cost.read_gate_run_history(book, start, end, home)
     bills = run_cost.spot_bills(book, start, end)
     paid_hourly = run_cost.paid_per_hour(bills)
-    allocations = run_cost.billed_allocations(bills, runs)
-    values = conf.read_or_repository('cloud_gate')
+    allocations = run_cost.billed_allocations(bills, history.runs)
+    gate_minimum: dict[tuple[str, str], Decimal] = {}
+    for variant, price in gate_pricing.prices.items():
+        key = variant.region, variant.instance_type
+        gate_minimum[key] = min(gate_minimum.get(key, price), price)
+    max_gate_minutes = values.whole('max_gate_minutes')
     counts = ('type', *regions)
     scopes: list[RunCosts] = []
     for scope in run_cost.SCOPES:
-        pricing = run_cost.GateRunPricing.from_config(values, evidence, home, scope.modes)
-        explanation = (f'USD per {scope.noun}, last {days} days. The estimate uses the lowest zone Spot price '
+        pricing = run_cost.GateRunPricing.from_config(values, gate_pricing.evidence, home, scope.modes)
+        explanation = (f'USD per {scope.noun}, last {days} days. The estimate uses the lowest deployed zone Spot price '
                        + 'and the median box time, including boot. It adds transfer charges outside the home region. '
-                       + f'Refusal wait ({evidence.refusal_wait_s:.0f} s each) and extra regional wait cost '
+                       + f'Refusal wait ({gate_pricing.evidence.refusal_wait_s:.0f} s each) and extra regional wait cost '
                        + f'{pricing.wait_usd_per_minute} USD/min. Paid: the AWS bill for the type and region, '
                        + 'split between runs by box time. Runs elsewhere: the type has no runs in the region, '
                        + 'so the time comes from the other regions. Runs same vCPUs: the type has no runs, '
                        + 'so the time comes from the types with its vCPU count.')
         estimates: list[Cheapest] = []
         grid: dict[tuple[str, str], Decimal] = {}
-        for size in sizes:
-            for region in regions:
-                price = minimum.get((region, size))
-                seconds, _source = evidence.box_seconds(size, region, scope.modes)
-                if price is not None and seconds:
-                    grid[region, size] = pricing.expected_usd(price, size, region)
+        slow = run_cost.slow_gate_types(gate_pricing.deployed, gate_pricing.evidence, scope.modes, max_gate_minutes)
+        for (region, size), price in gate_minimum.items():
+            if (size, region) not in slow:
+                estimate = pricing.estimate(price, size, region)
+                if isinstance(estimate.median_minutes, Decimal):
+                    grid[region, size] = estimate.usd_per_run
         headers = ('region', SPOT_HEADER, f'{scope.noun} (minutes)', 'runs', ESTIMATE_HEADER, 'paid USD/h', 'paid USD/run',
                    'paid runs')
         tables: list[Table] = []
@@ -253,17 +261,16 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
             launched_cells: list[str] = []
             for region in regions:
                 price = minimum.get((region, size))
-                seconds, source = evidence.box_seconds(size, region, scope.modes)
+                seconds, source = history.evidence.box_seconds(size, region, scope.modes)
                 estimate = grid.get((region, size))
-                # Placement picks only the instance_types, so only they can be the cheapest.
-                if estimate is not None and size in candidates:
+                if estimate is not None:
                     estimates.append(Cheapest(estimate, size, region))
-                here = [run for run in runs if (run.instance_type, run.region) == (size, region)]
+                here = [run for run in history.runs if (run.instance_type, run.region) == (size, region)]
                 scoped = [run for run in here if run.mode in scope.modes]
                 # Allocations split each bill between both kinds, so only the share of the scope's kinds counts here.
                 billed = run_cost.billed_runs(scoped, allocations)
                 paid = paid_hourly.get((size, region))
-                _refusals, refused, launched = evidence.refusals_per_launch(size, region, scope.modes)
+                _refusals, refused, launched = history.evidence.refusals_per_launch(size, region, scope.modes)
                 refused_cells.append(str(refused))
                 launched_cells.append(str(launched))
                 table.append((region, f'{price:.4f}' if price is not None else 'no price', run_minutes(seconds),
@@ -277,10 +284,14 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], candidates: fro
         right = frozenset(range(1, len(counts)))
 
         def estimate_cell(region: str, size: str) -> str:
+            if (size, region) in slow:
+                return 'too slow'
+            if (region, size) not in gate_minimum:
+                return 'no current gate price'
             estimate = grid.get((region, size))
-            return f'{estimate:.4f}' if estimate is not None else NOT_SOLD
+            return f'{estimate:.4f}' if estimate is not None else 'no runs'
 
-        gate_prices = region_type_table(sizes, regions, grid, estimate_cell, not_sold)
+        gate_prices = region_type_table(sizes, regions, grid, estimate_cell, frozenset())
         scopes.append(RunCosts(scope, explanation, tuple(tables), gate_prices, tuple(sorted(estimates, key=lambda entry: entry.usd)),
                                Table(f'Refused {scope.noun} requests (capacity and quota)', counts, right,
                                      tuple(refused_rows), 'columns'),

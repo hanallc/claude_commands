@@ -288,9 +288,11 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     except (OSError, ValueError, KeyError) as error:
         print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
         placement = ()
-    tables = spot_table.spot_tables(directory, now, settings_path=settings_path)
+    values = conf.read_or_repository('cloud_gate')
+    gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
+    tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
     data = page_data(tables, spend, now, placement)
-    comparisons = run_cost.merge_gate_comparisons(directory, now, conf.read_or_repository('cloud_gate'), configuration)
+    comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
     gate_time_data = {'table': gate_time_price, 'regions': regions}
