@@ -91,7 +91,7 @@ from threading import get_ident
 from typing import Literal, Protocol, TypedDict, cast
 from urllib.parse import unquote_to_bytes
 
-from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder, time_limit  # noqa: E402
+from scripts.lib import cargo_output, conf, copy_record, git_files, removal_guard, session_folder, time_limit  # noqa: E402
 from scripts.direct import recorder_state  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
@@ -889,13 +889,23 @@ def folder_record(path: Path) -> Path:
     return record if record.is_file() else removal_mark(path)
 
 
+class RemovalIntentAccess(Enum):
+    """Select whether a stale removal intent may be cleared."""
+
+    RECOVER = "recover"
+    READ_ONLY = "read only"
+
+
 def pending_removal(path: Path, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER,
 ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
     """Read deletion intent and check the identity of its source."""
     record = checked_removal(path)
     if not isinstance(record, StaleRemoval):
         return record
+    if intent is RemovalIntentAccess.READ_ONLY:
+        return copy_record.UnreadableRecord(f"{path}: the saved removal intent belongs to an earlier folder")
     # A lifetime scan may already own a different copy's record lock. Never wait
     # on a sibling merely to discard an old deletion intent.
     with directory_record_lock(path, wait=False, scratch_settings=scratch_settings) as acquired:
@@ -939,17 +949,18 @@ def checked_removal(path: Path) -> copy_record.Registered | copy_record.NotRegis
 
 def task_of(path: Path, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER,
 ) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
     """Read folder task evidence; plain files have no task record."""
     if os.path.isfile(path):
         return copy_record.NotRegistered()
     record = copy_record.read_record(path / copy_record.RECORD)
-    return pending_removal(path, scratch_settings=scratch_settings) if isinstance(record, copy_record.NotRegistered) else record
+    return pending_removal(path, scratch_settings=scratch_settings, intent=intent) if isinstance(record, copy_record.NotRegistered) else record
 
 
-def is_throwaway(path: Path) -> bool:
+def is_throwaway(path: Path, *, intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER) -> bool:
     """Identify a folder that code creates without edits from a person."""
-    record = task_of(path)
+    record = task_of(path, intent=intent)
     return isinstance(record, copy_record.Registered) and record.fields.get("throwaway") is True
 
 
@@ -1014,7 +1025,8 @@ def _unregistered_borrow_candidate(path: Path) -> UnregisteredBorrowCandidate:
     return UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER
 
 
-def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | Ended | Unknown:
+def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead,
+                    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER) -> Live | Ended | Unknown:
     """Check the copy registry for borrowers of this folder's Git objects."""
     protection: Live | Ended | Unknown = Ended("no copy borrows from it")
     try:
@@ -1028,7 +1040,7 @@ def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | 
                 break
             if child.resolve() == path.resolve():
                 continue
-            other = task_of(child, scratch_settings=scratch_settings)
+            other = task_of(child, scratch_settings=scratch_settings, intent=intent)
             if isinstance(other, copy_record.NotRegistered):
                 if _unregistered_borrow_candidate(child) is UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER:
                     continue
@@ -1094,19 +1106,20 @@ def lock_descendant_clones(path: Path, locks: ExitStack, scope: BusyMarkScope, *
 
 def record_lifetime(path: Path, now: float, ending_task: str = "", *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER,
 ) -> Live | Ended | Unknown:
     """Read end evidence while the caller holds any required removal lock."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    removal = pending_removal(path, scratch_settings=scratch_settings)
+    removal = pending_removal(path, scratch_settings=scratch_settings, intent=intent)
     if isinstance(removal, copy_record.UnreadableRecord):
         return Unknown(removal.reason)
-    record = task_of(path, scratch_settings=scratch_settings)
+    record = task_of(path, scratch_settings=scratch_settings, intent=intent)
     if isinstance(record, copy_record.UnreadableRecord):
         return Unknown(record.reason)
     if isinstance(record, copy_record.NotRegistered):
         return Unknown(f"repair record {path / copy_record.RECORD}: copy is not registered")
-    protection = borrow_lifetime(path, scratch_settings=scratch_settings)
+    protection = borrow_lifetime(path, scratch_settings=scratch_settings, intent=intent)
     if isinstance(removal, copy_record.Registered):
         return Ended(f"deletion intent for task {removal.task}") if isinstance(protection, Ended) else protection
     if record.task.startswith("phase:"):
@@ -1180,11 +1193,12 @@ def task_has_end_evidence(record: copy_record.Registered) -> bool:
 
 def lifetime(path: Path, now: float | None = None, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    intent: RemovalIntentAccess = RemovalIntentAccess.RECOVER,
 ) -> Live | Ended | Unknown:
     with judgment_lock(path) as idle:
         if not idle:
             return Live(BUSY_REASON)
-    return record_lifetime(path, time.time() if now is None else now, scratch_settings=scratch_settings)
+    return record_lifetime(path, time.time() if now is None else now, scratch_settings=scratch_settings, intent=intent)
 
 
 def folders(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[Folder]:
@@ -1354,20 +1368,21 @@ def report_retained_cargo_outputs(path: Path) -> bool:
     return seen
 
 
-def clean_cargo_outputs(path: Path, saved: tuple[SavedCargoOutput, ...]) -> None:
-    """Run the shared guard without importing the sweep back into scratch."""
-    if not any(not item.roots.build_directory.is_relative_to(path.resolve())
-               and item.roots.build_directory.exists() for item in saved):
-        return
-    result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "lint" / "folder_audit.py"),
-                             "--clean-cargo-output", str(path.resolve())],
-                            capture_output=True, text=True, check=False)
-    if result.returncode == CARGO_OUTPUT_KEPT_STATUS:
-        raise CargoOutputKept(result.stderr.strip())
-    if result.returncode:
-        raise OSError(result.stderr.strip() or "Cargo output cleanup failed")
-    if result.stderr:
-        print(result.stderr.strip(), file=sys.stderr)
+def clean_cargo_outputs(path: Path, saved: tuple[SavedCargoOutput, ...], *,
+                        source: removal_guard.Identity | None = None) -> None:
+    """List external outputs for review without running a deletion process."""
+    if source is not None and removal_guard.identity(path.lstat()) != source:
+        raise CargoOutputKept(f"{path}: source identity changed")
+    plan = removal_guard.RemovalList(removal_guard.Tool.CARGO)
+    for item in saved:
+        folder = item.roots.build_directory
+        if folder.is_relative_to(path) or item.borrows_build_directory() or not folder.exists():
+            continue
+        _ = plan.add_manual(removal_guard.Tool.CARGO, folder, path, 0, "external Cargo output")
+    if source is not None and removal_guard.identity(path.lstat()) != source:
+        raise CargoOutputKept(f"{path}: source identity changed")
+    if plan.rows:
+        plan.report()
 
 
 @dataclass(frozen=True)
@@ -1417,9 +1432,8 @@ class _GitWorkAssessment(Protocol):
 
 
 class _SweepRemoval(Protocol):
-    """Use the existing sweep checks and deletion method at the module boundary."""
+    """Use the sweep's saved-work check."""
     def git_work(self, path: Path, *, verified_repos: tuple[Path, ...]) -> _GitWorkAssessment: ...
-    def delete_tree(self, path: str) -> None: ...
 
 
 class _WorkspaceRescue(Protocol):
@@ -1686,7 +1700,25 @@ def finish_removal(path: Path, *, cargo_cleaned: bool = False, source_replaced: 
     removal_mark(path).unlink(missing_ok=True)
 
 
-def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | FolderRemoval | ExpiredFolderRemoval = FOLDER_REMOVAL, *,
+def delete_sweep_tree(path: str) -> None:
+    """Remove a source owned by the legacy folder audit."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+        return
+    try:
+        shutil.rmtree(path)
+    except PermissionError:
+        for _, _, _, descriptor in os.fwalk(path, follow_symlinks=False):
+            os.fchmod(descriptor, 0o700)
+        shutil.rmtree(path)
+
+
+@dataclass(frozen=True)
+class FinishAbsentRemoval:
+    """Complete a saved removal only while its source is absent."""
+
+
+def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | FolderRemoval | ExpiredFolderRemoval | FinishAbsentRemoval = FOLDER_REMOVAL, *,
                   source_deletion: SourceDeletion = SourceDeletion.STANDARD, dry_run: bool = False,
                   scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> RemovedCopy | KeptFolder:
@@ -1721,6 +1753,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
         present = os.path.lexists(path)
         record_lock = copy_record_lock(path, scratch_settings=scratch_settings) if path.is_dir() and not path.is_symlink() else nullcontext()
         with record_lock, ExitStack() as descendants:
+            if isinstance(request, FinishAbsentRemoval) and os.path.lexists(path):
+                return KeptFolder(path, "source exists again")
             pending = pending_removal(path, scratch_settings=scratch_settings)
             if isinstance(pending, copy_record.UnreadableRecord):
                 return KeptFolder(path, pending.reason)
@@ -1747,6 +1781,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 if not dry_run and source_deletion is not SourceDeletion.CRATE_WORKSPACE_ONLY:
                     finish_removal(path)
                 return RemovedCopy()
+            if isinstance(request, FinishAbsentRemoval):
+                return KeptFolder(path, "source exists again")
             if isinstance(request, SelectedCopyRemoval):
                 request.validate()
             held = _held_removal_lock(path)
@@ -1817,7 +1853,7 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                         raise ScratchError("cannot clear Claude trust: " + "; ".join(trust.reasons))
             if path.is_symlink() or not path.is_dir():
                 if source_deletion is SourceDeletion.SWEEP:
-                    cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep"))).delete_tree(str(path))
+                    delete_sweep_tree(str(path))
                 else:
                     path.unlink()
                 return RemovedCopy()
@@ -1827,10 +1863,13 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
             sidecars = lease.sidecar_identities() if lease is not None else {}
             has_cargo_manifest = isinstance(pending, copy_record.Registered) and any(
                 (folder / "Cargo.toml").is_file() for folder in (path, *descendant_checkouts))
+            source = removal_guard.identity(path.lstat())
             if source_deletion is SourceDeletion.CRATE_WORKSPACE_ONLY:
                 has_cargo_output = report_retained_cargo_outputs(path)
             else:
                 saved = save_cargo_outputs(path)
+                if removal_guard.identity(path.lstat()) != source:
+                    return KeptFolder(path, "source identity changed before Cargo output review")
                 clean_cargo_outputs(path, saved)
                 has_cargo_output = bool(saved)
             if isinstance(pending, copy_record.Registered) and (has_cargo_manifest or has_cargo_output):
@@ -1862,8 +1901,10 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                               removal_files=sorted(removal_regular_files(root, entries)), removal_ref_files=references,
                               removal_intent_ns=time.time_ns())
                 atomic_record(removal_mark(path), fields)
+            if removal_guard.identity(path.lstat()) != source:
+                return KeptFolder(path, "source identity changed before removal")
             if source_deletion is SourceDeletion.SWEEP:
-                cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep"))).delete_tree(str(path))
+                delete_sweep_tree(str(path))
             elif source_deletion is SourceDeletion.RUN:
                 cast(_RunSourceRemoval, cast(object, import_module("scripts.direct.remove_run_scratch"))).remove_tree(path)
             else:

@@ -1128,8 +1128,9 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
     with temporary_build_folder(spec) as path:
         pid = os.getpid()
         start_time = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-        marker = {"owner": owner, "pid": pid, "start_time": start_time,
-                  "boot_id": boot_identity()}
+        information = path.stat()
+        marker = {"owner": owner, "pid": pid, "start_time": start_time, "boot_id": boot_identity(),
+                  "copy_path": str(path.resolve()), "copy_device": information.st_dev, "copy_inode": information.st_ino}
         _ = (path / OWNER_MARKER).write_text(json.dumps(marker) + "\n")
         descriptor = build_folder_lock_fd(path)
         return run_build_command(command, path=path,
