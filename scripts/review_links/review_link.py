@@ -25,6 +25,7 @@ from urllib.parse import quote
 from scripts.lib import atomic_file, conf
 
 
+REVIEW_PAGE_PATH = '/console/review.html'
 SNAPSHOT_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
 
 

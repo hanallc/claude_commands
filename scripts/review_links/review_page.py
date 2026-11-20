@@ -31,7 +31,7 @@ from scripts.review_links import question_record, review_actions, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
 
-PAGE_PATH = '/console/review.html'
+PAGE_PATH = review_link.REVIEW_PAGE_PATH
 NEW_ITEM_PATH = '/console/review/new-item'
 ATTACHMENT_PATH = '/console/review/attachment'
 HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
