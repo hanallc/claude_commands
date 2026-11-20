@@ -302,80 +302,83 @@ window.fetch=async (path,options={})=>{
                 self.browser_answer_visibility(markup.decode(), "", probe, reload_console=in_console,
                                                viewport_width=320)
 
-    def test_bulk_controls_show_lucide_icons_and_accessible_labels(self) -> None:
-        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
-        controls = markup.split('<div class="list-expansion">', 1)[1].split('</div>', 1)[0]
-        for action, label, icon in (("expand", "Expand all", "chevrons-up-down"),
-                                    ("collapse", "Collapse all", "chevrons-down-up")):
-            with self.subTest(label=label):
-                self.assertRegex(controls, rf'<button\b[^>]*aria-label="{label}"[^>]*>\s*<svg\b')
-                self.assertIn(f'id="list-{action}-all" data-list-expansion="{action}"', controls)
-                control = controls.split(f'aria-label="{label}"', 1)[1].split('</button>', 1)[0]
-                self.assertIn(f'title="{label}"', control)
-                self.assertIn(f'class="lucide lucide-{icon}"', control)
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_row_controls_show_chevrons_and_accessible_labels(self) -> None:
+        _ = self.add("First item", number=1)
+        _ = self.add("Second item", number=2)
+        self.browser_row_expansion('''
+ check(!document.querySelector('[data-list-expansion], [aria-label="Expand all"], [aria-label="Collapse all"]'),
+  'The List uses individual row controls.');
+ for(const row of rows){
+  const button=toggle(row),detail=row.querySelector('[data-detail]');
+  check(button.tagName==='BUTTON' && button.getAttribute('aria-label')==='Show item '+row.dataset.number,
+   'The button names its item.');
+  check(button.getAttribute('aria-controls')===detail.id && isExpanded(row,false),
+   'The button points to its closed details.');
+  check(button.querySelector('.list-chevron')?.getAttribute('aria-hidden')==='true',
+   'The chevron is decorative.');
+ }
+''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
-    def test_browser_expands_only_items_that_match_show_chips_and_words(self) -> None:
+    def test_browser_opens_one_item_with_show_chips_and_words(self) -> None:
         for title in ("Deploy alpha", "Deploy beta", "Inspect logs"):
             _ = self.add(title, the_list.ItemState.WAITING_FOR_NATE)
         _ = self.add("Deploy gamma", the_list.ItemState.WAITING_FOR_NATE, owner=OTHER.id)
         _ = self.add("Deploy delta")
-        self.browser_bulk_expansion(r'''
+        self.browser_row_expansion(r'''
  chip('show','needs-me').click();
  selectOwner(OWNER);
  const words=document.querySelector('#list-search');
  const filtered=new Promise(resolve=>words.addEventListener('filterchange',resolve,{once:true}));
  words.value='deploy';words.dispatchEvent(new Event('input'));
  await filtered;
- check(rows.filter(row=>!row.hidden).length===2,'Two items match all filters.');
- document.querySelector('[aria-label="Expand all"]').click();
- for(const row of rows) check(isExpanded(row,!row.hidden),'Expand all leaves hidden items closed.');
+ const matches=rows.filter(row=>!row.hidden);
+ check(matches.length===2,'Two items match all filters.');
+ for(const selected of matches){
+  toggle(selected).click();
+  check(rows.every(row=>isExpanded(row,row===selected)),'Only the selected item opens.');
+ }
 '''.replace('OWNER', json.dumps(OWNER.id)))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
-    def test_browser_collapses_shown_items_and_preserves_hidden_items(self) -> None:
+    def test_browser_keeps_a_filtered_item_open_until_another_item_opens(self) -> None:
         _ = self.add("Deploy alpha")
         _ = self.add("Deploy beta")
         _ = self.add("Deploy gamma", owner=OTHER.id)
-        self.browser_bulk_expansion(r'''
- for(const row of rows) row.querySelector('.list-toggle').click();
- check(rows.every(row=>isExpanded(row,true)),'All items start open.');
+        self.browser_row_expansion(r'''
+ const other=rows.find(row=>row.dataset.owner!==OWNER);
+ toggle(other).click();
  selectOwner(OWNER);
- check(rows.filter(row=>!row.hidden).length===2,'Two items match the owner filter.');
- document.querySelector('[aria-label="Collapse all"]').click();
- for(const row of rows) check(isExpanded(row,row.hidden),'Collapse all leaves hidden items open.');
+ const matches=rows.filter(row=>!row.hidden);
+ check(matches.length===2 && other.hidden && isExpanded(other,true),'The filter keeps the hidden item open.');
  selectOwner('');
- check(rows.find(row=>row.dataset.owner!==OWNER).querySelector('[data-detail]').hidden===false,
-  'The hidden item remains open after the filter clears.');
+ check(!other.hidden && isExpanded(other,true),'Clearing the filter reveals the open item.');
+ selectOwner(OWNER);
+ toggle(matches[0]).click();
+ toggle(matches[0]).click();
+ selectOwner('');
+ check(rows.every(row=>isExpanded(row,false)),'Opening another item closes the previous item.');
 '''.replace('OWNER', json.dumps(OWNER.id)))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
-    def test_browser_bulk_controls_apply_words_before_the_search_timer_ends(self) -> None:
+    def test_browser_filter_chip_applies_words_before_the_search_timer_ends(self) -> None:
         _ = self.add("Deploy alpha", number=1)
         _ = self.add("Deploy beta", number=2)
-        self.browser_bulk_expansion(r'''
+        self.browser_row_expansion(r'''
  const alpha=rows.find(row=>row.dataset.number==='1'),beta=rows.find(row=>row.dataset.number==='2');
  const words=document.querySelector('#list-search');
  let changes=0;
  words.addEventListener('filterchange',()=>changes++);
- const search=value=>{words.value=value;words.dispatchEvent(new Event('input'));};
- search('alpha');
- document.querySelector('[aria-label="Expand all"]').click();
- check(changes===0,'Expand all runs before the search timer fires.');
- check(!alpha.hidden && isExpanded(alpha,true) && beta.hidden && isExpanded(beta,false),
-  'Expand all opens only the match for the new search.');
- const cleared=new Promise(resolve=>words.addEventListener('filterchange',resolve,{once:true}));
- search('');await cleared;
- beta.querySelector('.list-toggle').click();
- const beforeCollapse=changes;
- search('beta');
- document.querySelector('[aria-label="Collapse all"]').click();
- check(changes===beforeCollapse,'Collapse all runs before the search timer fires.');
- check(alpha.hidden && isExpanded(alpha,true) && !beta.hidden && isExpanded(beta,false),
-  'Collapse all closes only the match for the new search.');
+ words.value='alpha';words.dispatchEvent(new Event('input'));
+ chip('show','working').click();
+ check(changes===0,'The Show chip applies the filter before the search timer fires.');
+ check(!alpha.hidden && beta.hidden,'The new words filter the items.');
+ toggle(alpha).click();
+ check(isExpanded(alpha,true) && isExpanded(beta,false),'Only the selected match opens.');
 ''')
 
-    def browser_bulk_expansion(self, steps: str) -> None:
+    def browser_row_expansion(self, steps: str) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         probe = r'''<script>
 (async()=>{
@@ -383,8 +386,9 @@ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const rows=[...document.querySelectorAll('[data-list-item]')];
 const chip=(group,value)=>document.querySelector('[data-filter-row="'+group+'"] [data-filter-value="'+value+'"]');
 const selectOwner=value=>chip('owner',value ? 'staff:'+value : 'all').click();
+const toggle=row=>row.querySelector('.list-toggle');
 const isExpanded=(row,expanded)=>row.querySelector('[data-detail]').hidden===!expanded &&
- row.querySelector('.list-toggle').getAttribute('aria-expanded')===String(expanded);
+ toggle(row).getAttribute('aria-expanded')===String(expanded);
 try{
 ''' + steps + '''
 }catch(error){failures.push(String(error));}
@@ -942,12 +946,24 @@ frame.addEventListener('load',async()=>{
    check(win.location.href===jumpPlace && win.history.length===jumpHistoryLength,'a second click stays in the same history entry');
   }
   if(scenario==='history'){
-   target.querySelector('.list-toggle').click();
    row(3).querySelector('.list-toggle').click();
-   check(win.location.href===originalPlace && expanded(row(3)),'the new history entry has the original address and an extra open row');
+   const item=new URLSearchParams(win.location.hash.slice(1)).get('item');
+   check(item===row(3).dataset.key && expanded(row(3)) && !expanded(target),
+    'Opening row 3 closes the linked row and records row 3 in the address.');
+  }
+  if(scenario==='closed'){
+   const missingPlace=win.location.href;
+   const valid=[...source.querySelectorAll('[data-record-jump]')].find(link=>link.textContent==='#2');
+   valid.click();
+   check(expanded(row(2)) && !expanded(source) && missing.hidden,'A valid link opens its row and clears the notice.');
+   const backToMissing=changed(win);
+   history.back();await backToMissing;await frames(win);
+   check(win.location.href===missingPlace && expanded(source) && !expanded(row(2)) &&
+    !missing.hidden && missing.textContent==='Item #29 is closed',
+    'Back restores the open source and the notice for the closed item.');
   }
   if(!proof){
-   const back=scenario==='history' ? new Promise(done=>win.addEventListener('popstate',done,{once:true})) : changed(win);
+   const back=changed(win);
    history.back();await back;await frames(win);
    if(unavailableProducer){
     const restored=new URLSearchParams(win.location.hash.slice(1));
@@ -961,7 +977,14 @@ frame.addEventListener('load',async()=>{
    check(selected('show')===originalShow && !source.hidden && expanded(source),'Back restores the open source');
    check(filters().every((value,index)=>value===originalFilters[index]),'Back restores the staff chips, search and switch.');
    check(!target || !expanded(target),'Back collapses the target row');
-   if(scenario==='history') check(!expanded(row(3)),'Back collapses the extra row even when the address stays the same');
+   if(scenario==='history') check(!expanded(row(3)),'Back closes row 3.');
+  }
+  if(scenario==='closed'){
+   const navigated=changed(win);
+   win.location.hash=link.hash;
+   await navigated;
+   check(!source.hidden && expanded(source) && !missing.hidden && missing.textContent==='Item #29 is closed',
+    'A direct link to a closed item shows the notice and keeps the source open.');
   }
   if(scenario==='missing'){
    const missingKey=new URLSearchParams(link.hash.slice(1)).get('item');
@@ -1071,7 +1094,7 @@ frame.addEventListener('load',async()=>{
         body = list_page.render(self.root / "reviews").decode()
         self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>sdlc</span>')
         self.assertRegex(body, r'data-color-text="role.producer"[^>]*>morty</span>')
-        self.assertIn('<td data-label="Owner">nate</td>', body)
+        self.assertIn('<td data-label="Owner"><span class="list-owner-name"><span>nate</span></span></td>', body)
 
     def test_added_log_shows_staff_colors_local_eta_and_field_labels(self) -> None:
         _ = self.add("Log labels")
@@ -1339,7 +1362,7 @@ const open=number=>document.querySelector('[data-number="'+number+'"] .list-togg
 const scrollArea=right=>right.querySelector('.list-log-scroll') ?? right.querySelector('.list-log');
 const height=node=>node.getBoundingClientRect().height;
 try{
- for(const number of [1,2,3]) open(number);
+ open(1);
  const [left,right]=panel(1).children,log=scrollArea(right),heading=right.querySelector('h3');
  right.style.display='none';
  const naturalHeight=height(left);
@@ -1349,8 +1372,10 @@ try{
  log.scrollTop=90;
  check(log.scrollTop===90 && log.scrollHeight>log.clientHeight &&
   heading.getBoundingClientRect().top===headingTop,'The long log scrolls below its fixed heading.');
+ open(2);
  const secondLog=scrollArea(panel(2).lastElementChild);
  secondLog.scrollTop=45;
+ open(3);
  const shortLog=scrollArea(panel(3).lastElementChild);
  check(shortLog.scrollHeight===shortLog.clientHeight && getComputedStyle(shortLog).overflowY==='auto',
   'The short log fits without a scroll bar.');
@@ -1361,9 +1386,12 @@ try{
  });
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await replaced;
- check(reads===1 && scrollArea(panel(1).lastElementChild).scrollTop===90 &&
-  scrollArea(panel(2).lastElementChild).scrollTop===45 && scrollArea(panel(3).lastElementChild).scrollTop===0,
-  'The shared refresh restores each open log position.');
+ const thirdAtTop=scrollArea(panel(3).lastElementChild).scrollTop===0;
+ open(1);
+ const firstPosition=scrollArea(panel(1).lastElementChild).scrollTop;
+ open(2);
+ check(reads===1 && thirdAtTop && firstPosition===90 && scrollArea(panel(2).lastElementChild).scrollTop===45,
+  'Refresh preserves each log position when its row opens.');
 }catch(error){failures.push(String(error));}
 const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
 document.body.append(result);
@@ -1373,13 +1401,14 @@ document.body.append(result);
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_log_refresh_preserves_the_visible_entry_and_keeps_the_top_at_zero(self) -> None:
         self.browser_log_refresh('''
- open(1);open(2);
  const evidence=(number,index)=>log(number).querySelector('[data-log-index="'+index+'"] .log-evidence');
+ open(2);
+ check(log(2).scrollTop===0,'The second item starts at the top.');
+ open(1);
  evidence(1,0).open=true;
  log(1).scrollTop=239;
  const before=firstVisible(log(1));
  check(before.offset<0 && log(1).scrollTop>0,'The first item starts partway through an entry.');
- check(log(2).scrollTop===0,'The second item starts at the top.');
  evidence(1,0).querySelector('summary').focus({preventScroll:true});
  await refresh();
  check(evidence(1,0).open && !evidence(1,1).open && !evidence(2,0).open,
@@ -1389,6 +1418,7 @@ document.body.append(result);
  const after=firstVisible(log(1));
  check(after.text===before.text && Math.abs(after.offset-before.offset)<=1,
   'The first item keeps the same entry and offset after the new entry arrives.');
+ open(2);
  check(log(2).scrollTop===0 && firstVisible(log(2)).text.includes('New result for item 2.'),
   'The second item stays at the top and shows the new entry.');
 ''')
@@ -2064,9 +2094,10 @@ const expand=number=>row(number).querySelector('.list-toggle').click();
 const detail=number=>row(number).querySelector('[data-detail]:not([hidden])');
 unread.click();
 chips[2].click();
-expand(17);expand(19);
+expand(17);
 check(!row(17).hidden && detail(17)?.querySelector('[data-waiting-note]'),
  'The unparked item shows the waiting note in Morty answering.');
+expand(19);
 check(!row(19).hidden && detail(19)?.querySelector('[value="resend-Q1"]'),
  'The failed question stays in Morty answering with Resend.');
 chips[5].click();expand(18);
@@ -2077,7 +2108,7 @@ check(!row(18).hidden && waitingPanel?.querySelector('[data-waiting-note]') &&
  !row(18).querySelector('[data-parked-note]').getClientRects().length,
  'The parked item shows one parking note, the waiting note, and Unpark in its panel.');
 chips[4].click();
-document.getElementById('list-expand-all').click();
+expand(20);
 const answer=detail(20)?.querySelector('.list-panel [data-question="Q1"]');
 check(!row(20).hidden && row(20).querySelector('[aria-label="Unread update"]') &&
  answer?.textContent.includes('The gate passed.') && answer.querySelector('.question-unread') &&
@@ -2899,11 +2930,11 @@ window.fetch=async(_path,options={})=>{
         self.browser_action_sequence(r"""
  show('all');
  const other=document.querySelector('[data-number="2"]');
- other.querySelector('.list-toggle').click();
  const rectangle=element=>element.getBoundingClientRect();
  const near=(a,b)=>Math.abs(a-b)<1;
  for(const item of [row,other]){
   show(item===row ? 'parked' : 'all');
+  if(item===other) other.querySelector('.list-toggle').click();
   const pick=selector=>item.querySelector(selector);
   const box=rectangle(pick('textarea'));
   const remove=rectangle(pick('[value=remove]')),park=rectangle(pick('[data-later-toggle]'));
@@ -2921,6 +2952,7 @@ window.fetch=async(_path,options={})=>{
  }
  const unpark=form.querySelector('[value=unpark]');
  show('parked');
+ row.querySelector('.list-toggle').click();
  const hiddenCheck=row.querySelector('[data-list-check]');
  check(!hiddenCheck.getClientRects().length && hiddenCheck.textContent==='Check Nov 16 14:00 EST',
   'The parked row hides the check before it is overdue.');
@@ -3006,32 +3038,39 @@ window.fetch=async(_path,options={})=>{
  if(fixture.waiting) await refresh(fixture.waiting);
  const prior=current(),beforeOrder=numbers(),otherRow=other();
  const draft=otherRow.querySelector('textarea');
- otherRow.querySelector('.list-toggle').click();
- draft.value='Keep the words for the other item.';
- draft.dispatchEvent(new Event('input'));
- draft.focus();draft.setSelectionRange(5,14,'backward');
+ const editOther=()=>{
+  otherRow.querySelector('.list-toggle').click();
+  draft.value='Keep the words for the other item.';
+  draft.dispatchEvent(new Event('input'));
+  draft.focus();draft.setSelectionRange(5,14,'backward');
+ };
+ if(!parks){editOther();prior.querySelector('.list-toggle').click();}
  const methods=[];
  window.fetch=new Proxy(window.fetch,{apply(fetch,receiver,args){
   methods.push(args[1]?.method || 'GET');return Reflect.apply(fetch,receiver,args);
  }});
  refreshMarkup=fixture.saved;
  submit(parks ? 'park-until-delivered' : 'unpark',prior.querySelector('form'));
- if(!parks) prior.querySelector('.list-log-scroll').focus();
+ if(parks) editOther();
+ else prior.querySelector('.list-log-scroll').focus();
  finishPost(fixture.response);
  await flush();
  check(methods.join()==='POST,GET','The save makes one List GET while the item waits.');
  const refreshed=current(),freshDraft=other().querySelector('textarea');
  check(refreshed!==prior && beforeOrder===(parks ? '3,2' : '2,3') &&
   numbers()===(parks ? '2,3' : '3,2'),'The server moves the waiting row to its new group.');
+ check(freshDraft.value==='Keep the words for the other item.','Refresh keeps the other draft.');
+ if(parks){
+  check(refreshed.querySelector('[data-detail]').hidden,'Refresh keeps the row closed after the user opens another row.');
+  check(document.activeElement===freshDraft && freshDraft.selectionStart===5 &&
+   freshDraft.selectionEnd===14 && freshDraft.selectionDirection==='backward',
+   'Park keeps focus and the selection in the other draft.');
+  refreshed.querySelector('.list-toggle').click();
+ }else check(document.activeElement===refreshed.querySelector('.list-log-scroll'),
+  'Unpark keeps focus on the log in the waiting row.');
  check(!refreshed.querySelector('[data-detail]').hidden &&
   refreshed.querySelector('[data-waiting-questions]').textContent.includes('Which check passed?'),
-  'Refresh keeps the waiting question open.');
- check(freshDraft.value==='Keep the words for the other item.','Refresh keeps the other draft.');
- if(parks) check(document.activeElement===freshDraft && freshDraft.selectionStart===5 &&
-  freshDraft.selectionEnd===14 && freshDraft.selectionDirection==='backward',
-  'Park keeps focus and the selection in the other draft.');
- else check(document.activeElement===refreshed.querySelector('.list-log-scroll'),
-  'Unpark keeps focus on the log in the waiting row.');
+  'The open row shows the waiting question.');
  await refresh(fixture.answered);
  check(current().querySelector('textarea').value==='Keep the words for this item.',
   'The item draft returns after the producer answers.');
@@ -3105,9 +3144,9 @@ window.fetch=async(_path,options={})=>{
         self.browser_action_sequence('''
  show('parked');
  const second=document.querySelector('[data-number="2"]');
- second.querySelector('.list-toggle').click();
  submit('unpark');
  const finishFirst=finishPost;
+ second.querySelector('.list-toggle').click();
  submit('unpark',second.querySelector('form'));
  const result={item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'};
  const status=document.querySelector('[data-hidden-action-status]');
@@ -3118,7 +3157,10 @@ window.fetch=async(_path,options={})=>{
  check(second.hidden && !status.hidden && status.textContent==='Item #1 unparked. Item #2 unparked.',
        'Both results stay visible after both rows leave Parked.');
  show('all');
- check(status.hidden,'All shows the results in their expanded rows.');
+ check(!status.hidden && status.textContent==='Item #1 unparked.' &&
+       !second.hidden && !second.querySelector('[data-detail]').hidden &&
+       second.querySelector('[data-send-status]').textContent==='Unparked',
+       'All shows the first result above the table and the second result in the visible details.');
  show('parked');
  check(!status.hidden && status.textContent==='Item #1 unparked. Item #2 unparked.',
        'Parked shows both results again.');
@@ -3299,7 +3341,8 @@ observer.observe(original.parentNode,{childList:true});
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_bulk_controls_move_a_lost_remove_notice(self) -> None:
+    def test_browser_switching_rows_moves_a_lost_remove_notice(self) -> None:
+        _ = self.add("Second List item", number=2)
         self.browser_action_sequence('''
  show('all');
  submit('remove');
@@ -3311,14 +3354,11 @@ observer.observe(original.parentNode,{childList:true});
  const message='Save not confirmed: Fixture lost response';
  const inlineOnly=()=>above.hidden && inline.textContent===message && inline.getClientRects().length>0;
  const aboveOnly=()=>!above.hidden && above.textContent==='Item 1: '+message && !inline.getClientRects().length;
- check(inlineOnly(),'The open row shows the warning only in its details.');
- document.querySelector('[aria-label="Collapse all"]').click();
- check(aboveOnly(),'Collapse all moves the warning above the table.');
- const toggle=row.querySelector('.list-toggle');
- toggle.click();toggle.click();
- check(aboveOnly(),'Closing the row also moves the warning above the table.');
- document.querySelector('[aria-label="Expand all"]').click();
- check(inlineOnly(),'Expand all shows the warning only in the row details.');
+ check(inlineOnly(),'The open row has the notice in its details.');
+ document.querySelector('[data-number="2"] .list-toggle').click();
+ check(aboveOnly(),'Opening another row moves the notice above the table.');
+ row.querySelector('.list-toggle').click();
+ check(inlineOnly(),'Opening the first row returns the notice to its details.');
 ''')
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -3327,8 +3367,8 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_action_sequence('''
  show('all');
  const second=document.querySelector('[data-number="2"]');
- second.querySelector('.list-toggle').click();
  for(const item of [row,second]){
+  if(item.querySelector('[data-detail]').hidden) item.querySelector('.list-toggle').click();
   submit('remove',item.querySelector('form'));
   losePost();await flush();
   item.querySelector('.list-row').click();
@@ -3341,10 +3381,10 @@ observer.observe(original.parentNode,{childList:true});
  check(!shows(1) && shows(2),'opening row one preserves the latest notice');
  check(form.querySelector('[data-send-status]').textContent==='Save not confirmed: Fixture lost response',
   'row one shows its notice inline');
+ row.querySelector('.list-toggle').click();
+ check(!shows(1) && shows(2),'Closing row one does not restore the older notice.');
  second.querySelector('.list-toggle').click();
  check(status.hidden,'opening the latest failed row hides the notice above the table');
- row.querySelector('.list-toggle').click();
- check(status.hidden,'closing row one does not restore the older notice');
 ''')
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
@@ -4295,7 +4335,8 @@ observer.observe(original.parentNode,{childList:true});
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         self.assertNotIn("Closed with a waiting question", markup)
         self.assertNotIn(f'data-filter-value="staff:{OTHER.id}"', markup)
-        self.browser_bulk_expansion(r'''
+        self.browser_action_sequence(r'''
+ const chip=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]');
  const selected=()=>document.querySelector('[data-filter-row="show"] [aria-pressed="true"]');
  const count=()=>document.querySelector('[data-list-count]').textContent;
  const navigate=async params=>{
@@ -4303,18 +4344,18 @@ observer.observe(original.parentNode,{childList:true});
   location.hash=new URLSearchParams(params);
   await changed;
  };
- check(!chip('show','closed'),'Show has no Closed chip.');
- check(chip('show','morty-answering').dataset.filterCount==='0','The closed question does not count.');
+ check(!chip('closed'),'Show has no Closed chip.');
+ check(chip('morty-answering').dataset.filterCount==='0','The closed question does not count.');
  check(count()==='1 of 1 items shown · 0 need you · 1 unread','The totals count the open item.');
  for(const params of [{show:'closed'},{state:'Closed'}]){
   await navigate(params);
   check(selected().dataset.filterValue==='all' && count().startsWith('1 of 1'),'A legacy address selects All.');
  }
- await navigate({item:rows[0].dataset.key.replace(/L1$/,'L2')});
+ await navigate({item:row.dataset.key.replace(/L1$/,'L2')});
  const notice=document.querySelector('[data-missing-item]');
  check(!notice.hidden && notice.textContent==='Item #2 is closed','A closed item link shows one line.');
  check(count().startsWith('1 of 1'),'The closed link does not change the count.');
-''')
+''', add_item=False)
         self.assertEqual(path.read_text(), stored)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -4777,13 +4818,13 @@ window.fetch=async(_url,options)=>{
         _ = self.add("The next open item", number=2)
         self.browser_action_sequence(r"""
  const other=document.querySelector('[data-number="2"]');
- other.querySelector('.list-toggle').click();
  const remove=other.querySelector('button[value="remove"]');
  refreshMarkup=document.documentElement.outerHTML;
  const ask=form.querySelector('[value="question"]'),input=form.elements.words;
  input.value='Which check is next?';input.dispatchEvent(new Event('input'));
  ask.focus();
  submit('question');
+ other.querySelector('.list-toggle').click();
  remove.focus();
  check(document.activeElement===remove,'The user selects Remove on the other item during the request');
  finishPost({unread:'false',waiting_for_answer:'false'});await flush();
@@ -4816,14 +4857,16 @@ window.fetch=async(_url,options)=>{
         self.browser_action_sequence(r"""
  onlyUnread();
  const second=document.querySelector('[data-number="2"]');
- second.querySelector('.list-toggle').click();
  function ask(target){
   target.elements.words.value='Which check passed?';target.elements.words.dispatchEvent(new Event('input'));
-  target.querySelector('[value="question"]').focus();
+  const button=target.querySelector('[value="question"]');
+  button.focus();
+  check(button.getClientRects().length && document.activeElement===button,'Ask is visible and has focus.');
   submit('question',target);
  }
  ask(form);
  const failFirst=finishPost;
+ second.querySelector('.list-toggle').click();
  ask(second.querySelector('form'));
  failFirst({reason:'The save failed'});await flush();
  const returning=row.nextElementSibling.getAnimations({subtree:true})[0];
@@ -4904,10 +4947,7 @@ window.fetch=async(_url,options)=>{
  try{
   check(!row.hidden && !detail.hidden,'The direct link opens the unread row');
   check(!reads.length && unread(),'A hidden tab keeps the answer unread');
-  if(CLOSE_ROW){
-   row.querySelector('.list-toggle').click();
-   document.getElementById('list-expand-all').click();
-  }
+  if(CLOSE_ROW) row.querySelector('.list-toggle').click();
   REVEAL_FIRST();
   await paint();
   check(!reads.length && unread(),'The answer stays unread while the tab or frame is hidden');
@@ -5220,10 +5260,7 @@ const act=async (action,words='')=>{
   ? (post=fetch(url,options))
   : Promise.resolve(new win.Response('',{status:503}));
  try{
-  if(current.querySelector('[data-detail]').hidden){
-   if(action==='read') frame.contentDocument.getElementById('list-expand-all').click();
-   else current.querySelector('.list-toggle').click();
-  }
+  if(current.querySelector('[data-detail]').hidden) current.querySelector('.list-toggle').click();
   input.value=words;input.dispatchEvent(new win.Event('input'));
   form.querySelector('[value="'+action+'"]').click();
   if(!post || !(await post).ok) throw new Error('The List POST must succeed.');
@@ -5393,7 +5430,7 @@ const change=async path=>{
 
     def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True,
                                 window_size: tuple[int, int] | None = None, in_frame: bool = False,
-                                bulk_expand: bool = False, markup: str | None = None, open_number: int = 1) -> None:
+                                markup: str | None = None, open_number: int = 1) -> None:
         if add_item:
             _ = self.add("Test List action retries", number=1)
         if markup is None:
@@ -5453,7 +5490,7 @@ window.fetch=async(path,options={})=>{
  result.textContent=JSON.stringify(failures);parent.document.body.append(result);
 })();
 </script>'''
-        open_control = '#list-expand-all' if bulk_expand else f'[data-number="{open_number}"] .list-toggle'
+        open_control = f'[data-number="{open_number}"] .list-toggle'
         probe = probe.replace('OPEN_CONTROL', open_control).replace('OPEN_NUMBER', str(open_number))
         self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion,
                              window_size=window_size, in_frame=in_frame)
@@ -5850,15 +5887,22 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_staff_chip_rows_wrap_and_fit(self) -> None:
-        for number in range(1, 13):
+        _ = self.add("Item for cargo liner", owner=staff.StaffId("cargo-liner-style-modules"), number=1)
+        _ = self.add("Item for a long owner",
+                     owner=staff.StaffId("cargo-liner-style-modules-review-links-and-delivery"), number=2)
+        _ = self.add("Item for an owner without hyphens", owner=staff.StaffId("longownername" * 6), number=3)
+        for number in range(4, 13):
             _ = self.add(f"Item {number}", owner=staff.StaffId(f"delivery-team-{number:02d}"), number=number)
         all_staff = staff.StaffId("all")
         item = self.add("Item for all", owner=all_staff, number=13)
         _ = the_list.update(MORTY.id, item.id, {"producer": all_staff}, source="morty")
         _ = self.add("Item for builds", owner=OTHER.id, number=14)
         _ = self.add("Item for builds support", owner=staff.StaffId("builds-support"), number=15)
+        spacetime = staff.StaffId("10e35465-1777-435a-8bbf-5709e6ab0491")
+        _ = self.add("Item for spacetime", owner=spacetime, number=16)
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
-            member.to_json() for member in (MORTY, DWIGHT, OWNER, replace(OTHER, name="builds-unit"))]}))
+            member.to_json() for member in (MORTY, DWIGHT, OWNER, replace(OTHER, name="builds-unit"),
+                replace(OTHER, id=spacetime, name="spacetimebuilds", current_session=spacetime))]}))
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         probe = """<script>
 (async()=>{
@@ -5878,12 +5922,40 @@ check(new Set(ownerChips.map(button=>button.getBoundingClientRect().top)).size>1
  'The owner chips wrap onto more than one line.');
 check(rows.every(row=>Math.abs(left(row)-left(rows[0]))<1),'The three rows align.');
 check(document.documentElement.scrollWidth<=innerWidth,'The filter rows fit without horizontal scrolling.');
+const ownerName=number=>document.querySelector('[data-number="'+number+'"] .list-owner-name');
+const fits=name=>name.scrollWidth<=name.clientWidth;
+const spacetime=ownerName(16),name=document.createRange();
+name.selectNodeContents(document.createTreeWalker(spacetime,NodeFilter.SHOW_TEXT).nextNode());
+check(spacetime.textContent==='spacetimebuilds' && fits(spacetime) && name.getClientRects().length===1,
+ 'The owner name without hyphens fits on one line.');
+const parts=name=>[...name.querySelectorAll(':scope > span')];
+const lineCount=name=>new Set(parts(name).map(part=>part.getBoundingClientRect().top)).size;
+const cargo=ownerName(1),long=ownerName(2);
+check(cargo.textContent==='cargo-liner-style-modules' && fits(cargo) && lineCount(cargo)===1,
+ 'The full cargo-liner-style-modules name fits on one line.');
+const longParts=parts(long),segment=document.createRange();
+check(fits(long) && lineCount(long)>1 &&
+ longParts.slice(0,-1).every(part=>part.textContent.endsWith('-')) &&
+ longParts.every(part=>{
+  segment.selectNodeContents(document.createTreeWalker(part,NodeFilter.SHOW_TEXT).nextNode());
+  return segment.getClientRects().length===1;
+ }),
+ 'The long owner name wraps at hyphens and each segment stays on one line.');
+const unbroken=ownerName(3);
+segment.selectNodeContents(parts(unbroken)[0]);
+check(fits(unbroken) && segment.getClientRects().length>1,
+ 'The oversized segment wraps within the available width.');
+if(innerWidth>960){
+ const width=label=>document.querySelector('[data-number="1"] td[data-label="'+label+'"]').getBoundingClientRect().width;
+ check(Math.abs(width('Next step')-width('Item')*23/17)<1,
+  'Item and Next step share the available width in their original proportion.');
+}
 const producerBox=rows[1].getBoundingClientRect(),words=document.getElementById('list-search').getBoundingClientRect();
 check(innerWidth>620 ? words.top<producerBox.bottom && words.left>=producerBox.right :
  words.top>=producerBox.bottom,'The words box sits beside Producer on desktop and wraps below it on a phone.');
 const allChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="all"]'));
 const staffChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="staff:all"]'));
-check(allChips.every(chip=>chip.textContent==='All15') && staffChips.every(chip=>chip?.textContent==='all1'),
+check(allChips.every(chip=>chip.textContent==='All16') && staffChips.every(chip=>chip?.textContent==='all1'),
  'Each staff row has distinct All and all chips with separate counts.');
 check(ownerChips[2].textContent==='builds1' && ownerChips[3].textContent==='builds-support1',
  'The owner chips omit the suffix and sort by the displayed name.');
@@ -5903,7 +5975,7 @@ const result=document.createElement('p');result.id='probe-results';
 result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>"""
-        for width in (1280, 390):
+        for width in (1700, 1280, 1024, 390):
             with self.subTest(width=width):
                 self.browser_actions(markup, "", probe, window_size=(width, 900))
 
@@ -6006,7 +6078,6 @@ const select=(name,value)=>staffChip(name,value).click();
 const count=value=>Number(chip(value).querySelector('b').textContent);
 const staffCount=(name,value)=>Number(staffChip(name,value).dataset.filterCount);
 const unread=()=>document.getElementById('list-unread');
-const bulk=action=>document.querySelector('.list-table-tools [data-list-expansion="'+action+'"]');
 const searchField=()=>document.getElementById('list-search');
 const clearFilter=()=>document.querySelector('[data-clear-filter-words]');
 const border=()=>getComputedStyle(searchField()).borderTopColor;
@@ -6055,35 +6126,22 @@ try{
  searchField().dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',cancelable:true,bubbles:true}));
  check(!searchField().value && !query() && visible().length===5 && border()===emptyBorder &&
   !clearFilter().getClientRects().length,'Escape removes the words and returns all five rows.');
- const tools=document.querySelector('.list-table-tools'),table=tools.nextElementSibling;
- const countLine=tools.querySelector('[data-list-count]');
+ const countLine=document.querySelector('[data-list-count]'),table=countLine.nextElementSibling;
  const bounds=element=>element.getBoundingClientRect();
- const center=rect=>(rect.top+rect.bottom)/2;
  const near=(a,b)=>Math.abs(a-b)<1;
- const expand=bounds(bulk('expand')),collapse=bounds(bulk('collapse')),shown=bounds(countLine);
- check(table.matches('.list-table') && bounds(tools).bottom<=bounds(table).top,
-       'The controls and count sit directly above the table.');
- check(near(expand.left,bounds(table).left) && near(shown.right,bounds(table).right) &&
-       near(center(expand),center(collapse)) && near(center(expand),center(shown)) && expand.right<collapse.left,
-       'The two buttons and the right-aligned count share one row.');
+ const shown=bounds(countLine);
+ check(table.matches('.list-table') && shown.bottom<=bounds(table).top &&
+       near(shown.right,bounds(table).right) && getComputedStyle(countLine).textAlign==='right',
+       'The count is right aligned above the table.');
+ check(!document.querySelector('[data-list-expansion], [aria-label="Expand all"], [aria-label="Collapse all"]'),
+       'The List has no bulk expansion controls.');
  check(countLine.textContent.startsWith('5 of 5 items shown') && countLine.getAttribute('role')==='status',
        'The count in the row reports the visible items.');
- for(const action of ['expand','collapse']){
-  const button=bulk(action),box=bounds(button),icon=bounds(button.querySelector('svg'));
-  const minimum=innerWidth<960 ? 32 : 24;
-  check(box.width>=minimum && box.height>=minimum && box.width<36 && box.height<36 &&
-        icon.width>=16 && icon.height>=16 && icon.left>box.left && icon.right<box.right &&
-        icon.top>box.top && icon.bottom<box.bottom,'The small button fits its icon and has a hit area.');
-  const hit=document.elementFromPoint(box.left+3,center(box));
-  check(button.contains(hit),'The button accepts a click near its edge.');
- }
- check(expand.left>=0 && shown.right<=innerWidth && collapse.right<shown.left &&
-       document.documentElement.scrollWidth<=innerWidth,'The row fits without clipping or horizontal overflow.');
+ check(shown.left>=0 && shown.right<=innerWidth && document.documentElement.scrollWidth<=innerWidth,
+       'The count fits without horizontal overflow.');
  if(innerWidth>=960){
   check(bounds(document.querySelector('main')).width===Math.min(1124,document.documentElement.clientWidth),
         'The desktop uses the available width up to the shared limit.');
-  check(collapse.right<=bounds(document.querySelector('[data-sort="0"]').closest('th')).right,
-        'Both buttons sit above the number column.');
   for(const header of document.querySelectorAll('[data-sort]')){
    const label=document.createRange();label.selectNodeContents(header.firstChild);
    check(label.getClientRects().length===1,'the desktop header fits on one line: '+header.textContent);
@@ -6231,7 +6289,7 @@ try{
  check(document.querySelector('#list-search').value==='console','refresh keeps the query');
  check(document.activeElement.id==='list-search','refresh keeps focus');
  check(document.activeElement.selectionStart===1 && document.activeElement.selectionEnd===3,'refresh keeps the selection');
- check(!refreshed.querySelector('[data-detail]').hidden,'refresh keeps open rows');
+ check(!refreshed.querySelector('[data-detail]').hidden,'Refresh keeps the open row.');
  check(refreshed.querySelector('textarea').value==='Keep my draft','refresh keeps feedback words');
  check(!refreshed.querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
@@ -6248,15 +6306,11 @@ try{
  check(refreshed.dataset.unread==='true' && refusedForm.elements.words.value==='Keep my draft' &&
        refusedForm.querySelector('[data-send-status]').textContent==='Not saved: The row save was refused.',
        'A refusal restores the unread state and shows the reason beside the draft.');
- bulk('expand').click();
- check(visible().length===2 && visible().every(row=>!row.querySelector('[data-detail]').hidden),
-  'Expand all opens both matching rows after refresh');
- bulk('collapse').click();
- check(visible().length===2 && visible().every(row=>row.querySelector('[data-detail]').hidden),
-  'Collapse all closes both matching rows after refresh');
- refreshed.querySelector('.list-toggle').click();
  realFeedback=true;loseResponse=true;
  const tellRow=rows().find(row=>row.dataset.number==='105');tellRow.querySelector('.list-toggle').click();
+ check(visible().length===2 && refreshed.querySelector('[data-detail]').hidden &&
+  !tellRow.querySelector('[data-detail]').hidden,'Opening the second List row closes the first row.');
+ check(refreshed.querySelector('textarea').value==='Keep my draft','Closing the first row keeps its draft.');
  check(tellRow.dataset.unread==='true' && tellRow.querySelector('[value="read"]'),'Tell starts with a fresh unread row');
  let retryForm=tellRow.querySelector('form');
  retryForm.elements.words.value='Deliver this feedback once';retryForm.elements.words.dispatchEvent(new Event('input'));
@@ -6273,6 +6327,7 @@ try{
  check(retryForm.elements.request.value!==retryId,'success clears the saved retry identity');
  check(retryForm.elements.words.value==='' && retryForm.querySelector('[value="tell"]').disabled,'a successful send clears the box and disables Tell morty');
  realFeedback=false;failRefresh=true;
+ rows().find(row=>row.dataset.number==='106').querySelector('.list-toggle').click();
  const requestIds=[];
  for(const action of ['read','park','tell','remove']){
   const row=rows().find(row=>row.dataset.number==='106'),form=row.querySelector('form');
@@ -6295,7 +6350,9 @@ try{
    check(!form.querySelector('[value="tell"]').disabled,'the newer draft enables Tell morty after delivery');
   }
   if(action==='remove') check(row.hidden,'Remove hides the item after the save');
-  else check(!row.querySelector('[data-detail]').hidden,'feedback keeps the row open');
+  else check(!row.querySelector('[data-detail]').hidden &&
+   rows().find(row=>row.dataset.number==='105').querySelector('[data-detail]').hidden,
+   'Feedback keeps item 106 open and item 105 closed.');
  }
  check(new Set(requestIds).size===4,'each new action uses a fresh request');
  realFeedback=true;failRefresh=false;
