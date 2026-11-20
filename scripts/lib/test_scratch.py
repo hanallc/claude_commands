@@ -1846,6 +1846,24 @@ assert scratch.removal_mark(path).is_file()
         self.assertTrue(scratch.holds()[str(held)]["ended"])
         self.assertEqual((held / "work").read_text(), "keep")
 
+        with self.subTest(unreadable_journal=True):
+            task = "gate:other"
+            other = self.base / "other"
+            other.mkdir()
+            _ = (other / "work").write_text("keep")
+            _ = scratch.hold(other, task, "unfinished work")
+            journal = scratch.operation_journal(self.base / "pending-source", conf.read("scratch")).path
+            journal.parent.mkdir(exist_ok=True)
+            _ = journal.write_text("{")
+            moment = time.time()
+
+            result = scratch.end(task, now=moment)
+
+            self.assertIn("cannot read folder operation", next(item.reason for item in result.kept if item.path == journal))
+            self.assertEqual(journal.read_text(), "{")
+            self.assertEqual(scratch.holds()[str(other)]["ended"], moment)
+            self.assertEqual((other / "work").read_text(), "keep")
+
     def test_main_removes_a_session_clone_after_its_task_transfer(self) -> None:
         source = self.base / "source"
         source.mkdir()

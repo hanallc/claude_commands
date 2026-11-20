@@ -966,6 +966,24 @@ class IdleTests(TmpSweepCase):
         self.assertTrue((hidden / ".git").is_file())
         self.assertTrue(registration.is_file())
 
+        with self.subTest(backlink="mount alias"):
+            alias = self.tmp.parent / "alias"
+            alias.symlink_to(hidden, target_is_directory=True)
+            backlink = alias / ".git"
+            _ = registration.write_text(str(backlink) + "\n")
+            resolve = Path.resolve
+
+            def resolve_mount_alias(path: Path, strict: bool = False) -> Path:
+                # A bind mount gives the same file a different resolved path.
+                return path if path == backlink else resolve(path, strict)
+
+            with mock.patch.object(Path, "resolve", resolve_mount_alias):
+                result = self.sweep()
+
+            self.assertIn(str(hidden), result.kept.get(tmp_sweep.GitWork.REGISTERED_WORKTREE.value, []))
+            self.assertTrue(backlink.samefile(hidden / ".git"))
+            self.assertEqual(registration.read_text(), str(backlink) + "\n")
+
         with self.subTest(backlink="destination"):
             _ = registration.write_text(str(destination / ".git") + "\n")
 
@@ -996,38 +1014,51 @@ class IdleTests(TmpSweepCase):
         self.assertFalse(hidden.exists())
         self.assertEqual((destination / "note").read_text(), "source data")
 
-        with self.subTest(end_before_registration=True):
-            source = write(self.tmp / "interrupted" / "note", "source data").parent
-            scratch_root = self.tmp / "scratch"
-            environment = {copy_record.ROOT_ENV: str(scratch_root),
-                           scratch.VISIBLE_ROOT_ENV: str(self.tmp.parent / "visible")}
-            with (mock.patch.dict(os.environ, environment),
-                  mock.patch.object(scratch, "rename_adoption", return_value=False),
-                  mock.patch.object(scratch, "require_quiescent"),
-                  mock.patch.object(scratch, "finish_copy_adoption", side_effect=KeyboardInterrupt)):
-                with self.assertRaises(KeyboardInterrupt):
-                    _ = scratch.adopt(source, self.ADOPTION_TASK, "interrupted", visible=True)
-            settings = conf.read("scratch")
-            journal = scratch.operation_journal(source, settings)
-            step = journal.read().step
-            assert isinstance(step, scratch.PublishAdoption)
-            destination, hidden = step.paths.destination.path, step.paths.hidden
-            self.recent(destination / "note")
-            self.assertNotIn(str(hidden), scratch.read_holds())
-            roots = tmp_sweep.Roots((str(self.tmp), str(destination.parent)), (), (),
-                                    scratch=(str(scratch_root),))
+        cases = (("interrupted", False, "finish_copy_adoption"), ("retained", True, "complete_adoption_record"))
+        for name, source_in_use, stop_at in cases:
+            with self.subTest(source_in_use=source_in_use):
+                source = write(self.tmp / name / "note", "source data").parent
+                scratch_root = self.tmp / "scratch"
+                environment = {copy_record.ROOT_ENV: str(scratch_root),
+                               scratch.VISIBLE_ROOT_ENV: str(self.tmp.parent / "visible")}
+                with (mock.patch.dict(os.environ, environment),
+                      mock.patch.object(scratch, "rename_adoption", return_value=False),
+                      mock.patch.object(scratch, "require_quiescent"),
+                      mock.patch.object(scratch, stop_at, side_effect=KeyboardInterrupt)):
+                    with self.assertRaises(KeyboardInterrupt):
+                        _ = scratch.adopt(source, self.ADOPTION_TASK, name, visible=True)
+                settings = conf.read("scratch")
+                journal = scratch.operation_journal(source, settings)
+                step = journal.read().step
+                assert isinstance(step, scratch.PublishAdoption)
+                destination, hidden = step.paths.destination.path, step.paths.hidden
+                self.recent(destination / "note")
+                holds_before_end = scratch.read_holds()
+                self.assertEqual(str(hidden) in holds_before_end, source_in_use)
+                roots = tmp_sweep.Roots((str(self.tmp), str(destination.parent)), (), (),
+                                        scratch=(str(scratch_root),))
 
-            with (mock.patch.dict(os.environ, environment),
-                  mock.patch.object(scratch, "require_quiescent")):
-                _ = scratch.end(self.ADOPTION_TASK)
-                result = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
+                if source_in_use:
+                    fake_process(self.proc, 123, fds=(str(hidden / "note"),))
+                with (mock.patch.dict(os.environ, environment),
+                      mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc)),
+                      mock.patch.object(tmp_sweep, "lsof_paths",
+                                        return_value=tmp_sweep.process_paths(str(self.proc), str(hidden)))):
+                    _ = scratch.end(self.ADOPTION_TASK)
+                    result = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
 
-            self.assertEqual(result.failed, [])
-            self.assertIn(str(hidden), [entry["path"] for entry in result.deleted])
-            self.assertFalse(journal.path.exists())
-            self.assertFalse(hidden.exists())
-            self.assertNotIn(str(hidden), scratch.read_holds())
-            self.assertEqual((destination / "note").read_text(), "source data")
+                self.assertEqual(result.failed, [])
+                self.assertEqual((destination / "note").read_text(), "source data")
+                if source_in_use:
+                    self.assertEqual(scratch.read_holds().get(str(hidden)), holds_before_end[str(hidden)])
+                    self.assertIsInstance(journal.read().step, scratch.PublishAdoptionAfterTaskEnd)
+                    self.assertIn(str(source), result.kept.get(f"{hidden}: process 123 {tmp_sweep.HOLDS_FILE}", []))
+                    self.assertEqual((hidden / "note").read_text(), "source data")
+                else:
+                    self.assertIn(str(hidden), [entry["path"] for entry in result.deleted])
+                    self.assertFalse(journal.path.exists())
+                    self.assertFalse(hidden.exists())
+                    self.assertNotIn(str(hidden), scratch.read_holds())
 
     def test_sweep_removes_a_cross_disk_source_after_the_default_task_deadline(self) -> None:
         source = write(self.tmp.parent / "loose" / "note", "source data").parent

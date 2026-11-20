@@ -1613,11 +1613,11 @@ class WorktreeRegistration:
         common, metadata = checkout.common_dir, checkout.git_dir
         if metadata.parent != (common / "worktrees").resolve():
             return None
-        try:
-            backlink = (metadata / "gitdir").read_text().rstrip("\r\n")
-        except FileNotFoundError:
-            return None
-        if not backlink or (metadata / backlink).resolve() != checkout.toplevel / ".git":
+        backlink_path = metadata / "gitdir"
+        backlink = backlink_path.read_text().rstrip("\r\n")
+        if not backlink:
+            raise RemovalRefused(f"{backlink_path}: empty worktree backlink")
+        if not (metadata / backlink).samefile(checkout.toplevel / ".git"):
             return None
         return cls(common, metadata, directory_id(checkout.git_dir_status))
 
@@ -1884,6 +1884,10 @@ def require_quiescent(removal: CoordinatedRemoval, path: Path) -> None:
     """Check process use and holds through the same mount aliases."""
     aliases = removal.aliases(path)
     removal.check_held_paths(aliases.paths)
+    require_no_process_use(aliases)
+
+
+def require_no_process_use(aliases: MountAliases) -> None:
     lock_fds = RECORD_LOCK_FDS.get()
     for held in _REMOVAL_LOCKS.get():
         if held.active and held.process == os.getpid() and held.thread == get_ident():
@@ -1930,6 +1934,7 @@ def finish_copy_adoption(removal: CoordinatedRemoval, source: Path, source_id: D
     if existing is not None and (existing["task"] != task or not existing.get("release_on_task_end")):
         raise RemovalRefused(f"{paths.hidden}: the leftover has a different hold")
     if isinstance(step, PublishAdoptionAfterTaskEnd):
+        require_no_process_use(removal.aliases(paths.hidden))
         if existing is not None:
             remaining = {name: record for name, record in removal.holds.items() if name != hidden_name}
             write_holds(remaining, scratch_settings=settings)
@@ -3916,12 +3921,15 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
     with locked_holds(scratch_settings=scratch_settings):
         for path in operation_records(scratch_settings, "*.json"):
             journal = OperationJournal(path)
-            operation = journal.read()
-            step = operation.step
-            if (isinstance(step, PublishAdoption) and not isinstance(step, PublishAdoptionAfterTaskEnd)
-                    and step.paths.destination.task == task and selected(step.paths.hidden)):
-                journal.save(FolderOperation(operation.source, operation.source_id,
-                                             PublishAdoptionAfterTaskEnd(step.paths, step.stage_id)))
+            try:
+                operation = journal.read()
+                step = operation.step
+                if (isinstance(step, PublishAdoption) and not isinstance(step, PublishAdoptionAfterTaskEnd)
+                        and step.paths.destination.task == task and selected(step.paths.hidden)):
+                    journal.save(FolderOperation(operation.source, operation.source_id,
+                                                 PublishAdoptionAfterTaskEnd(step.paths, step.stage_id)))
+            except (OSError, ScratchError) as error:
+                kept[path] = str(error)
     for folder in folders(scratch_settings=scratch_settings):
         if folder.task == task and selected(folder.path):
             _ = remove_task_folder(folder.path)
