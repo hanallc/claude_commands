@@ -29,6 +29,7 @@ from scripts.lib import berth_board
 from scripts.style import fake_fmt
 from scripts.style import rules
 from scripts.style import style_ledger
+from scripts.style.approved_renames import NoAppliedCheck
 
 from scripts.style.style_plan_test_support import StylePlanFixture, unit_staff_id
 
@@ -110,7 +111,7 @@ class StylePlanTests(StylePlanFixture):
                     case.tearDown()
                     case.doCleanups()
 
-    def test_proved_item_with_unread_body_passes_gate_and_checkpoint(self) -> None:
+    def test_item_with_unread_body_refuses_gate_and_accepts_a_persons_reading_after_merge(self) -> None:
         from scripts.style.test_approved_renames import UNREAD_ITEM_BODIES
         for label, source in UNREAD_ITEM_BODIES:
             with self.subTest(body=label):
@@ -121,17 +122,20 @@ class StylePlanTests(StylePlanFixture):
                 try:
                     ticket, ledger, finding, issue, path = case.outer_binding_ticket(source)
                     case.write(path, source.replace("fn g(", "fn checkout_info("))
-                    self.assertEqual(case.reference_gate(ticket), (0, "approved proposal\n"))
+                    result, output = case.reference_gate(ticket)
+                    self.assertEqual(result, 1, output)
+                    self.assertIn("has no applied proof", output)
                     checkpoint = case.commit()
                     ledger = case.ledger()
                     ledger.set_tip(checkpoint, "main")
                     ledger.ticket_checkpoint(ticket, checkpoint)
                     refused = ledger.ticket_merge(ticket)
-                    self.assertFalse(any(isinstance(row.cause, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
-                                         for row in refused), refused)
+                    self.assertEqual(refused, (style_ledger.FindingNotBuilt(finding.finding_id, NoAppliedCheck("rename")),))
                     current, = case.ledger().proposal_findings(issue)
                     self.assertEqual(current.finding_id, finding.finding_id)
                     self.assertNotIsInstance(current.rename_disposition, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                    built, = ledger.mark_built_at_merge((finding.finding_id,), checkpoint, style_ledger.ReadByPerson("reader"))
+                    self.assertEqual(built.reading, style_ledger.ReadByPerson("reader"))
                 finally:
                     case.tearDown()
                     case.doCleanups()
@@ -942,13 +946,15 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(result, 1, output)
         self.assertIn(self.sources[1], output)
 
-    def test_a_bare_rename_beside_a_qualified_pair_leaves_the_pair_approved_and_approves_nothing_itself(self) -> None:
+    def test_an_unproved_bare_rename_beside_a_qualified_pair_refuses_the_gate(self) -> None:
         before = "fn read() { Outcome::OldName; helper(); }\n"
         self.write(self.sources[1], before)
         _ = self.commit()
         ticket = self.approved_reference_ticket((("Outcome::OldName", "Outcome::NewName"), ("helper", "assistant")))
         self.write(self.sources[1], before.replace("OldName", "NewName"))
-        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(f"helper -> assistant has no applied proof in {self.sources[0]}", output)
         for after in (before.replace("helper", "assistant"), before.replace("OldName", "NewName").replace("read", "load")):
             with self.subTest(after=after):
                 self.write(self.sources[1], after)
@@ -963,7 +969,7 @@ class StylePlanTests(StylePlanFixture):
         self.write(self.sources[1], "fn read() { Outcome::NewName; }\n")
         result, output = self.reference_gate(ticket)
         self.assertEqual(result, 1, output)
-        self.assertIn(self.sources[1], output)
+        self.assertIn("cannot parse all file renames", output)
 
     def test_type_approval_still_allows_any_change_in_the_finding_file(self) -> None:
         ticket = self.approved_reference_ticket(kinds=("type",))

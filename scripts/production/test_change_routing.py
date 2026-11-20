@@ -20,6 +20,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.production import change_review, change_routing, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.production.test_change_review import ProducerFixture, producer_rows
+from scripts.production.unrouted_alert import notify as notify_unrouted
 
 
 class StaffRoutingTests(unittest.TestCase):
@@ -93,15 +94,27 @@ class StaffRoutingTests(unittest.TestCase):
         cast(mock.Mock, self.alert).assert_not_called()
 
     def test_an_unknown_producer_id_is_unrouted_and_alerts_with_the_row(self) -> None:
+        _ = self.configured_root_document()
         _ = self.enterContext(production_staff_record())
         _ = self.enterContext(mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root))
-        identity = fixture_runtime_id("missing-producer")
-        owner = self.router().owner({"#": "C777", "Producer": identity}, self.root / "change-review - top.md")
-        self.assertIsInstance(owner, change_routing.UnroutedChange)
-        assert isinstance(owner, change_routing.UnroutedChange)
-        self.assertIn(identity, owner.note)
-        self.assertEqual(owner.tab, "unrouted")
-        self.assertEqual(cast(mock.Mock, self.alert).call_args.args[2]["#"], "C777")
+        _ = self.enterContext(mock.patch.object(unrouted_alert, "notify", notify_unrouted))
+        cached = staff.snapshot()
+        added = fixture_member("unit", name="new-builder", parent=self.child.id)
+        listing = self.root / "change-review - top.md"
+        for identity, seen_by_authority in ((added.id, True), (fixture_runtime_id("missing-producer"), False)):
+            with (self.subTest(seen_by_authority=seen_by_authority), staff.supplied_snapshot(cached),
+                  mock.patch.object(unrouted_alert, "send_message") as alert):
+                owner = self.router().owner({"#": "C777", "Producer": identity}, listing)
+                self.assertIsInstance(owner, change_routing.UnroutedChange)
+                assert isinstance(owner, change_routing.UnroutedChange)
+                self.assertIn(identity, owner.note)
+                self.assertEqual(owner.tab, "unrouted")
+                if seen_by_authority:
+                    alert.assert_not_called()
+                    self.assertEqual(list((self.root / "links" / ".review-link-unrouted").glob("*.json")), [])
+                else:
+                    alert.assert_called_once()
+                    self.assertIn("Row: C777", cast(str, alert.call_args.args[2]).splitlines())
 
     def test_a_staff_override_record_sends_no_alert_for_a_real_list(self) -> None:
         with (mock.patch.object(change_routing, "configured_lists_directory", return_value=self.root),
@@ -330,7 +343,8 @@ class StaffRoutingTests(unittest.TestCase):
         self.assertEqual(assignment.owner.showrunner_recipients, ())
         self.assertEqual(assignment.production, doc)
         cast(mock.Mock, self.alert).assert_called_once_with(self.root / "links", "orphan", row,
-                                                          f"No staff record for {identity}", (identity,))
+                                                          f"No staff record for {identity}", (identity,),
+                                                          still_unrouted=mock.ANY)
 
     def test_an_orphan_list_keeps_a_broken_parent_unrouted_with_the_root_document(self) -> None:
         doc = self.configured_root_document()

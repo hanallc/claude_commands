@@ -10,6 +10,7 @@ from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
 import json
+import os
 import subprocess
 import shutil
 import tempfile
@@ -136,7 +137,12 @@ PY
     esac
 fi
 if [ "$1 $2" = "nextest run" ] && [ -n "$EDIT_DURING_TEST" ]; then
+    test_edit_event() {
+        [ -z "$1" ] || python3 "$TEST_EDIT_WAIT" "$1"
+    }
+    test_edit_event "$TEST_EDIT_BEFORE" || exit $?
     printf "// changed during the test run\n" >> "$PACKAGE_ROOT/${EDIT_DURING_TEST_PATH:-src/lib.rs}"
+    test_edit_event "$TEST_EDIT_AFTER" || exit $?
 fi
 case "$1 $2" in
     "mend --version"|"clippy --version"|"+nightly fmt")
@@ -329,6 +335,34 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         self.metadata_calls = self.root / "metadata-calls"
         self.environment = self.fixture_environment.copy()
         _ = caller_admission(self, self.root, self.environment)
+
+    def prepare_edit_event(self, marker: str, *, before: bool) -> Path:
+        control = self.root / "edit-order"
+        control.mkdir()
+        self.environment.update({
+            "TEST_EDIT_CONTROL": str(control),
+            "TEST_EDIT_WAIT": str(Path(__file__).with_name("wait_for_test_state.py")),
+            ("TEST_EDIT_BEFORE" if before else "TEST_EDIT_AFTER"): str(control / marker),
+        })
+        return control
+
+    def prepare_edit_after_watch_snapshot(self) -> None:
+        """Let the watcher take one snapshot before the Cargo stub edits the tree."""
+        control = self.prepare_edit_event("watch-read", before=True)
+        _ = (control / "sitecustomize.py").write_text('''
+import os
+from pathlib import Path
+import sys
+import time
+
+if Path(sys.argv[0]).name == "tree_watch.py" and not sys.argv[1].startswith("--"):
+    def stop_after_read(_interval: float) -> None:
+        (Path(os.environ["TEST_EDIT_CONTROL"]) / "watch-read").touch()
+        raise SystemExit(3)
+    time.sleep = stop_after_read
+''')
+        startup = Path(__file__).resolve().parents[1] / "lib/python_startup"
+        self.environment["PYTHONPATH"] = os.pathsep.join((str(startup), str(control)))
 
     def side_by_side_phases(self, edited: str) -> subprocess.CompletedProcess[str]:
         """Test alpha, which depends on gamma, while another phase edits `edited`."""

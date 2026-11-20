@@ -1,3 +1,8 @@
 [job]
+# Minimum seconds after a successful upkeep run before the next run.
+# The job also uses this interval to rotate which producer it tries first.
+# Use a positive finite number.
 interval_seconds = 120
+# Maximum seconds for one upkeep run. The job stops the process group at this limit.
+# Use a positive finite number.
 timeout_seconds = 60

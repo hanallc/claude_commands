@@ -1,8 +1,8 @@
 """Exercise the watcher's scope with actual Git trees and Cargo workspace inputs."""
 from __future__ import annotations
 
-import os
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -66,9 +66,11 @@ class TreeWatchTests(TreeWatchFixture):
     def test_lint_versions_reuse_the_call_reading_and_keep_failed_reads_disabled(self) -> None:
         saved = self.root / "lint-versions"
         formatter = self.root / "rustfmt-version"
+        mend = b"cargo-mend 0.23.0-dev\ngit_hash: fixture\nbuild_id: first\nbuild_sysroot: fixture\n"
         with mock.patch.dict(os.environ, {"VERIFY_LINT_VERSIONS_FILE": str(saved),
                                          "VERIFY_LINT_RUSTFMT_VERSION_FILE": str(formatter)}):
-            with mock.patch.object(subprocess, "check_output", return_value=b"tool version\n") as probe:
+            with mock.patch.object(subprocess, "check_output",
+                                   side_effect=[mend, b"tool version\n", b"tool version\n", b"tool version\n"]) as probe:
                 first = tree_watch.lint_tool_versions()
                 self.assertEqual(tree_watch.lint_tool_versions(), first)
                 self.assertEqual(probe.call_count, 4)
@@ -77,9 +79,23 @@ class TreeWatchTests(TreeWatchFixture):
             with mock.patch.object(subprocess, "check_output", side_effect=OSError("tool missing")) as probe:
                 with self.assertRaises(OSError):
                     _ = tree_watch.lint_tool_versions()
+                self.assertEqual(saved.read_bytes(), b"")
                 with self.assertRaises(ValueError):
                     _ = tree_watch.lint_tool_versions()
                 probe.assert_called_once()
+
+    def test_mend_build_info_requires_a_git_hash_and_build_id(self) -> None:
+        header = b"cargo-mend 0.23.0-dev\n"
+        git_hash, build_id = b"git_hash: fixture\n", b"build_id: first\n"
+        with mock.patch.object(subprocess, "check_output", return_value=header + git_hash + build_id) as probe:
+            self.assertEqual(tree_watch.cargo_mend_build_info(), (header + git_hash + build_id).strip())
+            for fields in (git_hash, build_id, git_hash + b"build_id: unknown\n",
+                           b"git_hash: unknown\n" + build_id, git_hash + b"build_id: \n",
+                           b"git_hash: \n" + build_id):
+                with self.subTest(fields=fields):
+                    probe.return_value = header + fields
+                    with self.assertRaises(ValueError):
+                        _ = tree_watch.cargo_mend_build_info()
 
     def test_lint_keys_without_result_caching_do_not_probe_versions(self) -> None:
         import json

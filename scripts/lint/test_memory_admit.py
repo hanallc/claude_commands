@@ -6,7 +6,7 @@ from __future__ import annotations
 from scripts.buildlog import repository
 from scripts.lib import test_phase
 
-from scripts.build_queue import admission_records, placement, snapshot_codec as codec, step_estimator
+from scripts.build_queue import admission_records, memory_feed, placement, snapshot_codec as codec, step_estimator
 
 from scripts.lint.memory_test_support import admission_configuration_fixture, admission_policy_fixture
 
@@ -4663,6 +4663,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
             service.mkdir(parents=True)
             _ = (service / "memory.current").write_text(str(9 * GIB) + "\n")
             _ = (service / "memory.stat").write_text(f"anon {8 * GIB}\nshmem 0\ninactive_file 0\n")
+            _ = (service.parent / "memory.stat").write_text(f"anon {8 * GIB}\nshmem 0\n")
             _ = (service / "cgroup.procs").write_text("10\n11\n12\n13\n")
             proc = root / "proc"
             scope = "/cgroup/run-build.scope"
@@ -4677,12 +4678,75 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 _ = (folder / "status").write_text(f"VmRSS:\t{kib} kB\nRssAnon:\t{kib} kB\nRssShmem:\t0 kB\n")
             with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice")}):
                 reading, = gate.sccache_memory(proc)
+                (proc / "12" / "environ").unlink()
+                missing_environment, = gate.sccache_memory(proc)
+                _ = (proc / "12" / "environ").write_bytes(b"BUILDLOG_STEP_SCOPE=" + scope.encode() + b"\0")
+                status = proc / "12" / "status"
+                status.unlink()
+                status.mkdir()
+                unreadable_status, = gate.sccache_memory(proc)
+                step = admission_records.RunningStep("", "sccache.service", "compile", "builds.slice", 0,
+                                                     unreadable_status, pid=10)
+                entry = admission_records.ExplainedRunningStep(
+                    step, admission_records.AdmissionTimeNotRecorded(), 0, 7 * GIB, 7 * GIB)
+                tools = memory_feed.build_tool_ram((entry,), queued_use=2 * GIB)
+            self.assertEqual(tools, memory_feed.BuildToolRam(rust_analyzer=0, sccache=6 * GIB, other=0))
             assert isinstance(reading, admission_records.CompilerServiceMemory)
             self.assertEqual(reading.pid, 10)
             self.assertEqual(reading.jobs, (
                 admission_records.CompilerJob(Path(scope), admission_records.AnonymousRunUse(4 * GIB)),
                 admission_records.CompilerJob(Path("/cgroup/run-other.scope"), admission_records.AnonymousRunUse(2 * GIB))))
             self.assertEqual(reading.bytes, 3 * GIB)
+            assert isinstance(missing_environment, admission_records.CompilerServiceMemory)
+            self.assertEqual(missing_environment.anonymous_source, admission_records.NoSource())
+            self.assertEqual(missing_environment.jobs, (
+                admission_records.CompilerJob(Path(scope), admission_records.AnonymousRunUse(3 * GIB)),
+                admission_records.CompilerJob(Path("/cgroup/run-other.scope"), admission_records.AnonymousRunUse(2 * GIB))))
+            self.assertEqual(missing_environment.bytes, 4 * GIB)
+            assert isinstance(unreadable_status, admission_records.CompilerServiceMemory)
+            self.assertEqual(unreadable_status.anonymous_source, reading.anonymous_source)
+            self.assertEqual(unreadable_status.bytes, 7 * GIB)
+            self.assertEqual(len(unreadable_status.jobs), 2)
+            self.assertIsInstance(unreadable_status.jobs[0].use, admission_records.RunUseUnavailable)
+            self.assertEqual(unreadable_status.jobs[1:], (reading.jobs[1],))
+
+    def test_sccache_reading_distinguishes_no_job_from_an_incomplete_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = root / "builds.slice" / "sccache.service"
+            service.mkdir(parents=True)
+            _ = (service / "memory.current").write_text(str(GIB))
+            _ = (service / "memory.stat").write_text(f"anon {GIB}\nshmem 0\ninactive_file 0\n")
+            member = root / "proc" / "7"
+            member.mkdir(parents=True)
+            _ = (member / "comm").write_text("sccache\n")
+            environment = member / "environ"
+            _ = environment.write_bytes(b"HOME=/h\0")
+            members = service / "cgroup.procs"
+            _ = members.write_text("7\n")
+            with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(service.parent)}):
+                complete, = gate.sccache_memory(member.parent)
+                environment.unlink()
+                missing_environment, = gate.sccache_memory(member.parent)
+                members.unlink()
+                missing_members, = gate.sccache_memory(member.parent)
+                members.mkdir()
+                unreadable_members, = gate.sccache_memory(member.parent)
+            self.assertEqual(complete, admission_records.CompilerServiceMemory(GIB, pid=7,
+                anonymous_source=admission_records.ScopeSource(service, frozenset({7}))))
+            step = admission_records.RunningStep("", "sccache.service", "compile", "builds.slice", 0, complete, pid=7)
+            inputs = replace(self.inputs((), ()), running=(step,))
+            captured = gate.queue_read_from(inputs, admission_policy_fixture())
+            self.assertEqual(captured.explanation.decided_from.running, (step,))
+            self.assertEqual(captured.view.running, (
+                replace(step, measured=admission_records.CompilerServiceMemory(GIB, pid=7)),))
+            for name, reading, pid in (
+                ("missing environment", missing_environment, 7),
+                ("missing members", missing_members, admission_records.PidNotRecorded()),
+                ("unreadable members", unreadable_members, admission_records.PidNotRecorded()),
+            ):
+                with self.subTest(name=name):
+                    self.assertEqual(reading, admission_records.CompilerServiceMemory(GIB, pid=pid))
 
     def test_shared_process_use_is_counted_once_before_distinct_step_profiles_are_grouped(self) -> None:
         rows = (self.reservation("build", identity="z-parent"), self.reservation("clippy", identity="a-child"))
@@ -5445,11 +5509,25 @@ class QueueLeaveTests(unittest.TestCase):
         from scripts.build_queue.admission_test_support import caller_admission
         self.admission = caller_admission(self, self.root, self.environment)
         self.admission.configure(wait_reply_seconds=0.1, running_pass_seconds=5)
+        handle_request = self.admission.server.handle_request
+
+        def save_width(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                       ) -> list[wire.Reply]:
+            replies = handle_request(request, connection)
+            # Save the new width before Cargo can read the private state file.
+            if isinstance(request, wire.WidthRequest):
+                self.admission.server.persist()
+            return replies
+
+        _ = self.enterContext(patch.object(self.admission.server, "handle_request", side_effect=save_width))
         capture = self.root / "capture-width.py"
-        _ = capture.write_text("import json\nfrom scripts.build_queue import admission_client as client\n"
+        _ = capture.write_text("import json\nimport os\nfrom pathlib import Path\n"
             + "from scripts.build_queue.admission_records import RequestedTestWidth\n"
-            + "row, = client.view().explanation.reservations\n"
-            + "width = row['test_threads']\nassert isinstance(width, RequestedTestWidth)\n"
+            + "from scripts.build_queue.admission_service import read_state\n"
+            + f"record, = read_state(Path({str(self.admission.state_dir)!r})).reservations.values()\n"
+            + "reservation_id, _, _ = os.environ['BUILDLOG_RESERVED_STEP'].split('\\t')\n"
+            + "assert record.reservation_id == reservation_id\n"
+            + "width = record.test_width\nassert isinstance(width, RequestedTestWidth)\n"
             + "print(json.dumps({'test_threads': width.threads}))\n")
         queue_client = self.root / "queue-client.py"
         _ = queue_client.write_text("from __future__ import annotations\nimport sys\n"
@@ -5554,8 +5632,14 @@ class QueueLeaveTests(unittest.TestCase):
                 + 'run_nextest --workspace')
 
     def test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width(self) -> None:
+        with (self.root / "build_admission.conf").open("a", encoding="utf-8") as configuration:
+            _ = configuration.write("\n# whole: 0..\nnested_tokens=3\n")
         pool, calls = self.root / "pool", self.root / "cargo-calls"
         ran_args, reservation, waited = self.root / "args", self.root / "reservation", self.root / "waited"
+        listing = self.root / "test-list.json"
+        _ = listing.write_text(json.dumps({"rust-suites": {"suite": {"testcases": {
+            f"test_{index}": {"filter-match": {"status": "matches"}} for index in range(12)
+        }}}}), encoding="utf-8")
         os.mkfifo(pool)
         keeper = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, keeper)
@@ -5567,21 +5651,26 @@ class QueueLeaveTests(unittest.TestCase):
             + '[[ "$*" == "nextest --version" ]] && exit 0\n'
             + f'printf "%s\\n" "$*" >> "{calls}"\n'
             + '[[ " $* " == *" --no-run "* ]] && exit 0\n'
+            + f'if [[ "$1 $2" == "nextest list" ]]; then cat "{listing}"; exit $?; fi\n'
             + f'printf "%s\\n" "$*" > "{ran_args}"; "$TEST_PY" "$TEST_CAPTURE_WIDTH" > "{reservation}"\n')
         cargo.chmod(0o755)
         self.environment["PATH"] = f"{bin_dir}{os.pathsep}{self.environment['PATH']}"
         self.environment["CARGO_MAKEFLAGS"] = f"--jobserver-auth=fifo:{pool}"
+        self.environment["TMPDIR"] = str(self.root)
         free = (f'[[ -e "{calls}" ]] && echo built >> "{waited}"; echo waited >> "{waited}"; '
                 + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";')
         step = 'nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; LINT_TEST_WIDTH=logical; run_nextest --workspace'
         result = self.run_step(None, free, step)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
-        # The memory wait comes before the build, and the build before the tokens.
+        # The memory wait ends before the build. The build ends before the launcher takes tokens.
         self.assertEqual(waited.read_text().splitlines(), ["waited"])
-        self.assertEqual(calls.read_text().splitlines(), ["nextest run --no-run --workspace",
-                                                          "nextest run --test-threads 6 --workspace"])
-        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 6)
+        self.assertEqual(calls.read_text().splitlines(), [
+            "nextest run --no-run --workspace",
+            "nextest list --message-format json --workspace",
+            "nextest run --test-threads 3 --workspace",
+        ])
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 3)
         self.assertEqual(len(os.read(keeper, 64)), 6)
 
     def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:
