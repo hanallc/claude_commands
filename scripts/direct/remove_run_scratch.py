@@ -127,10 +127,7 @@ def end_tracked_scratch(run: Path) -> int:
         resolved = path.resolve()
         return any(cwd == resolved or resolved in cwd.parents for cwd in protected)
 
-    result = scratch.end(task, keep=retained)
-    for folder in result.kept:
-        print(f"remove_run_scratch: kept {folder.path}: {folder.reason}", file=sys.stderr)
-    return len(result)
+    return len(scratch.end(task, keep=retained))
 
 
 def main() -> int:

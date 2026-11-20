@@ -172,7 +172,12 @@ class StylePlanFixture(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.template_repo = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        fixture_parent = Path(tempfile.mkdtemp(prefix="style-plan-fixture-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, fixture_parent)
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ)))
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+            _ = os.environ.pop(key, None)
+        cls.template_repo = fixture_parent / "sample"
         cls.template_repo.mkdir()
         fixture = cls(methodName="runTest")
         fixture.repo = cls.template_repo

@@ -1,9 +1,7 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Scratch folders that belong to a task, and go when the task ends.
+"""Manage scratch folders and record when their tasks end.
 
-Agents made loose folders in /tmp and ~/rust (repo copies, repros, test trees) and nothing removed
-them. Sessions run for weeks, so a session end is no cleanup point (user, 2026-10-26/27). Each
-scratch folder belongs to a task, and the thing that ends the task removes it:
+Each folder belongs to a task. The end command keeps the folder for a manual removal list.
 
     scratch.py new [--task <task> | --until <when>] [--name <word>] [--visible]   make one; prints its path
     scratch.py new --worker [--name <word>]   make a worker folder under TMPDIR; prints its path
@@ -12,7 +10,7 @@ scratch folder belongs to a task, and the thing that ends the task removes it:
     scratch.py release <path>    drop a hold
     scratch.py renew <path>      mark it changed
     scratch.py hand-over <path> --to <unit> --task <task>  replace owner and task without moving it
-    scratch.py end --task <task>  remove every folder and held folder of the task
+    scratch.py end --task <task>  record task completion and list the retained folders
     scratch.py list              each folder and hold, its task and its last change
 
 A task, and what ends it:
@@ -37,7 +35,7 @@ folder is not held and goes with its session's other content. Any other folder l
 task's folder is `<word>-<suffix>`, or `scratch-<suffix>` with no word; its record keeps the time.
 scratch.conf suffix_length sets the suffix length.
 Worker folders live under TMPDIR as `<showrunner>-<unit>-<worker>-<suffix>[-<word>]`.
-The holds record indexes their paths, so task removal does not scan TMPDIR.
+The holds record lists their paths, so task end can find them.
 `--visible` (rows only) puts it in VISIBLE_ROOT
 as `<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds copy_record.RECORD with its task, maker and
 times. The hourly tmp sweep (scripts/lint/tmp_sweep.py) keeps a folder in ROOT while its task is
@@ -52,13 +50,11 @@ A retry checks changed, intact sources for unsaved work.
 A retry keeps changed, partly deleted sources and names the changed file.
 Completion removes Cargo recovery evidence before task recovery evidence.
 
-A hold keeps a folder that must stay where it is (a repo the user checks a change in). Its record
-(task, maker, reason) is in the machine's HOLDS file, not in the folder, where a repo would show it
-as uncommitted work. `end` removes a held folder with the task's other folders, unless a repo in
-it holds work that is on no remote (unsaved_work): that hold stays, marked ended, for the folder
-audit to name to its maker. The scratch guard hook
-(scripts/hooks/pre-tool-use-scratch-guard.py) refuses a loose folder in /tmp, ~/rust and the
-other roots.
+A hold protects a folder at its current path.
+The machine's HOLDS file records the task, maker, and reason.
+Task end marks the hold ended and keeps the folder.
+The scratch guard hook refuses loose folders in /tmp, ~/rust, and other configured roots.
+The hook is in scripts/hooks/pre-tool-use-scratch-guard.py.
 
 Copies live at <roots.copies>/<pair>/<copy>. Their records also name source and copy commits,
 target mode, seed, borrowed git directory, owner and land target. Open phases and borrowed parents
@@ -2369,103 +2365,69 @@ def unsaved_work(path: Path, *,
 
 
 class TaskCleanup(list[Path]):
-    """List removed paths for existing callers and report retained folders separately."""
+    """Report the folders retained at task end."""
 
     def __init__(self) -> None:
         super().__init__()
         self.kept: list[KeptFolder] = []
 
 
+def report_retained_task_folder(path: Path, reason: str) -> None:
+    print(f"kept for a manual removal list: {path} (scratch, {reason})", file=sys.stderr)
+
+
+def record_task_end(path: Path, task: str, moment: float, *,
+                    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    """Mark the current task ended in an existing folder record."""
+    def mark_ended(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
+        if not isinstance(record, copy_record.Registered) or record.task != task:
+            raise ScratchError(f"{path}: the folder task changed")
+        return {**record.fields, "ended": moment, "ended_task": task}
+
+    with copy_record_lock(path, scratch_settings=scratch_settings):
+        current = copy_record.read_record(path / copy_record.RECORD)
+        if not isinstance(current, copy_record.Registered) or current.task != task:
+            raise ScratchError(f"{path}: the folder task changed")
+        if not task_has_end_evidence(current):
+            _ = update_record(path, mark_ended, scratch_settings=scratch_settings)
+
+
 def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = lambda _: False,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> TaskCleanup:
-    """Remove task folders and report each retained folder with its reason."""
+    """Record task completion and keep its folders for manual removal."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     _ = checked_task(task, False)
-    removed = TaskCleanup()
-    kept: dict[Path, str] = {}
+    result = TaskCleanup()
     moment = time.time() if now is None else now
-
-    def selected(path: Path) -> bool:
-        if keep(path):
-            _ = kept.setdefault(path, "selected by the keep rule")
-            return False
-        return True
-
-    attempted: dict[Path, Path] = {}
-
-    def remove_task_folder(path: Path, *, require_task: bool = True) -> bool:
-        key = path.parent.resolve() / path.name
-        if key in attempted:
-            return attempted[key] not in kept
-        attempted[key] = path
-        try:
-            outcome = remove_folder(path, TaskRemoval(task, moment, require_task), scratch_settings=scratch_settings)
-            if isinstance(outcome, KeptFolder):
-                kept[path] = outcome.reason
-                return False
-        except (ScratchError, OSError) as error:
-            kept[path] = str(error)
-            return False
-        _ = kept.pop(path, None)
-        removed.append(path)
-        return True
-
-    for folder in folders(scratch_settings=scratch_settings):
-        if folder.task == task and selected(folder.path):
-            _ = remove_task_folder(folder.path)
+    paths = {folder.path.resolve(): folder.path for folder in folders(scratch_settings=scratch_settings)
+             if folder.task == task}
     with locked_holds(scratch_settings=scratch_settings) as found:
+        task_holds = {Path(name): record for name, record in found.items() if record["task"] == task}
+        for path in task_holds:
+            _ = paths.setdefault(path, path)
+        protected = {path for path in paths.values() if keep(path)}
         changed = False
-        for path, record in list(found.items()):
-            if record["task"] != task or not selected(Path(path)):
-                continue
-            changed = True
-            held = Path(path)
-            copies = Path(os.path.realpath(copy_record.copies_root()))
-            if copies.is_relative_to(held.resolve()) or held.parent == copies:
-                for copy in list(copy_paths()):
-                    if copy.is_relative_to(held) and selected(copy):
-                        _ = remove_task_folder(copy, require_task=False)
-                try:
-                    unfinished = clear_finished_copy_removals(copies, skip=attempted.keys(), scratch_settings=scratch_settings)
-                except (ScratchError, OSError) as error:
-                    kept[held] = str(error)
-                    record["ended"] = moment
-                    continue
-                for retained in unfinished:
-                    _ = kept.setdefault(retained.path, retained.reason)
-                    attempted[retained.path] = retained.path
-                if any(key.is_relative_to(held) and path in kept and not os.path.lexists(key)
-                       for key, path in attempted.items()):
-                    kept[held] = "the container has unfinished copy removals"
-                    record["ended"] = moment
-                    continue
-                remove_empty_copy_pairs(copies)
-                # A container hold never takes recursive deletion through the copies root.
-                if held != copies and held.exists():
-                    try:
-                        held.rmdir()
-                    except OSError as error:
-                        kept[held] = str(error)
-                        record["ended"] = moment
-                        continue
-                if held == copies and any(copy_paths()):
-                    kept[held] = "the container has retained copies"
-                    record["ended"] = moment
-                    continue
-                del found[path]
-                continue
-            needs_removal = (held in attempted or os.path.lexists(held)
-                             or removal_mark(held).exists() or cargo_removal_mark(held).exists())
-            if needs_removal and not remove_task_folder(held):
+        for path, record in task_holds.items():
+            if paths[path] not in protected and not record["ended"]:
                 record["ended"] = moment
-                continue
-            del found[path]
+                changed = True
         if changed:
             write_holds(found, scratch_settings=scratch_settings)
-    removed.kept = [KeptFolder(path, reason) for path, reason in kept.items()]
-    return removed
+
+    for path in paths.values():
+        reason = "selected by the keep rule" if path in protected else f"task {task} ended"
+        if path not in protected and not path.is_symlink():
+            current = copy_record.read_record(path / copy_record.RECORD)
+            if isinstance(current, copy_record.Registered) and current.task == task:
+                try:
+                    record_task_end(path, task, moment, scratch_settings=scratch_settings)
+                except (ScratchError, OSError) as error:
+                    reason = " ".join(str(error).splitlines())
+        report_retained_task_folder(path, reason)
+        result.kept.append(KeptFolder(path, reason))
+    return result
 
 
 def end_selected_copy(path: Path, expected: copy_record.Registered, now: float,
@@ -2588,19 +2550,13 @@ def main(argv: list[str]) -> int:
                       run_dir=cast(str, arguments.run_dir), land_target=cast(str, arguments.land_target), scratch_settings=scratch_settings)
             print(path)
         elif command == "end":
-            result = end(cast(str, arguments.task), scratch_settings=scratch_settings)
-            for path in result:
-                print(f"removed {path}")
-            for folder in result.kept:
-                print(f"scratch: kept {folder.path}: {folder.reason}", file=sys.stderr)
-            if result.kept:
-                return 1
+            _ = end(cast(str, arguments.task), scratch_settings=scratch_settings)
         else:
             now = time.time()
             for folder in folders(scratch_settings=scratch_settings):
                 print(f"{folder.path}\t{folder.task}\t{(now - folder.changed) / 3600:.1f} h since a change")
             for path, record in sorted(holds(scratch_settings=scratch_settings).items()):
-                state = "ended, unsaved work" if record["ended"] else "held"
+                state = "ended" if record["ended"] else "held"
                 print(f"{path}\t{record['task']}\t{state}: {record['reason']}")
     except (ScratchError, OSError) as error:
         print(f"scratch: {error}", file=sys.stderr)

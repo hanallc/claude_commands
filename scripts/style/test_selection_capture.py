@@ -1,7 +1,8 @@
 """Prove capture and replay against private selection fixtures."""
 
-from contextlib import closing
+from contextlib import closing, redirect_stderr
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,8 @@ import sqlite3
 import shutil
 import subprocess
 import sys
+import tempfile
+import unittest
 from typing import cast, final, override
 from unittest.mock import patch
 
@@ -16,6 +19,53 @@ from scripts.lib import conf
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, recorded_unit
 from scripts.style import refill_measure, selection_capture, style_config, style_ledger, style_reader
 from scripts.style.style_plan_test_support import StylePlanFixture, install_unconfigured_board
+
+
+class SelectionPublicationTests(unittest.TestCase):
+    def test_capture_keeps_canaries_and_refuses_an_existing_output(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="selection-capture-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
+        home = root / "home"
+        output = root / "capture"
+
+        def stage(_repo: Path, _ledger: Path, _unit: str, folder: Path) -> selection_capture.CaptureManifest:
+            _ = (folder / "value").write_text("new capture")
+            _ = (folder / "manifest.json").write_text('{"format": 2}')
+            return cast(selection_capture.CaptureManifest, cast(object, {"format": 2}))
+
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            with patch.object(selection_capture, "capture_inputs", side_effect=stage):
+                _ = selection_capture.capture(root, root, "fixture", output)
+            self.assertEqual((output / "value").read_text(), "new capture")
+            paths = [output]
+            for location in (home, home / "rust", home / "worktrees", home / ".claude"):
+                canary = location / "canary"
+                canary.mkdir(parents=True)
+                paths.append(canary)
+            for path in paths:
+                _ = (path / "value").write_text("fixture data")
+                with self.subTest(path=path), redirect_stderr(io.StringIO()) as error:
+                    with patch.object(sys, "argv", ["selection_capture", "capture", "--repo", str(root),
+                                                    "--ledger", str(root), "--unit", "fixture", "--folder", str(path)]):
+                        with self.assertRaises(SystemExit) as exit_status:
+                            _ = selection_capture.main()
+                    self.assertEqual(exit_status.exception.code, 2)
+                    self.assertEqual(len(error.getvalue().splitlines()), 1)
+                    self.assertIn(f"{path} exists. Pick a new path or remove the old path by hand.", error.getvalue())
+                    self.assertEqual((path / "value").read_text(), "fixture data")
+
+            late = root / "late-output"
+
+            def stage_with_competing_output(repo: Path, ledger: Path, unit: str, folder: Path) -> selection_capture.CaptureManifest:
+                late.mkdir()
+                return stage(repo, ledger, unit, folder)
+
+            with patch.object(selection_capture, "capture_inputs", side_effect=stage_with_competing_output):
+                with self.assertRaises(selection_capture.CaptureOutputExists):
+                    _ = selection_capture.capture(root, root, "fixture", late)
+            self.assertTrue(late.is_dir())
+            self.assertEqual(list(late.iterdir()), [])
+            self.assertEqual(list(selection_capture.capture_output_parent().iterdir()), [])
 
 
 @final
@@ -51,6 +101,12 @@ class SelectionCaptureTests(StylePlanFixture):
         self.proposal = self.approved_decision(rule, self.sources[:1], "type", name="capture")
         with self.ledger() as ledger:
             self.database = ledger.database
+
+    @override
+    def git(self, *args: str, cwd: Path | None = None) -> str:
+        result = subprocess.run(["git", "-C", str(cwd or self.repo), *args],
+                                env=selection_capture.git_environment(), capture_output=True, text=True, check=True)
+        return result.stdout.strip()
 
     def source_rows(self) -> tuple[str, ...]:
         """Read all source rows for an exact preservation check."""

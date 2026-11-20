@@ -63,6 +63,8 @@ class VerifyLintBerthCopyTests(support.VerifyLintScopeFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+            _ = self.environment.pop(key, None)
         _ = caller_admission(self, self.root, self.environment)
         self.use_real_toml_tools()
         for name in ("foreign", "free"):
@@ -95,9 +97,14 @@ class VerifyLintBerthCopyTests(support.VerifyLintScopeFixture):
         return [cast(dict[str, object], json.loads(line))
                 for line in calls.read_text(encoding="utf-8").splitlines()] if calls.exists() else []
 
-    def assert_copy_gone(self) -> None:
-        self.assertEqual(sorted(path.name for path in (self.root / "target/package").iterdir()
-                                if path.name.startswith(("verify-lint-copy", ".verify-lint-copy"))), [])
+    def assert_copy_closed(self, output: str) -> None:
+        folder = self.root / "target/package/verify-lint-copy"
+        notice = f"kept for a manual removal list: {folder} (fix_return,"
+        if folder.exists():
+            self.assertTrue((folder / "sent.json").is_file())
+            self.assertIn(notice, output)
+        else:
+            self.assertNotIn(notice, output)
 
     def test_held_fix_reaches_the_worktree_through_the_copy(self) -> None:
         status, output = self.lint({"src/lib.rs": "pub(crate) fn value() -> u8 { 1 }\n"})
@@ -110,14 +117,14 @@ class VerifyLintBerthCopyTests(support.VerifyLintScopeFixture):
             self.assertEqual(call["target"], str(self.root / "target"))
             manifest = cast(list[str], call["args"])[-1]
             self.assertEqual(manifest, str(self.root / "target/package/verify-lint-copy/tree/Cargo.toml"))
-        self.assert_copy_gone()
+        self.assert_copy_closed(output)
 
     def test_foreign_fix_is_reported_and_not_written(self) -> None:
         status, output = self.lint({"src/foreign.rs": "pub(crate) fn foreign() {}\n"})
         self.assertEqual(status, 0, output)
         self.assertEqual(self.text("src/foreign.rs"), "fn foreign() {}\n")
         self.assertIn("not written: src/foreign.rs is held by reservation other-2 (refs/heads/theirs)", output)
-        self.assert_copy_gone()
+        self.assert_copy_closed(output)
 
     def test_free_fix_fails_lint_and_is_not_written(self) -> None:
         status, output = self.lint({"src/lib.rs": "pub(crate) fn value() -> u8 { 1 }\n",
@@ -127,7 +134,7 @@ class VerifyLintBerthCopyTests(support.VerifyLintScopeFixture):
         self.assertEqual(self.text("src/lib.rs"), "pub(crate) fn value() -> u8 { 1 }\n")
         self.assertIn("run `cargo-berth check src/free.rs`, then run lint again", output)
         self.assertFalse(any("clippy" in cast(list[str], call["args"]) for call in self.copy_calls()))
-        self.assert_copy_gone()
+        self.assert_copy_closed(output)
 
     def test_unheld_fix_failure_is_not_replayed_after_claim(self) -> None:
         cache = self.enable_cache()

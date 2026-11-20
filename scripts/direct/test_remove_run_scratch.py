@@ -4,15 +4,15 @@
 from __future__ import annotations
 
 import json
-import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from contextlib import redirect_stderr
-from typing import override
+from collections.abc import Callable
+from typing import override, cast
 from unittest import mock
 
 from scripts.direct import remove_run_scratch, workers
@@ -29,14 +29,19 @@ class RemoveRunScratchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        root = Path(tempfile.mkdtemp(prefix="run-scratch-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ)))
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+            _ = os.environ.pop(key, None)
         owner = fixture_member("showrunner", name="demo")
         self.owner_id = fixture_member("unit", name="builders", parent=owner.id).id
 
     def make_run(self) -> tuple[Path, Path]:
         """A run folder with copies at several depths, and a folder outside it."""
-        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        root = Path(tempfile.mkdtemp(prefix="run-scratch-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
         run = root / "run"
         (run / "verify_cache").mkdir(parents=True)
         _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": self.owner_id}))
@@ -67,15 +72,15 @@ class RemoveRunScratchTests(unittest.TestCase):
         (run / "scratch" / "linked").symlink_to(outside)
         return run, outside
 
-    def test_tracked_cleanup_reports_retained_folders(self) -> None:
+    def test_tracked_cleanup_preserves_the_working_directory(self) -> None:
         run, outside = self.make_run()
-        result = scratch.TaskCleanup()
-        result.kept.append(scratch.KeptFolder(outside, scratch.BUSY_REASON))
-        error = io.StringIO()
-        with (mock.patch.object(scratch, "end", return_value=result),
-              mock.patch.object(workers, "protected_working_directories", return_value=[]), redirect_stderr(error)):
+        with (mock.patch.object(scratch, "end", return_value=scratch.TaskCleanup()) as end,
+              mock.patch.object(workers, "protected_working_directories", return_value=[outside])):
             self.assertEqual(remove_run_scratch.end_tracked_scratch(run), 0)
-        self.assertIn(f"kept {outside}: {scratch.BUSY_REASON}", error.getvalue())
+        end.assert_called_once_with(f"run:{run.name}", keep=mock.ANY)
+        keep = cast(Callable[[Path], bool], end.call_args.kwargs["keep"])
+        self.assertTrue(keep(outside))
+        self.assertFalse(keep(run))
 
     def test_a_bad_cargo_removal_mark_does_not_stop_other_folder_removals(self) -> None:
         run, _ = self.make_run()
@@ -212,7 +217,8 @@ class RemoveRunScratchTests(unittest.TestCase):
 
     def worktree_run(self) -> tuple[Path, Path, Path]:
         """A source repo, and a run folder holding a linked worktree of its branch copy."""
-        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        root = Path(tempfile.mkdtemp(prefix="run-scratch-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
         source, run = root / "source", root / "run"
         def git(*arguments: str) -> None:
             _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=t", "-c", "user.email=t@t", *arguments],

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+import io
 import os
 import shutil
 import subprocess
@@ -39,8 +41,13 @@ exec "$FIX_TEST_RSYNC" "${words[@]}"
 '''
 
 
+def git_environment() -> dict[str, str]:
+    return {name: value for name, value in os.environ.items()
+                   if name not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+
+
 def git(root: Path, *words: str) -> None:
-    _ = subprocess.run(["git", "-C", str(root), *words], check=True, capture_output=True)
+    _ = subprocess.run(["git", "-C", str(root), *words], check=True, capture_output=True, env=git_environment())
 
 
 def commit_all(root: Path) -> None:
@@ -56,7 +63,7 @@ def reservation(reservation_id: str, root: Path, branch: str, *scopes: str,
 
 def head(root: Path) -> str:
     return subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True, capture_output=True,
-                          text=True).stdout.strip()
+                          text=True, env=git_environment()).stdout.strip()
 
 
 UNCONFIGURED = berth_board.Board((), configured=False)
@@ -91,7 +98,8 @@ class ReturnFixTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(tempfile.mkdtemp(prefix="fix-return-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, self.root)
         real_rsync = shutil.which("rsync")
         if real_rsync is None:
             self.skipTest("rsync is not installed")
@@ -254,7 +262,9 @@ class RollForwardTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(tempfile.mkdtemp(prefix="fix-return-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, git_environment(), clear=True)))
         self.worktree = root / "worktree"
         self.staging = root / "staging"
         (self.worktree / "src").mkdir(parents=True)
@@ -272,7 +282,7 @@ class RollForwardTests(unittest.TestCase):
         stopped = subprocess.run(
             [sys.executable, "-c", STOPPED_CHILD, str(self.worktree), str(self.staging), stop_at],
             capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-            env={**os.environ, "PYTHONPATH": str(FIX_RETURN.parents[2])},
+            env={**git_environment(), "PYTHONPATH": str(FIX_RETURN.parents[2])},
         )
         self.assertEqual(stopped.returncode, 137, stopped.stdout + stopped.stderr)
 
@@ -280,7 +290,7 @@ class RollForwardTests(unittest.TestCase):
         started = subprocess.run(
             ["bash", "-c", VERIFY_START + verify_start_function(), "verify", str(VERIFY.parent)],
             cwd=self.worktree / "src", capture_output=True, text=True, check=False,
-            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, env={**os.environ, "VERIFY_PYTHON": sys.executable},
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS, env={**git_environment(), "VERIFY_PYTHON": sys.executable},
         )
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         return started.stdout
@@ -380,7 +390,8 @@ class HoldFilterTests(unittest.TestCase):
 
     def test_outstanding_reservation_whose_tip_is_in_head_history_does_not_withhold(self) -> None:
         # A later phase branch holds hook.rs by its tree; an earlier phase's outstanding reservation lists it.
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(tempfile.mkdtemp(prefix="fix-return-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
         git(root, "init", "-q")
         _ = (root / "hook.rs").write_text("earlier phase\n")
         commit_all(root)
@@ -440,7 +451,13 @@ class LocalCopyTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(tempfile.mkdtemp(prefix="fix-return-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, self.root)
+        home = self.root / "home"
+        home.mkdir()
+        self.enterContext(patch.dict(os.environ, {"HOME": str(home)}))
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+            _ = os.environ.pop(key, None)
         self.worktree = self.root / "worktree"
         source = self.worktree / "ws/src"
         source.mkdir(parents=True)
@@ -506,7 +523,7 @@ class LocalCopyTests(unittest.TestCase):
         self.assertEqual(fix_return.return_copy(self.worktree, made.folder, self.read), fix_return.FixNone())
         self.assertFalse(made.folder.exists())
 
-    def test_changed_worktree_refuses_and_deletes_the_copy(self) -> None:
+    def test_changed_worktree_refuses_and_removes_its_own_copy(self) -> None:
         made = self.copy()
         _ = (made.tree / "ws/src/held.rs").write_text("pub(crate) fn held() {}\n")
         _ = (self.worktree / "ws/src/held.rs").write_text("fn held() { edited }\n")
@@ -541,9 +558,9 @@ class LocalCopyTests(unittest.TestCase):
         self.assertIsInstance(made, fix_return.FixFailed)
 
     def stale_copy(self, owner: int) -> Path:
-        folder = fix_return.copy_parent(self.target) / fix_return.COPY_NAME
-        folder.mkdir(parents=True)
-        _ = (folder / fix_return.OWNER_NAME).write_text(str(owner))
+        folder = fix_return.claim_folder(fix_return.copy_parent(self.target), owner).folder
+        (folder / fix_return.TREE_NAME).mkdir()
+        _ = (folder / fix_return.SENT_NAME).write_text("{}")
         _ = (folder / "stale").write_text("left\n")
         return folder
 
@@ -566,6 +583,48 @@ class LocalCopyTests(unittest.TestCase):
         self.assertEqual(made.folder, folder)
         self.assertFalse((folder / "stale").exists())
 
+    def test_drop_removes_its_own_copy(self) -> None:
+        made = self.copy()
+        status = fix_return.main(["drop-copy", "--repo-root", str(self.worktree), "--folder", str(made.folder)])
+        self.assertEqual(status, 0)
+        self.assertFalse(made.folder.exists())
+
+    def test_drop_keeps_a_folder_that_replaced_its_own_copy(self) -> None:
+        made = self.copy()
+        _ = made.folder.rename(made.folder.with_name("original"))
+        made.folder.mkdir()
+        note = made.folder / "keep"
+        _ = note.write_text("replacement")
+        with redirect_stderr(io.StringIO()) as error:
+            status = fix_return.main(["drop-copy", "--repo-root", str(self.worktree), "--folder", str(made.folder)])
+        self.assertEqual(status, 0)
+        self.assertEqual(note.read_text(), "replacement")
+        self.assertIn(f"kept for a manual removal list: {made.folder}", error.getvalue())
+
+    def test_return_and_drop_keep_canaries_and_a_saved_copy(self) -> None:
+        home = Path.home()
+        saved = self.stale_copy(os.getpid())
+        canaries: list[Path] = []
+        for location in (home, home / "rust", home / "worktrees", home / ".claude"):
+            canary = location / "canary"
+            canary.mkdir(parents=True)
+            _ = (canary / "keep").write_text("fixture data")
+            canaries.append(canary)
+        snapshot = (saved / fix_return.SENT_NAME).read_bytes()
+        for folder in (*canaries, saved):
+            for command in ("return-copy", "drop-copy"):
+                with self.subTest(path=folder, command=command), redirect_stderr(io.StringIO()) as error:
+                    status = fix_return.main([command, "--repo-root", str(self.worktree), "--folder", str(folder)])
+                    self.assertEqual(status, int(command == "return-copy" and folder != saved))
+                    notices = [line for line in error.getvalue().splitlines()
+                               if line.startswith("kept for a manual removal list:")]
+                    reason = "the lint copy return ended" if command == "return-copy" else "the lint copy was dropped"
+                    self.assertEqual(notices, [f"kept for a manual removal list: {folder} (fix_return, {reason})"])
+        for canary in canaries:
+            self.assertEqual((canary / "keep").read_text(), "fixture data")
+        self.assertEqual((saved / fix_return.SENT_NAME).read_bytes(), snapshot)
+        self.assertTrue((saved / fix_return.TREE_NAME).is_dir())
+
     def test_member_the_copy_excludes_never_finds_the_worktree_workspace(self) -> None:
         clay = self.worktree / "ws/vendor/clay"
         (clay / "src").mkdir(parents=True)
@@ -585,7 +644,8 @@ class LocalCopyTests(unittest.TestCase):
 
 class ApplyFixTests(unittest.TestCase):
     def test_path_outside_the_worktree_fails(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(tempfile.mkdtemp(prefix="fix-return-fixture-")).resolve()
+        self.addCleanup(shutil.rmtree, root)
         staging = root / "staging"
         staging.mkdir()
         worktree = root / "worktree"

@@ -669,13 +669,15 @@ class GateRecovery:
     rollback: str = ""
     rollback_head: str = ""
     rollback_source: str = ""
+    finished: bool = False
 
     def save(self) -> None:
         write_text_atomic(self.path, json.dumps({
             "repo": self.repo, "pid": self.pid, "start": self.start,
             "groups": self.groups, "folders": self.folders,
             "tokens": [asdict(token) for token in self.tokens], "rollback": self.rollback,
-            "rollback_head": self.rollback_head, "rollback_source": self.rollback_source}) + "\n")
+            "rollback_head": self.rollback_head, "rollback_source": self.rollback_source,
+            "finished": self.finished}) + "\n")
 
     def add_group(self, pid: int) -> None:
         identity = process_start(pid)
@@ -694,7 +696,9 @@ class GateRecovery:
                              status.st_dev, status.st_ino, value.hex())
 
     def recover(self) -> None:
-        """Stop recorded groups before removing their folders and undoing the merge."""
+        """Stop recorded groups, return tokens, and undo the merge."""
+        if self.finished:
+            return
         stopping: set[int] = set()
         for pid, start in self.groups.items():
             identity = process_start(pid)
@@ -722,8 +726,8 @@ class GateRecovery:
                 process_group.send_process_group(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        # A dead leader can leave writers in its group. Wait before deleting their files.
-        for entry in Path("/proc").iterdir():
+        # A dead leader can leave writers in its group.
+        for entry in Path("/proc").iterdir() if stopping else ():
             if not entry.name.isdecimal():
                 continue
             try:
@@ -760,14 +764,7 @@ class GateRecovery:
                     if descriptor >= 0:
                         os.close(descriptor)
         for folder in self.folders:
-            path = Path(folder)
-            try:
-                if not build_folders.remove_build_folder(path, lambda: shutil.rmtree(path)):
-                    raise GateRefused(f"gate recovery kept held folder {path}")
-            except FileNotFoundError:
-                pass
-        self.folders.clear()
-        self.save()
+            report_retained_gate_folder(folder, "the gate owner ended")
         if self.rollback:
             repo = Path(self.repo)
             with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
@@ -786,7 +783,19 @@ class GateRecovery:
                 self.rollback = ""
                 self.save()
             print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
-        self.path.unlink()
+        self.finish()
+
+    def finish(self) -> None:
+        """Keep the recovery record when it names retained folders."""
+        if self.folders:
+            self.finished = True
+            self.save()
+        else:
+            self.path.unlink(missing_ok=True)
+
+
+def report_retained_gate_folder(folder: str, reason: str) -> None:
+    print(f"kept for a manual removal list: {folder} (merge_gate, {reason})", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -822,6 +831,8 @@ def recover_gate_directory(directory: Path) -> None:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         for path in sorted(directory.glob("*.json")):
             data = cast(dict[str, object], json.loads(path.read_text()))
+            if data.get("finished") is True:
+                continue
             pid, start = cast(int, data["pid"]), cast(str, data["start"])
             owner = process_start(pid)
             if isinstance(owner, Unreadable):
@@ -832,9 +843,11 @@ def recover_gate_directory(directory: Path) -> None:
             tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
                                     cast(int, token["inode"]), cast(str, token["value"]))
                       for token in cast(list[dict[str, object]], data["tokens"])]
+            folders = [entry if isinstance(entry, str) else cast(dict[str, str], entry)["path"]
+                       for entry in cast(list[object], data["folders"])]
             recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
                                     {int(group): identity for group, identity in groups.items()},
-                                    cast(list[str], data["folders"]), tokens, cast(str, data["rollback"]),
+                                    folders, tokens, cast(str, data["rollback"]),
                                     cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
             active = ACTIVE_GATE_RECOVERY.set(recovery)
             try:
@@ -878,8 +891,8 @@ def gate_recovery(repo: Path) -> Generator[GateRecovery]:
             yield recovery
         finally:
             ACTIVE_GATE_RECOVERY.reset(token)
-            if not (recovery.groups or recovery.folders or recovery.tokens or recovery.rollback):
-                path.unlink(missing_ok=True)
+            if not (recovery.groups or recovery.tokens or recovery.rollback):
+                recovery.finish()
 
 
 @contextmanager
@@ -909,7 +922,8 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
 def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator[Path]:
     with ExitStack() as cleanup:
         with cancellation.defer_cleanup_signals():
-            folder = cleanup.enter_context(build_folders.tool_folder(tool, parent))
+            request = build_folders.UniqueBuildFolder(f"{tool}-", build_folders.ExplicitBuildParent(parent))
+            folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
             recovery.folders.append(str(folder))
             recovery.save()
         try:

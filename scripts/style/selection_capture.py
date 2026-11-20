@@ -18,6 +18,7 @@ import tempfile
 from typing import Literal, TypedDict, cast
 
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import production_doc, staff
 from scripts.style import refill_inputs, refill_measure, style_config, style_ledger, style_reader, style_rules
 from scripts.style.unit_files import unit_worktrees
@@ -80,9 +81,15 @@ class ReplayReport(TypedDict):
     run: dict[str, object]
 
 
+def git_environment() -> dict[str, str]:
+    """Run Git in the specified checkout."""
+    return {key: value for key, value in os.environ.items()
+            if key not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+
+
 def git(repo: Path, *arguments: str, input: bytes = b"") -> str:
     """Read Git without changing the repository."""
-    return subprocess.run(["git", "-C", str(repo), *arguments], input=input,
+    return subprocess.run(["git", "-C", str(repo), *arguments], input=input, env=git_environment(),
                           capture_output=True, check=True).stdout.decode("utf-8")
 
 
@@ -109,21 +116,43 @@ def repository_files(repo: Path) -> Iterator[Path]:
 
 def board_text(repo: Path) -> str:
     """Read the board through its existing command."""
-    result = subprocess.run(["cargo-berth", "board", "--json"], cwd=repo,
+    result = subprocess.run(["cargo-berth", "board", "--json"], cwd=repo, env=git_environment(),
                             capture_output=True, text=True, check=False)
     return json.dumps(cast(object, json.loads(result.stdout)), sort_keys=True, separators=(",", ":"))
 
 
+class CaptureOutputExists(ValueError):
+    """An existing path prevents publication of the capture."""
+
+
+def capture_output_parent() -> Path:
+    return Path.home() / ".local/state/selection-captures"
+
+
 def capture(repo: Path, ledger: Path, unit: str, folder: Path) -> CaptureManifest:
-    """Copy selection inputs without writing the source ledger or repository."""
-    folder = folder.resolve()
-    folder.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=folder.name + "-", dir=folder.parent) as temporary:
-        sibling = Path(temporary)
-        manifest = capture_inputs(repo, ledger, unit, sibling)
-        if folder.exists():
-            shutil.rmtree(folder)
-        _ = sibling.rename(folder)
+    """Stage the capture and publish it at a new output path."""
+    def output_exists() -> CaptureOutputExists:
+        return CaptureOutputExists(f"{folder} exists. Pick a new path or remove the old path by hand.")
+
+    if os.path.lexists(folder):
+        raise output_exists()
+    parent = capture_output_parent()
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".capture-", dir=parent) as temporary:
+        staged = Path(temporary)
+        manifest = capture_inputs(repo, ledger, unit, staged)
+        try:
+            folder.mkdir(mode=0o700, parents=True)
+        except FileExistsError:
+            raise output_exists() from None
+        for entry in staged.iterdir():
+            if entry.name == "manifest.json":
+                continue
+            if entry.is_dir():
+                _ = shutil.copytree(entry, folder / entry.name)
+            else:
+                _ = shutil.copyfile(entry, folder / entry.name)
+        write_text_atomic(folder / "manifest.json", (staged / "manifest.json").read_text())
     return manifest
 
 
@@ -184,7 +213,7 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
     save(Path.home() / ".gitconfig", "git_configuration")
     xdg = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
     save(xdg / "git/config", "git_configuration", "XDG_CONFIG_HOME", "xdg/git/config")
-    excludes = subprocess.run(["git", "-C", str(repo), "config", "--path", "--get", "core.excludesfile"], capture_output=True, text=True)
+    excludes = subprocess.run(["git", "-C", str(repo), "config", "--path", "--get", "core.excludesfile"], env=git_environment(), capture_output=True, text=True)
     if excludes.returncode == 0:
         save(Path(excludes.stdout.strip()).expanduser(), "ignore")
     regex = refill_inputs.regex_configuration()
@@ -219,7 +248,7 @@ def capture_inputs(repo: Path, ledger: Path, unit: str, folder: Path) -> Capture
             for label, reference in ((f"unit:{row.unit}", row.branch), (f"main:{row.unit}", row.merge_branch),
                                      (f"pushed:{row.unit}", "refs/remotes/origin/" + row.branch)):
                 references[label] = reference
-                resolved = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", reference],
+                resolved = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", reference], env=git_environment(),
                                           capture_output=True, text=True)
                 revisions[label] = resolved.stdout.strip() if resolved.returncode == 0 else "absent"
         revisions["main"] = git(repo, "rev-parse", config.route.branch_point).strip()
@@ -306,7 +335,7 @@ def external_changes(folder: Path, manifest: CaptureManifest) -> list[ExternalCh
             changes.append({"source": "git:status:" + worktree, "expected": hashlib.sha256(expected.encode()).hexdigest(),
                             "actual": hashlib.sha256(actual.encode()).hexdigest()})
     for label, reference in manifest["references"].items():
-        result = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", reference], capture_output=True, text=True)
+        result = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", reference], env=git_environment(), capture_output=True, text=True)
         actual = result.stdout.strip() if result.returncode == 0 else "absent"
         if actual != manifest["revisions"][label]:
             changes.append({"source": "git:" + reference, "expected": manifest["revisions"][label], "actual": actual})
@@ -330,7 +359,7 @@ def replay_environment(folder: Path, reader: style_config.ReaderSource, private:
     config = private / "config"
     _ = shutil.copytree(folder / "config", config)
     refill_measure.select_reader(config, reader)
-    environment = {key: value for key, value in os.environ.items() if key not in OBSERVATION_VARIABLES}
+    environment = {key: value for key, value in git_environment().items() if key not in OBSERVATION_VARIABLES}
     environment.update(manifest["environment"])
     environment.update(CONF_DIR=str(config), STAFF_FILE=str(folder / "staff.json"),
                        STYLE_HISTORY_NATE_STYLE_DIR=str(folder / "rules"), STYLE_LEDGER_STATE_DIR=str(private / "state"),
@@ -423,7 +452,7 @@ def main() -> int:
             result = replay(args.folder, args.reader, args.workspace, stages=args.stages)
         else:
             result = measure_capture(args.folder, args.reader, args.workspace, stages=args.stages)
-    except UnsupportedCaptureFormat as error:
+    except (UnsupportedCaptureFormat, CaptureOutputExists) as error:
         parser.exit(2, f"{parser.prog}: {error}\n")
     print(json.dumps(result, sort_keys=True))
     return 0

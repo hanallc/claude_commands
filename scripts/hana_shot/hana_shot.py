@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import secrets
 import shutil
 import signal
 import socket
@@ -2446,8 +2447,7 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
         except staff.StaffUnreadable:
             pass
     with ExitStack() as cleanup:
-        # The app reads this folder after launch returns, so it must outlive this process.
-        # shutdown removes it; the deadline bounds a forgotten app.
+        # Keep the folder after a successful launch. Hana still reads it.
         launch_folder = scratch.new(word=f"hana-shot-{port}")
         _ = cleanup.callback(shutil.rmtree, launch_folder, ignore_errors=True)
         config = launch_folder / "config"
@@ -2492,7 +2492,7 @@ def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "
             return state, process
         except BaseException:
             if process is not None:
-                shutdown(port, process, hana_shot_settings=hana_shot_settings)
+                shutdown(port, process, owned_folder=launch_folder, hana_shot_settings=hana_shot_settings)
             raise
 
 
@@ -2549,10 +2549,22 @@ def same_binary(pid: int, binary: str) -> bool:
         return False
 
 
+def report_retained_launch_folder(path: Path, reason: str) -> None:
+    print(f"kept for a manual removal list: {path} (hana_shot, {reason})", file=sys.stderr)
+
+
+def retain_launch_state(state_path: Path, state: LaunchState) -> None:
+    """Save the ended launch record outside the active launch lookup."""
+    retained = state_path.parent / "retained"
+    retained.mkdir(mode=0o700, exist_ok=True)
+    _write_launch_state(retained / f"{state_path.stem}-{secrets.token_hex(8)}.json", state)
+
+
 def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
+    owned_folder: Path | Literal["saved_launch"] = "saved_launch",
     hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
-    """Stop a launched Hana, show any panic lines from its log, and remove its scratch."""
+    """Stop Hana and show any panic lines. Keep folders from saved launch records."""
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
     check_port(port, hana_shot_settings=hana_shot_settings)
@@ -2619,7 +2631,10 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None, *,
             print(f"hana_shot: Hana on port {port} logged a panic:", file=sys.stderr)
             for line in lines:
                 print(f"  {line}", file=sys.stderr)
-        shutil.rmtree(state["scratch"], ignore_errors=True)
+        folder = Path(state["scratch"])
+        if folder != owned_folder:
+            retain_launch_state(state_path, state)
+            report_retained_launch_folder(folder, "Hana shut down")
     else:
         deadline = time.monotonic() + shutdown_seconds
         while port_answers(port, hana_shot_settings=hana_shot_settings):
@@ -2656,14 +2671,19 @@ def instance(port: int, launch_first: bool, shutdown_after: bool, worktree: str 
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
     check_port(port, hana_shot_settings=hana_shot_settings)
-    process: subprocess.Popen[bytes] | None = None
-    if launch_first:
-        _, process = launch(port, worktree, binary, purpose, owner, hana_shot_settings=hana_shot_settings)
-    try:
-        yield Brp(port, settings=hana_shot_settings)
-    finally:
-        if shutdown_after:
-            shutdown(port, process, hana_shot_settings=hana_shot_settings)
+    with ExitStack() as cleanup:
+        process: subprocess.Popen[bytes] | None = None
+        owned_folder: Path | Literal["saved_launch"] = "saved_launch"
+        if launch_first:
+            state, process = launch(port, worktree, binary, purpose, owner, hana_shot_settings=hana_shot_settings)
+            if shutdown_after:
+                owned_folder = Path(state["scratch"])
+                _ = cleanup.callback(shutil.rmtree, owned_folder, ignore_errors=True)
+        try:
+            yield Brp(port, settings=hana_shot_settings)
+        finally:
+            if shutdown_after:
+                shutdown(port, process, owned_folder=owned_folder, hana_shot_settings=hana_shot_settings)
 
 
 # ---------------------------------------------------------------------------
