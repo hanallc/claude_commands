@@ -42,7 +42,7 @@ from scripts.production.update_registration import QuestionStaff, RegistrationFa
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import berth_board
-from scripts.worktree.worktrees import release_worktree_pair
+from scripts.worktree.worktrees import main_checkout, release_worktree_pair
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
 
@@ -524,6 +524,20 @@ class PreparedWrapUnit(NamedTuple):
     retirement: unit_config.RetiredSession
 
 
+def require_retirable_worktrees(production: Production, rows: tuple[UnitRow, ...]) -> None:
+    try:
+        protected = production_doc.protected_checkouts()
+    except production_doc.ProductionPathsError as error:
+        raise LifecycleStop("retire", "held", str(error)) from error
+    repository = main_checkout(production.checkout)
+    for unit in rows:
+        path = unit.worktree.resolve()
+        for checkout in protected:
+            if checkout.path.is_relative_to(path) or (
+                    checkout.repository == repository and checkout.branch == unit.branch):
+                raise LifecycleStop("retire", "held", f"{unit.name}: protected integration checkout {checkout.path}")
+
+
 def prepare_wrap_units(production: Production, rows: tuple[UnitRow, ...]) -> tuple[PreparedWrapUnit, ...]:
     """Validate all retirement evidence before the first worktree is removed."""
     prepared: list[PreparedWrapUnit] = []
@@ -603,6 +617,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         raise LifecycleStop("wrap", "held", "merge branch does not exist")
     runner = production.owner
     rows = units(runner, record)
+    require_retirable_worktrees(production, rows)
     checkpoints = merged_checkpoints(production, record=record)
     if isinstance(status, ProductionRunning):
         for item in close_out_items(lines):
@@ -635,6 +650,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         _ = capture_release(production.name, record=record)
     for item in prepared:
         unit = item.unit
+        require_retirable_worktrees(production, (unit,))
         _ = stop_resume.stop_unit_workers(unit.member.id, record)
         remaining = worker_panes.observe(unit.member.id, staff.snapshot()) if record.find(kind="worker", parent=unit.member.id) else []
         if any(isinstance(state, (worker_panes.OpenWorker, worker_panes.UncertainWorker)) for state in remaining):
