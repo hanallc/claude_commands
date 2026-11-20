@@ -571,42 +571,9 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
   1. Each number names its source run or record.
   2. The fixed cost times 840 modules plus the outside work, compared with the 6,452 CPU s gate mean.
 
-### Phase 399 — each riser of the 11-16 to 11-19 rise has a cause  · status: todo
-**Depends on:** none
+### Phase 399 — each riser of the 11-16 to 11-19 rise has a cause  · status: done (no change)
 
-#### Work Order
-
-**Goal:** one report gives one cause for each named riser, and one cause or "not found" for the broad +24% rise in 798 unchanged modules. Predicted saving: 0 CPU in this phase (measure). The rise is about 1,410 CPU s for each green AWS full gate (measured means, AWS: 5,602 less 4,192). That is about 200,000 CPU s each day at 150 gates (computed).
-
-**Spec:**
-1. Change no repository file. Use read-only queries of the buildlog index and `git log` on origin/main.
-2. Open the index with `scripts/buildlog/index.py` `read_only()`. Read the column lists `GATE_RUN_COLUMNS`, `GATE_MODULE_COLUMNS` and `GATE_TEST_COLUMNS` in that file before the first query.
-3. Confirm the day table first. Mean CPU of green AWS full gates by day: 11-15 4,513; 11-16 4,192; 11-17 4,318; 11-18 5,055; 11-19 5,602. If your values differ, give the query and both values in the report.
-4. Named risers, AWS module median CPU s, 11-16 to 11-19: slot_order 0 to 155.6; statusline 36.7 to 153.5; list_page 0 to 97.2; verify_doc_checkout 7.7 to 59.2; offload_cleanup 7.1 to 37.4; verify_lint_repair_grant 0 to 28.1; test_copies 23.5 to 42.0; models_registry 8.1 to 26.1; worktrees 11.2 to 27.6. The top 30 risers sum to 744 s. The 45 new modules sum to 339 s.
-5. For each named riser, run `git log --since=2026-11-16 --until=2026-11-20 origin/main -- <test module> <its support> <its source>`. Name the commit that fits the first day of the rise. Class the cause: test file, source of another unit, or new module.
-6. For a new module (0 on 11-16), the cause is the commit that added it. List its tests of 0.5 s or more from `gate_tests`.
-7. statusline: Phase 365 commits 0fa6239249, ab170ab869, 5671102e4d and fd04c696b0 brought natedev back to 41 to 51 s on 11-20. AWS has no record after the fix. Record it as "fixed on natedev; AWS not confirmed".
-8. Broad rise. The 798 modules present on all five days went from 4,149 to 5,166 s. The median module ratio is 1.15. Of 510 modules above 1 s, 197 rose more than 20%. The box had 16 vCPU on both days.
-9. Test these causes from records, in this order. State for each the record that confirms it or rules it out.
-   - A fixed cost for each module: compare the rise in seconds with the test count of each module. A constant rise in small modules points to module start.
-   - Box load: count the gates that ran at the same time on one box, and compare CPU with wall time for each run.
-   - A commit in shared start code in the window: `scripts/test_times/module_run.py`, the gate's module environment in `merge_gate.py`, `sitecustomize`, and the `scripts/lib` modules that most tests import.
-   - A box image or Python change: commits under `scripts/aws_target` and its config in the window.
-   - Host check: compute the same 798-module ratio on natedev for the same days. A rise on both hosts points to code. A rise on AWS only points to the box.
-10. Run a module only when the records cannot separate two causes. Then measure one module with `module_cost.py` on the 11-16 tree and on the 11-19 tree. This run needs natemerge's go, the unit's one build-queue item, and `systemd-run --user --scope -p MemoryMax=2G`.
-11. Report: one row for each riser (module, two medians, commit, cause class). For each test-file cause, write the Goal line of a Lane A phase. For each cause in another unit's source, write the message to builds with the commit and the two numbers. For the broad rise, write one cause or "not found".
-
-**Files:**
-- `scripts/buildlog/index.py`, `scripts/test_times/show.py`, `scripts/test_times/gate_record.py` — read only; no file changes, and the report goes in the session folder of this phase
-
-**Workers:** 1 writer. One set of queries; nothing splits.
-- `impl` — the queries and the report.
-
-**State:** none.
-
-**Constraints from prior phases:** The last AWS gate record is from 2026-11-19 09:08 UTC (AWS hold). `show.py top --host aws` reads 7 days, so query the index for the days by date. Never give an AWS number and a natedev number as before and after. Use Phase 398's split of one module start if its report exists. No test run starts without natemerge's go (rule 2).
-
-**Acceptance gate:** each number names its query or its commit; each of the nine risers has one cause with a commit hash, or "not found" with the checks made; the broad rise has one cause with its records, or "not found" with the record that rules out each cause of step 9; `git status` shows no changed file.
+**As built:** no code change. The report is `/session/natest/testcount/rise_report_399.md`. Mean CPU of a green AWS full gate rose 1,409 s (4,192 on 11-16 to 5,602 on 11-19). New modules: `copies/test_slot_order.py` (155.6 s, commits 2e49fd46c5 and bddbd51cf1), `review_links/test_list_page.py` (97.2, 9b2b208a45), `direct/test_verify_lint_repair_grant.py` (28.1, 891fa52702). Test file causes: `direct/test_verify_doc_checkout.py` (7.7 to 59.2, 0eeaf8919e and bddbd51cf1), `lib/test_models_registry.py` (8.1 to 26.1, 5bd2d6b09a), `worktree/test_worktrees.py` (11.2 to 27.6, 7f9f08a714). Source of another unit: statusline (2b7e107c94; one AWS gate after the Phase 365 repair gave 53.9 s), offload cleanup (aa09eeedf2), copies (bddbd51cf1). The broad rise has no cause: 798 common modules rose from 4,149 to 5,166 s, median ratio 1.135 on AWS and 1.407 on natedev. Module start explains about 19 s. No two AWS runs shared a box. A rise on both hosts points to code; Phase 407 measures it.
 
 ### Phase 400 — the Lane A target from the top list halves its AWS CPU  · status: todo
 **Depends on:** none
@@ -819,3 +786,32 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 **Constraints from prior phases:** builds made natest the owner on 2026-11-20, because Phase 355 renames the gate code and one owner keeps the order. The user approved the change and its risk on 2026-11-20: a defect outside the selected modules reaches main, and the nightly gate finds it. The change is merged to main only after Phase 355 is on main. The box result reader merges before the writer: natedev reads with main and the box writes with candidate code, so keep the record readable by both. aws reviews the `gate_box.py` and `cloud_gate.py` side before the hash. No test run starts without natemerge's go.
 
 **Acceptance gate:** the four tests pass in 20 repeated runs with each importer of changed code, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`; basedpyright gives zero errors and zero warnings on changed files; one blind review and the aws review have no open finding; the full gate that builds runs for the merge passes. After the phase is merged to main, the director writes in the next file the mean modules for each AWS merge gate and the count of nightly reds that no merge gate selected.
+
+### Phase 407 — the broad CPU rise in unchanged modules has a measured cause  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** one report names the code change that made unchanged modules use more CPU from 11-16 to 11-19, or shows that none did. Predicted saving: 0 CPU in this phase (measure). The broad rise is about 1,018 CPU s for each AWS full gate (measured, AWS: 798 common modules, 4,149 to 5,166 s).
+
+**Spec:**
+1. Read `/session/natest/testcount/rise_report_399.md`, sections 3 and 7. Section 7 holds the run commands.
+2. Take 6 modules whose test files and source did not change in the window and whose AWS median rose more than 20%: 3 that start many shell processes and 3 that start none.
+3. Run each with `module_cost.py --tests 20 --commands 20` on the tree of the last 11-16 gate and on the tree of the last 11-19 gate, in private clones, fresh TMPDIR on /tmp, bytecode on.
+4. Compare for each module: CPU, process starts, execs, and CPU for each command group. Name the command group that holds the rise.
+5. When a group holds the rise, find the commit with `git log` between the two trees on the files that the group runs. Candidates from Phase 399: 51a28f5e8c and 70e6c54344 (runner folders from the leased allocator), and shell start files.
+6. When natedev shows no rise between the two trees, state that the cause is outside the tree (box image, kernel, load) and list what the records can and cannot show.
+7. Change no repository file.
+
+**Files:**
+- `scripts/test_times/module_cost.py`, `scripts/test_times/module_run.py` — read and run only; no file changes, and the report goes in the session folder of this phase
+
+**Workers:** 1 writer. One measure; nothing splits.
+- `impl` — the runs and the report.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 399 ruled out a fixed module start cost (about 19 s of the rise) and shared boxes on AWS. The runs need natemerge's go, the unit's one build-queue item, and `systemd-run --user --scope -p MemoryMax=2G`. Never give a natedev number as an AWS number.
+
+**Acceptance gate:** the report gives both numbers for each of the 6 modules with host and tree; it names one commit with the command group that holds the rise, or states "no rise between the trees on natedev" with the numbers; `git status` shows no changed file.
+
