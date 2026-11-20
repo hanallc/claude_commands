@@ -3268,6 +3268,13 @@ Keep the registry error and recovered omission rows. Item 2 keeps the 44cu rows 
 
 Tests: one row in `test_end_reports_held_work_and_continues_after_a_removal_error` (test_scratch.py:1849) for item 1, failing first. Item 2 needs no row (no user-visible result); the item 1 row covers the path.
 
+### Phase 44dr — Placement sees every held coordinator lease  · status: todo
+**From the 44dm closure (pass 2), 2026-11-19:** the builds landing rule moves this gap out of 44dm. After 44dm merges.
+
+1. The coordinator lease lookup reads the kernel lock table once (scripts/mac_test/eligibility.py:272). The lock helper documents that the kernel can omit a holder line (scripts/lib/file_lock.py:99). Then placement can assign a run that offload at once refuses as `busy` (offload.py:3181); the retry recovers, and the exclusive lease still protects the mirror. Fix: read the lease as the lock helper documents, in one place that both readers use, with no extra read in the common case.
+
+Tests: one row in the existing coordinator lease rows (scripts/mac_test/test_mac_test.py:1342) for an omitted holder line, failing first.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
