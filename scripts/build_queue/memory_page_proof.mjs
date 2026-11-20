@@ -312,12 +312,18 @@ try {
                       && staffBounds.right <= tipBounds.right && staffColor !== getComputedStyle(tooltip).color},
                   verbs:[cell('row',running).textContent,cell('row',mac).textContent,
                     waiterCell.textContent,cell('wait',direct).textContent],
+                  waitingAbout:waiting.about, waitingCaption:tooltip.querySelector('.caption')?.textContent,
+                  macAbout:mac.about,
                   macFields:tooltipRows('row:' + mac.key, latest).map(({label,value}) => [label,value]),
                   facts:waiting.verify,clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
               })()`);
               assert.deepEqual(result.headers, ['Verify','Verify']);
               assert.deepEqual(result.verbs, ['final','test','final','']);
-              assert.deepEqual(result.macFields.slice(1), [['Step','nextest'],['Call','verify test sample --no-cache']]);
+              assert.equal(result.waitingAbout, 'Checks the workspace targets and runs the selected tests.');
+              assert.equal(result.macAbout, 'Runs the selected tests.');
+              assert.equal(result.waitingCaption, result.waitingAbout);
+              assert.deepEqual(result.macFields.slice(1), [
+                ['',result.macAbout],['Step','nextest'],['Call','verify test sample --no-cache']]);
               const {fields, facts, staff} = result;
               assert.deepEqual([staff.title, staff.unit, staff.visible], ['builder', 'builder', true]);
               assert.equal(fields.find(field => field.label === 'Runs on').value, 'natedev only');
@@ -2614,7 +2620,7 @@ try {
         const gateReading=structuredClone(base);
         const gateIndex=gateReading.walk.findIndex(row=>row.queued);
         assert.ok(gateIndex>=0,'The base reading has no queued run.');
-        const gateAbout='Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc.';
+        const gateAbout='Merges the checkpoint into the sdlc branch, runs every test module, then pushes sdlc.';
         const gateRow=gateReading.walk[gateIndex];
         Object.assign(gateRow,{name:'natemerge integrate',unit:'natemerge',title:{unit:'natemerge',step:'integrate'},
           about:gateAbout,changes:'sdlc branch',showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,
