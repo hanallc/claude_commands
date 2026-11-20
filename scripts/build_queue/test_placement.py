@@ -49,9 +49,9 @@ class PlacementFixture(AdmissionFixture):
 
     read_host_evidence: Callable[[placement.HostEvidenceKey], placement.HostEvidence]
 
-    def __init__(self) -> None:
+    def __init__(self, *, fixture_defaults_only: bool = False) -> None:
         self.provider_evidence: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
-        super().__init__()
+        super().__init__(fixture_defaults_only=fixture_defaults_only)
 
     @override
     def read_provider(self, key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -2320,9 +2320,33 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             assert isinstance(completed, wire.DispatchStatus)
             self.assertEqual(completed.state, placement.ClosedAssignment("completed"))
 
+    def test_adapter_authorization_cannot_become_a_coordinator_launch(self) -> None:
+        with PlacementFixture(fixture_defaults_only=True) as fixture:
+            request = placement_request(fixture)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            claim = adopt_assignment(fixture, request, assignment)
+            consume = consume_permission("adapter-authorization", assignment, claim)
+            self.assertEqual(fixture.connect(consume).replies(), [wire.FirstAuthorization(assignment, claim)])
+
+            upgrade = replace(request, constraints=replace(request.constraints, command_kind="run"))
+            for retry in (request, upgrade):
+                reply, = fixture.connect(retry).replies()
+                self.assertIsInstance(reply, wire.PlacementWait)
+
+            fixture.restart()
+            reply, = fixture.connect(upgrade).replies()
+            self.assertIsInstance(reply, wire.PlacementWait)
+            self.assertEqual(fixture.connect(wire.CancelPlacement(
+                "coordinator-cancel", request.episode, request.owner, "fixture cancel")).replies(), [wire.Ok()])
+            status, = fixture.connect(consume).replies()
+            assert isinstance(status, wire.DispatchStatus)
+            self.assertEqual(status.state, placement.CurrentAssignment())
+            self.assertEqual(status.reason, "launch permission was already consumed")
+
     def test_coordinator_retries_a_lost_mac_assignment_with_either_switch_value(self) -> None:
         for switch in ("on", "off"):
-            with self.subTest(switch=switch), PlacementFixture() as fixture:
+            with self.subTest(switch=switch), PlacementFixture(fixture_defaults_only=True) as fixture:
                 request = placement_request(fixture)
                 request = replace(request, constraints=replace(request.constraints,
                     command_kind="run", selection=placement.PinnedHost("mac")))
@@ -2340,6 +2364,25 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 if switch == "off":
                     _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.mac=off\n")
 
+                self.assertEqual(fixture.connect(request).replies(), [wire.Assignment(saved.assignment)])
+                self.assertEqual(service.read_state(fixture.state_dir).assignments[key].permission, saved.permission)
+
+                for constraints in (
+                    replace(request.constraints, command=("cargo", "run", "--release")),
+                    replace(request.constraints, command_kind="shot"),
+                    replace(request.constraints, command_kind=placement.CommandKindNotSent()),
+                    replace(request.constraints, source_key=execution_identity.SourceKeyKnown("source-b")),
+                ):
+                    with self.subTest(constraints=constraints):
+                        self.assertEqual(fixture.connect(replace(request, constraints=constraints)).replies(),
+                            [wire.Refused("Mac launch request changed its owner, source or command")])
+
+                claim = placement.assigned_claim_reference(saved.assignment)
+                status, = fixture.connect(consume_permission("adapter-retry", saved.assignment, claim)).replies()
+                assert isinstance(status, wire.DispatchStatus)
+                self.assertEqual(status.reason, "launch permission was already consumed")
+
+                fixture.restart()
                 self.assertEqual(fixture.connect(request).replies(), [wire.Assignment(saved.assignment)])
                 self.assertEqual(service.read_state(fixture.state_dir).assignments[key].permission, saved.permission)
 

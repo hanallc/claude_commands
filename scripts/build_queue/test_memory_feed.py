@@ -2217,22 +2217,6 @@ process.stdout.write(JSON.stringify({
                         self.assertNotIn("mac_state", row)
                     self.assertEqual(row.get("mac_text"), "")
 
-    def test_the_page_reason_names_the_mac_switch(self) -> None:
-        routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
-        with mock.patch.object(target_availability.build_targets, "step_policy",
-                               return_value=target_config.ExcludedTarget(MAC, "off")):
-            for route, eligible_targets, runs_on in (
-                (target_config.ANY_ELIGIBLE_TARGET, ["natedev"], "natedev only"),
-                (target_config.MAC_ONLY, [], ""),
-                (target_config.PinnedTarget("mac"), [], ""),
-            ):
-                with self.subTest(route=route):
-                    notes = memory_feed.target_notes(route, routes, "nextest", "/fixture/hana", "hana")
-                    self.assertEqual(notes["because"], "enabled.mac is off")
-                    self.assertEqual(notes["mac_text"], "Mac: no, enabled.mac is off")
-                    self.assertEqual(notes["targets"], eligible_targets)
-                    self.assertEqual(notes["runs_on"], runs_on)
-
     def test_target_notes_name_what_holds_the_mac_only_for_a_mac_only_step_while_something_holds_it(self) -> None:
         routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
         with mock.patch.object(routes, "holds", return_value="busy with check cargo-handler"):
@@ -3458,6 +3442,49 @@ process.stdout.write(JSON.stringify({
         page = cast(dict[str, object], json.loads(memory_feed.page_json(payload)))
         self.assertEqual(page["cap"], {"kind": "CapUnavailable", "runs": []})
         self.assertIn("PressureNotRecorded", json.dumps(page["psi"]))
+
+
+class MemoryMacSwitchTests(unittest.TestCase):
+    def read_routes(self, switch: str, snapshots: target_availability.Snapshots) -> target_availability.MacRoutes:
+        with tempfile.TemporaryDirectory() as directory:
+            _ = (Path(directory) / "build_targets.conf").write_text(
+                f"enabled.mac={switch}\nplatform.other-mac=macos\n")
+            with mock.patch.dict(os.environ, {"CONF_DIR": directory}):
+                disabled = target_availability.read_disabled_mac_targets()
+        return target_availability.MacRoutes(snapshots, {}, UTC, disabled_mac_targets=disabled)
+
+    def test_mac_only_and_mac_pinned_rows_obey_the_switch_for_every_step_kind(self) -> None:
+        snapshots = (snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free()))
+        steps = sorted(RECORDED_VERBS | set(placement.STEP_COMMAND_KINDS) | set(placement.MAC_RUN_KINDS)
+                       | {"nextest", "mend", ""})
+        for switch in ("off", "on"):
+            routes = self.read_routes(switch, snapshots)
+            for step in steps:
+                for route in (target_config.MAC_ONLY, target_config.PinnedTarget("mac")):
+                    with self.subTest(switch=switch, step=step, route=route):
+                        notes = memory_feed.target_notes(route, routes, step, "/fixture/hana", "hana")
+                        if switch == "off":
+                            self.assertEqual(notes, {"runs_on": "", "targets": [],
+                                "because": "enabled.mac is off", "mac_text": "Mac: no, enabled.mac is off"})
+                        else:
+                            self.assertEqual(notes, {"runs_on": "Mac only", "targets": ["mac"],
+                                "because": "", "mac_text": "Mac: no block or claim recorded"})
+
+    def test_mac_switch_excludes_new_work_when_the_target_snapshot_is_unreadable(self) -> None:
+        routes = self.read_routes("off", target_availability.SnapshotsUnreadable("targets unavailable"))
+        for route, targets_for_step in (
+            (target_config.MAC_ONLY, ()),
+            (target_config.PinnedTarget("mac"), ()),
+            (target_config.PinnedTarget("other-mac"), ()),
+            (target_config.ANY_ELIGIBLE_TARGET, ("natedev",)),
+        ):
+            for step in ("run", "nextest"):
+                with self.subTest(route=route, step=step):
+                    notes = memory_feed.target_notes(route, routes, step, "/fixture/hana", "hana")
+                    self.assertEqual(notes["targets"], list(targets_for_step))
+                    self.assertEqual(notes["because"], "enabled.mac is off")
+        notes = memory_feed.target_notes(target_config.PinnedTarget("hana-gpu"), routes, "run", "/fixture/hana", "hana")
+        self.assertEqual(notes["targets"], ["hana-gpu"])
 
 
 class BuildsPageProofTests(unittest.TestCase):

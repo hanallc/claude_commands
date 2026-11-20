@@ -43,9 +43,9 @@ def _template(name: str) -> Path:
 TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
 
 
-def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
-    """Merge committed defaults, test defaults, existing settings, then explicit overrides. Keep each setting's explicit limit."""
-    source = _template(f"{template}.conf" if template else path.name)
+def write_config_fixture(path: Path, overrides: str = "", *, template: str | Path | None = None) -> int:
+    """Merge fixture defaults, test defaults, existing settings and explicit overrides. Keep each setting's limit."""
+    source = template if isinstance(template, Path) else _template(f"{template}.conf" if template else path.name)
     lines = source.read_text().splitlines() if source.exists() else []
     existing = path.read_text() if path.exists() else ""
     limit_prefixes = ("# whole:", "# range:", "# one of:")
@@ -133,26 +133,30 @@ def commit_config_fixture(path: Path) -> None:
                            capture_output=True, env=environment, timeout=TEST_HANG_GUARD_SECS)
 
 
-def config_environment(root: Path) -> dict[str, str]:
-    """Give subprocess fixtures their own complete configuration folder."""
+def config_environment(root: Path, *, fixture_defaults_only: bool = False) -> dict[str, str]:
+    """Give subprocesses a private configuration folder."""
     folder = root
-    names = {source.name for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf")}
-    names.update((ADMISSION_CONFIG_FIXTURE.name, TARGETS_CONFIG_FIXTURE.name))
+    fixtures = {source.name: source for source in (ADMISSION_CONFIG_FIXTURE, TARGETS_CONFIG_FIXTURE)}
+    names = set(fixtures)
+    if not fixture_defaults_only:
+        names.update(source.name for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"))
     for name in sorted(names):
         destination = folder / name
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if name in TEST_CONFIG_DEFAULTS:
+            if fixture_defaults_only:
+                _ = write_config_fixture(destination, template=fixtures[name])
+            elif name in TEST_CONFIG_DEFAULTS:
                 _ = write_config_fixture(destination)
             else:
                 _ = destination.write_bytes(_template(name).read_bytes())
     return {"CONF_DIR": str(folder), "BUILD_TARGETS_CONFIG": str(folder / "build_targets.conf")}
 
 
-def gate_isolation_environment(root: Path) -> dict[str, str]:
+def gate_isolation_environment(root: Path, *, fixture_defaults_only: bool = False) -> dict[str, str]:
     """Keep a gate subprocess outside the caller's holds and session records."""
     return {
-        **config_environment(root),
+        **config_environment(root, fixture_defaults_only=fixture_defaults_only),
         **private_ci_environment(root),
         "BUILD_HOLD_DIR": str(root / "holders"),
         "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -184,7 +188,8 @@ def write_pressure_reading(path: Path, *, full_avg10: float = 0.0, some_avg10: f
 
 def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
                          total_kib: int = 67108864, full_avg10: float = 0.0,
-                         swap_total_kib: int = 0, swap_free_kib: int = 0, some_avg10: float = 0.0) -> dict[str, str]:
+                         swap_total_kib: int = 0, swap_free_kib: int = 0, some_avg10: float = 0.0,
+                         fixture_defaults_only: bool = False) -> dict[str, str]:
     meminfo = root / "meminfo"
     pressure = root / "pressure"
     vmstat = root / "vmstat"
@@ -193,7 +198,7 @@ def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
                           + f"SwapTotal: {swap_total_kib} kB\nSwapFree: {swap_free_kib} kB\n")
     write_pressure_reading(pressure, full_avg10=full_avg10, some_avg10=some_avg10)
     return {
-        **config_environment(root),
+        **config_environment(root, fixture_defaults_only=fixture_defaults_only),
         **private_ci_environment(root),
         "BUILDLOG_MEMINFO": str(meminfo),
         "BUILDLOG_VMSTAT": str(vmstat),

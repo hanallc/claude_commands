@@ -351,11 +351,11 @@ class SocketPeer:
 class AdmissionFixture(ExitStack):
     """Every server test uses this temporary state, socket, clock and owner set."""
     def __init__(self, *, root: Path | None = None, log_dir: Path | None = None,
-                 skip_idle_spacing: bool = False) -> None:
+                 skip_idle_spacing: bool = False, fixture_defaults_only: bool = False) -> None:
         super().__init__()
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
-        if configuration := os.environ.get("CONF_DIR"):
+        if not fixture_defaults_only and (configuration := os.environ.get("CONF_DIR")):
             _ = config_environment(Path(configuration))
         self.root: Path = root if root is not None else Path(self.enter_context(tempfile.TemporaryDirectory()))
         self.temporary: Path = self.root / "tmp"
@@ -378,8 +378,9 @@ class AdmissionFixture(ExitStack):
         memory = ({"BUILDLOG_MEMINFO": str(self.root / "meminfo"),
                    "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure")}
                   if (self.root / "meminfo").exists() else fake_memory_readings(
-                      self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024))
-        environment = {**gate_isolation_environment(self.root), **memory,
+                      self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024,
+                      fixture_defaults_only=fixture_defaults_only))
+        environment = {**gate_isolation_environment(self.root, fixture_defaults_only=fixture_defaults_only), **memory,
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(self.root / "live-memory-reads.jsonl"),
             "LINT_CONFIG_READER": str(Path(__file__).resolve().parents[1] / "lint/lint_config.sh"),

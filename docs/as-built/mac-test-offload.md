@@ -486,6 +486,7 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 The admission service reads `enabled.mac` in `config/build_targets.conf` at first launch authorization.
 When the value is `off`, the service refuses new placed work with `enabled.mac is off`.
 A run with launch authorization can finish after the value changes.
+The Memory feed removes the Mac from the targets for new work, even when the target snapshot is unreadable.
 Status reads continue.
 
 Use `mac_queue_run.py --manual` with `--kind shot`, `install`, `probe`, or `run` for a command you type.
@@ -495,6 +496,8 @@ These commands skip the switch and still check capacity.
 Automated commands omit `--manual` and use the switch.
 The nightly slot sweep is an automated command.
 For commands from `mac_queue_run.py`, the reply that supplies the assignment also authorizes launch.
+The service can repeat that reply to the same coordinator for the same source and command.
+An adapter claim authorizes launch through the first reply to its claim request.
 
 ### `config/mac_test.conf`
 

@@ -1143,6 +1143,7 @@ class DeferredOwnerRequest:
 class ParkedPlacement:
     """A placement request whose reply waits for the next pass."""
     request: wire.PlacementRequest
+    requested_constraints: placement.PlacementConstraints
     connection: Connection
 
 
@@ -2237,7 +2238,7 @@ class AdmissionServer:
         parked, self.parked_placements = self.parked_placements, []
         for item in parked:
             if not item.connection.finished and item.connection.socket.fileno() >= 0:
-                self._send(item.connection, self._placement_reply(item.request,
+                self._send(item.connection, self._placement_reply(item.request, item.requested_constraints,
                     self.local_hold_holders.get(item.request.episode, placement.ResourceHolderUnknown())))
 
     def _pass(self, configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration
@@ -3588,7 +3589,8 @@ done
             if not self._placement_owner_live(request.owner):
                 if saved is not None:
                     if ((isinstance(saved.permission, placement.PermissionAvailable)
-                         or coordinator_runs_mac_command(request, saved.assignment.destination))
+                         or (isinstance(saved.provider, placement.NoProviderClaim)
+                             and coordinator_runs_mac_command(request, saved.assignment.destination)))
                             and not self._start_pending(saved)):
                         self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"))
                     else:
@@ -3632,8 +3634,9 @@ done
         self.current_assignments[request.episode] = key
         return assignment
 
-    def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
-                         ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
+    def _placement_reply(self, request: wire.PlacementRequest, requested_constraints: placement.PlacementConstraints,
+                         local_holder: placement.ResourceHolder
+                         ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.Refused:
         diagnostics = tuple(evidence.provider_diagnostic
             for candidate in self.placement_eligibility.get(request.episode, ())
             if candidate.destination.provider != "local" and isinstance(candidate.eligibility, placement.TemporaryExclusion)
@@ -3699,7 +3702,13 @@ done
                 assert isinstance(replay.reply, wire.Admitted)
                 return wire.LocalPlacementGranted(saved.assignment, replay.reply, diagnostics, disk_exclusions, stale_hana)
             coordinator_runs = coordinator_runs_mac_command(request, saved.assignment.destination)
-            if coordinator_runs:
+            if coordinator_runs and isinstance(saved.provider, placement.NoProviderClaim):
+                # The saved request keeps the command once it has an explicit kind.
+                if (request.owner != saved.assignment.owner
+                        or requested_constraints.source_key != saved.assignment.source_key
+                        or requested_constraints.command != request.constraints.command
+                        or requested_constraints.command_kind != request.constraints.command_kind):
+                    return wire.Refused("Mac launch request changed its owner, source or command")
                 if isinstance(saved.permission, placement.PermissionAvailable):
                     refusal = self._mac_launch_refusal(request, saved)
                     if isinstance(refusal, wire.DispatchStatus):
@@ -3708,7 +3717,7 @@ done
                     key = execution_identity.attempt_key(saved.assignment.episode, saved.assignment.attempt)
                     self.assignments[key] = replace(saved, permission=placement.PermissionConsumed(self.clock.now()))
                     self.persist()
-            elif isinstance(saved.permission, placement.PermissionConsumed):
+            elif coordinator_runs or isinstance(saved.permission, placement.PermissionConsumed):
                 return wire.PlacementWait(request.episode, request.since, 1,
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
@@ -4198,7 +4207,8 @@ done
                 saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
                 if saved is not None and (isinstance(saved.permission, placement.PermissionAvailable)
                         or saved.assignment.destination.provider == "local"
-                        or coordinator_runs_mac_command(submitted, saved.assignment.destination)):
+                        or (isinstance(saved.provider, placement.NoProviderClaim)
+                            and coordinator_runs_mac_command(submitted, saved.assignment.destination))):
                     if saved.assignment.destination.provider == "local" and request.episode in self.reservations:
                         reservation = self.reservations[request.episode]
                         with retry_cleanup(Path(reservation.path)):
@@ -4238,6 +4248,7 @@ done
             if previous is not None and (previous.owner != request.owner or previous.since != request.since
                     or previous.run != request.run or previous.purpose != request.purpose):
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
+            requested_constraints = request.constraints
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
@@ -4253,7 +4264,7 @@ done
                     and isinstance(self.pending_configuration, NoPass) and not self.pass_stale
                     and isinstance(self.last_result, gate.PassResult)
                     and self.clock.monotonic() < self.next_pass):
-                return [self._placement_reply(request,
+                return [self._placement_reply(request, requested_constraints,
                     self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
             self.placement_requests[request.episode] = request
             if previous is None:
@@ -4261,11 +4272,11 @@ done
             self._watch_owner(request.owner)
             self.persist()
             if isinstance(connection, Connection) and not self._pass_gap_open():
-                self.parked_placements.append(ParkedPlacement(request, connection))
+                self.parked_placements.append(ParkedPlacement(request, requested_constraints, connection))
                 self.next_pass = min(self.next_pass, self.clock.monotonic())
                 return []
             _ = self.run_pass()
-            return [self._placement_reply(request,
+            return [self._placement_reply(request, requested_constraints,
                 self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
         assignment = request.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)

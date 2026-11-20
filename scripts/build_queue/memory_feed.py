@@ -538,6 +538,8 @@ def step_runs_on(route: target_config.StepRoute, routes: target_availability.Mac
     """The targets that can take a natedev queue step: a route that limits the step first, else the Mac routes."""
     if isinstance(route, target_config.LocalRequired):
         return RunsOn((LOCAL_TARGET,), RUN_ASKS_TEXT if route == target_config.LOCAL_CALLER else route.reason)
+    if routes.mac_disabled_for(route):
+        return RunsOn(() if mac_only_route(route, routes) else (LOCAL_TARGET,), target_config.MAC_DISABLED_REASON)
     if mac_only_route(route, routes):
         return RunsOn((MAC_TARGET,))
     if isinstance(route, target_config.PinnedTarget):
@@ -560,17 +562,13 @@ def target_notes(route: target_config.StepRoute, routes: target_availability.Mac
     route_excludes_mac = isinstance(route, target_config.LocalRequired) or (
         isinstance(route, target_config.PinnedTarget) and not routes.is_mac(route.target))
     fit = routes.route_fit(route, step, folder, package) if not route_excludes_mac else target_availability.NoMacTarget()
-    mac_disabled = fit == target_availability.NotAllowed(target_config.MAC_DISABLED_REASON)
-    mac_only = mac_only_route(route, routes)
-    runs_on = (RunsOn(()) if mac_disabled and mac_only
-               else step_runs_on(route, routes, step, folder, package))
+    runs_on = step_runs_on(route, routes, step, folder, package)
     notes: TargetNotes = {"runs_on": runs_on.text(), "targets": list(runs_on.targets),
                           "because": route_reason(runs_on.reason),
                           "mac_text": "" if route_excludes_mac else target_availability.mac_reason(fit)}
-    if mac_disabled:
-        notes["because"] = target_config.MAC_DISABLED_REASON
+    if runs_on.reason == target_config.MAC_DISABLED_REASON:
         return notes
-    if mac_only and (holds := routes.holds(folder)):
+    if mac_only_route(route, routes) and (holds := routes.holds(folder)):
         notes["because"] = route_reason(holds)
         notes["mac_state"] = holds
         notes["mac_text"] = ""
@@ -2419,6 +2417,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     host = explanation.decided_from.host
     if not isinstance(captured, admission_records.MemoryRoom) or not isinstance(host, admission_records.HostMemory):
         raise RuntimeError("recorded room unavailable")
+    disabled_mac_targets = target_availability.read_disabled_mac_targets()
     snapshots = target_availability.read_snapshots()
     slot_roots = conf.read_or_repository("build_folders").values()
     mac_reading = queue_view.read_mac_builds()
@@ -2433,7 +2432,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
              *target_availability.holder_sessions(snapshots)], os.environ)
     members = FeedStaff(staff_display.members)
     zone = user_zone()
-    routes = target_availability.MacRoutes(snapshots, labels, zone)
+    routes = target_availability.MacRoutes(snapshots, labels, zone, disabled_mac_targets=disabled_mac_targets)
     ci_rows: dict[str, RunRow] = {}
     for entry in explanation.running:
         memory = entry.step.measured
