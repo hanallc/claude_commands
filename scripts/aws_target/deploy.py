@@ -2141,7 +2141,9 @@ class Deployment:
             discovered = self._deployment_network(account, self._api(settings))
             network = HanaNetwork(discovered.vpc, discovered.subnet_in(settings.availability_zone))
         if isinstance(recorded, RecordedHanaInstance):
-            if for_setup and (not saved.get('requested') or not saved.get('instance')):
+            if for_setup and not saved.get('instance'):
+                raise DeploymentRefused('The saved Hana setup lacks instance. Complete approved setup first.')
+            if for_setup and not saved.get('requested'):
                 raise DeploymentRefused('The Hana instance has no matching setup record. Review the saved deployment.')
             identity = recorded.deployment
         else:
