@@ -29,7 +29,7 @@ from scripts.lib.build_steps import RECORDED_STEP_NAMES
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.production import staff
-from scripts.production.staff_test_support import fixture_member, isolated_staff_file
+from scripts.production.staff_test_support import build_fixture_sessions, fixture_member, isolated_staff_file
 
 
 DOC_COMMAND = ("bash", str(VERIFY), "doc")
@@ -131,9 +131,9 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
         _ = self.enterContext(isolated_staff_file(self.root / "doc-staff.json", self.environment))
         showrunner = fixture_member("showrunner", name="builds")
         unit = fixture_member("unit", name="doc-proof", parent=showrunner.id,
-                              worktree=staff.PresentWorktree(local_machine(), registered))
-        self.environment["CLAUDE_CODE_SESSION_ID"] = unit.current_session
-        _ = self.environment.pop("CODEX_THREAD_ID", None)
+                              worktree=staff.PresentWorktree(local_machine(), registered),
+                              runtime_id=staff.caller_identity())
+        self.environment.update(build_fixture_sessions(unit.current_session))
         self.assert_doc_slot_wait_identity(showrunner, unit, session=unit.current_session, folder="")
 
     def assert_doc_slot_wait_identity(self, showrunner: staff.StaffRow, unit: staff.StaffRow, *,

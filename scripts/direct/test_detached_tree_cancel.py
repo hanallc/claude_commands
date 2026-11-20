@@ -56,7 +56,7 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
     def start_detached(self, fixture: VerifyTreeCancelFixture, identity: str, *, done_message: bool = False) -> Path:
         session = fixture.board
         session.mkdir(parents=True, exist_ok=True)
-        native = fixture_runtime_id(identity)
+        native = staff.caller_identity() or fixture_runtime_id(identity)
         environment = {**fixture.environment, "CODEX_THREAD_ID": native,
                        "CODEX_HOME": str(fixture.root / "codex"), "TEST_FINISH": "1",
                        "DESIGN_ROLES_STATE": str(fixture.root / "roles")}
@@ -120,7 +120,9 @@ class DetachedTreeCancelTests(VerifyTreeCancelFixture):
 
     def inbox_path(self, fixture: VerifyTreeCancelFixture, identity: str) -> Path:
         with isolated_staff_file(fixture.root / "staff.json", {}):
-            return session_staff.inbox_path(staff.native_id(fixture_runtime_id(identity)))
+            worker = next((row for row in staff.local_snapshot().find(kind="worker") if row.name == identity), None)
+            member = worker.id if worker is not None else staff.native_id(fixture_runtime_id(identity))
+            return session_staff.inbox_path(member)
 
     def inbox(self, fixture: VerifyTreeCancelFixture, identity: str) -> dict[str, object]:
         return cast(dict[str, object], json.loads(self.inbox_path(fixture, identity).read_text()))

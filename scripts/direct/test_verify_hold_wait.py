@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_runtime_id
 
 import json
 import unittest
@@ -106,7 +105,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         started, = [row for row in rows if row["event_type"] == "wait_started"]
         finished, = [row for row in rows if row["event_type"] == "wait_finished"]
         self.assertEqual((started["wait_kind"], started["wait_reason"], started["owner_session"]),
-                         ("WaitingForMemoryOrSlot", "build hold", fixture_runtime_id("thread-impl")))
+                         ("WaitingForMemoryOrSlot", "build hold", self.fixture.environment["CODEX_THREAD_ID"]))
         self.assertEqual(started["wait_id"], finished["wait_id"])
         self.assertEqual(cast(dict[str, object], finished["wait_end"])["state"], "Finished")
 

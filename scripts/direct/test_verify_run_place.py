@@ -18,6 +18,7 @@ from scripts.build_queue import admission_protocol as wire, admission_service as
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
+from scripts.production import staff
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
@@ -163,7 +164,7 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             output_fd = os.open(outgoing, os.O_RDWR | os.O_NONBLOCK)
             self.addCleanup(os.close, input_fd)
             self.addCleanup(os.close, output_fd)
-            process = self.start(script, "detached", CODEX_THREAD_ID="fixture",
+            process = self.start(script, "detached", CODEX_THREAD_ID=staff.caller_identity() or "fixture",
                                  VERIFY_DETACHED_RUNS_SCRIPT=str(launcher), DETACHED_INPUT=str(incoming),
                                  DETACHED_OUTPUT=str(outgoing), DETACHED_ERROR=str(fixture.root / "detached.err"))
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -194,7 +195,8 @@ with Path(os.environ["DETACHED_INPUT"]).open("r") as input_stream:
             started = fixture.root / "detach-started"
             _ = launcher.write_text(f"from pathlib import Path\n_ = Path({str(started)!r}).write_text('started')\n")
             process = self.start(script, "build", "sample", "--release", "--attached",
-                                 CODEX_THREAD_ID="fixture", VERIFY_DETACHED_RUNS_SCRIPT=str(launcher))
+                                 CODEX_THREAD_ID=staff.caller_identity() or "fixture",
+                                 VERIFY_DETACHED_RUNS_SCRIPT=str(launcher))
             probe = self.probe(process)
             self.assertEqual(probe["pid"], process.pid)
             self.proceed(process)
