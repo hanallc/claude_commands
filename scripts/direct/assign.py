@@ -116,16 +116,17 @@ def with_test_rules(prompt: str) -> str:
     except (OSError, UnicodeError) as error:
         refuse(f"cannot read test rules in {PROMPT_CONTRACT} ({error})")
     for tag in ("TestRules", "WhenYouWriteNoTest"):
-        opening, closing = f"<{tag}>", f"</{tag}>"
-        _, _, rest = contract.partition(opening)
-        body, closed, _ = rest.partition(closing)
-        rules = dedent(body).strip()
-        if not closed or not rules:
+        pattern = re.compile(rf"^[ \t]*<{tag}>[ \t]*\n(.*?)^[ \t]*</{tag}>[ \t]*$", re.MULTILINE | re.DOTALL)
+        section = pattern.search(contract)
+        rules = dedent(section[1]).strip() if section else ""
+        if not rules:
             refuse(f"missing {tag} section in {PROMPT_CONTRACT}")
-        block = f"{opening}\n{rules}\n{closing}"
-        before, _, rest = prompt.partition(opening)
-        _, closed, after = rest.partition(closing)
-        prompt = before + block + after if closed else prompt + f"\n\n{block}\n"
+        block = f"<{tag}>\n{rules}\n</{tag}>"
+        existing = pattern.search(prompt)
+        if existing:
+            prompt = prompt[:existing.start()] + block + prompt[existing.end():]
+        else:
+            prompt += f"\n\n{block}\n"
     return prompt
 
 
