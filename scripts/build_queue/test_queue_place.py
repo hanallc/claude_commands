@@ -1160,7 +1160,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     os.kill(holder, number)
                     descriptor = os.pidfd_open(holder)
                     try:
-                        self.assertTrue(select.select([descriptor], [], [], 8)[0], "signal cleanup did not finish")
+                        self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0],
+                                        "the holder did not exit after the signal")
                     finally:
                         os.close(descriptor)
                     _, status = os.waitpid(holder, 0)
