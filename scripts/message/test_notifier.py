@@ -193,9 +193,12 @@ class NotifierTests(unittest.TestCase):
                 environment["SHOWN_ZONE"] = ""
             else:
                 environment["SHOWN_ZONE"] = zone.stdout.rstrip("\n") if zone.returncode == 0 else ""
-        with launch_process(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
-            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
-            return subprocess.CompletedProcess(command, child.wait(), output, errors)
+        # A tick can exit before its background jobs finish. Keep ownership until test cleanup.
+        child = self.enterContext(launch_process(
+            command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ))
+        output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+        return subprocess.CompletedProcess(command, child.wait(), output, errors)
 
     def successful(self, *args: str, now: int = NOW, send_rc: int = 0) -> str:
         result = self.run_cli(*args, now=now, send_rc=send_rc)

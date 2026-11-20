@@ -38,7 +38,6 @@ from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue.test_placement import placement_request
 from scripts.mac_test import claim_state, mac_test
 from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP
-from scripts.lib.process_group import send_process_group
 
 
 SCRIPT = Path(__file__).with_name("copy_watch.py")
@@ -392,7 +391,6 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.result = Path()
         self.runner = Path()
         self.environment: dict[str, str] = {}
-        self.step: ManagedProcess[bytes] | None = None
         self.watcher: ManagedProcess[str] | None = None
 
     @override
@@ -439,31 +437,27 @@ class CopyWatchProcessTests(unittest.TestCase):
             return private_provider_evidence(admission, key, paths, allowed)
 
         admission.server.host_probe = provider
-        self.step = None
         self.watcher = None
-
-    @override
-    def tearDown(self) -> None:
-        _ = (self.root / "release-runner").write_text("go\n")
-        for process in (self.watcher, self.step):
-            if process is not None and process.poll() is None:
-                if os.getpgid(process.pid) == process.pid:
-                    send_process_group(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
-                _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def start_step(self) -> ManagedProcess[bytes]:
         log = self.root / "step.log"
-        self.step = self.enterContext(launch_process([sys.executable, str(self.root / "step.py"), str(self.root), str(log)],
-                                     env=self.environment))
-        _ = self.info.write_text(f"pgid={self.step.pid}\nlog={log}\n")
-        return self.step
+        step = self.enterContext(launch_process(
+            [sys.executable, str(self.root / "step.py"), str(self.root), str(log)], env=self.environment,
+        ))
+        _ = self.info.write_text(f"pgid={step.pid}\nlog={log}\n")
+        return step
 
     def start_watcher(self, modes: str, *, filter_run: bool = False, call_started: str = "1000.5") -> None:
         arguments = self.watcher_arguments(filter_run=filter_run, call_started=call_started)
-        self.watcher = self.enterContext(launch_process(arguments, env={**self.environment, "TEST_COPY_MODES": modes},
-                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
+        # Read the guardian's PID in the child before it executes the watcher.
+        self.watcher = self.enterContext(launch_process([
+            sys.executable, "-c",
+            "import os, sys\n"
+            + "python, script, *args = sys.argv[1:]\n"
+            + "os.execv(python, [python, script, '--parent-pid', str(os.getppid()), *args])\n",
+            *arguments,
+        ], env={**self.environment, "TEST_COPY_MODES": modes},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
 
     def watcher_arguments(self, *, filter_run: bool = False, call_started: str = "1000.5") -> list[str]:
         arguments = [
@@ -471,7 +465,6 @@ class CopyWatchProcessTests(unittest.TestCase):
             "--info", str(self.info), "--result", str(self.result), "--runner", str(self.runner),
             "--settings", str(self.root / "mac_test.conf"), "--repo-root", str(self.repository),
             "--package", "sample", "--call-id", "v-call", "--call-started", call_started,
-            "--parent-pid", str(os.getpid()),
         ]
         if filter_run:
             arguments.append("--filter-run")
@@ -702,8 +695,7 @@ class CopyWatchProcessTests(unittest.TestCase):
                 self.wait_until((self.root / "runner-ready").exists, "the copy to run")
                 values = self.finish_watcher(terminate=True)
                 self.assertEqual(values["copy"], "natedev_won")
-                send_process_group(step.pid, signal.SIGKILL)
-                _ = step.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                step.close()
 
     def test_a_running_copy_blocks_copies_of_other_calls(self) -> None:
         # A copy claim holds the Mac against other copies: free-now --copy says busy.
@@ -749,14 +741,14 @@ class CopyWatchProcessTests(unittest.TestCase):
         if before_start:
             self.result.parent.rmdir()
         # The watcher and its runner inherit this parent's output pipe.
-        # EOF proves both processes closed the pipe. Cleanup owns only this new process group.
+        # EOF shows that both processes closed the pipe.
         # The delayed wrapper starts the watcher after its parent exits.
-        parent: ManagedProcess[str] = self.enterContext(launch_process([
+        with launch_process([
             sys.executable, "-c",
             "import os, signal\n"
             + 'signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"]))\n'
             + "import subprocess, sys\n"
-            + "sys.argv[sys.argv.index('--parent-pid') + 1] = str(os.getpid())\n"
+            + "sys.argv[3:3] = ['--parent-pid', str(os.getpid())]\n"
             + ("child = subprocess.Popen([sys.executable, '-c', "
                + repr("import os, signal\n"
                       + 'signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"]))\n'
@@ -770,8 +762,7 @@ class CopyWatchProcessTests(unittest.TestCase):
             + ("" if before_start else "signal.pause()\n"),
             *self.watcher_arguments(),
         ], env={**self.environment, "TEST_COPY_MODES": "hold"},
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
-        try:
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as parent:
             assert parent.stdout is not None
             watcher_pid = int(cast(str, parent.stdout.readline()))
             if not before_start:
@@ -791,12 +782,6 @@ class CopyWatchProcessTests(unittest.TestCase):
             self.assertFalse(self.candidate_active(), f"watcher {watcher_pid} left its candidate")
             if running_copy:
                 self.assertTrue((self.root / "runner-stopped").exists())
-        finally:
-            try:
-                send_process_group(parent.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            _ = parent.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def test_parent_killed_ends_the_watcher_at_once(self) -> None:
         self.assert_parent_loss_stops_watcher(running_copy=False)
@@ -809,8 +794,6 @@ class CopyWatchProcessTests(unittest.TestCase):
 
     def test_missing_parent_pid_is_an_argument_error(self) -> None:
         arguments = self.watcher_arguments()
-        index = arguments.index("--parent-pid")
-        del arguments[index:index + 2]
         errors = io.StringIO()
         with mock.patch("sys.stderr", errors), self.assertRaises(SystemExit) as failure:
             _ = copy_watch.parser().parse_args(arguments[2:])
