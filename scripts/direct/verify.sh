@@ -780,6 +780,7 @@ step_was_killed_for_memory() {
 }
 
 step_writes_tree() {
+    [[ "${VALIDATION_COPY_EDITS:-0}" == 0 ]] || return 0
     # The Mac fix pass writes the tree only through its key check in offload.py.
     [[ "${LINT_MAC_FIX:-0}" == 0 ]] || return 1
     if [[ "${1:-}" == env ]]; then
@@ -871,7 +872,8 @@ run_step() {
     local STEP_WRITES_TREE=0
     local VERIFY_SLOT_SOURCE="" VERIFY_SLOT_TREE="" VERIFY_SLOT_HEAD="" VERIFY_SLOT_CAPACITY_FILE=""
     local slot_deadline=""
-    if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]] && buildlog_step_compiles "$@"; then
+    if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]] \
+            && { [[ "$CMD" == validation ]] || buildlog_step_compiles "$@"; }; then
         build_check_record_failure "$PLACEMENT_CLEANUP_ERROR"
         return 2
     fi
@@ -901,7 +903,7 @@ run_step() {
     if buildlog_step_compiles "$@"; then
         if [[ "${CMD:-}" == doc && -n "${DOC_REPO_TOP:-}" && "${BUILDLOG_PREPARED_COPY:-}" != "$DOC_REPO_TOP" ]]; then
             VERIFY_SLOT_SOURCE=$DOC_REPO_TOP
-        elif [[ "$STEP_WRITES_TREE" == 0 && -n "${COPIES_STEP_SOURCE:-}" &&
+        elif [[ "$CMD" != validation && "$STEP_WRITES_TREE" == 0 && -n "${COPIES_STEP_SOURCE:-}" &&
                 "$(git rev-parse --show-toplevel)" == "$COPIES_STEP_SOURCE" ]]; then
             VERIFY_SLOT_SOURCE=$COPIES_STEP_SOURCE
         fi
@@ -911,7 +913,7 @@ run_step() {
     while :; do
         LINT_REPAIR_REUSED_GRANT=0
         if [[ -f "${HOLD_WAIT_DIR:-/nonexistent}/lint-held" ]]; then HOLD_LINT=1; fi
-        if buildlog_step_compiles "$@"; then
+        if [[ "$CMD" == validation ]] || buildlog_step_compiles "$@"; then
             route_compiling_step "$@" || { status=$?; rm -f "$step_log"; return "$status"; }
             if [[ "$STEP_RAN_ON_MAC" == 1 ]]; then rm -f "$step_log"; return 0; fi
             if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then rm -f "$step_log"; return "$LINT_LEFT_QUEUE_STATUS"; fi
@@ -975,14 +977,15 @@ run_step() {
         if [[ -n "${PLACEMENT_GRANT_FILE:-}" && -e "$PLACEMENT_GRANT_FILE.outcome" ]]; then apply_placement_outcome; fi
         if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
         step_state local_noncompiling
+        if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]] && [[ "$CMD" == validation || "$status" != 0 ]]; then
+            rm -f "$step_log"
+            (( status != 0 )) || status=2
+            return "$status"
+        fi
         if [[ "$status" == 0 ]]; then
             RUN_LAST_ATTEMPT_KILLED=0
             rm -f "$step_log"
             return 0
-        fi
-        if [[ "${PLACEMENT_OUTCOME:-}" == unresolved ]]; then
-            rm -f "$step_log"
-            return "$status"
         fi
         # A repairable tool failure may continue a lint pass. A failed check
         # must end the call even when that tool's caller handles failures.
@@ -1001,7 +1004,12 @@ run_step() {
             rm -f "$step_log"
             return "$status"
         fi
-        if buildlog_step_compiles "$@" && { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]] || step_stopped_by_hold; }; then
+        if [[ "$CMD" == validation && "${PLACEMENT_OUTCOME:-}" != retry ]]; then
+            rm -f "$step_log"
+            return "$status"
+        fi
+        if { [[ "$CMD" == validation ]] || buildlog_step_compiles "$@"; } \
+                && { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]] || step_stopped_by_hold; }; then
             if [[ "$CMD" == doc ]]; then
                 rm -f "$step_log"
                 return "$status"
@@ -1468,6 +1476,16 @@ finish_mac_fix() {
     verify_helper "$VERIFY_START_DIR/../mac_test/fix_return.py" finish --repo-root "$(git rev-parse --show-toplevel)"
 }
 
+validation_fallback_source_matches() {
+    local source_key
+    finish_mac_fix || return $?
+    source_key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "$(git rev-parse --show-toplevel)") || return $?
+    if [[ -z "$source_key" || "$source_key" != "$VALIDATION_FALLBACK_SOURCE" ]]; then
+        echo 'verify.sh: the source changed after the Mac edit return. Validation stopped before a local fix.' >&2
+        return "$TREE_CHANGED_STATUS"
+    fi
+}
+
 VERIFY_ORIGINAL_ARGS=("$@")
 # A flag, not an env prefix, so a call stays one plain command that the
 # settings.json allow rule matches.
@@ -1485,7 +1503,7 @@ fi
 
 CMD="${1:-}"
 case "$CMD" in
-    check|test|lint|doc|build|example|final|example-test) ;;
+    check|test|lint|doc|build|example|final|example-test|validation) ;;
     *) usage; exit 2 ;;
 esac
 
@@ -1499,7 +1517,8 @@ esac
 # A build call with --attached does not detach: its caller reads the binary line inline.
 DETACHED_RUNS_SCRIPT="${VERIFY_DETACHED_RUNS_SCRIPT:-$BUILD_HELPER_ROOT/agents/detached_runs.py}"
 verify_helper --start
-if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" && " ${*:2} " != *" --attached "* ]]; then
+if [[ "$CMD" != validation && -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" \
+        && " ${*:2} " != *" --attached "* ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     DETACH_STATUS=0
     verify_helper "$DETACHED_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
@@ -1545,8 +1564,21 @@ format_verify_call "${VERIFY_ORIGINAL_ARGS[@]}"
 VERIFY_STEP_COUNT=1
 if [[ "$CMD" == final ]]; then VERIFY_STEP_COUNT=2; fi
 
-parse_routing_arguments "$@"
-parse_command_arguments "${ARGS[@]}"
+VALIDATION_OPERATION="" VALIDATION_KIND="" VALIDATION_COPY_EDITS=0 VALIDATION_FALLBACK_SOURCE=""
+if [[ "$CMD" == validation ]]; then
+    parse_routing_arguments
+    if ! parse_validation_step "$@"; then
+        printf 'verify.sh: invalid validation operation: %s\n' "$*" >&2
+        exit 2
+    fi
+    NO_CACHE=1
+    VERIFY_PACKAGE=""
+    ARGS=("")
+    COMMAND_ARGS=("$@")
+else
+    parse_routing_arguments "$@"
+    parse_command_arguments "${ARGS[@]}"
+fi
 set -- ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}
 if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ONLY" == 0 && "$LOCAL_ONLY" == 0 ]]; then
     FINAL_PASS_START="$("$PY" "$FINAL_PASS_SCRIPT" start "${BASH_SOURCE[0]}")"
@@ -2253,6 +2285,7 @@ forward_mac_runner_signal() {
 }
 
 remote_step_kind() {
+    if [[ -n "${VALIDATION_KIND:-}" ]]; then printf '%s\n' "$VALIDATION_KIND"; return; fi
     if [[ "$CMD" != final ]]; then printf '%s\n' "$CMD"; return; fi
     local verb kind
     while IFS=$'\t' read -r verb kind; do
@@ -2294,6 +2327,17 @@ try_mac_test() {
     fi
     if declare -F release_token >/dev/null; then release_token || return $?; fi
     if [[ "$MAC_VERB" != nextest ]]; then runner_args+=(--verb "$MAC_VERB"); fi
+    if [[ "$CMD" == validation ]]; then
+        runner_args+=(--validation-step)
+        for name in "${PLACEMENT_COMMAND[@]}"; do runner_args+=("--validation-command-word=$name"); done
+        if [[ "$MAC_VERB" == doc && -n "${LINT_DOC_JOBS:-}" ]]; then
+            export LINT_DOC_JOBS
+            runner_args+=(--env LINT_DOC_JOBS)
+        elif [[ "$MAC_VERB" == nextest && "${NEXTEST_TEST_THREADS+x}" == x ]]; then
+            export NEXTEST_TEST_THREADS
+            runner_args+=(--env NEXTEST_TEST_THREADS)
+        fi
+    fi
     local remote_kind
     remote_kind=$(remote_step_kind)
     runner_args+=(--kind "$remote_kind")
@@ -2318,7 +2362,9 @@ try_mac_test() {
     if [[ "$FILTER_RUN" -eq 1 ]]; then
         runner_args+=(--filter-run)
     fi
-    if [[ "$MAC_VERB" == nextest ]]; then
+    if [[ "$CMD" == validation ]]; then
+        runner_args+=(-- "${COMMAND_ARGS[@]}")
+    elif [[ "$MAC_VERB" == nextest ]]; then
         runner_args+=(-- "${NEXTEST_ARGS[@]}")
     else
         runner_args+=(-- "${MAC_VERB_ARGS[@]}")
@@ -2464,6 +2510,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             exit "$runner_status"
             ;;
         passed)
+            if [[ "${VALIDATION_COPY_EDITS:-0}" == 1 && "$MAC_FIX_RESULT" != applied && "$MAC_FIX_RESULT" != none ]]; then
+                printf 'verify.sh: validation could not return every edit (%s).\n' "${MAC_FIX_RESULT:-missing result}" >&2
+                exec 9>&-
+                rm -f "$MAC_LOG_FILE"
+                MAC_LOG_FILE=""
+                return 2
+            fi
             if [[ "$MAC_FETCH_GIVEN" == 1 && "$result_fetch" != fetched ]]; then
                 if [[ "$FILTER_RUN" == 1 ]]; then BUILDLOG_MAC=passed_filter; else BUILDLOG_MAC=passed_full; fi
                 printf 'verify.sh: FAIL: the tests passed on the Mac, but --fetch %s brought nothing back (%s).\n' "$MAC_FETCH" "$result_fetch" >&2
@@ -2520,7 +2573,7 @@ check_routing_hold() {
 initialize_step_record() {
     local answer table line name eligibility reason settings platform extra status=0 decision_reason="no eligible SSH target"
     local eligible_names="" mac_names="" mac_disk_exclusions=""
-    local arguments=(constraints --new-step --probe-marks-file "$HOLD_WAIT_DIR/probe-marks" --kind "$CMD" --repo-root "$(git rev-parse --show-toplevel)")
+    local arguments=(constraints --new-step --probe-marks-file "$HOLD_WAIT_DIR/probe-marks" --kind "${VALIDATION_KIND:-$CMD}" --repo-root "$(git rev-parse --show-toplevel)")
     if [[ "$CMD" == final ]]; then arguments+=(--remote-kinds-file "$HOLD_WAIT_DIR/remote-step-kinds"); fi
     PKG="${ARGS[0]:-}"
     arguments+=(--package "$PKG")
@@ -2574,7 +2627,7 @@ initialize_step_record() {
         done <<< "$table"
     fi
     local record_args=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
-        --repo "$(git rev-parse --show-toplevel)" --kind "$CMD"
+        --repo "$(git rev-parse --show-toplevel)" --kind "${VALIDATION_KIND:-$CMD}"
         --runs-on "$STEP_RUNS_ON" --reason "$decision_reason" --state waiting_hold
         --mac-disk-exclusions "$mac_disk_exclusions")
     if [[ "$STEP_RUNS_ON" == any_target ]]; then
@@ -2642,7 +2695,9 @@ route_compiling_step() {
     fi
     buildlog_begin "$@" || true
     BUILDLOG_PLACEMENT_PREPARED=1
-    if [[ "${STEP_WRITES_TREE:-0}" == 0 ]]; then
+    if [[ "$CMD" == validation ]]; then
+        MAC_VERB=$VALIDATION_VERB
+    elif [[ "${STEP_WRITES_TREE:-0}" == 0 ]]; then
         shift
         if [[ "$command" == env ]]; then
             while [[ "${1:-}" == *=* || "${1:-}" == -u ]]; do
@@ -2875,7 +2930,7 @@ placement_once() {
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
         --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "$repository" --package "$PKG"
-        --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
+        --kind "${VALIDATION_KIND:-$CMD}" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$token"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
     [[ -z "${BUILDLOG_RUN:-}" ]] || placement_args+=(--run "$BUILDLOG_RUN")
@@ -2885,7 +2940,11 @@ placement_once() {
         placement_args+=(--target mac)
     fi
     [[ "${LOCAL_ONLY:-0}" == 0 ]] || placement_args+=(--local-only --local-reason "$LOCAL_REASON")
-    [[ "${STEP_WRITES_TREE:-0}" == 0 ]] || placement_args+=(--writes-tree)
+    if [[ "${VALIDATION_COPY_EDITS:-0}" == 1 ]]; then
+        placement_args+=(--return-copy-edits --local-reason "")
+    elif [[ "${STEP_WRITES_TREE:-0}" == 1 ]]; then
+        placement_args+=(--writes-tree)
+    fi
     [[ "${MAC_ONLY:-0}" == 0 ]] || placement_args+=(--mac-only)
     if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]]; then
         verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" \
@@ -3111,7 +3170,7 @@ route_test() {
             continue
         fi
         (( placement_status == 0 )) || return "$placement_status"
-        if [[ "$STEP_ASSIGNED_TARGET" != hana-gpu && "${PLACEMENT_COMMAND[0]:-}" == cargo
+        if [[ "$CMD" != validation && "$STEP_ASSIGNED_TARGET" != hana-gpu && "${PLACEMENT_COMMAND[0]:-}" == cargo
                 && "${PLACEMENT_COMMAND[1]:-}" == nextest ]]; then
             require_nextest
         fi
@@ -3196,6 +3255,16 @@ route_test() {
         fi
         try_reserved_target "$last_decline" || return $?
         [[ "$MAC_PASSED" != 1 ]] || return 0
+        if [[ "$CMD" == validation && "${LAST_TARGET_REASON:-}" == validation_edit_return ]]; then
+            VALIDATION_FALLBACK_SOURCE="$PLACEMENT_SOURCE_KEY"
+            local source_status=0
+            validation_fallback_source_matches || source_status=$?
+            if (( source_status != 0 )); then
+                verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
+                    --pid "$PLACEMENT_OWNER_PID" --reason "cannot verify the source after the Mac edit return" >/dev/null || true
+                return "$source_status"
+            fi
+        fi
         if [[ "${LINT_MAC_FIX:-0}" == 1 && "${LAST_TARGET_REASON:-}" != busy && "${LAST_TARGET_REASON:-}" != blocked ]]; then
             verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
                 --pid "${PLACEMENT_OWNER_PID:-$$}" --reason "the Mac fix pass did not run" >/dev/null 2>&1 || true
@@ -4744,6 +4813,9 @@ run_lint_sequence() {
 }
 
 case "$CMD" in
+    validation)
+        VALIDATION_EXPECTED_VERB="$VALIDATION_VERB" validation_cargo_step "${COMMAND_ARGS[@]}"
+        ;;
     check)
         PKG="$VERIFY_PACKAGE"
         KEEP_GOING=()

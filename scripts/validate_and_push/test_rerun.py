@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import shutil
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
@@ -30,18 +29,17 @@ else:
 ''')
 
     def install_autofix(self) -> None:
-        lint = self.stub("lint", '''import os, sys
-from pathlib import Path
-if sys.argv[1] == "fmt":
-    Path("seed.txt").write_text("formatted\\n")
-    stop = Path(os.environ["HOME"]) / "stop-formatter"
-    if stop.exists():
-        stop.unlink()
-        sys.exit(86)
+        target = self.write(self.home / ".claude/scripts/direct/verify.sh", r'''#!/usr/bin/env bash
+if [[ $1 != validation ]]; then exit 2; fi
+if [[ $2 == fmt ]]; then
+    printf 'formatted\n' > seed.txt
+    if [[ -f "$HOME/stop-formatter" ]]; then
+        rm "$HOME/stop-formatter"
+        exit 86
+    fi
+fi
 ''')
-        target = self.home / ".claude/scripts/lint/lint"
-        target.parent.mkdir(parents=True)
-        _ = shutil.copy2(lint, target)
+        target.chmod(0o755)
         _ = self.stub("taplo", "pass\n")
         self.environment["VALIDATE_QUICK"] = "1"
 

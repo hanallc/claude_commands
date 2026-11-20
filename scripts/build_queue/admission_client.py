@@ -1334,6 +1334,7 @@ class ClientArguments(argparse.Namespace):
     assignment_file: Path = Path()
     token: str = "none"
     writes_tree: bool = False
+    return_copy_edits: bool = False
     local_only: bool = False
     local_reason: str = ""
     mac_only: bool = False
@@ -1450,6 +1451,13 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             routing, selection,
             writes_tree=args.writes_tree)
         constraints = replace(constraints, cargo_folder=cargo_folder)
+        if args.return_copy_edits:
+            constraints = replace(constraints, candidates=tuple(
+                replace(candidate, eligibility=placement.FixedExclusion("the target cannot return copy edits"))
+                if candidate.destination.provider == "ssh" and isinstance(candidate.eligibility, placement.AllowedHost)
+                else candidate
+                for candidate in constraints.candidates
+            ))
         if args.mac_only and not args.writes_tree:
             constraints = replace(constraints, selection=placement.MacOnlyHost())
         prerequisite = (placement.TokenRequired(placement.TokenReadinessUnchecked())
@@ -1574,6 +1582,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = placement_parser.add_argument("--request-file", type=Path)
     _ = placement_parser.add_argument("--token", choices=(*TOKEN_REQUIRED_CHOICES, "held", "none"), default="none")
     _ = placement_parser.add_argument("--writes-tree", action="store_true")
+    _ = placement_parser.add_argument("--return-copy-edits", action="store_true")
     _ = placement_parser.add_argument("--local-only", action="store_true")
     _ = placement_parser.add_argument("--local-reason", default=os.environ.get("BUILD_QUEUE_LOCAL_REASON", ""))
     _ = placement_parser.add_argument("--mac-only", action="store_true")

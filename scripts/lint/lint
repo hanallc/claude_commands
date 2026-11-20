@@ -114,6 +114,7 @@ CMD="${1:-}"
 [[ $# -gt 0 ]] && shift
 
 case "$CMD" in
+  validation)   VALIDATION_EXPECTED_VERB="${1:?validation requires a verb}" validation_cargo_step "${@:2}" ;;
   build)        resolve_scope "$@"
                 run cargo build ${SCOPE[@]+"${SCOPE[@]}"} "$@"
                 BUILD_METADATA_ARGS=()

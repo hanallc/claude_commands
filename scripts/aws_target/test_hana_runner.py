@@ -211,6 +211,26 @@ class HanaRunnerTests(unittest.TestCase):
         self.assertEqual(build_folders.build_folder_state(self.root / 'guest-slots/hana-slot1'), 'free')
         self.assertEqual(hana_protocol.decode_outcome(hana_protocol.encode_outcome(outcome)), outcome)
 
+    def test_explicit_rust_target_is_checked_before_cargo_starts(self) -> None:
+        target = 'x86_64-pc-windows-gnu'
+        argv = ('cargo', 'clippy', '--all-targets', '--workspace', '--all-features', '--target', target, '--', '-D', 'warnings')
+        request = replace(self.request, argv=argv, manifest=replace(self.manifest, argv=argv))
+        with tempfile.TemporaryFile() as marker:
+            missing = self.run_request(request, build_start_fd=marker.fileno())
+            _ = marker.seek(0)
+            self.assertEqual(marker.read(), b'')
+        self.assertIsInstance(missing, hana_protocol.HanaExecutionRefused)
+        assert isinstance(missing, hana_protocol.HanaExecutionRefused)
+        self.assertIn(f'rustup target add {target}', missing.reason)
+
+        self.tool('rustup', f'if [ "$1" = target ]; then printf "%s\\n" "{target}"; fi\n')
+        available = self.run_request(request)
+        self.assertIsInstance(available, hana_protocol.HanaCommandFinished)
+        assert isinstance(available, hana_protocol.HanaCommandFinished)
+        self.assertEqual(available.result.argv, argv)
+        self.assertEqual(available.result.status, 13)
+        self.assertIn(' '.join(argv[1:]).encode(), available.result.stdout)
+
     def test_cargo_exit_127_differs_from_a_missing_executable(self) -> None:
         # Limit the prepared shell to fixture executables.
         for name in ('flock', 'mkdir', 'python3'):

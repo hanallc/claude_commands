@@ -372,7 +372,8 @@ def hold_filter(repo_root: Path, changes: MirrorChanges,
 
 
 def apply_fix(repo_root: Path, staging: Path, changes: MirrorChanges,
-              worktree_unchanged: Callable[[], bool], board_reader: BoardReader | None = None) -> FixResult:
+              worktree_unchanged: Callable[[], bool], board_reader: BoardReader | None = None,
+              *, require_all: bool = False) -> FixResult:
     """Write the held staged files when the worktree is unchanged since the copy.
 
     board_reader defaults to read_board, looked up at each call.
@@ -383,6 +384,8 @@ def apply_fix(repo_root: Path, staging: Path, changes: MirrorChanges,
     if isinstance(board, berth_board.BoardUnavailable):
         return FixFailed(f"cargo-berth board: {board.reason}")
     changes, withheld = hold_filter(repo_root, changes, board)
+    if require_all and withheld:
+        return FixRefused("reservations withhold " + ", ".join(item.path for item in withheld))
     if not changes.changed and not changes.removed:
         return FixApplied((), (), withheld) if withheld else FixNone()
     try:
@@ -397,6 +400,8 @@ def apply_fix(repo_root: Path, staging: Path, changes: MirrorChanges,
             if not source.is_file() or source.is_symlink():
                 return FixFailed(f"the staged copy of {source.relative_to(staging)} is missing")
         with record_lock(repo_root) as path:
+            if require_all and not worktree_unchanged():
+                return FixRefused("the worktree changed before the edits could be applied")
             record = FixRecord(state="staging", renames=renames, removals=list(changes.removed))
             write_record(path, record)
             try:

@@ -18,12 +18,16 @@ from scripts.lib import conf
 from scripts.mac_test import cargo_manifest
 
 
-MacVerb = Literal["nextest", "check", "clippy", "mend-check", "mend-fix", "doc", "build"]
+MacVerb = Literal["nextest", "check", "clippy", "mend-check", "mend-fix", "mend-copy", "fmt", "doc", "build"]
+
+
+def returns_copy_edits(verb: MacVerb) -> bool:
+    return verb in ("mend-fix", "mend-copy", "fmt")
 
 
 def step_kind(verb: str) -> str:
     """Map a command verb to its recorded step kind."""
-    return {"test": "nextest", "mend-check": "mend", "mend-fix": "mend"}.get(verb, verb)
+    return {"test": "nextest", "mend-check": "mend", "mend-fix": "mend", "mend-copy": "mend"}.get(verb, verb)
 
 
 NonBusyMacDeclineReason = Literal[
@@ -40,6 +44,8 @@ NonBusyMacDeclineReason = Literal[
     "copy",
     "source_changed",
     "runner",
+    "validation_edit_return",
+    "rust_target_missing",
 ]
 
 
@@ -435,7 +441,7 @@ def remote_step_kinds(kind: str) -> tuple[str, ...]:
 
 
 def verb_kind(verb: MacVerb) -> str:
-    return "test" if verb == "nextest" else "lint" if verb in ("clippy", "mend-check", "mend-fix") else verb
+    return "test" if verb == "nextest" else "lint" if verb in ("clippy", "mend-check", "mend-fix", "mend-copy", "fmt") else verb
 
 
 def recorded_step_kind(step: str) -> str:

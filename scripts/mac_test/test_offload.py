@@ -1473,6 +1473,33 @@ class OffloadCommandTests(OffloadCommandFixture):
                 if verb == "doc":
                     self.assertIn("LINT_CONFIG_FORCE=1", sent[:position])
 
+    def test_validation_nextest_keeps_all_tests_when_mac_has_a_skip_filter(self) -> None:
+        self.config["mac_skip.hana"] = "test(skip-this)"
+        self.sync_config()
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            config = eligibility.read_config(self.config_path)
+            request = offload.OffloadRequest(self.repository, "", "validation-call",
+                offload.NO_RESULT_FILE, ("nextest",), owner="verify", holder_session="fixture",
+                validation_step=True)
+            remote = offload.remote_test_command(config, request, HANA)
+        sent, _ = split_mac_run_command(remote)
+        position = sent.index("~/.claude/scripts/lint/lint")
+        self.assertEqual(sent[position + 1:], ["validation", "nextest", "nextest"])
+        self.assertNotIn("skip-this", remote)
+
+    def test_validation_clippy_sends_the_operation_to_the_ssh_linux_runner(self) -> None:
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            config = eligibility.read_config(self.config_path)
+            target = target_config.SshTarget("peer", "linux", self.config_path)
+            request = offload.OffloadRequest(self.repository, "", "validation-call", offload.NO_RESULT_FILE,
+                ("clippy",), owner="verify", holder_session="fixture", verb="clippy", target="peer", validation_step=True)
+            with mock.patch.object(eligibility, "configured_ssh_target", return_value=target):
+                sent = shlex.split(offload.remote_test_command(config, request, HANA))
+        values = cast(dict[str, str], json.loads(sent[sent.index("--values") + 1]))
+        self.assertEqual(values["validation_step"], "1")
+        self.assertEqual(sent[sent.index("--verb") + 1], "clippy")
+        self.assertEqual(sent[sent.index("--") + 1:], ["clippy"])
+
     def test_no_package_names_the_mac_claim_for_the_workspace(self) -> None:
         self.write_portable_workspace()
         result = self.command("--workspace", verb="check", package="")

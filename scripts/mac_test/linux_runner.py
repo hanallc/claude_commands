@@ -170,6 +170,19 @@ def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
 CARGO_START_ERROR = 'The guest could not start Cargo because the executable is missing from the prepared PATH'
 
 
+def rust_target_checks(argv: tuple[str, ...]) -> str:
+    """Check each explicit Rust target in the prepared guest shell."""
+    words = argv[:argv.index('--')] if '--' in argv else argv
+    script = Path(__file__).resolve().parents[1] / 'lint/rust_target.py'
+    targets: list[str] = []
+    for index, word in enumerate(words):
+        if word == '--target' and index + 1 < len(words):
+            targets.append(words[index + 1])
+        elif word.startswith('--target='):
+            targets.append(word.partition('=')[2])
+    return ''.join(f'python3 {shlex.join((str(script), target))} || exit $?\n' for target in targets)
+
+
 def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment: Mapping[str, str], *,
              shell: ShellEnvironment, compiler_version: str, free_floor_gib: float,
              output_max_bytes: int, timeout_s: float, build_start_fd: int = -1) -> LeasedCommandResult:
@@ -212,6 +225,7 @@ def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment:
             + f'[[ "$actual" == {shlex.quote("rustc " + compiler_version)} '
             + f'|| "$actual" == {shlex.quote("rustc " + compiler_version + " ")}* ]] || exit 75\n'
             + f'export {assignments}\n'
+            + rust_target_checks(argv)
             + 'cargo=$(type -P -- cargo) && [[ -x "$cargo" && ! -d "$cargo" ]] || '
             + f'{{ printf "%s\\n" {shlex.quote(CARGO_START_ERROR)} >&2; exit 127; }}\n'
             + f': > {shlex.quote(str(started))} || exit 75\n'
@@ -220,8 +234,11 @@ def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment:
                                         command_environment, output_max_bytes, timeout_s=timeout_s,
                                         extra_descriptors=(build_start_fd,) if build_start_fd >= 0 else ())
         if not started.exists():
-            reason = (CARGO_START_ERROR if result.stderr.endswith((CARGO_START_ERROR + '\n').encode())
-                      else 'The guest shell or compiler parity check failed')
+            if result.status == os.EX_PROTOCOL and result.stderr.strip():
+                reason = result.stderr.decode(errors='replace').strip().splitlines()[-1]
+            else:
+                reason = (CARGO_START_ERROR if result.stderr.endswith((CARGO_START_ERROR + '\n').encode())
+                          else 'The guest shell or compiler parity check failed')
             raise ValueError(reason)
         return result
 
@@ -552,6 +569,11 @@ def nextest_words_with_skip(
     return tuple(updated)
 
 
+def lint_invocation(verb: str, words: tuple[str, ...], *, validation_step: bool) -> tuple[str, ...]:
+    """Name the lint entry and the expected verb for a validation step."""
+    return ('validation', verb, *words) if validation_step else (verb, *words)
+
+
 def command_script(mirror: str, values: dict[str, str], repository: str, verb: str,
                    words: tuple[str, ...], call_id: str, tree_key: str, repo_identity: str,
                    test_environment: tuple[tuple[str, str], ...] = (),
@@ -710,7 +732,8 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         clear_environment: str = '') -> int:
     if verb not in ('nextest', 'check', 'doc', 'clippy', 'mend-check', 'build'):
         raise ValueError('unsupported remote verb')
-    if verb == 'nextest':
+    validation_step = values.get('validation_step') == '1'
+    if verb == 'nextest' and not validation_step:
         words = nextest_words_with_skip(words, values.get(f'skip.{repository}', ''), insert_filter=True)
     kind = values.get('step_kind') or ('test' if verb == 'nextest' else 'lint' if verb in ('clippy', 'mend-check') else verb)
     if kind not in {word.strip() for word in values['kinds'].split(',')}:
@@ -743,7 +766,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         'CARGO_TARGET_DIR': str(target),
         'BUILDLOG_WORKSPACE': str(mirror),
     }
-    if verb == 'nextest':
+    if verb == 'nextest' or validation_step and verb == 'doc':
         environment.update(test_environment)
     if tree_key:
         environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
@@ -777,6 +800,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     ])
     abandoned_sessions = (removal_script(shlex.quote(str(target)), int(values['abandoned_session_minutes'])) + '\n'
                           if target == (mirror / 'target').resolve() else '')
+    invocation = shlex.join(lint_invocation(verb, words, validation_step=validation_step))
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
             ".linux-step-", build_folders.ExplicitBuildParent(mirror))) as step_directory:
@@ -792,7 +816,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
                     + (clear_environment + '\n' if verb == 'nextest' and clear_environment else '')
                     + f'export {assignments}\n'
                     + f': > {shlex.quote(str(started))} || exit 75\n'
-                    + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
+                    + f'exec "$HOME/.claude/scripts/lint/lint" {invocation}')
         completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
                                    pass_fds=execution_descriptors())
         status = completed.returncode if completed.returncode >= 0 else 128 - completed.returncode

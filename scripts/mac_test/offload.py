@@ -31,7 +31,7 @@ import time
 import traceback
 import uuid
 from types import FrameType
-from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, cast, final
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, Protocol, TextIO, TypedDict, cast, final, get_args
 from urllib.parse import quote
 
 
@@ -612,6 +612,8 @@ class OffloadRequest:
     repository_scope: copy_record.RepositoryScope = copy_record.ALL_REPOSITORIES
     kind: str = ""
     placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
+    validation_step: bool = False
+    validation_command: tuple[str, ...] = ()
 
     @property
     def source_root(self) -> Path:
@@ -811,6 +813,7 @@ class ReportedMacStatus:
     status: int
     cleanup: CleanupOutcome = CleanupUnconfirmed()
     build_target_directory: str = ""
+    rust_target_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -909,6 +912,8 @@ class CliArguments(argparse.Namespace):
         self.copy: bool = False
         self.nextest_words: list[str] = []
         self.verb: MacVerb = "nextest"
+        self.validation_step: bool = False
+        self.validation_command_word: list[str] = []
         self.kind: str = ""
         self.claim_owner_pid: int = 0
         self.claim_id: str = ""
@@ -1121,6 +1126,7 @@ class ProcessController:
         mismatch = ""
         mirror_refusal: MirrorBusyRefusal | NoMirrorBusyRefusal = NoMirrorBusyRefusal()
         build_target_directory = ""
+        rust_target_missing = False
         received_bytes = 0
         finished_output = False
         try:
@@ -1159,6 +1165,9 @@ class ProcessController:
                     status = UnresolvedSlotStartup()
                     held_status_line = ""
                     cleanup = CleanupUnconfirmed()
+                    continue
+                if marker == "validation_refusal=" + placement.RUST_TARGET_MISSING:
+                    rust_target_missing = True
                     continue
                 status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
                 if status_match is not None or marker == MAC_NEXTTEST_SETUP_FAILURE:
@@ -1210,7 +1219,8 @@ class ProcessController:
         if mismatch and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
-            return ReportedMacStatus(status.status, cleanup, build_target_directory)
+            return ReportedMacStatus(status.status, cleanup, build_target_directory,
+                                     rust_target_missing and status.status == os.EX_PROTOCOL)
         if isinstance(status, MacNextestSetupFailed):
             return MacNextestSetupFailed(cleanup)
         if isinstance(mirror_refusal, MirrorBusyRefusal):
@@ -1336,6 +1346,8 @@ def write_result(
             description = f"disk: {result.detail}" if result.detail else reason
         elif isinstance(result, DeclinedMacRun) and result.reason in ("source_changed", "runner"):
             reason = result.reason
+        elif result.reason in (placement.VALIDATION_EDIT_RETURN, placement.RUST_TARGET_MISSING):
+            reason = result.reason
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the {label} ({description})")
     fixed = result.fix if isinstance(result, PassedOnMac) else FIX_NOT_RUN
@@ -1358,7 +1370,7 @@ def write_result(
         _ = destination.path.write_text(
             f"{prefix}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line + details
             + (f"fetch={fetch_word(fetch_result(result))}\n" if isinstance(fetch, FetchFolder) else "")
-            + (f"fix={fix_return.fix_word(fixed)}\n" if verb == "mend-fix" else ""),
+            + (f"fix={fix_return.fix_word(fixed)}\n" if eligibility.returns_copy_edits(verb) else ""),
             encoding="utf-8",
         )
     return status
@@ -2063,14 +2075,18 @@ def remote_test_command(
     repository: KnownRepository,
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
 ) -> str:
+    from scripts.mac_test import linux_runner
+
     clear_environment = (result_environment.read_policy().clear_remote_environment()
                          if request.verb == "nextest" and request.environment else "")
     if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform):
-        from scripts.mac_test import linux_runner
         words = request.nextest_words
+        values = {**runner_values(config, request.target), "step_kind": request.kind or eligibility.verb_kind(request.verb)}
+        if request.validation_step:
+            values["validation_step"] = "1"
         return linux_runner.command_script(
             remote_mirror(repository, request.target, request.slot),
-            {**runner_values(config, request.target), "step_kind": request.kind or eligibility.verb_kind(request.verb)},
+            values,
             repository.policy_name, request.verb, words, request.call_id,
             sent_tree_key.value if isinstance(sent_tree_key, KnownTreeKey) else "",
             repository.key, request.environment, clear_environment,
@@ -2079,9 +2095,9 @@ def remote_test_command(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
     )
     words = request.nextest_words
-    if request.verb == "nextest":
+    if request.verb == "nextest" and not request.validation_step:
         words = nextest_words_with_skip(words, config.values.get(f"mac_skip.{repository.name}", ""))
-    invocation = shlex.join([request.verb, *words])
+    invocation = shlex.join(linux_runner.lint_invocation(request.verb, words, validation_step=request.validation_step))
     sent_tree = (
         f"BUILDLOG_SENT_TREE_KEY={shlex.quote(sent_tree_key.value)} "
         if isinstance(sent_tree_key, KnownTreeKey) else ""
@@ -2099,6 +2115,8 @@ def remote_test_command(
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
+    if request.validation_step:
+        environment += 'CARGO_TARGET_DIR="$PWD/target" '
     clear_environment = clear_environment + " && " if clear_environment else ""
     # The Mac cargo gate passes a placed run; its folder stays ahead of the real cargo.
     mac_placement = (
@@ -2254,6 +2272,8 @@ def return_fix(
 
     if not isinstance(sent_tree_key, KnownTreeKey):
         return fix_return.FixRefused("the copy sent no tree key")
+    if request.validation_step and read_tree_key(request.repo_root) != sent_tree_key:
+        return fix_return.FixRefused("the worktree changed after the copy")
     ignored = ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
         return fix_return.FixFailed("git did not list the ignored paths")
@@ -2275,6 +2295,8 @@ def return_fix(
         if isinstance(changes, fix_return.FixFailed):
             return changes
         if not changes.changed and not changes.removed:
+            if request.validation_step and read_tree_key(root) != sent_tree_key:
+                return fix_return.FixRefused("the worktree changed during the comparison")
             return fix_return.FixNone()
         with tempfile.TemporaryDirectory(prefix="mac-fix-") as staging:
             if changes.changed:
@@ -2288,7 +2310,8 @@ def return_fix(
                 if not isinstance(fetched, CommandOutput) or fetched.status != 0:
                     return fix_return.FixFailed("the changed files could not be fetched from the Mac")
             return fix_return.apply_fix(root, Path(staging), changes,
-                                        lambda: read_tree_key(root) == sent_tree_key)
+                                        lambda: read_tree_key(root) == sent_tree_key,
+                                        require_all=request.validation_step)
     except OSError as error:
         return fix_return.FixFailed(str(error))
 
@@ -2576,7 +2599,7 @@ def claimed_run(
     evidence.slot = request.slot
     try:
         linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
-        if linux and request.verb == "mend-fix":
+        if linux and eligibility.returns_copy_edits(request.verb):
             return declined("target does not permit this command", started)
         if linux:
             expected = expected_linux_parity(controller, config)
@@ -2719,7 +2742,7 @@ def claimed_run(
         if not linux:
             eligibility.linux_version_decline_path(request.target, repository.name).unlink(missing_ok=True)
         setup_failed = (isinstance(remote_status, MacNextestSetupFailed)
-                        or (linux and remote_status.status == os.EX_TEMPFAIL))
+                        or (linux and not request.validation_step and remote_status.status == os.EX_TEMPFAIL))
         fetched = (fetch_folder(controller, config, request, repository)
                    if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
         if not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder):
@@ -2747,11 +2770,16 @@ def claimed_run(
             if not linux:
                 evidence.execution = execution_identity.ExecutionNotStarted()
             return declined("state", started)
+        if request.validation_step and request.verb == "clippy" and len(request.nextest_words) == 2 and remote_status.rust_target_missing:
+            evidence.execution = execution_identity.ExecutionNotStarted()
+            return declined("rust_target_missing", started)
         if remote_status.status == 0:
             fixed = (return_fix(controller, config, request, repository, copied.tree_key)
-                     if request.verb == "mend-fix" else FIX_NOT_RUN)
+                     if eligibility.returns_copy_edits(request.verb) else FIX_NOT_RUN)
+            if request.validation_step and isinstance(fixed, (fix_return.FixRefused, fix_return.FixFailed)):
+                return DeclinedMacRun("validation_edit_return", seconds, fixed.reason)
             return PassedOnMac(seconds, fetched, remote_status.build_target_directory, fixed)
-        if remote_status.status == 4 and request.verb == "nextest":
+        if remote_status.status == 4 and request.verb == "nextest" and not request.validation_step:
             return NoTestMatchedOnMac(seconds, fetched)
         return FailedOnMac(remote_status.status, seconds, fetched)
     except OffloadInterrupted:
@@ -2839,6 +2867,13 @@ class MeasuredHanaSource:
         return self.objects.signed_get(sha256)
 
 
+def hana_command(request: OffloadRequest) -> tuple[str, ...]:
+    """Use the same exact validation command for admission and execution."""
+    if request.validation_step:
+        return request.validation_command
+    return ("cargo", request.verb, *request.nextest_words)
+
+
 def run_hana_offload(controller: ProcessController, transport: hana_placement.HanaControlTransport,
                      request: OffloadRequest, started: float) -> MacOffloadResult:
     """Select Hana policy before any SSH probe, process scan, or mirror transfer."""
@@ -2863,7 +2898,7 @@ def run_hana_offload(controller: ProcessController, transport: hana_placement.Ha
     policy = hana.fixed_policy(transport, str(request.repo_root), kind)
     if isinstance(policy, hana.HanaStepRefused):
         return DeclinedMacRun('off', elapsed_seconds(started), policy.reason, refusal_settings)
-    command = ('cargo', request.verb, *request.nextest_words)
+    command = hana_command(request)
     step = hana.classify_command(request.verb, kind, command)
     if (isinstance(step, hana.HanaStepRefused) or request.copy or isinstance(request.fetch, FetchFolder)
             or not isinstance(request.source, RepositoryWorkingTree)):
@@ -2965,13 +3000,14 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     if isinstance(claim, hana.HanaClaimRefused):
         return close_prelaunch(claim.reason)
     evidence.provider = claim.reserved.claim.reference
-    command = ('cargo', request.verb, *request.nextest_words)
+    command = hana_command(request)
+    arguments = command[2:]
     features: list[str] = []
-    for index, word in enumerate(request.nextest_words):
+    for index, word in enumerate(arguments):
         if word.startswith('--features='):
             features.extend(word.removeprefix('--features=').replace(',', ' ').split())
-        elif word == '--features' and index + 1 < len(request.nextest_words):
-            features.extend(request.nextest_words[index + 1].replace(',', ' ').split())
+        elif word == '--features' and index + 1 < len(arguments):
+            features.extend(arguments[index + 1].replace(',', ' ').split())
     try:
         sender = hana_transport.SourceSender(MeasuredHanaSource(hana_transport.AwsSourceObjects(
             cast('hana_provider.AwsHanaProvider', lifecycle.provider), configuration,
@@ -3342,7 +3378,9 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--repo-root", required=True)
     _ = run.add_argument("--source-root", default="")
     _ = run.add_argument("--package", default="")
-    _ = run.add_argument("--verb", choices=("nextest", "check", "clippy", "mend-check", "mend-fix", "doc", "build"), default="nextest")
+    _ = run.add_argument("--verb", choices=get_args(MacVerb), default="nextest")
+    _ = run.add_argument("--validation-step", action="store_true")
+    _ = run.add_argument("--validation-command-word", action="append", default=[])
     _ = run.add_argument("--kind", default="")
     _ = run.add_argument("--call-id", required=True)
     _ = run.add_argument("--settings", default="")
@@ -3405,6 +3443,8 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         last_decline=last_decline,
         copy=arguments.copy,
         verb=arguments.verb,
+        validation_step=arguments.validation_step,
+        validation_command=tuple(arguments.validation_command_word),
         kind=arguments.kind,
         target=arguments.target,
         environment=tuple((name, os.environ[name]) for name in arguments.environment),
@@ -3611,7 +3651,7 @@ def report_result_details(request: OffloadRequest, result: MacOffloadResult) -> 
         return
     if isinstance(request.fetch, FetchFolder):
         report_fetch(request.fetch, fetch_result(result))
-    if request.verb == "mend-fix" and isinstance(result, PassedOnMac):
+    if eligibility.returns_copy_edits(request.verb) and isinstance(result, PassedOnMac):
         report_fix(result.fix)
 
 
@@ -3633,7 +3673,19 @@ def main() -> int:
 
     cli = parser()
     arguments = cli.parse_args(namespace=CliArguments())
-    if arguments.environment and arguments.verb != "nextest":
+    if arguments.validation_step:
+        if not arguments.assignment_file:
+            cli.error("a validation step requires an assignment")
+        if not arguments.validation_command_word:
+            cli.error("a validation step requires its placed command")
+        if arguments.source_root or arguments.copy or arguments.filter_run or arguments.fetch is not None:
+            cli.error("a validation step uses the complete source and test selection")
+        settings_names = {"doc": {"LINT_DOC_JOBS"}, "nextest": {"NEXTEST_TEST_THREADS"}}
+        if set(arguments.environment) - settings_names.get(arguments.verb, set()):
+            cli.error("unsupported validation step environment")
+    elif arguments.validation_command_word or arguments.verb in ("fmt", "mend-copy"):
+        cli.error("this copy operation requires --validation-step")
+    elif arguments.environment and arguments.verb != "nextest":
         cli.error("--env applies only to nextest runs")
     if arguments.fetch is not None and (arguments.verb != "nextest" or arguments.copy):
         cli.error("--fetch applies only to non-copy nextest runs")

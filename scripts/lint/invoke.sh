@@ -401,27 +401,29 @@ run_step_attempt() {
         lint_dev_shell_path || return $?
     fi
     printf '+ %s\n' "$*"
-    if buildlog_step_compiles "$@"; then
-        if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
-            local hold_status=0
-            build_hold_check_local || hold_status=$?
-            if (( hold_status != 0 )); then
-                source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
-                BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
-                buildlog_release_memory "$hold_status"
-                if (( hold_status == 10 )); then return "$LINT_LEFT_QUEUE_STATUS"; fi
-                return "$hold_status"
-            fi
-        else
-            build_hold_wait_local || return $?
+    local compiles=0
+    if buildlog_step_compiles "$@"; then compiles=1; fi
+    if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
+        local hold_status=0
+        build_hold_check_local || hold_status=$?
+        if (( ! compiles || hold_status != 0 )); then
+            source "$BUILDLOG_SELECTED_LOCAL_GRANT" || return $?
         fi
+        if (( hold_status != 0 )); then
+            BUILDLOG_MEM_PRELAUNCH_REASON="local hold changed before execution"
+            buildlog_release_memory "$hold_status"
+            if (( hold_status == 10 )); then return "$LINT_LEFT_QUEUE_STATUS"; fi
+            return "$hold_status"
+        fi
+    elif (( compiles )); then
+        build_hold_wait_local || return $?
     fi
     if [[ "${BUILDLOG_PLACEMENT_PREPARED:-0}" != 1 ]]; then
         buildlog_begin "$@" || true
     fi
     BUILDLOG_PLACEMENT_PREPARED=0
     local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0 seed_notice="" seed_checked=0
-    if buildlog_step_compiles "$@"; then
+    if (( compiles )); then
         while :; do
             buildlog_wait_for_memory "$@" || {
                 status=$?
@@ -474,6 +476,41 @@ run_step_attempt() {
             }
         done
         BUILDLOG_MEM_WAIT_S=$memory_wait
+    fi
+    if [[ "${VALIDATION_OPERATION:-}" == fmt && -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
+        if ! require_rustfmt; then
+            buildlog_finish_memory 2 "$sampler_pid"
+            return 2
+        fi
+    fi
+    if [[ "${VALIDATION_OPERATION:-}" == nextest && -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
+        if ! (require_nextest); then
+            buildlog_finish_memory 2 "$sampler_pid"
+            return 2
+        fi
+    fi
+    if [[ -n "${VALIDATION_CARGO_TARGET:-}" ]]; then
+        local target_status=0
+        "$BUILD_HELPER_ROOT/lib/py" "$BUILD_HELPER_ROOT/lint/rust_target.py" "$VALIDATION_CARGO_TARGET" || target_status=$?
+        if (( target_status == 76 )); then
+            if [[ -n "${BUILDLOG_PLACEMENT_FILE:-}" ]]; then
+                BUILDLOG_MEM_PRELAUNCH_REASON=rust_target_missing
+                target_status=$LINT_LEFT_QUEUE_STATUS
+            else
+                echo 'validation_refusal=rust_target_missing'
+            fi
+        fi
+        if (( target_status != 0 )); then
+            buildlog_finish_memory "$target_status" "$sampler_pid"
+            return "$target_status"
+        fi
+    fi
+    if [[ -n "${VALIDATION_FALLBACK_SOURCE:-}" ]]; then
+        validation_fallback_source_matches || status=$?
+        if (( status != 0 )); then
+            buildlog_finish_memory "$status" "$sampler_pid"
+            return "$status"
+        fi
     fi
     local holder=() LINT_NEXTEST_WIDTH_FILE=""
     if [[ -n "${LINT_NEXTEST_POOL:-}" && "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run
@@ -827,6 +864,15 @@ fmt_cargo() {
         lint_config_skip_notice fmt "cargo +nightly fmt $*"
         return 0
     fi
+    if [[ "${LINT_QUEUE_PLACEMENT:-0}" == 1 && "${VALIDATION_OPERATION:-}" == fmt ]]; then
+        run cargo +nightly fmt "$@"
+        return
+    fi
+    require_rustfmt || return $?
+    run cargo +nightly fmt "$@"
+}
+
+require_rustfmt() {
     local version_file="${VERIFY_LINT_RUSTFMT_VERSION_FILE:-}"
     if [[ -n "$version_file" ]]; then
         if [[ ! -f "$version_file" ]]; then
@@ -834,13 +880,12 @@ fmt_cargo() {
         fi
         if [[ ! -s "$version_file" ]]; then
             echo "cargo +nightly fmt is required" >&2
-            exit 2
+            return 2
         fi
     elif ! cargo +nightly fmt --version >/dev/null 2>&1; then
         echo "cargo +nightly fmt is required" >&2
-        exit 2
+        return 2
     fi
-    run cargo +nightly fmt "$@"
 }
 
 # Clippy with warnings denied. Callers pass full cargo scope args (--workspace
@@ -935,4 +980,63 @@ invoke_sweep() {
         return 0
     fi
     run "$BUILD_HELPER_ROOT/lib/py" "$BUILD_HELPER_ROOT/lint/sweep.py" "$@"
+}
+
+# Validate the fixed pre-push operation before placement or execution.
+parse_validation_step() {
+    VALIDATION_OPERATION=${1:-}
+    VALIDATION_CARGO_TARGET=""
+    VALIDATION_COPY_EDITS=0
+    VALIDATION_KIND=lint
+    VALIDATION_VERB=$VALIDATION_OPERATION
+    case "$VALIDATION_OPERATION" in
+        clippy)
+            if [[ $# == 2 && "$2" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]]; then
+                VALIDATION_CARGO_TARGET=$2
+            elif [[ $# != 1 ]]; then
+                return 2
+            fi
+            ;;
+        doc|nextest|mend-check|self-mend-check)
+            [[ $# == 1 ]] || return 2
+            case "$VALIDATION_OPERATION" in
+                doc) VALIDATION_KIND=doc ;;
+                nextest) VALIDATION_KIND=test ;;
+                self-mend-check) VALIDATION_VERB=mend-check ;;
+            esac
+            ;;
+        fmt|mend-fix|self-mend-fix)
+            [[ $# == 1 ]] || return 2
+            VALIDATION_COPY_EDITS=1
+            if [[ "$VALIDATION_OPERATION" != fmt ]]; then VALIDATION_VERB=mend-copy; fi
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+validation_cargo_step() {
+    local VALIDATION_OPERATION VALIDATION_CARGO_TARGET VALIDATION_COPY_EDITS VALIDATION_KIND VALIDATION_VERB
+    if ! parse_validation_step "$@" || [[ "${VALIDATION_EXPECTED_VERB:-$VALIDATION_VERB}" != "$VALIDATION_VERB" ]]; then
+        printf 'lint: invalid validation operation: %s\n' "$*" >&2
+        return 2
+    fi
+    # The validator checks its mend policy before it submits either mend step.
+    # Execute every submitted operation even if the assigned host disables it.
+    local LINT_CONFIG_FORCE=1
+    local target_args=()
+    case "$VALIDATION_OPERATION" in
+        mend-fix) invoke_mend --workspace --fix ;;
+        mend-check) invoke_mend --workspace --fail-on-warn ;;
+        self-mend-fix) run bash "$BUILD_HELPER_ROOT/lint/self_mend.sh" --fix ;;
+        self-mend-check) run bash "$BUILD_HELPER_ROOT/lint/self_mend.sh" --fail-on-warn ;;
+        fmt) fmt_cargo --all ;;
+        clippy)
+            if [[ -n "$VALIDATION_CARGO_TARGET" ]]; then
+                target_args=(--target "$VALIDATION_CARGO_TARGET")
+            fi
+            invoke_clippy --all-targets --workspace --all-features ${target_args[@]+"${target_args[@]}"}
+            ;;
+        doc) invoke_doc --workspace --all-features ;;
+        nextest) run_nextest --workspace --all-features --tests ;;
+    esac
 }

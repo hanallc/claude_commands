@@ -613,6 +613,18 @@ route_test
         self.assertEqual(outcome.status, 1)
         publish.assert_called_once()
 
+    def test_validation_sends_the_placed_clippy_argv(self) -> None:
+        command = ('cargo', 'clippy', '--all-targets', '--workspace', '--all-features', '--', '-D', 'warnings')
+        request = replace(self.request, verb='clippy', kind='lint', nextest_words=('clippy',),
+                          validation_step=True, validation_command=command)
+        repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
+        with self.context(), mock.patch.object(hana_transport.SourceSender, 'prepare',
+                side_effect=hana_protocol.SourceRefused('fixture stops before upload')) as capture:
+            outcome = offload.claimed_run(self.controller, self.transport, request, repository, time.monotonic())
+        self.assertIsInstance(outcome, offload.HanaCommandAdmissionRefused)
+        capture.assert_called_once()
+        self.assertEqual(capture.call_args.args[1], command)
+
     def test_source_refusal_releases_the_claim_for_fallback(self) -> None:
         cause = 'IgnoredInput: remove the ignored path'
         reason = 'The Hana payload could not be prepared: ' + cause

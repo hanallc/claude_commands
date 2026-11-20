@@ -3434,6 +3434,9 @@ done
                                ) -> tuple[tuple[placement.CandidateEligibility, ...], placement.ResourceHolder]:
         result: list[placement.CandidateEligibility] = []
         local_holder: placement.ResourceHolder = placement.ResourceHolderUnknown()
+        needs_local_fix = any(saved.assignment.episode == request.episode
+            and saved.state == placement.ClosedAssignment(placement.VALIDATION_EDIT_RETURN)
+            for saved in self.assignments.values())
         for candidate in request.constraints.candidates:
             destination = candidate.destination
             permitted: placement.HostEligibility = candidate.eligibility
@@ -3443,6 +3446,8 @@ done
                 permitted = placement.FixedExclusion("another target is pinned")
             elif isinstance(selection, placement.MacOnlyHost) and destination.target != "mac":
                 permitted = placement.FixedExclusion("only the Mac is selected")
+            elif needs_local_fix and destination.provider != "local":
+                permitted = placement.FixedExclusion("the validation fix must run on natedev")
             elif isinstance(retry, placement.EvidenceNeeded):
                 permitted = retry
             elif isinstance(retry, placement.DoNotRetry):

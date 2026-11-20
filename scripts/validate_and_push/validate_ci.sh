@@ -1,17 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Single bottom layer for cargo invocations: scripts/lint owns every command's
-# flags (lint CLI over invoke.sh); this script only picks subcommands.
-# LINT_CONFIG_FORCE=1 is set on each step that must never be skipped by
-# config/lint.conf — as a pre-push gate, only the two mend steps honor that
-# file (see the mend note below).
-# Every lint call here passes --workspace explicitly. The lint CLI otherwise
-# narrows scope to the members the working tree changed, which is right for a
-# dev loop and wrong for a pre-push gate: a change that compiles in its own
-# crate can still break a dependent one, and this is the last check before the
-# push. Full coverage is the point.
-LINT_CMD="$HOME/.claude/scripts/lint/lint"
+# Verify places each Cargo step. The shared lint code owns its flags.
+VERIFY_CMD="$HOME/.claude/scripts/direct/verify.sh"
 
 # Lint policy, read for `mend` only — see the mend note in the header comment
 # below. A missing reader means every step runs.
@@ -36,13 +27,12 @@ LOCAL_CI_FILE="${REPO_ROOT}/.claude/config/local_ci.sh"
 # showrunner pushes each merge this way, after its own tests, and runs the full
 # validation every fifth merge. clippy, rustdoc, nextest and local CI are skipped.
 VALIDATE_QUICK="${VALIDATE_QUICK:-0}"
-MERGED_CHECKOUT_LOCAL_REASON="it edits the merged checkout on natedev with mend and fmt, and the push goes from there"
 
 # Canonical local CI mirror for Nate's Rust repos.
 # Variations:
 # - When the repo builds cargo-mend, fix and strict steps invoke that build
 #   instead of the installed binary, so a mend change gates its own push; all
-#   other repos use the installed cargo-mend through LINT_CMD
+#   other repos use the installed cargo-mend
 # - Clippy lints --all-targets, the same scope CI uses; benches are linted but
 #   intentionally never run here — run them ad hoc
 # - A repo can list extra target triples in `.claude/config/cross_targets`, one
@@ -226,24 +216,8 @@ EOF
   fi
 }
 
-# Build cargo-mend with the ambient env so its fingerprint matches every other
-# build here, then run it with RUSTC_WRAPPER cleared: a compiler cache replays
-# cached output instead of running rustc, which suppresses the diagnostics mend
-# analyzes.
-run_self_mend() {
-  local mend_bin="${REPO_TARGET_DIR}/debug/cargo-mend"
-  local -x BUILD_QUEUE_LOCAL_REASON="$MERGED_CHECKOUT_LOCAL_REASON"
-
-  echo "+ cargo build -p ${MEND_SELF_PACKAGE} --bin cargo-mend"
-  cargo build -p "$MEND_SELF_PACKAGE" --bin cargo-mend
-
-  if [ ! -x "$mend_bin" ]; then
-    echo "validate_ci.sh: no cargo-mend binary at ${mend_bin} after building ${MEND_SELF_PACKAGE}" >&2
-    return 1
-  fi
-
-  echo "+ env RUSTC_WRAPPER= ${mend_bin} --workspace --all-targets $*"
-  env RUSTC_WRAPPER= "$mend_bin" --workspace --all-targets "$@"
+validate_cargo_step() {
+  bash "$VERIFY_CMD" validation "$@"
 }
 
 resolve_mend_self_package
@@ -251,12 +225,12 @@ resolve_mend_self_package
 if ! lint_config_enabled mend; then
   lint_config_skip_notice mend "cargo-mend autofix"
 elif [ -n "$MEND_SELF_PACKAGE" ]; then
-  run_autofix_step "cargo-mend autofix (in-repo build)" run_self_mend --fix
+  run_autofix_step "cargo-mend autofix (in-repo build)" validate_cargo_step self-mend-fix
 else
-  run_autofix_step "cargo-mend autofix" env BUILD_QUEUE_LOCAL_REASON="$MERGED_CHECKOUT_LOCAL_REASON" "$LINT_CMD" mend --workspace --fix
+  run_autofix_step "cargo-mend autofix" validate_cargo_step mend-fix
 fi
 
-run_autofix_step "rustfmt" env BUILD_QUEUE_LOCAL_REASON="$MERGED_CHECKOUT_LOCAL_REASON" LINT_CONFIG_FORCE=1 "$LINT_CMD" fmt
+run_autofix_step "rustfmt" validate_cargo_step fmt
 
 run_autofix_step "taplo" taplo fmt
 
@@ -266,7 +240,7 @@ else
   # --all-features on clippy and rustdoc: the lint CLI and the dev loop run the
   # default feature set, so the whole tree shares one compiled copy of its
   # dependencies. The push gate is where feature-gated code gets covered.
-  run_step "clippy" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --all-features
+  run_step "clippy" validate_cargo_step clippy
 
   # Cross-target clippy for the triples listed in CROSS_TARGETS_FILE. Read into
   # an array first, so no step can drain the loop's stdin.
@@ -280,32 +254,24 @@ else
       fi
     done <"$CROSS_TARGETS_FILE"
   fi
-  if [ "${#CROSS_TARGETS[@]}" -gt 0 ]; then
-    INSTALLED_TARGETS="$(rustup target list --installed)"
-    for target in "${CROSS_TARGETS[@]}"; do
-      if ! grep -qxF "$target" <<<"$INSTALLED_TARGETS"; then
-        echo "!!! ${CROSS_TARGETS_FILE#"${REPO_ROOT}/"} lists ${target}, which is not installed."
-        echo "!!! Install it with: rustup target add ${target}"
-        exit 1
-      fi
-      run_step "clippy (${target})" env LINT_CONFIG_FORCE=1 "$LINT_CMD" clippy --workspace --all-features --target "$target"
-    done
-  fi
+  for target in "${CROSS_TARGETS[@]}"; do
+    run_step "clippy (${target})" validate_cargo_step clippy "$target"
+  done
 
   # rustdoc across every member with every feature on. The dev-time run covers
   # the workspace with default features, so it cannot see a doc link that
   # rotted behind a non-default feature. This is the sweep that catches it.
-  run_step "rustdoc" env LINT_CONFIG_FORCE=1 "$LINT_CMD" doc --workspace --all-features
+  run_step "rustdoc" validate_cargo_step doc
 
-  run_step "nextest" "$LINT_CMD" nextest --workspace --all-features --tests
+  run_step "nextest" validate_cargo_step nextest
 fi
 
 if ! lint_config_enabled mend; then
   lint_config_skip_notice mend "cargo-mend --fail-on-warn"
 elif [ -n "$MEND_SELF_PACKAGE" ]; then
-  run_step "cargo-mend (in-repo build)" run_self_mend --fail-on-warn
+  run_step "cargo-mend (in-repo build)" validate_cargo_step self-mend-check
 else
-  run_step "cargo-mend" "$LINT_CMD" mend --workspace --fail-on-warn
+  run_step "cargo-mend" validate_cargo_step mend-check
 fi
 
 if [ ! -f "$LOCAL_CI_FILE" ]; then

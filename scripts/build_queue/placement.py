@@ -147,6 +147,8 @@ class UnknownAssignedSettingsGeneration:
 
 
 SETTINGS_REFUSAL_REASONS = frozenset({"off", "repo"})
+VALIDATION_EDIT_RETURN = "validation_edit_return"
+RUST_TARGET_MISSING = "rust_target_missing"
 
 
 @dataclass(frozen=True)
@@ -522,7 +524,8 @@ def retry_decision(destination: PlacementDestination, reason: str | execution_id
         return DoNotRetry(reason.reason)
     if destination.target == "hana-gpu" and reason not in ("busy", "blocked"):
         return DoNotRetry(reason)
-    if reason in SETTINGS_REFUSAL_REASONS or reason in ("no_tests", "linux_only", "local_flag", "command"):
+    if reason in SETTINGS_REFUSAL_REASONS or reason in (
+            "no_tests", "linux_only", "local_flag", "command", RUST_TARGET_MISSING, VALIDATION_EDIT_RETURN):
         return DoNotRetry(reason)
     delay = 180 if destination.provider == "mac" and reason not in ("busy", "blocked", "disk") else 0
     return RetryAt(now + delay)

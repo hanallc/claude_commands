@@ -135,14 +135,15 @@ class ReturnFixTests(unittest.TestCase):
         (self.mirror / "target").mkdir()
         _ = (self.mirror / "target/build.txt").write_text("mac build\n")
 
-    def return_fix(self, sent: offload.TreeKey) -> fix_return.FixResult:
+    def return_fix(self, sent: offload.TreeKey, *, validation_step: bool = False) -> fix_return.FixResult:
         config = eligibility.OffloadConfig(
             enabled=True, connection=eligibility.SshConnectionSettings(HOST, 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=1, default_target_budget_gib="24", values={},
         )
         request = offload.OffloadRequest(
             self.worktree, "", "fix-call", offload.NO_RESULT_FILE, (), owner="verify",
-            holder_session="fixture-session", verb="mend-fix", target="mac")
+            holder_session="fixture-session", verb="mend-copy" if validation_step else "mend-fix", target="mac",
+            validation_step=validation_step)
         return offload.return_fix(offload.ProcessController(), config, request, REPOSITORY, sent)
 
     def test_mac_fix_returns_the_patch(self) -> None:
@@ -192,6 +193,25 @@ class ReturnFixTests(unittest.TestCase):
         self.assertEqual((self.worktree / "a.rs").read_text(), "pub(crate) fn a() {}\n")
         self.assertFalse((self.worktree / "c.rs").exists())
         self.assertEqual((self.worktree / "b.rs").read_text(), "fn b() {}\n")
+
+    def test_validation_refuses_all_edits_when_a_reservation_withholds_one(self) -> None:
+        self.board = berth_board.Board((
+            reservation("own-1", self.worktree, "mine", "file:a.rs"),
+            reservation("other-2", self.root / "other", "theirs", "file:c.rs"),
+        ))
+        sent = offload.read_tree_key(self.worktree)
+        self.fix_the_mirror()
+        result = self.return_fix(sent, validation_step=True)
+        self.assertIsInstance(result, fix_return.FixRefused)
+        self.assertEqual((self.worktree / "a.rs").read_text(), "fn a() {}\n")
+        self.assertFalse((self.worktree / "c.rs").exists())
+
+    def test_validation_requires_the_source_key_for_an_empty_return(self) -> None:
+        sent = offload.read_tree_key(self.worktree)
+        for tree in (self.mirror, self.worktree):
+            _ = (tree / "a.rs").write_text("fn a() { local_edit(); }\n")
+        self.assertEqual(self.return_fix(sent, validation_step=True),
+                         fix_return.FixRefused("the worktree changed after the copy"))
 
     def test_unchanged_mirror_writes_nothing(self) -> None:
         result = self.return_fix(offload.read_tree_key(self.worktree))
