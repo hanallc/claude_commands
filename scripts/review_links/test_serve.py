@@ -2905,9 +2905,15 @@ class ReviewLinksServerTests(unittest.TestCase):
                     change_page.deliver(saved.delivery, case.status)
                 current = review_page.build_snapshot(case.root)
                 self.assertIn('Question not delivered.', current.assets['question-delivery:'+key])
-        _ = investigation.answer(report.owner, report.id, 'The smoke checks passed.')
-        current = review_page.build_snapshot(case.root)
-        self.assertNotIn('question-delivery:'+investigation_key, current.assets)
+                if key == investigation_key:
+                    question = case.status.slots(saved.delivery.page, saved.delivery.row).question
+                    assert isinstance(question, change_page.OpenQuestion)
+                    _ = investigation.answer(report.owner, report.id, 'The smoke checks passed.',
+                                             question_id=question.question_id)
+                    current = review_page.build_snapshot(case.root)
+                    self.assertNotIn('question-delivery:'+investigation_key, current.assets)
+                elif key in (proposal, efficiency):
+                    self.assertNotIn('question-delivery:'+investigation_key, current.assets)
 
     def test_review_returns_conflict_for_a_deleted_investigation(self) -> None:
         case = self.review_fixture()

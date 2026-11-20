@@ -1070,21 +1070,33 @@ class DeliveryStatus:
         self.question_jobs: WeakSet[IO[str]] = WeakSet()
         self.startup_recovery_pending: threading.Event = threading.Event()
         self.deferred_questions: dict[Path, MessageDelivery | None] = {}
-        self.deferred_questions_lock: threading.Lock = threading.Lock()
+        self.deferred_alerts: set[Path] = set()
+        self.sending_alerts: set[Path] = set()
+        self.deferred_delivery_lock: threading.Lock = threading.Lock()
 
     def has_deferred_questions(self) -> bool:
-        with self.deferred_questions_lock:
+        with self.deferred_delivery_lock:
             return bool(self.deferred_questions)
 
     def defer_question(self, path: Path, delivery: MessageDelivery | None = None) -> None:
-        with self.deferred_questions_lock:
+        with self.deferred_delivery_lock:
             self.deferred_questions[path] = delivery
 
     def take_deferred_questions(self) -> dict[Path, MessageDelivery | None]:
-        with self.deferred_questions_lock:
+        with self.deferred_delivery_lock:
             deliveries = self.deferred_questions
             self.deferred_questions = {}
         return deliveries
+
+    def has_deferred_alerts(self) -> bool:
+        with self.deferred_delivery_lock:
+            return bool(self.deferred_alerts)
+
+    def recover_deferred_alerts(self) -> None:
+        with self.deferred_delivery_lock:
+            paths, self.deferred_alerts = self.deferred_alerts, set()
+        for path in paths:
+            self.send_pending_alerts(path)
 
     def read_view(self) -> DeliveryReadView:
         return DeliveryReadView(self, frozenset(self.root.glob(DELIVERY_PREFIX + "*")))
@@ -1199,7 +1211,8 @@ class DeliveryStatus:
             dispatch = fields.get("question_dispatch")
             has_receipt = intent.kind == "question" and self.has_review_save_receipt(page, row, intent)
             if has_receipt or (dispatch is not None and dispatch["attempt"] == intent.attempt
-                               and dispatch["state"] == "finished"):
+                               and (dispatch["state"] == "finished"
+                                    or (intent.kind == "verdict" and dispatch["state"] == "failed"))):
                 self.finish_intent_locked(delivery, slots, intent)
                 return False
             if dispatch is not None and dispatch["attempt"] == intent.attempt and dispatch["state"] in ("started", "unknown"):
@@ -1268,19 +1281,43 @@ class DeliveryStatus:
         self.write_closeout(path, fields)
 
     def send_pending_alerts(self, path: Path) -> None:
-        """Keep each failure alert until the sender accepts it."""
+        """Keep each alert until the sender confirms its result."""
+        with self.deferred_delivery_lock:
+            if path in self.sending_alerts:
+                self.deferred_alerts.add(path)
+                return
+            self.sending_alerts.add(path)
+            self.deferred_alerts.discard(path)
+        retry = False
         try:
-            with self.locked():
-                fields = cast(StoredDeliveryCloseout, json.loads(path.read_text(encoding="utf-8")))
-                alerts = fields.get("pending_alerts", [])
-                for index, alert in enumerate(alerts):
-                    _ = send_to_staff(alert["recipient"], SENDER, alert["message"], key=alert.get("key", ""))
-                    fields["pending_alerts"] = alerts[index + 1:]
-                    self.write_closeout(path, fields)
+            saved = cast(StoredDeliveryCloseout, json.loads(path.read_text(encoding="utf-8")))
+            for alert in saved.get("pending_alerts", []):
+                try:
+                    outcome = send_to_staff(alert["recipient"], SENDER, alert["message"], key=alert.get("key", ""))
+                    if outcome == "pending":
+                        retry = True
+                        continue
+                except SEND_ERRORS as error:
+                    print(f"review-links delivery alert {path.name}: {error}", file=sys.stderr)
+                    if not isinstance(error, FinalSendFailure):
+                        retry = True
+                        continue
+                with self.locked():
+                    fields = cast(StoredDeliveryCloseout, json.loads(path.read_text(encoding="utf-8")))
+                    alerts = fields.get("pending_alerts", [])
+                    if alert in alerts:
+                        alerts.remove(alert)
+                        self.write_closeout(path, fields)
         except FileNotFoundError:
             pass
-        except (*SEND_ERRORS, ValueError, TypeError, KeyError) as error:
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            retry = retry or isinstance(error, OSError)
             print(f"review-links delivery alert {path.name}: {error}", file=sys.stderr)
+        finally:
+            with self.deferred_delivery_lock:
+                self.sending_alerts.remove(path)
+                if retry:
+                    self.deferred_alerts.add(path)
 
     def notify_closeout_failure(self, page: ReviewPage, row: str, message: str,
                                 recipients: tuple[staff.StaffId, ...]) -> None:
@@ -2051,6 +2088,10 @@ class UnconfirmedSend(RuntimeError):
     """The sender could not confirm whether the recipient accepted the message."""
 
 
+class FinalSendFailure(RuntimeError):
+    """The sender returned a terminal failure."""
+
+
 def send_message(recipient: str, sender: str, message: str, *, key: str = "",
                  recipient_key: str = "") -> Literal["skipped", "pending"] | None:
     if not key:
@@ -2066,7 +2107,7 @@ def send_message(recipient: str, sender: str, message: str, *, key: str = "",
         return result
     if result in ("sent", "kept", "queued"):
         return None
-    raise RuntimeError(error)
+    raise FinalSendFailure(error)
 
 
 def feature_review_id(page: ReviewPage, doc: Path, row_id: str) -> str:
@@ -2502,10 +2543,11 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
     """Use the same send loop for a question stored in Review delivery slots."""
     page, row = delivery.page, delivery.row
     started = False
+    finished = False
     key = review_delivery_key(page.review_list, row, intent.attempt)
 
     def authorize() -> None:
-        nonlocal started
+        nonlocal started, finished
         with status.locked():
             slots = status.slots(page, row)
             if intent not in slots.intents() or review_open_question(page, slots, intent) != question:
@@ -2519,6 +2561,7 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
                     raise ValueError("The Review question save is unconfirmed.")
             if not started:
                 if not status.start_review_dispatch_locked(delivery, slots, intent, question=True):
+                    finished = True
                     raise StaleQuestionAttempt("The Review question has a delivery result.")
                 started = True
 
@@ -2540,6 +2583,8 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
                                        isinstance(result, DeliveryFailure) and isinstance(result.recipient, str)))
         error = run.error
         if isinstance(error, StaleQuestionAttempt):
+            if finished and intent.kind == "verdict":
+                status.send_pending_alerts(status.closeout_path(page, row))
             return
         failures = [result for result in run.results.values() if isinstance(result, DeliveryFailure)]
         if isinstance(error, ClosedQuestionSource):
@@ -2559,6 +2604,7 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
         result = (FailedDelivery(delivery.attempt, page.review_list, row, failures[-1].error)
                   if failures else NoFailedDelivery())
         relayed = False
+        alerts: tuple[PendingDeliveryAlert, ...] = ()
         if failures and error is None:
             alert_recipients = delivery.alert_recipients
             if isinstance(page, (ReviewMessagePage, UserQuestionPage)):
@@ -2567,19 +2613,25 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
                 except (OSError, ValueError) as failure:
                     print(f"review-links delivery alert {row}: {failure}", file=sys.stderr)
                     alert_recipients = ()
-            relayed = alert_delivery_failures(failures, run.attempts, source=page.review_list, row=row,
-                                             message=delivery.message, recipients=alert_recipients,
-                                             attempt=delivery.attempt, errors=(Exception,))
+            if intent.kind == "verdict":
+                alerts = pending_delivery_alerts(delivery, failures, run.attempts, alert_recipients)
+            if not alerts:
+                relayed = alert_delivery_failures(failures, run.attempts, source=page.review_list, row=row,
+                                                 message=delivery.message, recipients=alert_recipients,
+                                                 attempt=delivery.attempt, errors=(Exception,))
         with status.locked():
             slots = status.slots(page, row)
             if intent not in slots.intents() or review_open_question(page, slots, intent) != question:
                 return
             if intent.kind == "question" and (isinstance(result, NoFailedDelivery) or relayed):
                 status.write_save_receipt(page, row, intent)
-            status.record_result_locked(delivery, result, question_relayed=relayed, question_id=question.question_id)
+            status.record_result_locked(delivery, result, alerts, question_relayed=relayed,
+                                        question_id=question.question_id)
             if (isinstance(result, NoFailedDelivery) or relayed or error is not None
                     or isinstance(page, (ReviewMessagePage, UserQuestionPage))):
                 status.finish_intent_locked(delivery, slots, intent)
+        if alerts:
+            status.send_pending_alerts(status.closeout_path(page, row))
         if error is not None:
             print(f"review-links question {row}: {reason}", file=sys.stderr)
     except (OSError, ValueError) as failure:
@@ -2645,11 +2697,7 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
     routes = [(failure, tuple(recipient for recipient in showrunners_for_alert if recipient != failure.recipient))
               for failure in failures]
     if tracked_review:
-        alerts = tuple(
-            PendingDeliveryAlert(recipient=recipient,
-                key=review_delivery_key(page.review_list, delivery.row, delivery.attempt, purpose=f"alert:{failure.recipient}"),
-                message=delivery_failure_alert(failure, tries, page.review_list, delivery.row, delivery.message))
-            for failure, recipients in routes for recipient in recipients)
+        alerts = pending_delivery_alerts(delivery, failures, tries, showrunners_for_alert)
         status.record(delivery, result, alerts=alerts)
         if alerts:
             status.send_pending_alerts(status.closeout_path(delivery.page, delivery.row))
@@ -2659,6 +2707,16 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
         if not tracked_review or not recipients:
             _ = alert_delivery_failures([failure], tries, source=delivery.page.review_list, row=delivery.row,
                                         message=delivery.message, recipients=recipients, attempt=delivery.attempt)
+
+
+def pending_delivery_alerts(delivery: MessageDelivery, failures: list[DeliveryFailure], tries: int,
+                            recipients: tuple[staff.StaffId, ...]) -> tuple[PendingDeliveryAlert, ...]:
+    source, row = delivery.page.review_list, delivery.row
+    return tuple(
+        PendingDeliveryAlert(recipient=recipient,
+            key=review_delivery_key(source, row, delivery.attempt, purpose=f"alert:{failure.recipient}"),
+            message=delivery_failure_alert(failure, tries, source, row, delivery.message))
+        for failure in failures for recipient in recipients if recipient != failure.recipient)
 
 
 def delivery_failure_alert(failure: DeliveryFailure, tries: int, source: Path, row: str, message: str,

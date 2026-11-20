@@ -2190,11 +2190,12 @@ class ChangePageTests(unittest.TestCase):
         key = change_page.review_delivery_key(self.page.review_list, "C1", "fixture", purpose="alert")
         fields["pending_alerts"] = [{"recipient": showrunner.id, "message": alert, "key": key}]
         status.write_closeout(path, fields)
-        pending = subprocess.CompletedProcess([], 5, "PENDING: delivery unconfirmed", "")
+        sent = subprocess.CompletedProcess([], 0, "SENT: fixture accepted the alert", "")
         with (patch.object(change_page, "send_message", new=SEND_MESSAGE),
-              patch.object(subprocess, "run", return_value=pending) as run):
-            with patch.object(status, "write_closeout", side_effect=OSError("The clear write failed.")):
+              patch.object(subprocess, "run", return_value=sent) as run):
+            with patch.object(status, "write_closeout", side_effect=OSError("The clear write failed.")) as write:
                 status.send_pending_alerts(path)
+            write.assert_called_once()
             change_page.DeliveryStatus(self.root).send_pending_alerts(path)
         self.assertEqual(run.call_count, 2)
         self.assertEqual(run.call_args_list[0], run.call_args_list[1])
@@ -2202,6 +2203,62 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(command[command.index("--key") + 1], key)
         self.assertEqual(command[command.index("--recipient-key") + 1], showrunner.id)
         self.assertEqual(status.closeout_fields(self.page, "C1").get("pending_alerts"), [])
+
+    def test_pending_alert_retries_with_its_saved_key_until_the_result_is_final(self) -> None:
+        showrunner = showrunners.owner_for("page-owner")
+        status = change_page.DeliveryStatus(self.root)
+        path = status.closeout_path(self.page, "C1")
+        fields = status.closeout_fields(self.page, "C1")
+        alert: change_page.PendingDeliveryAlert = {
+            "recipient": showrunner.id, "message": "Pass the answer on by hand.", "key": "review:fixture-alert"}
+        fields["pending_alerts"] = [alert]
+        status.write_closeout(path, fields)
+        outcomes = [
+            subprocess.CompletedProcess([], 5, "PENDING: delivery unconfirmed", ""),
+            subprocess.CompletedProcess([], 6, "RETRY: delivery unconfirmed", ""),
+            subprocess.CompletedProcess([], 2, "REFUSED: the recipient cannot take alerts", ""),
+        ]
+        with (patch.object(change_page, "send_message", new=SEND_MESSAGE),
+              patch.object(subprocess, "run", side_effect=outcomes) as run, redirect_stderr(StringIO()) as errors):
+            status.send_pending_alerts(path)
+            self.assertTrue(status.has_deferred_alerts())
+            self.assertEqual(status.closeout_fields(self.page, "C1").get("pending_alerts"), [alert])
+            status.recover_deferred_alerts()
+            self.assertTrue(status.has_deferred_alerts())
+            self.assertEqual(status.closeout_fields(self.page, "C1").get("pending_alerts"), [alert])
+            status.recover_deferred_alerts()
+            status.recover_deferred_alerts()
+        self.assertFalse(status.has_deferred_alerts())
+        self.assertEqual(status.closeout_fields(self.page, "C1").get("pending_alerts"), [])
+        self.assertIn("REFUSED: the recipient cannot take alerts", errors.getvalue())
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args_list, [run.call_args_list[0]] * 3)
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--key") + 1], alert["key"])
+
+    def test_alert_transport_releases_the_delivery_lock_and_preserves_later_writes(self) -> None:
+        showrunner = showrunners.owner_for("page-owner")
+        status = change_page.DeliveryStatus(self.root)
+        path = status.closeout_path(self.page, "C1")
+        fields = status.closeout_fields(self.page, "C1")
+        fields["pending_alerts"] = [{
+            "recipient": showrunner.id, "message": "Pass the answer on by hand.", "key": "review:fixture-alert"}]
+        status.write_closeout(path, fields)
+
+        def send(_recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+            self.assertEqual(key, "review:fixture-alert")
+            with (self.root / ".review-link-delivery.lock").open("a", encoding="utf-8") as contender:
+                fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                current = status.closeout_fields(self.page, "C1")
+                current["messages"].append("Another request updated this record.")
+                status.write_closeout(path, current)
+
+        with patch.object(change_page, "send_to_staff", side_effect=send) as sender:
+            status.send_pending_alerts(path)
+        sender.assert_called_once()
+        current = status.closeout_fields(self.page, "C1")
+        self.assertEqual(current.get("pending_alerts"), [])
+        self.assertEqual(current["messages"], ["Another request updated this record."])
 
     def test_open_question_answer_recovers_for_the_asker_when_the_saved_mark_fails(self) -> None:
         key = self.file_user_question("Keep the saved answer")

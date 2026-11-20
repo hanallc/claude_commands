@@ -1687,7 +1687,9 @@ If the showrunner is the failed recipient, the server records the failure withou
 The alert names the list, row, recipient, number of tries, and last error.
 It states that the user's answer is saved and requests a manual handoff.
 Each saved alert has its own key.
-Recovery uses that key again if the server cannot clear an alert after sending it.
+Recovery reuses the alert key after an unconfirmed send or a failed clear.
+The server sends saved alerts outside the delivery lock.
+It takes the lock to clear an alert after confirmed acceptance or final failure.
 The user receives no delivery alert.
 
 At startup, the server delivers pending records with the same retry and alert rules.

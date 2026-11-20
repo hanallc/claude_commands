@@ -5524,11 +5524,11 @@ const change=async path=>{
   check(/(?:EST|EDT)$/.test(waitingQuestion?.querySelector('time[datetime]')?.textContent),
    'the waiting question shows the asked time in the user zone');
   await change('/answer');
-  await open('working','','1');
+  await open('needs-me','','1');
   const unreadQuestion=row().querySelector('.list-panel [data-question="Q1"]');
   check(!row().hidden && hasDot() && unreadQuestion?.textContent.includes('Which check passed?') &&
    unreadQuestion.textContent.includes('The gate passed.') && !row().querySelector('[data-open-question-note]'),
-   'Working with Unread only shows the answer in the panel and clears the question note.');
+   'Needs me with Unread only shows the answer in the panel and clears the question note.');
   check(unreadQuestion?.querySelectorAll('time[datetime]').length===2 &&
    unreadQuestion.querySelector('.question-unread')?.textContent==='Unread',
    'the unread answer shows both times and the Unread mark');
@@ -5558,7 +5558,7 @@ const change=async path=>{
   check(!row().querySelector('[data-detail]').hidden && nextQuestion(row()) && firstAnswer(row()),
    'a direct link shows both the waiting question and the first answer in the log');
   const {loggedAt}=await change('/second-answer');
-  await open('working','','1');
+  await open('all','','1');
   const original=row(), doc=frame.contentDocument;
   const panelQuestion=original.querySelector('[data-question="Q2"]');
   const askedAt=Date.parse(panelQuestion.querySelector('time').dateTime);
@@ -5586,11 +5586,11 @@ const change=async path=>{
   const chip=(filter,value)=>doc.querySelector('[data-filter-row="'+filter+'"] [data-filter-value="'+value+'"]');
   const count=(filter,value)=>Number(chip(filter,value).dataset.filterCount);
   const shown=()=>doc.querySelector('table').querySelectorAll('[data-list-item]:not([hidden])').length;
-  check(shown()===2 && count('owner','all')===2 && count('producer','all')===2 && count('show','working')===2,
-   'The Owner, Producer, and Working counts include the row kept open after the read.');
+  check(shown()===2 && count('owner','all')===2 && count('producer','all')===2 && count('show','all')===2,
+   'The Owner, Producer, and Show All counts include the row kept open after the read.');
   check(doc.querySelector('[data-list-count]').textContent.startsWith('2 of 2 items shown'),
    'The total includes the row kept open after the read.');
-  check(count('show','all')===1,'The Show All count reflects the end of the exception when Show changes.');
+  check(count('show','working')===1,'The Working count excludes the read row when Show changes.');
   chip('owner','staff:'+doc.querySelector('[data-number="2"]').dataset.owner).click();
   const allOwners=count('owner','all');
   chip('owner','all').click();
