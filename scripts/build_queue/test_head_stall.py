@@ -71,7 +71,7 @@ class FindStallTests(unittest.TestCase):
     def test_head_behind_an_idle_holder_with_no_start_is_a_stall(self) -> None:
         stall = head_stall.find_stall(STALLED, NOW - 2 * 3600, NOW, LIMIT)
         assert isinstance(stall, head_stall.HeadStall)
-        self.assertEqual((stall.last_start, stall.need, round(stall.waited), round(stall.quiet)),
+        self.assertEqual((stall.last_memory_start, stall.need, round(stall.waited), round(stall.quiet)),
                          (NOW - 2 * 3600, 15 * GIB, 3 * 3600, 2 * 3600))
         self.assertEqual(stall.holders, (head_stall.Holder("check", "/home/u/rust/devtools-chooserux", 706237,
                                                          12 * GIB, GIB // 10, 3 * 3600.0),))
@@ -329,7 +329,23 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 2)
         _ = self.observe(STALLED, NOW + 60)
         self.assertEqual(len(self.sent), 2)
-        admission = NOW + 120
+        passed_at = NOW + 90
+        _, head = STALLED.inputs.ordered[0]
+        events = (
+            {"kind": "admitted", "admitted_at": passed_at, "need": 0},
+            {"kind": "landing_pass", "passed_at": passed_at, "pid": head["pid"],
+             "start_time": head["start_time"], "since": head["since"]},
+        )
+        _ = (self.paths.admission / "queue_times.jsonl").write_text(
+            "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events))
+        self.assertEqual(self.observe(STALLED, passed_at), head_stall.NoStall())
+        same_stall = self.observe(STALLED, passed_at + LIMIT)
+        assert isinstance(same_stall, head_stall.HeadStall)
+        self.assertEqual(same_stall.quiet, LIMIT)
+        self.assertEqual(same_stall.last_memory_start, NOW - 3 * 3600)
+        self.assertEqual(len(self.sent), 2)
+
+        admission = passed_at + LIMIT + 30
         self.admit_at(admission)
         self.assertEqual(self.observe(STALLED, admission), head_stall.NoStall())
         self.assertEqual(len(self.sent), 2)

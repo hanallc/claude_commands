@@ -65,8 +65,8 @@ class Holder:
 
 @dataclass(frozen=True)
 class HeadStall:
-    """The head waited at least the limit, steps hold memory, and no step started in that time."""
-    last_start: float
+    """The head reached the wait and quiet limits while steps hold memory."""
+    last_memory_start: float
     step: str
     folder: str
     pid: int
@@ -88,6 +88,12 @@ class StallPaths:
     state: Path
 
 
+@dataclass(frozen=True)
+class QueueActivity:
+    last_memory_admission: float = 0.0
+    last_landing_pass: float = 0.0
+
+
 def default_paths() -> StallPaths:
     return StallPaths(store.root() / "admission", store.root() / "head_stall.json")
 
@@ -99,30 +105,40 @@ def configured_limits() -> tuple[float, float]:
 
 
 def last_admission(times: Path) -> float:
-    """The newest admitted time of a step with memory need in the tail of queue_times.jsonl; 0 when none.
+    """Find the last start that added a memory promise."""
+    return queue_activity(times, records.NoWaiter()).last_memory_admission
 
-    A merge gate or targeted test is admitted with zero need every few minutes; it frees nothing for the head.
-    """
+
+def queue_activity(times: Path, head: records.Waiter | records.NoWaiter) -> QueueActivity:
+    """Read the last admission with memory need and the last pass of this head."""
     try:
         with times.open("rb") as stream:
             size = stream.seek(0, 2)
             _ = stream.seek(max(0, size - TIMES_TAIL_BYTES))
             lines = stream.read().decode(errors="replace").splitlines()
     except OSError:
-        return 0.0
+        return QueueActivity()
+    last_landing_pass = 0.0
     for line in reversed(lines):
-        if '"kind":"admitted"' not in line:
+        if '"kind":"admitted"' not in line and '"kind":"landing_pass"' not in line:
             continue
         try:
             row = cast(object, json.loads(line))
         except ValueError:
             continue
-        if isinstance(row, dict):
-            fields = cast(dict[str, object], row)
+        if not isinstance(row, dict):
+            continue
+        fields = cast(dict[str, object], row)
+        if fields.get("kind") == "admitted":
             value, need = fields.get("admitted_at"), fields.get("need")
             if isinstance(value, (int, float)) and isinstance(need, int) and need > 0:
-                return float(value)
-    return 0.0
+                return QueueActivity(float(value), last_landing_pass)
+        elif (not isinstance(head, records.NoWaiter) and fields.get("pid") == head["pid"]
+                and fields.get("start_time") == head["start_time"] and fields.get("since") == head["since"]):
+            passed_at = fields.get("passed_at")
+            if isinstance(passed_at, (int, float)):
+                last_landing_pass = max(last_landing_pass, float(passed_at))
+    return QueueActivity(last_landing_pass=last_landing_pass)
 
 
 def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
@@ -156,22 +172,24 @@ def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
     return CompilerScanCountUnavailable()
 
 
-def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: float) -> HeadStall | NoStall:
+def find_stall(snapshot: QueueSnapshot, last_memory_admission: float, now: float, limit: float, *,
+               last_landing_pass: float = 0.0) -> HeadStall | NoStall:
     inputs = snapshot.inputs
     running = tuple(step for step in inputs.running if step.promise > 0)
     if not inputs.ordered or not running:
         return NoStall()
     _, head = inputs.ordered[0]
     waited = now - head["since"]
-    last_start = max(admitted, *(step.started_at for step in running))
-    quiet = now - last_start
+    last_memory_start = max(last_memory_admission, *(step.started_at for step in running))
+    quiet_since = max(last_memory_start, last_landing_pass)
+    quiet = now - quiet_since
     if waited < limit or quiet < limit:
         return NoStall()
     holders = tuple(Holder(step.step, step.folder, step.pid, step.promise,
                            attributed.use.bytes if isinstance(attributed.use, records.AnonymousRunUse) else attributed.use,
                            max(0.0, now - step.started_at) if step.started_at > 0 else HolderAdmissionUnavailable())
                     for _, step, attributed in gate.attributed_step_uses(inputs) if step.promise > 0)
-    return HeadStall(last_start, head.get("step", "step"), head.get("folder", ""),
+    return HeadStall(last_memory_start, head.get("step", "step"), head.get("folder", ""),
                      head["pid"], head["need"], waited, quiet, holders, _compiler_scan(inputs.running))
 
 
@@ -179,7 +197,11 @@ def current_stall(paths: StallPaths, now: float, limit: float, freshest: float) 
     snapshot = read_queue_snapshot(paths.admission)
     if not isinstance(snapshot, QueueSnapshot) or now - snapshot.written_at > freshest:
         return NoStall()
-    return find_stall(snapshot, last_admission(paths.admission / "queue_times.jsonl"), now, limit)
+    if not snapshot.inputs.ordered:
+        return NoStall()
+    _, head = snapshot.inputs.ordered[0]
+    activity = queue_activity(paths.admission / "queue_times.jsonl", head)
+    return find_stall(snapshot, activity.last_memory_admission, now, limit, last_landing_pass=activity.last_landing_pass)
 
 
 def _folder_name(folder: str) -> str:
@@ -240,12 +262,12 @@ def _delivered_stalls(state: Path) -> dict[AlertRecipient, float | str]:
     return delivered
 
 
-def _already_alerted(value: float | str, last_start: float) -> bool:
+def _already_alerted(value: float | str, last_memory_start: float) -> bool:
     if isinstance(value, str):
         # The previous key ended with the last start in whole seconds.
         _, separator, second = value.rpartition(":")
-        return bool(separator) and second.isdecimal() and int(last_start) <= int(second)
-    return last_start <= value
+        return bool(separator) and second.isdecimal() and int(last_memory_start) <= int(second)
+    return last_memory_start <= value
 
 
 def send_alert(stall: HeadStall, state: Path, now: float, run: Callable[[list[str], str], bool]) -> None:
@@ -256,12 +278,12 @@ def send_alert(stall: HeadStall, state: Path, now: float, run: Callable[[list[st
     text = builds_text(stall)
     write_errors: list[OSError] = []
     for recipient in ALERT_RECIPIENTS:
-        if recipient in delivered and _already_alerted(delivered[recipient], stall.last_start):
+        if recipient in delivered and _already_alerted(delivered[recipient], stall.last_memory_start):
             continue
         command = session_send_argv(recipient, sender=SENDER)
-        command.extend(["--key", f"head-stall-{stall.last_start}"])
+        command.extend(["--key", f"head-stall-{stall.last_memory_start}"])
         if run(command, text):
-            delivered[recipient] = stall.last_start
+            delivered[recipient] = stall.last_memory_start
             try:
                 write_text_atomic(state, json.dumps({"alerted": delivered, "at": now}) + "\n")
             except OSError as error:

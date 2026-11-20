@@ -389,7 +389,8 @@ The first two minutes use the same calculation. A run never counts its use twice
 The display shows zero room for a shortfall. The cap explanation shows the shortfall.
 These readings never reduce a promise from history.
 
-Waiting runs follow priority, first run arrival, and PID order.
+Waiting runs use unit priority, first run arrival, and PID for their normal order.
+A verified landing test gets [limited priority](#landing-merge-test-priority) in the natedev memory queue.
 A younger run starts only when its need fits after the first run's need remains protected.
 The first run can start despite insufficient room when no admitted run or held slot remains.
 Readable host memory, clear readable pressure, and a current estimate remain necessary.
@@ -549,14 +550,17 @@ At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 1. `admitted` records the original arrival, admission time, wait seconds, need, need source, and whether the step is first.
 2. `left` records a cancelled waiter or a waiter whose owner is gone.
 3. `ended` records the reservation's end time, outcome, end kind, and sampled peak state.
+4. `token_gap` records when the step left for tokens and when it returned to the queue.
+5. `landing_pass` records when a landing test passed the head.
 
+New events carry `landing_merge` to identify verified landing tests.
 Each event identifies the logical step by `pid`, `start_time`, and the original `since`.
 Each admission and end also identifies its reservation interval by `reservation_id`.
 A token wait ends an interval with `TokenReturn`. It does not complete the step.
 A normal end uses `StepEnd`. An exit before a positive sample records `NoPositiveSample`.
 The saved finalization intent retains the facts for the end event across retries.
 The event identity prevents a retry from publishing the same end twice.
-The service saves pending admission and cancellation facts with each durable state transition.
+The service saves pending admissions, cancellations, and head passes with each durable state transition.
 One lifecycle outbox publishes these facts after the state write and during restart.
 Reservation removal and removal of its non-token place use the same state write.
 
@@ -1014,15 +1018,15 @@ The sender prints each send outcome header to the journal.
 It reads `queue.json` and the tail of `queue_times.jsonl`. It does not ask the service.
 The watch uses `head_stall_alert_minutes` from `build_admission.conf` as the stall limit.
 The head must wait at least that long. At least one step must hold memory.
-The last admission or step start with a memory need above zero must also be at least that old.
-Merge gates and targeted tests start with a memory need of zero.
+The [quiet clock](buildlog-memory-stalls.md#queue-head-stalls) must also reach that limit.
+A landing test that passes the head resets its quiet clock, even with zero memory need.
 The watch skips snapshots older than `silence_seconds`. `down-alert` covers a silent service.
 
 The watch sends one alert per stall to each of the `builds` and `bob` sessions.
 The alert names the head and lists each holder's time since admission, memory promise, and memory use.
 It adds a note when an incomplete sccache scan can make the use values too low.
-The stall key is the most recent admission or step start with a memory need above zero.
-A head change keeps the same key. A new admission or step start ends the stall.
+The stall key is the most recent start with a positive memory promise.
+A head change or a zero-need landing pass keeps the same key.
 The sender uses the stall key to keep one queued copy per recipient.
 The watch accepts `SENT`, `SKIPPED`, `QUEUED`, and `KEPT` as delivery outcomes.
 After each accepted send, the watch records the recipient and stall key in `~/.local/state/buildlog/head_stall.json`.
@@ -1913,7 +1917,7 @@ The drain check requires matching entry content and a matching recorded version;
 The service owns the durable admission state and the socket.
 `RankedWaiter` adds `PriorityUnit` or `NormalOrder` to a resolved row through `rank_waiter`.
 A durable waiter has no `priority_rank` or resolved `order` field.
-The order is priority, the step's original order time, then pid.
+The normal order uses unit priority, the step's original order time, and PID.
 Token waiters keep their clocks and places but cannot protect room as the head.
 `TokenWaitersOnly` distinguishes a token-only queue from an empty queue.
 
@@ -1928,6 +1932,40 @@ Retries retain the transition id and read only the saved log tail.
 The service imports old files once.
 A failed cleanup logs its path and retains its record.
 Each later finalization attempt uses the same guard, so other admissions continue.
+
+#### Landing merge test priority
+
+For a local `merge-gate` request, the service reads the PID from the socket credentials.
+The peer must be the request owner or one of its descendants.
+An ancestor of the peer must match a live land record by PID and process start time.
+The service also checks that the request session's staff chain reaches the fixed staff ID of `natemerge`.
+A unit trial without a matching land record keeps its normal place.
+The service checks the land record and process again before it changes the order.
+
+The first eligible test from each land can move ahead in the natedev memory queue.
+It must fit within the normal memory limits with all current claims in place.
+Promotion cannot return another waiter's continuation claim.
+A promoted test cannot start through `StartsAlone`.
+The service saves the land's PID and start time when it admits this test.
+A later request from the same land keeps its normal place.
+A landing test waits behind any waiter that reached the pass limit.
+Admission counts one pass for each waiter that the landing test moved ahead of.
+The count uses the waiter's PID, process start time, and original queue arrival.
+The count stays with that wait through a reconnect.
+The service removes the count when the owner exits.
+
+Each landing order reads two keys from `config/build_admission.conf`.
+
+- `landing_merge_first` starts at `on`. Set it to `off` to use the normal order.
+- `landing_merge_max_passes` starts at `2` and accepts whole numbers from zero. Zero prevents passes.
+
+Run `scripts/lib/py -m scripts.lint.memory_admit landing-waits --since <time>` for the memory wait report.
+Use Unix seconds or an ISO 8601 time with a UTC offset.
+The report counts steps that arrived at or after that time and have a complete memory wait.
+It prints count, median, and maximum in seconds for verified landing tests and unit steps.
+For an unmarked `merge-gate`, the report uses the staff chain of a matching current session.
+Inferred landing tests appear in the row `Landing tests before (by session)`.
+The report excludes older sessions because the staff record retains only current sessions.
 
 ### Mac disk floor
 
@@ -2006,7 +2044,7 @@ Room equals free memory minus `safety_gib` and run keep-asides. The safety is 3 
 The cap equals our swap-backed use plus CI use plus free memory minus safety. It does not limit an estimate.
 The first two minutes use the same formula. Use and kept bytes never count the need twice.
 
-The first eligible run follows queue priority, first run arrival, and PID.
+The first eligible run follows the [resolved queue order](#priority-and-token-waits-after-the-service-switch).
 A younger run starts only if its need fits room minus the first run's need.
 Pressure or unreadable pressure holds new starts and extra memory only while it lasts.
 An unreadable pressure file shows `pressure unreadable: <path>` with a short error or `incomplete` when available.

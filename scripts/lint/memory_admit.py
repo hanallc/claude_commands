@@ -14,6 +14,7 @@ import json
 import math
 import mmap
 import os
+from statistics import median
 import subprocess
 import sys
 import uuid
@@ -21,6 +22,7 @@ from collections import deque
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from enum import Enum
 from pathlib import Path
 
 from typing import BinaryIO, Literal, Protocol, TypedDict, cast
@@ -52,6 +54,7 @@ from scripts.lib.test_phase import (
 )
 
 from scripts.buildlog import record, store
+from scripts.production import staff
 
 
 from scripts.build_queue.admission_records import (
@@ -460,11 +463,11 @@ def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> boo
                  if waiter.get("fresh_test", False) else policy.timing.estimate_refresh_seconds))
 
 
-def ranked_queue_waiters(inputs: QueueInputs) -> list[tuple[Path, RankedWaiter]]:
-    """Resolve order metadata without adding it to captured waiter rows."""
-    return sorted(((path, rank_waiter(row, inputs.waiter_orders[records.waiter_owner(row)]))
-                   for path, row in inputs.ordered),
-                  key=lambda item: waiter_order(item[1]))
+def ranked_queue_waiters(inputs: QueueInputs, *, resolved_order: bool = False) -> list[tuple[Path, RankedWaiter]]:
+    """Restore unit ranks and sort the rows if the caller has not resolved the order."""
+    ranked = [(path, rank_waiter(row, inputs.waiter_orders[records.waiter_owner(row)]))
+              for path, row in inputs.ordered]
+    return ranked if resolved_order else sorted(ranked, key=lambda item: waiter_order(item[1]))
 
 
 
@@ -1402,9 +1405,15 @@ def waiter_label(row: Waiter) -> str:
 
 
 def waiter_order(row: Waiter) -> tuple[int, float, int]:
+    """Return the normal queue sort key."""
     order = records.waiter_priority(row)
     rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
     return rank, row.get("order_since", row["since"]), row["pid"]
+
+
+def move_waiter(rows: list[tuple[Path, Waiter]], source: int, destination: int) -> None:
+    """Move one waiter within the queue."""
+    rows.insert(destination, rows.pop(source))
 
 
 @dataclass(frozen=True)
@@ -1539,6 +1548,9 @@ class MemoryWaitIncomplete:
     """A later admission has no recorded token return time."""
 
 
+LandingHistoryMark = Literal["landing", "ordinary", "unmarked"]
+
+
 @dataclass(frozen=True)
 class QueueStepLifetime:
     pid: int
@@ -1550,6 +1562,9 @@ class QueueStepLifetime:
     token_gaps: tuple[QueueTokenGap, ...]
     end: ReservationEnded | LeftQueue | StepStillOpen
     memory_wait_s: float | MemoryWaitIncomplete
+    session_id: str = ""
+    unit: str = ""
+    landing_merge: LandingHistoryMark = "unmarked"
 
 
 def read_queue_lifetimes(directory: Path) -> tuple[QueueStepLifetime, ...]:
@@ -1560,6 +1575,8 @@ def read_queue_lifetimes(directory: Path) -> tuple[QueueStepLifetime, ...]:
         return ()
     grouped: dict[tuple[int, str, float], list[dict[str, object]]] = {}
     for event in events:
+        if event.get("kind") == "landing_pass":
+            continue
         pid, start, since = event.get("pid"), event.get("start_time"), event.get("since")
         if type(pid) is not int or not isinstance(start, str) or type(since) not in (int, float):
             continue
@@ -1572,13 +1589,23 @@ def read_queue_lifetimes(directory: Path) -> tuple[QueueStepLifetime, ...]:
         intervals: dict[str, ReservationInterval] = {}
         gaps: list[QueueTokenGap] = []
         end: ReservationEnded | LeftQueue | StepStillOpen = StepStillOpen()
-        step, repo = "", ""
+        step, repo, session, unit = "", "", "", ""
+        landing_merge: LandingHistoryMark = "unmarked"
+        # Use the first admission or departure to classify the original queue wait.
+        for row in rows:
+            if row.get("kind") in ("admitted", "left"):
+                mark = row.get("landing_merge")
+                if isinstance(mark, bool):
+                    landing_merge = "landing" if mark else "ordinary"
+                break
         # The append path preserves event order, including equal timestamps.
         for row in rows:
             try:
                 kind = row.get("kind")
                 step = str(row.get("step", step))
                 repo = str(row.get("repo", repo))
+                session = str(row.get("session_id") or session)
+                unit = str(row.get("unit") or unit)
                 if kind == "admitted":
                     admitted = cast(AdmittedEvent, codec.parse_snapshot_value(row, AdmittedEvent))
                     reservation = admitted["reservation_id"]
@@ -1617,7 +1644,8 @@ def read_queue_lifetimes(directory: Path) -> tuple[QueueStepLifetime, ...]:
             wait = max(0.0, end.ended_at - since)
         else:
             wait = MemoryWaitIncomplete()
-        steps.append(QueueStepLifetime(pid, start, since, step, repo, ordered, tuple(gaps), end, wait))
+        steps.append(QueueStepLifetime(pid, start, since, step, repo, ordered, tuple(gaps), end, wait,
+                                       session, unit, landing_merge))
     return tuple(sorted(steps, key=lambda step: (step.since, step.pid, step.start_time)))
 
 
@@ -2002,8 +2030,18 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
     return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
-def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
-    ordered = ranked_queue_waiters(inputs)
+class ContinuationClaimPolicy(Enum):
+    """Control whether the pass can release a claim for an earlier waiter."""
+
+    RELEASE_FOR_EARLIER_WAITER = "release_for_earlier_waiter"
+    KEEP_FOR_OWNER = "keep_for_owner"
+
+
+def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt, *,
+                resolved_order: bool = False,
+                claim_policy: ContinuationClaimPolicy = ContinuationClaimPolicy.RELEASE_FOR_EARLIER_WAITER
+                ) -> HeadPolicy:
+    ordered = ranked_queue_waiters(inputs, resolved_order=resolved_order)
     candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
     queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
     safety = policy.safety_bytes
@@ -2011,8 +2049,9 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
     while True:
         room = inputs_room(inputs, policy)
         kept, used = (room.kept, room.used) if isinstance(room, MemoryRoom) else (0, 0)
-        admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start)
-        if not inputs.slots:
+        admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start,
+                                    claim_policy=claim_policy)
+        if claim_policy is ContinuationClaimPolicy.KEEP_FOR_OWNER or not inputs.slots:
             break
         held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
                        if entry.decision.reused_slot and isinstance(entry.decision.order_hold, HeldBehindHead)}
@@ -2057,7 +2096,7 @@ def can_use_natedev(row: Waiter) -> bool:
 def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]],
                    room: MemoryRoom | ReadingUnavailable,
                    now: float, policy: AdmissionPolicy, kept: int, used: int, safety: int,
-                   next_start: NextStartAt) -> list[WaiterAdmission]:
+                   next_start: NextStartAt, *, claim_policy: ContinuationClaimPolicy) -> list[WaiterAdmission]:
     """Admit local steps in order and name the first local step that waits."""
     if isinstance(room, MemoryRoom):
         remaining, readable = room.signed_room, True
@@ -2079,9 +2118,14 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     gpu_used = sum(gpu_test_reservation(row, gpu) for row in inputs.reservations)
     first_for_folder: dict[placement.CargoFolder, Waiter] = {}
     folder_slot_bytes: dict[placement.CargoFolder, int] = {}
+    folder_claim_counts: dict[placement.CargoFolder, int] = {}
     for owner, claim in claims.items():
         folder = inputs.cargo_folders.get(owner)
-        if folder is not None:
+        if folder is None:
+            continue
+        if claim_policy is ContinuationClaimPolicy.KEEP_FOR_OWNER:
+            folder_claim_counts[folder] = folder_claim_counts.get(folder, 0) + 1
+        else:
             folder_slot_bytes[folder] = folder_slot_bytes.get(folder, 0) + claim.slot.bytes
     first_folder_wait: Waiter | NoWaiter = NoWaiter()
     first_held: Waiter | NoWaiter = NoWaiter()
@@ -2100,11 +2144,13 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
         folder = inputs.cargo_folders.get(owner) if local_route else None
-        folder_busy = folder in inputs.occupied_cargo_folders
+        folder_busy = (folder in inputs.occupied_cargo_folders
+                       or (folder is not None and folder_claim_counts.get(folder, 0) > int(reused)))
         earlier = first_for_folder.get(folder, NoWaiter()) if folder is not None else NoWaiter()
-        # A grant returns the other continuation claims for this folder.
+        # The normal grant returns the other continuation claims for this folder.
         released = (folder_slot_bytes.get(folder, 0) - held
-                    if folder is not None and not folder_busy and isinstance(earlier, NoWaiter) else 0)
+                    if claim_policy is ContinuationClaimPolicy.RELEASE_FOR_EARLIER_WAITER
+                    and folder is not None and not folder_busy and isinstance(earlier, NoWaiter) else 0)
         checked_room = remaining + released
         alone = head_owner == owner and head_can_start_alone
         fits = extra <= checked_room
@@ -2188,9 +2234,11 @@ def admission_wait_holder(decision: AdmissionDecision, reason: WaitReason,
     return wait_holder_identity(session_id, session_name, unit)
 
 
-def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> PassResult:
+def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *, resolved_order: bool = False,
+                   claim_policy: ContinuationClaimPolicy = ContinuationClaimPolicy.RELEASE_FOR_EARLIER_WAITER
+                   ) -> PassResult:
     next_start = start_spacing_after(now, policy)
-    resolved = head_policy(inputs, now, policy, next_start)
+    resolved = head_policy(inputs, now, policy, next_start, resolved_order=resolved_order, claim_policy=claim_policy)
     candidate = resolved.queued_head
     head_owner = records.waiter_owner(candidate.waiter) if isinstance(candidate, QueuedHead) else ""
     available = inputs.host.available if isinstance(inputs.host, HostMemory) else 0
@@ -2241,7 +2289,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         blocker: BlockingIndex | NoSingleBlocker | BlockerNotRequested = BlockerNotRequested()
         if owner in inputs.blockers_for and decision.state == "hold" and isinstance(entry.state, QueuedWaiter):
             if not endings:
-                endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,)), policy), now, policy)
+                endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,)), policy),
+                                    now, policy, resolved_order=resolved_order, claim_policy=claim_policy)
                                 for ended in range(len(inputs.running)))
             blocker = blocking_index(owner, endings)
         rows.append(PassRow(owner, decision, reason, blocker, proposal,
@@ -2352,7 +2401,9 @@ def queue_read_from(inputs: QueueInputs, policy: AdmissionPolicy) -> QueueRead:
 
 def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                          result: PassResult) -> QueueRead:
-    ordered = ranked_queue_waiters(inputs)
+    paths = {records.waiter_owner(row): path for path, row in inputs.ordered}
+    ordered = [(paths[owner], rank_waiter(entry.waiter, inputs.waiter_orders[owner]))
+               for entry in result.policy.walk if (owner := records.waiter_owner(entry.waiter)) in paths]
     candidate = result.policy.queued_head
     identities = RecordedQueueIdentities()
     available = inputs.host.available if isinstance(inputs.host, HostMemory) else 0
@@ -2413,7 +2464,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
         WaitingLine(tuple(line), len(line), sum(item.fits_now for item in line),
                     min((item.waiter.need for item in line), default=0), max((item.waiter.need for item in line), default=0),
                     min((item.waiter.since for item in line), default=inputs.now)),
-        inputs, tuple(row for _, row in ordered), inputs.reservations,
+        replace(inputs, ordered=ordered), tuple(row for _, row in ordered), inputs.reservations,
         inputs.spacing, inputs.priority, room=result.policy.room, policy=policy)
     return QueueRead(view, explanation, ordered)
 
@@ -2463,7 +2514,7 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
     indices = frozenset(ended)
     released = [row for index, row in enumerate(explanation.running) if index in indices]
     inputs = inputs_after_steps_end(explanation.decided_from, indices, explanation.policy)
-    result = admission_pass(inputs, explanation.now, explanation.policy)
+    result = admission_pass(inputs, explanation.now, explanation.policy, resolved_order=True)
     candidate = result.policy.queued_head
     if isinstance(candidate, NoQueuedHead):
         return NoWaiter()
@@ -2573,7 +2624,7 @@ class FinalizationIntents(Protocol):
 def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, now: datetime,
                          status: int | OutcomeNotRecorded = OUTCOME_NOT_RECORDED, *,
                          intents: FinalizationIntents,
-                         end_kind: StepEnd | TokenReturn) -> HistoryRecorded | NoHistoryRecorded:
+                         end_kind: StepEnd | TokenReturn, landing_merge: bool = False) -> HistoryRecorded | NoHistoryRecorded:
     """Save the peak before removing evidence; the service owns reservation state."""
     maximum = path.with_suffix(".max")
     history_path = path.parent / "anon_peaks.jsonl"
@@ -2652,7 +2703,8 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
             "end_kind": TokenReturn() if intent.get("end_kind") == "token_return" else StepEnd(),
             "peak": PeakSampled(intent["peak"]) if intent["peak"] > 0 else NoPositiveSample(),
         }
-        append_queue_time(path.parent, cast(dict[str, object], codec.snapshot_value(event)), ended_at)
+        append_queue_time(path.parent, {**cast(dict[str, object], codec.snapshot_value(event)),
+                                       "landing_merge": landing_merge}, ended_at)
     maximum.unlink(missing_ok=True)
     path.with_suffix(".wave").unlink(missing_ok=True)
     if row["sidecar"]:
@@ -2667,10 +2719,82 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
     return result
 
 
+def queue_staff_chain(members: staff.StaffSnapshot, session: str) -> Iterator[staff.StaffRow]:
+    """Find the session and its staff parents."""
+    if not session:
+        return
+    member = members.by_current_session(session)
+    seen: set[staff.StaffId] = set()
+    while member is not None and member.id not in seen:
+        seen.add(member.id)
+        yield member
+        member = members.parent_of(member)
+
+
+NATEMERGE_STAFF_ID = staff.StaffId("506b6872-03cb-4a1a-9465-fbd9cf88975e")
+
+
+def is_natemerge(member: staff.StaffRow) -> bool:
+    return member.id == NATEMERGE_STAFF_ID
+
+
+def landing_wait_report(directory: Path, since: float) -> str:
+    """Summarize completed memory waits for the selected queue arrivals."""
+    try:
+        members = staff.local_snapshot()
+    except staff.StaffUnreadable:
+        members = staff.StaffSnapshot(())
+    landing: list[float] = []
+    before: list[float] = []
+    unit: list[float] = []
+    for step in read_queue_lifetimes(directory):
+        wait = step.memory_wait_s
+        if step.since < since or isinstance(wait, MemoryWaitIncomplete):
+            continue
+        if step.landing_merge == "landing":
+            landing.append(wait)
+            continue
+        chain = tuple(queue_staff_chain(members, step.session_id))
+        if step.landing_merge == "unmarked" and step.step == "merge-gate" and any(map(is_natemerge, chain)):
+            before.append(wait)
+        elif step.unit or any(member.kind == "unit" for member in chain):
+            unit.append(wait)
+    lines = ["Group\tCount\tMedian (s)\tMax (s)"]
+    for group, waits in (("Landing tests", landing), ("Landing tests before (by session)", before), ("Unit steps", unit)):
+        stats = f"{median(waits):.1f}\t{max(waits):.1f}" if waits else "-\t-"
+        lines.append(f"{group}\t{len(waits)}\t{stats}")
+    lines.append("The report excludes older sessions for unmarked landing tests.")
+    return "\n".join(lines)
+
+
+def landing_wait_since(value: str) -> float:
+    try:
+        since = float(value)
+    except ValueError:
+        parsed = datetime.fromisoformat(value)
+        if parsed.utcoffset() is None:
+            raise ValueError("a date requires a UTC offset")
+        since = parsed.timestamp()
+    if not math.isfinite(since):
+        raise ValueError("the time must be finite")
+    return since
+
+
 def main() -> None:
     try:
         if len(sys.argv) == 3 and sys.argv[1] == "tripwire":
             check_memory_reading(Path(sys.argv[2]))
+        elif sys.argv[1:2] == ["landing-waits"]:
+            import argparse
+
+            class Arguments(argparse.Namespace):
+                since: float = 0.0
+
+            parser = argparse.ArgumentParser(prog="memory_admit.py landing-waits")
+            _ = parser.add_argument("--since", type=landing_wait_since, required=True,
+                                    help="Unix seconds or an ISO 8601 time with a UTC offset")
+            arguments = parser.parse_args(sys.argv[2:], namespace=Arguments())
+            print(landing_wait_report(admission_dir(store.root()), arguments.since))
         else:
             raise ValueError("admission actions use queue_place.py")
     except LiveMemoryReading as error:
