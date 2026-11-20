@@ -851,8 +851,7 @@ class GateWorker:
         reservation = next((row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt), None)
         if reservation is None:
             raise ledger.LedgerUnavailable('The gate has no saved reservation')
-        bills = self.book.read_bills()
-        rate_refusal: ledger.GateRateAboveReservation | None = None
+        rate_refusal: ledger.GateRateAboveReservation | ledger.GateBillRatesUnavailable | None = None
         unreachable: set[str] = set()
         for offset in range(index, stop):
             replaying = bool(launch.get('arguments')) and offset == index
@@ -866,17 +865,6 @@ class GateWorker:
                 if variant.instance_type in unauthorized or variant.region in unreachable:
                     continue
                 size, self.box_region, zone = variant.instance_type, variant.region, variant.zone
-            now = int(self.clock())
-            if not replaying or now < ledger.instant(request, 'expires'):
-                check = ledger.gate_launch_rate(reservation, ledger.GateRateCandidate(size, self.box_region), bills, now)
-                if isinstance(check, ledger.GateRateAboveReservation):
-                    rate_refusal = check
-                    print(f'Cloud gate skips {check.reason}.', flush=True)
-                    if replaying:
-                        # The saved request may have reached AWS. Keep it for reconciliation.
-                        return LocalFallback(check.reason)
-                    save(path, {**saved_order, 'variant': offset + 1})
-                    continue
             if not replaying:
                 variant = variants[offset]
                 regional = regional_rows[variant.region]
@@ -943,15 +931,25 @@ class GateWorker:
                     return instance
                 raise AwsUnavailable('The expired launch remains unconfirmed')
             launch_json = json.dumps(arguments)
+            candidate = ledger.GateRateCandidate(size, self.box_region)
             try:
                 for retry in range(settings().whole('launch_reply_tries')):
+                    check = self.book.check_gate_launch_rate(reservation, candidate, int(self.clock()))
+                    if not isinstance(check, ledger.GateRateWithinReservation):
+                        rate_refusal = check
+                        print(f'Cloud gate skips {check.reason}.', flush=True)
+                        if replaying or retry:
+                            # Keep the request for reconciliation if AWS may have received it.
+                            return LocalFallback(check.reason)
+                        launch = {**saved_order, 'variant': offset + 1}
+                        save(path, launch)
+                        break
                     try:
                         if retry == 0:
                             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
                                 'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
                         reply = api.call('run-instances', '--cli-input-json', launch_json)
                         self.record_launch(request, size, zone, 'launched')
-                        break
                     except AwsUnavailable as error:
                         self.record_launch(request, size, zone, 'refused', str(error))
                         if not aws_down(str(error)) or retry + 1 == settings().whole('launch_reply_tries'):
@@ -960,6 +958,16 @@ class GateWorker:
                         self.record_launch(request, size, zone, 'refused',
                                            type(error).__name__ + ': ' + str(error))
                         raise
+                    else:
+                        instances = ledger.rows(reply, 'Instances')
+                        if len(instances) != 1:
+                            raise AwsUnavailable('The launch reply has no unique instance')
+                        instance = ledger.text(instances[0], 'InstanceId')
+                        save(path, {**launch, 'instance': instance})
+                        self.book.resolve_gate(attempt, ledger.GateRunning(instance), instance_type=size)
+                        self.box_zone = zone
+                        print(f'Cloud gate accepted {size} in {self.box_region} ({zone}).', flush=True)
+                        return instance
                 else:
                     raise AssertionError('The launch retry count must be positive')
             except AwsUnavailable as error:
@@ -987,16 +995,8 @@ class GateWorker:
                     raise
                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
                 return LocalFallback(f'{size} in {zone}: {launch_error_code(str(error))}')
-            instances = ledger.rows(reply, 'Instances')
-            if len(instances) != 1:
-                raise AwsUnavailable('The launch reply has no unique instance')
-            instance = ledger.text(instances[0], 'InstanceId')
-            save(path, {**launch, 'instance': instance})
-            self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
-            self.box_zone = zone
-            print(f'Cloud gate accepted {size} in {self.box_region} ({zone}).', flush=True)
-            return instance
-        self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
+        if not isinstance(rate_refusal, ledger.GateBillRatesUnavailable):
+            self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
         return LocalFallback(rate_refusal.reason if rate_refusal else 'Spot capacity is unavailable in every configured region')
 
     def artifact_etags(self, bucket: str, prefix: str) -> dict[str, str]:

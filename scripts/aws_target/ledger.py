@@ -1688,6 +1688,16 @@ class GateRateAboveReservation:
                 f'{self.usd_per_hour:g} USD/h with {self.reserved_usd_per_hour:g} USD/h reserved')
 
 
+@dataclass(frozen=True)
+class GateBillRatesUnavailable:
+    candidate: GateRateCandidate
+    detail: str
+
+    @property
+    def reason(self) -> str:
+        return f'Cannot read bill rates for {self.candidate.instance_type} in {self.candidate.region}: {self.detail}'
+
+
 def _gate_estimate_rate(reservation: GateReservation) -> BoxRate:
     return (reservation.rate if reservation.rate.source != 'not priced'
             else BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour'))
@@ -2150,10 +2160,23 @@ class CostLedger:
         write_text_atomic(self.path, json.dumps(document, sort_keys=True) + "\n")
 
     def bill_paths(self) -> tuple[Path, ...]:
-        return tuple(sorted((self.directory / 'charges').glob('*.json')))
+        try:
+            return tuple(sorted(path for path in (self.directory / 'charges').iterdir()
+                                if path.name.endswith('.json')))
+        except FileNotFoundError:
+            return ()
 
     def read_bills(self) -> tuple[ChargeRead, ...]:
         return tuple(read_charge(path) for path in self.bill_paths())
+
+    def check_gate_launch_rate(self, reservation: GateReservation, candidate: GateRateCandidate,
+                               now: int) -> GateRateWithinReservation | GateRateAboveReservation | GateBillRatesUnavailable:
+        """Read the local bills before this launch request."""
+        try:
+            readings = self.read_bills()
+        except (OSError, ValueError, ArithmeticError) as error:
+            return GateBillRatesUnavailable(candidate, str(error))
+        return gate_launch_rate(reservation, candidate, readings, now)
 
     def _strict_charge_reads(self) -> Iterator[tuple[str, _ChargeReadHistory]]:
         for path in self.bill_paths():

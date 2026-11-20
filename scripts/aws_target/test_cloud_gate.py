@@ -2115,6 +2115,51 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         assert isinstance(booked, ledger.GateReserved)
         self.assertEqual(booked.reservation.rate.usd_per_hour, Decimal('.12'))
 
+    def launch_with_bill_update(self, refusal: str, update: Callable[[Path, ledger.ChargeRead], None]) -> str | cloud_gate.LocalFallback:
+        _, bill, small, large = self.launch_rate_fixture()
+        bill = replace(bill, actual_usd=Decimal('.22'),
+                       usage_types=(bill.usage_types[0], replace(bill.usage_types[1], usd=Decimal('.10'))))
+        directory = self.state / 'charges'
+        directory.mkdir()
+        bill_path = directory / f'{bill.day}.json'
+        cloud_gate.save(bill_path, ledger.charge_record(bill))
+        self.book_small_box(small)
+        path = self.folder / 'launch.json'
+        cloud_gate.save(path, {'variant': 0, 'variants': [asdict(small), asdict(large)]})
+        self.fake.refusals = [refusal]
+
+        def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            reply = self.fake(arguments, **options)
+            if 'run-instances' in arguments and len(self.fake.launches) == 1:
+                update(bill_path, bill)
+            return reply
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', small.region, 1, execute=transport),
+            self.book, self.settings, self.folder / 'reservation', clock=lambda: self.now, pause=self.advance)
+        return worker.launch(self.folder, self.request, self.deployment)
+
+    def test_capacity_fallback_reads_the_bill_again_before_trying_the_next_choice(self) -> None:
+        def raise_large_rate(path: Path, bill: ledger.ChargeRead) -> None:
+            bill = replace(bill, actual_usd=Decimal('.92'),
+                           usage_types=(bill.usage_types[0], replace(bill.usage_types[1], usd=Decimal('.80'))))
+            cloud_gate.save(path, ledger.charge_record(bill))
+
+        self.assertEqual(self.launch_with_bill_update('InsufficientInstanceCapacity', raise_large_rate),
+            cloud_gate.LocalFallback('m7a.8xlarge in us-east-2 costs 0.80 USD/h with 0.12 USD/h reserved'))
+        self.assertEqual([row['InstanceType'] for row in self.fake.launches], ['m7a.4xlarge'])
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateAbsent)
+
+    def test_retry_with_an_unreadable_bill_keeps_the_request_for_reconciliation(self) -> None:
+        def damage_bill(path: Path, _bill: ledger.ChargeRead) -> None:
+            _ = path.write_text('{')
+
+        outcome = self.launch_with_bill_update('InternalFailure', damage_bill)
+        assert isinstance(outcome, cloud_gate.LocalFallback)
+        self.assertIn('Cannot read bill rates for m7a.4xlarge in us-east-2', outcome.reason)
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertEqual(cloud_gate.read(self.folder / 'launch.json')['arguments'], self.fake.launches[0])
+        self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
+
     def test_saved_retry_skips_a_box_above_the_off_reservation(self) -> None:
         worker, reading, small, large = self.launch_rate_fixture()
         self.request['retry_launch'] = {'variant': 0, 'variants': [asdict(large), asdict(small)]}
