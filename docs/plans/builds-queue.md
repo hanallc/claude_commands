@@ -3231,6 +3231,14 @@ Tests: one row in the existing bare copy removal test, failing first.
 
 Tests: one row each in the existing Mac offload busy-mirror test and the existing dispatch test, each failing first.
 
+### Phase 44ds — A busy Linux reservation gets no second assignment from old evidence  · status: todo
+**From builds, 2026-11-19 22:55 EST (found by natest phase 396).** Ahead of the other unstarted work. Base: main 14c8b1f60.
+
+1. On a pinned Linux target, verify reports a busy reservation (`claim-failed --reason busy`, scripts/direct/verify.sh:3174) and asks for placement again. Admission can close the failed assignment before it reads the competing claim. `placement.retry_decision` gives a local `busy` a 0 s delay (scripts/build_queue/placement.py:527). Admission can then use a cached host reading that still shows the target free (admission_service.py:2966) and give a second assignment for the same step (admission_service.py:4250). Fix, in admission and placement: a busy refusal gets no new assignment from host evidence older than the refusal. The next assignment waits for a reading of the competing claim.
+2. Remove natest's marked temporary fixture hold in `test_pinned_linux_reservation_race_waits_only_with_a_live_claim` (scripts/direct/test_verify_wait_holder.py:737), so that its single-attempt assertion guards the fix again.
+
+Tests: one row in the existing placement retry test for a busy local refusal with a cached free reading: no second assignment until a newer reading. It fails first. Item 2 makes the natest row the end-to-end check.
+
 ### Phase 44dn — The sweep and scratch end keep going past a bad backlink or journal  · status: todo
 **Hold (builds, 2026-11-19 21:29):** these are removal sites under item 152 (user rule 20:42: no automatic deletion until the bubblewrap proof exists). resources owns them now: phase 181 (scratch task end) and phase 178 (the sweep). After 181 and 178 merge, merge main in, check with resources that nothing removes more than 178 and 181 allow, then send the hash. No more work until then.
 **From the 44de reviews (pass 1 and closure pass 2), 2026-11-19:** the builds landing rule moves these gaps out of 44de. After 44de merges.
