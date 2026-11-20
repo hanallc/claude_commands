@@ -51,7 +51,8 @@ def words_box(element_id: str, placeholder: str) -> str:
     identity = html.escape(element_id, quote=True)
     words = html.escape(placeholder, quote=True)
     return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words'
-            + f' aria-label="{words}" placeholder="{words}"></div>')
+            + f' autocomplete="off" aria-label="{words}" placeholder="{words}">'
+            + f'<button type="button" id="{identity}-clear" data-clear-filter-words aria-label="Clear filter">×</button></div>')
 
 
 CLOCK = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
@@ -89,13 +90,20 @@ main{font-size:15px;line-height:1.5}
 background:var(--card);color:var(--ink);border-radius:8px;max-width:100%;min-width:0}
 .list-filters input{width:260px}
 .list-search-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
-.record-filter-words{display:flex;justify-content:flex-end;margin-bottom:10px}
-.record-filter-words input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
-background:var(--card);color:var(--ink);width:300px;max-width:100%;min-width:0;box-sizing:border-box}
+.record-filter-words{position:relative;width:300px;max-width:100%;margin:0 0 10px auto}
+.record-filter-words input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);
+border-radius:8px;background:var(--card);color:var(--ink);width:100%;min-width:0;box-sizing:border-box}
+.record-filter-words input:not(:placeholder-shown){padding-inline-end:44px;border-color:var(--filter-selected-bg)}
+.record-filter-words input::-webkit-search-cancel-button{appearance:none}
+.record-filter-words input:placeholder-shown+[data-clear-filter-words]{display:none}
+@media(max-width:340px){.record-filter-words input::placeholder{font-size:14px}}
+[data-clear-filter-words]{position:absolute;inset-block:0;inset-inline-end:0;width:44px;margin:0;padding:0;
+border:0;border-radius:8px;background:none;color:var(--ink-2);font-size:22px;cursor:pointer}
+[data-clear-filter-words]:hover{color:var(--ink)}
 .record-filter-row{display:grid;grid-template-columns:5rem minmax(0,1fr);align-items:baseline;gap:8px;margin-bottom:8px}
 .record-filter-row>span{color:var(--ink-2);font-size:13px}
 .record-filter-row>div{display:flex;flex-wrap:wrap;gap:6px}
-[data-filter-row] button,.list-expansion button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
+[data-filter-row] button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
 color:var(--ink);border:1px solid var(--line);border-radius:999px;background:var(--card);padding:4px 10px;margin:0}
 [data-filter-row] button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
 color:var(--filter-selected-ink)}
@@ -206,6 +214,12 @@ border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--
 
 
 SCRIPT = r'''const filterControl={
+ wordValues:new WeakMap(),
+ getWords(control){return this.wordValues.get(control) ?? '';},
+ setWords(control,value){
+  this.wordValues.set(control,value);
+  if(control.value!==value) control.value=value;
+ },
  buttons(row){return [...row.querySelectorAll('[data-filter-value]')];},
  setCounts(row,counts){
   for(const button of this.buttons(row)){
@@ -232,9 +246,22 @@ SCRIPT = r'''const filterControl={
   const emit=value=>control.dispatchEvent(new CustomEvent('filterchange',{bubbles:true,detail:value}));
   if(control.hasAttribute('data-filter-words')){
    let timer;
-   control.addEventListener('input',()=>{
+   const clear=()=>{
     clearTimeout(timer);
-    timer=setTimeout(()=>{if(control.isConnected) emit(control.value);},120);
+    this.setWords(control,'');
+    control.focus({preventScroll:true});
+    emit('');
+   };
+   control.addEventListener('input',()=>{
+    this.setWords(control,control.value);
+    clearTimeout(timer);
+    timer=setTimeout(()=>{if(control.isConnected) emit(this.getWords(control));},120);
+   });
+   control.parentElement.querySelector('[data-clear-filter-words]').addEventListener('click',clear);
+   control.addEventListener('keydown',event=>{
+    if(event.key!=='Escape' || event.defaultPrevented || event.isComposing || !control.value) return;
+    event.preventDefault();
+    clear();
    });
   }else{
    for(const button of this.buttons(control))
@@ -373,6 +400,8 @@ if(options.mount){
 const sortValues=data=>options.sortValues?.(data) ?? JSON.parse(data.sortValues);
 const words=()=>content.querySelector('[data-filter-words]') ?? content.querySelector('#list-search');
 const sharedWords=()=>words().hasAttribute?.('data-filter-words');
+const currentWords=()=>sharedWords() ? filterControl.getWords(words()) : words().value;
+if(sharedWords()) addEventListener('pageshow',()=>setTimeout(()=>filterControl.setWords(words(),currentWords()),0));
 const chipRow=name=>content.querySelector('[data-filter-row="'+name+'"]');
 const staffChipPrefix='staff:';
 const isStaffChipFilter=name=>options.staffChipFilters?.includes(name);
@@ -434,20 +463,21 @@ function readPlace(params,followingItemLink=false){
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
    owner='';show='all';
    query='';type='';for(const name of filterNames) filters[name]='';}
-  if(options.single) opened.clear();opened.add(item);revealKey=item;
+  if(options.hasKey?.(item) ?? itemWithKey(item)){openCard(item);revealKey=item;}
  }
  const saved=followingItemLink ? null : history.state?.recordTable;
+ if(saved && (!options.mount || saved.top!==undefined)){
+  opened.clear();
+  const key=saved.opened.includes(item) ? item : saved.opened[0];
+  if(key) openCard(key);
+ }
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
  pendingItem=Boolean(options.resolveItem && linkedItem && saved?.pendingItem);
  const reveal=options.revealLinked && params.get('reveal')==='1';
  revealedLinkedItem=reveal || saved?.revealedLinkedItem===linkedItem ? linkedItem : '';
- if(saved && (!options.mount || saved.top!==undefined)){
-  opened.clear();
-  saved.opened.forEach(key=>opened.add(key));
- }
  owner=options.resolveOwner?.(owner) ?? owner;
- if(sharedWords()) words().value=query;
+ if(sharedWords()) filterControl.setWords(words(),query);
  return saved?.top;
 }
 function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}){
@@ -754,8 +784,8 @@ function restorePlace(event){
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
 }
 function saveDeparturePlace(){
- if(sharedWords() && query!==words().value){
-  query=words().value;
+ if(sharedWords() && query!==currentWords()){
+  query=currentWords();
   writePlace(false,scrollY);
  }else history.replaceState(placeState(scrollY),'');
 }
@@ -766,8 +796,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  pendingItem=unresolved;
  if(target){
   if(keys.size) keys.add(key);
-  if(options.single) opened.clear();
-  opened.add(key);
+  openCard(key);
   const selection=currentSelection();
   if(!preserveFilters && !canRevealLinked(target,selection) && !matches(target,selection)){
    const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
@@ -778,7 +807,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
    if(type && !matches(target,{...unfiltered,type})) type='';
    for(const name of filterNames)
     if(filters[name] && !matches(target,{...unfiltered,filters:{[name]:filters[name]}})) filters[name]='';
-   if(sharedWords()) words().value=query;
+   if(sharedWords()) filterControl.setWords(words(),query);
   }
  }
  if(options.mount && target) revealKey=key;
@@ -802,23 +831,24 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
  options.itemOpened?.(mountedTarget);
 }
-function setRowsExpanded(items,expanded){
- for(const item of items){
-  const key=item.dataset.key;
-  if(opened.has(key)===expanded) continue;
-  if(!expanded && key===linkedItem) linkedItem='';
-  if(expanded){
-   if(options.single) opened.clear();
-   opened.add(key);
-  }else opened.delete(key);
-  measured.delete(key);
- }
- apply(true,{animate:true});
+function openCard(key){
+ for(const previous of opened) measured.delete(previous);
+ opened.clear();
+ opened.add(key);
+ measured.delete(key);
+ if(linkedItem!==key){linkedItem='';revealedLinkedItem='';}
+}
+function closeCard(key,write=true){
+ const wasOpen=opened.delete(key);
+ if(linkedItem===key){linkedItem='';revealedLinkedItem='';}
+ else if(!wasOpen) return;
+ measured.delete(key);
+ if(write && location.hash===placeHash) writePlace();
 }
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
  const changePlace=(normalizeOwner=false)=>apply(true,{dismissMissingItem:true,normalizeOwner});
- const changeFilter=()=>{if(sharedWords()) query=words().value;changePlace(true);};
+ const changeFilter=()=>{if(sharedWords()) query=currentWords();changePlace(true);};
  content.querySelector('[data-clear-linked-reviews]')?.addEventListener('click',()=>{
   keys.clear();changeFilter();words().focus({preventScroll:true});
  });
@@ -843,35 +873,22 @@ function bind(){
  content.addEventListener('click',event=>{
   const item=event.target.closest('.list-row')?.closest('[data-list-item]');if(!item) return;
   if(event.target.closest('a') || (event.target.closest('button') && !event.target.closest('.list-toggle'))) return;
-  const expanded=!opened.has(item.dataset.key);
-  setRowsExpanded([item],expanded);
+  const key=item.dataset.key,expanded=!opened.has(key);
+  if(expanded) openCard(key);else closeCard(key,false);
+  apply(true,{animate:true});
   if(expanded && !item.hidden) options.itemOpened?.(item);
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
   type=button.dataset.typeChip;changeFilter();
  }));
 }
-return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
+return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
  revealMatchingItem(key){
   const target=itemWithKey(key);
-  const selection=currentSelection({query:words().value.trim().toLowerCase()});
+  const selection=currentSelection({query:currentWords().trim().toLowerCase()});
   if(!target || !matches(target,selection)) return false;
   jump(key,{preserveFilters:true});
   return true;
- },
- setShownExpanded(expanded){
-  const currentQuery=words().value;
-  if(query!==currentQuery){
-   query=currentQuery;
-   apply(false,{dismissMissingItem:true});
-  }
-  setRowsExpanded(content.querySelector('table').querySelectorAll('[data-list-item]:not([hidden])'),expanded);
- },
- closeCard(key){
-  const wasOpen=opened.delete(key);
-  if(linkedItem===key){linkedItem='';revealedLinkedItem='';}
-  else if(!wasOpen) return;
-  if(location.hash===placeHash) writePlace();
  },
  releaseLink(key){
   if(linkedItem!==key) return;
@@ -901,11 +918,11 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,retryItem
  get hasActiveRowAnimations(){return rowMotion.size>0;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(draw=true){
-  const previous=words(),previousQuery=query;
+  const previous=currentWords(),previousQuery=query;
   for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
-  if(sharedWords()){query=previous.value;words().value=query;}
+  if(sharedWords()){query=previous;filterControl.setWords(words(),query);}
   bind();if(draw) applyRows(query!==previousQuery);
  }};
 }
@@ -958,7 +975,15 @@ function closeDateTimePicker(menu,focus){
  const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
  if(focus) toggle.focus();
 }
-function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=()=>{},retryTime=()=>NaN}){
+function pickerSummary(zone){
+ const date=new Intl.DateTimeFormat('en-GB',{timeZone:zone,weekday:'short',day:'numeric',month:'short'});
+ return at=>{
+  const {hour,minute}=zoneParts(zone,at);
+  return date.format(at)+' '+dateTimeClock(hour*60+minute);
+ };
+}
+function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummary=pickerSummary(zone),
+ prepareMenu=()=>{},retryTime=()=>NaN}){
  const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
  const custom=menu.querySelector('[data-later-custom]'),chooseItem=menu.querySelector('[data-later-choose]');
  const items=()=>[...menu.querySelectorAll('[role=menuitem]:not([hidden])')];
@@ -977,7 +1002,6 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
  const dayText=date=>date.toISOString().slice(0,10);
  const monthText=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',year:'numeric'});
  const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
- const summary=new Intl.DateTimeFormat('en-GB',{timeZone:zone,weekday:'short',day:'numeric',month:'short'});
  let selected=new Date(),display=new Date();
  const today=()=>{const now=zoneParts(zone,Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
  const update=(normalize=false)=>{
@@ -989,9 +1013,8 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
   field.dispatchEvent(new Event('input',{bubbles:true}));
   const retry=retryTime();
   const at=Number.isFinite(retry) ? retry : valid ? dateTimeEpoch(zone,selected,minutes) : NaN;
-  const resolved=Number.isFinite(at) ? zoneParts(zone,at) : null;
-  custom.querySelector('[data-later-summary]').textContent=resolved ? summaryPrefix+summary.format(at)+' '+
-   dateTimeClock(resolved.hour*60+resolved.minute) : 'Choose a time';
+  custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at)
+   ? summaryPrefix+formatSummary(at) : 'Choose a time';
   save.disabled=!Number.isFinite(retry) && !(at>Date.now());
  };
  const draw=()=>{

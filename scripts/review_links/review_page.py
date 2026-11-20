@@ -1142,7 +1142,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
                      {'validate':'asked the showrunner to check', 'question':'question sent'}.get(outcome,'answer'))
 
 
-STYLE = '''<style>
+QUESTION_COLOR_RULE = '.question{--type-color:#b99aff}'
+STYLE = '<style>' + QUESTION_COLOR_RULE + '''
 main:has(>[data-review]){max-width:1124px}
 [data-review]{display:flex;flex-wrap:wrap;align-items:center;column-gap:16px}
 [data-review]>:is(.page-heading,.review-queue){flex:0 0 100%;min-width:0}
@@ -1163,7 +1164,7 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
-.question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
+.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
 .proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}.bug{--type-color:#ed876b}.response{--type-color:#edc46d}
 .review-icon{color:var(--type-color)}.review-panel{border-left-color:var(--type-color);grid-template-columns:1.25fr 1fr;padding:0 20px 18px 58px;gap:4px 28px}
 .response-answer time{display:block;margin-bottom:8px;color:var(--ink-3);font-size:12px}
@@ -1564,7 +1565,7 @@ try{
 }catch{}
 storeSavedVerdicts();
 const showValues=[...content.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip);
-const view=createRecordTable({content:()=>content,single:true,
+const view=createRecordTable({content:()=>content,
  entries:allEntries,mount:entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
   content.querySelector('[data-type-chip="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
  focusKey:()=>focusAfterLoad?.key,
