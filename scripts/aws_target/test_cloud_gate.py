@@ -869,6 +869,18 @@ class CloudGateTests(CostFixture):
         self.assertEqual(len(self.fake.launches), 1)
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[-1].state, ledger.GateAbsent)
 
+    def test_switch_off_recovers_the_running_box_after_a_lost_launch_reply(self) -> None:
+        worker, _ = self.steering_fixture()
+        self.fake.launch_timeouts = 1
+        with self.assertRaises(subprocess.TimeoutExpired):
+            _ = worker.launch(self.folder, self.request, self.deployment)
+        override_fixture_settings(self.root / 'build_targets.conf', 'enabled.aws-gate=off')
+
+        self.assertEqual(worker.launch(self.folder, self.request, self.deployment), 'i-fixture')
+        self.assertEqual(len(self.fake.launches), 1)
+        self.assertEqual(self.book.read_snapshot().gate_reservations[-1].state, ledger.GateRunning('i-fixture'))
+        self.assertFalse(self.fake.terminated)
+
     def test_quota_refusal_at_zero_live_vcpus_expires_at_the_cooldown(self) -> None:
         worker, variants = self.steering_fixture()
         numeric_settings(self.root / 'cloud_gate.conf', {'capacity_cooldown_seconds': '30'})

@@ -109,6 +109,12 @@ def read(path: Path) -> dict[str, object]:
     return ledger.mapping(cast(object, json.loads(path.read_text())))
 
 
+def _instances_for_launch(api: AwsCli, arguments: dict[str, object]) -> tuple[dict[str, object], ...]:
+    token = ledger.text(arguments, 'ClientToken')
+    observed = api.call('describe-instances', '--filters', 'Name=client-token,Values=' + token)
+    return tuple(row for group in ledger.rows(observed, 'Reservations') for row in ledger.rows(group, 'Instances'))
+
+
 def save(path: Path, row: dict[str, object]) -> None:
     write_text_atomic(path, json.dumps(row, sort_keys=True) + '\n')
 
@@ -767,10 +773,7 @@ class GateWorker:
             self.book.gate_region(ledger.text(request, 'attempt'), self.box_region)
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
             if self.clock() >= ledger.instant(request, 'expires'):
-                reply = api.call('describe-instances', '--filters',
-                                      'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
-                instances = [instance for group in ledger.rows(reply, 'Reservations')
-                             for instance in ledger.rows(group, 'Instances')]
+                instances = _instances_for_launch(api, arguments)
                 if len(instances) == 1:
                     instance = ledger.text(instances[0], 'InstanceId')
                     save(path, {**launch, 'instance': instance})
@@ -792,19 +795,16 @@ class GateWorker:
                                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
                                 return LocalFallback(refusal)
                             # A previous request may have launched this box. Look it up without another launch.
-                            observed = api.call('describe-instances', '--filters',
-                                'Name=client-token,Values=' + ledger.text(arguments, 'ClientToken'))
-                            matches = [row for group in ledger.rows(observed, 'Reservations')
-                                       for row in ledger.rows(group, 'Instances')]
-                            if len(matches) != 1:
+                            instances = _instances_for_launch(api, arguments)
+                            if len(instances) != 1:
                                 return LocalFallback(refusal)
-                            reply = {'Instances': matches}
                             break
                     try:
                         if retry == 0:
                             cloud_progress.publish(self.sidecar, cloud_progress.CloudProgress(
                                 'requesting', self.size_vcpus, 0, self.clock(), stage='launch'))
                         reply = api.call('run-instances', '--cli-input-json', launch_json)
+                        instances = ledger.rows(reply, 'Instances')
                         self.record_launch(request, size, zone, 'launched')
                         break
                     except AwsUnavailable as error:
@@ -842,7 +842,6 @@ class GateWorker:
                     raise
                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
                 return LocalFallback(f'{size} in {zone}: {launch_error_code(str(error))}')
-            instances = ledger.rows(reply, 'Instances')
             if len(instances) != 1:
                 raise AwsUnavailable('The launch reply has no unique instance')
             instance = ledger.text(instances[0], 'InstanceId')

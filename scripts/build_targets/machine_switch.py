@@ -25,7 +25,7 @@ class MachineSwitchError(conf.Unusable):
 
     def __init__(self, source: Path, detail: str) -> None:
         super().__init__(f"{source}: {detail}")
-        self.detail = detail
+        self.detail: str = detail
 
 
 def read(machine: Machine, values: Mapping[str, str] | None = None) -> MachineSwitch:
