@@ -3099,8 +3099,8 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 ### Phase 143s — The ~/worktrees settings row (item 143)  · status: done
 **Source:** builds, 2026-11-20 10:35 EST: the merge checkpoint needs a review trial line for settings commit `1c76e231d`. nate approved the two values via bob (2026-11-19 about 20:10 EST) and gave natemerge his direct yes (2026-11-20).
 
-#### Work Order
-1. One read-only review of `1c76e231d` (two lines in `settings.json`): `permissions.additionalDirectories` and `sandbox.filesystem.allowWrite` name `~/worktrees` beside `~/rust`.
+- `settings.json`: `permissions.additionalDirectories` and `sandbox.filesystem.allowWrite` name `~/worktrees` beside `~/rust`.
+- Read-only review: 0 findings. On main `168cedb541` as `24e9e2013` (bb12).
 
 ### Phase 180 — AWS local folder removal under the item 152 rules  · status: in progress
 **Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Survey rows in phases/178/survey_reply.txt (180 rows). aws gets the lines first (sent 2026-11-20 10:3x).
