@@ -1544,7 +1544,7 @@ try{
 }catch{}
 storeSavedVerdicts();
 const showValues=[...content.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip);
-const view=createRecordTable({content:()=>content,single:true,
+const view=createRecordTable({content:()=>content,
  entries:allEntries,mount:entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
   content.querySelector('[data-type-chip="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
  focusKey:()=>focusAfterLoad?.key,
