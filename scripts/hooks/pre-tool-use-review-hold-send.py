@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Block a native send to a session with an open review hold."""
+"""Require send.py for messages to another Claude session."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -7,26 +7,17 @@ except FileNotFoundError:
     pass
 
 import json
+import re
 import shlex
 import sys
-import time
 from typing import cast
 
 from scripts.lib.transcripts import config_dirs
-from scripts.message import review_hold
+from scripts.message.session_records import UnreadableSessionRecord, parse_session, running_session
 
 
-def matching_sessions(target: str) -> dict[str, str]:
-    """Return matching session IDs and names from the Claude registry files."""
-    if target.startswith("uds:"):
-        field, value = "messagingSocketPath", target.removeprefix("uds:")
-    elif target.startswith("session:"):
-        field, value = "sessionId", target.removeprefix("session:")
-    else:
-        field, value = "name", target
-    matches: dict[str, str] = {}
-    if not value:
-        return matches
+def matches_session_name(name: str) -> bool:
+    """Check the registered name of a running session."""
     for config in config_dirs():
         try:
             paths = list((config / "sessions").iterdir())
@@ -36,20 +27,13 @@ def matching_sessions(target: str) -> dict[str, str]:
             if path.suffix != ".json" or not path.stem.isdecimal():
                 continue
             try:
-                raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-            except (OSError, ValueError):
+                record = parse_session(cast(object, json.loads(path.read_text(encoding="utf-8"))))
+                if (not isinstance(record, UnreadableSessionRecord) and record["sessionId"]
+                        and record["name"] == name and running_session(record)):
+                    return True
+            except (OSError, ValueError, RecursionError):
                 continue
-            if not isinstance(raw, dict):
-                continue
-            record = cast(dict[str, object], raw)
-            if record.get(field) != value:
-                continue
-            session = record.get("sessionId")
-            if not isinstance(session, str) or not session:
-                continue
-            name = record.get("name")
-            matches[session] = name if isinstance(name, str) and name else f"session:{session}"
-    return matches
+    return False
 
 
 def main() -> None:
@@ -62,28 +46,20 @@ def main() -> None:
         if payload.get("tool_name") != "SendMessage" or not isinstance(tool_input, dict):
             return
         fields = cast(dict[str, object], tool_input)
-        target, message = fields.get("to"), fields.get("message")
-        if not isinstance(target, str) or not isinstance(message, str) or message.startswith(review_hold.URGENT_PREFIX):
+        target = fields.get("to")
+        if not isinstance(target, str) or not target or not isinstance(fields.get("message"), str):
             return
-        matches = matching_sessions(target)
-    except Exception:
+        if not target.startswith(("uds:", "session:")):
+            target = re.sub(r" \[[^\[\]\r\n]+\]\Z", "", target)
+            if not target or not matches_session_name(target):
+                return
+    except (OSError, ValueError, RecursionError):
         return
 
-    at = time.time()
-    for session, name in matches.items():
-        try:
-            if review_hold.has_open_hold(session, at):
-                break
-        except Exception:
-            continue
-    else:
-        return
-
-    address = shlex.quote(f"session:{session}")
-    reason = (f"{name} is in a review. Send the same text with "
-              + f"`~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to {address} "
+    reason = ("Use send.py for messages to another session. Send the same text with "
+              + f"`~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to {shlex.quote(target)} "
               + '--from "<your session name>" --text "<same text>"`. '
-              + "It keeps the message until the review ends and returns KEPT.")
+              + "Add `--urgent` for an URGENT message.")
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason,
     }}))

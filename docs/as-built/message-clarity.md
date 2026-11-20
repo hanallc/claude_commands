@@ -44,10 +44,17 @@ These fields do not change the recipient, reply name, or message key.
 ### Messages during an ad hoc review
 
 `send.py` keeps local messages during an open review and returns `KEPT`.
-The sender's `pre-tool-use-review-hold-send.py` hook denies native `SendMessage` calls to a session with an open hold.
-It asks the sender to send the same text with `send.py`.
-Messages that start with `URGENT:` pass through the hook.
+The `pre-tool-use-review-hold-send.py` hook refuses native `SendMessage` calls to other sessions, including urgent calls.
+It matches `uds:` addresses, `session:` addresses, and live registry names.
+For a name, it removes a trailing ` [ref]` before lookup.
+The hook allows calls to local helpers.
+Use `send.py` for messages to other sessions. Add `--urgent` for an URGENT message.
 The hook works only after its `PreToolUse` entry is in `settings.json`.
+
+When the receiver keeps a native prompt, it blocks the prompt with "Kept for the end of the review."
+The block tells Claude Code to omit the original prompt text.
+The session-start hook preserves the state and pending messages while the review hold is open.
+It delivers pending messages after the hold ends.
 
 ### Replies to relay sockets
 

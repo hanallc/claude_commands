@@ -1,16 +1,18 @@
-"""Check the sender hook with private Claude session records and review state."""
+"""Check the sender hook with private Claude session records."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
-import time
 from typing import cast, final, override
 import unittest
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message.process_identity import process_start
 
 
 HOOK = Path(__file__).resolve().with_name("pre-tool-use-review-hold-send.py")
@@ -23,111 +25,87 @@ MESSAGE = "The checks completed."
 class ReviewHoldSendTests(unittest.TestCase):
     home: Path = Path()
     config: Path = Path()
-    socket: Path = Path()
     environment: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config = self.home / "configured"
-        self.socket = self.home / "review.sock"
-        conf = self.home / "config"
-        conf.mkdir()
-        _ = (conf / "send.conf").write_text(
-            "# range: 0.001..\nreview_hold_idle_minutes=60\n", encoding="utf-8")
-        self.environment = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.config), "CONF_DIR": str(conf)}
+        self.environment = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.config)}
 
-    def write_session(self, config: Path, *, session: str = SESSION) -> Path:
+    def write_session(self, config: Path, *, started: str) -> None:
+        pid = os.getpid()
         sessions = config / "sessions"
         sessions.mkdir(parents=True)
-        record = sessions / "42.json"
-        socket = self.socket if session == SESSION else config / "other.sock"
-        _ = record.write_text(json.dumps({"pid": 42, "sessionId": session, "name": NAME,
-                                          "messagingSocketPath": str(socket), "updatedAt": 1}), encoding="utf-8")
-        return record
+        _ = (sessions / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "procStart": started, "sessionId": SESSION, "name": NAME,
+            "messagingSocketPath": str(config / "session.sock"), "updatedAt": 1,
+        }), encoding="utf-8")
 
-    def open_hold(self) -> Path:
-        directory = self.home / ".local/state/adhoc_review"
-        holds = directory / ".holds"
-        holds.mkdir(parents=True)
-        _ = (directory / SESSION).write_text("1\n", encoding="utf-8")
-        state = holds / f"{SESSION}.json"
-        _ = state.write_text(json.dumps({"last_activity": time.time(), "messages": []}), encoding="utf-8")
-        return state
+    def write_live_session(self, config: Path) -> None:
+        started = process_start(os.getpid())
+        assert started
+        self.write_session(config, started=started)
 
-    def run_hook(self, target: str, message: str = MESSAGE) -> subprocess.CompletedProcess[str]:
-        payload = {"tool_name": "SendMessage", "tool_input": {"to": target, "message": message}}
-        return subprocess.run([sys.executable, "-S", "-B", str(HOOK)], input=json.dumps(payload),
+    def run_hook(self, payload: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, "-S", "-B", str(HOOK)], input=payload,
                               env=self.environment, capture_output=True, text=True, check=False,
                               timeout=TEST_HANG_GUARD_SECS)
 
-    def assert_allowed(self, target: str, message: str = MESSAGE) -> None:
-        result = self.run_hook(target, message)
-        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+    def send(self, target: str, message: str = MESSAGE) -> subprocess.CompletedProcess[str]:
+        return self.run_hook(json.dumps({"tool_name": "SendMessage", "tool_input": {"to": target, "message": message}}))
 
-    def assert_denied(self, target: str) -> None:
-        result = self.run_hook(target)
+    def assert_denied(self, result: subprocess.CompletedProcess[str], target: str, message: str = MESSAGE) -> None:
         self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertTrue(result.stdout, f"The hook must refuse {target}.")
         payload = cast(dict[str, dict[str, str]], json.loads(result.stdout))
         decision = payload["hookSpecificOutput"]
         self.assertEqual(decision["hookEventName"], "PreToolUse")
         self.assertEqual(decision["permissionDecision"], "deny")
         reason = decision["permissionDecisionReason"]
-        self.assertIn(f"{NAME} is in a review.", reason)
-        self.assertIn(f"~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to session:{SESSION} ", reason)
-        self.assertIn("Send the same text", reason)
-        self.assertIn("KEPT", reason)
-        self.assertNotIn(MESSAGE, reason)
+        self.assertIn(
+            f'~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to {shlex.quote(target)} '
+            + '--from "<your session name>" --text "<same text>"', reason,
+        )
+        self.assertIn("Add `--urgent` for an URGENT message.", reason)
+        self.assertNotIn(message, reason)
 
-    def test_denies_a_held_session_by_socket_in_the_config_override(self) -> None:
-        _ = self.write_session(self.config)
-        _ = self.open_hold()
-        self.assert_denied(f"uds:{self.socket}")
+    def test_denies_explicit_addresses_without_registry_records(self) -> None:
+        for target in (f"uds:{self.home / 'session.sock'}", f"session:{SESSION}"):
+            with self.subTest(target=target):
+                self.assert_denied(self.send(target), target)
 
-    def test_denies_a_held_session_by_name_in_a_home_config_dir(self) -> None:
-        _ = self.write_session(self.home / ".claude2")
-        _ = self.open_hold()
-        self.assert_denied(NAME)
+    def test_denies_a_live_registry_name_with_or_without_a_ref(self) -> None:
+        self.write_live_session(self.home / ".claude2")
+        for target in (NAME, f"{NAME} [ref]"):
+            with self.subTest(target=target):
+                self.assert_denied(self.send(target), NAME)
 
-    def test_allows_a_session_without_a_hold(self) -> None:
-        _ = self.write_session(self.config)
-        self.assert_allowed(NAME)
+    def test_denies_an_urgent_message_to_a_session(self) -> None:
+        self.write_live_session(self.config)
+        message = "URGENT: The build needs attention."
+        self.assert_denied(self.send(NAME, message), NAME, message)
 
-    def test_allows_an_unknown_target(self) -> None:
-        _ = self.write_session(self.config)
-        _ = self.open_hold()
-        self.assert_allowed("unknown")
-
-    def test_allows_an_urgent_message(self) -> None:
-        _ = self.write_session(self.config)
-        _ = self.open_hold()
-        self.assert_allowed(NAME, "URGENT: The build needs attention.")
-
-    def test_denies_a_held_session_beside_an_invalid_session_file(self) -> None:
-        record = self.write_session(self.home / ".claude2")
-        _ = self.write_session(self.config)
-        _ = self.open_hold()
+    def test_denies_a_live_session_beside_an_invalid_session_file(self) -> None:
+        sessions = self.home / ".claude2" / "sessions"
+        sessions.mkdir(parents=True)
+        record = sessions / "42.json"
+        self.write_live_session(self.config)
         for invalid in ("{incomplete", "[]", json.dumps({"name": NAME})):
             with self.subTest(invalid=invalid):
                 _ = record.write_text(invalid, encoding="utf-8")
-                self.assert_denied(NAME)
+                self.assert_denied(self.send(NAME), NAME)
 
-    def test_denies_a_name_shared_with_a_held_session(self) -> None:
-        _ = self.write_session(self.home / ".claude2", session="other-session")
-        _ = self.write_session(self.config)
-        _ = self.open_hold()
-        self.assert_denied(NAME)
+    def test_allows_helper_names_without_a_live_registry_match(self) -> None:
+        self.write_session(self.config, started="stale process start")
+        for target in ("main", "helper", NAME):
+            with self.subTest(target=target):
+                result = self.send(target)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
 
-    def test_denies_a_held_session_by_id(self) -> None:
-        _ = self.write_session(self.config)
-        _ = self.open_hold()
-        self.assert_denied(f"session:{SESSION}")
-
-    def test_allows_a_send_when_the_hold_file_is_invalid(self) -> None:
-        _ = self.write_session(self.config)
-        state = self.open_hold()
-        _ = state.write_text("{unreadable", encoding="utf-8")
-        self.assert_allowed(NAME)
+    def test_allows_a_bad_payload(self) -> None:
+        result = self.run_hook('{"tool_name": "SendMessage",')
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
 
 
 if __name__ == "__main__":

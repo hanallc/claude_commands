@@ -164,12 +164,6 @@ def _hold_open(count: Path, state: ReviewState, at: float) -> bool:
     return not isinstance(activity, EndedReview) and _read_count(count) > 0 and not _idle(activity, at)
 
 
-def has_open_hold(session: str, at: float) -> bool:
-    """Read whether the session has an open review hold at the given Unix time."""
-    count = _count_file(session)
-    return _hold_open(count, _read_state(count, _state_file(count)), at)
-
-
 def keep_native_message(session: str, message: ReviewMessage) -> bool:
     if message.text.startswith(URGENT_PREFIX):
         return False
@@ -178,9 +172,10 @@ def keep_native_message(session: str, message: ReviewMessage) -> bool:
     if not (count.exists() or path.exists()):
         return False
     with _locked(path):
-        if not has_open_hold(session, message.sent):
+        state = _read_state(count, path)
+        if not _hold_open(count, state, message.sent):
             return False
-        OpenReview(path, _read_state(count, path)).keep(message)
+        OpenReview(path, state).keep(message)
         return True
 
 
@@ -324,8 +319,11 @@ def deliver_at_session_start(session: str, emit: Callable[[str], None], *, recor
             state = _read_state(count, path)
             if not (state.messages or state.reserved):
                 return
+            at = datetime.now(timezone.utc).timestamp()
+            if _hold_open(count, state, at):
+                return
             held = _reserve(path, _end_review(path, state), delivery)
-        _emit_saved(count, path, held, datetime.now(timezone.utc).timestamp(), emit, record_keys)
+        _emit_saved(count, path, held, at, emit, record_keys)
 
 
 @contextmanager
