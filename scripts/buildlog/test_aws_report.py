@@ -26,8 +26,10 @@ from scripts.buildlog.test_index import use_test_log
 use_test_log()
 
 from scripts.aws_target import config as aws_config, ledger, measurement, run_cost
+from scripts.aws_target import spend as aws_spend
 from scripts.aws_target.ledger_test_support import numeric_settings
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
+from scripts.lib import conf
 
 
 def utc_fixture(spends: tuple[ledger.DailySpend, ...]) -> ledger.UtcAccountSpend:
@@ -341,6 +343,27 @@ class AwsReportTests(MeasurementFixture):
         output = self.render()
         self.assertIn('**Month to date (UTC 2026-01): $2.00 of the $400.00 monthly limit.**', output)
         self.assertNotIn('Month forecast:', output)
+
+    def test_forecast_uses_recovery_from_capture_after_git_history_changes(self) -> None:
+        self.replace('spend_pace_days', '7')
+        self.commit_settings()
+        self.remove('spend_pace_days')
+        with read_only_evidence(self, self.root, allow_private_history=True):
+            evidence = narrow(self, ledger.capture_spend_evidence(self.state, NOW), ledger.SpendEvidenceAt)
+
+        self.costs({'spend_pace_days': '14'})
+        self.commit_settings()
+        self.remove('spend_pace_days')
+        self.assertEqual(conf.read(self.settings).whole('spend_pace_days'), 14)
+
+        bills = tuple(ledger.DailySpend(f'2026-01-{day:02d}', 'AWS bill',
+                                      (ledger.SpendGroupCost(ledger.SPEND_GROUPS[0], Decimal(1)),), 1)
+                      for day in range(7, 15))
+        spend_report = aws_spend.UtcSpendReport(evidence, utc_fixture(bills))
+        with read_only_evidence(self, self.root), mock.patch.object(
+                Path, 'open', side_effect=AssertionError('the forecast must use the captured setting')):
+            lines = report.utc_spend_summary(spend_report, date.fromisoformat(DAY))
+        self.assertIn('Month forecast: $25.00 at $1.00 a day. The pace uses 7 accepted bill days.', lines)
 
     def test_report_keeps_measures_when_the_forecast_setting_is_missing(self) -> None:
         self.remove('spend_pace_days')

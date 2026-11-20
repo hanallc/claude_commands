@@ -2395,10 +2395,9 @@ def utc_spend_summary(report: aws_spend.UtcSpendReport, today: date) -> list[str
     if any(isinstance(day, ledger.UtcDaySpend) for day in month.days):
         total = f'Month to date (UTC {today:%Y-%m}): ${month.usd:.2f} of the ${evidence.settings.monthly_limit_usd:.2f} monthly limit.'
         lines.extend((f'**{total}**', ''))
-        try:
-            pace_days = evidence.account_configuration.whole('spend_pace_days')
-        except conf.Unusable as error:
-            reason = ' '.join(str(error).splitlines())
+        pace_days = evidence.forecast_pace_days
+        if isinstance(pace_days, conf.UnavailableValue):
+            reason = ' '.join(pace_days.reason.splitlines())
             lines.extend((f'Month forecast unavailable: {reason}.', ''))
             return lines
         forecast = aws_spend.utc_month_forecast(account, today, pace_days)

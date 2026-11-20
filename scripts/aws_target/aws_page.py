@@ -404,7 +404,10 @@ def utc_spend_data(report: aws_spend.UtcSpendReport) -> SpendData:
     tiles.append({'label': 'Month to date', 'usd': f'${month.usd:.2f}' if has_amount else '—',
                   'note': f'UTC {today:%Y-%m}, of the ${evidence.settings.monthly_limit_usd:.2f} monthly limit.'
                   if has_amount else f'UTC {today:%Y-%m}. No spend evidence.'})
-    forecast = aws_spend.utc_month_forecast(account, today, evidence.account_configuration.whole('spend_pace_days'))
+    pace_days = evidence.forecast_pace_days
+    if isinstance(pace_days, conf.UnavailableValue):
+        raise conf.Unusable(pace_days.reason)
+    forecast = aws_spend.utc_month_forecast(account, today, pace_days)
     forecast_line = ''
     if isinstance(forecast, aws_spend.UtcMonthForecast):
         forecast_line = (f'{forecast.display_line()} '

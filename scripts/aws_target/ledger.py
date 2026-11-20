@@ -3049,6 +3049,7 @@ class SpendEvidenceAt:
     _launch_records: tuple[bytes, ...]
     hana_journal: remote.HanaStartJournal
     settings: SpendingSettings
+    forecast_pace_days: int | conf.UnavailableValue
     account_configuration: conf.ConfigRead
     gate_configuration: conf.ConfigRead
     page_inputs: SpendPageInputs | SpendPageInputsNotCaptured
@@ -3380,6 +3381,11 @@ def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | N
                 configurations = ()
             settings = read_settings(account)
             builder_region = account.text('region')
+            forecast_pace_days: int | conf.UnavailableValue
+            try:
+                forecast_pace_days = account.whole('spend_pace_days')
+            except conf.Unusable as error:
+                forecast_pace_days = conf.UnavailableValue(str(error))
             gate_root = gate.origin('root_gib', conf.positive_whole)
             if not isinstance(gate_root, conf.UsableLiveValue):
                 recovery = conf.read(_REPOSITORY_GATE_SPEND_SETTINGS, load=conf.read_bytes)
@@ -3410,7 +3416,7 @@ def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | N
                     raise LedgerUnavailable(f'{path.name} changed during capture')
             revision = replace(sources.revision, configurations=versions)
             return SpendEvidenceAt(revision, contents, bills, refusals, launches, journal,
-                                   settings, account, gate, page_inputs, builder_region, gate_root.value,
+                                   settings, forecast_pace_days, account, gate, page_inputs, builder_region, gate_root.value,
                                    spot_prices, spot_document, deployment, placement)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
         return SpendEvidenceUnavailable(str(error))

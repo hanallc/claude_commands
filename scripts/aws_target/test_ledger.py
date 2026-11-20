@@ -12,7 +12,6 @@ import io
 import json
 from pathlib import Path
 import subprocess
-from tempfile import TemporaryDirectory
 from threading import Event
 from typing import cast, override
 from unittest import mock
@@ -28,14 +27,15 @@ from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atom
 class RefusedBillEstimateTests(CostFixture):
     day: str = '2026-01-15'
     query_usd: Decimal = Decimal('.07')
+    start: int = instant(day + 'T00:00:00Z')
+    end: int = start + 86400
+    now: int = end + 3600
+    bill: ledger.ChargeRead = ledger.ChargeRead(day, end, start, end, Decimal(5), Decimal(0), query_usd)
 
     @override
     def setUp(self) -> None:
         super().setUp()
-        start = instant(self.day + 'T00:00:00Z')
-        end = start + 86400
-        self.now = end + 3600
-        self.bill = ledger.ChargeRead(self.day, end, start, end, Decimal(5), Decimal(0), self.query_usd)
+        start, end = self.start, self.end
         with ledger.CostLedger(self.state).transaction() as state:
             state.inventories.append(ledger.ResourceInventory(start, (), 'fixture', builder_removed=True))
             state.observations.append(ledger.InstanceObservation(start, 'terminated', 'fixture'))
