@@ -597,8 +597,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 11. Report: one row for each riser (module, two medians, commit, cause class). For each test-file cause, write the Goal line of a Lane A phase. For each cause in another unit's source, write the message to builds with the commit and the two numbers. For the broad rise, write one cause or "not found".
 
 **Files:**
-- none changed. The report goes in the session folder of this phase.
-- `scripts/buildlog/index.py`, `scripts/test_times/show.py`, `scripts/test_times/gate_record.py` — read only
+- `scripts/buildlog/index.py`, `scripts/test_times/show.py`, `scripts/test_times/gate_record.py` — read only; no file changes, and the report goes in the session folder of this phase
 
 **Workers:** 1 writer. One set of queries; nothing splits.
 - `impl` — the queries and the report.
@@ -628,8 +627,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 9. Write a map in the summary: each assertion, and the test that checks it after the phase.
 
 **Files:**
-- the chosen test module and its test support file — the cheaper start
-- one production file — only for a production cause, with its owner's go
+- `scripts/copies/test_slot_order.py`, `scripts/review_links/test_list_page.py`, `scripts/direct/test_verify_doc_checkout.py` — the candidates; the director writes the chosen module and its support file here at dispatch
 
 **Workers:** 1 writer. One module and its support; nothing splits.
 - `impl` — all files.
@@ -658,8 +656,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 10. Change no repository file.
 
 **Files:**
-- none changed. The report goes in the session folder of this phase.
-- `docs/plans/builds-natest-next.md`, `scripts/direct/verify.sh`, `scripts/direct/test_verify*.py`, `scripts/lib/shell_test_support.py` — read only
+- `docs/plans/builds-natest-next.md`, `scripts/direct/verify.sh`, `scripts/direct/test_verify*.py`, `scripts/lib/shell_test_support.py` — read only; no file changes, and the report goes in the session folder of this phase
 
 **Workers:** 1 writer. Records step at once; run steps after natemerge's go.
 - `impl` — the report.
@@ -749,8 +746,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 10. `test_times/coverage_overlap.py` is natest's file. Decide it in this phase and state the reason.
 
 **Files:**
-- `docs/plans/builds-natest-next.md` — new section "Dead-code answers"
-- the evidence table goes in the session folder of this phase
+- `docs/plans/builds-natest-next.md` — new section "Dead-code answers"; the evidence table goes in the session folder of this phase
 
 **Workers:** 1 writer. One graph, one table, one set of questions.
 - `impl` — the table, the question texts and the new section.
@@ -778,7 +774,7 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 7. Summary: each deleted test file with the reason "code deleted".
 
 **Files:**
-- the files of the "delete" rows — removed
+- `scripts/` — the files of the "delete" rows; the director writes the list here at dispatch
 - `config/*.conf`, `config/README.md`, `docs/as-built/*.md` — the lines that name them
 
 **Workers:** 2 writers, split by folder group so that no file is common.
@@ -813,8 +809,8 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 **Files:**
 - `scripts/production/gate.py`, `scripts/production/affected_modules.py` — selection for a not-shared machine
 - `scripts/aws_target/gate_box.py`, `scripts/aws_target/cloud_gate.py` — the request field and the box run (aws reviews this side)
-- the nightly job file that step 6 finds, and its config
-- their test files and `docs/as-built` lines that say each merge gate is full
+- `scripts/production/`, `config/` — the nightly job file that step 6 finds, its config, and the test files
+- `docs/as-built/` — the lines that say each merge gate is full
 
 **Workers:** 2 writers, split by folder.
 - `impl` — `scripts/production` and the nightly job; hub: the request record type
