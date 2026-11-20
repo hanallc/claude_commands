@@ -5357,6 +5357,15 @@ else: raise AssertionError(args)
         self.assertEqual(len(self.commands('deploy')), 2)
 
 
+    def test_prepare_refuses_invalid_spending_before_saving_the_ledger(self) -> None:
+        self.replace('monthly_limit_usd', '-1')
+        subject = self.deployment()
+        with mock.patch.object(ledger.CostLedger, '_save') as save, \
+                mock.patch.object(subject, '_api', side_effect=AssertionError('Unexpected AWS call')):
+            with self.assertRaisesRegex(aws_config.SpendingConfigurationUnavailable, 'monthly_limit_usd'):
+                _ = subject.prepare()
+        save.assert_not_called()
+
     def test_prepare_refuses_missing_or_unreadable_notification_files(self) -> None:
         self.notification_file.unlink()
         for unreadable in (False, True):

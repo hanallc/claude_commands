@@ -339,6 +339,24 @@ class DeploymentRecoveryTests(unittest.TestCase):
             _ = subject.prepare()
         self.assertEqual([path.read_bytes() for path in files[1:]], original[1:])
 
+    def test_recovery_records_an_invalid_spending_setting(self) -> None:
+        self.configure_preparation()
+        _ = self.deployment().prepare()
+        paths = (self.foundation, *(self.output / name for name in ('template.json', 'parameters.json', 'preflight.json')))
+        original = [path.read_bytes() for path in paths]
+        override_fixture_settings(self.settings, 'monthly_limit_usd=-1\n')
+        self.clock.advance(1)
+
+        status, output = self.recover('--write')
+
+        self.assertEqual(status, 1, output)
+        self.assertIn('monthly_limit_usd', output)
+        decision = ledger.CostLedger(self.state).read_snapshot().decision
+        self.assertEqual(decision['status'], 'unavailable')
+        self.assertEqual(decision['at'], self.clock.now)
+        self.assertEqual([path.read_bytes() for path in paths], original)
+        self.assertFalse(self.manifest.exists())
+
     def test_missing_preparation_refuses_before_aws_or_record_publication(self) -> None:
         (self.output / 'preflight.json').unlink()
         with self.assertRaisesRegex(deploy.PreparationRequired, r'Run deploy\.py prepare first'):
