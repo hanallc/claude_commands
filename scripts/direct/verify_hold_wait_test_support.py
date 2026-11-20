@@ -638,7 +638,7 @@ if arguments[:1] == ["metadata"]:''',
         self.fixture.write_executable(cargo, source)
 
     def observe_step_hold_waiter(self) -> tuple[Path, Path, Path]:
-        """Record the first step hold waiter's PID, readiness, and exit."""
+        """Record the first step hold waiter's state and the PIDs of later waiters."""
         pid_saved = self.fixture.root / "step-hold-pid-saved"
         ready = self.fixture.root / "step-hold-ready"
         exited = self.fixture.root / "step-hold-exited"
@@ -657,6 +657,8 @@ if arguments[:1] == ["metadata"]:''',
         observed = observed.replace(wait, r'''    if [[ -n "$TEST_STEP_HOLD_READY" ]]; then
         printf '%s\n' "$HOLD_WAITER_PID" > "$TEST_STEP_HOLD_PID_SAVED.tmp"
         mv -- "$TEST_STEP_HOLD_PID_SAVED.tmp" "$TEST_STEP_HOLD_PID_SAVED"
+    elif [[ -e "$TEST_STEP_HOLD_PID_SAVED" ]]; then
+        printf '%s\n' "$HOLD_WAITER_PID" >> "$TEST_STEP_HOLD_PID_SAVED"
     fi
 ''' + wait + '''
     if [[ -n "$TEST_STEP_HOLD_READY" ]]; then

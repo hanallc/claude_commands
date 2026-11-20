@@ -6,6 +6,7 @@ import json
 import fcntl
 import subprocess
 import os
+import select
 import signal
 import time
 import unittest
@@ -155,11 +156,24 @@ read -r command
         self.wait_for_call(process)
         wait_for_verify_state(lambda: pid_saved.exists() and (ready.exists() or exited.exists()),
                               ready.parent, process, "the first step hold waiter became ready or exited")
+        pid = int(pid_saved.read_text().splitlines()[0])
         if not ready.exists():
-            pid = pid_saved.read_text().strip()
             self.fail(f"Step hold waiter PID {pid} exited without a ready marker")
-        process.send_signal(signal.SIGTERM)
-        code, output = self.finish(process)
+
+        early_exit = f"Step hold waiter PID {pid} exited after its ready marker"
+        try:
+            descriptor = os.pidfd_open(pid)
+        except ProcessLookupError:
+            self.fail(early_exit)
+        try:
+            self.assertFalse(select.select([descriptor], [], [], 0)[0], early_exit)
+            process.send_signal(signal.SIGTERM)
+            code, output = self.finish(process)
+            self.assertTrue(select.select([descriptor], [], [], 0)[0],
+                            f"Step hold waiter PID {pid} stayed alive after verify exited\n{output}")
+        finally:
+            os.close(descriptor)
+        self.assertEqual(pid_saved.read_text().splitlines(), [str(pid)], f"A second step waiter started\n{output}")
         self.assertEqual(code, 143, output)
         self.assertEqual(self.fixture.local_runs(), [])
         observed = cast(WaitObservation, json.loads(observation.read_text()))
