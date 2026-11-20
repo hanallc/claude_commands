@@ -44,7 +44,9 @@ from scripts.production import (
     add_unit,
     unit_names,
 )
-from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_doc import (
+    Production, ProductionPathsError, Refusal, read_production, require_removable_checkout,
+)
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.worktree.worktrees import release_worktree_pair
@@ -1276,6 +1278,10 @@ def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[
     return [unit.staff_member, *record.find(kind="worker", parent=unit.staff_member.id)]
 
 def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
+    try:
+        require_removable_checkout(unit.worktree, unit.production.checkout, unit.branch)
+    except ProductionPathsError as error:
+        return [str(error)]
     failed: list[str] = []
     if unit.worktree.exists():
         result = retirement_git(unit, "worktree", "remove", "--force", str(unit.worktree), settings=settings)

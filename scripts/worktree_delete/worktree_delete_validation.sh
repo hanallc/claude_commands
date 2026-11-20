@@ -44,6 +44,12 @@ if [[ "$CURRENT_DIR" == "$SELECTED_ABSOLUTE" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! PROTECTION_REASON=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" \
+    protect-deletion "$SELECTED_WORKTREE" "$TARGET_BRANCH" "$SELECTED_WORKTREE" 2>&1); then
+    "$SCRIPT_DIR/../lib/py" -c 'import json, sys; print(json.dumps({"status": "error", "message": sys.argv[1]}))' \
+        "$PROTECTION_REASON"
+    exit 1
+fi
 CLEANUP=false
 if CLEANUP_REASON=$("$SCRIPT_DIR/../lib/py" "$SCRIPT_DIR/../worktree/worktrees.py" cleanup "$SELECTED_WORKTREE" 2>&1); then
     CLEANUP=true

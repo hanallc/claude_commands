@@ -21,6 +21,7 @@ import sys
 
 from scripts.lib import git_files, git_rescue, scratch
 from scripts.lint.sweep import gib
+from scripts.production.production_doc import ProductionPathsError, protected_checkouts
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,13 @@ def remove_gate(path: Path, dry_run: bool) -> FolderDecision:
         with scratch.judgment_lock(path) if dry_run else scratch.removal_lock(path) as idle:
             if not idle:
                 return KeptBusy(path)
+            canonical = path.resolve()
+            try:
+                for checkout in sorted(protected_checkouts(), key=lambda item: item.path):
+                    if checkout.path.is_relative_to(canonical):
+                        return KeptFilesystemError(path, f"contains protected production checkout {checkout.path}")
+            except ProductionPathsError as error:
+                return KeptFilesystemError(path, str(error))
             contents = inspect_folder(path)
             if contents.repositories:
                 return KeptRepository(path)

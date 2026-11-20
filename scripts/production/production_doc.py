@@ -253,6 +253,23 @@ def protected_checkouts() -> frozenset[ProtectedCheckout]:
     return frozenset(protected)
 
 
+def require_removable_checkout(path: Path, repository: Path, branch: str) -> None:
+    """Refuse removal of a protected path or its branch in the same repository."""
+    try:
+        protected = protected_checkouts()
+        candidate = path.resolve()
+        matching = [checkout for checkout in protected if branch and checkout.branch == branch]
+        if matching:
+            common = git_files.locate(repository).common_dir
+            if any(checkout.repository == common for checkout in matching):
+                raise ProductionPathsError(f"{repository}: protected production branch {branch}")
+        for checkout in protected:
+            if checkout.path.is_relative_to(candidate):
+                raise ProductionPathsError(f"{candidate}: contains protected production checkout {checkout.path}")
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ProductionPathsError(f"{path}: cannot check production protection: {error}") from error
+
+
 def _legacy_checkouts(row: staff.StaffRow, lines: list[str]) -> tuple[ProtectedCheckout, ...]:
     path_field = optional_field(lines, "Showrunner checkout")
     branch_field = optional_field(lines, "Merge branch")

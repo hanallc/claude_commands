@@ -19,7 +19,7 @@ from typing import cast
 
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import build_folders, scratch
-from scripts.production import session_staff, staff
+from scripts.production import production_doc, session_staff, staff
 from scripts.agents import remote
 
 
@@ -271,16 +271,20 @@ def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedO
 
 
 def cleanup(path: Path) -> CleanupReady | Kept:
+    head = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    if head.returncode not in (0, 1):
+        raise Refused(1, head.stderr.strip())
+    branch = head.stdout.strip()
+    try:
+        production_doc.require_removable_checkout(path, path, branch)
+    except production_doc.ProductionPathsError as error:
+        return Kept(path, str(error))
     _ = git(path, "fetch", "--no-prune", "origin")
     dirty = git(path, "status", "--porcelain").stdout
     if dirty:
         return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines()))
-    head = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     if head.returncode == 1:
         return Kept(path, "HEAD is detached")
-    if head.returncode:
-        raise Refused(1, head.stderr.strip())
-    branch = head.stdout.strip()
     repo = main_checkout(path)
     local = local_branch_tip(repo, branch)
     if isinstance(local, LocalBranchAbsent):
@@ -323,6 +327,10 @@ def release_worktree_pair(path: Path) -> None:
 
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     path, repo = Path(record.path), Path(record.repo)
+    try:
+        production_doc.require_removable_checkout(path, repo, record.branch)
+    except production_doc.ProductionPathsError as error:
+        return Kept(path, str(error))
     resolver = session_staff.RowResolver(snapshot)
     member = resolver.member_by_folder(remote.local_machine(), path)
     if isinstance(member, session_staff.MemberFound):
@@ -473,9 +481,21 @@ def main() -> int:
     check_cleanup = commands.add_parser("cleanup")
     _ = check_cleanup.add_argument("path")
     _ = check_cleanup.add_argument("--checked-tips", action="store_true")
+    protection = commands.add_parser("protect-deletion")
+    _ = protection.add_argument("path")
+    _ = protection.add_argument("branch")
+    _ = protection.add_argument("repository")
     release = commands.add_parser("release-pair")
     _ = release.add_argument("path")
     arguments = parser.parse_args()
+    if cast(str, arguments.command) == "protect-deletion":
+        try:
+            production_doc.require_removable_checkout(
+                Path(cast(str, arguments.path)), Path(cast(str, arguments.repository)), cast(str, arguments.branch))
+        except production_doc.ProductionPathsError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        return 0
     if cast(str, arguments.command) == "release-pair":
         release_worktree_pair(Path(cast(str, arguments.path)).absolute())
         return 0
