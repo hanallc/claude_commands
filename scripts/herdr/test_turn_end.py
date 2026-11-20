@@ -1866,6 +1866,40 @@ class TurnEndTests(unittest.TestCase):
                 self.assertEqual(self.case.fixture.world.closed, closed)
                 self.assertEqual(worker_panes.worker_run(row), next_run)
 
+    def test_restored_stage_one_done_submits_stage_two(self) -> None:
+        name = "review"
+        run = self.case.run_dir
+        ready = run / "review.ready"
+        self.case.agent.finish_after = 1
+        result = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), "review", self.case.prompt,
+            session_dir=run, slot=name, phase="8", kind="review", launcher_command=[name],
+            early_ready=ready, reply=self.case.reply)
+        self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
+        pane = self.case.agent.submitted[-1][0]
+        row = self.case.agent.row(pane)
+        passed = worker_panes.worker_pass(row, run)
+        delivery = progress_history.dispatch_delivery(passed)
+        runs = run / detached_runs.DETACHED_RUNS_DIR
+        runs.mkdir(exist_ok=True)
+        log = runs / "earlier-result.log"
+        record: detached_runs.RunRecord = {
+            "run_id": log.stem, "worker": row.name, "staff_id": row.id, "status": "finished",
+            "started_at": 0, "pid": 0, "command": ["true"], "label": "private verification",
+            "log": str(log), "session_dir": str(run), "director_dir": str(run), "done_message_file": "",
+            "pane_dispatch_id": "earlier-pass", "delivery": f"sent: worker {row.name} at {pane}",
+        }
+        atomic_file.write_text_atomic(log.with_suffix(".json"), json.dumps(record))
+        self.case.agent.complete(pane)
+        self.case.agent.append(pane, "user", f"Detached run: {log.stem}")
+        self.case.agent.append(pane, "assistant", "The earlier check passed.")
+        atomic_file.write_text_atomic(ready, "ready\n")
+
+        before = len(self.case.agent.submitted)
+        self.assertIs(self.case.finish(name), turn_end.TurnOutcome.SUBMITTED)
+        self.assertEqual(len(self.case.agent.submitted), before + 1)
+        self.assertIn(f"DONE {worker_panes.stage_two_completion_id(delivery.completion_id)}",
+                      self.case.agent.submitted[-1][1])
+
     def test_stage_two_recovers_busy_and_interrupted_submission(self) -> None:
         for reason in ("busy", "interrupt_before_submit", "interrupt_stage_two"):
             with self.subTest(reason=reason):

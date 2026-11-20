@@ -471,6 +471,18 @@ def launcher_command() -> list[str]:
     return ["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]]
 
 
+def record_worker_launch_exit(run: Path, instance: uuid.UUID, outcome: progress_history.AssignmentLaunchExit,
+                              ) -> progress_history.RecordedAssignmentLaunch | progress_history.AssignmentLaunchNotRecorded:
+    """Wait for the worker to finish confirming submission before recording a failure."""
+    if outcome is progress_history.AssignmentLaunchExit.SUBMITTED:
+        return progress_history.record_assignment_launch_exit(run, instance, outcome)
+    target = progress_history.assignment_launch_worker_id(run, instance)
+    if isinstance(target, progress_history.AssignmentLaunchNotRecorded):
+        return target
+    with worker_panes.worker_id_lock(target, blocking=True):
+        return progress_history.record_assignment_launch_exit(run, instance, outcome)
+
+
 def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                   role: str, paths: list[str], env: dict[str, str]) -> int:
     """Send the assignment through the shared worker command."""
@@ -537,10 +549,12 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     if result.returncode:
         outcome = (progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS if result.returncode in (1, 2)
                    else progress_history.AssignmentLaunchExit.FAILED)
-    recorded = progress_history.record_assignment_launch_exit(run, instance, outcome)
+    recorded = record_worker_launch_exit(run, instance, outcome)
     selected, failure_recorded = slot, False
     if isinstance(recorded, progress_history.RecordedAssignmentLaunch):
         selected, failure_recorded = recorded.slot, recorded.failure_recorded
+        if result.returncode and not failure_recorded:
+            return result.returncode
     elif not result.returncode:
         selected = progress_history.launch_slot(run, slot, launcher)
     if selected != slot:

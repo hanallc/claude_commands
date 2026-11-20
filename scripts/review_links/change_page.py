@@ -909,6 +909,17 @@ class DeliveryStatus:
         owner = self.request_attempts.get(attempt)
         return owner is not None and owner.row_file == self.path(page, row) and owner.request_thread.is_alive()
 
+    def release_recovery_claims(self, attempts: tuple[str, ...]) -> None:
+        """Release this recovery thread's claims after its sends end."""
+        if not attempts:
+            return
+        recovery_thread = threading.current_thread()
+        with self.locked():
+            for attempt in attempts:
+                owner = self.request_attempts.get(attempt)
+                if owner is not None and owner.request_thread is recovery_thread:
+                    del self.request_attempts[attempt]
+
     def _image_question_message(self, page: ReviewPage, row: str) -> dict[str, object]:
         try:
             value = cast(object, json.loads(self.path(page, row).read_text(encoding="utf-8")))
@@ -2431,12 +2442,7 @@ def recover_pending(status: DeliveryStatus, *,
             except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
                 print(f"review-links recovery {path.name}: {error}", file=sys.stderr)
             finally:
-                if recovered_attempts:
-                    with status.locked():
-                        for attempt in recovered_attempts:
-                            ownership = status.request_attempts.get(attempt)
-                            if ownership is not None and ownership.state == "claimed":
-                                _ = status.request_attempts.pop(attempt, None)
+                status.release_recovery_claims(recovered_attempts)
 
 
 def recover_review_messages(status: DeliveryStatus) -> None:
@@ -2483,9 +2489,7 @@ def recover_review_messages(status: DeliveryStatus) -> None:
         except (OSError,ValueError,KeyError,TypeError) as error:
             print(f'review-links recovery {path.name}: {error}',file=sys.stderr)
         finally:
-            with status.locked():
-                for attempt in claimed:
-                    _ = status.request_attempts.pop(attempt,None)
+            status.release_recovery_claims(claimed)
 
 
 def recover_question_answers(status: DeliveryStatus) -> None:
@@ -2535,11 +2539,7 @@ def recover_question_answers(status: DeliveryStatus) -> None:
                 update_registration.InputError) as error:
             print(f"review-links recovery {path.name}: {error}", file=sys.stderr)
         finally:
-            with status.locked():
-                for attempt in claimed:
-                    owner = status.request_attempts.get(attempt)
-                    if owner is not None and owner.state == "claimed":
-                        del status.request_attempts[attempt]
+            status.release_recovery_claims(claimed)
 
 
 def console_folder(root: Path) -> Path:

@@ -51,3 +51,12 @@ def send_outcome(returncode: int | None, stdout: str) -> ConfirmedSendOutcome | 
         return ConfirmedSendOutcome(header)
     return UnconfirmedSendOutcome()
 
+
+
+def delivered_or_kept(returncode: int | None, stdout: str, *, accept_skipped: bool = False) -> bool:
+    """Check delivery or durable storage. Accept skips when the caller permits them."""
+    outcome = send_outcome(returncode, stdout)
+    if isinstance(outcome, UnconfirmedSendOutcome):
+        return False
+    result = outcome.header.outcome
+    return result in ("sent", "kept") or (accept_skipped and result == "skipped")

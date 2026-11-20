@@ -43,7 +43,7 @@ TYPE_CHIPS = (*review_items.QUESTION_TYPES, *(kind for kind in TYPES if kind not
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
          ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap', ReviewType.BUG: 'bug', ReviewType.RESPONSE: 'inbox'}
 INDEX_STATES = (ReviewState.OPEN, ReviewState.WAITING, ReviewState.VALIDATING)
-SHOWS = (('open', 'Open'), (ReviewState.VALIDATING, ReviewState.VALIDATING), ('all', 'All'))
+SHOWS = (('all', 'All'), ('open', 'Open'), (ReviewState.WAITING, 'Waiting'), (ReviewState.VALIDATING, 'Validating'))
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
           ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies', ReviewType.BUG: 'Bugs',
           ReviewType.RESPONSE: 'Responses'}
@@ -190,7 +190,7 @@ class ReviewSnapshot:
         return self.payload
 
     def render(self, *, show: str = 'open') -> bytes:
-        selected = 'all' if show == 'Waiting' else show if show in dict(SHOWS) else 'open'
+        selected = next((value for value, _ in SHOWS if value.lower() == show.lower()), 'open')
         page = self.page.replace(b'data-show="open"', ('data-show="'+selected+'"').encode(), 1)
         if selected != 'open':
             page = page.replace(b'data-show-chip="open" aria-pressed="true"',b'data-show-chip="open" aria-pressed="false"',1)
@@ -947,27 +947,29 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE
-        +page_frame.title('Review', 'review', action=new_item_dialog.title_button('review'))
         +f'<div data-review data-version="{snapshot.version}" data-show="{show}" data-refresh-seconds="{snapshot.refresh_seconds}" '
         +f'data-request-timeout-seconds="{snapshot.request_timeout_seconds}" '
         +snapshot.card_motion.attributes()+' '
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
+        +page_frame.title('Review', 'review', action=new_item_dialog.title_button('review'))
+        +'<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
+        +'<input type="search" id="list-search" placeholder="Filter by id or words"></div>'
+        +'<div class="review-queue">'
         +record_table.labelled_chip_row('Type', chips, chip_classes='review-types')
         +record_table.labelled_chip_row('State', shows, chip_classes='review-types review-shows', chip_id='list-show')
         +record_table.labelled_chip_row('Owner', owner_chips, chip_classes='review-types', chip_id='list-owner')
         +'<div class="list-filters">'
         +'<button type="button" data-clear-linked-reviews aria-label="Clear linked reviews filter"'
         +' aria-pressed="true" hidden>Linked reviews <span aria-hidden="true">×</span></button>'
-        +'<label class="list-search-label" for="list-search">Search</label><input type="search" id="list-search" placeholder="Filter by id or words">'
         +'</div><p data-missing-item role="status" hidden></p><p role="status" data-review-notice hidden></p><p data-hidden-action-status role="status" hidden></p>'
         +'<ul data-review-source-notices'+('' if snapshot.notices else ' hidden')+'>'
         +''.join('<li>'+html.escape(notice)+'</li>' for notice in snapshot.notices)+'</ul>'
-        +'<script>'+CARD_REQUEST_SCRIPT+'</script><script type="application/json" data-review-index>'+index+'</script>'
+        +'<script type="application/json" data-review-index>'+index+'</script><script>'+CARD_REQUEST_SCRIPT+'</script>'
         +'<div class="list-table"><table aria-label="Review">'
         +CARD_COLUMNS+'<thead><tr>'+headers+'</tr></thead>'
         +'<tbody data-window-before></tbody><tbody data-window-after></tbody>'
-        +'</table><p data-empty hidden>No items in this view.</p></div></div>'
+        +'</table><p data-empty hidden>No items in this view.</p></div></div></div>'
         +new_item_dialog.render()+'<script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
@@ -1165,11 +1167,21 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
                      {'validate':'asked the showrunner to check', 'question':'question sent'}.get(outcome,'answer'))
 
 
-STYLE = '''<style>
+QUESTION_COLOR_RULE = '.question{--type-color:#b99aff}'
+STYLE = '<style>' + QUESTION_COLOR_RULE + '''
+main:has(>[data-review]){max-width:1124px}
+[data-review]{display:flex;flex-wrap:wrap;align-items:center;column-gap:16px}
+[data-review]>:is(.page-heading,.review-queue){flex:0 0 100%;min-width:0}
+[data-review]>:is(.page-status,.record-filter-words){margin:0}
+[data-review]>.page-status{flex:1 1 0;min-width:0}
+[data-review]>.page-status>[data-status-reason]{white-space:normal;overflow-wrap:anywhere;min-width:0}
+[data-review]>.record-filter-words{flex:0 0 300px}
+.review-queue{margin-top:12px}
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-waiting-why{display:block;color:var(--ink-3);font-size:.85em}
 .review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
 [data-review] .record-filter-row{margin-bottom:12px}
+[data-review] .list-filters:has(>[data-clear-linked-reviews][hidden]){display:none}
 .record-filter-row>.review-types{gap:8px}
 .review-types button{max-width:100%;overflow-wrap:anywhere}
 :is(.review-types button,[data-clear-linked-reviews]){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
@@ -1177,7 +1189,7 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
-.question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
+.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
 .proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}.bug{--type-color:#ed876b}.response{--type-color:#edc46d}
 .review-icon{color:var(--type-color)}.review-panel{border-left-color:var(--type-color);grid-template-columns:1.25fr 1fr;padding:0 20px 18px 58px;gap:4px 28px}
 .response-answer time{display:block;margin-bottom:8px;color:var(--ink-3);font-size:12px}
@@ -1205,9 +1217,11 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 @media(min-width:961px){.review-handoff{display:flex;align-items:baseline;gap:.25em}}
 @media(max-width:960px){:is([data-review],[data-review-card]) .list-row td:last-child::before{content:'Age: '}
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
+@media(max-width:800px){[data-review]>:is(.page-status,.record-filter-words){flex-basis:100%}
+[data-review]>.record-filter-words{margin-top:8px}
+[data-review]>.record-filter-words input{width:100%}}
 @media(max-width:480px){[data-review] .record-filter-row{grid-template-columns:minmax(0,1fr)}}
 </style>'''
-
 
 CARD_VIEW_STYLE = '''<style>
 :root{scrollbar-gutter:auto}
@@ -1491,37 +1505,8 @@ mountCard(document);
 setInterval(updateHandoffAges,5000);
 })();'''
 
-CARD_REQUEST_SCRIPT = r'''
-function reviewRequestSignal(){
- const seconds=Number(document.querySelector('[data-review]').dataset.requestTimeoutSeconds);
- return AbortSignal.timeout(seconds*1000);
-}
-function requestReviewCard(key,version){
- return fetch(location.pathname+'?'+new URLSearchParams({body:key,version}),{cache:'no-store',signal:reviewRequestSignal()})
-  .then(async response=>({response,text:response.ok ? await response.text() : ''}));
-}
-const firstReviewCard=(()=>{
- const fragment=new URLSearchParams(location.hash.slice(1));
- const key=fragment.get('jump') || fragment.get('item') || new URLSearchParams(location.search).get('item');
- if(!key) return null;
- const version=document.querySelector('[data-review]').dataset.version;
- const result=requestReviewCard(key,version);
- void result.catch(()=>{});
- return {key,version,result};
-})();
-'''
-
-SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT
-          + REVIEW_CARD_SCRIPT + console.REVIEW_PLACE_SCRIPT + r'''(reviewPlace => {
-let content=document.querySelector('[data-review]');
-const saved=new Map(),bodies=new Map(),bodyRequests=new Map();
-const pendingSaves=new Map(),recovering=new Map();
-const scrollDepartures=new Set();
-const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
+CARD_REQUEST_SCRIPT = record_table.SCRIPT + console.REVIEW_PLACE_SCRIPT + r'''
 const kinds=''' + json.dumps(WIRE_TYPES) + ''',states=''' + json.dumps(INDEX_STATES) + r''';
-let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
-let focusAfterLoad=null,firstRequest=firstReviewCard;
-let deferredLink=null,revealCreated=null;
 function indexEntry(payload,row,at){
  const owner=payload.n[row[3]],source=payload.n[row[4]];
  return {key:row[0],id:row[1] || row[0],type:row[13]?'response':kinds[row[2]],owner:owner[0],sourceOwner:source[0],
@@ -1532,6 +1517,43 @@ function indexEntry(payload,row,at){
 function readIndex(payload){
  return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
 }
+let index=readIndex(JSON.parse(document.querySelector('[data-review-index]').textContent));
+function reviewRequestSignal(){
+ const seconds=Number(document.querySelector('[data-review]').dataset.requestTimeoutSeconds);
+ return AbortSignal.timeout(seconds*1000);
+}
+function requestReviewCard(key,version){
+ return fetch(location.pathname+'?'+new URLSearchParams({body:key,version}),{cache:'no-store',signal:reviewRequestSignal()})
+  .then(async response=>({response,text:response.ok ? await response.text() : ''}));
+}
+const firstReviewCard=(()=>{
+ const frame=window.frameElement;
+ if(frame?.reviewPlace){
+  const {place,table}=frame.reviewPlace;
+  delete frame.reviewPlace;
+  if(!history.state?.recordTable && place===location.pathname+location.search+location.hash)
+   history.replaceState({recordTable:table},'');
+ }
+ const params=recordPlaceParams();
+ legacyReviewPlace(params);
+ const key=recordItemLink(params,value=>resolveShownRecordId(index,value));
+ if(!index.has(key)) return null;
+ const version=document.querySelector('[data-review]').dataset.version;
+ const result=requestReviewCard(key,version);
+ void result.catch(()=>{});
+ return {key,version,result};
+})();
+'''
+
+SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + record_table.DATE_TIME_SCRIPT
+          + REVIEW_CARD_SCRIPT + r'''(reviewPlace => {
+let content=document.querySelector('[data-review]');
+const saved=new Map(),bodies=new Map(),bodyRequests=new Map();
+const pendingSaves=new Map(),recovering=new Map();
+const scrollDepartures=new Set();
+const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
+let focusAfterLoad=null,firstRequest=firstReviewCard;
+let deferredLink=null,revealCreated=null;
 function allEntries(){return [...index.values()];}
 function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
  const linked=keys?.has(entry.key);
@@ -1567,15 +1589,16 @@ try{
  }
 }catch{}
 storeSavedVerdicts();
-const view=createRecordTable({content:()=>content,single:true,
+const showValues=[...content.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip);
+const view=createRecordTable({content:()=>content,
  entries:allEntries,mount:entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
   content.querySelector('[data-type-chip="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
  focusKey:()=>focusAfterLoad?.key,
  unmount:row=>{if(!saved.has(row.dataset.key)) rememberForm(row.querySelector('[data-review-form]'));},
  place:params=>{
   reviewPlace(params);
-  if(params.get('show')==='Waiting') params.set('show','all');
-  if(params.get('type')==='response' && params.get('show')==='Validating') params.set('show','open');
+  const show=showValues.find(value=>value.toLowerCase()===params.get('show')?.toLowerCase());
+  if(show) params.set('show',params.get('type')==='response' && show==='Validating' ? 'open' : show);
  },
  persistLinkedTarget:true,
  missingItem:()=> 'This review is no longer on the Review page.',
@@ -1585,8 +1608,9 @@ const view=createRecordTable({content:()=>content,single:true,
   return button ? button.dataset.ownerChip : owner;
  },
  selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
- hasKey:key=>allEntries().some(entry=>entry.key===key),
-  shows:['open','Validating','all'],
+ resolveItem:value=>resolveShownRecordId(index,value),
+ hasKey:key=>index.has(key),
+ shows:showValues,
  visible:(data,filters)=>{
   const key=data.key,entry=index.get(key),departure=saved.get(key);
   if(!entry || pendingSaves.get(key)?.departing) return false;
@@ -1604,10 +1628,13 @@ const view=createRecordTable({content:()=>content,single:true,
    button.hidden=Boolean(id) && id!==owner && !eligibleOwners.some(entry=>matchesOwner(entry,id));
    button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,id)).length;
   });
+  const eligible=matching({type,owner,query,sourceOwner,keys});
+  const stateCounts=new Map();
+  for(const {state} of eligible) stateCounts.set(state,(stateCounts.get(state) ?? 0)+1);
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
    const show=button.dataset.showChip;
    button.hidden=type==='response' && show==='Validating';
-   const count=matching({type,owner,query,sourceOwner,keys,show}).length;
+   const count=show==='all' ? eligible.length : stateCounts.get(show==='open' ? 'Open' : show) ?? 0;
    button.querySelector('b').textContent=count;
    button.toggleAttribute('data-empty-count',count===0);
   });
@@ -1902,12 +1929,14 @@ function applyReviewIndex(payload){
  }
  storeSavedVerdicts();
  for(const [key,result] of saved) savedEntry(key,result);
- bind();view.apply(false);
+ bind();
+ const openedLink=view.retryItemLink();
+ if(!openedLink) view.apply(false);
  if(focusAfterLoad) restoreFocus(focusAfterLoad.key);
  if(focusedOwner!==undefined && (!document.activeElement?.hasAttribute('data-owner-chip') || document.activeElement.hidden))
   menu.querySelector('[aria-pressed="true"]')?.focus({preventScroll:true});
  content.dataset.loaded='true';
- if(!revealNewItem()) scrollTo({top,behavior:'instant'});
+ if(!revealNewItem() && !openedLink) scrollTo({top,behavior:'instant'});
  content.dispatchEvent(new Event('review-refreshed'));
 }
 bind();
@@ -1924,11 +1953,6 @@ document.addEventListener('review-item-created',event=>{
  revealCreated={key,id};
  void pageRefresh.refresh(true);
 });
-function itemLinkKey(){
- const fragment=new URLSearchParams(location.hash.slice(1)),search=new URLSearchParams(location.search);
- const field=name=>fragment.get(name) ?? search.get(name);
- return field('jump') || (field('item') ?? field('row'));
-}
 function followItemLink(options){
  const applyLink=unappliedOnly=>view.followItemLink({...options,unappliedOnly,beforeJump:key=>{
   if(pendingSaves.has(key)) return false;
@@ -1936,25 +1960,18 @@ function followItemLink(options){
   if(marker && !marker.closes && !marker.question && !marker.handed) saved.delete(key);
   return true;
  }});
- const key=view.hasActiveRowAnimations ? itemLinkKey() : null;
+ const key=view.hasActiveRowAnimations ? view.itemLinkKey() : null;
  if(!key || !content.querySelector('[data-record-motion] .list-toggle[aria-controls="'+CSS.escape(detailId(key))+'"]'))
   return applyLink(options?.unappliedOnly);
  const href=location.href;
  void afterRowAnimations(()=>applyLink(true),()=>location.href===href);
  return true;
 }
-const frame=window.frameElement;
-if(frame?.reviewPlace){
- const {place,table}=frame.reviewPlace;
- delete frame.reviewPlace;
- if(!history.state?.recordTable && place===location.pathname+location.search+location.hash)
-  history.replaceState({recordTable:table},'');
-}
 if(history.state?.recordTable) view.restorePlace();
 else if(!followItemLink()){view.place();view.apply(true,{normalizeOwner:true});}
 function isDeferredLink(key){return deferredLink?.key===key && deferredLink.href===location.href;}
 function restorePlace(event){
- const key=itemLinkKey();
+ const key=view.itemLinkKey();
  if(pendingSaves.has(key)){
   deferredLink={key,href:location.href};return;
  }

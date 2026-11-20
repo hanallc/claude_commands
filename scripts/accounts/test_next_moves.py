@@ -158,10 +158,33 @@ class NextMovesTests(unittest.TestCase):
                 entry = next_moves.add_next_move("units", 1, target, fallback_targets=fallbacks)
                 self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW, dry_run=True), ["units: unchanged"])
                 self.assertEqual(next_moves.read_next_moves(), (entry,))
-                self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW), ["units: unchanged"])
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW), [])
+                self.assertEqual(output.getvalue().splitlines(), [f"Removed next move units 1 at 1% to {target}."])
                 self.assertEqual(next_moves.read_next_moves(), ())
                 self.assertEqual(fixture.moves.calls, [])
                 self.assertEqual(fixture.notifications, [])
+
+    def test_current_account_fallback_stays_queued_after_the_selection_changes(self) -> None:
+        with self.watch_fixture() as fixture:
+            _ = fixture.groups()
+            fixture.reading("main@example.invalid", 0)
+            entry = next_moves.add_next_move("units", 1, "claude2", fallback_targets=("claude1",))
+            choose = refusal_watch._choose_auto_move_target  # pyright: ignore[reportPrivateUsage]
+
+            def change_after_choice(rule: refusal_watch.AutoMoveRule, account: str, now: datetime,
+                                    account_config: conf.ConfigRead) -> refusal_watch.AutoMoveRule | refusal_watch.BlockedAutoMoveTargets:
+                chosen = choose(rule, account, now, account_config)
+                assert isinstance(chosen, refusal_watch.AutoMoveRule)
+                self.assertEqual(chosen.to, "claude1")
+                _ = accounts.set_group_account("units", "claude3", why="operator selection", now=now)
+                return chosen
+
+            with patch.object(refusal_watch, "_choose_auto_move_target", side_effect=change_after_choice):
+                self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW), [])
+            self.assertEqual(next_moves.read_next_moves(), (entry,))
+            self.assertEqual(fixture.moves.calls, [])
 
     def test_due_entry_stays_queued_when_both_targets_are_blocked(self) -> None:
         with self.watch_fixture() as fixture:
@@ -213,7 +236,10 @@ class NextMovesTests(unittest.TestCase):
             _ = accounts.set_group_account("units", "claude3", why="auto: " + entry.id,
                                            now=watch_tests.NOW, origin=accounts.AutoOrigin())
             accounts.roles_history_file().unlink()
-            _ = refusal_watch.run_auto_moves(watch_tests.NOW)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(refusal_watch.run_auto_moves(watch_tests.NOW), [])
+            self.assertEqual(output.getvalue().splitlines(), ["Removed next move units 1 at 1% to claude2."])
             self.assertEqual(next_moves.read_next_moves(), ())
             self.assertIn("auto: " + entry.id, accounts.roles_history_file().read_text())
             self.assertEqual(fixture.moves.calls, [])
