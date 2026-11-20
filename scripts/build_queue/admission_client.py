@@ -814,16 +814,21 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     try:
         from scripts.build_queue import admission_records as records
         if isinstance(configuration, ReadConfigurationAtUse):
-            resolved = records.read_memory_config(report=False)
+            try:
+                resolved = records.read_memory_config(report=False)
+            except conf.Unusable as error:
+                return refuse(str(error), checker=True)
         else:
             resolved = configuration
         request = replace(request, code_version=LOADED_ADMISSION_CODE_VERSION)
+        if report_refusal and isinstance(resolved, records.MemoryConfig):
+            records.warn_configuration_diagnostics(resolved.diagnostics)
         if isinstance(request, (wire.AdmitRequest, wire.LaunchRequest, wire.ServiceEstimateRequest)):
             assert not isinstance(resolved, wire.CleanupTiming)
             reply = _run_admission(request, on_wait, refresh, attempt, retry, resolved, refuse)
         else:
             reply = _control_reply(request, retry, resolved, refuse)
-        if not isinstance(reply, wire.Refused) and isinstance(resolved, records.MemoryConfig):
+        if not report_refusal and not isinstance(reply, wire.Refused) and isinstance(resolved, records.MemoryConfig):
             records.warn_configuration_diagnostics(resolved.diagnostics)
         return reply
     except _QueueLeft:
@@ -833,6 +838,8 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
             raise
         return refuse(str(error))
     except conf.Unusable as error:
+        if report_refusal:
+            raise
         return refuse(str(error), checker=True)
     finally:
         _ACQUISITION_RETRY.reset(token)
