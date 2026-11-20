@@ -776,8 +776,10 @@ The command runs in its own session, including through the scope prefix.
 The record saves the command's process group.
 The supervisor uses default TERM, INT, and HUP dispositions.
 It installs no signal handler.
-`detached_runs.py stop` checks the supervisor and command identity, then signals the command group.
-The supervisor stays alive, records the exit status and delivers the result.
+`detached_runs.py stop` checks the supervisor and the command identity before it signals the command group.
+The supervisor stays alive to record the exit status and deliver the result.
+A worker that stops its own run keeps its pass active.
+A stop from another caller can end the pass and notify the director.
 The command gate starts a watcher in the command group. The watcher reads the supervisor pipe.
 The supervisor writes "done" to the pipe after the command ends.
 If the pipe closes without "done", the supervisor ended first: a signal, a SIGKILL or a crash.

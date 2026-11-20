@@ -44,6 +44,15 @@ class StepProfile:
 
 
 @dataclass(frozen=True)
+class Identity:
+    session_id: str
+    name: str
+    step: str
+    folder: str
+    unit: str = ""
+
+
+@dataclass(frozen=True)
 class AdmitRequest:
     episode: str
     owner: wire.Owner
@@ -51,7 +60,7 @@ class AdmitRequest:
     cwd: str
     since: float
     sidecar: str
-    identity: wire.Identity
+    identity: Identity
     call: records.Call
     test_width: records.TestWidth
     profile: StepProfile

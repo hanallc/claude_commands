@@ -40,8 +40,11 @@ class AstraWorkTests(unittest.TestCase):
     def write_progress(self) -> None:
         _ = (self.run_directory / "progress_history_state.json").write_text(json.dumps({
             "run_id": "durable-run-id", "history_file": str(self.history),
-            "open_phases": [{"id": "3", "instance_id": "instance-three", "status": "open"}],
-            "phase": {"id": "4", "instance_id": "instance-four", "status": "active"},
+            "open_phases": [
+                {"id": "3", "instance_id": "instance-three", "status": "active"},
+                {"id": "4", "instance_id": "instance-four", "status": "active"},
+            ],
+            "phase": {"id": "5", "instance_id": "instance-five", "status": "completed"},
         }), encoding="utf-8")
 
     def brief(self, phase: str = "4") -> subprocess.CompletedProcess[str]:
@@ -67,6 +70,10 @@ class AstraWorkTests(unittest.TestCase):
                 self.assertEqual(str(work.history_file), str(self.history))
                 self.assertEqual(work.phase_id, phase)
                 self.assertEqual(work.phase_instance_id, instance)
+
+    def test_phase_resolution_ignores_the_last_finished_phase(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not resolve to one open phase"):
+            _ = astra_work.phase_work(self.run_directory, "5")
 
     def test_unresolved_phase_and_missing_or_invalid_progress_are_refused(self) -> None:
         with self.assertRaises(ValueError):

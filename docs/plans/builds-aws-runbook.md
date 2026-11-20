@@ -451,6 +451,10 @@ The setup command needs no active target or slot capacity.
 6. Run `scripts/aws_target/deploy.py hana-setup --approve-resources` after resource approval.
 7. Confirm that the command reports a stopped box.
 
+After you confirm Hana is stopped, run `deploy.py hana-release-unknown-stop --approve-release` to record your approval. The command makes no AWS call.
+Hana refuses claims until the controller confirms the stop. If the controller finds Hana running, it stops Hana first.
+Run `deploy.py hana-release-unknown-stop` again to check for `already released`.
+
 `hana-image` converts the image to a raw disk and uploads it to one EBS snapshot with coldsnap.
 Coldsnap applies the cost tag with `--tag Key=...,Value=...` during the upload.
 `image_upload_tool` names the coldsnap package.
