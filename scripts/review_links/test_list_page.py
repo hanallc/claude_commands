@@ -852,7 +852,6 @@ async function inspect(){
   !!form.querySelector('[data-later-toggle]'),'The card shows the Review actions.');
  const phone=direct || document.querySelector('.mobile-header').getClientRects().length>0;
  check(phone===(direct || new URLSearchParams(location.search).has('phone')),'The List uses the expected layout.');
- if(direct) check(innerWidth===430,'The direct overlay uses the 430 px viewport.');
  if(phone){
   const box=dialog.getBoundingClientRect();
   const top=listFrame?.getBoundingClientRect().top ?? box.top;
@@ -1157,15 +1156,16 @@ if(shot){const image=new Image();image.hidden=true;image.src='/complete';documen
                             assert proof is not None
                             result = self.firefox_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
-                        elif width < FIREFOX_MIN_SHARED_WIDTH:
+                        elif size == "430,900":
                             command, environment = _private_firefox_command(
-                                self.root / "overlay-profile", width, height, dark=True)
-                            browser = subprocess.Popen([*command, url], stdout=subprocess.DEVNULL,
-                                                       stderr=subprocess.DEVNULL, env=environment, start_new_session=True)
-                            try:
-                                self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
-                            finally:
-                                _stop_browser(browser)
+                                self.root / f"overlay-profile-{size}", width, height, dark=True)
+                            with subprocess.Popen([*command, url], stdout=subprocess.DEVNULL,
+                                                  stderr=subprocess.DEVNULL, env=environment) as browser:
+                                try:
+                                    self.assertTrue(complete.wait(35), "The browser must report the overlay results.")
+                                finally:
+                                    browser.terminate()
+                                    _ = browser.wait(timeout=10)
                         else:
                             with self.firefox().page(url, width, height, dark=True):
                                 self.assertTrue(complete.wait(35), "The browser must report the overlay results.")

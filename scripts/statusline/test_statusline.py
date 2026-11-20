@@ -87,19 +87,22 @@ def fixture_colors(path: Path) -> Path:
     return path
 
 
+def fixture_rebuild_settings(cache: str) -> str:
+    return (
+        f"rebuild.cache={cache}\nrebuild.repo=/etc/nixos\nrebuild.ref=main\n"
+        + "rebuild.natedev=natedev\nrebuild.mac=MacBook-Pro\nrebuild.ssh=mac\n"
+        + "rebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.eval_retry_seconds=600\n"
+        + "rebuild.cwd.natedev=/etc/nixos\nrebuild.cwd.mac=~/nixos\n"
+        + "rebuild.generations=~/.local/state/rebuild/generations.log\n")
+
+
 def fixture_command(root: Path, *, rebuild_cache: str = "~/.local/state/showrunner/rebuilds") -> str:
     """Use private settings for the shell and its assignment process."""
     folder = root / "scripts/statusline"
     folder.mkdir(parents=True, exist_ok=True)
     configuration = fixture_colors(root / "config/statusline.conf")
     with configuration.open("a", encoding="utf-8") as settings:
-        _ = settings.write(
-            "# whole: 1..\ncounts.retry_seconds=7\n"
-            + f"rebuild.cache={rebuild_cache}\nrebuild.repo=/etc/nixos\nrebuild.ref=main\n"
-            + "rebuild.natedev=natedev\nrebuild.mac=MacBook-Pro\nrebuild.ssh=mac\n"
-            + "rebuild.interval=60\nrebuild.eval_timeout=120\nrebuild.eval_retry_seconds=600\n"
-            + "rebuild.cwd.natedev=/etc/nixos\nrebuild.cwd.mac=~/nixos\n"
-            + "rebuild.generations=~/.local/state/rebuild/generations.log\n")
+        _ = settings.write("# whole: 1..\ncounts.retry_seconds=7\n" + fixture_rebuild_settings(rebuild_cache))
     _ = configuration.with_name("user_zone.conf").write_text(f"zone={USER_ZONE.key}\n", encoding="utf-8")
     for name in ("statusline.sh", "statusline.jq", "assignment.py", "rebuild_row.py"):
         _ = shutil.copyfile(PROGRAM.parent / name, folder / name)
@@ -579,9 +582,9 @@ class ForYouStatusTests(unittest.TestCase):
     def test_linux_rejects_a_cache_that_expires_during_the_action_store_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = root / "config/statusline.conf"
+            config = root / "statusline.conf"
             cache = root / "rebuild-cache"
-            _ = fixture_command(root, rebuild_cache=str(cache))
+            _ = config.write_text(fixture_rebuild_settings(str(cache)), encoding="utf-8")
             environment = {"HOME": directory, "STAFF_FILE": os.devnull, "STATUSLINE_SYSTEM": "Linux",
                            "REBUILD_NEEDS_DIR": str(root / "needs"), "FOR_YOU_ACTIONS_DIR": str(fixture_actions(root))}
             for expire, expected in ((False, "0"), (True, "unavailable")):
