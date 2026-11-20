@@ -2195,7 +2195,7 @@ def free_now(
     else:
         path = eligibility.config_path() if isinstance(settings, eligibility.DefaultMacSettings) else settings
         capacity_settings = conf.read(path)
-    if isinstance(origin, placement.PlacedMacWork) and not eligibility.placement_enabled(paths.platform):
+    if not isinstance(origin, placement.ManualMacCommand) and not eligibility.placement_enabled(paths.platform):
         return "off"
     backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
                else eligibility.read_backoff(time.time(), paths.target))
@@ -2633,7 +2633,8 @@ def parser() -> argparse.ArgumentParser:
     _ = free.add_argument("--repo-root", default=os.getcwd())
     _ = free.add_argument("--copy", action="store_true")
     _ = free.add_argument("--manual", dest="mac_origin", action="store_const",
-                          const=placement.ManualMacCommand(), help="Check capacity for a manual Mac command.")
+                          const=placement.ManualMacCommand(), default=placement.PlacedMacWork(),
+                          help="Check capacity for a manual Mac command.")
 
     _ = commands.add_parser("status")
     _ = commands.add_parser("watch")

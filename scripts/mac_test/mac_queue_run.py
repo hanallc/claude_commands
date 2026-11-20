@@ -361,7 +361,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = parser.add_argument("--what", required=True)
     _ = parser.add_argument("--kind", choices=placement.MAC_RUN_KINDS, required=True)
     _ = parser.add_argument("--manual", dest="mac_origin", action="store_const",
-                            const=placement.ManualMacCommand(), help="Mark a command that a person requests on the Mac.")
+                            const=placement.ManualMacCommand(), default=placement.PlacedMacWork(),
+                            help="Mark a command that a person requests on the Mac.")
     _ = parser.add_argument("--package", required=True)
     _ = parser.add_argument("--worktree", type=Path, default=Path.cwd())
     _ = parser.add_argument("--cwd", default="")

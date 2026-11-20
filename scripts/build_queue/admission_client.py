@@ -1581,7 +1581,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = placement_parser.add_argument("--local-reason", default=os.environ.get("BUILD_QUEUE_LOCAL_REASON", ""))
     _ = placement_parser.add_argument("--mac-only", action="store_true")
     _ = placement_parser.add_argument("--manual", dest="mac_origin", action="store_const",
-                                      const=placement.ManualMacCommand())
+                                      const=placement.ManualMacCommand(), default=placement.PlacedMacWork())
     _ = placement_parser.add_argument("--once", action="store_true")
     _ = placement_parser.add_argument("--wait-events", action="store_true")
     _ = placement_parser.add_argument("--pinned-refusals", action="store_true")
