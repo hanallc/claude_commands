@@ -1500,7 +1500,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** `slot_operation` writes the holder's PID and command into the lock file. A busy row error names the holder: `<name>: another operation holds this row (pid <pid>: <command>)`. On main 10fd385ee (merged as 6b648d50b, hash c2edd1f3e).
 
-### Phase 88 — Merges run no type check; the nightly type check sends each red to its author  · status: todo
+### Phase 88 — Merges run no type check; the nightly type check sends each red to its author  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1526,6 +1526,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. No merge path runs basedpyright. The nightly run still type checks `scripts`. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** no merge path runs basedpyright. The nightly type check blames each diagnostic line, finds the unit that merged it, and sends that unit its own diagnostics. A diagnostic with no author goes to sdlc. On main f7a28f40d (merged as 905c9d003, hash 9ac0328f7).
 
 ### Phase 89 — A session in a review gets its messages at the review end; an urgent message goes through at once  · status: done
 **Depends on:** none
