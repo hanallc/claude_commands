@@ -139,7 +139,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             admission.assert_not_called()
         self.assert_gate_released()
 
-    def test_suites_remove_free_gate_folders_before_admission_and_keep_held_ones(self) -> None:
+    def test_suites_report_old_gate_folders_and_keep_their_records(self) -> None:
         tmpfs = self.root / "gate-tmpfs"
         parent = merge_gate.gate_test_parent(tmpfs)
         parent.mkdir(parents=True)
@@ -150,19 +150,24 @@ class SharedGateAdmissionTests(ServiceGateFixture):
         free = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
             "merge-gate-", build_folders.ExplicitBuildParent(parent)))
         release(free)
-        # Another program's folder in the shared tmpfs, with a free lock file beside it, is kept.
+        # The shared parent also holds a folder from another program.
         foreign = tmpfs / "foreign"
         foreign.mkdir()
         (tmpfs / "foreign.lock").touch()
-        with mock.patch.dict(os.environ, self.environment), \
-             mock.patch.object(build_folders, "tmpfs_temporary_parent", return_value=tmpfs), \
-             mock.patch.object(merge_gate, "gate_reservation", side_effect=GateRefused("stopped at admission")):
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(build_folders, "tmpfs_temporary_parent", return_value=tmpfs),
+              mock.patch.object(merge_gate, "gate_reservation", side_effect=GateRefused("stopped at admission")),
+              redirect_stderr(io.StringIO()) as report):
             with self.assertRaisesRegex(GateRefused, "stopped at admission"):
                 _ = merge_gate.run_suites(self.checkout)
-        self.assertFalse(free.exists())
-        self.assertFalse(free.with_name(free.name + ".lease.json").exists())
+        self.assertTrue(free.is_dir())
+        self.assertTrue(free.with_name(free.name + ".lease.json").is_file())
         self.assertTrue(held.is_dir())
         self.assertTrue(foreign.is_dir())
+        self.assertCountEqual(report.getvalue().splitlines(), [
+            f"kept for a manual removal list: {folder} (merge_gate, an earlier test fixture created this folder)"
+            for folder in (held, free)
+        ])
         self.assert_gate_released()
 
     def test_gate_reservation_refuses_unusable_config_before_default_sizing_admission(self) -> None:
