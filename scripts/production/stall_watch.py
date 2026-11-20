@@ -35,6 +35,7 @@ from uuid import uuid4
 
 
 from scripts.agents import detached_runs
+from scripts.build_targets.target_config import pinned_target_names
 from scripts.build_targets.targets import (
     ConfigError, Held, LocalTarget, StateUnreadable, local_hold_states, read_targets, ssh_target_state,
 )
@@ -709,34 +710,41 @@ def status_defers_bump(status: str, peers: Iterable[str], own_names: tuple[str, 
 class BuildHolds(NamedTuple):
     configured_targets: frozenset[str]
     held_targets: frozenset[str]
+    local_hold_live: bool = False
 
     def status_waits_on_hold(self, status: str) -> bool:
-        if not self.held_targets or BUILD_HOLD_WAIT.search(status) is None:
+        any_hold = self.local_hold_live or bool(self.held_targets)
+        if not any_hold or BUILD_HOLD_WAIT.search(status) is None:
             return False
         named = {target for target in self.configured_targets if name_spans(status, target)}
         return not named or bool(named & self.held_targets)
 
 
 def read_build_holds() -> BuildHolds:
+    local_hold_live = False
+    for state in local_hold_states():
+        if isinstance(state, StateUnreadable):
+            print(f"stall-watch: local build hold state unreadable: {state.reason}", file=sys.stderr)
+        elif isinstance(state, Held):
+            local_hold_live = True
     try:
-        targets = read_targets()
+        configuration = tunables.read("build_targets")
+        targets = read_targets(configuration=configuration)
+        pinned = pinned_target_names(configuration)
     except ConfigError as error:
         print(f"stall-watch: build targets unreadable: {error}", file=sys.stderr)
-        return BuildHolds(frozenset(), frozenset())
-    held_targets: set[str] = set()
+        return BuildHolds(frozenset(), frozenset(), local_hold_live)
+    held_targets = {target.name for target in targets if isinstance(target, LocalTarget) and local_hold_live}
     for target in targets:
-        if isinstance(target, LocalTarget):
-            states = local_hold_states()
-        elif target.platform == "macos":
-            states = (ssh_target_state(target),)
-        else:
+        if isinstance(target, LocalTarget) or target.platform != "macos":
             continue
-        for state in states:
-            if isinstance(state, StateUnreadable):
-                print(f"stall-watch: {target.name}: build hold state unreadable: {state.reason}", file=sys.stderr)
-            elif isinstance(state, Held):
-                held_targets.add(target.name)
-    return BuildHolds(frozenset(target.name for target in targets), frozenset(held_targets))
+        state = ssh_target_state(target)
+        if isinstance(state, StateUnreadable):
+            print(f"stall-watch: {target.name}: build hold state unreadable: {state.reason}", file=sys.stderr)
+        elif isinstance(state, Held):
+            held_targets.add(target.name)
+    known_targets = frozenset(target.name for target in targets).union(pinned)
+    return BuildHolds(known_targets, frozenset(held_targets), local_hold_live)
 
 
 def holding_names_outside(status: str, peers: Iterable[str], own_names: tuple[str, ...]) -> bool:
@@ -1607,7 +1615,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             if not holding and socket and not stretch["bump_sent"]:
                 report.decision = "idle bump requested"
                 text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
-                        "Continue your run. If you wait for someone, name that person in your status line. "
+                        + "Continue your run. If you wait for someone, name that person in your status line. "
                         + "Do not reply to stall-watch.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
             if not holding and socket and not stretch["tell_sent"] and showrunner_socket:

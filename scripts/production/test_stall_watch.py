@@ -2502,7 +2502,7 @@ runpy.run_path(str(script), run_name='__main__')
 
     def test_holding_statuses_log_each_pass_without_any_delivery(self) -> None:
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            "targets=natedev,mac\npinned_targets=hana-gpu\nkind.natedev=local\nplatform.natedev=linux\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         (self.root / "mac_test.conf").touch()
         mac_state = self.root / "mac-state"
@@ -2514,6 +2514,7 @@ runpy.run_path(str(script), run_name='__main__')
             ("holding: the build hold ended; waiting for my tests", "natedev", False),
             ("holding: waiting for the build hold log", "natedev", False),
             ("— holding: waiting on the natedev hold release", "mac", False),
+            ("— holding: waiting on the hana-gpu hold release", "mac", False),
         )
         for status, held_target, holding in cases:
             with self.subTest(status=status):
