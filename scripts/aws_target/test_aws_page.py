@@ -48,7 +48,6 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
         standard = ('c7a.4xlarge', 'm7a.8xlarge')
         gpu = 'g6.2xlarge'
         config = self.root / 'cloud_gate.conf'
-        _ = config.write_bytes((Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf').read_bytes())
         for key, value in (
             ('spot_candidate_regions', ' '.join(reversed(regions))), ('instance_types', standard[0]),
             ('price_compare_instance_types', standard[1]), ('gpu_instance_types', gpu),

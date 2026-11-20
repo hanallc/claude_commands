@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presign
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings
-from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting, write_gate_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
@@ -60,7 +60,9 @@ class CloudWorkerHoldTests(IsolatedBuildHoldTest):
     def test_forwarded_worker_session_cannot_pass_another_sessions_hold(self) -> None:
         from scripts.lib import conf
 
-        configuration = conf.read_or_repository('cloud_gate')
+        settings = self.scratch / 'cloud_gate.conf'
+        write_gate_config(settings)
+        configuration = conf.read(settings)
         for paired in (False, True):
             with (self.subTest(paired=paired), mock.patch.dict(os.environ,
                   {'CLAUDE_CODE_SESSION_ID': 'fixture-caller', 'CODEX_THREAD_ID': ''}),

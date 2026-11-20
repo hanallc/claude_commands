@@ -13,7 +13,6 @@ import multiprocessing
 from multiprocessing.connection import Connection
 import os
 import pathlib
-import re
 import shlex
 import shutil
 import signal
@@ -31,7 +30,7 @@ from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
-from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.ledger_test_support import CostFixture, text_setting, write_gate_config
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
@@ -48,6 +47,7 @@ class GuestTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        write_gate_config(root / 'cloud_gate.conf')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
 
     def test_user_data_fits_ec2_limit_with_module_times_and_400_character_signed_links(self) -> None:
@@ -347,10 +347,7 @@ class PairedTrialTests(CostFixture):
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
         shipped = Path(__file__).resolve().parents[2]
-        # The fixture pins its branch prefix, so a tuned live prefix changes no test.
-        _ = (self.root / 'cloud_gate.conf').write_text(re.sub(
-            r'(?m)^trial_branch_prefix=.*$', 'trial_branch_prefix=gate-trial',
-            (shipped / 'config/cloud_gate.conf').read_text()))
+        text_setting(self.root / 'cloud_gate.conf', 'trial_branch_prefix', 'gate-trial')
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):

@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 import json
 import os
-from pathlib import Path
 import subprocess
 from typing import override
 from unittest import mock
@@ -30,8 +29,6 @@ class PriceDayTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         self.clock = TestClock()
-        source = Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf'
-        _ = (self.root / 'cloud_gate.conf').write_bytes(source.read_bytes())
         self.enterContext(mock.patch.dict(os.environ, {
             'AWS_SHARED_CREDENTIALS_FILE': str(self.root / 'private-scaler'),
         }))

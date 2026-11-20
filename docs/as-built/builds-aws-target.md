@@ -27,8 +27,16 @@ Older readers treat the record as delivered.
 A retry after a recipient change can send the same notice to both recipients. A duplicate notice is safer than a lost notice.
 Code older than this change still sends a pending notice after its period ends. That ends when every branch has this change.
 
+Floors from Eastern accounting days before the UTC change can overstate the November 2026 month count by at most USD 1.99.
+These floors leave the month window on December 1, 2026.
+A legacy notice ID expires when its period ends.
+The code has no special handling for these cases.
+
 `report.py` reads the AWS state folder without target registration.
 Its AWS section retains the account bill, daily gate spend, and historical builder comparisons.
+The AWS lead line uses one UTC accounting day for cost, uptime, steps, and savings.
+An explicit report date selects the UTC day with that date.
+A report without a date uses the UTC day at the report time.
 `sync.hosts.aws=aws-build` identifies historical steps.
 The report shows no synchronization status for the removed builder.
 
@@ -637,6 +645,9 @@ Tests use private journals, injected clocks, and a fake provider.
 They verify that neither the controller lock nor the ledger lock remains held during provider work.
 Regression tests cover expired bootstrap, start, and publication recovery.
 They also cover stale recovery responses, concurrent cap refusals, and interruptions during idle stops.
+
+Fixtures in `scripts/aws_target/fixtures/` supply settings for `aws_target` tests.
+The tests do not read tracked configuration.
 
 ## Removed builder: 2026-11-04
 
