@@ -14,6 +14,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, tzinfo
 from enum import Enum, StrEnum
+from functools import cache
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
@@ -26,7 +27,7 @@ from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
 from scripts.review_links import new_item_dialog, review_items, review_page
-from scripts.review_links import staff_names
+from scripts.review_links import search_fold, staff_names
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
 
@@ -64,6 +65,60 @@ CHIP_BY_STATE = {
     the_list.ItemState.DONE: ListChip.ALL,
     the_list.ItemState.PAUSED: ListChip.BLOCKED,
 }
+
+
+class FilterFacet(NamedTuple):
+    name: str
+    field: str
+    bit: int
+    count_mask: int
+
+
+FILTER_FIELDS = {"show": "chip", "owner": "owner", "producer": "producer"}
+ALL_FILTER_BITS = (1 << len(FILTER_FIELDS)) - 1
+# Each count ignores its own filter.
+FILTER_FACETS = tuple(FilterFacet(name, field, 1 << index, ALL_FILTER_BITS ^ (1 << index))
+                      for index, (name, field) in enumerate(FILTER_FIELDS.items()))
+STAFF_FILTERS = ("owner", "producer")
+SEARCH_FIELDS = {"number": r"^#?l?(?=[0-9])", "ownerName": "", "title": "", "state": "", "parkingLabel": ""}
+PARKED_SEARCH_LABEL = search_fold.fold("Parked")
+STATE_SEARCH_TEXT = {state: search_fold.fold(state.value) for state in the_list.ItemState}
+UNREAD_FILTER = ("unread", "1", "true")
+UNREAD_FIELD, UNREAD_VALUE, UNREAD_MATCH = UNREAD_FILTER
+LIST_QUERY_FIELDS = ("show", UNREAD_FIELD, *record_table.OWNER_QUERY_KEYS, "producer", "q", "key", "item", "reveal", "state")
+LINK_REVEAL_FIELDS = (("openQuestion", "true", ""), (UNREAD_FIELD, "false", UNREAD_FIELD))
+# Match the whitespace that String.trim removes.
+QUERY_WHITESPACE = ("\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+                    + "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff")
+
+
+def normalize_search_text(text: str) -> str:
+    """Match the text that the browser reads from HTML attributes."""
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if "\0" in text:
+        text = text.replace("\0", "\ufffd")
+    return search_fold.fold(text)
+
+
+class SearchText(NamedTuple):
+    owner: str
+    title: str
+
+
+def show_aliases() -> dict[str, dict[str, ListChip]]:
+    aliases: dict[str, dict[str, ListChip]] = {}
+    for show in ("", "*", "open", "done", "closed", UNREAD_FIELD, *ListChip):
+        states = {"Closed": ListChip.ALL}
+        if show in ("", "open", ListChip.ALL, UNREAD_FIELD):
+            states.update({state.value: chip for state, chip in CHIP_BY_STATE.items()})
+        if show in ("done", "closed", UNREAD_FIELD):
+            states[""] = ListChip.ALL
+        aliases[show] = states
+    return aliases
+
+
+SHOW_ALIASES = show_aliases()
 
 
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
@@ -544,7 +599,7 @@ def render_review_updates(root: Path, members: staff.StaffSnapshot, review_recor
     reviews = linked_reviews(root, members, review_records, (entry.item for entry in entries))
     today = the_list.now()
     return ''.join(
-        f'<template data-list-review-key="{html.escape(entry.key, quote=True)}"'
+        f'<template data-list-review-key="{record_table.identity_attribute(entry.key)}"'
         + f' data-list-review-version="{review_version(entry.item)}">'
         + '<span data-list-review-summary>' + review_summary(entry.item, reviews, today) + '</span>'
         + '<div data-list-review-links>' + review_links(entry.item, reviews, today) + '</div></template>'
@@ -608,30 +663,32 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
 
 
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
-              reviews: ReviewDisplay, *, parked: bool, open_question: bool,
-              visibility: the_list.WaitingForAnswer | the_list.QuestionResends) -> str:
+              reviews: ReviewDisplay, *, owner_cell: str, owner_sort: str, search_text: SearchText, parked: bool,
+              open_question: bool, visibility: the_list.WaitingForAnswer | the_list.QuestionResends,
+              hidden: bool = False) -> str:
     item = entry.item
-    owner = owner_name(names.members, item.owner)
     producer = owner_name(names.members, item.producer)
     unread = isinstance(item.unread_since, datetime)
     unread_answers = the_list.unread_answer_ids(item)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
     due = the_list.eta_due(item.eta)
     eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(item.eta, today).casefold())
-    values = (item.number, owner.casefold(), producer.casefold(), item.title.casefold(), item.state.value.casefold(),
+    values = (item.number, owner_sort, producer.casefold(), item.title.casefold(), item.state.value.casefold(),
               item.next_step.casefold(), eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
     parking = (the_list.ParkUntilDelivered.DELIVERED.value
                if item.parked_until is the_list.ParkUntilDelivered.DELIVERED else str(parked).lower())
-    attributes = {"key": entry.key, "number": str(item.number), "owner": str(item.owner), "producer": item.producer,
-                  "keeper-produces": str(item.producer == entry.keeper).lower(), "state": item.state.value,
-                  "unread": str(unread).lower(), "parked": parking, "waiting-for-answer": str(waiting).lower(),
-                  "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
-                  "title": item.title.lower(),
-                  "owner-name": owner.lower(),
-                  "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
-    attrs = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attributes.items())
+    key = entry.key
+    attrs = (f' data-key="{record_table.identity_attribute(key)}" data-number="{item.number}"'
+             + f' data-owner="{record_table.identity_attribute(str(item.owner))}"'
+             + f' data-producer="{record_table.identity_attribute(item.producer)}"'
+             + f' data-keeper-produces="{str(item.producer == entry.keeper).lower()}" data-state="{item.state.value}"'
+             + f' data-unread="{str(unread).lower()}" data-parked="{parking}" data-waiting-for-answer="{str(waiting).lower()}"'
+             + f' data-open-question="{str(open_question).lower()}"'
+             + f' data-unread-delivery="{str(the_list.unread_delivery(item)).lower()}"'
+             + f' data-title="{html.escape(search_text.title)}" data-owner-name="{html.escape(search_text.owner)}"'
+             + f' data-order="{index}" data-sort-values="{html.escape(json.dumps(values, ensure_ascii=False))}"')
     panel = f'list-detail-{index}'
-    row_id = html.escape(entry.key.replace("/", "-"), quote=True)
+    row_id = html.escape(key.replace("/", "-"))
     number = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}" '
               + f'aria-label="Show item {item.number}" id="list-toggle-{row_id}">'
               + f'<span class="list-chevron" aria-hidden="true">›</span>{item.number}</button>')
@@ -670,13 +727,12 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     eta_cell = (f'<span class="{eta_class}" id="list-eta-{row_id}" tabindex="0" title="{full_eta}">'
                 + f'<span class="list-eta-text">{short_eta}</span>'
                 + f'<span class="list-eta-full" aria-hidden="true">{full_eta}</span></span>')
-    owner_cell = ('<span class="list-owner-name">' + '<wbr>'.join(
-        f'<span>{names.html(item.owner, part[0])}</span>' for part in re.finditer(r"[^-]*-|[^-]+", owner)) + '</span>')
     cells = (number, owner_cell, field_html("producer", item.producer, today, names),
              title, state, field_html("next_step", item.next_step, today, names), eta_cell, update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
-    return (f'<tbody data-list-item{attrs}><tr class="list-row">' + row
+    hidden_attr = ' hidden' if hidden else ''
+    return (f'<tbody data-list-item{attrs}{hidden_attr}><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
             + details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label)
             + '</td></tr></tbody>')
@@ -951,19 +1007,91 @@ def counts_strip(members: staff.StaffSnapshot, names: staff_names.StaffNames) ->
             + ''.join(chips) + '</aside>') if chips else ''
 
 
-def staff_chips(members: staff.StaffSnapshot, counts: Counter[the_list.ItemOwner]) -> list[record_table.Chip]:
+def staff_chips(members: staff.StaffSnapshot, identities: Iterable[the_list.ItemOwner],
+                counts: Counter[str]) -> list[record_table.Chip]:
     """Build a counted chip for each staff ID, in name order."""
-    choices = [(re.sub(r"(?:-unit)+\Z", "", owner_name(members, identity)) or str(identity), identity, count)
-               for identity, count in counts.items()]
+    choices = [(re.sub(r"(?:-unit)+\Z", "", owner_name(members, identity)) or str(identity), f"staff:{identity}")
+               for identity in identities]
     choices.sort(key=lambda choice: (choice[0].casefold(), choice[1]))
-    return [record_table.Chip("all", "All", counts.total()),
-            *(record_table.Chip(f"staff:{identity}", html.escape(label), count)
-              for label, identity, count in choices)]
+    return [record_table.Chip("all", "All", counts["all"]),
+            *(record_table.Chip(value, html.escape(label), counts[value]) for label, value in choices)]
+
+
+@dataclass(frozen=True)
+class ListQuery:
+    selected: dict[str, str]
+    words: str
+    unread: bool
+    keys: frozenset[str]
+    item: str
+    reveal: bool
+
+    @classmethod
+    def read(cls, query: str, items: list[ListRecord]) -> ListQuery:
+        fields = {name: values for name, values in parse_qs(query, keep_blank_values=True).items()
+                  if name in LIST_QUERY_FIELDS}
+
+        def first(name: str) -> str:
+            return fields.get(name, [""])[0]
+
+        raw_show = first("show")
+        if raw_show == UNREAD_FIELD:
+            fields[UNREAD_FIELD] = [UNREAD_VALUE]
+        aliases = SHOW_ALIASES.get(raw_show, SHOW_ALIASES["*"])
+        show = aliases.get(first("state"), aliases.get("", raw_show))
+        owner = next((value for key in record_table.OWNER_QUERY_KEYS if (value := first(key))), "")
+        producer = first("producer")
+        keys = frozenset(fields.get("key", ()))
+        item = first("item")
+        if keys and item:
+            if any(entry.key == item for entry in items):
+                keys |= {item}
+            else:
+                keys -= {item}
+        return cls({
+            "show": show if show in ListChip and show != ListChip.ALL else "",
+            "owner": owner if any(entry.item.owner == owner for entry in items) else "",
+            "producer": producer if any(entry.item.producer == producer for entry in items) else "",
+        }, first("q"), first(UNREAD_FIELD) == UNREAD_VALUE, keys, item, first("reveal") == "1")
+
+    def count_row(self, entry: ListRecord, text: SearchText, chip: ListChip,
+                  counts: dict[str, Counter[str]], search: str) -> bool:
+        item = entry.item
+        if self.keys and entry.key not in self.keys:
+            return False
+        if self.unread and str(isinstance(item.unread_since, datetime)).lower() != UNREAD_MATCH:
+            return False
+        if search:
+            search_values = {"number": str(item.number), "ownerName": text.owner, "title": text.title,
+                             "state": STATE_SEARCH_TEXT[item.state],
+                             "parkingLabel": PARKED_SEARCH_LABEL if chip == ListChip.PARKED else ""}
+            if not any((re.sub(pattern, "", search) if pattern else search) in search_values[field]
+                       for field, pattern in SEARCH_FIELDS.items()):
+                return False
+        data = {"chip": chip, "owner": str(item.owner), "producer": item.producer}
+        excluded = sum(bit for name, field, bit, _ in FILTER_FACETS
+                       if self.selected[name] and data[field] != self.selected[name])
+        for name, field, _, count_mask in FILTER_FACETS:
+            if not excluded & count_mask:
+                counts[name]["all"] += 1
+                value = f"staff:{data[field]}" if name in STAFF_FILTERS else data[field]
+                if value != "all":
+                    counts[name][value] += 1
+        return not excluded
+
+    def reveals(self, entry: ListRecord, open_question: bool) -> bool:
+        if self.item != entry.key:
+            return False
+        values = {"openQuestion": str(open_question).lower(),
+                  UNREAD_FIELD: str(isinstance(entry.item.unread_since, datetime)).lower()}
+        active = {UNREAD_FIELD: self.unread}
+        return self.reveal or any((not filter_name or active[filter_name]) and values[field] == value
+                                  for field, value, filter_name in LINK_REVEAL_FIELDS)
 
 
 def render(root: Path, *, include_counts: bool = True, defer_counts: bool = False,
            status: change_page.DeliveryStatus | Literal["standalone"] = "standalone",
-           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK) -> bytes:
+           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK, query: str = "") -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
@@ -986,18 +1114,37 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     ordered_items = [(entry, the_list.parking_active(entry.item.parked_until, today)) for entry in items]
     ordered_items.sort(key=lambda pair: pair[1])
     secret = form_secret(root)
+    selection = ListQuery.read(query, items) if query else None
+    chip_totals: dict[str, Counter[str]] = {facet.name: Counter() for facet in FILTER_FACETS}
+    search = normalize_search_text(selection.words.strip(QUERY_WHITESPACE)) if selection else ""
     owners: Counter[the_list.ItemOwner] = Counter()
     producers: Counter[the_list.ItemOwner] = Counter()
     rows: list[str] = []
+    linked_row = ''
     deferred_links = False
     chip_counts: Counter[ListChip] = Counter()
+    shown = 0
+
+    @cache
+    def owner_display(identity: the_list.ItemOwner) -> tuple[str, str, str]:
+        owner = owner_name(members, identity)
+        cell = ('<span class="list-owner-name">' + '<wbr>'.join(
+            f'<span>{names.html(identity, part[0])}</span>' for part in re.finditer(r"[^-]*-|[^-]+", owner)) + '</span>')
+        return cell, owner.casefold(), normalize_search_text(owner)
+
     for index, (entry, parked) in enumerate(ordered_items):
         owners[entry.item.owner] += 1
         producers[entry.item.producer] += 1
         open_question = has_open_question(entry.item)
         visibility = the_list.question_visibility(entry.keeper, entry.item, status)
-        chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question,
-                              unread_delivery=the_list.unread_delivery(entry.item))] += 1
+        chip = list_chip(entry.item.state, parked=parked, open_question=open_question,
+                         unread_delivery=the_list.unread_delivery(entry.item))
+        chip_counts[chip] += 1
+        owner_cell, owner_sort, owner_search = owner_display(entry.item.owner)
+        search_text = SearchText(owner_search, normalize_search_text(entry.item.title))
+        visible = selection is None or selection.count_row(entry, search_text, chip, chip_totals, search)
+        linked = not visible and selection is not None and selection.reveals(entry, open_question)
+        shown += visible
         row_reviews = reviews
         if entry.item.reviews and (
             reviews is LinkedReviewRead.AFTER_RENDER
@@ -1006,12 +1153,31 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         ):
             row_reviews = LinkedReviewRead.AFTER_RENDER
             deferred_links = True
-        rows.append(
-            item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
-                      open_question=open_question, visibility=visibility))
+        row = item_rows(entry, names, today, index, secret, row_reviews, owner_cell=owner_cell, owner_sort=owner_sort,
+                        search_text=search_text, parked=parked, open_question=open_question, visibility=visibility,
+                        hidden=not (visible or linked))
+        if linked:
+            linked_row = row
+        else:
+            rows.append(row)
     shows = [record_table.Chip("all", "All", len(items)),
              *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]
+    if selection is not None:
+        shows = [replace(chip, count=chip_totals["show"][chip.value]) for chip in shows]
+    else:
+        for name, totals in (("owner", owners), ("producer", producers)):
+            chip_totals[name].update({f"staff:{identity}": total for identity, total in totals.items()})
+            chip_totals[name]["all"] = totals.total()
+    owner_chips = staff_chips(members, owners, chip_totals["owner"])
+    producer_chips = staff_chips(members, producers, chip_totals["producer"])
+    owner_selected = f'staff:{selection.selected["owner"]}' if selection and selection.selected["owner"] else "all"
+    producer_selected = f'staff:{selection.selected["producer"]}' if selection and selection.selected["producer"] else "all"
+    show_selected = (selection.selected["show"] or "all") if selection else "all"
+    check_unread = ' checked' if selection and selection.unread else ''
+    words = selection.words if selection else ''
+    hide_empty = ' hidden' if shown or selection is None else ''
+    hide_link = '' if linked_row else ' hidden'
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     linked_headers = ''.join(f'<th scope="col">{label}</th>' for label in HEADERS)
@@ -1027,8 +1193,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     counts = ''
     if include_counts:
         if defer_counts:
-            query = COUNTS_AND_LINKS_QUERY if deferred_links else COUNTS_QUERY
-            counts = f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(query)}"></div>'
+            counts_query = COUNTS_AND_LINKS_QUERY if deferred_links else COUNTS_QUERY
+            counts = f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(counts_query)}"></div>'
         else:
             counts = counts_strip(members, names)
     content = (STYLE + page_frame.title("The List", "list", action=new_item_dialog.title_button("list"), compact_actions=True)
@@ -1038,13 +1204,13 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
                + '<div data-record-filters>'
-               + record_table.chip_row('Owner', staff_chips(members, owners), 'all')
+               + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)
                + '<div class="list-producer-filter">'
-               + record_table.chip_row('Producer', staff_chips(members, producers), 'all')
-               + record_table.words_box('list-search', 'Filter by number, owner, item or state')
+               + record_table.chip_row('Producer', producer_chips, producer_selected, encode_values=True)
+               + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
                + '</div>'
-               + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, 'all')
-               + '<label class="list-unread-switch"><input type="checkbox" role="switch" id="list-unread" value="1">'
+               + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, show_selected)
+               + f'<label class="list-unread-switch"><input type="checkbox" role="switch" id="list-unread" value="{UNREAD_VALUE}"{check_unread}>'
                + 'Unread only</label></div>'
                + '<p data-hidden-action-status role="status" hidden></p></div>'
                + '</div>'
@@ -1052,10 +1218,10 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<div data-list-count role="status" aria-live="polite"></div>'
                + '<div class="list-table"><table aria-label="The List">' + columns + '<thead><tr>' + headers + '</tr></thead>'
                + ''.join(rows) + '</table>'
-               + '<p data-empty hidden>No items in this view.</p></div>'
-               + '<section data-linked-item hidden><h2 id="list-linked-heading">Linked item outside filters</h2>'
+               + f'<p data-empty{hide_empty}>No items in this view.</p></div>'
+               + f'<section data-linked-item{hide_link}><h2 id="list-linked-heading">Linked item outside filters</h2>'
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
-               + '<thead><tr>' + linked_headers + '</tr></thead></table></div></section>'
+               + '<thead><tr>' + linked_headers + '</tr></thead>' + linked_row + '</table></div></section>'
                + counts + '</div>'
                + '<dialog data-list-review-dialog aria-label="Review card"><div class="list-review-close">'
                + '<button type="button" autofocus>Close</button></div></dialog>'
@@ -1155,26 +1321,51 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 }
 </style>'''
 
+# Use the Python case-folding table for browser search.
 SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
           + record_table.DATE_TIME_SCRIPT + '''(() => {
 const chipsByQuestion=''' + json.dumps({
     str(open_question).lower(): {
         str(parked).lower(): {
-            state.value: list_chip(state, parked=parked, open_question=open_question).value for state in CHIP_BY_STATE
+            str(unread_delivery).lower(): {
+                state.value: list_chip(state, parked=parked, open_question=open_question, unread_delivery=unread_delivery)
+                for state in CHIP_BY_STATE
+            } for unread_delivery in (False, True)
         } for parked in (False, True)
     } for open_question in (False, True)
 }) + ''';
 const shows=''' + json.dumps(list(ListChip)) + r''';
-const chipsByState=chipsByQuestion.false.false;
+const showAliases=''' + json.dumps(SHOW_ALIASES) + r''';
+const [unreadField,unreadValue,unreadMatch]=''' + json.dumps(UNREAD_FILTER) + r''';
+const filterFacets=''' + json.dumps(FILTER_FACETS) + r''';
+const staffFilters=''' + json.dumps(STAFF_FILTERS) + r''';
+const linkRevealFields=''' + json.dumps(LINK_REVEAL_FIELDS) + r''';
+const parkedSearchLabel=''' + json.dumps(PARKED_SEARCH_LABEL) + r''';
+const stateSearchText=''' + json.dumps(STATE_SEARCH_TEXT) + r''';
+const [foldRanges,searchCaseFold]=''' + json.dumps(
+    (search_fold.RANGES, search_fold.EXCEPTIONS), ensure_ascii=False, separators=(",", ":")) + r''';
+for(const [start,end,step,offset] of foldRanges)
+ for(let point=start;point<=end;point+=step) searchCaseFold[point]=String.fromCodePoint(point+offset);
+const normalizeWords=words=>words.trim().replace(/\r\n?/g,'\n').replace(/\0/g,'\ufffd')
+ .replace(/[A-Z\u0080-\u{10ffff}]/gu,character=>searchCaseFold[character.codePointAt(0)] ?? character);
+const searchFields=Object.entries(''' + json.dumps(SEARCH_FIELDS) + r''').map(([field,pattern])=>
+ [field,pattern && new RegExp(pattern)]);
 const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + r''';
 const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed') return;
- const parked=isParked(data);
- if(!parked && data.unreadDelivery==='true') return 'needs-me';
- return chipsByQuestion[data.openQuestion][String(parked)][data.state];
+ const byDelivery=chipsByQuestion[data.openQuestion][String(isParked(data))];
+ return byDelivery[String(data.unreadDelivery==='true')][data.state];
 };
 let content=document.querySelector('[data-list]');
+function decodeListKeys(list){
+ for(const row of list.querySelectorAll('[data-list-item][data-key*="%"]'))
+  row.dataset.key=decodeURIComponent(row.dataset.key);
+}
+decodeListKeys(content);
+function listRow(key){
+ return [...content.querySelectorAll('[data-list-item]')].find(row=>row.dataset.key===key);
+}
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
 let saving=0,listSaveVersion=0,refreshNeeded=false;
 let createdItem='';
@@ -1238,10 +1429,11 @@ function restoreEvidenceDetails(fresh){
  }
 }
 function matchesWords(data,search){
- if(!search) return true;
- const number=search.replace(/^#?l?(?=\d)/,'');
- return [data.number,data.ownerName,data.title,data.state,data.parked!=='false' ? 'Parked' : '']
-  .some(value=>(value || '').toLowerCase().includes(value===data.number ? number : search));
+ return searchFields.some(([field,pattern])=>{
+  const text=field==='parkingLabel' ? (isParked(data) ? parkedSearchLabel : '') :
+   field==='state' ? stateSearchText[data.state] : data[field] || '';
+  return text.includes(pattern ? search.replace(pattern,'') : search);
+ });
 }
 function syncUnread(item,form,unread,unreadSort){
  item.dataset.unread=String(unread);
@@ -1348,16 +1540,26 @@ async function markOpenedAnswerRead(item,watch){
 const tableView=createRecordTable({content:()=>content,
  shows,
  defaultShow:'all',
- place:params=>{
-  const show=params.get('show');
-  if(show==='unread'){params.set('show','all');params.set('unread','1');}
-  const state=params.get('state'),stateChip=chipsByState[state];
-  if(show==='done' || show==='closed' || state==='Closed') params.set('show','all');
-  else if((show==='open' || show==='all' || show==='unread' || !show) && Object.hasOwn(chipsByState,state))
-   params.set('show',stateChip);
+ queryFields:''' + json.dumps(LIST_QUERY_FIELDS) + r''',
+ normalizeWords,
+ expandFilters:params=>{
+  const show=params.get('show') || '',state=params.get('state') || '';
+  if(show===unreadField) params.set(unreadField,unreadValue);
+  else if(params.has(unreadField) && params.get(unreadField)!==unreadValue) params.set(unreadField,'');
+  if(params.has('show') || params.has('state')){
+   const aliases=Object.hasOwn(showAliases,show) ? showAliases[show] : showAliases['*'];
+   const alias=Object.hasOwn(aliases,state) ? state : '';
+   params.set('show',Object.hasOwn(aliases,alias) ? aliases[alias] : show);
+   params.delete('state');
+  }
+  const [owner,showrunner]=ownerQueryKeys;
+  if(params.has(showrunner)){
+   params.set(owner,params.get(owner) || params.get(showrunner));
+   params.delete(showrunner);
+  }
  },
- filters:['producer','unread'],
- staffChipFilters:['owner','producer'],
+ filters:['producer',unreadField],
+ staffChipFilters:staffFilters,
  beforeApply:rememberLogPositions,
  applied:(_items,{show,filters})=>{
   const nextUnreadShow=filters.unread ? show : '';
@@ -1371,18 +1573,19 @@ const tableView=createRecordTable({content:()=>content,
  itemOpened:watchOpenedAnswer,
  expandedSelection:(data,selection)=>selection.filters.unread && selection.show===unreadShow &&
   keepOpenAfterRead.has(data.key) ? {...selection,filters:{...selection.filters,unread:''}} : undefined,
- hasKey:key=>!closedKeys.has(key) && !!content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]'),
- revealLinked:(data,{filters})=>data.openQuestion==='true' || (filters.unread && data.unread!=='true'),
+ hasKey:key=>!closedKeys.has(key) && !!listRow(key),
+ revealLinked:(data,{filters})=>linkRevealFields.some(([field,value,filter])=>
+  (!filter || filters[filter]) && (data[field] || 'false')===value),
  missingItem:key=>{
   const number=key.match(/\/L([1-9]\d*)$/)?.[1];
   if(!number) return '';
   return 'Item #'+number+(closedKeys.has(key) ? ' is closed' : ' is not on the List');
  },
- filterValues:(data,search,{filters})=>{
-  const chip=chipFor(data);
-  if(!chip || (filters.unread && data.unread!=='true') || !matchesWords(data,search)) return null;
-  return {show:chip==='all' ? [] : [chip],owner:[data.owner],producer:[data.producer]};
+ eligibleChip:(data,search,{filters})=>{
+  if((filters[unreadField] && data[unreadField]!==unreadMatch) || (search && !matchesWords(data,search))) return;
+  return chipFor(data);
  },
+ filterFacets,
  counts:(items,count,{counts})=>{
   const open=items.filter(item=>item.dataset.state!=='Closed');
   return count+' of '+open.length+' items shown · '+(counts.show['needs-me'] ?? 0)+' need you · '+
@@ -1731,7 +1934,7 @@ async function readListCounts(source){
   if(signal.aborted || !footer) return;
   footer.innerHTML=markup;
   const updates=new Map([...footer.querySelectorAll('template[data-list-review-key]')]
-   .map(update=>[update.dataset.listReviewKey,update]));
+   .map(update=>[decodeURIComponent(update.dataset.listReviewKey),update]));
   if(updates.size) for(const row of pendingRows().filter(wasRequested)){
    const update=updates.get(row.dataset.key);
    if(!update || update.dataset.listReviewVersion!==row.dataset.listReviewVersion) continue;
@@ -1760,6 +1963,7 @@ async function refresh(_supersede=false,current=()=>true){
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
+ decodeListKeys(fresh);
  await tableView.settled();
  if(saving || dateTimePickerOpen(content) || !current()) return;
  refreshNeeded=false;
@@ -1794,7 +1998,7 @@ async function refresh(_supersede=false,current=()=>true){
   const button=action && row?.querySelector('[data-detail]:not([hidden]) button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
   (button || row?.querySelector('.list-toggle') || content.querySelector('#list-search')).focus({preventScroll:true});
  }
- if(createdItem && content.querySelector('[data-list-item][data-key="'+CSS.escape(createdItem)+'"]')){
+ if(createdItem && listRow(createdItem)){
   const place=new URL(location.href),fragment=new URLSearchParams(place.hash.slice(1));
   fragment.set('jump',createdItem);place.hash=fragment.toString();
   history.replaceState(history.state,'',place);
@@ -1832,7 +2036,10 @@ function reviewLinkPlace(link){
  return {key:row.dataset.key,selector,position:[...row.querySelectorAll(selector)].indexOf(link)};
 }
 function restoreReviewLink({key,selector,position}){
- const findRow=()=>content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]:not([hidden])');
+ const findRow=()=>{
+  const row=listRow(key);
+  return row?.hidden ? undefined : row;
+ };
  const visibleLink=row=>{
   const link=row?.querySelectorAll(selector)[position];
   return link?.getClientRects().length ? link : null;
@@ -1864,7 +2071,7 @@ async function refreshSavedReview(){
  refreshingReview=true;
  const version=listSaveVersion;
  await pageRefresh.refresh(true);
- const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(card.link.key)+'"]');
+ const row=listRow(card.link.key);
  if(activeReview===card && row?.hasAttribute('data-list-review-version')) await listCounts;
  refreshingReview=false;
  if(savedReview!==card || version!==listSaveVersion){
