@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable, Generator, Iterable, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import StrEnum
@@ -24,10 +24,10 @@ from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf, file_lock
-from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
+from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
 from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
-from scripts.production import change_review, delivery_state, record_store, staff
+from scripts.production import change_review, delivery_state, record_store, session_pane, staff
 from scripts.review_links import change_page, page_question, question_record
 
 
@@ -1164,9 +1164,9 @@ def question_visibility(keeper: staff.StaffId, item: ListItem,
     unanswered = tuple(question for question in item.questions if question.answer is None)
     if not unanswered:
         return QuestionResends(())
-    target = _list_question_target(keeper, item)
     resends: list[QuestionResend] = []
     for question in unanswered:
+        target = _list_question_target(keeper, item, question.recipient_id(keeper))
         delivery = change_page.published_question_delivery_view(status, target.saved(question))
         if not delivery.state.waits:
             resends.append(QuestionResend(question, delivery))
@@ -1735,11 +1735,16 @@ def _save_page_request(store: record_store.NumberedRecords, keeper: staff.StaffI
     return item
 
 
+class NoQuestionAnswerer(StrEnum):
+    ABSENT = "absent"
+
+
 @dataclass(frozen=True)
 class _ListQuestionStore:
     keeper: staff.StaffId
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
     resend_id: str = ""
+    answerer: staff.StaffRow | NoQuestionAnswerer = NoQuestionAnswerer.ABSENT
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
         current = load(self.keeper, item)
@@ -1770,16 +1775,53 @@ class _ListQuestionStore:
             question = next((question for question in current.questions if question.question_id == question_id), None)
             if question is None or question.answer is not None:
                 raise question_record.AnswerRefused("This item has no open question with that id.")
-            questions = tuple(replace(question, answer=answer) if question.question_id == question_id else question
-                              for question in current.questions)
+            answerer = self.answerer
+            if answerer is NoQuestionAnswerer.ABSENT or answerer.id not in (self.keeper, question.recipient_id(self.keeper)):
+                raise question_record.AnswerRefused("Only the question recipient or morty can answer.")
+            questions = tuple(replace(saved, answer=answer) if saved.question_id == question_id else saved
+                              for saved in current.questions)
             moment = now()
-            entry = ItemChange(moment, QuestionAnswered(question_id), "morty")
+            entry = ItemChange(moment, QuestionAnswered(question_id), answerer.name)
             changed = replace(current, questions=questions, updated=moment, unread_since=moment, log=(*current.log, entry))
             try:
                 _save(store, changed)
             except AtomicDurabilityUnconfirmed:
                 if load(self.keeper, item) != changed:
                     raise
+
+
+def _new_question_recipient(keeper: staff.StaffId, producer: staff.StaffId
+                            ) -> staff.StaffId | question_record.KeeperForUnavailableProducer:
+    if producer == keeper:
+        return keeper
+    member = next((row for row in staff.active(staff.snapshot(), "producer") if row.id == producer), None)
+    if member is not None and not isinstance(member.exited, staff.Exited):
+        try:
+            _ = session_pane.session_place(member.current_session)
+        except (session_pane.NoSuchTarget, OSError, session_pane.HerdrFailure, ValueError):
+            pass
+        else:
+            return producer
+    return question_record.KeeperForUnavailableProducer(keeper, producer)
+
+
+def _prepare_question_recipient(path: Path, request: PageRequest, keeper: staff.StaffId, producer: staff.StaffId
+                                ) -> staff.StaffId | question_record.KeeperForUnavailableProducer:
+    """Keep the first recipient if the List write fails."""
+    fields = _request_fields(request)
+    try:
+        saved = delivery_state.read_fields(path)
+    except FileNotFoundError:
+        recipient = _new_question_recipient(keeper, producer)
+        record = {"request": fields, **question_record.recipient_fields(recipient)}
+        write_text_atomic(path, json.dumps(record) + "\n", new_file_mode=0o600)
+        return recipient
+    if saved.get("request") != fields:
+        raise ListError("this request already has a different action or words")
+    recipient = question_record.read_recipient(saved)
+    if recipient is question_record.DefaultQuestionRecipient.PAGE:
+        raise ListError("the prepared question has no recipient")
+    return recipient
 
 
 def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
@@ -1804,19 +1846,30 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
                 return change_page.NoMessageDelivery()
         elif open_question is not None:
             questions.save_request(item, request, open_question)
-        return _claim_question(questions, item, request.words, status)
+        request_key = json.dumps([str(store.path(item.id).resolve()), _request_id(request.request)]).encode()
+        preparation = status.root / (".review-link-list-ask-" + hashlib.sha256(request_key).hexdigest())
+        recipient = (_prepare_question_recipient(preparation, request, keeper, item.producer) if open_question is None
+                     else open_question.recipient_id(keeper))
+        delivery = _claim_question(questions, item, request.words, recipient, status)
+        with suppress(OSError):
+            preparation.unlink()
+        return delivery
 
 
 def _claim_question(questions: _ListQuestionStore, item: ListItem, words: str,
+                    recipient: staff.StaffId | question_record.KeeperForUnavailableProducer,
                     status: change_page.DeliveryStatus, *, resend_request: str = "") -> change_page.MessageDelivery:
-    return page_question.ask(questions, _list_question_target(questions.keeper, item), words, status,
-                             resend_unknown=bool(questions.resend_id), resend_request=resend_request)
+    recipient_id = recipient.keeper if isinstance(recipient, question_record.KeeperForUnavailableProducer) else recipient
+    return page_question.ask(questions, _list_question_target(questions.keeper, item, recipient_id), words, status,
+                             resend_unknown=bool(questions.resend_id), resend_request=resend_request,
+                             new_recipient=recipient)
 
 
-def _list_question_target(keeper: staff.StaffId, item: ListItem) -> change_page.QuestionDeliveryTarget:
+def _list_question_target(keeper: staff.StaffId, item: ListItem, recipient: staff.StaffId
+                          ) -> change_page.QuestionDeliveryTarget:
     owner = None if isinstance(item.owner, UnassignedOwner) else item.owner
     return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title,
-                                           keeper, alert_owner=owner)
+                                           recipient, alert_owner=owner)
 
 
 def resend_question(keeper: staff.StaffId, identity: str, question_id: str,
@@ -1828,8 +1881,8 @@ def resend_question(keeper: staff.StaffId, identity: str, question_id: str,
             return change_page.NoMessageDelivery()
         for question in item.questions:
             if question.question_id == question_id and question.answer is None:
-                return _claim_question(_ListQuestionStore(keeper, resend_id=question_id), item, question.words, status,
-                                       resend_request=request)
+                return _claim_question(_ListQuestionStore(keeper, resend_id=question_id), item, question.words,
+                                       question.recipient_id(keeper), status, resend_request=request)
         return change_page.NoMessageDelivery()
 
 
@@ -2154,15 +2207,16 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper, caller=caller.id)
-        if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "close"):
-            raise ListError(f"only morty can run {name}")
         if name == "answer":
             identity, question = cast(str, args.id), cast(str, args.question)
-            result = page_question.answer(_ListQuestionStore(keeper), identity, question, cast(str, args.text))
+            result = page_question.answer(_ListQuestionStore(keeper, answerer=caller), identity, question,
+                                          cast(str, args.text))
             if isinstance(result, page_question.AnswerRefused):
                 raise ListError(result.reason)
             print(f"answered {identity} {question}")
             return 0
+        if assigned_to is not AllItems.INCLUDED and name not in ("add", "park", "close"):
+            raise ListError(f"only morty can run {name}")
         if name in ("park", "close"):
             if assigned_to is not AllItems.INCLUDED:
                 source = caller.name

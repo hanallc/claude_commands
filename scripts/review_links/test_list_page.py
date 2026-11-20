@@ -27,12 +27,13 @@ from xml.etree import ElementTree
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
+from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
-from scripts.message import send_result
+from scripts.message import send_result, sessions
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
-from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
+from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_pane, session_staff, showrunners, staff, the_list, unrouted_alert
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
@@ -1441,7 +1442,7 @@ document.body.append(result);
                          ['owner', 'producer', 'show'])
         shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
         self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>', shows),
-                         [("all", "All"), ("needs-me", "Needs me"), ("morty-answering", "Morty answering"),
+                         [("all", "All"), ("needs-me", "Needs me"), ("producer-answering", "Producer answering"),
                           ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked")])
         self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
         owners = controls.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
@@ -1742,8 +1743,8 @@ if(row.hidden || !row.querySelector('.list-dot')) failures.push('Needs me shows 
 row.querySelector('.list-toggle').click();
 if(!row.querySelector('[value="read"]') || !row.querySelector('[data-list-review-card]'))
  failures.push('The waiting row shows Mark read and its change link');
-document.getElementById('filter-show-morty-answering').click();
-if(!row.hidden) failures.push('Morty answering excludes the unread delivery');
+document.getElementById('filter-show-producer-answering').click();
+if(!row.hidden) failures.push('Producer answering excludes the unread delivery');
 const result=document.createElement('p');result.id='probe-results';
 result.textContent=JSON.stringify(failures);document.body.append(result);
 </script>""", reduced_motion=True)
@@ -1800,7 +1801,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
     def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
         item = self.add("Explain this item")
         form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", NOW, (),
-                                       producer_name=MORTY.name)
+                                       members=staff.snapshot())
         actions, words = form.split('</div>', 1)
         self.assertNotIn('value="tell"', actions)
         self.assertNotIn('<label for="words-', words)
@@ -1913,16 +1914,33 @@ document.body.append(result);
                     _ = the_list.mark_read(MORTY.id, item.id, source="nate")
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
+        bob = replace(DWIGHT, name="bob", id=staff.StaffId(str(uuid4())), current_session=staff.StaffId(str(uuid4())))
+        moved = replace(DWIGHT, current_session=staff.StaffId(str(uuid4())))
         for number, state in ((17, the_list.ItemState.DELIVERED), (18, the_list.ItemState.WORKING),
                               (19, the_list.ItemState.WORKING), (20, the_list.ItemState.BLOCKED)):
             item = self.add("Check the question result", state, number=number)
+            if number == 17:
+                item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
             if number == 18:
                 item = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="nate")
             outcome = question_outcome("refused", "Producer offline") if number == 19 else question_outcome()
-            with (patch.object(change_page, "send_question", return_value=outcome),
+            with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")) as place:
+                delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
+            if number == 17:
+                place.assert_called_once_with(DWIGHT.current_session)
+                _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
+                    row.to_json() for row in (MORTY, moved, bob, OWNER, OTHER)]}))
+                _ = the_list.update(MORTY.id, item.id, {"producer": bob.id}, source="morty")
+                _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+            else:
+                place.assert_not_called()
+            with (patch.object(unrouted_alert, "message_outcome", return_value=outcome) as send,
                   patch.object(change_page, "alert_delivery_failures")):
-                list_page.deliver(list_page.submit(root, urlencode(
-                    self.fields(item, "question", words="Which check passed?")), status))
+                list_page.deliver(delivery)
+            if number == 17:
+                send.assert_called_once()
+                self.assertEqual(send.call_args.args[0], f"session:{moved.current_session}")
+                self.assertEqual(the_list.load(MORTY.id, item.id).questions[0].recipient, DWIGHT.id)
             if number in (18, 19):
                 _ = the_list.update(MORTY.id, item.id, {"latest_status": "A new check passed."}, source="morty")
             if number == 20:
@@ -1940,7 +1958,7 @@ const unread=document.getElementById('list-unread');
 const total=document.querySelector('[data-list-count]');
 const entries=[
  ['all',[1,2,3,4,5,6,7,9,10,11,12,13,14,15,17,18,19,20],[1,3,4,6,9,11,13,15,18,19,20]],
- ['needs-me',[4,5],[4]],['morty-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7,20],[3,20]],
+ ['needs-me',[4,5],[4]],['producer-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7,20],[3,20]],
  ['parked',[9,10,11,12,13,14,15,18],[9,11,13,15,18]],
 ];
 const count=button=>Number(button.dataset.filterCount);
@@ -1965,10 +1983,17 @@ const detail=number=>row(number).querySelector('[data-detail]:not([hidden])');
 unread.click();
 chips[2].click();
 expand(17);expand(19);
-check(!row(17).hidden && detail(17)?.querySelector('[data-waiting-note]'),
- 'The unparked item shows the waiting note in Morty answering.');
+check(!row(17).hidden && detail(17)?.querySelector('[data-waiting-note]')?.textContent==='dwight will answer.',
+ 'The waiting note names the saved recipient after the producer changes.');
 check(!row(19).hidden && detail(19)?.querySelector('[value="resend-Q1"]'),
- 'The failed question stays in Morty answering with Resend.');
+ 'The failed question stays in Producer answering with Resend.');
+const producerChips=document.querySelector('[data-filter-row="producer"]');
+for(const number of [17,19]){
+ producerChips.querySelector('[data-filter-value="staff:'+row(number).dataset.producer+'"]').click();
+ check(count(chips[2])===1 && visible().join()===String(number),
+  'Producer answering shows and counts the selected producer’s item.');
+}
+producerChips.querySelector('[data-filter-value="all"]').click();
 chips[5].click();expand(18);
 const waitingPanel=detail(18);
 check(!row(18).hidden && waitingPanel?.querySelector('[data-waiting-note]') &&
@@ -3317,7 +3342,7 @@ observer.observe(original.parentNode,{childList:true});
             delivery = list_page.submit(root, urlencode(fields), status)
             opened = list_page.render(root, status=status).decode().split('<script>', 1)[0]
             self.assertIn('data-waiting-for-answer="true"', opened)
-            self.assertIn('<p data-waiting-note>The producer will answer.</p>', opened)
+            self.assertIn('<p data-waiting-note>morty will answer.</p>', opened)
             self.assertIn('Question Q1 — waiting for an answer</h3>' + asked_time, opened)
             self.assertIn("What changed in &lt;List&gt;?", opened)
             self.assertNotIn('name="action" value="question"', opened)
@@ -3516,7 +3541,9 @@ observer.observe(original.parentNode,{childList:true});
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         item = self.add("Check the repair")
-        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")):
+            asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
         assert isinstance(asked, list_page.ListQuestionDelivery)
         delivery = asked.delivery
         assert isinstance(delivery, change_page.PageQuestionSend)
@@ -3535,6 +3562,8 @@ observer.observe(original.parentNode,{childList:true});
                 list_page.deliver(asked)
             sending = change_page.read_question_attempt(path)
             self.assertEqual(sending.state, delivery_state.QuestionSendState.SENDING)
+            self.assertEqual(sending.recipient_id, DWIGHT.id)
+            _ = the_list.update(MORTY.id, item.id, {"producer": MORTY.id}, source="morty")
             for _ in range(2):
                 change_page.recover_review_messages(change_page.DeliveryStatus(root))
         self.assertEqual(transport.calls, [sending.message_id] * 2)
@@ -3751,11 +3780,36 @@ observer.observe(original.parentNode,{childList:true});
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         state = delivery_state.QuestionSendState
-        for number, previous_state in enumerate((state.READY, state.SENT, state.QUEUED), 1):
-            with self.subTest(state=previous_state):
+        cases = ((state.READY, "keeper"), (state.SENT, "keeper"), (state.QUEUED, "keeper"),
+                 (state.SENT, "no live process"), (state.SENT, "invalid registry"),
+                 (state.SENT, "failed save"), (state.SENT, "exited"))
+        for number, (previous_state, producer_state) in enumerate(cases, 1):
+            with self.subTest(state=previous_state, producer_state=producer_state):
                 item = self.add("Original title", number=number)
+                if producer_state != "keeper":
+                    item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                if producer_state == "exited":
+                    producer = replace(DWIGHT, exited=staff.Exited(NOW.isoformat(), "nate", "Stopped work"))
+                    _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
+                        row.to_json() for row in (MORTY, producer, OWNER, OTHER)]}))
                 words = "Which check passed?\nWhat did you find?"
-                asked = list_page.submit(root, urlencode(self.fields(item, "question", words=words)), status)
+                fields = urlencode(self.fields(item, "question", words=words))
+                with (patch.object(session_pane, "session_place", wraps=session_pane.session_place) as place,
+                      patch.object(session_pane, "read_registry", return_value=sessions.RegistryRead((), ())) as registry):
+                    if producer_state == "invalid registry":
+                        registry.side_effect = ValueError("Invalid registry setting.")
+                    if producer_state == "failed save":
+                        with (patch.object(the_list, "_save", side_effect=OSError("Cannot save the question.")),
+                              self.assertRaisesRegex(OSError, "Cannot save the question")):
+                            _ = list_page.submit(root, fields, status)
+                        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+                    if producer_state in ("failed save", "exited"):
+                        place.return_value = HerdrPlace("native", "w1:p1")
+                    asked = list_page.submit(root, fields, status)
+                    if producer_state in ("keeper", "exited"):
+                        place.assert_not_called()
+                    else:
+                        place.assert_called_once_with(DWIGHT.current_session)
                 assert isinstance(asked, list_page.ListQuestionDelivery)
                 delivery = asked.delivery
                 assert isinstance(delivery, change_page.PageQuestionSend)
@@ -3769,8 +3823,10 @@ observer.observe(original.parentNode,{childList:true});
                     _ = delivery.job.release()
                 else:
                     outcome = "queued" if previous_state is state.QUEUED else "sent"
-                    with patch.object(change_page, "send_question", return_value=question_outcome(outcome)):
+                    with patch.object(unrouted_alert, "message_outcome", return_value=question_outcome(outcome)) as send:
                         list_page.deliver(asked)
+                    send.assert_called_once()
+                    self.assertEqual(send.call_args.args[0], f"session:{MORTY.current_session}")
 
                 edited = the_list.update(MORTY.id, item.id, {"title": "New title"}, source="morty")
                 target = change_page.list_question_target(Path(claimed.source.path), edited.id, edited.number,
@@ -3787,7 +3843,13 @@ observer.observe(original.parentNode,{childList:true});
                         send.assert_not_called()
                 final_state = state.SENT if previous_state is state.READY else previous_state
                 self.assertEqual(change_page.read_question_attempt(path).state, final_state)
-                self.assertEqual(list_page.saved_action_state(MORTY.id, item.id, status=status)["waiting_for_answer"], "true")
+                saved = list_page.saved_action_state(MORTY.id, item.id, status=status)
+                self.assertEqual(saved["waiting_for_answer"], "true")
+                if producer_state != "keeper":
+                    self.assertEqual(edited.questions[0].recipient,
+                                     question_record.KeeperForUnavailableProducer(MORTY.id, DWIGHT.id))
+                    note = '<p data-waiting-note>dwight is not live, so morty will answer.</p>'
+                    self.assertIn(note, saved.get("waiting_details_html", ""))
                 body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
                 self.assertNotIn('value="resend-Q1"', body)
 
@@ -3917,7 +3979,7 @@ observer.observe(original.parentNode,{childList:true});
             send.assert_called_once()
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_moves_a_saved_question_to_morty_answering(self) -> None:
+    def test_browser_moves_a_saved_question_to_producer_answering(self) -> None:
         _ = self.add("Only this row matches the search", the_list.ItemState.WAITING_FOR_NATE, number=1)
         _ = self.add("Other item", number=2, owner=OTHER.id)
         self.browser_action_sequence(r"""
@@ -3933,7 +3995,8 @@ observer.observe(original.parentNode,{childList:true});
  check(!row.hidden,'The row stays in All until the save succeeds');
  finishPost({unread:'false',waiting_for_answer:'true',open_question:'true'});await flush();
  check(!row.hidden,'The saved row stays in All.');
- check(row.querySelector('[data-open-question-note]').getClientRects().length &&
+ const note=row.querySelector('[data-open-question-note]');
+ check(note?.getClientRects().length && note.textContent==='Producer answering' &&
   row.querySelector('.list-state').textContent==='Waiting for nate','The note appears below the saved state.');
  check(changes.join()==='POST','The chip changes without a refresh.');
  check(count.textContent==='2 of 2 items shown · 0 need you · 1 unread','All counts the saved row.');
@@ -3948,13 +4011,18 @@ observer.observe(original.parentNode,{childList:true});
  location.hash=new URLSearchParams({show:'working',item:row.dataset.key}).toString();
  await flush();
  check(!row.hidden && row.closest('[data-linked-item]:not([hidden])') && !row.querySelector('[data-detail]').hidden &&
-  row.querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
+  row.querySelector('[data-waiting-note]').textContent==='morty will answer.' &&
   !row.querySelector('[value="question"]'),'A direct link opens only the waiting row without Ask');
  check(count.textContent.startsWith('1 of 2'),'The linked row counts in All and stays outside Working.');
- show('morty-answering');
+ for(const savedShow of ['waiting-answer','morty-answering']){
+  location.hash=new URLSearchParams({show:savedShow,item:row.dataset.key}).toString();
+  await flush();
+  check(document.getElementById('filter-show-producer-answering').getAttribute('aria-pressed')==='true' && !row.hidden,
+   savedShow+' selects Producer answering.');
+ }
  input.value='Only this row';input.dispatchEvent(new Event('input'));
  await new Promise(resolve=>setTimeout(resolve,150));
- check(!row.hidden && count.textContent.startsWith('1 of 2'),'Search finds the waiting row in Morty answering.');
+ check(!row.hidden && count.textContent.startsWith('1 of 2'),'Search finds the waiting row in Producer answering.');
 """, reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -3994,12 +4062,12 @@ observer.observe(original.parentNode,{childList:true});
  location.hash=new URLSearchParams({show:'parked',item:row.dataset.key}).toString();
  await flush();
  check(!row.hidden && !row.querySelector('[data-detail]').hidden &&
-  row.querySelector('[data-waiting-note]').textContent==='The producer will answer.' &&
+  row.querySelector('[data-waiting-note]').textContent==='morty will answer.' &&
   !row.querySelector('form'),'The direct link opens the item with only the waiting line.');
  check(chip.dataset.filterCount==='0' && !status.hidden,
   'The direct link leaves the item out of the count and keeps the Unpark confirmation.');
- show('morty-answering');
- check(!row.hidden && !status.hidden,'Morty answering keeps the Unpark confirmation.');
+ show('producer-answering');
+ check(!row.hidden && !status.hidden,'Producer answering keeps the Unpark confirmation.');
 ''', reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -4188,7 +4256,7 @@ observer.observe(original.parentNode,{childList:true});
   await changed;
  };
  check(!chip('show','closed'),'Show has no Closed chip.');
- check(chip('show','morty-answering').dataset.filterCount==='0','The closed question does not count.');
+ check(chip('show','producer-answering').dataset.filterCount==='0','The closed question does not count.');
  check(count()==='1 of 1 items shown · 0 need you · 1 unread','The totals count the open item.');
  for(const params of [{show:'closed'},{state:'Closed'}]){
   await navigate(params);
@@ -4350,7 +4418,7 @@ observer.observe(original.parentNode,{childList:true});
   onlyUnread(false);
   show('all');
   check(!row.hidden && !linked.contains(row) && linked.hidden,'All shows the parked row in the main table.');
-  for(const view of ['needs-me','morty-answering','working','blocked']){
+  for(const view of ['needs-me','producer-answering','working','blocked']){
    show(view);
    check(row.hidden,'The parked row is absent from '+view+'.');
   }
@@ -4530,8 +4598,8 @@ window.fetch=async(_url,options)=>{
   source.querySelector('.list-toggle').click();
   source.querySelector('a[data-record-jump]').click();
   const waiting=row();
-  check(linked(waiting) && chip('morty-answering').dataset.filterCount==='1',
-   'The link opens the waiting item outside Working and counts it in Morty answering.');
+  check(linked(waiting) && chip('producer-answering').dataset.filterCount==='1',
+   'The link opens the waiting item outside Working and counts it in Producer answering.');
   const replaced=new Promise(resolve=>{
    const observer=new MutationObserver(()=>{
     if(waiting.isConnected) return;
@@ -4545,7 +4613,7 @@ window.fetch=async(_url,options)=>{
   check(linked(answered) && answered.querySelector('[data-question="Q1"]').textContent.includes('The gate passed.'),
    'Refresh keeps the linked details open and shows the answer.');
   check(chip('working').getAttribute('aria-pressed')==='true' &&
-   chip('needs-me').dataset.filterCount==='1' && chip('morty-answering').dataset.filterCount==='0' &&
+   chip('needs-me').dataset.filterCount==='1' && chip('producer-answering').dataset.filterCount==='0' &&
    document.querySelector('[data-list-count]').textContent.startsWith('1 of 2'),
    'The item counts in Needs me and stays outside the Working results.');
   chip('working').click();
@@ -5134,7 +5202,7 @@ const change=async path=>{
    'The saved question has its note and stays out of Working.');
   await open('all',key);
   check(!row().hidden && !row().querySelector('[data-detail]').hidden &&
-   row().querySelector('[data-waiting-note]')?.textContent==='The producer will answer.' &&
+   row().querySelector('[data-waiting-note]')?.textContent==='morty will answer.' &&
    !row().querySelector('[value="question"]'),'a direct link shows the waiting line without Ask');
   const waitingQuestion=row().querySelector('[data-waiting-questions] [data-question="Q1"]');
   check(/(?:EST|EDT)$/.test(waitingQuestion?.querySelector('time[datetime]')?.textContent),
@@ -5164,8 +5232,8 @@ const change=async path=>{
   check(await act('question','Which check is next?')==='Question saved; update remains unread',
    'the notice says the newer update remains unread');
   check(hasDot() && row().hidden,'The unread item leaves Working after the question saves.');
-  frame.contentDocument.getElementById('filter-show-morty-answering').click();
-  check(hasDot() && !row().hidden,'Morty answering shows the unread item.');
+  frame.contentDocument.getElementById('filter-show-producer-answering').click();
+  check(hasDot() && !row().hidden,'Producer answering shows the unread item.');
   const nextQuestion=(current)=>current.querySelector('[data-waiting-questions] [data-question="Q2"]');
   const firstAnswer=(current)=>current.querySelector('[data-log-index="Q1-answered"]');
   check(nextQuestion(row()) && firstAnswer(row())?.textContent.includes('The gate passed.'),

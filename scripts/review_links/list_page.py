@@ -49,10 +49,14 @@ HEADERS = ("#", FIELD_LABELS["owner"], FIELD_LABELS["producer"], "Item",
 class ListChip(StrEnum):
     ALL = "all"
     NEEDS_ME = "needs-me"
-    MORTY_ANSWERING = "morty-answering"
+    PRODUCER_ANSWERING = "producer-answering"
     WORKING = "working"
     BLOCKED = "blocked"
     PARKED = "parked"
+
+    @property
+    def label(self) -> str:
+        return self.value.replace("-", " ").capitalize()
 
 
 CHIP_BY_STATE = {
@@ -74,7 +78,7 @@ def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
         return ListChip.PARKED
     if unread_delivery:
         return ListChip.NEEDS_ME
-    return ListChip.MORTY_ANSWERING if open_question else chip
+    return ListChip.PRODUCER_ANSWERING if open_question else chip
 
 
 def has_open_question(item: the_list.ListItem) -> bool:
@@ -276,7 +280,8 @@ def item_log_html(entry: ListRecord, today: datetime, names: staff_names.StaffNa
         question_body = "Question " + html.escape(identity) + log_source_html("nate", names)
         answer_entry = answer_entries.get(identity)
         answered = answer_entry.time if answer_entry is not None else datetime.fromisoformat(answer.answered_at).astimezone(UTC)
-        source = the_list.source_without_clock(answer_entry.source) if answer_entry is not None else item.producer
+        source = (the_list.source_without_clock(answer_entry.source) if answer_entry is not None
+                  else question.recipient_id(entry.keeper))
         answer_body = "Answer" + log_source_html(source, names)
         rows.append((asked, log_row(f"{identity}-asked", asked,
                                    question_body + change_browser.question_paragraphs(question.words), today)))
@@ -364,13 +369,15 @@ def signed_form_fields(entry: ListRecord, secret: str) -> str:
 
 
 def feedback_form(entry: ListRecord, secret: str, today: datetime, resends: tuple[the_list.QuestionResend, ...],
-                  *, producer_name: str, parking_label: str = "") -> str:
+                  *, members: staff.StaffSnapshot, parking_label: str = "") -> str:
     hidden = signed_form_fields(entry, secret)
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     parked = '' if parking_label else ' hidden'
     note = 'Parked until ' + parking_label if parking_label else ''
-    retry = "".join(question_resend(resend, today) for resend in resends)
+    retry = "".join(question_resend(resend, today, owner_name(members, resend.question.recipient_id(entry.keeper)))
+                    for resend in resends)
+    producer_name = owner_name(members, entry.item.producer)
     words_label = html.escape(f"Your words for {producer_name} about this item", quote=True)
     return ('<form method="post" data-feedback-form>' + hidden + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read
@@ -387,15 +394,15 @@ def feedback_form(entry: ListRecord, secret: str, today: datetime, resends: tupl
             + f'<button name="action" value="tell" disabled>Tell {html.escape(producer_name)}</button></div></form>')
 
 
-def question_resend(resend: the_list.QuestionResend, today: datetime) -> str:
+def question_resend(resend: the_list.QuestionResend, today: datetime, recipient: str) -> str:
     question = resend.question
-    notice = {"failed": "did not reach morty", "ready": "is ready to send",
-              "prepared": "is ready to send"}.get(resend.delivery.state, "may not have reached morty")
+    notice = {"failed": f"did not reach {recipient}", "ready": "is ready to send",
+              "prepared": "is ready to send"}.get(resend.delivery.state, f"may not have reached {recipient}")
     block = resend.delivery
     action = (f'<p>{html.escape(block.reason)}</p>' if isinstance(block, change_page.ResendBlocked)
               else f'<button name="action" value="resend-{question.question_id}">Resend question {question.question_id}</button>')
     return (f'<section class="page-question" data-question="{question.question_id}">'
-            + f'<h3>Question {question.question_id} {notice}</h3>'
+            + f'<h3>Question {question.question_id} {html.escape(notice)}</h3>'
             + question_time_html(question.asked_at, today)
             + f'<p>{html.escape(question.words)}</p>' + action + '</section>')
 
@@ -435,7 +442,20 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
     return review_card_link(review.key, review.id)
 
 
-WAITING_NOTE = "The producer will answer."
+def waiting_note(entry: ListRecord, names: staff_names.StaffNames, *, hidden: bool = False) -> str:
+    item = entry.item
+    notes: dict[str, None] = {}
+    for question in item.questions:
+        if question.answer is not None:
+            continue
+        recipient = owner_name(names.members, question.recipient_id(entry.keeper))
+        note = f"{recipient} will answer."
+        if isinstance(question.recipient, question_record.KeeperForUnavailableProducer):
+            producer = owner_name(names.members, question.recipient.producer)
+            note = f"{producer} is not live, so {note}"
+        notes[note] = None
+    text = " ".join(notes) or f"{owner_name(names.members, item.producer)} will answer."
+    return f'<p data-waiting-note{" hidden" if hidden else ""}>{html.escape(text)}</p>'
 
 
 def question_time_html(stamp: str, today: datetime) -> str:
@@ -550,7 +570,7 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str) ->
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
                     unread_answers: frozenset[str], secret: str,
                     reviews: ReviewDisplay, parking_label: str) -> str:
-    sections = (f'<p data-waiting-note>{WAITING_NOTE}</p><div data-waiting-questions>'
+    sections = (waiting_note(entry, names) + '<div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(entry, secret, parking_label))
     return detail_panel(entry, sections, today, names, unread_answers, secret)
@@ -576,9 +596,8 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
         sections += '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>'
     sections += review_links(item, reviews, today)
     questions = panel_questions(item, today, unread_answers, visibility.questions)
-    form = feedback_form(entry, secret, today, visibility.questions,
-                         producer_name=owner_name(names.members, item.producer), parking_label=parking_label)
-    return f'<p data-waiting-note hidden>{WAITING_NOTE}</p>' + detail_panel(
+    form = feedback_form(entry, secret, today, visibility.questions, members=names.members, parking_label=parking_label)
+    return waiting_note(entry, names, hidden=True) + detail_panel(
         entry, sections + questions + form, today, names, unread_answers, secret)
 
 
@@ -618,7 +637,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
             the_list.ItemState.DONE: "room"}.get(item.state, "muted")
     state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if open_question:
-        state += '<small data-open-question-note>Morty answering</small>'
+        state += f'<small data-open-question-note>{ListChip.PRODUCER_ANSWERING.label}</small>'
     if isinstance(item.next_check, datetime):
         check = field_html("next_check", item.next_check, today, names)
         if item.next_check < today:
@@ -1002,7 +1021,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
                       open_question=open_question, visibility=visibility))
     shows = [record_table.Chip("all", "All", len(items)),
-             *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
+             *(record_table.Chip(chip.value, chip.label, chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
@@ -1330,6 +1349,7 @@ const tableView=createRecordTable({content:()=>content,
  place:params=>{
   const show=params.get('show');
   if(show==='unread'){params.set('show','all');params.set('unread','1');}
+  if(show==='waiting-answer' || show==='morty-answering') params.set('show','producer-answering');
   const state=params.get('state'),stateChip=chipsByState[state];
   if(show==='done' || show==='closed' || state==='Closed') params.set('show','all');
   else if((show==='open' || show==='all' || show==='unread' || !show) && Object.hasOwn(chipsByState,state))
@@ -1445,7 +1465,7 @@ function bindFeedbackForm(form){
     if(!questionNote){
      const note=document.createElement('small');
      note.dataset.openQuestionNote='';
-     note.textContent='Morty answering';
+     note.textContent=''' + json.dumps(ListChip.PRODUCER_ANSWERING.label) + r''';
      state.after(note);
     }
    }else questionNote?.remove();

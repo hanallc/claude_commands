@@ -706,27 +706,36 @@ def _send_result(delivery: VerifiedQuestionAttempt) -> QuestionAttempt:
 
 
 def _list_question_store(record: QuestionAttempt) -> record_store.NumberedRecords:
-    return record_store.NumberedRecords(record.recipient_id, "list", "L", "list item", ValueError)
+    keepers = [row.id for row in staff.active(staff.snapshot(), "producer") if row.name == "morty"]
+    if len(keepers) != 1:
+        raise StaleQuestionAttempt("The List keeper is unavailable.")
+    listing = record_store.NumberedRecords(keepers[0], "list", "L", "list item", ValueError)
+    try:
+        path = listing.path(record.source.item_id)
+    except ValueError as error:
+        raise StaleQuestionAttempt("The List question source is unavailable.") from error
+    if path.resolve() != Path(record.source.path):
+        raise StaleQuestionAttempt("The List question source has moved.")
+    return listing
 
 
 def _open_list_question(listing: record_store.NumberedRecords,
-                        record: QuestionAttempt) -> dict[str, str]:
+                        record: QuestionAttempt) -> tuple[dict[str, str], question_record.Question]:
     source = record.source
-    try:
-        path = listing.path(source.item_id)
-    except ValueError as error:
-        raise StaleQuestionAttempt("The List question source is unavailable.") from error
+    path = listing.path(source.item_id)
     if path.resolve() != Path(source.path):
         raise StaleQuestionAttempt("The List question source has moved.")
     try:
         fields = listing.read(source.item_id, path=path).fields
     except ValueError as error:
         raise OSError(f"Cannot read the List question source: {error}") from error
-    if (fields.get("id") != source.item_id or
-            fields.get("producer", record.recipient_id) != record.recipient_id or
-            fields.get("state", "Closed") == "Closed"):
+    if fields.get("id") != source.item_id or fields.get("state", "Closed") == "Closed":
         raise StaleQuestionAttempt("The List question source is no longer open.")
-    return fields
+    for question in delivery_state.read_list_questions(fields.get("questions", "[]")):
+        if (question.question_id == source.question_id and question.answer is None and question.words == source.words
+                and question.recipient_id(listing.owner) == record.recipient_id):
+            return fields, question
+    raise StaleQuestionAttempt("The List question is no longer open for this recipient.")
 
 
 @contextmanager
@@ -737,11 +746,7 @@ def _lock_open_question_source(record: QuestionAttempt) -> Generator[None, None,
         return
     listing = _list_question_store(record)
     with listing.locked():
-        fields = _open_list_question(listing, record)
-        questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
-        if not any(question.question_id == record.source.question_id and question.answer is None
-                   and question.words == record.source.words for question in questions):
-            raise StaleQuestionAttempt("The List question is no longer open.")
+        _ = _open_list_question(listing, record)
         yield
 
 
@@ -839,16 +844,15 @@ def recover_page_question(status: DeliveryStatus, path: Path, record: QuestionAt
             target = image_question_target(source_path, image)
             delivery = _recover_saved_question(status, target, record, questions)
     elif source.row == f"List item {source.item_id.removeprefix('L')}/{source.question_id}":
-        listing = _list_question_store(record)
-        with listing.locked(), status.locked():
-            try:
-                fields = _open_list_question(listing, record)
-            except StaleQuestionAttempt:
-                return
-            questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
-            target = list_question_target(source_path, fields["id"], int(fields["number"]), fields["title"],
-                                          record.recipient_id, alert_owner=staff.StaffId(fields["owner"]))
-            delivery = _recover_saved_question(status, target, record, questions)
+        try:
+            listing = _list_question_store(record)
+            with listing.locked(), status.locked():
+                fields, question = _open_list_question(listing, record)
+                target = list_question_target(source_path, source.item_id, int(fields["number"]), fields["title"],
+                                              record.recipient_id, alert_owner=staff.StaffId(fields["owner"]))
+                delivery = _recover_saved_question(status, target, record, (question,))
+        except StaleQuestionAttempt:
+            return
     else:
         return
     deliver(delivery, status)

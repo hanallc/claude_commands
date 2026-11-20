@@ -802,11 +802,15 @@ Owner and Producer list staff in name order after All and omit every trailing `-
 If the resulting name is empty, the chip shows the original staff ID.
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
 The words box sits beside the Producer chips and wraps below them when space is limited.
-The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
+The chip order is All, Needs me, Producer answering, Working, Blocked, and Parked.
 The List excludes Closed records from rows, filters, and counts.
 Parked includes every non-Closed item with an active park.
 An unread delivery release belongs to Needs me even if the question remains open.
-Morty answering includes other unparked items with an open question, including items that need Resend.
+Producer answering includes other unparked items with an open question for any producer.
+It includes items that need Resend.
+The Producer selection limits which items the chip shows and counts.
+Producer answering uses the Show value `producer-answering`.
+Saved links with `waiting-answer` or `morty-answering` select Producer answering.
 Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
 Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
@@ -993,22 +997,26 @@ Tell applies the current filters. A read item leaves the view when Unread only i
 Tell with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
 The page uses the question and delivery code shared with Images.
-The server replies to the browser before it sends morty the item number, title, question, and answer command.
+Ask saves the item's current producer as the question recipient.
+If the producer is unavailable, Ask saves morty as the recipient and records the unavailable producer.
+At send time, the server finds the recipient's current session.
+The server replies to the browser before it sends the item number, title, question, and answer command.
+Reassignment keeps the saved recipient. A question without a saved recipient belongs to morty.
 Equal words select the open question. Different words create a new question.
-An exact request retry uses the same question ID, even after morty answers it.
-The row moves to Morty answering when the question saves.
+An exact request retry uses the same question ID after an answer.
+The row moves to Producer answering when the question saves.
 The row shows a waiting note when each unanswered question has a live sender or confirmed acceptance.
 Acceptance includes a confirmed place in the transport queue.
 The List changes the search results, chip counts, and totals as soon as the browser receives the save result.
 The console updates its unread indicator on its own news refresh.
 The next List refresh shows the delivery notice and Resend when a question needs another send.
-An unknown result shows “Question Qn may not have reached morty.”
+An unknown result shows “Question Qn may not have reached <recipient>.”
 The List shows why Resend is unavailable if the previous sender is active or cannot be checked.
 Images shows the same reason when it cannot retry the question.
 All attempts for one question use the same sender lock.
 A damaged delivery record keeps the question visible and cannot grant Resend while the lock is held.
 A released sender lock lets Resend proceed even if the previous process identity is unreadable.
-Resend uses the saved question, its ID, and the current recipient to repair a mismatched delivery record.
+Resend uses the saved question, its ID, and its recipient to repair a mismatched delivery record.
 The question reader checks the stored question words and answer command.
 A List title edit preserves the delivery state. Recovery sends the prepared message with its original title.
 Only an explicit Resend question action can retry that delivery on the List.
@@ -1019,7 +1027,8 @@ After a successful Ask keeps the row visible, the row toggle receives lost focus
 Focus stays on the user's selection if they move it during the request, including to the parent console.
 On refresh, the List restores focus to an available action button with the same item key and action.
 Column sort buttons keep focus through refresh.
-A waiting row shows “The producer will answer.”
+A waiting row shows `<recipient> will answer.` for each saved recipient with an open question.
+If Ask chose morty because the producer was unavailable, the row shows `<producer> is not live, so morty will answer.`
 The panel shows each open question with its asked time and the linked review cards.
 An actively parked waiting row shows the parking condition and Unpark.
 A waiting row with an unread delivery release shows Mark read.
@@ -1029,14 +1038,16 @@ The section does not change the results count.
 The List address preserves a linked item outside the filters when the console reloads.
 It counts in its current status chip.
 Close the linked item or change a filter to dismiss the section.
-An open question adds a Morty answering note below the saved state.
-Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
+An open question adds a Producer answering note below the saved state.
+The recipient runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
+Morty can answer any List question.
 The answer adds one record event and marks the item unread.
 Closing an item moves each open question to a “Question closed with item” log entry.
-The entry keeps the question ID, words, and time.
+The entry keeps the question ID, words, time, and saved recipient.
 The question no longer accepts answers or retries.
 Older Closed records stay in the store in their original format.
 Question delivery checks the current List record under the same lock that Close uses.
+The check uses the saved question recipient.
 The check runs before the first send and each retry.
 A close preserves the delivery result of a send already in progress.
 The sender checks the item again before it sends a failure alert.
@@ -1047,7 +1058,7 @@ A retry of a saved Ask returns its saved result without sending again.
 After the last answer, the next refresh returns the row to its status chip.
 The item stays in Parked while its park is active.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
-That request moves the item to Morty answering and shows its confirmation next to Show.
+That request moves the item to Producer answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
 Opening an individual row with an unread answer uses the same signed read operation.
@@ -1128,7 +1139,7 @@ The same parking event and link must still be current.
 The writer clears parking, sets Delivered, and marks the item unread.
 Both delivery signals save an Unparked event with the reason.
 The unread delivery release returns to Needs me with its review links.
-After Mark read, an open question returns the item to Morty answering.
+After Mark read, an open question returns the item to Producer answering.
 A dated park remains active until its time or an explicit Unpark.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells the item's producer which action nate completed.

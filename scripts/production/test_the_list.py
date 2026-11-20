@@ -17,9 +17,10 @@ from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 from scripts.agents.remote import local_machine
+from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, conf
 from scripts.message import send_result
-from scripts.production import change_review, delivery_state, investigation, record_store, staff, the_list, update_registration
+from scripts.production import change_review, delivery_state, investigation, record_store, session_pane, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, new_item_dialog, question_record, review_items, review_page, review_submissions
 
@@ -750,8 +751,6 @@ class TheListTests(unittest.TestCase):
                 with self.subTest(command=name):
                     self.assertEqual(self.command(name, *args, "--source", "dwight"),
                                      (1, "", f"the_list: only morty can run {name}\n"))
-            self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "Answer"),
-                             (1, "", "the_list: only morty can run answer\n"))
         self.assertEqual(the_list.records(MORTY.id), [item])
         self.assertEqual(self.notices, [])
 
@@ -1117,6 +1116,31 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "A second answer."),
                          (1, "", "the_list: This question already has an answer.\n"))
         self.assertEqual(path.read_bytes(), before)
+
+        for legacy, answerer in ((False, OTHER), (False, MORTY), (True, MORTY)):
+            with self.subTest(legacy=legacy, answerer=answerer.name):
+                assigned = self.add(changes={"producer": OTHER.id})
+                words = "Which check passed?"
+                if legacy:
+                    self.write_legacy_question(assigned, question_record.Question("Q1", START.isoformat(), words))
+                else:
+                    with patch.object(session_pane, "session_place", return_value=HerdrPlace("native", "w1:p1")) as place:
+                        _ = the_list.ask_question(MORTY.id, assigned.id,
+                            the_list.PageRequest("ask", "question", words), status)
+                    place.assert_called_once_with(OTHER.current_session)
+                reassigned = the_list.update(MORTY.id, assigned.id, {"producer": BOB.id}, source="morty")
+                args = ("answer", assigned.id, "--question", "Q1", "--text", "The check passed.")
+                for refused in ((BOB, OTHER) if legacy else (BOB,)):
+                    with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": refused.current_session}):
+                        self.assertEqual(self.command(*args),
+                            (1, "", "the_list: Only the question recipient or morty can answer.\n"))
+                self.assertEqual(the_list.load(MORTY.id, assigned.id), reassigned)
+                with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": answerer.current_session}):
+                    self.assertEqual(self.command(*args), (0, f"answered {assigned.id} Q1\n", ""))
+                saved = the_list.load(MORTY.id, assigned.id)
+                self.assertEqual(saved.log[-1].source, answerer.name)
+                self.assertEqual(saved.questions[0].recipient_id(MORTY.id), MORTY.id if legacy else OTHER.id)
+                self.assertIsInstance(saved.questions[0].answer, question_record.Answer)
 
     def test_answer_round_trips_unicode_separators(self) -> None:
         item = self.add()

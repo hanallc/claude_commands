@@ -33,7 +33,9 @@ class QuestionStore(Protocol):
 
 def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
         words: str, status: change_page.DeliveryStatus, *,
-        resend_unknown: bool = False, resend_request: str = "") -> change_page.MessageDelivery:
+        resend_unknown: bool = False, resend_request: str = "",
+        new_recipient: question_record.QuestionRecipient = question_record.DefaultQuestionRecipient.PAGE
+        ) -> change_page.MessageDelivery:
     """Save and claim the question before the server answers the browser."""
     if not resend_request:
         words = words.strip()
@@ -49,7 +51,8 @@ def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
             if resend_request:
                 raise question_record.AnswerRefused("This item has no open question with that id.")
             number = max((int(question.question_id[1:]) for question in questions), default=0) + 1
-            question = question_record.Question(f"Q{number}", datetime.now(UTC).isoformat(), words)
+            question = question_record.Question(f"Q{number}", datetime.now(UTC).isoformat(), words,
+                                                recipient=new_recipient)
         saved = target.saved(question)
         page = saved.page()
         path = status.path(page, saved.source.row)
@@ -71,8 +74,11 @@ def ask(store: QuestionStore, target: change_page.QuestionDeliveryTarget,
         if not new_question and view.state is QuestionSendState.UNKNOWN and not resend_unknown:
             return change_page.question_envelope(page, record)
         if isinstance(previous, QuestionAttempt):
+            same_list_slot = (new_recipient is not question_record.DefaultQuestionRecipient.PAGE
+                              and replace(previous.source, words=words) == saved.source)
             unsaved_draft = (new_question and previous.state is QuestionSendState.PREPARED
-                             and not previous.earlier_unconfirmed and previous.message_id == prepared.message_id)
+                             and not previous.earlier_unconfirmed
+                             and (previous.message_id == prepared.message_id or same_list_slot))
             if new_question and not unsaved_draft and not saved.matches(previous):
                 raise question_record.AnswerRefused("The question does not match its delivery record.")
             if unsaved_draft or view.state in (QuestionSendState.FAILED, QuestionSendState.UNKNOWN) or (
@@ -107,7 +113,7 @@ def answer(store: QuestionStore, item: str, question_id: str, text: str) -> Answ
         store.set_answer(item, question_id, response)
     except question_record.AnswerRefused as error:
         return AnswerRefused(str(error))
-    return Answered(question_record.Question(question.question_id, question.asked_at, question.words, response))
+    return Answered(replace(question, answer=response))
 
 
 def open_question_html(question: question_record.Question, *, asked_time_html: str = "") -> str:
