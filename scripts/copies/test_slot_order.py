@@ -946,7 +946,14 @@ placement_once
                                      "the bash -c caller holds a folder during its Mac wait")
                 for _ in range(2):
                     _ = start_caller("capacity")
-                wait_for_callers(hold_waiters, maximum - 2)
+                mac_ready.touch()
+                self.queue.server.wake_loop()
+                wait_for_callers(hold_waiters, maximum)
+                with self.queue.loop_turn():
+                    waiting_owners = {self.queue.server.placement_requests[episode].owner.pid
+                                      for episode in hold_waiters}
+                    self.assertEqual(len(waiting_owners), maximum)
+                    self.assertTrue(hold_waiters.isdisjoint(self.queue.server.current_assignments))
                 waiting_folders = held_folders()
                 print(f"Waiting: {len(waiting_folders)} of {maximum} held; {len(slot_requests)} slot waiters.", flush=True)
                 self.assertEqual(len(waiting_folders), 0)
@@ -956,7 +963,6 @@ placement_once
                     capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                 local_hold.unlink(missing_ok=True)
 
-            mac_ready.touch()
             write_pressure_reading(self.queue.root / "pressure")
             self.queue.server.wake_loop()
             running = dict(next_running_step() for _ in range(maximum))
