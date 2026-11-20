@@ -1602,6 +1602,30 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. The spec cases pass. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 93 — A merge batch fetch survives a branch rename on origin  · status: todo
+**Depends on:** Phase 86 (on main 10fd385ee)
+
+#### Work Order
+
+**Goal:** sdlc add-on after phase 86 (Nov 19), with the phase 86 minors F024-F026. Name: renamefetch. A branch rename on origin (`topic` to `topic/rework`) with a cached `origin/topic` breaks the `--no-prune` wildcard fetch in `merge_checkpoint.py` (`on_origin` and the batch fetch): git cannot write `refs/remotes/origin/topic/rework` while the file `refs/remotes/origin/topic` exists.
+
+**Spec:**
+1. Fetch each named ref to an explicit destination, not through the wildcard `+refs/heads/*:refs/remotes/origin/*`. A rename elsewhere on origin cannot then break the fetch.
+2. Delete no tracking ref that other worktrees share. Add no `--prune`.
+3. F024: a ref item whose tracking ref a narrow fetch config leaves stale gets the fresh tip.
+4. F025: a cached phase-branch ref item plus an unrelated rename on origin still fetches.
+5. F026: a merge-branch rename between a stopped batch and its rerun does not hide the stopped merge from the guard. Identify a checkpoint merge apart from the branch name.
+6. Add rows to the existing `merge_checkpoint` tests; add no new test module. Tests use fixture repos only, never live state.
+
+**Files:** `scripts/production/merge_checkpoint.py`, its existing tests, `docs/as-built/merge-gate-and-test-speed.md` where it states the batch fetch.
+
+**Workers:** 1 writer.
+
+**Order:** branch from main 10fd385ee. Tests run only when natemerge allows them.
+
+**Acceptance gate:**
+1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
