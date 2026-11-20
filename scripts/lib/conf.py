@@ -212,10 +212,12 @@ class ConfigRead:
             return RecoveredValue(value, reason)
         return UnavailableValue(reason)
 
-    def origin(self, key: str, convert: Callable[[str], Result]
+    def origin(self, key: str, convert: Callable[[str], Result], *,
+               default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
+               warn: bool = False
                ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
-        """Distinguish live values from recovered values without a warning."""
-        return self._resolve(key, convert, warn=False)
+        """Read a value with its origin. Report warnings only on request."""
+        return self._resolve(key, convert, warn=warn, default=default, allow_blank=allow_blank)
 
     def value(self, key: str, convert: Callable[[str], Result], *,
               default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,

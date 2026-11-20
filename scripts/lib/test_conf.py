@@ -703,6 +703,13 @@ conf_reads.record('disabled')
                     self.fail("History must remain distinct from live spending permission")
                 self.assertEqual(recovered.value, Decimal("40"))
                 self.assertEqual(conf.read("example").number("amount"), 40)
+        with self.subTest(source="blank and missing"):
+            self.write("blank=\n")
+            settings = conf.read("example")
+            self.assertEqual(settings.origin("blank", str, default="fallback", allow_blank=True),
+                             conf.UsableLiveValue(""))
+            self.assertEqual(settings.origin("missing", str, default="fallback", allow_blank=True),
+                             conf.UsableLiveValue("fallback"))
 
     def test_value_origin_reports_unavailable_data_without_an_implicit_limit(self) -> None:
         self.write("# range: 0..\namount=broken\n")

@@ -1018,7 +1018,10 @@ class PlacementTests(unittest.TestCase):
                  (False, "off", "busy at local preview"), (False, "busy", "off at local preview"),
                  (False, "busy", "remove Mac target"), (False, "busy", "registry read error"),
                  (False, "busy", "recovered absence"), (False, "lost", "retry delay with registry error"),
-                 (False, "busy", "recovered registration with off"))
+                 (False, "busy", "recovered registration with off"),
+                 (False, "busy", "remove Mac with a pending journal close"),
+                 (False, "lost", "remove Mac during retry delay"))
+        local_registry = "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
         for pinned, reason, change in cases:
             with self.subTest(reason=reason, change=change), PlacementFixture() as fixture:
                 landing_pass = change in ("landing pass", "busy at local preview", "off at local preview")
@@ -1029,9 +1032,10 @@ class PlacementTests(unittest.TestCase):
                 if pinned:
                     request = replace(request, constraints=replace(request.constraints,
                         selection=placement.PinnedHost(destination.target)))
-                if change in ("retry delay with registry error", "recovered registration with off"):
+                if change in ("retry delay with registry error", "remove Mac during retry delay",
+                              "recovered registration with off"):
                     request = replace(request, constraints=replace(request.constraints, selection=placement.MacOnlyHost()))
-                if change == "retry delay with registry error":
+                if reason == "lost":
                     request = replace(request, local=wire.LocalAdmissionUnavailable("no local candidate"))
                     _ = publish_candidate(fixture, request)
                     assigned = assignment_for(fixture, request)
@@ -1039,16 +1043,58 @@ class PlacementTests(unittest.TestCase):
                     assert isinstance(ended, wire.DispatchStatus)
                     self.assertEqual(ended.state, placement.ClosedAssignment("lost"))
                     self.assertEqual(ended.retry, placement.RetryAt(fixture.clock.now() + 180))
-                    _ = (fixture.root / "build_targets.conf").write_bytes(b"\xff")
+                    registry = fixture.root / "build_targets.conf"
+                    if change == "remove Mac during retry delay":
+                        _ = registry.write_text(local_registry)
+                        refusal = "target is no longer configured"
+                    else:
+                        _ = registry.write_bytes(b"\xff")
+                        refusal = "retry deadline has not passed"
                     refused, = fixture.server.handle_request(request)
                     assert isinstance(refused, wire.DispatchStatus)
-                    self.assertEqual(refused.retry, placement.DoNotRetry("retry deadline has not passed"))
+                    self.assertEqual(refused.retry, placement.DoNotRetry(refusal))
                     self.assertEqual(published_mac_waits(fixture), ())
+                    continue
+                if change == "remove Mac with a pending journal close":
+                    fixture.hold_starts()
+                    assert isinstance(request.local, wire.LocalAdmissionContext)
+                    call_id = "remove-mac-pending-close"
+                    request = replace(request, local=replace(request.local, call=records.CallRecord(call_id)),
+                                      constraints=replace(request.constraints,
+                                          candidates=(*request.constraints.candidates, local_candidate(fixture))))
+                    _ = publish_candidate(fixture, request)
+                    assigned = assignment_for(fixture, request)
+                    attempt = execution_identity.attempt_key(assigned.episode, assigned.attempt)
+                    wait_key = records.PlacementWaitKey(call_id, assigned.episode, assigned.attempt)
+                    records.record_placement_wait(wait_key, records.PlacementWaitReason.REMOTE_START, fixture.clock.now())
+                    fixture.clock.advance(4)
+                    with redirect_stderr(io.StringIO()), mock.patch.object(records, "_append_wait_event",
+                            side_effect=OSError("journal unavailable")):
+                        ended, = fixture.server.handle_request(wire.ClaimFailure("failed-close", assigned, reason))
+                        assert isinstance(ended, wire.DispatchStatus)
+                        self.assertIsInstance(ended.state, placement.CurrentAssignment)
+                        _ = fixture.run_pass()
+                        mac, local = fixture.server.placement_eligibility[request.episode]
+                        self.assertEqual(mac.eligibility,
+                                         placement.EvidenceNeeded("the earlier attempt waits for its journal close"))
+                        self.assertEqual(local.eligibility, ALLOWED_HOST)
+                        self.assertEqual([wait.episode for wait in published_mac_waits(fixture)], [request.episode])
+
+                        _ = (fixture.root / "build_targets.conf").write_text(local_registry)
+                        _ = fixture.run_pass()
+                        self.assertEqual(published_mac_waits(fixture), ())
+                        mac, local = fixture.server.placement_eligibility[request.episode]
+                        self.assertEqual(mac.eligibility, placement.FixedExclusion("target is no longer configured"))
+                        self.assertEqual(local.eligibility, ALLOWED_HOST)
+                        self.assertEqual(fixture.server.placement_ends_awaiting_close[attempt].wait_key, wait_key)
+                        self.assertEqual(records.read_placement_waits(call_id), ())
+                        self.assertNotIn(request.episode, fixture.server.current_assignments)
+                        self.assertNotIn(request.episode, fixture.caller_reservations())
                     continue
                 if change in ("recovered absence", "recovered registration with off"):
                     registry = fixture.root / "build_targets.conf"
                     original_registry = registry.read_bytes()
-                    contents = "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
+                    contents = local_registry
                     if change == "recovered registration with off":
                         contents += "pinned_targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
                     _ = registry.write_text(contents)
@@ -1153,7 +1199,6 @@ class PlacementTests(unittest.TestCase):
                     self.assertIsInstance(reply, wire.PlacementWait)
                     self.assertEqual([wait.episode for wait in waits], [request.episode])
                     registry = fixture.root / "build_targets.conf"
-                    local_registry = "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
                     unreadable = change == "registry read error"
                     if unreadable:
                         _ = registry.write_bytes(b"\xff")

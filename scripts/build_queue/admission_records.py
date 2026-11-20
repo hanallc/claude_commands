@@ -635,11 +635,12 @@ class UnregisteredTarget:
 
 
 def effective_target(name: str, settings: placement.ProviderSettings, *,
-                     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                     on_membership_recovery: target_config.MembershipRecovery = target_config.IgnoreMembershipRecovery.IGNORE
                      ) -> target_config.Target | UnregisteredTarget:
     """Select the registered target with the settings supplied by the request."""
     for target in target_config.read_targets(selected=name, purpose=target_config.RegistryRead.PLACEMENT,
-                                              configuration=configuration):
+                                              configuration=configuration, on_membership_recovery=on_membership_recovery):
         return ssh_target_settings(target, settings) if isinstance(target, target_config.SshTarget) else target
     return UnregisteredTarget()
 

@@ -190,6 +190,13 @@ class RegistryRead(Enum):
     PLACEMENT = auto()
 
 
+class IgnoreMembershipRecovery(Enum):
+    IGNORE = auto()
+
+
+MembershipRecovery = Callable[[str], None] | IgnoreMembershipRecovery
+
+
 def _target_names(value: str) -> tuple[str, ...]:
     names = tuple(name.strip() for name in value.split(","))
     if not all(names) or len(set(names)) != len(names):
@@ -218,11 +225,26 @@ def _settings_path(value: str, registry: Path) -> Path:
         raise ValueError(str(error)) from error
 
 
+def _registry_setting[Value](config: conf.ConfigRead, key: str, convert: Callable[[str], Value],
+                             on_membership_recovery: MembershipRecovery, *,
+                             default: Value | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                             allow_blank: bool = False) -> Value:
+    if isinstance(on_membership_recovery, IgnoreMembershipRecovery):
+        return config.value(key, convert, default=default, allow_blank=allow_blank)
+    result = config.origin(key, convert, default=default, allow_blank=allow_blank, warn=True)
+    if isinstance(result, conf.UnavailableValue):
+        raise ConfigError(f"{result.reason}; no usable committed value")
+    if isinstance(result, conf.RecoveredValue):
+        on_membership_recovery(result.reason)
+    return result.value
+
+
 def _registry_value[Value](config: conf.ConfigRead, key: str, convert: Callable[[str], Value],
-                           purpose: RegistryRead) -> Value:
+                           purpose: RegistryRead,
+                           on_membership_recovery: MembershipRecovery = IgnoreMembershipRecovery.IGNORE) -> Value:
     if purpose is RegistryRead.PLACEMENT:
-        return config.value(key, convert)
-    value = config.value(key, str, default="", allow_blank=True)
+        return _registry_setting(config, key, convert, on_membership_recovery)
+    value = _registry_setting(config, key, str, on_membership_recovery, default="", allow_blank=True)
     try:
         return convert(value)
     except (OSError, ValueError) as error:
@@ -247,8 +269,10 @@ def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> T
 
 def read_targets(path: Path | None = None, *, selected: str = "", target_name: str = "",
                  purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES,
-                 configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                 configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                 on_membership_recovery: MembershipRecovery = IgnoreMembershipRecovery.IGNORE
                  ) -> tuple[Target, ...]:
+    """Read the targets. Report recovery of the lists that define membership on request."""
     if selected and target_name and selected != target_name:
         raise ConfigError("expected one selected target")
     selected = selected or target_name
@@ -261,9 +285,10 @@ def read_targets(path: Path | None = None, *, selected: str = "", target_name: s
             configuration = current.configurations[registry]
         else:
             configuration = conf.read(registry)
-    names = _registry_value(configuration, "targets", _target_names, purpose)
+    names = _registry_value(configuration, "targets", _target_names, purpose, on_membership_recovery)
     if selected and selected not in names:
-        pinned = configuration.value("pinned_targets", str, default="", allow_blank=True)
+        pinned = _registry_setting(configuration, "pinned_targets", str, on_membership_recovery,
+                                   default="", allow_blank=True)
         if any(name.strip() == selected for name in pinned.split(",")):
             names = (selected,)
     targets: list[Target] = []
