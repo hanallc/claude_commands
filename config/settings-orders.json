@@ -9,7 +9,8 @@
     "hana_gpu_route_enabled": 3
   },
   "console": {
-    "page.accounts.owner": 7
+    "page.accounts.owner": 7,
+    "page.aws.owner": 10
   },
   "hana_aws": {
     "source_allowed_ignored": 1
