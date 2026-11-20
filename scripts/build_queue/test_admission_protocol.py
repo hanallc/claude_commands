@@ -147,7 +147,7 @@ class ProtocolTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             for place in (wire.LocalPlace(), wire.CloudPlace("aws")):
                 with self.subTest(place=place):
-                    request = replace(fixture.request(step="merge-gate"), place=place)
+                    request = replace(fixture.request(step="gate"), place=place)
                     parsed = wire.parse_request(wire.encode_request(request))
                     self.assertEqual(parsed, request)
                     assert isinstance(parsed, wire.AdmitRequest)
@@ -224,7 +224,7 @@ class ProtocolTests(unittest.TestCase):
             assert isinstance(reply, wire.ViewReply)
             base = reply.reading
             cloud_row = wire.CloudRow(wire.Owner(700001, "10"),
-                wire.Identity("cloud-session", "cloud-worker", "merge-gate", "/private", "cloud-unit"),
+                wire.Identity("cloud-session", "cloud-worker", "gate", "/private", "cloud-unit"),
                 wire.CloudPlace("aws"), NOW - 60, NOW - 50,
                 cloud_progress.CloudProgress("running", 32, 1, NOW - 20),
                 progress_profile.ProgressCounter("modules", 7, 12), records.ReadyForAdmission())
@@ -390,7 +390,7 @@ class ProtocolTests(unittest.TestCase):
         current["diagnostics"] = [{"kind": "ConfigurationDiagnostic", "diagnostic": "service warning"}]
         parsed = codec.parse_snapshot_value(current, records.QueueRead)
         self.assertEqual(parsed, replace(reading, diagnostics=(records.ConfigurationDiagnostic("service warning"),)))
-        step = records.RunningStep("owner", "worker", "merge-gate", "/tree", GIB, records.MeasuredMemory(0),
+        step = records.RunningStep("owner", "worker", "gate", "/tree", GIB, records.MeasuredMemory(0),
                                 run=LiveBuildRun(123, "456", NOW - 60), started_at=NOW - 30, pid=123)
         self.assertEqual(codec.parse_snapshot_value(codec.snapshot_value(step), records.RunningStep), step)
 
@@ -405,6 +405,9 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(wire.parse_record(wire.encode_record(current), type(current)), current)
 
     def test_shell_and_protocol_share_a_version_that_includes_the_version_module(self) -> None:
+        for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
+            with self.subTest(name=name):
+                self.assertEqual(f"production/{name}" in admission_code.ADMISSION_CODE_PATHS, expected)
         source = Path(__file__).resolve().parents[1]
         test_modules = {"admission_protocol_v1_fixture.py", "admission_test_support.py"}
         admission_modules = {str(path.relative_to(source))
@@ -473,7 +476,7 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
         with AdmissionFixture() as fixture:
             request = fixture.request()
             requests: list[wire.Request] = [request, fixture.launch(),
-                replace(request, profile=records.ProgramProfile("merge-gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
+                replace(request, profile=records.ProgramProfile("gate", "repo", "tree", records.HistoryPeakSizing(3 * GIB, records.FirstProgramPeak(3 * GIB), 0.0))),
                 replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",
                     records.HistoryPeakSizing(18 * GIB, records.FirstProgramPeak(18 * GIB), NOW))),
                 replace(request, profile=records.ProgramProfile("rust-analyzer", "repo", "tree",
@@ -518,6 +521,30 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                                 _ = decode_legacy(json.dumps(envelope))
                         self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, shaped))
                         self.assertEqual(wire.parse_record(json.dumps(data), wire.AdmitRequest), shaped)
+
+    def test_verify_metadata_is_optional_and_older_decoders_ignore_it(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            old = fixture.request(step="build")
+            assert isinstance(old.profile, records.StepProfile)
+            old = replace(old, profile=replace(old.profile,
+                peak=records.ExpectedPeak(10 * GIB, "shape", 14, records.ShapeRankedPeak(14, 10))))
+            facts = records.VerifyCall("build", "verify build sample --release", 1, 1)
+            request = replace(old, identity=replace(old.identity, verify=facts))
+            encoded = wire.encode_request(request)
+            self.assertEqual(wire.parse_request(encoded), request)
+            old_message = wire.encode_request(old)
+            self.assertNotIn('"verify":', old_message)
+            self.assertEqual(wire.parse_request(old_message), old)
+            placed = placement_request(fixture)
+            placed = replace(placed, identity=replace(placed.identity, verify=facts))
+            self.assertEqual(wire.parse_request(wire.encode_request(placed)), placed)
+            for version in (1, 2):
+                previous = cast(dict[str, object], json.loads(old_message))
+                current = cast(dict[str, object], json.loads(encoded))
+                previous["v"] = current["v"] = version
+                self.assertEqual(decode_legacy(json.dumps(previous)), decode_legacy(json.dumps(current)))
 
     def test_every_reply_round_trips_and_domain_payloads_use_the_shared_codec(self) -> None:
         with AdmissionFixture() as fixture:

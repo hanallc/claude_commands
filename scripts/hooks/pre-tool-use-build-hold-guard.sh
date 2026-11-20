@@ -35,7 +35,7 @@ needs_decision() {
     local continuation='\\\n'
     command_text="${command_text//"$continuation"/}"
     case "$command_text" in
-        *unittest*|*pytest*|*py.test*|*module_run*|*coverage_overlap*|*merge_gate*|*/gate.py*|*' gate.py'*|*'"gate.py'*|*targeted_test*|*bubble_wrapped_tests*)
+        *unittest*|*pytest*|*py.test*|*module_run*|*coverage_overlap*|*bubble_wrapped_tests*)
             return 0
             ;;
         *python*|*/py*|*node*|*bash*|*zsh*|*dash*|*'"sh '*|*'"sh"'*|*'/sh '*|*'/sh"'*|*' sh '*)
@@ -47,6 +47,11 @@ needs_decision() {
             [[ $hook_input == *'"Bash"'* ]] && return 0
             ;;
     esac
+    case "$command_text" in
+        *merge_gate*|*targeted_test*) return 0 ;;
+    esac
+    local gate_path='(^|[^[:alnum:]_.-])(gate\.py|scripts\.production\.gate)([^[:alnum:]_.-]|$)'
+    [[ "$command_text" =~ $gate_path ]] && return 0
     case "$command_text" in
         *cargo*) ;;
         *) return 1 ;;

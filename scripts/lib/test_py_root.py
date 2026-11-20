@@ -49,15 +49,17 @@ def load_tests(loader, tests, pattern):
 COPY_TARGETED_RUN = COPY_IMPORT_AUDIT + '''
 import runpy
 from unittest import mock
-from scripts.production import merge_gate
+from scripts.production import gate
 root = Path(os.environ['EXPECTED_CHECKOUT'])
+os.environ['GATE_STATE_DIR'] = str(root / 'gate-state')
+os.environ['GATE_PASSED_DIR'] = str(root / 'gate-passes')
 def selected_suite(repo, *args, **kwargs):
-    assert kwargs['mode'] is merge_gate.SuiteMode.TARGETED_TEST
-    return merge_gate.run_suites(repo, machine=merge_gate.WholeMachine(),
-        selected=merge_gate.SelectedModules(('scripts/build_targets/test_copy_imports.py',)),
+    assert kwargs['mode'] is gate.SuiteMode.TARGETED
+    return gate.run_suites(repo, machine=gate.WholeMachine(),
+        selected=gate.SelectedModules(('scripts/build_targets/test_copy_imports.py',)),
         mode=kwargs['mode'])
 sys.argv = [str(root / 'scripts/production/targeted_test.py'), '--repo', str(root)]
-with mock.patch.object(merge_gate, 'run_gate_suites', side_effect=selected_suite):
+with mock.patch.object(gate, 'run_gate_suites', side_effect=selected_suite):
     try:
         runpy.run_path(sys.argv[0], run_name='__main__')
     finally:
@@ -95,7 +97,7 @@ class PythonRootTests(unittest.TestCase):
         ):
             with (self.subTest(arguments=arguments),
                   mock.patch.object(sys, "orig_argv", original),
-                  mock.patch.dict(os.environ, {"MERGE_GATE_PARENT_PID": "1"}),
+                  mock.patch.dict(os.environ, {"GATE_PARENT_PID": "1"}),
                   mock.patch.object(sitecustomize, "kernel_guarded", return_value=False),
                   mock.patch.object(os, "execv", side_effect=FileNotFoundError("launcher refused")) as launch):
                 with self.assertRaisesRegex(SystemExit, "cannot start the launcher"):
@@ -115,7 +117,7 @@ class PythonRootTests(unittest.TestCase):
         with (mock.patch.object(sitecustomize, "__name__", "_shim_python_startup"),
               mock.patch.object(sys, "orig_argv", original),
               mock.patch.object(sitecustomize, "kernel_guarded", return_value=True) as guarded,
-              mock.patch.dict(os.environ, {"MERGE_GATE_PARENT_PID": "1"})):
+              mock.patch.dict(os.environ, {"GATE_PARENT_PID": "1"})):
             sitecustomize._start_test_run("/checkout")  # pyright: ignore[reportPrivateUsage]
         guarded.assert_called_once_with()
 

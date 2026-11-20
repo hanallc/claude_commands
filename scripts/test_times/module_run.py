@@ -34,6 +34,7 @@ import unittest
 import unittest.case as unittest_case
 
 from scripts.lib import bubble_wrapped_tests
+from scripts.lib.python_startup.sitecustomize import gate_parent_pid
 
 if TYPE_CHECKING:
     from scripts.test_times.gate_record import TestStatus, TestTime
@@ -609,7 +610,7 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
     if signal_fd < 0:
         raise OSError(ctypes.get_errno(), "cannot watch runner signals")
     parent_fds: list[int] = []
-    parent = os.environ.pop("MERGE_GATE_PARENT_PID", "")
+    parent = gate_parent_pid(consume=True)
     if parent:
         # No test child exists before the parent-death handoff completes.
         parent_fds.append(os.pidfd_open(int(parent)))

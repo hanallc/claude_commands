@@ -264,7 +264,10 @@ def format_state(name: str, state: TargetState,
 
     name = display_field(name)
     if isinstance(state, Free):
-        return f"{name}: free"
+        from scripts.buildlog.mac_idle_alert import kept_claims_text
+
+        suffix = f" · {kept_claims_text(state.kept_claims)}" if state.kept_claims else ""
+        return f"{name}: free{suffix}"
     if isinstance(state, Running):
         return f"{name}: " + "; ".join(running_job_text(job, labels) for job in state.jobs)
     if isinstance(state, Unreachable):

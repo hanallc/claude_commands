@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # review.sh starts a fresh Claude reviewer.
 #
-# Usage: review.sh [--phase <id>] [--style-since <commit> [--style-until <commit>]] <session_dir>
+# Usage: review.sh [--phase <id>] [--early-review-pass-id <id>] [--style-since <commit>] <session_dir>
 #                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
@@ -52,6 +52,7 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 
 # A phase running beside the current one names itself, so start-pass stamps this pass with it.
 PHASE_ID=""
+EARLY_REVIEW_PASS_ID=""
 STYLE_SINCE=""
 STYLE_UNTIL=""
 STYLE_INPUT_DIR=""
@@ -62,6 +63,7 @@ while [[ "${1:-}" == --* ]]; do
     --style-since) STYLE_SINCE="${2:?--style-since requires a baseline}" ;;
     --style-until) STYLE_UNTIL="${2:?--style-until requires an end commit}" ;;
     --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
+    --early-review-pass-id) EARLY_REVIEW_PASS_ID="${2:?Pass the id from arm-review.}" ;;
     *) echo "ERROR: unknown review option '$1'." >&2; exit 2 ;;
   esac
   shift 2
@@ -95,6 +97,10 @@ PASS_ACTIVITY="${6:-reviewing the current diff against its work order}"
 PASS_INDEX="${7:-1}"
 LENS="${REQUESTED_LENS:-${8:-}}"
 EARLY_READY_FILE="${9:-}"
+if [[ -n "${EARLY_REVIEW_PASS_ID}" && -z "${EARLY_READY_FILE}" ]]; then
+  echo "ERROR: --early-review-pass-id requires an early-ready file." >&2
+  exit 2
+fi
 TASK="direct.${SUBTASK}"
 # shellcheck source=/dev/null
 source "${BASH_SOURCE[0]%/*}/../agents/models_config.sh"
@@ -107,26 +113,32 @@ esac
 
 # A closed set, like the pass kinds: an unrecognized lens would suffix artifacts
 # nobody reads and record a pass under a worker no column renders, both silently.
-LENS_SLOT="$("${BASH_SOURCE[0]%/*}/../lib/py" - "${BASH_SOURCE[0]}" "${LENS}" <<'PYLENS'
+TEAM_SLOT="$("${BASH_SOURCE[0]%/*}/../lib/py" - "${BASH_SOURCE[0]}" "${LENS}" "${PHASE_ID}" <<'PYLENS'
+import hashlib
 import sys
 from pathlib import Path
 with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.usage.agents_log import PHASE_REVIEW_LENSES
-lens = sys.argv[2]
+lens, phase = sys.argv[2:]
 if lens and lens not in PHASE_REVIEW_LENSES:
     print(f"ERROR: unknown review lens '{lens}' ({', '.join(PHASE_REVIEW_LENSES)})", file=sys.stderr)
     sys.exit(2)
-print({"adversary": "test", "contract": "impl", "": ""}.get(lens, "review"))
+if phase:
+    digest = hashlib.sha256(phase.encode()).hexdigest()[:24]
+    print(f"review-{lens or 'single'}-{digest}")
+else:
+    print({"adversary": "test", "contract": "impl", "": ""}.get(lens, "review"))
 PYLENS
 )"
 
 SUFFIX="${LENS:+_${LENS}}"
 # Give each lens a separate tag in the shared activity log.
 BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
-# Each lens records its pass in a separate slot.
-TEAM_SLOT="${LENS_SLOT}"
 export UNIT_TEAM_ROLE="${TEAM_SLOT}"
 export UNIT_RUN_DIR="${SESSION_DIR}"
+if [[ -n "${PHASE_ID}" ]]; then
+  export UNIT_PHASE_ID="${PHASE_ID}"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
@@ -137,7 +149,7 @@ source "$SCRIPT_DIR/file_lock.sh"
 # repo needs >= 3.12.
 PY="${SCRIPT_DIR}/../lib/py"
 TURN_FINDINGS_READY=0
-PASS_STARTED=0
+PASS_INSTANCE_ID=""
 mkdir -p "${ARTIFACT_DIR}"
 # Every dispatch names the run's director in the run folder (unit_runs.py), which the
 # production tree reads: a marker names one run per director, and a director runs phases side by side.
@@ -151,7 +163,7 @@ AGENT_FILE="${ARTIFACT_DIR}/review_agent${SUFFIX}"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 BOARD_HELPER="${SCRIPT_DIR}/board.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
-PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
+PROGRESS_HELPER="${SCRIPT_DIR}/pass_record.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
@@ -257,7 +269,9 @@ record_pass_start() {
   # UX time belongs to the director's activity, including early launches.
   [[ "${LENS}" != ux ]] || return 0
   [[ -f "${PROGRESS_STATE}" ]] || return 0
-  if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
+  PASS_INSTANCE_ID="$(UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
+    --print-pass-id --launcher-pid "$$" \
+    ${EARLY_REVIEW_PASS_ID:+--early-review-pass-id "${EARLY_REVIEW_PASS_ID}"} \
     --session-dir "${SESSION_DIR}" \
     --pass-kind review \
     --prompt-file "${PROMPT_FILE}" \
@@ -267,10 +281,7 @@ record_pass_start() {
     --called-model "${AGENT_MODEL}" \
     --called-effort "${AGENT_EFFORT:-unset}" \
     --launcher-command "$("$PY" -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${LAUNCHER_COMMAND[@]}")" \
-    ${PHASE_ID:+--phase-id "${PHASE_ID}"}; then
-    return 1
-  fi
-  PASS_STARTED=1
+    ${PHASE_ID:+--phase-id "${PHASE_ID}"})"
 }
 
 if [[ -z "${EARLY_READY_FILE}" ]]; then
@@ -367,20 +378,20 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
   # pass is still open, so start-pass would close it as interrupted and every
   # later progress call would be refused for having no active window; and the
   # verdict is void regardless, because the final diff does not exist yet.
-  if [[ "${PASS_STARTED}" -eq 0 && -e "${EARLY_READY_FILE}" ]]; then
+  if [[ "${PASS_INSTANCE_ID}" == "" && -e "${EARLY_READY_FILE}" ]]; then
     if ! record_pass_start; then
       echo "ERROR: unable to record the review pass start." >&2
       exit 1
     fi
   fi
   write_review_status reviewed
-  if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
+  if [[ -f "${PROGRESS_STATE}" && -n "${PASS_INSTANCE_ID}" ]]; then
     if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
-      --session-dir "${SESSION_DIR}" --status completed; then
+      --session-dir "${SESSION_DIR}" --pass-instance-id "${PASS_INSTANCE_ID}" --status completed; then
       echo "ERROR: unable to record the review pass completion." >&2
       exit 1
     fi
-    PASS_STARTED=0
+    PASS_INSTANCE_ID=""
   fi
   if [[ -n "${EARLY_READY_FILE}" && ! -e "${EARLY_READY_FILE}" ]]; then
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper \
@@ -400,10 +411,10 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
 else
   # An early reviewer that failed before its pass started recorded nothing;
   # there is no pass to close.
-  if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
+  if [[ -f "${PROGRESS_STATE}" && -n "${PASS_INSTANCE_ID}" ]]; then
     UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
-      --session-dir "${SESSION_DIR}" --status error \
-      && PASS_STARTED=0 \
+      --session-dir "${SESSION_DIR}" --pass-instance-id "${PASS_INSTANCE_ID}" --status error \
+      && PASS_INSTANCE_ID="" \
       || echo "ERROR: unable to record the review pass error." >&2
   fi
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent exited with code ${AGENT_CODE}" || true

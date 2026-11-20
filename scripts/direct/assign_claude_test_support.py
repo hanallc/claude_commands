@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.agents import remote
 
 from scripts.lib import test_hang_guard
+from scripts.lib.fork_test_support import ForkChildren
 from scripts.production import staff, unit_config
 from scripts.production.staff_test_support import isolated_staff_file
 
@@ -66,7 +67,7 @@ def direct_launcher_helpers() -> Generator[None]:
 
     def fixture_command(command: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
         if len(command) < 2 or Path(command[1]).name not in {
-                "progress_history.py", "phase_reservation.py", "worker_state.py", "build_folders.py"}:
+                "progress_history.py", "pass_record.py", "phase_reservation.py", "worker_state.py", "build_folders.py"}:
             return real_run(command, **options)
         script = command[1]
         module = ModuleType("launcher_helper")
@@ -348,19 +349,18 @@ class AssignClaudeLauncherFixture(LauncherFixture):
         child_source = "\n".join((
             "assign.SCRIPTS = assign_claude.SCRIPTS = Path(__file__).resolve().parent",
             "assign.PYTHON = assign_claude.PYTHON = str(assign.SCRIPTS.parent / 'lib/py')",
+            "assign.PASS_RECORD = str(assign.SCRIPTS / 'pass_record.py')",
             "args = assign.parse_arguments()",
             "env = dict(os.environ)",
             "cwd, prompt = Path(args.cwd).resolve(), Path(args.prompt).resolve()",
             "run, phase = assign.prepare_run(args, cwd, prompt, env)",
             "role = 'impl' if args.role == 'implement' else args.role",
             "model = assign.resolve_model(args, role, env)",
-            "check = assign.call([assign.PYTHON, str(assign.SCRIPTS / 'progress_history.py'), 'check-launch', '--session-dir', str(run), '--pass-kind', role, '--phase-id', phase, '--prompt-file', str(prompt), '--fix-cause', args.fix_cause], env, check=False)",
+            "check = assign.call([assign.PYTHON, assign.PASS_RECORD, 'check-launch', '--session-dir', str(run), '--pass-kind', role, '--phase-id', phase, '--prompt-file', str(prompt), '--fix-cause', args.fix_cause], env, check=False)",
             "if check.returncode: raise SystemExit(3 if check.returncode == 3 else 2)",
             "slot = args.to or args.new_worker or role",
-            "before = assign.pass_start_count(run, slot)",
             "worker = assign_claude.ClaudeFollowUp(args.to) if args.to else assign_claude.NewClaudeWorker()",
             "code = assign_claude.run(assign_claude.ClaudeLaunch(run, phase, cwd, prompt, role, slot, args.fix_cause, args.pass_number, model[1], model[2], worker, ('bash', str(assign.SCRIPTS / 'assign.sh'), *sys.argv[1:]), env))",
-            "if code and assign.pass_start_count(run, slot) > before: assign.end_failed_launch(run, slot, env)",
             "raise SystemExit(code)",
         )) + "\n"
         if self.direct_cli_calls:
@@ -460,13 +460,21 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             _ = runpy.run_path(str(entry), run_name="__main__")
             return 0
 
-        with (patch.object(direct_package, "__path__", list(cast(Sequence[str], getattr(direct_package, "__path__")))),
-              patch.object(assign, "SCRIPTS", direct),
-              patch.object(assign, "PYTHON", str(direct.parent / "lib/py")),
-              patch.object(assign_claude, "SCRIPTS", direct),
-              patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py")),
-              direct_launcher_helpers()):
-            return invoke_cli(module, child_main, arguments, environment, self.working_dir)
+        def run_warm() -> int:
+            with (patch.object(direct_package, "__path__", list(cast(Sequence[str], getattr(direct_package, "__path__")))),
+                  patch.object(assign, "SCRIPTS", direct),
+                  patch.object(assign, "PYTHON", str(direct.parent / "lib/py")),
+                  patch.object(assign_claude, "SCRIPTS", direct),
+                  patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py")),
+                  direct_launcher_helpers()):
+                result = invoke_cli(module, child_main, arguments, environment, self.working_dir)
+            _ = sys.stdout.write(result.stdout)
+            _ = sys.stderr.write(result.stderr)
+            return result.returncode
+
+        with ForkChildren() as children:
+            result = children.start(run_warm).result()
+        return subprocess.CompletedProcess(command, result.returncode, result.stdout, result.stderr)
 
     def launch_records(self, session: Path, kind: str) -> list[dict[str, object]]:
         path = self.history_dir / "runs" / f"{session.name}.jsonl"
@@ -549,7 +557,7 @@ printf '%s\\n' '{answer}'
         """Record the status each copied helper sees before it updates its ledger."""
         direct_dir = self.root / "scripts" / "direct"
         for name, commands in (
-            ("progress_history.py", ("finish-pass",)),
+            ("pass_record.py", ("finish-pass",)),
             ("findings.py", ("landed", "abandon")),
         ):
             script = direct_dir / name

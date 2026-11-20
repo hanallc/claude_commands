@@ -24,7 +24,7 @@ from uuid import uuid4
 
 from scripts.lib import conf, bubble_wrapped_tests
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import merge_gate
+from scripts.production import gate
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 CONFIG = CHECKOUT / "config/bubble_wrapped_tests.conf"
@@ -248,7 +248,7 @@ class TestBubblewrapProof(unittest.TestCase):
         with mock.patch.object(Path, "is_file", autospec=True, side_effect=installed) as existence, \
                 mock.patch.object(sys, "path", sys.path.copy()), \
                 mock.patch.object(bubble_wrapped_tests, "guarded", return_value=False), \
-                mock.patch.dict(os.environ, {"MERGE_GATE_PARENT_PID": "1"}, clear=True), \
+                mock.patch.dict(os.environ, {"GATE_PARENT_PID": "1"}, clear=True), \
                 mock.patch.object(sys, "argv", argv), \
                 mock.patch.object(sys, "orig_argv", [sys.executable, *argv]):
             with self.assertRaisesRegex(bubble_wrapped_tests.BubblewrapUnavailable, "Bubblewrap is unavailable"):
@@ -310,7 +310,7 @@ select.select([], [], [])
                         [sys.executable, "-I", "-c", child, str(marker), str(ready_write)], folder, lease_fd=lease,
                     )
                 argv[1:1] = ["--info-fd", str(info_write), "--block-fd", str(block_read)]
-                job = merge_gate.start_gate_job(
+                job = gate.start_gate_job(
                     "lib", Path(__file__), argv, CHECKOUT, environment, folder / "gate.log",
                     pass_fds=(lease, info_write, block_read, ready_write),
                 )
@@ -334,9 +334,9 @@ select.select([], [], [])
                 self.assertEqual(os.getpgid(pid), job.process.pid)
                 self.assertNotIn("untrusted startup ran", job.log.read_text())
             finally:
-                with mock.patch.object(merge_gate, "module_stop_deadline",
+                with mock.patch.object(gate, "module_stop_deadline",
                                        return_value=time.monotonic() + TEST_HANG_GUARD_SECS):
-                    self.assertTrue(merge_gate.kill_job_group(job), job.stop_error)
+                    self.assertTrue(gate.kill_job_group(job), job.stop_error)
             assert descriptor is not None
             self.assertTrue(select.select([descriptor], [], [], 0)[0], "The namespace PID 1 stayed alive.")
             self.assertEqual(marker.exists(), not during_startup)
@@ -373,7 +373,7 @@ class TestBubblewrapHookProof(unittest.TestCase):
                 ("scripts/lib/py -m unittest x", old),
                 (f"cd {old} && scripts/lib/py -m unittest x", CHECKOUT),
                 (["python3", str(MODULE_RUNNER), str(old / "scripts/lib"), "test_x.py"], CHECKOUT),
-                (["python3", "scripts/production/merge_gate.py", "--repo", str(old)], CHECKOUT),
+                (["python3", "scripts/production/gate.py", "--repo", str(old)], CHECKOUT),
             ):
                 with self.subTest(command=command):
                     self.assertIn(f"Test starts require scripts/lib/bubble_wrapped_tests.py in {old}",

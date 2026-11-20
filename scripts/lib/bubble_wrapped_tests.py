@@ -85,7 +85,7 @@ def command(argv: Sequence[str], job_folder: Path, *, lease_fd: int | None = Non
         values = _kept_environment(settings, source)
         values.update({key: source[key] for key in MODULE_VALUES if key in source})
         tmp = str(job_folder.resolve(strict=True))
-        values.update(TMPDIR=tmp, TMP=tmp, TEMP=tmp, MERGE_GATE_PARENT_PID="1")
+        values.update(TMPDIR=tmp, TMP=tmp, TEMP=tmp, GATE_PARENT_PID="1")
         if source.get("COVERAGE_OUT") == f"{tmp}/coverage.json":
             values["COVERAGE_OUT"] = f"{tmp}/coverage.json"
             if "COVERAGE_TREE_SHA" in source:

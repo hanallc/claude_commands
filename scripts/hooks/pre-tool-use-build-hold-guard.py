@@ -20,18 +20,20 @@ from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
 from scripts.hooks.tool_call_text import scan_text
 
 from scripts.lib.direct_test_starts import SHELLS, is_python_command, is_test_start, python_target, shell_target
-from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
+from scripts.lib.suite_runners import SUITE_MODULES, SUITE_RUNNERS, starts_suite_runner
 
 GUARD = Path("scripts/lib/bubble_wrapped_tests.py")
 SHIM = Path("scripts/lib/py")
 RUNNER = Path("scripts/test_times/module_run.py")
-GUARDED_RUNNERS = SUITE_RUNNERS | {"gate.py", RUNNER.name, "coverage_overlap.py"}
+GUARDED_RUNNERS = SUITE_RUNNERS | {RUNNER.name, "coverage_overlap.py"}
+SUITE_PATTERN = (r"(?<![\w.-])(?:"
+                 + "|".join(map(re.escape, sorted(SUITE_RUNNERS | {module for _, module in SUITE_MODULES})))
+                 + r")(?![\w.-])")
 # Keep these markers in sync with the shell hook.
 GUARD_CANDIDATE = re.compile(
-    r"unittest|pytest|py[.]test|test_|proof|module_run|coverage_overlap|merge_gate|targeted_test|bubble_wrapped_tests"
-    + r"|(?<![\w.-])gate[.]py"
+    r"unittest|pytest|py[.]test|test_|proof|module_run|coverage_overlap|bubble_wrapped_tests|" + SUITE_PATTERN
 )
-CANDIDATE = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted({"cargo", *SUITE_RUNNERS})) + r")\b")
+CANDIDATE = re.compile(r"\bcargo\b|" + SUITE_PATTERN)
 PREFIXES = frozenset({"env", "sudo", "exec", "command", "nohup", "time", "timeout", "nice",
                       "!", "{", "then", "else", "do", "if", "while", "until"})
 PREFIX_ARGUMENTS = frozenset({"-u", "--unset", "--user", "-g", "--group", "-n", "--adjustment",

@@ -64,15 +64,11 @@ completes.
    Complete the phase only after both workers finish.
    Load the implementation summary into `${IMPL_SUMMARY}` and read the other worker's summary.
    Apply <WorkerLaunchFailure/> before reporting a launch error.
-   `assign.py` ends a run when its only worker command fails and no pass completed.
-   Each recorder slot counts as one worker. A Claude launch must add a `pass_started` event for its slot.
-   The director must hold only that run. A launcher signal does not trigger this path.
-   Only exit 2 qualifies. Exits 3 through 8 retain the run.
-   The launcher calls `progress_history.py finish-run --session-dir <run> --status error`, then `end_session.sh`.
-   It keeps the launch exit code and the phase reservation. A failed cleanup child reports its error.
-   For other genuine errors, cancel early review under <EarlyReviewArm/> and apply <RetainPhaseReservation/>.
-   Report the dispatch log and record `finish-run --status error`.
-   Run the end step as one command, without a pipe:
+   A failed launch keeps the run open for a retry.
+   If you end the run, apply <EarlyReviewArm/> and <RetainPhaseReservation/>.
+   Report the dispatch log.
+   Record `finish-run --status error`.
+   Run the end step as one command without a pipe:
 
    ```sh
    bash ~/.claude/scripts/direct/end_session.sh

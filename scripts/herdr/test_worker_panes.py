@@ -1,6 +1,8 @@
 """Worker operations preserve native identity and proved pane ownership."""
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 import io
 import json
 import fcntl
@@ -939,8 +941,8 @@ class WorkerPaneTests(StaffTestCase):
         if not state.exists():
             run.mkdir(exist_ok=True)
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
-                "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
-                          "status": "active"}, "pass": {}, "events": [],
+                "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
+                                 "status": "active"}], "pass": {}, "events": [],
                 "history_file": str(run / "history.jsonl"),
                 "main_agent": {"session_id": self.parent.current_session, "family": "claude",
                                "model": "fixture", "effort": "high"}}))
@@ -1003,7 +1005,9 @@ class WorkerPaneTests(StaffTestCase):
                 _ = progress_history.begin_dispatch(run, slot="impl", phase=phase, role="impl",
                     worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
                 before = self.staff_state()
-                if operation in {"finish-phase", "finish-run"}:
+                if operation == "finish-phase":
+                    self.record_command(operation, "--phase-id", phase, "--status", "completed", at=3)
+                elif operation == "finish-run":
                     self.record_command(operation, "--status", "completed", at=3)
                 else:
                     self.record_command("finish-pass", "--status", "interrupted", "--orphaned-launcher", at=3)
@@ -2112,11 +2116,21 @@ class WorkerPaneTests(StaffTestCase):
         self.dispatch(opened.row, "impl")
         run = self.root / "run"
         progress_history.save_dispatch_delivery(run, "dispatch-" + opened.row.name,
-            progress_history.DispatchDelivery("saved prompt", "dispatch-" + opened.row.name, str(self.root / "reply"), "",
+            pass_recorder.DispatchDelivery("saved prompt", "dispatch-" + opened.row.name, str(self.root / "reply"), "",
                                               progress_history.NO_COMPLETION_ACTIONS))
         with patch("scripts.agents.detached_runs.live_runs", return_value=[]):
             self.assertIsInstance(worker_panes.can_close(opened), worker_panes.Kept)
             self.assertIsInstance(self.start(role="review"), worker_panes.StartRefused)
+
+            path = run / unit_runs.STATE_FILE
+            state = cast(dict[str, object], json.loads(path.read_text()))
+            passes = cast(dict[str, dict[str, object]], state["pass"])
+            passes["newer-slot"] = {"worker_id": opened.row.id, "instance_id": "newer-pass",
+                                    "started_at": 1, "status": "completed"}
+            write_text_atomic(path, json.dumps(state))
+            self.reply_to_dispatch(opened.row, "newer-pass")
+            self.assertIsInstance(worker_panes.can_close(opened), worker_panes.CloseAllowed)
+            self.assertIsInstance(self.start(role="review"), worker_panes.OpenWorker)
 
     def test_failed_unpublished_close_reports_one_anomaly(self) -> None:
         for failure in (False, OSError("TEST close failed\nsecond line")):
@@ -2569,7 +2583,7 @@ class WorkerPaneTests(StaffTestCase):
                 if unfinished:
                     self.dispatch(row, "impl")
                     progress_history.save_dispatch_delivery(self.root / "run", "dispatch-" + row.name,
-                        progress_history.DispatchDelivery("saved prompt", "dispatch-" + row.name, str(self.root / "reply"), "",
+                        pass_recorder.DispatchDelivery("saved prompt", "dispatch-" + row.name, str(self.root / "reply"), "",
                                                           progress_history.NO_COMPLETION_ACTIONS))
                 else:
                     self.completed_dispatch(row, "impl")

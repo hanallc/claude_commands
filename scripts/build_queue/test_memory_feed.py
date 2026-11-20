@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records, placement
+from scripts.build_queue import admission_records, admission_service, placement
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -30,7 +30,7 @@ from unittest import mock
 
 from scripts.buildlog import charts, cost_actions, costs, parse
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.slot_wait import NoNamedStep, SlotCaller, recorded_step
@@ -49,7 +49,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, command_job, read_step_names
 from scripts.message import unit_labels
 from scripts.production import staff
-from scripts.production.merge_gate import SuiteMode
+from scripts.production.gate import SuiteMode
 from scripts.review_links import staff_names
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_config_fixture
@@ -364,10 +364,10 @@ class MemoryFeedTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "build_steps.conf",
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
-            + "names.merge-gate=merge gate\nnames.targeted-test=targeted test\n"
-            + "owned.default={unit} {step}\nowned.merge-gate={unit} merge\n"
-            + "owned.targeted-test={unit} targeted\nowned.ci-default=CI {step}\n"
-            + "owned.showrunner-default=showrunner {step}\nowned.showrunner-merge-gate=showrunner merge\n")
+            + "names.gate=merge gate\n"
+            + "owned.default={unit} {step}\n"
+            + "owned.ci-default=CI {step}\n"
+            + "owned.showrunner-default=showrunner {step}\n")
         self.configure()
         _ = (self.root / "mac-builds.json").write_text(json.dumps({"read_at": ADMISSION_NOW, "builds": [], "error": ""}))
         proc = self.root / "proc"
@@ -658,18 +658,43 @@ process.stdout.write(JSON.stringify({
                     (proc / str(pid)).mkdir()
                     command = gate_command[:2] + arguments + (gate_command[2:] if expected.branch else [])
                     _ = (proc / str(pid) / "cmdline").write_bytes(b"\0".join(part.encode() for part in command) + b"\0")
-                    job = memory_feed.step_job("merge-gate", pid, proc)
+                    job = memory_feed.step_job("gate", pid, proc)
                     self.assertEqual(job, expected)
                     notes = memory_feed.job_notes(job, "report", names)
                     self.assertTrue(notes.get("about"))
                     self.assertEqual(notes.get("changes"), "sdlc branch" if expected.step == "integrate" else "no branch")
             self.assertIsInstance(memory_feed.step_job("nextest", 10, proc), memory_feed.NotGateStep)
-            self.assertIsInstance(memory_feed.step_job("merge-gate", 99, proc), memory_feed.CommandUnreadable)
+            self.assertIsInstance(memory_feed.step_job("gate", 99, proc), memory_feed.CommandUnreadable)
         for command, named in (
             (["python3", "-X", "dev", "/repo/scripts/production/targeted_test.py"], StepJob("test-affected")),
             (["py", "targeted_test.py", "--full"], StepJob("test-all")),
             (["python3", "targeted_test.py", "--module", "a"], StepJob("test-modules", modules=1)),
             (["python3", "-m", "scripts.production.merge_gate", "--tests-only"], StepJob("test-all")),
+            (["python3", "/repo/scripts/production/gate.py", "--unit", "handler", "--merge-branch", "sdlc"],
+             StepJob("integrate", unit="handler", branch="sdlc")),
+            (["python3", "-m", "scripts.production.gate", "--unit", "handler", "--merge-branch=sdlc"],
+             StepJob("integrate", unit="handler", branch="sdlc")),
+            (["gate.py", "--tests-only"], StepJob("test-all")),
+            (["gate.py", "--tests-only", "--module=a", "--module", "b"], StepJob("test-modules", modules=2)),
+            (["gate.py", "--nightly", "--merge-branch", "sdlc"], StepJob("test-nightly", branch="sdlc")),
+            (["gate.py", "--promote-only", "--merge-branch", "sdlc"], StepJob("promote", branch="sdlc")),
+            (["python3", "-m", "scripts.production.gate", "--tests-only"], StepJob("test-all")),
+            (["python3", "-m", "scripts.production.gate", "--tests-only", "--module=a"],
+             StepJob("test-modules", modules=1)),
+            (["python3", "-mscripts.production.gate", "--nightly", "--merge-branch=sdlc"],
+             StepJob("test-nightly", branch="sdlc")),
+            (["python3", "-m", "scripts.production.gate", "--promote-only", "--merge-branch", "sdlc"],
+             StepJob("promote", branch="sdlc")),
+            (["python3", "/repo/scripts/production/gate.py", "--affected"], StepJob("test-affected")),
+            (["gate.py", "--affected", "--full"], StepJob("test-all")),
+            (["gate.py", "--affected", "--module", "a", "--module=b"], StepJob("test-modules", modules=2)),
+            (["python3", "-m", "scripts.production.gate", "--affected"], StepJob("test-affected")),
+            (["python3", "-m", "scripts.production.gate", "--affected", "--full"], StepJob("test-all")),
+            (["python3", "-m", "scripts.production.gate", "--affected", "--module=a"],
+             StepJob("test-modules", modules=1)),
+            (["merge_gate.py", "--affected"], StepJob("test-affected")),
+            (["python3", "-c", "pass", "gate.py"], OTHER_COMMAND),
+            (["python3", "tool.py", "gate.py", "--affected"], OTHER_COMMAND),
             (["verify.sh", "--session-dir", "/session", "lint"], StepJob("lint")),
             (["bash", "verify.sh", "test", "hana"], StepJob("test")),
             (["python3", "-c", "pass", "merge_gate.py"], OTHER_COMMAND),
@@ -700,14 +725,14 @@ process.stdout.write(JSON.stringify({
 
 
     def test_local_test_counters_reach_the_page_through_admission(self) -> None:
-        for step in ("targeted-test", "merge-gate", "nextest", "test", "t"):
+        for step in ("test-affected", "gate", "nextest", "test", "t"):
             with self.subTest(step=step):
                 with AdmissionFixture() as fixture, fixture.loop_turn():
                     owner = fixture.proc.spawn()
                     sidecar = fixture.scope(owner)
                     request = replace(fixture.request(owner=owner, step=step), sidecar=str(sidecar))
                     grant = only_admitted(fixture.server.handle_request(request))
-                    phase = "suites:1" if step in ("targeted-test", "merge-gate") else "test:1"
+                    phase = "suites:1" if step in ("test-affected", "gate") else "test:1"
                     counter = progress_profile.ProgressCounter(phase, 7, 12)
                     progress_profile.publish_counter(sidecar, counter)
                     _ = fixture.run_pass()
@@ -2229,6 +2254,95 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(row.get("mac_text"), "")
                 self.assertEqual(row.get("because"), reason.removeprefix("it ") if reason else "direct cargo command")
 
+    def verify_call_page(self) -> memory_feed.MemoryPage:
+        """Read the verify facts from admissions through the private service socket."""
+        with AdmissionFixture() as fixture:
+            facts = admission_records.VerifyCall("final", "verify final sample --local 'creates a Linux install'", 1, 2)
+            run = fixture.run_owner()
+            first = fixture.request(step="nextest", need=admission_records.GIB, run=run)
+            first = replace(first, sidecar=str(fixture.scope(first.owner)),
+                            identity=replace(first.identity, verify=replace(facts, position=2)))
+            _ = only_admitted(fixture.server.handle_request(first))
+            fixture.allow_next_start()
+            fixture.free(0)
+            direct = fixture.request(step="check", need=2 * admission_records.GIB)
+            direct_peer = fixture.connect(direct)
+            direct_reply, = direct_peer.replies()
+            self.assertIsInstance(direct_reply, wire.Wait)
+            fixture.clock.advance(1)
+            second = fixture.request(step="check", need=4 * admission_records.GIB)
+            environment = {"BUILDLOG_VERIFY_VERB": facts.verb, "BUILDLOG_VERIFY_CALL": facts.call,
+                           "BUILDLOG_VERIFY_POSITION": "1", "BUILDLOG_VERIFY_TOTAL": "2",
+                           "BUILD_QUEUE_LOCAL_REASON": "creates a Linux install"}
+            with (mock.patch.dict(os.environ, environment),
+                  mock.patch.object(admission_client, "CLOCK", fixture.clock),
+                  mock.patch.object(step_estimator, "step_estimate", return_value=step_estimator.StepEstimate(
+                      second.profile, step_estimator.ReusableEstimate()))):
+                second = admission_client.step_request(list(second.argv), second.cwd, second.owner,
+                    second.since, second.sidecar, second.episode)
+            self.assertEqual(second.identity.verify, facts)
+            waiter = fixture.connect(second)
+            reply, = waiter.replies()
+            self.assertIsInstance(reply, wire.Wait)
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual(snapshot.inputs.running[0].verify, replace(facts, position=2))
+            self.assertNotIn("verify", snapshot.inputs.ordered[0][1])
+            self.assertEqual(snapshot.inputs.ordered[1][1].get("verify"), facts)
+            self.assertEqual(snapshot.inputs.reservations[0].get("queue_waiter", {}).get("verify"),
+                             replace(facts, position=2))
+            state = admission_service.read_state(fixture.state_dir)
+            self.assertEqual(state.reservations[first.episode].queue_waiter.get("verify"), replace(facts, position=2))
+            reply, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(reply, wire.ViewReply)
+            with mock.patch.object(admission_client, "view", return_value=reply.reading):
+                return memory_feed.reading()
+
+    def mac_verify_call_page(self) -> memory_feed.MemoryPage:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, placement_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            facts = admission_records.VerifyCall("test", "verify test sample --no-cache", 1, 1)
+            request = placement_request(fixture)
+            request = replace(request, identity=replace(request.identity, step="nextest", verify=facts))
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            reply, = fixture.connect(wire.ViewRequest()).replies()
+            assert isinstance(reply, wire.ViewReply)
+            now = reply.reading.explanation.now
+            build = queue_view.MacBuild(710001, "/Mac/hana", now - 10, "cargo nextest run", "hana",
+                gate_label=queue_view.MacGateLabel.PLACEMENT,
+                gate_placement=f"{assignment.episode}/{assignment.attempt}")
+            other = replace(build, pid=710002, gate_placement=f"{assignment.episode}/other-attempt")
+            mac = queue_view.MacBuildReading(now, (build, other))
+            with (mock.patch.object(admission_client, "view", return_value=reply.reading),
+                  mock.patch.object(queue_view, "read_mac_builds", return_value=mac),
+                  mock.patch.object(memory_feed, "mac_build_units", return_value={})):
+                return memory_feed.reading()
+
+    def test_placed_mac_build_shows_the_verify_call_without_process_evidence(self) -> None:
+        page = self.mac_verify_call_page()
+        placed, unrelated = [row for row in page["walk"] if row.get("kind") == "mac-build"]
+        self.assertEqual(placed.get("verify"), {
+            "step": "nextest", "verb": "test", "call": "verify test sample --no-cache", "position": 1, "total": 1})
+        self.assertNotIn("verify", unrelated)
+
+    def test_verify_call_reaches_running_and_waiting_feed_rows(self) -> None:
+        page = self.verify_call_page()
+        running, = [row for row in page["walk"] if "verify" in row]
+        direct, waiting = page["waiters"]
+        running_call = running.get("verify")
+        waiting_call = waiting.get("verify")
+        assert running_call is not None and waiting_call is not None
+        self.assertEqual((running_call["step"], running_call["position"]), ("nextest", 2))
+        self.assertEqual((waiting_call["step"], waiting_call["position"]), ("check", 1))
+        self.assertEqual(running_call["call"], "verify final sample --local 'creates a Linux install'")
+        self.assertEqual(waiting_call["call"], running_call["call"])
+        self.assertEqual((running_call["verb"], waiting_call["total"]), ("final", 2))
+        self.assertNotIn("verify", direct)
+
     def test_queued_tooltips_use_the_verify_route_or_the_direct_command_reason(self) -> None:
         page = self.macroute_page()
         self.assertEqual([row.get("mac_text") for row in page["waiters"]], [
@@ -2486,16 +2600,15 @@ process.stdout.write(JSON.stringify({
         approved = {"integrate", "test all", "test named", "test affected", "test nightly", "fast track",
                     "promote", "CI", "toolchain trial"}
         modes = {mode.value for mode in SuiteMode}
-        self.assertEqual(modes, memory_feed.GATE_STEPS)
+        self.assertEqual(modes | {"merge-gate", "targeted-test"}, memory_feed.GATE_STEPS)
         for mode in sorted(modes):
-            program = mode.replace("-", "_") + ".py"
-            cases = ((), ("--full",), ("--module", "test_sample")) if mode == SuiteMode.TARGETED_TEST.value else (
+            cases = (("--affected",), ("--affected", "--full"), ("--affected", "--module", "test_sample")) if mode == SuiteMode.TARGETED_TEST.value else (
                 ("--unit", "devtools", "--merge-branch", "sdlc"),
                 ("--tests-only", "--full"), ("--tests-only", "--module", "test_sample"),
                 ("--nightly", "--merge-branch", "sdlc"), ("--promote-only",))
             for arguments in (*cases, memory_feed.CommandUnreadable("missing cmdline"), admission_records.PidNotRecorded()):
                 with self.subTest(mode=mode, arguments=arguments):
-                    argv = ("python3", program, *arguments) if isinstance(arguments, tuple) else ()
+                    argv = ("python3", "gate.py", *arguments) if isinstance(arguments, tuple) else ()
                     page = self.gate_job_page(mode, argv,
                         running_pid=arguments if isinstance(arguments, admission_records.PidNotRecorded) else 700000)
                     job = command_job(argv)
@@ -2517,15 +2630,17 @@ process.stdout.write(JSON.stringify({
 
         copied = ("python3", "/repo/scripts/copies/copies.py", "run", "--repo=/repo", "--",
                   "python3", "/repo/scripts/production/merge_gate.py", "--tests-only", "--full")
-        page = self.gate_job_page("merge-gate", copied)
-        local, = [row for row in page["walk"] if row.get("queued")]
-        waiting, = [row for row in page["waiters"] if not row.get("kind")]
-        for row in (local, waiting):
-            self.assertIn(row["title"]["step"], approved)
-            self.assertEqual(row["name"], "devtools test all")
-            self.assertEqual(row.get("about"), "Tests every module of devtools.")
+        for step in ("gate", "merge-gate"):
+            with self.subTest(step=step):
+                page = self.gate_job_page(step, copied)
+                local, = [row for row in page["walk"] if row.get("queued")]
+                waiting, = [row for row in page["waiters"] if not row.get("kind")]
+                for row in (local, waiting):
+                    self.assertIn(row["title"]["step"], approved)
+                    self.assertEqual(row["name"], "devtools test all")
+                    self.assertEqual(row.get("about"), "Tests every module of devtools.")
 
-        page = self.gate_job_page("merge-gate", (), job=StepJob("test-all"))
+        page = self.gate_job_page("gate", (), job=StepJob("test-all"))
         local, = [row for row in page["walk"] if row.get("queued")]
         waiting, = [row for row in page["waiters"] if not row.get("kind")]
         for row in (local, waiting):
@@ -2546,7 +2661,7 @@ process.stdout.write(JSON.stringify({
         policy = admission_policy_fixture()
         owner = staff.StaffRow(staff.StaffId("director"), "unit", "devtools", staff.StaffRoot(),
                                current_session=staff.StaffId("director-session"))
-        for step, expected in (("test-all", "test all"), ("merge-gate", "devtools")):
+        for step, expected in (("test-all", "test all"), ("gate", "devtools")):
             with self.subTest(ended_step=step):
                 run = LiveBuildRun(101, "101", inputs.now - 15)
                 reservation = memory_tests.ProgressKeepAsideTests.reservation(step, need=admission_records.GIB)
@@ -2576,13 +2691,13 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(staff_names.parts_text(row.get("about_parts", [])), about)
                     self.assertEqual(row.get("changes"), "no branch")
 
-        integration = self.gate_job_page("merge-gate", ("python3", "merge_gate.py"), showrunner=True)
+        integration = self.gate_job_page("gate", ("python3", "gate.py"), showrunner=True)
         for rows in (integration["walk"], integration["waiters"]):
             row, = [row for row in rows if row.get("kind") == "cloud"]
             self.assertEqual(row["name"], "showrunner integrate")
 
     def test_cloud_full_tests_use_the_test_all_name_and_description(self) -> None:
-        page = self.gate_job_page("merge-gate", ("python3", "scripts/production/merge_gate.py", "--tests-only", "--full"))
+        page = self.gate_job_page("gate", ("python3", "scripts/production/gate.py", "--tests-only", "--full"))
         row, = [row for row in page["walk"] if row.get("kind") == "cloud"]
         self.assertEqual(row["name"], "devtools test all")
         self.assertEqual(row.get("about"), "Tests every module of devtools.")
@@ -2719,18 +2834,18 @@ process.stdout.write(JSON.stringify({
                                                 unit_labels.NoDirector())
         unknown = unit_labels.UnitLabels("unknown")
         for step, owner, expected in (
-            ("targeted-test", director, "panes"),
-            ("merge-gate", runner, "builds"),
-            ("merge-gate", director, "panes"),
-            ("merge-gate", merge_staff, "sdlc-merge-gate"),
-            ("merge-gate", unit_worker, "panes"),
-            ("merge-gate", runner_worker, "builds"),
-            ("targeted-test", unknown, "unknown"),
-            ("merge-gate", unknown, "unknown"),
-            ("targeted-test", unit_labels.UnitLabels("worker", "sdlc", "panes"), "panes"),
-            ("merge-gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "panes"),
-            ("targeted-test", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "sdlc"),
-            ("merge-gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "sdlc"),
+            ("test-affected", director, "panes"),
+            ("gate", runner, "builds"),
+            ("gate", director, "panes"),
+            ("gate", merge_staff, "sdlc-merge-gate"),
+            ("gate", unit_worker, "panes"),
+            ("gate", runner_worker, "builds"),
+            ("test-affected", unknown, "unknown"),
+            ("gate", unknown, "unknown"),
+            ("test-affected", unit_labels.UnitLabels("worker", "sdlc", "panes"), "panes"),
+            ("gate", unit_labels.UnitLabels("worker", "sdlc", "panes"), "panes"),
+            ("test-affected", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "sdlc"),
+            ("gate", unit_labels.UnitLabels("panes", "sdlc", "—", unit_labels.OwnerRole.UNIT), "sdlc"),
         ):
             with self.subTest(step=step, owner=owner):
                 page = self.cloud_owner_page(step, owner)
@@ -3242,27 +3357,31 @@ process.stdout.write(JSON.stringify({
 class BuildsPageProofTests(unittest.TestCase):
     def test_held_nightly_lease_selects_all_page_proof_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            _ = write_config_fixture(Path(directory) / "build_folders.conf")
             checkout = Path(directory) / "checkout"
             checkout.mkdir()
-            self.assertFalse(needs_all_page_proof_views(checkout))
-            _ = build_slots.lease_path(checkout).write_text(json.dumps({"work": "test-nightly"}), encoding="utf-8")
-            with checkout.with_name(checkout.name + ".lock").open("wb") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self.assertTrue(needs_all_page_proof_views(checkout))
-            self.assertFalse(needs_all_page_proof_views(checkout))
+            with mock.patch.dict(os.environ, {"CONF_DIR": directory}):
+                self.assertFalse(needs_all_page_proof_views(checkout))
+                _ = build_slots.lease_path(checkout).write_text(json.dumps({"work": "test-nightly"}), encoding="utf-8")
+                with checkout.with_name(checkout.name + ".lock").open("wb") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertTrue(needs_all_page_proof_views(checkout))
+                self.assertFalse(needs_all_page_proof_views(checkout))
 
     def test_builds_page_renders_the_queue_and_tooltips_in_chrome(self) -> None:
         source = Path(__file__).resolve()
-        all_views = needs_all_page_proof_views(source.parents[2])
         executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
         proof = source.with_name("memory_page_proof.mjs")
-        mode = [] if all_views else ["--gate"]
         environment = {**os.environ, "PYTHON": sys.executable}
         for setting in ("MEMORY_PAGE_SHOT", "SWAP_BEFORE_PAGE", "STEADY_BASELINE"):
             _ = environment.pop(setting, None)
         with tempfile.TemporaryDirectory(prefix="builds-page-proof-") as directory:
+            _ = write_config_fixture(Path(directory) / "build_folders.conf")
+            with mock.patch.dict(os.environ, {"CONF_DIR": directory}):
+                all_views = needs_all_page_proof_views(source.parents[2])
+            mode = [] if all_views else ["--gate"]
             result = subprocess.run([executable, str(proof), *mode, directory],
-                env={**environment, "TMPDIR": directory}, text=True, capture_output=True,
+                env={**environment, "CONF_DIR": directory, "TMPDIR": directory}, text=True, capture_output=True,
                 timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             verdict = cast(dict[str, object], json.loads(result.stdout.splitlines()[-1]))
@@ -3376,8 +3495,8 @@ def write_browser_fixture(folder: Path) -> None:
                 return model.names.shown(row.identity.step)
             naming = mock.patch.object(queue_view, "cloud_step_name", side_effect=recorded_name)
             with (naming if version == "before" else nullcontext()):
-                targeted = fixture.cloud_owner_page("targeted-test", director)
-                merge = fixture.cloud_owner_page("merge-gate", runner)
+                targeted = fixture.cloud_owner_page("test-affected", director)
+                merge = fixture.cloud_owner_page("gate", runner)
             targeted["walk"] = [row for page in (targeted, merge) for row in page["walk"] if row.get("kind") == "cloud"]
             targeted["waiters"] = [row for page in (targeted, merge) for row in page["waiters"] if row.get("kind") == "cloud"]
             pages[f"owner_names_{version}"] = json.loads(memory_feed.page_json(targeted))
@@ -3397,6 +3516,18 @@ def write_browser_fixture(folder: Path) -> None:
         pages["step_ci"] = json.loads(memory_feed.page_json(ci_page))
         pages["step_unknown"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(
             unit_labels.UnitLabels("unknown", "—", "owner not recorded"))))
+        verify_page = fixture.verify_call_page()
+        builder = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(),
+                                 current_session=staff.StaffId("builder"))
+        verify_page["staff_names"] = staff_names.StaffNames(staff.StaffSnapshot((builder,))).registry()
+        verified_waiter, = [row for row in verify_page["waiters"] if "verify" in row]
+        builder_unit = memory_feed.StaffUnitName(builder.name)
+        verified_waiter["unit"] = builder_unit
+        verified_waiter["title"]["unit"] = builder_unit
+        verified_waiter["detail"] = builder.name
+        verify_page["walk"].extend(row for row in fixture.mac_verify_call_page()["walk"]
+                                   if row.get("kind") == "mac-build" and "verify" in row)
+        pages["verify_calls"] = json.loads(memory_feed.page_json(verify_page))
         pages["macroute"] = json.loads(memory_feed.page_json(fixture.macroute_page()))
         pages["macroute_reason"] = json.loads(memory_feed.page_json(fixture.macroute_page(
             local_reason="it edits the merged checkout on natedev with mend and fmt, and the push goes from there")))

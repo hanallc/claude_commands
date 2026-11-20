@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import sys
@@ -1298,7 +1299,8 @@ class AccountsTests(unittest.TestCase):
                         _ = prompt.write_text("Check the saved dispatch.\n")
                         _ = (current_run / "progress_history_state.json").write_text(json.dumps({
                             "owner_staff_id": member.id, "pass": {},
-                            "phase": {"id": "8", "title": "Workers", "instance_id": "phase-eight", "status": "active"},
+                            "open_phases": [{"id": "8", "title": "Workers", "instance_id": "phase-eight",
+                                             "status": "active"}],
                             "history_file": str(current_run / "history.jsonl")}))
                         _ = progress_history.begin_dispatch(current_run, slot=target.name, phase="8", role="impl",
                             worker_name=target.name, worker_id=target.id, launcher_command=["assign.sh"],
@@ -8362,7 +8364,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
                     f"End your final reply with this line alone: DONE {instance}\n"
                     "A reply that waits on a detached run is not final.")
             progress_history.save_dispatch_delivery(self.run_dir, instance,
-                progress_history.DispatchDelivery(line, instance, str(self.root / "reply.md")))
+                pass_recorder.DispatchDelivery(line, instance, str(self.root / "reply.md")))
             backend = staff.backend(row)
             assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
             entry = ({"type": "event_msg", "payload": {"type": "user_message", "message": line}}

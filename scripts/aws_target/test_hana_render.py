@@ -46,6 +46,7 @@ UNSHIPPED_IMPORTS = {
     'copies/copies.py': {'lint/tmp_sweep.py', 'agents/remote.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'direct/local_release_wait.py': {'build_targets/build_targets.py', 'build_targets/targets.py', 'build_hold/build_hold.py'},
     'lib/build_folders.py': {'lib/descendants.py'},
+    'lib/python_startup/sitecustomize.py': {'lib/testing_folders.py'},
     'lib/scratch.py': {'direct/phase_table.py', 'production/proposals_table.py', 'production/unit_lookup.py',
         'production/production_doc.py', 'direct/plan_history.py', 'accounts/__init__.py', 'accounts/accounts.py'},
     'lib/unit_runs.py': {'direct/worker_state.py'},
@@ -292,10 +293,15 @@ class HanaRenderTests(unittest.TestCase):
                 + '"scripts.aws_target.hana_placement", "scripts.buildlog.transfer_bytes"))',
                 str(runtime)], cwd=runtime, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
-            launcher = subprocess.run([sys.executable, '-IB', 'runner.py', '--help'], cwd=runtime,
+            launcher = runtime / 'scripts/build_queue/program_start.py'
+            startup = subprocess.run([sys.executable, '-E', '-B', str(launcher)], cwd=runtime,
+                                     capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(startup.returncode, 2, startup.stdout + startup.stderr)
+            self.assertIn('program start: expected --program-start', startup.stderr)
+            help_run = subprocess.run([sys.executable, '-IB', 'runner.py', '--help'], cwd=runtime,
                                       capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(launcher.returncode, 0, launcher.stdout + launcher.stderr)
-            self.assertIn('--command-timeout-s', launcher.stdout)
+            self.assertEqual(help_run.returncode, 0, help_run.stdout + help_run.stderr)
+            self.assertIn('--command-timeout-s', help_run.stdout)
             for path in runtime.rglob('*'):
                 if path.is_file() and '__pycache__' not in path.parts:
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)

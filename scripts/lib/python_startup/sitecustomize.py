@@ -269,6 +269,16 @@ def kernel_guarded() -> bool:
         return False
 
 
+def gate_parent_pid(consume: bool = False) -> str:
+    """Read the gate parent and optionally clear both names before tests start."""
+    # Chunk 6 removes the old parent variable read.
+    parent = os.environ.get("GATE_PARENT_PID") or os.environ.get("MERGE_GATE_PARENT_PID", "")
+    if consume:
+        _ = os.environ.pop("GATE_PARENT_PID", None)
+        _ = os.environ.pop("MERGE_GATE_PARENT_PID", None)
+    return parent
+
+
 def _start_test_run(selected: str) -> None:
     classifier = _load_direct_test_starts()
     original = sys.orig_argv
@@ -294,7 +304,7 @@ def _start_test_run(selected: str) -> None:
             os.execv(sys.executable, [sys.executable, "-I", guard, "--", sys.executable, *original[1:]])
         except OSError as error:
             raise SystemExit(f"Bubblewrap tests: cannot start the launcher: {error}") from error
-    if os.environ.get("MERGE_GATE_PARENT_PID"):
+    if gate_parent_pid():
         return
     # Partial fixture checkouts can contain only the startup files.
     if not os.path.isfile(os.path.join(selected, "scripts/lib/testing_folders.py")):

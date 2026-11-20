@@ -175,6 +175,68 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='place']"), "1")
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']/span"), "first")
 
+    def test_verify_column_and_tooltip_use_the_recorded_call(self) -> None:
+        data: dict[str, object] = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
+            "walk": [{"name": "demo nextest", "queued": True, "started_at": 100, "used": 1,
+                      "reserved": 0, "counted": 1, "verify": {"verb": "final", "step": "nextest",
+                          "call": "verify final demo", "position": 2, "total": 2}}],
+            "waiters": [{"name": "demo clippy", "since": 100, "need": 1, "reason": "free memory",
+                         "verify": {"verb": "example", "step": "clippy", "position": 1, "total": 1,
+                                    "call": "verify example demo --name sample"}},
+                        {"name": "rust-analyzer", "since": 100, "need": 1, "reason": "free memory"},
+                        {"name": "demo check", "unit": "builder", "detail": "checkout",
+                         "since": 100, "need": 1,
+                         "why": "the build in the same Cargo folder",
+                         "reason": "waits for the build in the same Cargo folder",
+                         "verify": {"verb": "check", "step": "check", "position": 1, "total": 1,
+                                    "call": "verify check demo"}},
+                        {"kind": "repository-slot", "name": "demo build", "unit": "builder",
+                         "since": 100, "need": 0, "reason": "waits for a free slot",
+                         "verify": {"verb": "build", "step": "build", "position": 1, "total": 1,
+                                    "call": "verify build demo"}}]}
+        rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        self.assertEqual([cell.text for cell in root.findall(".//th[@class='verify']")], ["Verify", "Verify"])
+        for key, verb, step, call in (
+            ("row:fixture-run-0", "final", "nextest (2 of 2)", "verify final demo"),
+            ("wait:fixture-wait-0", "example", "clippy", "verify example demo --name sample"),
+            ("wait:fixture-wait-1", "", "", ""),
+            ("wait:fixture-wait-2", "check", "check", "verify check demo"),
+            ("wait:fixture-wait-3", "build", "build", "verify build demo"),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(root.findtext(f".//tr[@data-tip='{key}']/td[@class='verify']"), verb)
+                tip = str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
+                grid = ElementTree.fromstring(tip)
+                labels = {cell.text: grid[index + 1].text for index, cell in enumerate(grid) if cell.tag == "dt"}
+                if verb:
+                    self.assertEqual(labels["Step"], step)
+                    self.assertEqual(labels["Call"], call)
+                    self.assertEqual(grid[-2].text, "Call")
+                    self.assertEqual(grid[-1].get("class"), "call group")
+                else:
+                    self.assertNotIn("Step", labels)
+                    self.assertNotIn("Call", labels)
+        self.assertEqual(root.findtext(".//div[@data-tip='wait:fixture-wait-2']//span[@class='wait-note']"),
+                         "waits for the build in the same Cargo folder")
+        for key, name in (("wait:fixture-wait-2", "demo check"), ("wait:fixture-wait-3", "demo build")):
+            row = root.find(f".//tr[@data-tip='{key}']")
+            assert row is not None
+            self.assertEqual(row.findtext("th[@class='step']/span"), name)
+            self.assertEqual(row.findtext("td[@class='unit']/span"), "builder")
+
+    def test_unavailable_memory_keeps_the_verify_tooltip_fields(self) -> None:
+        verify = {"verb": "final", "step": "nextest", "position": 2, "total": 2, "call": "verify final demo"}
+        data = {"walk": [{"kind": "mac-build", "name": "demo nextest", "used": {"kind": "MacMemoryUnavailable"},
+                          "verify": verify}],
+                "waiters": [{"name": "demo nextest", "head_room": {"unavailable": True}, "verify": verify}]}
+        for key in ("row:fixture-run-0", "wait:fixture-wait-0"):
+            with self.subTest(key=key):
+                rows = cast(list[dict[str, object]], self.page_expression(f"tooltipRows('{key}', data)", data))
+                self.assertEqual([(row["label"], row["value"]) for row in rows],
+                                 [("demo nextest", "unavailable"), ("Step", "nextest (2 of 2)"),
+                                  ("Call", "verify final demo")])
+
     def test_the_done_column_uses_each_counter_and_preserves_unknown_progress(self) -> None:
         for phase, unit, done, total, percent, expected in (
             ("building", "units", 7, 10, 70, "70.0%"),
@@ -272,7 +334,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(amounts["= In queue cap"], "5.2 GiB")
 
     def test_a_queued_run_hover_says_its_use_need_room_and_progress(self) -> None:
-        row = memory_tests.ProgressKeepAsideTests.reservation("merge-gate", need=4 * GIB)
+        row = memory_tests.ProgressKeepAsideTests.reservation("gate", need=4 * GIB)
         memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))
         adjusted = gate.progress_memory(row, memory, gate.AttributedStepUse(memory.anonymous, True),
             progress.ProgressCounter("suites:1", 8, 10), memory_tests.ProgressKeepAsideTests.profile("suites:1", 3 * GIB // 2),
@@ -287,10 +349,10 @@ class MemoryHoverTests(unittest.TestCase):
         test_counter: memory_feed.RowProgress = {**module_counter, "unit": "tests"}
         hold = room.runs[0]
         for name, counter, ordering_note in (
-            ("merge-gate", module_counter, True),
+            ("gate", module_counter, True),
             ("merge gate", module_counter, True),
             ("fixture-project merge gate", module_counter, True),
-            ("merge-gate", test_counter, False),
+            ("gate", test_counter, False),
         ):
             with self.subTest(name=name, unit=counter["unit"]):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"read_at": 400, "walk": [{
@@ -310,7 +372,7 @@ class MemoryHoverTests(unittest.TestCase):
                               ({"used": 1, "reserved": 0, "started_at": 100}, "running 5 min")):
             with self.subTest(row=row):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"read_at": 400, "walk": [{
-                    "name": "merge-gate", "unit": "fixture", "queued": True, "keep_text": "", "counted": 1,
+                    "name": "gate", "unit": "fixture", "queued": True, "keep_text": "", "counted": 1,
                     "need": 4.0, "need_part": False, **row}]}))
                 self.assertIn(expected, hover[0])
                 if expected == "unavailable":
@@ -357,6 +419,27 @@ class MemoryHoverTests(unittest.TestCase):
                 fields = [(cell.text, grid[index+1].text) for index, cell in enumerate(grid) if cell.tag == "dt"]
                 self.assertEqual(fields[1:3], [("Changes", "sdlc branch"), ("Showrunner", "builds")])
 
+    def test_fixed_final_route_names_natedev_and_its_reason_in_the_tooltip(self) -> None:
+        from datetime import UTC
+        from scripts.build_queue import admission_client, execution_identity, placement, target_availability
+        from scripts.build_targets import target_config
+        from scripts.mac_test import claim_state
+        from scripts.build_hold.owning_session import NoOwningSession
+
+        mac = placement.PlacementDestination("mac", "mac", "fixture-mac", claim_state.WHOLE_MAC)
+        local = placement.PlacementDestination("local", "natedev", "fixture-local", claim_state.WHOLE_MAC)
+        constraints = placement.PlacementConstraints(execution_identity.SourceKeyKnown("source"), ("cargo", "check"),
+            "/fixture", "", NoOwningSession(), (placement.PlacementCandidate(mac,
+                placement.FixedExclusion("full gate runs on natedev")), placement.PlacementCandidate(local)))
+        route = admission_client.constrained_step_route(target_config.ANY_ELIGIBLE_TARGET, constraints)
+        shown = memory_feed.step_runs_on(route, target_availability.MacRoutes((), {}, UTC), "check", "/fixture", "")
+        data = {"read_at": 200, "waiters": [{"name": "cargo-liner check", "since": 100, "need": 5,
+            "runs_on": shown.text(), "because": shown.reason}]}
+        hover = str(self.page_expression("tipText('wait:fixture-wait-0', data)", data))
+        self.assertIn("Runs on  natedev only", hover)
+        self.assertIn("full gate runs on natedev", hover)
+        self.assertNotIn("natedev or Mac", hover)
+
     def test_a_ci_hover_keeps_its_ci_line(self) -> None:
         data = {"read_at": 200, "walk": [{"name": "hana CI", "ci": True, "ci_label": "hana CI · runner-1",
                 "detail": "busy", "unit": "", "keep_text": "", "runner": "unknown"}]}
@@ -380,7 +463,7 @@ class MemoryHoverTests(unittest.TestCase):
                                  ("setup", progress.NoCounter("no cloud counter")), ("", progress.NoCounter("no cloud counter"))):
             with self.subTest(status=status):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"walk": [{
-                    "kind": "cloud", "machine": "aws", "name": "merge-gate", "unit": "cloud-unit", "showrunner": "fixture",
+                    "kind": "cloud", "machine": "aws", "name": "gate", "unit": "cloud-unit", "showrunner": "fixture",
                     "status": status, "activity": status, "progress": memory_feed.cloud_row_progress(counter)}]}))
                 self.assertIn("Showrunner  fixture\nRuns on  AWS", hover[1])
                 self.assertEqual("Status  " in hover[1], bool(status))
@@ -457,7 +540,7 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Done", "Step", "Dur", "Unit", "Pid", "Target", "vCPU", "Slot", "Tokens"])
+                                 ["Stage", "Done", "Step", "Dur", "Verify", "Unit", "Pid", "Target", "vCPU", "Slot", "Tokens"])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:fixture-run-{index}']")
@@ -474,7 +557,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(len(spacers), 1)
                 if waiting:
                     self.assertEqual([cell.text for cell in queue_headers[0]],
-                                     ["#", "Done", "Step", "Waiting", "Unit", "Pid", "Target", "vCPU"])
+                                     ["#", "Done", "Step", "Waiting", "Verify", "Unit", "Pid", "Target", "vCPU"])
                     self.assertTrue(all(cell.get("scope") == "col" for cell in queue_headers[0]))
                     for index, expected in enumerate(("1", "cloud", "2")):
                         row = table.find(f"./tbody/tr[@data-tip='wait:fixture-wait-{index}']")
@@ -550,8 +633,9 @@ class MemoryHoverTests(unittest.TestCase):
         root = ElementTree.fromstring(f"<root>{result[0]}</root>")
         row = root.find(".//tr[@data-tip='row:fixture-run-0']")
         assert row is not None
-        self.assertEqual([row[index].text for index in (0, 3, 5, 7)], ["—", "—", "—", "—"])
-        self.assertEqual(row[4][0].text, "—")
+        for column in ("place", "duration", "pid", "vcpus"):
+            self.assertEqual(row.findtext(f"td[@class='{column}']"), "—")
+        self.assertEqual(row.findtext("td[@class='unit']/span"), "—")
         self.assertEqual(result[1].count("unavailable"), 1)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:

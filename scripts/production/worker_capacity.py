@@ -20,11 +20,12 @@ except FileNotFoundError:
 
 import sys
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
 from scripts.agents import detached_runs, restart
-from scripts.direct import progress_history
+from scripts.direct import progress_history, recorder_state
 from scripts.herdr import herdr, herdr_types, worker_panes
 from scripts.lib import conf
 from scripts.production import broadcast, session_staff, showrunners, staff
@@ -85,6 +86,14 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
         if isinstance(hold, worker_panes.Kept):
             return WorkerNotStopped(row.name, hold.blocker)
         state = _observe(parent, row)
+        if isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
+            return WorkerNotStopped(row.name, state.reason)
+        try:
+            run = worker_panes.worker_run(row)
+            with suppress(FileNotFoundError):
+                _ = recorder_state.read_state(run / recorder_state.STATE_FILENAME)
+        except recorder_state.OldRecorderState as error:
+            return WorkerNotStopped(row.name, str(error))
         process: Literal["stopped", "absent"] = "absent"
         for _ in range(STOP_ATTEMPTS):
             if not isinstance(state, worker_panes.OpenWorker):
@@ -96,11 +105,10 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
             return WorkerNotStopped(row.name, state.reason)
         if isinstance(state, worker_panes.OpenWorker):
             return WorkerNotStopped(row.name, "the stop did not prove that the worker stopped")
-        run = worker_panes.worker_run(row)
         canceled: int | PassesNotCanceled
         try:
             canceled = progress_history.cancel_worker_passes(run, row.id)
-        except (OSError, ValueError, SystemExit) as error:
+        except (OSError, ValueError, SystemExit, recorder_state.OldRecorderState) as error:
             canceled = PassesNotCanceled(" ".join(str(error).split()))
         runs = run / detached_runs.DETACHED_RUNS_DIR
         detached = tuple(f"{record['run_id']}: result {runs / (record['run_id'] + '.json')}; log {record['log']}"
@@ -110,7 +118,7 @@ def stop_worker(parent: staff.StaffRow, row: staff.StaffRow, client: herdr.Herdr
             # The stop is complete here. The pane closes only when the close checks permit it.
             try:
                 closed = worker_panes.close(parent.id, name, lock=hold)
-            except (herdr_types.HerdrFailure, OSError, ValueError) as error:
+            except (herdr_types.HerdrFailure, OSError, ValueError, recorder_state.OldRecorderState) as error:
                 closed = worker_panes.UncertainWorker(row, " ".join(str(error).split()))
             if isinstance(closed, worker_panes.Kept):
                 pane = PaneOpen("kept", closed.blocker)
@@ -185,7 +193,8 @@ def stop() -> int:
                         progress_history.NoActiveDispatch):
                     continue
                 outcomes.append(stop_worker(parent, state.row, client))
-            except (herdr_types.HerdrFailure, staff.StaffRefused, OSError, ValueError) as error:
+            except (herdr_types.HerdrFailure, staff.StaffRefused, OSError, ValueError,
+                    recorder_state.OldRecorderState) as error:
                 outcomes.append(WorkerNotStopped(state.row.name, " ".join(str(error).split())))
         faults.extend(_fault_lines(parent, outcomes))
         if text := report_text(outcomes):

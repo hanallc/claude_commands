@@ -61,9 +61,10 @@ A pre-tool hook permits one `SendMessage` call with the private address and expe
 The proxy buffers the request until the relay closes its write side.
 Before it writes any bytes, the proxy compares the decoded body with the exact encoding of the approved text.
 The encoder matches the two tag escape passes in Claude Code 2.1.319.
-The sender keeps the original approved text for the tool result check.
-The sender requires a complete forward of the approved payload and one explicit success result for the approved tool ID.
-A possible write without this evidence leaves the delivery unconfirmed and retains the claim.
+The sender uses the tool ID from the completed proxy write to find the approved call and its result.
+The sender requires a complete forward of the approved text and one explicit success result for that tool ID.
+The `SENT` line reports how many SendMessage calls the relay made and that the proxy forwarded one.
+A possible write without confirmed acceptance leaves delivery unconfirmed and retains the claim.
 Claude's socket protocol has no expected conversation field.
 The race window extends from the final registry check until the receiver accepts the request.
 The sender closes its cleanup pipe on exit. The cleanup process removes the private directory.
@@ -337,7 +338,7 @@ New escalate holds retain their registered template and values.
   The result requires no action. The failure text includes an action.
   The gate says the next nightly run tries again. The cold credentials example directs the user to run `github-warmup`.
   Silence keeps only the newest push and delivers it when silence ends.
-  The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `merge_gate.conf` at use.
+  The gate reads `nightly_result_push=on` and `nightly_result_modules=8` from `gate.conf` at use.
   `off` disables both pushes. The module limit controls how many failed modules the result names.
   A run that never reaches merge_gate.py sends no push unless the timer script sends one.
 - `auto_mode.refused` has need `decision`. Auto mode refuses commands; the session continues its other work.

@@ -13,7 +13,6 @@ import multiprocessing
 from multiprocessing.connection import Connection
 import os
 import pathlib
-import re
 import shlex
 import shutil
 import signal
@@ -36,8 +35,9 @@ from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
 from scripts.build_queue.admission_wire import CloudGroup, Owner
-from scripts.production import merge_gate
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib.git_test_support import write_fixture_git_config
+from scripts.lint.memory_test_support import config_environment
+from scripts.production import gate
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -47,8 +47,27 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 class GuestTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
+        _ = (root / 'cloud_gate.conf').write_text(
+            'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
+            + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux\n')
+        _ = (root / 'test_times.conf').write_text(
+            '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
+            + '# whole: 1..\nTOP_RUNS=5\n')
+        _ = (root / 'gate.conf').write_text('# range: 1..\nGATE_TIME_LIMIT_FACTOR=1.5\n')
+        _ = (root / 'buildlog.conf').write_text(
+            '# range: 0..\nINDEX_UNUSED_DAYS=2\n'
+            + '# range: 0..\nINDEX_TOUCH_MINUTES=60\n'
+            + '# whole: 1..\nINDEX_SPILL_PAGES=65536\n')
+        _ = (root / 'build_folders.conf').write_text(
+            f'roots.system={root}\nroots.gate={root}\n'
+            + '# whole: 1..\nnames.suffix_length=8\n'
+            + 'names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_\n'
+            + 'patterns.legacy-unique={purpose}{suffix}\n'
+            + 'patterns.tool={purpose}{suffix}\n'
+            + '# range: 0.001..60\nlocks.probe_wait_seconds=0.25\n'
+            + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
 
     def test_user_data_fits_ec2_limit_with_module_times_and_400_character_signed_links(self) -> None:
         prefix = 'https://fixture.invalid/object?X-Amz-Signature='
@@ -209,15 +228,21 @@ class GuestTests(unittest.TestCase):
             modules = [('fixture', suite / 'test_stuck.py'), ('fixture', suite / 'test_broken.py')]
             uploads: dict[str, bytes] = {}
             timings = {'fixture/test_stuck.py': 20.0, 'fixture/test_broken.py': 1.0}
-            def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            real_run = subprocess.run
+            def transport(arguments: Sequence[str], **options: object
+                          ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+                if arguments[0] == 'awk':
+                    return real_run(arguments, input=cast(bytes, options['input']), stdout=subprocess.PIPE, check=True)
                 if arguments[0] == 'curl':
                     self.assertIn(arguments[arguments.index('--max-time') + 1], ('30', '60'))
-                    url = next(word for word in arguments if word.startswith('https://'))
-                    if '-o' in arguments:
+                    configuration = Path(arguments[arguments.index('--config') + 1])
+                    url = cast(str, json.loads(configuration.read_text().partition('= ')[2]))
+                    if '-X' not in arguments:
                         content = json.dumps(timings).encode() if url == links['module_seconds'] else b'fixture bundle'
                         _ = Path(arguments[arguments.index('-o') + 1]).write_bytes(content)
                     else:
                         uploads[url] = cast(bytes, options['input'])
+                    return subprocess.CompletedProcess(arguments, 0, b'200')
                 return subprocess.CompletedProcess(arguments, 0, 'version', '')
             code = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root)))
             candidate = gate_box.CANDIDATE_GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/proc/stat'", repr(str(root / 'stat')))
@@ -225,9 +250,9 @@ class GuestTests(unittest.TestCase):
             _ = (repo / 'scripts/aws_target/gate_box.py').write_text('fixture candidate')
             _ = (root / 'stat').write_text('cpu 100 0 100 10000 1000 0 0 0 9999 9999\n')
             _ = (root / 'meminfo').write_text('MemTotal: 1000000 kB\nMemAvailable: 200000 kB\n')
-            original_reap = merge_gate.reap_gate_job
+            original_reap = gate.reap_gate_job
             broken_finished = False
-            def reap(job: merge_gate.RunningGateJob, *, block: bool = False) -> None:
+            def reap(job: gate.RunningGateJob, *, block: bool = False) -> None:
                 nonlocal broken_finished
                 original_reap(job, block=block)
                 if job.module == 'test_broken.py' and job.process.returncode is not None:
@@ -236,32 +261,33 @@ class GuestTests(unittest.TestCase):
                         job.process.returncode is None and not job.killed_for):
                     self.assertEqual(ready.recv(5), b'ready')
                     job.started = time.monotonic() - module_limit_s
-            original_run = merge_gate.run_suites
-            def run_suites(repo: Path, *, full: bool, machine: merge_gate.WholeMachine,
-                           module_time_limit_s: float) -> merge_gate.GateRun:
+            original_run = gate.run_suites
+            def run_suites(repo: Path, *, full: bool, machine: gate.WholeMachine,
+                           module_time_limit_s: float) -> gate.GateRun:
                 self.assertEqual(machine.module_seconds, timings)
                 run = original_run(repo, full=full, machine=machine, module_time_limit_s=module_time_limit_s)
                 _ = (root / 'stat').write_text('cpu 500 0 100 20000 5000 0 0 400 20000 20000\n')
                 return run
-            with (mock.patch.dict(os.environ, {'MERGE_GATE_BASEDPYRIGHT': str(types), 'MERGE_GATE_PYTHON': sys.executable,
-                                                 'GATE_BOX_DIR': str(root), 'box_dir': str(root)}),
+            with (mock.patch.dict(os.environ, {'GATE_BASEDPYRIGHT': str(types), 'GATE_PYTHON': sys.executable,
+                                                 'GATE_BOX_DIR': str(root), 'box_dir': str(root),
+                                                 'BUILDLOG_DIR': str(root / 'buildlog')}),
                   mock.patch.object(sys, 'path', list(sys.path)),
                   mock.patch.object(gate_box, 'CANDIDATE_GUEST', candidate),
                   mock.patch.object(gate_box, '__file__', str(repo / 'scripts/aws_target/gate_box.py')),
                   mock.patch.object(Path, 'home', return_value=root),
                   mock.patch('subprocess.run', side_effect=transport),
                   mock.patch('os.cpu_count', return_value=2),
-                  mock.patch.object(merge_gate, 'reap_gate_job', side_effect=reap),
-                  mock.patch.object(merge_gate, 'run_suites', side_effect=run_suites),
-                  mock.patch.object(merge_gate, 'module_runner', return_value=runner),
-                  mock.patch.object(merge_gate, 'discover_test_modules', return_value=modules) as discover,
-                  mock.patch.object(merge_gate, 'BuildHoldWait', side_effect=AssertionError('hold read')),
-                  mock.patch.object(merge_gate, 'gate_reservation', side_effect=AssertionError('admission')),
-                  mock.patch.object(merge_gate, 'shared_cpu_pool', side_effect=AssertionError('CPU pool')),
-                  mock.patch.object(merge_gate, 'suite_scope_prefix', side_effect=AssertionError('scope')),
-                  mock.patch.object(merge_gate, 'merge_gate_governor_gib', side_effect=AssertionError('governor')),
-                  mock.patch.object(merge_gate, 'gate_state_dir', side_effect=AssertionError('test ledger')),
-                  mock.patch.object(merge_gate, 'typecheck_python', side_effect=AssertionError('type preparation during tests-only trial'))):
+                  mock.patch.object(gate, 'reap_gate_job', side_effect=reap),
+                  mock.patch.object(gate, 'run_suites', side_effect=run_suites),
+                  mock.patch.object(gate, 'module_runner', return_value=runner),
+                  mock.patch.object(gate, 'discover_test_modules', return_value=modules) as discover,
+                  mock.patch.object(gate, 'BuildHoldWait', side_effect=AssertionError('hold read')),
+                  mock.patch.object(gate, 'gate_reservation', side_effect=AssertionError('admission')),
+                  mock.patch.object(gate, 'shared_cpu_pool', side_effect=AssertionError('CPU pool')),
+                  mock.patch.object(gate, 'suite_scope_prefix', side_effect=AssertionError('scope')),
+                  mock.patch.object(gate, 'merge_gate_governor_gib', side_effect=AssertionError('governor')),
+                  mock.patch.object(gate, 'gate_state_dir', side_effect=AssertionError('test ledger')),
+                  mock.patch.object(gate, 'typecheck_python', side_effect=AssertionError('type preparation during tests-only trial'))):
                 previous = Path.cwd()
                 try:
                     exec(compile(code, '<guest>', 'exec'), {})
@@ -340,11 +366,11 @@ class PairedTrialTests(CostFixture):
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
+        for name in tuple(os.environ):
+            if name in ('GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS') or name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')):
+                del os.environ[name]
+        os.environ['GIT_CONFIG_GLOBAL'] = str(write_fixture_git_config(self.root))
         shipped = Path(__file__).resolve().parents[2]
-        # The fixture pins its branch prefix, so a tuned live prefix changes no test.
-        _ = (self.root / 'cloud_gate.conf').write_text(re.sub(
-            r'(?m)^trial_branch_prefix=.*$', 'trial_branch_prefix=gate-trial',
-            (shipped / 'config/cloud_gate.conf').read_text()))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
@@ -381,8 +407,17 @@ class Sample(unittest.TestCase):
         self.changed = trial.checked_git(self.repo, 'rev-parse', 'HEAD')
         self.origin = self.root / 'origin.git'
         _ = subprocess.run(['git', 'clone', '--bare', str(self.repo), str(self.origin)], check=True, capture_output=True)
-        path = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(path, f'clone_url={self.origin}\n')
+        _ = (self.root / 'cloud_gate.conf').write_text(
+            f'clone_url={self.origin}\n'
+            + f'credential_file={self.root / "credentials"}\n'
+            + 'regions=us-east-2 us-west-2\n'
+            + 'trial_branch_prefix=gate-trial\n'
+            + '# whole: 1..9\nslots=9\n'
+            + '# whole: 1..60\nlifetime_minutes=20\n'
+            + '# range: 0.01..300\ngit_network_timeout_s=60\n'
+            + '# range: 1..3600\nmodule_time_limit_s=1800\n'
+            + '# range: 1..600\ntermination_timeout_s=120\n'
+            + '# range: 1..120\napi_timeout_s=30\n')
 
     def test_expired_sweep_preserves_a_racing_coordinator_termination(self) -> None:
         now = 1700000000
@@ -567,7 +602,7 @@ class Sample(unittest.TestCase):
         before = self.remote_branches()
         config = self.root / 'cloud_gate.conf'
         lifetime = 5
-        _ = write_config_fixture(config, f'lifetime_minutes={lifetime}\n')
+        _ = config.write_text(config.read_text().replace('lifetime_minutes=20', f'lifetime_minutes={lifetime}'))
 
         def first_service(_command: Sequence[str], _unit: str) -> int:
             live = self.remote_branches()
@@ -575,7 +610,7 @@ class Sample(unittest.TestCase):
             folder = next((self.state / 'paired-trials').iterdir())
             request = cloud_gate.read(next(folder.glob('*/request.json')))
             self.assertEqual(request['expires'], now + lifetime * 60)
-            _ = write_config_fixture(config, 'lifetime_minutes=1\n')
+            _ = config.write_text(config.read_text().replace(f'lifetime_minutes={lifetime}', 'lifetime_minutes=1'))
 
             def second_service(_command: Sequence[str], _unit: str) -> int:
                 remote = self.remote_branches()
@@ -888,8 +923,11 @@ else:
         tools.mkdir()
         curl = tools / 'curl'
         _ = curl.write_text(f'''#!{sys.executable}
-import os, pathlib, sys
-pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buffer.read())
+import json, pathlib, sys
+config = pathlib.Path(sys.argv[sys.argv.index('--config') + 1])
+name = json.loads(config.read_text().partition('= ')[2])
+pathlib.Path({str(box)!r}, 'uploaded-' + name).write_bytes(sys.stdin.buffer.read())
+print('200', end='')
 ''')
         curl.chmod(0o755)
         _ = (box / 'guest.py').write_text(gate_box.GUEST)
@@ -1059,7 +1097,7 @@ pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buf
         events: list[object] = []
 
         @contextmanager
-        def reserve(repo: Path, path: Path, job: merge_gate.SuiteMode | StepJob, *,
+        def reserve(repo: Path, path: Path, job: gate.SuiteMode | StepJob, *,
                     group: CloudGroup) -> Generator[cloud_gate.CloudReservation]:
             self.assertEqual((repo, path, job, group),
                 (folder, sidecar, trial.PAIRED_TRIAL_JOB, trial_group))
