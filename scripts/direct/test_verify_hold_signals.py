@@ -17,6 +17,7 @@ from unittest import mock
 
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.process_group import send_process_group
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.direct.verify_hold_wait_test_support import (
@@ -153,24 +154,25 @@ read -r command
         observation = self.observe_waits()
         pid_saved, ready, exited = self.observe_step_hold_waiter()
         process = self.start("final")
-        self.wait_for_call(process)
-        wait_for_verify_state(lambda: pid_saved.exists() and (ready.exists() or exited.exists()),
-                              ready.parent, process, "the first step hold waiter became ready or exited")
+        wait_for_verify_state(pid_saved.exists, pid_saved.parent, process, "verify saved the step hold waiter PID")
         pid = int(pid_saved.read_text().splitlines()[0])
-        if not ready.exists():
-            self.fail(f"Step hold waiter PID {pid} exited without a ready marker")
-
-        early_exit = f"Step hold waiter PID {pid} exited after its ready marker"
         try:
             descriptor = os.pidfd_open(pid)
         except ProcessLookupError:
-            self.fail(early_exit)
+            state = "after its ready marker" if ready.exists() else "without a ready marker"
+            self.fail(f"Step hold waiter PID {pid} exited {state}")
         try:
-            self.assertFalse(select.select([descriptor], [], [], 0)[0], early_exit)
+            wait_for_verify_state(lambda: ready.exists() or exited.exists(), ready.parent, process,
+                                  "the first step hold waiter became ready or exited")
+            if not ready.exists():
+                self.fail(f"Step hold waiter PID {pid} exited without a ready marker")
+            self.wait_for_call(process)
+            self.assertFalse(select.select([descriptor], [], [], 0)[0],
+                             f"Step hold waiter PID {pid} exited after its ready marker")
             process.send_signal(signal.SIGTERM)
             code, output = self.finish(process)
-            self.assertTrue(select.select([descriptor], [], [], 0)[0],
-                            f"Step hold waiter PID {pid} stayed alive after verify exited\n{output}")
+            self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0],
+                            f"Step hold waiter PID {pid} did not exit before the hang guard expired\n{output}")
         finally:
             os.close(descriptor)
         self.assertEqual(pid_saved.read_text().splitlines(), [str(pid)], f"A second step waiter started\n{output}")
