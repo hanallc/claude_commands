@@ -829,6 +829,14 @@ class StylePlanFixture(unittest.TestCase):
         style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
 
     def reference_gate(self, ticket: str) -> tuple[int, str]:
+        try:
+            with style_ledger.open_ledger(self.repo) as ledger:
+                if ledger.ticket_get(ticket)["state"] == "queued":
+                    ledger.ticket_assign(ticket, "main")
+        except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun) as error:
+            return 2, f"error: {error}\n"
+        except ValueError as error:
+            return 1, f"review: {error}\n"
         output = io.StringIO()
         with redirect_stdout(output):
             result = style_plan.gate(self.repo, ticket)

@@ -74,6 +74,81 @@ class TheListTests(unittest.TestCase):
         return the_list.add(MORTY.id, title, owner=RUNNER.id, source="nate", number=number,
                             changes=changes if changes is not None else {})
 
+    def test_log_field_changes_replays_linked_delivery(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        delivered = the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered("sdlc/C1"))
+        update = the_list.FieldChange("Updated", {"state": the_list.ItemState.DELIVERED, "next_step": "Read the page."})
+        item = replace(item, log=(*item.log, the_list.ItemChange(START, delivered, "the List"),
+                                  the_list.ItemChange(START, update, "morty")))
+        self.assertEqual(list(the_list.log_field_changes(item))[-2:], [{}, {"next_step": "Read the page."}])
+
+    def test_log_field_changes_replays_legacy_reopened(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        _ = path.write_text(path.read_text().rstrip("\n")
+            + '\n- 2026-11-16 18:10:00+00:00 Closed: Done. — nate\n'
+            + '- 2026-11-16 18:20:00+00:00 Reopened — nate\n'
+            + '- 2026-11-16 18:30:00+00:00 Updated state: "New"; next_step: "Read the page." — morty\n')
+        restored = the_list.load(MORTY.id, item.id)
+        self.assertEqual(list(the_list.log_field_changes(restored))[-1], {"next_step": "Read the page."})
+
+    def test_log_field_changes_replays_the_saved_requester(self) -> None:
+        for requester in the_list.RequestedBy:
+            with self.subTest(requester=requester):
+                item = the_list.add(MORTY.id, "Track the requester", owner=RUNNER.id, source="nate",
+                                    requested_by=requester, changes={})
+                _ = the_list.update(MORTY.id, item.id, {"requested_by": requester, "next_step": "Read the page."},
+                                    source="morty")
+                added, updated = the_list.log_field_changes(the_list.load(MORTY.id, item.id))
+                self.assertEqual(added["requested_by"], requester)
+                self.assertEqual(updated, {"next_step": "Read the page."})
+
+    def test_log_field_changes_uses_defaults_for_fields_that_legacy_added_omits(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        header, marker, _ = path.read_text().partition("## Log\n\n")
+        _ = path.write_text(header + marker
+            + '- 2026-11-16 18:00:00+00:00 Added; title: "Deliver the page" — nate\n'
+            + '- 2026-11-16 18:10:00+00:00 Updated evidence: "" — morty\n')
+        added, updated = the_list.log_field_changes(the_list.load(MORTY.id, item.id))
+        self.assertEqual(added, {"title": item.title})
+        self.assertEqual(updated, {})
+
+    def test_log_field_changes_shows_only_the_append_after_legacy_evidence_cleanup(self) -> None:
+        item = self.add(changes={"evidence": "Keep this line.\nMigration copy."})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        _ = path.write_text(path.read_text().rstrip("\n")
+            + "\n- 2026-11-16 18:10:00+00:00 Removed the migration copy of checkins.json from Evidence — morty\n"
+            + r'- 2026-11-16 18:20:00+00:00 Updated evidence: "Keep this line.\nAppended line." — morty' + "\n")
+        changes = list(the_list.log_field_changes(the_list.load(MORTY.id, item.id)))
+        self.assertEqual(changes[1:], [{}, {"evidence": "Appended line."}])
+
+    def test_log_field_changes_shows_only_added_evidence_lines_in_order(self) -> None:
+        item = self.add(changes={"evidence": "Keep this line.\nRemove this line."})
+        _ = the_list.update(MORTY.id, item.id,
+                            {"evidence": "First addition.\nKeep this line.\nSecond addition."}, source="morty")
+        updated = the_list.update(MORTY.id, item.id, {"evidence": "Keep this line."}, source="morty")
+        changes = list(the_list.log_field_changes(updated))
+        self.assertEqual(changes[1:], [{"evidence": "First addition.\nSecond addition."}, {}])
+
+    def test_log_field_changes_ignores_evidence_line_ending_changes(self) -> None:
+        item = self.add(changes={"evidence": "First line.\r\nSecond line.\r\n"})
+        _ = the_list.update(MORTY.id, item.id, {"evidence": "First line.\nSecond line.\n"}, source="morty")
+        added, updated = the_list.log_field_changes(the_list.load(MORTY.id, item.id))
+        self.assertEqual(added["evidence"], "First line.\r\nSecond line.\r\n")
+        self.assertEqual(updated, {})
+
+    def test_log_field_changes_shows_the_first_requester_after_legacy_added_omits_it(self) -> None:
+        item = self.add(changes={"requested_by": the_list.RequestedBy.DWIGHT})
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        header, marker, _ = path.read_text().partition("## Log\n\n")
+        _ = path.write_text(header + marker
+            + '- 2026-11-16 18:00:00+00:00 Added; title: "Deliver the page" — nate\n'
+            + '- 2026-11-16 18:10:00+00:00 Updated requested_by: "nate" — morty\n'
+            + '- 2026-11-16 18:20:00+00:00 Updated requested_by: "nate" — morty\n')
+        changes = list(the_list.log_field_changes(the_list.load(MORTY.id, item.id)))
+        self.assertEqual(changes[1:], [{"requested_by": the_list.RequestedBy.NATE}, {}])
+
     def test_commands_preserve_fields_text_and_history(self) -> None:
         content = "Use the result.\r\n\n\n## Latest status\n\nThis heading stays in the text.\n"
         self.enterContext(patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))

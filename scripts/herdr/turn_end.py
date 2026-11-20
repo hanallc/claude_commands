@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, cast
 
 from scripts.agents import detached_runs, shutdown_record, worker_lifecycle
-from scripts.direct import progress_history
+from scripts.direct import progress_history, recorder_state
 from scripts.herdr import herdr_types
 from scripts.lib import atomic_file, scratch, unit_runs
 from scripts.herdr import herdr, worker_panes
@@ -392,6 +392,7 @@ def _submit_stage(parent: staff.StaffRow, row: staff.StaffRow, state: worker_pan
             print(str(error), file=sys.stderr)
             result = worker.ExitCode.UNCERTAIN
     if result is worker.DispatchSubmission.SUBMITTED:
+        progress_history.confirm_assignment_submission(run, instance, delivery.completion_id)
         return TurnOutcome.SUBMITTED
     outcome = TurnOutcome.BUSY if result == worker.ExitCode.BUSY else TurnOutcome.UNCERTAIN
     details = diagnostics.getvalue().strip() or f"Stage 2 submission returned {result}"
@@ -675,9 +676,13 @@ class WorkerByThread(Enum):
 
 def handle(event: WorkerEvent, *, owner: staff.StaffId | WorkerByThread = WorkerByThread.LOOKUP) -> TurnOutcome:
     """Send the decided notice after releasing the worker lock."""
-    decision = _handle_locked(event, owner)
-    if isinstance(decision, TurnDecision):
-        return decision.send_notice() or decision.outcome
+    try:
+        decision = _handle_locked(event, owner)
+        if isinstance(decision, TurnDecision):
+            return decision.send_notice() or decision.outcome
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return TurnOutcome.UNCERTAIN
     return decision
 
 
@@ -1118,6 +1123,7 @@ def _handle_locked(event: WorkerEvent,
             return ignore_turn(reason, close_pane=False)
         stale_done = _stale_done_detail(reply, delivery.completion_id)
         if isinstance(receipt, worker.DispatchComplete):
+            progress_history.confirm_assignment_submission(run, instance, delivery.completion_id)
             if Path(delivery.early_ready).exists():
                 completion_id = worker_panes.stage_two_completion_id(instance)
                 diff = delivery.early_ready.removesuffix(".ready") + ".diff"
