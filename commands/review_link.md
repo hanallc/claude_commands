@@ -8,7 +8,7 @@ Run `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/review_link.py <fil
 
 To show edited files, run it again on the same files. Give the same links. Tell the user to refresh the page. Use `--new` only to make separate links. Links expire seven days after the last update.
 
-Before you give each link, fetch it on this machine with `curl -s -o /dev/null -w '%{http_code}' '<URL>'`. Give it only if the result is `200`. Use a clickable Markdown link with the file name. Use only the review-links service. Never give a link from a hand-run server.
+Before you give each link, fetch it on this machine with `curl -s -o /dev/null -w '%{http_code}' '<URL>'`. Give it only if the result is `200`. Write each link as the full URL in plain text. Never write a Markdown link or a wikilink; the user's terminal cannot open them. Use only the review-links service. Never give a link from a hand-run server.
 
 Links need Tailscale. They use the Tailscale IPv4 address because on its own machine the host name resolves to a local address where the server does not listen. The path is short so the URL does not wrap in a terminal.
 
