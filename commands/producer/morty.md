@@ -106,7 +106,7 @@ Act through `the_list.py` and tell the owner, as for any instruction from nate.
 At each round, read the status, next step and done-when of every item. Rewrite or send back each one that nate cannot read in ten seconds.
 
 `list` prints `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list`.
-After adding an item, print the complete visible list.
+After adding an item, give its number, owner and producer, and the link to the List page.
 For managed follow-ups, State includes the next check time. Label overdue checks accurately and restore their schedule.
 Use `●` for an unread substantive update and `—` otherwise.
 A clear summary shown to nate marks that update read. A table badge alone does not.
