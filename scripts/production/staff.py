@@ -1556,6 +1556,19 @@ def find(*, kind: Kind | None = None, parent: StaffId | None = None) -> list[Sta
     return snapshot().find(kind=kind, parent=parent)
 
 
+def serving_merge_unit(production_staff_id: str) -> StaffRow | None:
+    """Find the merge unit of the production or its nearest ancestor."""
+    record = snapshot()
+    production = record.by_id(StaffId(production_staff_id))
+    merge_units = tuple(row for row in active(record, "unit") if row.unit_type == UnitDetails("merge"))
+    while production is not None and production.kind == "showrunner":
+        unit = next((row for row in merge_units if row.reports_to(production.id)), None)
+        if unit is not None:
+            return unit
+        production = record.parent_of(production)
+    return None
+
+
 def _under_test_root(path: Path) -> bool:
     """Identify temporary locations before a write to the real staff record."""
     import tempfile
