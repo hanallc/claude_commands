@@ -776,8 +776,13 @@ class WorkerResultUnconfirmed(Result):
     """The prompt may have sent input, and the transcript receipt is missing."""
 
 
-class BlockedWorkerResult(Result):
+@dataclass(frozen=True)
+class BlockedWorkerResult:
     """The worker needs input, and the result must wait for the pane."""
+
+    detail: str
+    send_to_holder: Callable[[str, str], Result]
+    outcome: Literal["retry"] = field(init=False, default="retry")
 
 
 class RecordedDeliveryAcceptance(Result):
@@ -5000,7 +5005,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         sender: str, timeout: float, reason: str = "",
                         receipt: WorkerResultReceipt | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
                         selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
-                        review_text: str = "", allow_holder_fallback: bool = True) -> Result:
+                        review_text: str = "", allow_holder_fallback: bool = True) -> Result | BlockedWorkerResult:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
@@ -5009,6 +5014,13 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
     worker_only = isinstance(receipt, WorkerResultReceipt) and receipt.worker_only
     if holder is None:
         return Result("retry" if worker_only else "failed", f"{worker.name}: worker holder is unavailable")
+
+    def send_to_holder(fallback_reason: str, body: str) -> Result:
+        address = f"session:{holder.current_session}"
+        options = parse(["--here", "--to", address, "--from", sender, "--timeout", str(timeout),
+                         "--text", f"Worker {worker.name}: {one_line(fallback_reason)}\n{body}"])
+        return _send(options._replace(selection=WorkerHolderRecipient(address, holder.id)), membership=membership)
+
     if not reason:
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
         if isinstance(state, worker_panes.OpenWorker):
@@ -5085,7 +5097,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     if state.status != herdr.AgentStatus.BLOCKED or worker_only:
                         return Result("retry", reason)
                     if allow_holder_fallback and not isinstance(selection, FixedStaffLookup):
-                        return BlockedWorkerResult("retry", reason)
+                        return BlockedWorkerResult(reason, send_to_holder)
         elif state is None:
             reason = "worker observation is unavailable"
         elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
@@ -5098,10 +5110,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         return Result("retry", reason)
     if not allow_holder_fallback or isinstance(selection, FixedStaffLookup):
         return Result("failed", reason)
-    address = f"session:{holder.current_session}"
-    options = parse(["--here", "--to", address, "--from", sender,
-                     "--timeout", str(timeout), "--text", f"Worker {worker.name}: {one_line(reason)}\n{text}"])
-    return _send(options._replace(selection=WorkerHolderRecipient(address, holder.id)), membership=membership)
+    return send_to_holder(reason, text)
 
 
 def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
@@ -5367,17 +5376,11 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             enqueue(replace(transport_message, key=None if transport_message.review_batch else message.key), result.detail, started,
                     recipient=attempt_recipient, order=order, membership=membership, mailbox=queue_mailbox)
         elif isinstance(route, PaneWorkerRecipient):
-            if batch_only:
-                result = deliver_worker_text(route.row, membership, agent_text(transport_message),
-                                             sender=message.sender, timeout=options.timeout, selection=options.selection,
-                                             allow_holder_fallback=False)
-            elif transport_message.review_batch:
-                result = deliver_worker_text(route.row, membership, agent_text(message),
-                                             sender=message.sender, timeout=options.timeout, selection=options.selection,
-                                             review_text=agent_text(transport_message))
-            else:
-                result = deliver_worker_text(route.row, membership, agent_text(message),
-                                             sender=message.sender, timeout=options.timeout, selection=options.selection)
+            result = deliver_worker_text(route.row, membership, agent_text(transport_message if batch_only else message),
+                sender=message.sender, timeout=options.timeout, selection=options.selection,
+                review_text=agent_text(transport_message) if transport_message.review_batch and not batch_only else "",
+                allow_holder_fallback=not batch_only)
+            assert isinstance(result, Result)
         else:
             claude_started = time.monotonic()
             def relay_and_queue(relay_message: Message, timeout: float) -> Result:

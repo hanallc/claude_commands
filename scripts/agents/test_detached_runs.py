@@ -4137,7 +4137,6 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assert_holder_result(self.record(row), "duplicate native identities")
 
     def test_blocked_worker_result_reaches_its_holder(self) -> None:
-        _ = self.enterContext(patch.object(send, "STATE", self.fixture.root / "messages"))
         row = self.fixture.worker()
         pane = "w1:p1"
         self.fixture.world.add(row, pane)
