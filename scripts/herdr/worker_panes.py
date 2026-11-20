@@ -591,23 +591,31 @@ def worker_fallback_run(parent: staff.StaffRow, *,
     return unit_runs.state_dir() / "staff" / "workers" / parent.id
 
 
+def parent_run_roots() -> tuple[Path, ...]:
+    design_root = cast(Callable[[], Path], import_module("scripts.astra.design_roles").state_root)()
+    return unit_runs.ASTRA_RUN_ROOT, design_root
+
+
 def parent_run_index(record: staff.StaffSnapshot) -> dict[str, list[str]]:
     """Read the launcher's run roots once for all parent sessions."""
-    design_root = cast(Callable[[], Path], import_module("scripts.astra.design_roles").state_root)()
     return unit_runs.held_by_session(os.environ.get("ROSTER_RUN_ROOT"), record=record,
-                                     additional_roots=(unit_runs.ASTRA_RUN_ROOT, design_root))
+                                     additional_roots=parent_run_roots())
 
 
-def worker_run_directories(record: staff.StaffSnapshot) -> unit_runs.LauncherRunDirectories:
+def run_state(run: Path) -> dict[str, object]:
+    return worker_lifecycle.read_json_object(run / recorder_state.STATE_FILENAME)
+
+
+def worker_run_directories(record: staff.StaffSnapshot, *, scanned: dict[str, list[str]] | None = None,
+                           read: Callable[[Path], dict[str, object]] | None = None) -> unit_runs.LauncherRunDirectories:
     """Resolve each worker through the launcher and retain its candidate directories."""
     workers = record.find(kind="worker")
     if not workers:
         return unit_runs.LauncherRunDirectories({}, {})
 
-    scanned = parent_run_index(record)
+    scanned = parent_run_index(record) if scanned is None else scanned
     linked = progress_history.recorded_dispatch_runs()
-    # Workers share their parent's runs; build their paths and read their state files once.
-    read = cache(_run_state)
+    read = cache(run_state) if read is None else read
     parents: dict[StaffId, tuple[list[Path], Path, tuple[Path, ...]]] = {}
     found: dict[StaffId, tuple[Path, ...]] = {}
     for row in workers:
@@ -618,12 +626,17 @@ def worker_run_directories(record: staff.StaffSnapshot) -> unit_runs.LauncherRun
             fallback = worker_fallback_run(parent, record=record)
             runs = [Path(run) for run in _parent_runs(parent, held)]
             parents[parent.id] = (runs, runs[0] if runs else fallback,
-                                  (*(Path(directory) for directory in held), *recorded, fallback))
+                                  (*runs, *recorded, fallback))
         runs, first, shared = parents[parent.id]
         dispatched = linked[row.id].directory if row.id in linked else None
-        selected = (_worker_run_in(row, runs, dispatched, first, record=record, read=read) if parent is not row
-                    else worker_run(row, record=record, scanned=scanned))
-        found[row.id] = tuple(dict.fromkeys((selected, *shared)))
+        try:
+            selected = (_worker_run_in(row, runs, dispatched, first, record=record, read=read) if parent is not row
+                        else worker_run(row, record=record, scanned=scanned))
+        except recorder_state.OldRecorderState as error:
+            print(error, file=sys.stderr)
+            # Detached records prove their worker by staff id.
+            selected = first
+        found[row.id] = tuple(dict.fromkeys((selected, *shared, *((dispatched,) if dispatched is not None else ()))))
     return unit_runs.LauncherRunDirectories(found, scanned)
 
 
@@ -648,7 +661,7 @@ def worker_run(member: staff.StaffRow, *,
 
     dispatched = progress_history.recorded_dispatch_run(member.id)
     linked = dispatched.directory if isinstance(dispatched, progress_history.RecordedDispatchRun) else None
-    return _worker_run_in(member, runs, linked, first, record=record, read=_run_state)
+    return _worker_run_in(member, runs, linked, first, record=record, read=run_state)
 
 
 def _parent_runs(parent: staff.StaffRow, held: list[str]) -> list[str]:
@@ -665,12 +678,14 @@ def _worker_run_in(member: staff.StaffRow, runs: Sequence[Path], linked: Path | 
                    record: staff.StaffSnapshot, read: Callable[[Path], dict[str, object]]) -> Path:
     """Select the parent run or linked run that holds the worker's newest pass."""
     candidates = dict.fromkeys((*runs, *(() if linked is None else (linked,)), fallback))
-    passes = [(run, passed) for run in candidates if (passed := _pass_in(member, read(run), record))]
+    passes = [(run, passed) for run in candidates if (passed := _pass_in(member, _run_state(run, read), record))]
     return max(passes, key=lambda item: _pass_started_at(item[1]))[0] if passes else fallback
 
 
-def _run_state(run: Path) -> dict[str, object]:
-    return worker_lifecycle.read_json_object(run / recorder_state.STATE_FILENAME)
+def _run_state(run: Path, read: Callable[[Path], dict[str, object]] = run_state) -> dict[str, object]:
+    state = read(run)
+    recorder_state.require_current_shape(run / recorder_state.STATE_FILENAME, state)
+    return state
 
 
 def _passes(state: dict[str, object]) -> list[dict[str, object]]:
@@ -693,14 +708,18 @@ def worker_pass(row: staff.StaffRow, run: Path, *,
 
 
 def _pass_in(row: staff.StaffRow, fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
+    no_pass: dict[str, object] = {}
+    return max(_worker_passes_in(row, fields, record), key=_pass_started_at, default=no_pass)
+
+
+def _worker_passes_in(row: staff.StaffRow, fields: dict[str, object],
+                      record: staff.StaffSnapshot) -> list[dict[str, object]]:
     current = record.by_id(row.id)
     owner = unit_runs.run_owner(fields, record)
     if (current is None or current.kind != "worker" or not isinstance(owner, staff.StaffRow)
             or current.parent != staff.ReportsTo(owner.id)):
-        return {}
-    no_pass: dict[str, object] = {}
-    return max((item for item in reversed(_passes(fields)) if item.get("worker_id") == current.id),
-               key=_pass_started_at, default=no_pass)
+        return []
+    return [item for item in reversed(_passes(fields)) if item.get("worker_id") == current.id]
 
 
 def dispatch_role(row: staff.StaffRow) -> WorkerRole | WorkerRoleUnavailable:
@@ -734,12 +753,20 @@ def _completed_turn(row: staff.StaffRow, dispatch: object) -> CloseAllowed | Kep
     return CloseAllowed()
 
 
+@dataclass(frozen=True)
+class PassDetachedResults:
+    instance_id: str
+    started_at: float
+    live_runs_checked: bool
+
+
 class RecordedCompletionEvidence(Protocol):
     def completion_close_evidence(self, row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
                                   run: Path, reply_file: str) -> CloseAllowed | Kept: ...
 
-    def detached_reply_hold(self, row: staff.StaffRow, line: str, completion_id: str, *,
-                            run: Path) -> CloseAllowed | Kept: ...
+    def pass_reply_evidence(self, row: staff.StaffRow, delivery: pass_recorder.DispatchDelivery, *,
+                            run: Path, reply_file: str, require_completion: bool,
+                            detached_results: PassDetachedResults) -> CloseAllowed | Kept: ...
 
 
 def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, object]) -> CloseAllowed | Kept:
@@ -812,6 +839,9 @@ class RunningDetachedWorkers(Protocol):
     @property
     def staff_ids(self) -> frozenset[staff.StaffId]: ...
 
+    @property
+    def unreadable_workers(self) -> frozenset[staff.StaffId]: ...
+
 
 class DetachedWorkAtUse(Enum):
     READ = "read detached runs for this worker"
@@ -819,46 +849,79 @@ class DetachedWorkAtUse(Enum):
 
 def worker_dispatch_state(row: staff.StaffRow, run: Path,
                           lock: WorkerLockHold | WorkerLockAtUse = WorkerLockAtUse.ACQUIRE, *,
-                          detached: RunningDetachedWorkers | DetachedWorkAtUse = DetachedWorkAtUse.READ) -> WorkerDispatchState:
-    """Classify the pass through its status, worker lock, submission, and detached runs."""
+                          detached: RunningDetachedWorkers | DetachedWorkAtUse = DetachedWorkAtUse.READ,
+                          record: staff.StaffSnapshot | None = None, related_runs: Sequence[Path] = (),
+                          read: Callable[[Path], dict[str, object]] = run_state,
+                          ) -> WorkerDispatchState:
+    """Check the worker lock, detached runs, and all saved passes for this worker."""
 
     locked = check_worker_lock(row, lock)
     if isinstance(locked, Kept):
         return DispatchHoldsWorker(locked.blocker)
     if isinstance(detached, DetachedWorkAtUse):
-        live_runs = cast(Callable[[Path, str], Sequence[object]], import_module("scripts.agents.detached_runs").live_runs)
-        live = bool(live_runs(run / "detached_runs", row.name))
+        live_runs = cast(Callable[..., Sequence[object]], import_module("scripts.agents.detached_runs").live_runs)
+        live = bool(live_runs(run / "detached_runs", row.name, identity=row.id))
     else:
+        if row.id in detached.unreadable_workers:
+            return DispatchHoldsWorker("a detached run record is unreadable")
         live = row.id in detached.staff_ids
     if live:
         return DispatchHoldsWorker("a detached run is live")
-    passed = worker_pass(row, run)
-    if passed:
-        status, dispatch = passed.get("status"), passed.get("instance_id")
-        delivery = pass_recorder.dispatch_delivery(passed)
-        completion = progress_history.hook_completion(passed)
-        if (delivery.line and delivery.completion_id
-                and not (isinstance(completion, progress_history.HookCompletion) and completion.finished)):
-            evidence = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
-            hold = evidence.detached_reply_hold(row, delivery.line, delivery.completion_id, run=run)
-            if isinstance(hold, Kept):
-                return DispatchHoldsWorker(hold.blocker)
+    record = staff.local_snapshot() if record is None else record
+    if isinstance(detached, DetachedWorkAtUse):
+        # Direct pane operations use the current pass.
+        passed = worker_pass(row, run, record=record)
+        if passed:
+            return _pass_dispatch_state(row, run, passed, passed.get("status"), passed.get("instance_id"),
+                                        live_runs_checked=False)
+        passes = []
     else:
+        passes = [(directory, item) for directory in dict.fromkeys((run, *related_runs))
+                  for item in _worker_passes_in(row, _run_state(directory, read), record)]
+    if not passes:
         latest = progress_history.last_dispatch(row.id)
         if (not isinstance(latest, progress_history.RecordedDispatch)
                 or latest.status is progress_history.DispatchDetailNotRecorded.UNRECORDED):
             return ReleasedWorkerPass.NO_PROMPT_DELIVERED
-        status, dispatch = latest.status, latest.instance_id
+        return _pass_dispatch_state(row, run, {}, latest.status, latest.instance_id, live_runs_checked=False)
+
+    passes.sort(key=lambda item: _pass_started_at(item[1]), reverse=True)
+    directory, passed = passes[0]
+    newest = _pass_dispatch_state(row, directory, passed, passed.get("status"), passed.get("instance_id"),
+                                  live_runs_checked=True)
+    if isinstance(newest, DispatchHoldsWorker):
+        return newest
+    for directory, passed in passes[1:]:
+        if passed.get("status") == "active":
+            state = _pass_dispatch_state(row, directory, passed, "active", passed.get("instance_id"),
+                                         live_runs_checked=True)
+            if isinstance(state, DispatchHoldsWorker):
+                return state
+    return newest
+
+
+def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, object], status: object,
+                         dispatch: object, *, live_runs_checked: bool) -> WorkerDispatchState:
+    delivery = pass_recorder.dispatch_delivery(passed)
+    completion = progress_history.hook_completion(passed)
+    active = status == "active" and bool(delivery.line)
+    finished = isinstance(completion, progress_history.HookCompletion) and completion.finished
+    if active or (delivery.line and delivery.completion_id and not finished):
+        evidence = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
+        reply_file = completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file
+        started_at = _pass_started_at(passed)
+        hold = evidence.pass_reply_evidence(row, delivery, run=run, reply_file=reply_file, require_completion=active,
+            detached_results=PassDetachedResults(dispatch if isinstance(dispatch, str) else "",
+                                               0 if started_at == float("-inf") else started_at, live_runs_checked))
+        if isinstance(hold, Kept):
+            return DispatchHoldsWorker(hold.blocker)
+        if active:
+            return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "completed":
-        completion = progress_history.hook_completion(passed)
         if isinstance(completion, progress_history.HookCompletion) and completion.outcome == "done":
             return ReleasedWorkerPass.ENDED
         return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
     if status == "active":
-        if pass_recorder.dispatch_delivery(passed).line:
-            if isinstance(recorded_completion_close(row, run, passed), CloseAllowed):
-                return CompletedWorkerPass(dispatch if isinstance(dispatch, str) else "")
-            return DispatchHoldsWorker("submitted pass awaits completion")
         pid, command = passed.get("launcher_pid"), passed.get("launcher_command")
         if isinstance(pid, int) and isinstance(command, list):
             parts = cast(list[object], command)
@@ -1706,6 +1769,9 @@ def main(arguments: list[str] | None = None) -> int:
             return ExitCode.REFUSED
         account = DestinationWorkerAccount(args.account) if args.account else ConfiguredWorkerAccount.CURRENT
         return _result(start_or_resume(owner.id, name, cast(WorkerRole, args.role), account=account))
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return ExitCode.UNCERTAIN
     except (staff.StaffUnreadable, staff.StaffRefused, OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"anomaly: {error}; correct the evidence and retry", file=sys.stderr)
         return ExitCode.UNCERTAIN

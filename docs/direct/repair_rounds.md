@@ -90,8 +90,8 @@ Phase records are the unit director's, and both belong at the real boundary:
 before that phase's first dispatch. Recording them late attributes the new
 phase's work to the finished one — its title, its elapsed clock, and its pass
 counts all describe the wrong phase. A phase opened beside one still running
-leaves that one open: `start-phase` parks it, and `finish-phase --phase-id <id>`
-closes each at its own end. Name the phase on every launch,
+leaves that phase open. Use `finish-phase --phase-id <id>` at the end of each phase.
+Name the phase on every launch.
 `assign.sh --role implement --phase <id>` and `assign.sh --role review --phase <id>`: the pass is stamped
 with it, and the launcher writes its files to that phase's `${PHASE_DIR}`.
 A launch without a phase is refused (the user, 2026-10-28).

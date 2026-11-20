@@ -25,8 +25,8 @@ import sys
 import tempfile
 import time
 import threading
-from collections.abc import Generator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -425,7 +425,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         server = cast(ReviewLinksServer, self.server)
         root = server.root
         route = urlsplit(self.path)
-        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH:
+        fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query == "page=list"
+        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH and not fixture_options:
             self.send_error(404)
             return None
         if route.path == f"/{change_page.CONSOLE_FOLDER}":
@@ -433,7 +434,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         if route.path == f"/{change_page.CONSOLE_FOLDER}/":
             try:
-                content = console.render(console.read_pages(), console.read_rebuilds())
+                with server.staff_read_scope():
+                    content = console.render(console.read_pages(), console.read_rebuilds())
             except (OSError, ValueError, ImportError) as error:
                 print(f"review-links console: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The console is not available.</p>"))
@@ -458,8 +460,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 except (OSError, ValueError):
                     print("review-links accounts: could not read the quota alerts", file=sys.stderr)
             try:
-                payload = (console.for_you_count(for_you.read()) if route.query == "view=count"
-                           else console.for_you_payload())
+                with server.staff_read_scope():
+                    payload = (console.for_you_count(for_you.read()) if route.query == "view=count"
+                               else console.for_you_payload())
             except (OSError, ValueError) as error:
                 print(f"review-links actions: {error}", file=sys.stderr)
                 self.json_response(503, {"available": False, **extra})
@@ -488,11 +491,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 snapshot = cast(ReviewLinksServer,self.server).review_cache.get()
                 fields = parse_qs(route.query)
                 if 'body' in fields:
+                    view = (review_page.ReviewBodyView.CARD if fields.get('view') == ['card']
+                            else review_page.ReviewBodyView.TABLE)
                     try:
-                        content = snapshot.body(fields['body'][0])
+                        key = fields['body'][0]
+                        content = (snapshot.linked_card(root, key) if view is review_page.ReviewBodyView.CARD
+                                   else snapshot.body(key))
                     except LookupError as error:
-                        self.review_response(html.escape(str(error)).encode(), 'text/html; charset=utf-8',
-                                             version=snapshot.version, status=404)
+                        message = html.escape(str(error))
+                        content = (change_page.document(f'<p role="status">{message}</p>', 'Review card')
+                                   if view is review_page.ReviewBodyView.CARD else message.encode())
+                        self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version, status=404)
                     else:
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)
                     return None
@@ -522,7 +531,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 self.list_action_state(fields)
                 return None
             try:
-                with server.list_store_access():
+                with server.list_store_access(), server.staff_read_scope():
                     live = server.mode is ServerMode.LIVE
                     reviews = server.list_review_records()
                     content = list_page.render(root, include_counts=live, defer_counts=True,
@@ -530,15 +539,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                                review_records=(list_page.LinkedReviewRead.AFTER_RENDER
                                                                if live and reviews is list_page.LinkedReviewRead.FROM_DISK
                                                                else reviews))
+                    content = owned_document(content, "list")
             except (OSError, ValueError) as error:
                 print(f"review-links list: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
                 return None
-            self.html_response(200, owned_document(content, "list"))
+            self.html_response(200, content)
             return None
         if route.path == images.PAGE_PATH:
             try:
-                content = images.render(cast(ReviewLinksServer, self.server).delivery_status)
+                with server.staff_read_scope():
+                    content = images.render(server.delivery_status)
             except (OSError, ValueError) as error:
                 print(f"review-links images: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Images page is not available.</p>"))
@@ -564,16 +575,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.html_response(503, change_page.document("<p>This branch page is not available.</p>"))
             return None
         else:
-            server = cast(ReviewLinksServer, self.server)
             with server.branch_deletions_lock:
                 if branches.folder in server.branch_deletions:
                     self.html_response(200, change_page.document(f"<p>{BRANCHES_DELETING}</p>"))
                     return None
-            self.html_response(200, branch_page.render(branches))
+            with server.staff_read_scope():
+                content = branch_page.render(branches)
+            self.html_response(200, content)
             return None
         try:
             change_browser.rebuilds_at(root, self.path)
-            content = change_browser.render_rebuilds()
+            with server.staff_read_scope():
+                content = change_browser.render_rebuilds()
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as error:
@@ -593,7 +606,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         else:
             try:
-                content = change_browser.render(browser, cast(ReviewLinksServer, self.server).delivery_status)
+                with server.staff_read_scope():
+                    content = change_browser.render(browser, server.delivery_status)
             except (OSError, ValueError, change_page.change_review.ChangeReviewError, change_page.Refusal) as error:
                 print(f"review-links browser: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>This review page is not available.</p>"))
@@ -610,7 +624,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         else:
             try:
-                content = change_page.render(page, cast(ReviewLinksServer, self.server).delivery_status)
+                with server.staff_read_scope():
+                    content = change_page.render(page, server.delivery_status)
             except (OSError, ValueError, change_page.change_review.ChangeReviewError, change_page.Refusal) as error:
                 print(f"review-links render: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>This review page is not available.</p>"))
@@ -717,7 +732,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 self.html_response(403, change_page.document(f"<p>{html.escape(refusal)}</p>"))
             return
         if route.path == review_page.NEW_ITEM_PATH:
-            self.new_item_post()
+            self._write_post(self.new_item_post)
             return
         if route.path == review_page.ATTACHMENT_PATH:
             self.send_error(405)
@@ -725,22 +740,22 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
             return
-        if urlsplit(self.path).path == review_page.PAGE_PATH:
-            self.review_post()
+        if route.path == review_page.PAGE_PATH:
+            self._write_post(self.review_post)
             return
-        if urlsplit(self.path).path == accounts_page.PAGE_PATH:
+        if route.path == accounts_page.PAGE_PATH:
             self.accounts_post()
             return
-        if urlsplit(self.path).path == images.PAGE_PATH:
-            self.image_post()
+        if route.path == images.PAGE_PATH:
+            self._write_post(self.image_post)
             return
-        if urlsplit(self.path).path == investigations_page.PAGE_PATH:
-            self.investigation_post()
+        if route.path == investigations_page.PAGE_PATH:
+            self._write_post(self.investigation_post)
             return
-        if urlsplit(self.path).path == list_page.PAGE_PATH:
-            self.list_post()
+        if route.path == list_page.PAGE_PATH:
+            self._write_post(self.list_post)
             return
-        if urlsplit(self.path).path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
+        if route.path == f"/{change_page.CONSOLE_FOLDER}/{console.NEWS_NAME}":
             self.news_post()
             return
         if self.is_disks_measure():
@@ -758,7 +773,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.html_response(404, change_page.document("<p>This branch page is not available.</p>"))
             return
         else:
-            self.delete_branches(branches)
+            self._write_post(partial(self.delete_branches, branches))
             return
         try:
             browser = change_browser.page_at(server.root, self.path)
@@ -769,7 +784,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.html_response(404, change_page.document("<p>This review page is not available.</p>"))
             return
         else:
-            self.browser_answer(browser)
+            self._write_post(partial(self.browser_answer, browser))
             return
         try:
             page = change_page.page_at(server.root, self.path)
@@ -777,6 +792,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             print(f"review-links page: {error}", file=sys.stderr)
             self.html_response(404, change_page.document("<p>This review page is not available.</p>"))
             return
+        self._write_post(partial(self._change_post, page))
+
+    def _write_post(self, action: Callable[[], None]) -> None:
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            action()
+        finally:
+            server.clear_staff_snapshot()
+
+    def _change_post(self, page: change_page.ReviewPage) -> None:
+        server = cast(ReviewLinksServer, self.server)
         body = ""
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -917,10 +943,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         try:
             fields: dict[str, object] = {"token": server.new_item_token}
             if selected:
-                settings = conf.read_or_repository("console")
-                members = staff.local_snapshot()
-                owner = review_submissions.page_owner(selected[0], settings, members)
-                producer = review_submissions.list_producer(settings, members)
+                with server.list_store_access():
+                    settings = conf.read_or_repository("console")
+                    members = staff.local_snapshot()
+                    owner = review_submissions.page_owner(selected[0], settings, members)
+                    producer = review_submissions.list_producer(settings, members)
                 recipients: list[review_submissions.RecipientOption] = []
                 fields["page_owner"] = ""
                 if isinstance(owner, staff.StaffRow):
@@ -929,11 +956,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 if isinstance(producer, staff.StaffRow) and producer != owner:
                     recipients.append({"id": producer.id, "name": producer.name, "proposal": False})
             else:
-                recipients = review_submissions.recipient_options(staff.snapshot())
+                with server.staff_read_scope():
+                    recipients = review_submissions.recipient_options(staff.snapshot())
         except (OSError, ValueError) as error:
             print(f"review-links New item recipients: {error}", file=sys.stderr)
             self.json_response(503, {"error": "The recipients are unavailable."})
             return
+        if server.mode is ServerMode.LIST_FIXTURE:
+            fields.update(token="", send_disabled="Sending is off on a practice List.")
         self.json_response(200, {**fields, "recipients": recipients})
 
     def new_item_post(self) -> None:
@@ -984,6 +1014,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         try:
             created = server.review_cache.create_submission(request)
+            response = {"id": created.saved.id, "key": created.key, "version": created.version}
+            if request.page == "list":
+                response["list_key"] = list_page.add_submission(created).key
             details = created.saved.details
             evidence_url = ""
             if key or details.images or request.page_state is not None or isinstance(
@@ -1005,11 +1038,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(503, {"error": "Could not publish the item. Try Send again."})
             return
         try:
-            self.json_response(200, {"id": created.saved.id, "key": created.key, "version": created.version})
+            self.json_response(200, response)
         finally:
             self.deliver_review(server, delivery)
             if key:
-                if created.saved.reused:
+                if review_submissions.PAGE_SCREENSHOT in details.images:
                     server.page_captures.discard(key)
                 elif (image := server.page_captures.file(key, created.saved)) is not None:
                     server.attach_page_screenshot(created.saved, image)
@@ -1172,20 +1205,21 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if server.mode is not ServerMode.LIVE:
             self.send_error(404)
             return
-        try:
-            members = staff.snapshot()
-            content = list_page.counts_strip(members, staff_names.StaffNames(members))
-        except (OSError, ValueError) as error:
-            print(f"review-links List counts: {error}", file=sys.stderr)
-            self.html_response(503, b"")
-            return
-        if include_linked_reviews:
+        with server.staff_read_scope():
             try:
-                content += list_page.render_review_updates(server.root, members, server.list_review_records())
-            except (OSError, ValueError, change_review.ChangeReviewError) as error:
-                print(f"review-links List links: {error}", file=sys.stderr)
-                content += '<template data-list-review-read-error></template>'
-        self.html_response(200, content.encode())
+                members = staff.snapshot()
+                content = list_page.counts_strip(members, staff_names.StaffNames(members))
+            except (OSError, ValueError) as error:
+                print(f"review-links List counts: {error}", file=sys.stderr)
+                self.html_response(503, b"")
+                return
+            if include_linked_reviews:
+                try:
+                    content += list_page.render_review_updates(server.root, members, server.list_review_records())
+                except (OSError, ValueError, change_review.ChangeReviewError) as error:
+                    print(f"review-links List links: {error}", file=sys.stderr)
+                    content += '<template data-list-review-read-error></template>'
+            self.html_response(200, content.encode())
 
     def list_action_state(self, fields: dict[str, list[str]]) -> None:
         """Read the current item after an action response is lost."""
@@ -1194,7 +1228,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             (identity,) = fields["item-state"]
             (keeper,) = fields.get("keeper", [])
             (park_request,) = fields.get("park-request", [""])
-            with server.list_store_access():
+            with server.list_store_access(), server.staff_read_scope():
                 current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
                                                        park_request=park_request,
                                                        review_records=server.list_review_records())
@@ -1299,16 +1333,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             opened = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True).get("open", [])
             pages: list[console.ConsolePage] = []
-            for page in console.read_pages():
-                if page.items is review_page.waiting_items:
-                    page = replace(page, items=waiting_review)
-                elif page.items is images.waiting_images:
-                    page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
-                pages.append(page)
-            # An empty name means the open page is not a navigation entry, such as the Rebuilds page.
-            if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
-                raise ValueError("name one console page or none")
-            fresh = console.news(server.root, tuple(pages), opened[0])
+            with server.staff_read_scope():
+                for page in console.read_pages():
+                    if page.items is review_page.waiting_items:
+                        page = replace(page, items=waiting_review)
+                    elif page.items is images.waiting_images:
+                        page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
+                    pages.append(page)
+                # Rebuilds has no navigation entry, so its request uses an empty name.
+                if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
+                    raise ValueError("name one console page or none")
+                fresh = console.news(server.root, tuple(pages), opened[0])
         except ValueError as error:
             self.browser_failure(400, "Name one console page.", error)
             return
@@ -1430,6 +1465,19 @@ class ConsoleReviewSnapshotCache(review_page.ReviewSnapshotCache):
             print(f"review-links List delivery parks: {error}", file=sys.stderr)
 
 
+@dataclass(frozen=True)
+class StaffSnapshotUnloaded:
+    """The next reader must load staff from its authority."""
+
+
+@dataclass(frozen=True)
+class StaffSnapshotAttempt:
+    """Keep the result and completion time of the last cache read."""
+
+    finished_at: float
+    result: staff.StaffSnapshot | staff.ReadStaffAuthority
+
+
 class ReviewLinksServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], root: Path, *, mode: ServerMode = ServerMode.LIVE,
                  initialize_review: bool = False) -> None:
@@ -1444,9 +1492,12 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self.branch_deletions: set[Path] = set()
         self.branch_deletions_lock: threading.Lock = threading.Lock()
+        self._staff_snapshot_lock: threading.Lock = threading.Lock()
+        self._staff_snapshot: StaffSnapshotAttempt | StaffSnapshotUnloaded = StaffSnapshotUnloaded()
         self.accounts_cache: AccountsPageCache = AccountsPageCache()
         self.review_cache: review_page.ReviewSnapshotCache = ConsoleReviewSnapshotCache(
-            self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE)
+            self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE,
+            staff_scope=self.staff_read_scope)
         self.new_item_token: str = secrets.token_urlsafe()
         self.capture_slot: threading.BoundedSemaphore = threading.BoundedSemaphore()
         self.page_captures: PageCaptures = PageCaptures()
@@ -1471,6 +1522,28 @@ class ReviewLinksServer(ThreadingHTTPServer):
             recover_list()
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
+
+    def staff_read_scope(self) -> AbstractContextManager[None]:
+        """Supply one remote staff snapshot for a request or a Review build."""
+        if staff.is_owner():
+            return nullcontext()
+        seconds = conf.read("review_links").number("staff_snapshot_seconds")
+        with self._staff_snapshot_lock:
+            attempt = self._staff_snapshot
+            if isinstance(attempt, StaffSnapshotUnloaded) or time.monotonic() - attempt.finished_at >= seconds:
+                result: staff.StaffSnapshot | staff.ReadStaffAuthority
+                try:
+                    result = staff.authority_snapshot()
+                except staff.StaffUnreadable:
+                    result = staff.ReadStaffAuthority()
+                attempt = self._staff_snapshot = StaffSnapshotAttempt(time.monotonic(), result)
+            if isinstance(attempt.result, staff.StaffSnapshot):
+                return staff.supplied_snapshot(attempt.result)
+            return nullcontext()
+
+    def clear_staff_snapshot(self) -> None:
+        with self._staff_snapshot_lock:
+            self._staff_snapshot = StaffSnapshotUnloaded()
 
     def list_review_records(self) -> list_page.ImmediateReviewRecords:
         cache = self.review_cache

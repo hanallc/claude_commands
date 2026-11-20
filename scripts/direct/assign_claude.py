@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import NoReturn, TypedDict, cast
 
@@ -159,7 +160,11 @@ def run(launch: ClaudeLaunch) -> int:
     return code
 
 
-def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path,
+class UnclaimedPhaseStatus(Enum):
+    PRESERVE = "preserve the slot status"
+
+
+def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path | UnclaimedPhaseStatus,
                 slot: str, env: dict[str, str]) -> bool:
     """Claim the phase files before the worker opens."""
     if phase:
@@ -169,7 +174,8 @@ def claim_phase(run: Path, phase: str, cwd: Path, log: Path, status: Path,
                 env=env, stdout=output, stderr=subprocess.STDOUT)
         if reserved.returncode:
             print(f"ERROR: phase {phase} could not claim its files before its worker opens; see {log}.", file=sys.stderr)
-            write_text_atomic(status, "error\n")
+            if isinstance(status, Path):
+                write_text_atomic(status, "error\n")
             _ = subprocess.run(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "blocked",
                 f"launcher: phase {phase} could not claim its files; its worker did not open"],
                 env=env, text=True, check=False)
