@@ -74,6 +74,31 @@ from scripts.accounts import outage_alerts
 
 
 
+@dataclass(frozen=True)
+class TargetRegistryRead(conf.ConfigRead):
+    """Keep the recovery reasons from the existing target lookup."""
+
+    recovery_reasons: list[str] = field(default_factory=list)
+
+    @override
+    def _resolve[Value](self, key: str, convert: Callable[[str], Value], *, warn: bool,
+                        default: Value | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                        allow_blank: bool = False, recover_invalid: bool = True
+                        ) -> conf.UsableLiveValue[Value] | conf.RecoveredValue[Value] | conf.UnavailableValue:
+        result = super()._resolve(key, convert, warn=warn, default=default, allow_blank=allow_blank,
+                                  recover_invalid=recover_invalid)
+        if isinstance(result, conf.RecoveredValue):
+            self.recovery_reasons.append(result.reason)
+        return result
+
+
+@dataclass(frozen=True)
+class RecoveredRegistryOmission:
+    """The recovered registry omits the target. Its live registration is unknown."""
+
+    reason: str
+
+
 @dataclass
 class ProviderConfiguration:
     """Reuse provider settings during one admission pass."""
@@ -81,20 +106,29 @@ class ProviderConfiguration:
     transports: dict[target_config.SshTarget, ExecutionTransport] = field(default_factory=dict)
     settings: dict[str | Path, conf.ConfigRead] = field(default_factory=dict)
     files: dict[Path, conf.ConfigurationBytes | OSError] = field(default_factory=dict)
-    targets: dict[str, target_config.Target | records.UnregisteredTarget | conf.Unusable] = field(default_factory=dict)
+    targets: dict[str, target_config.Target | records.UnregisteredTarget | RecoveredRegistryOmission | conf.Unusable] = field(default_factory=dict)
     generations: dict[tuple[str, placement.ProviderSettings], str] = field(default_factory=dict)
 
-    def registered_target(self, name: str) -> target_config.Target | records.UnregisteredTarget:
+    def target_registration(self, name: str
+                            ) -> target_config.Target | records.UnregisteredTarget | RecoveredRegistryOmission:
         if name not in self.targets:
             try:
-                self.targets[name] = records.effective_target(name, placement.ConfiguredProviderSettings(),
-                    configuration=self.read("build_targets"))
+                registry = self.read("build_targets")
+                lookup = TargetRegistryRead(registry.file, registry.source, registry.settings,
+                                            registry.repository_allowed, registry.stamp)
+                target = records.effective_target(name, placement.ConfiguredProviderSettings(), configuration=lookup)
+                self.targets[name] = (RecoveredRegistryOmission(lookup.recovery_reasons[0])
+                    if isinstance(target, records.UnregisteredTarget) and lookup.recovery_reasons else target)
             except conf.Unusable as error:
                 self.targets[name] = error
         target = self.targets[name]
         if isinstance(target, conf.Unusable):
             raise target
         return target
+
+    def registered_target(self, name: str) -> target_config.Target | records.UnregisteredTarget:
+        target = self.target_registration(name)
+        return records.UnregisteredTarget() if isinstance(target, RecoveredRegistryOmission) else target
 
     def target(self, name: str, settings: placement.ProviderSettings
                ) -> target_config.Target | records.UnregisteredTarget:
@@ -3956,15 +3990,17 @@ done
                 permitted = placement.FixedExclusion(retry.reason)
             elif retry.deadline > self.clock.now():
                 permitted = placement.TemporaryExclusion("retry deadline has not passed")
-            if destination.provider == "mac" and not isinstance(permitted, placement.FixedExclusion):
+            if destination.provider == "mac" and isinstance(permitted, placement.AllowedHost):
                 with conf.report_key_changes():
                     try:
-                        target = _provider_configuration().registered_target(destination.target)
+                        target = _provider_configuration().target_registration(destination.target)
                     except conf.Unusable as error:
                         permitted = placement.EvidenceNeeded(str(error))
                     else:
                         if isinstance(target, records.UnregisteredTarget):
                             permitted = placement.FixedExclusion("target is no longer configured")
+                        elif isinstance(target, RecoveredRegistryOmission):
+                            permitted = placement.EvidenceNeeded(target.reason)
             if isinstance(permitted, placement.AllowedHost):
                 evidence = self._request_host_evidence(request, destination, keys)
                 if destination.provider == "local" and isinstance(evidence, placement.FreshHostEvidence):
