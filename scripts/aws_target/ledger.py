@@ -854,7 +854,7 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
             gate_state = GateTerminated(instant(status, 'at'), text(status, 'instance_id'))
         else:
             raise LedgerUnavailable('unknown gate reservation state')
-        evidence.gate_reservations.append(GateReservation(
+        reservation = GateReservation(
             text(item, 'attempt'), instant(item, 'at'), instant(item, 'expires'),
             money(text(item, 'usd_per_hour')), money(text(item, 'allowance_usd')), gate_state,
             str(item.get('instance_type', '')),
@@ -869,7 +869,16 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
                             text(mapping(item['owner']), 'folder')) if item.get('owner') else GateOwnerUnknown(),
             str(item.get('mode', '')),
             GateTrialBudget(text(mapping(item['trial']), 'trial_id'), money(text(mapping(item['trial']), 'limit_usd')))
-            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0)))))
+            if item.get('trial') else NoGateTrial(), int(str(item.get('root_gib', 0))))
+        if isinstance(gate_state, GateLaunchPending):
+            # Older workers saved the booked rates in the estimate fields.
+            booked = gate_state.booked_day_rates or reservation.day_rates
+            if not booked:
+                day = datetime.fromtimestamp(reservation.at, ZoneInfo('UTC')).date().isoformat()
+                booked = ((day, _gate_estimate_rate(reservation)),)
+            reservation = replace(reservation, state=replace(gate_state, booked_day_rates=booked),
+                                  rate=booked[0][1], day_rates=booked)
+        evidence.gate_reservations.append(reservation)
     if len({r.attempt for r in evidence.gate_reservations}) != len(evidence.gate_reservations):
         raise LedgerUnavailable('duplicate gate attempt')
     if 'gate_quota_refusals' in row:
@@ -1679,20 +1688,23 @@ class GateRateAboveReservation:
                 f'{self.usd_per_hour:g} USD/h with {self.reserved_usd_per_hour:g} USD/h reserved')
 
 
+def _gate_estimate_rate(reservation: GateReservation) -> BoxRate:
+    return (reservation.rate if reservation.rate.source != 'not priced'
+            else BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour'))
+
+
 def gate_launch_rate(reservation: GateReservation, candidate: GateRateCandidate, readings: Sequence[ChargeRead],
                      now: int) -> GateRateWithinReservation | GateRateAboveReservation:
-    """Compare the choice with the saved rate for each remaining bill day."""
+    """Compare the latest bill rate with the fixed booking for each remaining day."""
     if not isinstance(reservation.state, GateLaunchPending):
         raise LedgerUnavailable('The gate has no pending reservation')
     rates = _bill_rates(readings, candidate.instance_type, now, candidate.region)
-    current = dict(reservation.day_rates)
-    booked = dict(reservation.state.booked_day_rates)
-    fallback = reservation.rate.usd_per_hour if reservation.rate.source != 'not priced' else reservation.usd_per_hour
+    booked = dict(reservation.state.booked_day_rates or reservation.day_rates)
+    fallback = min((rate.usd_per_hour for rate in booked.values()), default=_gate_estimate_rate(reservation).usd_per_hour)
     zone = ZoneInfo('UTC')
     for left, _right in _days(now, max(now + 1, reservation.expires), zone):
         day = datetime.fromtimestamp(left, zone).date().isoformat()
-        usable = current[day].usd_per_hour if day in current else fallback
-        limit = min(usable, booked[day].usd_per_hour) if day in booked else usable
+        limit = booked[day].usd_per_hour if day in booked else fallback
         rate = rates.for_day(day, reservation.usd_per_hour).usd_per_hour
         if rate > limit:
             return GateRateAboveReservation(candidate, rate, limit)
@@ -1739,7 +1751,7 @@ def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int
             continue
         end = min(now, reservation.state.at) if isinstance(reservation.state, GateTerminated) else (
             max(now, reservation.expires) if reserve else now)
-        rate = reservation.rate if reservation.rate.source != 'not priced' else BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour')
+        rate = _gate_estimate_rate(reservation)
         rates = dict(reservation.day_rates)
         intervals.extend(day_compute_intervals(reservation.at, end, minimum_seconds, lambda day: rates.get(day, rate),
                                               source='gate:' + reservation.attempt))
@@ -2176,6 +2188,7 @@ class CostLedger:
         return tuple(mapping(cast(object, json.loads(line))) for line in path.read_text().splitlines()) if path.exists() else ()
 
     def _price_gates(self, state: LedgerEvidence, readings: Sequence[ChargeRead], now: int) -> None:
+        """Refresh cost estimates and keep existing pending bookings fixed."""
         launch_rows = self.launches()
         launches = {str(row.get('attempt', '')): row for row in reversed(launch_rows) if row.get('result') == 'launched'}
         gate_counts: dict[str, int] = {}
@@ -2193,6 +2206,9 @@ class CostLedger:
         root_gib = configuration.whole('root_gib') if configuration is not None and needs_root else 0
         priced: list[GateReservation] = []
         for reservation in state.gate_reservations:
+            if isinstance(reservation.state, GateLaunchPending) and reservation.state.booked_day_rates:
+                priced.append(reservation)
+                continue
             launch = launches.get(reservation.attempt)
             size = text(launch, 'instance_type') if launch is not None else reservation.instance_type
             at = int(float(str(launch['time']))) if launch is not None else reservation.at

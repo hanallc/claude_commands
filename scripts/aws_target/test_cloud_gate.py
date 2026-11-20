@@ -2133,6 +2133,43 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 self.assertEqual(worker.execute(self.folder, self.request, self.deployment)['status'], 'complete')
         self.assertEqual([row['InstanceType'] for row in self.fake.launches], [small.instance_type])
 
+    def reprice_legacy_pending_gate(self, small_rate: Decimal, large_rate: Decimal) -> cloud_gate.GateLaunchVariant:
+        _, initial_bill, small, large = self.launch_rate_fixture()
+        directory = self.state / 'charges'
+        directory.mkdir()
+        bill_path = directory / f'{initial_bill.day}.json'
+        cloud_gate.save(bill_path, ledger.charge_record(initial_bill))
+        self.book_small_box(small)
+        now = int(self.now)
+        self.assertIsInstance(self.book.reserve_gate(self.settings, ledger.GateReservation(
+            'other', now, now + 1200, Decimal('.8'), Decimal('.02'),
+            region=small.region, instance_type=small.instance_type)), ledger.GateReserved)
+        document = cloud_gate.read(self.book.path)
+        first = ledger.rows(document, 'gate_reservations')[0]
+        del ledger.mapping(first['state'])['booked_day_rates']
+        cloud_gate.save(self.book.path, document)
+        cloud_gate.save(self.folder / 'launch.json', {'variant': 0, 'variants': [asdict(large)]})
+        bill = replace(initial_bill, actual_usd=small_rate + large_rate, usage_types=(
+            replace(initial_bill.usage_types[0], usd=small_rate),
+            replace(initial_bill.usage_types[1], usd=large_rate)))
+        cloud_gate.save(bill_path, ledger.charge_record(bill))
+        self.book.resolve_gate('other', ledger.GateAbsent(now))
+        self.book = ledger.CostLedger(self.state)
+        saved = self.book.read_snapshot().gate_reservations[0]
+        self.assertEqual(saved.rate.usd_per_hour, Decimal('.12'))
+        return large
+
+    def test_restart_rejects_a_higher_bill_rate_after_repricing_a_legacy_reservation(self) -> None:
+        _ = self.reprice_legacy_pending_gate(Decimal('.80'), Decimal('.80'))
+        self.assertEqual(self.execute(), {'status': 'fallback',
+            'reason': 'm7a.8xlarge in us-east-2 costs 0.80 USD/h with 0.12 USD/h reserved'})
+        self.assertEqual(self.fake.launches, [])
+
+    def test_restart_allows_a_lower_bill_rate_within_the_legacy_reservation(self) -> None:
+        large = self.reprice_legacy_pending_gate(Decimal('.06'), Decimal('.10'))
+        self.assertEqual(self.execute()['status'], 'complete')
+        self.assertEqual([row['InstanceType'] for row in self.fake.launches], [large.instance_type])
+
     def test_launch_checks_the_booked_rate_after_a_config_change(self) -> None:
         worker, reading, small, large = self.launch_rate_fixture()
         with mock.patch.object(self.book, 'read_bills', return_value=(reading,)):
