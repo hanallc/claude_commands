@@ -459,8 +459,11 @@ The stack creates the launch template, security group, private control bucket, a
 The launch template uses persistent Spot and stops the instance when AWS interrupts it.
 Before a launch, setup reads Spot prices for the configured type and its fallback types.
 If the instance is already recorded, setup resumes without a Spot price check.
-It keeps the network in the existing Hana stack parameters.
-For a direct stack with only a VPC parameter, it keeps the subnet in the saved preparation.
+It keeps the VPC from the existing Hana stack and reads the deployed subnet with `ec2:DescribeInstances`.
+This read uses the existing deployment admin permission.
+Before an instance exists, it uses the matching saved preparation or image record.
+Preparation can regenerate `parameters.json` from the deployed network.
+Setup retains the original parameter approval when the instance uses a fallback zone.
 For a new setup, it uses the network in the saved image record when available.
 Otherwise it finds a public subnet in the configured zone with the deployment network resolver.
 It also checks each available default subnet in another zone of the same VPC.

@@ -200,7 +200,7 @@ class DeploymentRefused(ValueError):
 
 
 class DeploymentNetworkUnavailable(DeploymentRefused):
-    """AWS does not provide a usable network for deployment."""
+    """The available evidence does not identify a usable network."""
 
 
 class HanaControlRefused(DeploymentRefused):
@@ -484,23 +484,20 @@ class HanaNetwork:
     vpc: str
     subnet: str
 
-    @classmethod
-    def from_preparation(cls, output: Path) -> HanaNetwork:
-        parameters = prepared_parameters(output)
-        return cls(ledger.text(parameters, 'VpcId'), ledger.text(parameters, 'SubnetId'))
 
-    @classmethod
-    def from_stack(cls, stack: dict[str, object], output: Path) -> HanaNetwork:
-        parameters = {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
-                      for row in ledger.rows(stack, 'Parameters')}
-        vpc = ledger.text(parameters, 'VpcId')
-        if 'SubnetId' in parameters:
-            return cls(vpc, ledger.text(parameters, 'SubnetId'))
-        # The direct setup template stores only the VPC.
-        prepared = cls.from_preparation(output)
-        if prepared.vpc != vpc:
-            raise DeploymentNetworkUnavailable('The prepared Hana network differs from the live stack VPC.')
-        return prepared
+@dataclass(frozen=True)
+class DeployedHanaNetwork(HanaNetwork):
+    zone: str
+
+
+@dataclass(frozen=True)
+class HanaSetupInputs:
+    settings: DeploymentSettings
+    parameters: dict[str, str]
+    template: bytes
+    stack: dict[str, object]
+    network: HanaNetwork
+    approved_parameters: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -815,9 +812,10 @@ class Deployment:
         admin_secrets.refuse_plain_admin(self.settings_path)
         with self._require_hana_control('prepare --workload hana'):
             self._refuse_hana_replacement()
-            settings, parameters, template = self._hana_inputs(for_preparation=True)
+            inputs = self._hana_inputs()
+            settings, parameters = inputs.settings, inputs.parameters
             decision = self._guard()
-            prepared = self._hana_output()._write_preparation(settings, parameters, template, decision)
+            prepared = self._hana_output()._write_preparation(settings, parameters, inputs.template, decision)
             path = self.directory / 'hana' / 'setup.json'
             if not path.exists():
                 _save_hana_setup(path, {'version': HANA_SETUP_VERSION, 'deployment': parameters['DeploymentId'],
@@ -859,26 +857,19 @@ class Deployment:
                     raise DeploymentRefused('The configured Hana image differs from the registration. Review the saved deployment.')
             if ownership is HanaBoxOwnership.STACK:
                 return self._update_stack_owned_hana(path, saved, workload, limits)
-            settings, parameters, template = self._hana_inputs(workload)
-            if not saved:
-                parameters['DeploymentId'] = ledger.text(prepared_parameters(child.output), 'DeploymentId')
-            resume_stop = saved.get('requested') is True and saved.get('stop_pending') is True and bool(saved.get('instance'))
-            child.confirm_preparation_evidence(settings, parameters, template, allow_expired=resume_stop)
+            inputs = self._hana_inputs(workload, for_setup=True)
+            settings, parameters, template = inputs.settings, inputs.parameters, inputs.template
             book = ledger.CostLedger(self.directory)
             spending = hana_spend.HanaSpending(book, self.settings_path, limits)
             outputs: dict[str, str] = {}
             if saved.get('requested'):
                 saved_settings = replace(settings, region=ledger.text(saved, 'region'))
-                stack = child._read_stack(saved_settings)
+                stack = inputs.stack
                 outputs = child._stack_outputs(stack, require_outputs=True) if stack else {}
                 if 'Instance' in outputs or 'DataVolume' in outputs:
                     raise DeploymentRefused('The existing Hana stack owns the instance or data disk. ' + HANA_DOWN_FIRST)
                 if outputs:
                     self._refuse_hana_stack_instance(self._api(saved_settings), saved_settings.stack_name)
-                    if settings.region == saved_settings.region:
-                        live_network = HanaNetwork.from_stack(stack, child.output)
-                        if live_network != HanaNetwork(parameters['VpcId'], parameters['SubnetId']):
-                            raise DeploymentNetworkUnavailable('The prepared Hana network differs from the live stack. Run prepare again.')
                 if not outputs:
                     if any(key in saved for key in ('instance', 'data_volume', 'bucket', 'pending_launch', 'pending_volume')):
                         raise DeploymentRefused('The Hana stack is missing and the setup record names resources or pending requests. '
@@ -898,7 +889,7 @@ class Deployment:
                     print('hana-setup: cleared the saved setup for the missing stack')
                     saved = {}
             template_hash = sha256(template).hexdigest()
-            parameter_hash = _hana_parameter_hash(parameters)
+            parameter_hash = _hana_parameter_hash(inputs.approved_parameters)
             stack_parameters = {key: value for key, value in parameters.items()
                                 if key not in ('InstanceType', 'AvailabilityZone', 'SubnetId', 'DataGiB',
                                                'FallbackInstanceTypes')}
@@ -949,9 +940,13 @@ class Deployment:
                     saved['spot_max_price'] = previous_ceiling
                     update_ceiling = True
             with step('hana-setup', 'checking the image and subnet', self.settings_path):
-                self._validate_inputs(settings, parameters)
+                placement = replace(settings, availability_zone=inputs.network.zone) if isinstance(
+                    inputs.network, DeployedHanaNetwork) else settings
+                self._validate_inputs(placement, parameters)
                 candidates = (() if saved.get('instance') else self._hana_spot_candidates(
-                    api, settings, parameters, limits, workload))
+                    api, settings, inputs.approved_parameters, limits, workload))
+            if outputs and not (child.output / 'parameters.json').exists():
+                child._write_parameters(parameters)
             launch_deadline = 0
             if not saved.get('instance'):
                 if update_ceiling:
@@ -2091,8 +2086,7 @@ class Deployment:
         foundation = describe_regional_stack(api, account.stack_name) if api.region == account.region else {}
         return resolve_deployment_network(api, foundation)
 
-    def _hana_inputs(self, workload: conf.ConfigRead | None = None, *,
-                     for_preparation: bool = False) -> tuple[DeploymentSettings, dict[str, str], bytes]:
+    def _hana_inputs(self, workload: conf.ConfigRead | None = None, *, for_setup: bool = False) -> HanaSetupInputs:
         """Share the existing deployment validation and use only Hana sizes and prices."""
         if workload is None:
             workload = conf.read_or_repository('hana_aws')
@@ -2111,10 +2105,25 @@ class Deployment:
         settings = replace(settings, ami_id=image, ami_owner_id=owner)
         identity_path = self.directory / 'hana' / 'setup.json'
         saved = remote.read_record(identity_path) if identity_path.exists() else {}
-        identity = ledger.text(saved, 'deployment') if saved else uuid4().hex
         if saved and saved.get('stack') != settings.stack_name:
             raise DeploymentRefused('The saved Hana stack differs; review replacement before setup')
-        network = self._hana_network(account, settings, saved, registered, for_preparation=for_preparation)
+        output = self.output / 'hana'
+        template = HANA_TEMPLATE.read_bytes()
+        evidence: dict[str, object] = {}
+        if for_setup:
+            resume_stop = saved.get('requested') is True and saved.get('stop_pending') is True and bool(saved.get('instance'))
+            evidence = self._hana_output()._read_preparation_evidence(settings, template, allow_expired=resume_stop)
+        identity = (ledger.text(saved, 'deployment') if saved else
+                    ledger.text(prepared_parameters(output), 'DeploymentId') if for_setup else uuid4().hex)
+        saved_settings = replace(settings, region=ledger.text(saved, 'region')) if saved.get('requested') else settings
+        stack = self._read_stack(saved_settings) if saved.get('requested') else {}
+        if stack and stack.get('StackStatus') != 'REVIEW_IN_PROGRESS':
+            network = self._existing_hana_network(saved_settings, stack, saved, registered)
+        elif isinstance(registered, hana_image.RegisteredImage):
+            network = HanaNetwork(registered.vpc, registered.subnet)
+        else:
+            discovered = self._deployment_network(account, self._api(settings))
+            network = HanaNetwork(discovered.vpc, discovered.subnet_in(settings.availability_zone))
         parameters = {
             'DeploymentId': identity, 'Image': settings.ami_id, 'InstanceType': limits.instance_type,
             'FallbackInstanceTypes': ','.join(limits.fallback_instance_types),
@@ -2122,24 +2131,68 @@ class Deployment:
             'RootDevice': settings.root_device_name, 'RootGiB': str(limits.root_gib), 'DataGiB': str(limits.data_gib),
             'SpotMaxPrice': str(limits.spot_max_usd_per_hour), 'ScalerUser': settings.scaler_user_name,
         }
-        return settings, parameters, HANA_TEMPLATE.read_bytes()
+        approved_parameters = parameters
+        if for_setup:
+            approved_parameters = self._hana_approved_parameters(settings, network, parameters, saved)
+            if evidence.get('fingerprint') not in (fingerprint(settings, parameters, template),
+                                                   fingerprint(settings, approved_parameters, template)):
+                raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
+        return HanaSetupInputs(settings, parameters, template, stack, network, approved_parameters)
 
-    def _hana_network(self, account: DeploymentSettings, settings: DeploymentSettings, saved: dict[str, object],
-                      registered: hana_image.RegisteredImage | hana_image.PendingImageRegistration | hana_image.NoRegisteredImage,
-                      *, for_preparation: bool) -> HanaNetwork:
-        output = self.output / 'hana'
-        if saved.get('requested'):
-            # Setup checks its preparation before it reads the existing stack.
-            if not for_preparation:
-                return HanaNetwork.from_preparation(output)
-            if saved.get('region') == settings.region:
-                stack = self._read_stack(settings)
-                if stack and stack.get('StackStatus') != 'REVIEW_IN_PROGRESS':
-                    return HanaNetwork.from_stack(stack, output)
-        if isinstance(registered, hana_image.RegisteredImage):
-            return HanaNetwork(registered.vpc, registered.subnet)
-        network = self._deployment_network(account, self._api(settings))
-        return HanaNetwork(network.vpc, network.subnet_in(settings.availability_zone))
+    def _existing_hana_network(self, settings: DeploymentSettings, stack: dict[str, object], saved: dict[str, object],
+                               registered: hana_image.RegisteredImage | hana_image.PendingImageRegistration |
+                               hana_image.NoRegisteredImage) -> HanaNetwork:
+        unavailable = 'The existing Hana deployment has no confirmed subnet. Review the saved deployment.'
+        try:
+            parameters = {ledger.text(row, 'ParameterKey'): row.get('ParameterValue')
+                          for row in ledger.rows(stack, 'Parameters')}
+            vpc = ledger.text(parameters, 'VpcId')
+            outputs = self._stack_outputs(stack, require_outputs=True)
+            instance = outputs.get('Instance') or str(saved.get('instance', ''))
+            if instance or 'pending_launch' in saved:
+                filters = ('--instance-ids', instance) if instance else (
+                    '--filters', f'Name=client-token,Values={PendingHanaLaunch.decode(saved["pending_launch"]).token}',
+                    'Name=instance-state-name,Values=' + spot_end.LIVE_BOX_STATES)
+                reply = self._api(settings).call('describe-instances', *filters)
+                instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
+                if instances or instance:
+                    if (len(instances) != 1 or (instance and instances[0].get('InstanceId') != instance)
+                            or instances[0].get('VpcId') != vpc):
+                        raise DeploymentNetworkUnavailable(unavailable)
+                    row, = instances
+                    return DeployedHanaNetwork(vpc, ledger.text(row, 'SubnetId'),
+                                               ledger.text(ledger.mapping(row['Placement']), 'AvailabilityZone'))
+        except (AwsUnavailable, KeyError, ledger.LedgerUnavailable, OSError, subprocess.SubprocessError) as error:
+            raise DeploymentNetworkUnavailable(unavailable) from error
+        subnet = parameters.get('SubnetId')
+        if isinstance(subnet, str) and subnet:
+            return HanaNetwork(vpc, subnet)
+        try:
+            prepared = prepared_parameters(self.output / 'hana')
+            if prepared.get('VpcId') == vpc:
+                return HanaNetwork(vpc, ledger.text(prepared, 'SubnetId'))
+        except (OSError, json.JSONDecodeError, ledger.LedgerUnavailable):
+            pass
+        if isinstance(registered, hana_image.RegisteredImage) and registered.vpc == vpc:
+            return HanaNetwork(vpc, registered.subnet)
+        raise DeploymentNetworkUnavailable(unavailable)
+
+    def _hana_approved_parameters(self, settings: DeploymentSettings, network: HanaNetwork, parameters: dict[str, str],
+                                  saved: dict[str, object]) -> dict[str, str]:
+        approved_hash = saved.get('parameters_sha256')
+        if (not approved_hash or _hana_parameter_hash(parameters) == approved_hash
+                or not isinstance(network, DeployedHanaNetwork) or network.zone == settings.availability_zone
+                or saved.get('region') != settings.region):
+            return parameters
+        # A fallback launch keeps the approval for the original zone and subnet.
+        reply = self._api(settings).call('describe-subnets', '--filters', f'Name=vpc-id,Values={network.vpc}',
+                                         f'Name=availability-zone,Values={settings.availability_zone}')
+        for row in ledger.rows(reply, 'Subnets'):
+            if row.get('VpcId') == network.vpc and row.get('AvailabilityZone') == settings.availability_zone:
+                candidate = parameters | {'SubnetId': ledger.text(row, 'SubnetId')}
+                if _hana_parameter_hash(candidate) == approved_hash:
+                    return candidate
+        return parameters
 
     def _hana_output(self) -> Deployment:
         """Use separate preparation files with the existing deployment helper."""
@@ -2153,15 +2206,18 @@ class Deployment:
         prepared = PreparedDeployment(int(self.clock()), fingerprint(settings, parameters, template), parameters)
         self.output.mkdir(parents=True, exist_ok=True)
         write_text_atomic(self.output / 'template.json', template.decode())
-        write_text_atomic(self.output / 'parameters.json', json.dumps([
-            {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
-        ], sort_keys=True) + '\n')
+        self._write_parameters(parameters)
         write_text_atomic(self.output / 'preflight.json', json.dumps({
             'at': prepared.at, 'fingerprint': prepared.fingerprint,
             'decision': ledger.decision_record(decision),
             'inventory': [{'name': resource.name, 'usd_per_month': str(resource.usd_per_month)} for resource in resources],
         }, sort_keys=True) + '\n')
         return prepared
+
+    def _write_parameters(self, parameters: dict[str, str]) -> None:
+        write_text_atomic(self.output / 'parameters.json', json.dumps([
+            {'ParameterKey': key, 'ParameterValue': value} for key, value in parameters.items()
+        ], sort_keys=True) + '\n')
 
     def prepare(self) -> PreparedDeployment:
         admin_secrets.refuse_plain_admin(self.settings_path)
@@ -2389,18 +2445,22 @@ class Deployment:
     def confirm_preparation_evidence(self, settings: DeploymentSettings, parameters: dict[str, str], template: bytes,
                                     *, renew: bool = False, current_fingerprint: str = '', allow_expired: bool = False) -> None:
         """Verify saved preparation before either workload can create resources."""
-        preflight = remote.read_record(self.output / 'preflight.json')
-        at = ledger.instant(preflight, 'at')
+        preflight = self._read_preparation_evidence(settings, template, renew=renew, allow_expired=allow_expired)
         expected = current_fingerprint or fingerprint(settings, parameters, template)
-        age = int(self.clock()) - at
-        if ((not renew and (age < 0 or (not allow_expired and age > settings.preflight_max_age_s)))
-                or preflight.get('fingerprint') != expected
-                or fingerprint(settings, parameters, template) != expected
-                or (self.output / 'template.json').read_bytes() != template):
+        if preflight.get('fingerprint') != expected or fingerprint(settings, parameters, template) != expected:
             raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
         if renew:
             preflight['at'] = int(self.clock())
             write_text_atomic(self.output / 'preflight.json', json.dumps(preflight, sort_keys=True) + '\n')
+
+    def _read_preparation_evidence(self, settings: DeploymentSettings, template: bytes, *, renew: bool = False,
+                                   allow_expired: bool = False) -> dict[str, object]:
+        preflight = remote.read_record(self.output / 'preflight.json')
+        age = int(self.clock()) - ledger.instant(preflight, 'at')
+        if ((not renew and (age < 0 or (not allow_expired and age > settings.preflight_max_age_s)))
+                or (self.output / 'template.json').read_bytes() != template):
+            raise DeploymentRefused('deployment preparation expired or its inputs changed; run prepare again')
+        return preflight
 
     def _authorize(self, approve_resources: bool) -> None:
         if isinstance(self.mode, plan_run.PlanRun):

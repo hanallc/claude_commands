@@ -498,6 +498,7 @@ class HanaSetupFailureTests(CostFixture):
         stack_id = 'active-stack'
         errors = iter(launch_errors)
         disk_errors = iter(volume_errors)
+        instance_subnets: dict[str, str] = {}
 
         def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
                     check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -544,6 +545,7 @@ class HanaSetupFailureTests(CostFixture):
                 if launch_errors:
                     return subprocess.CompletedProcess(arguments, 1, '', next(errors))
                 instance = fake.launch(tagged=True)
+                instance_subnets[instance] = arguments[arguments.index('--subnet-id') + 1]
                 reply = {'Instances': [{'InstanceId': instance, 'SpotInstanceRequestId': fake.boxes[instance].request}]}
                 return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
             if operation == 'create-volume':
@@ -582,7 +584,16 @@ class HanaSetupFailureTests(CostFixture):
                     fake.create_retained()
                 fake.roll_back()
                 self.deleted_stacks[stack_id] = (created, fake.events.copy())
-            return fake(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+            result = fake(arguments, capture_output=capture_output, text=text, timeout=timeout, check=check, env=env)
+            if operation == 'describe-instances' and result.returncode == 0:
+                reply = ledger.mapping(cast(object, json.loads(result.stdout)))
+                for reservation in ledger.rows(reply, 'Reservations'):
+                    for instance in ledger.rows(reservation, 'Instances'):
+                        subnet = instance_subnets.get(ledger.text(instance, 'InstanceId'), 'fixture-subnet')
+                        zone = 'us-east-2' + (subnet[-1] if subnet in ('fixture-subnet-a', 'fixture-subnet-c') else 'b')
+                        instance.update(VpcId='fixture-vpc', SubnetId=subnet, Placement={'AvailabilityZone': zone})
+                return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), result.stderr)
+            return result
 
         def api(settings: aws_config.DeploymentSettings) -> aws_cli.AwsCli:
             return aws_cli.AwsCli(settings.profile, settings.region, settings.timeout_s, execute)
@@ -821,8 +832,8 @@ class HanaSetupFailureTests(CostFixture):
     def test_hana_create_commands_use_one_cli_attempt(self) -> None:
         execute = mock.Mock(return_value=subprocess.CompletedProcess([], 0, '{}', ''))
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=execute)
-        settings, _, _ = subject._hana_inputs()  # pyright: ignore[reportPrivateUsage]
-        api = subject._api(settings)  # pyright: ignore[reportPrivateUsage]
+        inputs = subject._hana_inputs()  # pyright: ignore[reportPrivateUsage]
+        api = subject._api(inputs.settings)  # pyright: ignore[reportPrivateUsage]
         environment = {'AWS_MAX_ATTEMPTS': '3'}
         with mock.patch.object(subject.admin, 'environment', return_value=environment):
             _ = api.call('run-instances')
@@ -1111,6 +1122,8 @@ class HanaSetupFailureTests(CostFixture):
                 reply = {'Reservations': [{'Instances': [{'InstanceId': instance,
                     'ImageId': prepared.parameters['Image'], 'LaunchTime': 'fixture-launch',
                     'State': {'Name': live_state}, 'InstanceLifecycle': 'spot',
+                    'VpcId': prepared.parameters['VpcId'], 'SubnetId': prepared.parameters['SubnetId'],
+                    'Placement': {'AvailabilityZone': prepared.parameters['AvailabilityZone']},
                     'BlockDeviceMappings': [{'DeviceName': '/dev/sdf', 'Ebs': {
                         'VolumeId': volume, 'DeleteOnTermination': False}}],
                     'SpotInstanceRequestId': saved['spot_request']}]}]}
@@ -1638,7 +1651,7 @@ class HanaSetupFailureTests(CostFixture):
         with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'stopped.*again when the box is idle'):
             _ = subject.hana_setup(approve_resources=True)
 
-        self.assertEqual(len(self.instance_reads), 1)
+        self.assertEqual(len(self.instance_reads), 2)
         self.assertEqual(self.scaler_calls, [])
         self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
 
@@ -1706,7 +1719,7 @@ class HanaSetupFailureTests(CostFixture):
         with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'parameters or region changed'):
             _ = subject.hana_setup(approve_resources=True)
 
-        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+        self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks', 'describe-stacks'])
         self.assertEqual(self.setup_path.read_bytes(), saved)
 
     def test_hana_policy_update_refuses_a_stack_that_disappears(self) -> None:
