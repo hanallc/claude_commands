@@ -96,7 +96,9 @@ Capture it as ${CHANGE_SURFACE} and skip to `<ChooseDestination/>`.
 **Goal:** an as-built overview, drafted without burning orchestrator tokens on a
 codebase re-read.
 
-Dispatch ONE `Explore` (or `general-purpose`) subagent. Its prompt must include:
+Assign one read-only worker through `/showrunner:worker` when enrolled.
+Keep its order and reply in the existing run directory. Before enrollment, use one built-in helper.
+Give it these instructions:
 
 - ${SOURCE} `plan` — the absolute plan-doc path, and a directive to read the plan
   **and** the key shipped files it names (the Delegation Context **Key files**

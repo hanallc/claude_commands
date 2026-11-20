@@ -272,11 +272,13 @@ The output file will be `/tmp/claude/bevy_migration_deps_$(basename "${CODEBASE}
 
 **Launch 10 parallel subagents for quick applicability filtering:**
 
-Use the Agent tool to launch 10 general-purpose subagents **in a single message** (parallel execution).
+When enrolled, assign read-only workers through `/showrunner:worker` within the worker limit.
+Keep orders and replies in the existing run directory. Send script work that writes to a unit.
+Before enrollment, launch the ten general-purpose helpers in one `Agent` message.
 
 **For each subagent (1-10):**
 
-Create an Agent tool call with description: `"Pass 1: Subagent ${N}"`
+Name the assignment `bevy-pass1-${N}`.
 
 **Agent prompt:**
 
@@ -375,7 +377,8 @@ If APPLICABLE_GUIDES_DATA is empty (no applicable guides found):
 
 APPLICABLE_GUIDES_DATA holds each guide's `guide_path`, `matched_patterns` and `total_occurrences` from Pass 1. Set PASS2_AGENT_COUNT to min(10, the number of applicable guides). Distribute every guide exactly once across balanced batches; each agent handles several guides when there are more than 10.
 
-Launch PASS2_AGENT_COUNT Agent tool calls in one message, with description `"Deep Analysis: Batch ${N} of ${PASS2_AGENT_COUNT}"`.
+Assign the batches through the Pass 1 route. Name each assignment `bevy-pass2-${N}`.
+Send any plan or code writes to a unit when enrolled.
 
 **Agent prompt (include the batch's complete guide objects):**
 

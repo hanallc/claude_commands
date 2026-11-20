@@ -245,7 +245,9 @@ for the current `As-built` block.
 
 Otherwise skip this step when no `todo` phase remains; the floor is empty.
 
-Dispatch ONE `Explore` (or `general-purpose`) subagent. Its prompt must include:
+Assign one read-only worker through `/showrunner:worker` when enrolled.
+Keep its order and reply in the existing run directory. Before enrollment, use one built-in helper.
+Give it these instructions:
 
 - The absolute plan-doc path and the line ranges of the **`todo` phases** and
   `## Delegation Context` (from `<Locate/>`'s heading map). Directive: read those

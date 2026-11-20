@@ -318,7 +318,11 @@ The question form for every question to the user is defined by this import:
   never poll.
 - A ruling that parks, stops or replaces work names the runs to cancel in
   the same turn under <WorkerRuns/> in `/unit:direct`.
-- **Helpers.** Stop each named helper agent once its report is read.
+- **Helpers.** On an enrolled showrunner, assign `review` or `astra-reviewer` with
+  `/showrunner:worker`. Keep orders and replies in the existing run directory.
+  Respect the worker limit when assigning reviews in parallel. End each helper
+  after reading its report. Send write orders to a unit or the serving merge unit.
+  Before enrollment, stop each built-in helper after reading its report.
 - **An auto-mode denial** is never retried or worked around. Tell the user what
   was denied and let them add a permission rule.
 - **Unmeasured ETAs.** When a unit has no measured phase ETA, run `~/.claude/scripts/lib/py
@@ -730,7 +734,9 @@ Read a shot, not even to look before a merge or before the user sees it. The
 2026-10-01 nightly review counted 116 shots (227k tokens) loaded there in 2.6
 days. Units run this check themselves before each checkpoint notice
 (<MergeCheckpoint/> step 3). Run it here only when a notice's verdict is
-missing or stale: spawn a fresh helper agent with this prompt:
+missing or stale.
+Assign a fresh read-only review worker through `/showrunner:worker` when enrolled.
+Before enrollment, start a built-in helper. Give it this prompt:
 
 > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
 > <paths>. Guide: <UX guide path>. Scale: <shot pixels per logical pixel>.
@@ -739,7 +745,8 @@ missing or stale: spawn a fresh helper agent with this prompt:
 > rules: <the doc's Production rules that concern looks>. Return only the
 > verdict and the table.
 
-Read its verdict, then stop the helper. Save each canonical candidate it
+Read the verdict and end the helper. When enrolled, send the example writes
+below to the unit that owns the guide. Save each canonical candidate it
 lists, without viewing it, into a slot still empty: `mkdir -p
 <guide>/examples/<stem> && magick <shot> -crop <crop> +repage
 <guide>/examples/<stem>/<slot>.png`. Saving it approves it for use now; add
