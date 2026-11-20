@@ -323,7 +323,7 @@ def require_merge_branch(production: ProductionDocument) -> None:
 def request_from(args: argparse.Namespace) -> MergeRequest:
     bump = user_bump(args)
     record = staff.snapshot()
-    production = read_production(cast(str, args.production), record)
+    production = checkpoint_gate.integration_production(read_production(cast(str, args.production), record))
     name = cast(str, args.unit)
     resolver = session_staff.RowResolver(record)
     rows = record.find(kind="unit", parent=production.owner.id)
@@ -338,7 +338,7 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
         parent = record.parent_of(selected)
         if parent is None or parent.kind != "showrunner" or not worktree_in_repo(selected, main_checkout):
             raise Refusal(f"unit {name}: staff parent is {parent.name if parent else 'unavailable'}; use that production")
-        parent_production = read_production(parent)
+        parent_production = checkpoint_gate.integration_production(read_production(parent))
         rows.extend(record.find(kind="unit", parent=parent.id))
     if isinstance(selected.worktree, staff.RemovedWorktree):
         raise Refusal(f"unit {name} is not a staff unit of this production")
@@ -1339,7 +1339,7 @@ def start_gate(request: MergeRequest, paths: tuple[str, ...], merge_head: str, t
         "production_doc": str(parent.doc), "name": parent.name,
         "owner_id": str(parent.owner.id), "unit_id": str(request.unit.staff_id),
         "merge_branch": request.production.merge_branch, "checkout": str(request.production.checkout),
-        "production_log": os.path.relpath(parent.log, request.production.checkout),
+        "production_log": str(parent.log),
         "zone": str(parent.zone), "unit": request.unit.name,
         "delivered_to": [],
         "paths": list(paths), "merge_tests": [list(command) for command in request.merge_tests],
@@ -1996,7 +1996,7 @@ def child_runner(action: str, *arguments: str) -> str:
 
 
 def child_request(args: argparse.Namespace) -> ChildHandoffRequest:
-    production = read_production(cast(str, args.production))
+    production = checkpoint_gate.integration_production(read_production(cast(str, args.production)))
     name = owner_for(cast(str, args.from_child)).name
     try:
         parent = child_runner("parent", name)
@@ -2007,7 +2007,7 @@ def child_request(args: argparse.Namespace) -> ChildHandoffRequest:
         raise Refusal(f"{name} reports to {parent}; --root-self needs a root")
     if not root_self and parent != production.name:
         raise Refusal(f"{name} is not attached under {production.name}")
-    child = read_production(name)
+    child = checkpoint_gate.integration_production(read_production(name))
     lines = child.doc.read_text().splitlines()
     if production_field(lines, "Kind") != "style":
         raise Refusal(f"{name} is not a style production")

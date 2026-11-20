@@ -40,8 +40,11 @@ def run_gate(path: Path) -> int:
         record["proc_start"] = proc_start
         save_record(path, record)
     try:
+        checkout = Path(record["checkout"])
+        # Older receipts recorded the LOG relative to the checkout saved in the receipt.
+        log = checkout / record["production_log"]
         production = ProductionDocument(Path(record["production_doc"]), record["name"], record["merge_branch"],
-            Path(record["checkout"]), Path(record["checkout"]) / record["production_log"], ZoneInfo(record["zone"]))
+                                        checkout, log, ZoneInfo(record["zone"]))
         with copies.requested_source(production.checkout, copies.CommittedSource(record["tip"]), copies.NO_MERGE) as source:
             steps = test_steps(replace(production, checkout=source), tuple(record["paths"]),
                                tuple(tuple(command) for command in record["merge_tests"]))
