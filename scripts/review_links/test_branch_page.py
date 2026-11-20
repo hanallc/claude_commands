@@ -207,7 +207,7 @@ class BranchPageTests(unittest.TestCase):
         self.assertIn('Unit: nate — not active', body)
 
     def test_lists_only_merged_recorded_natedev_unit_branches_and_checks_each_row(self) -> None:
-        for live_directory in ("present", "missing", "pruned", "newest-run", "unrecorded", "remote-main"):
+        for live_directory in ("present", "missing", "pruned", "newest-run", "unrecorded", "remote-main", "enrolled"):
             with self.subTest(live_directory=live_directory), scratch_branches() as fixture:
                 if live_directory in ("missing", "pruned", "newest-run", "unrecorded"):
                     shutil.rmtree(fixture.live_worktree)
@@ -237,6 +237,25 @@ class BranchPageTests(unittest.TestCase):
                     _ = fixture.command("-C", str(clone), "merge", "--no-ff", "TEST-merged", "-m", "Merge new branch commit")
                     fixture.merges["TEST-merged"] = fixture.command("-C", str(clone), "rev-parse", "HEAD")
                     _ = fixture.command("-C", str(clone), "push", "origin", "main", "TEST-merged")
+                if live_directory == "enrolled":
+                    integration = fixture.root / "integration"
+                    _ = fixture.command("worktree", "add", str(integration), "TEST-production")
+                    pointer = fixture.repository / "docs/plans/former-production.md"
+                    live_doc = pointer.with_name("former-production-live.md")
+                    _ = live_doc.write_text(
+                        f"- **Repository:** `{fixture.repository}`\n- **Merge branch:** `TEST-production`\n"
+                        + f"- **Merge checkout:** `{integration}`\n- **Log:** `production.log`\n"
+                        + pointer.read_text(encoding="utf-8").partition("## Units")[1]
+                        + pointer.read_text(encoding="utf-8").partition("## Units")[2], encoding="utf-8")
+                    _ = pointer.write_text(f"Moved to staff {fixture.publisher}.\n", encoding="utf-8")
+                    _ = fixture.command("commit", "-am", "Point to the live production")
+                    _ = fixture.command("push", "origin", "main")
+                    rows = [replace(row, doc=staff.LiveDoc("natedev", live_doc)) if row.id == fixture.publisher else row
+                            for row in staff.snapshot().rows]
+                    _ = fixture.staff_file.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}),
+                                                      encoding="utf-8")
+                    self.assertIn("TEST-production", fixture.remote_names())
+                    self.assertNotIn("TEST-production", {row.name for row in fixture.listing().rows})
                 rows = fixture.rows()
                 expected = {"TEST-merged", "TEST-keep", "TEST-rejected", "TEST-legacy", "TEST-owner-fallback",
                             "TEST-history-only", "TEST-active<&"}
