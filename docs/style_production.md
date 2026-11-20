@@ -24,7 +24,7 @@ it joins; a tier A or E rule, local or global, has no family.
 
 | Family | B: listed rules | C: file reads | D: crate checks |
 | --- | --- | --- | --- |
-| `names` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
+| `names` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
 | `values` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
 | `types` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
 | `modules` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
@@ -127,8 +127,7 @@ every fix.
 5. Names: spell-out-names, dont-repeat-enum-domain-in-variant-names,
    name-submodules-after-anchor-types, prefer-type-named-fields-and-bindings,
    dont-repeat-type-name-in-fields, avoid-repeated-field-affixes,
-   name-bindings-to-match-parameters, comments-name-code-constructs,
-   forbidden-words.
+   name-bindings-to-match-parameters, comments-name-code-constructs.
 6. Layout, sort only: constants-file-organization, module-structure.
    workspace-dependencies takes any position after use-bevy_kana-in-all-bevy-crates.
 7. Tier A final: rustfmt, clippy, mend.
@@ -559,11 +558,12 @@ Exit 1 means the trees differ; run the five steps:
    Without a package, lint checks the workspace with mend, rustfmt, and Clippy.
    Clippy uses `--all-targets --all-features` and the workspace lint config.
    Nothing rewrites the tree: mend runs in report mode and rustfmt with `--check`.
-   `copies.standing` holds the checkout's `.claude-busy` lock through lint and
-   cleanup. Each checkout keeps its own real `target/`; a second busy checkout
-   uses its own cache. A missing or swept cache builds cold. The configured
-   gates root and pool limit come from `config/copies.conf` (see
-   `docs/as-built/gate-checkouts.md`). No `CARGO_TARGET_DIR` is set.
+   `copies.standing` holds a repository slot through lint and cleanup.
+   The machine shares the repository pool across owners.
+   Each `<repository>-slot<N>` checkout keeps its own `target/`.
+   A missing or swept cache builds cold. Lint leaves `CARGO_TARGET_DIR` unset.
+   `config/build_folders.conf` sets the slot root and the repository or machine default limit.
+   See [Standing gate checkouts](as-built/gate-checkouts.md).
    It records per-file diagnostics once per tool; disabled or incomplete checks
    grant no successful coverage. Exit 0 means clean, every tool recorded passing;
    continue the sync. Exit 1 means diagnostics recorded or a tool did not pass;
@@ -614,9 +614,10 @@ Use `merge_checkpoint.py --production <showrunner name> <unit> <phase> <hash> --
 The checkpoint does not filter code paths by responsibilities.
 The ticket gate and cargo-berth manage the ticket files and reservations.
 
-The publication coordinator confirms reservation release before another publication can move HEAD.
-It records the run folder and phase with the ticket checkpoint.
-If a retained record still needs release, repeat the coordinator command before publishing more work.
+The ledger saves the candidate, its parent and the full reservation before HEAD moves.
+The publication record prevents need, widen, yield and cancel changes for the ticket.
+Repeat the coordinator command to finish a pending publication.
+The coordinator records the checkpoint and confirms reservation release before it removes the publication record.
 `ticket merge` and `reconcile` also recover any retained reservation record.
 After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
 to recover any retained reservation and wake units waiting for sync. Send the owning director
@@ -697,28 +698,41 @@ Selection skips files reserved on the berth board, changed on live units'
 unmerged branches, or dirty in their worktrees. Acquire reservations when
 editing begins. Product work always wins a conflict.
 
-After a clean incoming merge mid-ticket, recheck the file's incoming diff before
-checkpointing and record the new fingerprint. On a conflict or berth overlap,
-drop every finding touching that file, including all its edits in other files;
-a multi-file rename is dropped as a whole. Release reservations no remaining
-finding touches, rerun the gate, and leave dropped cells stale for later work.
-Record each dropped file with `style_ledger.py ticket yield --repo <unit-worktree>
---id <ticket> --path <file>`; this clears the ticket's verdicts and unfiled held
-findings on it, leaving its cells for later work.
-Before a proposal yield or drop, record each reserved, unmerged or dirty file outside the ticket that the change needs.
-Use `style_ledger.py held need --repo <unit-worktree> --finding <finding-id> --path <file>`.
-The need belongs to the finding and lasts across drops and refills.
-The command accepts any finding in the ledger, with or without a build ticket.
-Refill waits while the needed file is busy.
-The ticket's gate accepts an edit to the recorded need path.
+After a clean incoming merge, check the incoming diff again before the checkpoint.
+Record the new fingerprint.
 
-A proposal ticket yields the file of a finding whose file, or a file its change
-edits, is blocked. Its findings at that file stay filed under their decision with
-no build ticket, and the ticket no longer lists them. The gate and `ticket merge`
-skip them, and a later proposal ticket takes them. The command prints
-`yielded <finding id>: it stays filed for a later ticket` for each. It refuses a
-file with no finding of the ticket, a file that holds every finding the ticket has
-left (drop the ticket), and a kept finding that can need a yielded one. A `path`
+For a proposal ticket with blocked changes, use this procedure.
+
+1. Record each reserved, unmerged or dirty file that a finding needs outside the ticket.
+   Use `style_ledger.py held need --repo <unit-worktree> --finding <finding-id> --path <file>`.
+2. Yield the blocked findings.
+   Use `style_ledger.py ticket yield --repo <unit-worktree> --id <ticket> --finding <finding-id>`.
+   Repeat `--finding` for each blocked finding.
+3. Release reservations that the remaining work does not need.
+4. Run the gate again.
+
+The ledger also yields findings that share an edit path with a yielded finding.
+This check continues until the remaining findings share no edit paths with the yielded findings.
+The ledger checks the ticket base and the current synced tip.
+It refuses the yield if it cannot read the synced tip.
+The command prints each yielded ID and its reason.
+The yielded findings stay filed for a later ticket.
+The ledger removes the rule pin when the ticket keeps no finding for that rule.
+A repeated yield changes nothing.
+Drop the ticket if the yield would release all its findings.
+Refill waits while a recorded need path is busy.
+The ledger stores a blocked need when another ticket holds its path.
+The ticket gate and checkpoint refuse while the ticket has a blocked need.
+Run `held need` again to acquire the path after the other ticket releases it.
+The ticket gate requires assignment and allows edits to acquired need paths.
+The gate records and refuses a rename it cannot prove.
+Use the reviewed merge route and `held built --commit <merge> --by <person>` for a rename without an applied check.
+
+Use `style_ledger.py ticket yield --repo <unit-worktree> --id <ticket> --path <file>` to yield work by file.
+This clears the ticket's verdicts and unfiled findings at that path.
+For a proposal ticket, it releases all findings at that path.
+The command refuses to release every remaining finding or to release work that a kept finding may need.
+A `path`
 attribute that mounts a file across crates refuses when either crate holds a
 finding of the ticket, and a `path` attribute that mounts a file not named
 `.rs` refuses anywhere. A `path` attribute on an inline module names the folder
@@ -733,6 +747,30 @@ the crate can re-export a renamed module, glob-import its parent, or hold an
 on the unit branch proves that the kept work builds without the yielded change.
 A structure ticket cannot yield.
 Style units obey build holds and memory admission like any unit.
+
+## Widening a proposal ticket
+
+The ticket footprint includes the file paths that approved findings state for a rename or split.
+Each file rename must pass the content check and the applied check.
+The ticket base tells the ledger which split destinations are new files.
+An existing split destination is an ordinary edit path.
+Assignment saves a reservation with the edit role for each path.
+Dispatch and assignment use the same paths.
+The gate verifies reference edits with the rename checks.
+The ledger checks additional paths for overlap before it saves them.
+It updates the reservation when a ticket checkpoints, widens, or yields.
+Refill uses saved reservations for other tickets.
+When legacy records are incomplete, the ledger reserves the affected crate and the known edit paths.
+Use a bare file name for a split destination in the finding's directory.
+Use a repository-relative path for a companion file in another directory.
+Use `style_plan.py widen --repo <unit-worktree> --ticket <ticket> --files <new-file> --reason <reason> --by <name>`
+to add a required path that the findings do not name.
+The command refuses a path that another queued, assigned, or checkpointed ticket holds or plans to create.
+Assignment leaves a ticket queued if another unit holds any path in its reservation.
+In a worker session, the command uses `UNIT_RUN_DIR` to update the active dispatch.
+Use `--session-dir <run>` to identify that run from another session.
+Repeat the same widen if the ledger saved the paths before the dispatch update.
+Read the updated `ticket-paths.txt` before you edit the new file.
 
 ## Big changes
 
@@ -1087,46 +1125,28 @@ refuses a finding whose decision is declined, because the next `file` waives it
 again: answer the decline again first. It strips `--by`. A refusal writes
 nothing for any id.
 
-A file rename is a `rename` finding whose `after` starts with `Rename <a> to <b>`,
-where `<a>` and `<b>` are sibling `.rs` files and the finding's path ends with `<a>`.
-Neither file name may be a Rust keyword, and the rest of `after` may not name a
-second `<x>.rs to <y>.rs` pair or a move, split or merge. Only these exact forms
-negate a move, so it is not a second change:
-- `does not`, `doesn't`, `cannot`, `never` or `without` right before it
-  (`does not move`, `without moving`);
-- a clause that is `nothing`, `none`, or `no`, at most three words and a noun that
-  names code (`definition`, `item`, `type`, `helper`, …) before it, with a place
-  word (`into`, `out`, `from`, `to`, …) or the sentence end (`.`, `;`, end of text) after it (`no existing
-  definition moves from those callers`);
-- a clause of `no` and at most three words before a move word that is a noun, with
-  a form of `be` after it (`no additional split is introduced`);
-- `no`, at most three words and a noun that names code right after it, then the
-  sentence end (`move no skipped definitions.`).
-
-`no longer`, `no more`, `no less`, `no fewer`, `no later`, `no sooner`, `no doubt`
-and `no matter` never negate.
-
-Every other form counts as a move, and a person decides: `Do not introduce a
-facade or move any definition`, `moves no item into a file`, `move no other helpers
-than LockError` and `move nothing apart from LockError` are refused. A clause starts after a mark
-(`. ; : , ( )`) or after `and`, `but` or `then`. A hyphenated word such as
-`finding-merging` is a name, not a merge.
-It is applied when only the new file is in the code, and not applied when only the
-old file is. It has no check when a folder of child modules (`lock/` or
-`mutation_lock/`) is there; the gate refuses changes in that folder, and a person
-moves it. The gate allows the old file to go and the new file to come, and it
-compares the new file with the old file at HEAD. The old file must be gone, and
-no file may be at the new path in HEAD. The new file may change only as the other
-Rust files below may: its own paths such as `crate::ledger::lock::LockError` take
-the new name, and its `use` and `mod` lines may take the order rustfmt gives them.
-A definition that comes into or goes out of the file, or any other change, is
-refused (`<new> (renamed from <old>: change is not only the rename)`). When
-another finding of the ticket has the old or the new path, the new file is free,
-as a finding's file is: it moves under that finding's approval, so an item rename
-declared there can change it. A new file that is byte-identical to the old one
-passes with no scan, also outside every crate root (`tests/helper.rs`). The text rules do not catch every move request
-(`only LockError goes into ledger/error.rs`): when the worker builds only the
-rename, the gate marks the finding built. In other
+A file rename finding uses kind `rename` and starts its `after` with `Rename <a> to <b>`.
+Use two sibling `.rs` paths in each pair.
+Write bare paths or enclose them in backticks.
+One source must match the end of the finding path.
+Rust keywords are invalid file stems.
+Join pairs with a comma, `and`, or `plus`.
+Use `Rename` or `Rename the companion file` after a period or semicolon.
+Use a separate `Update` clause for module declarations, imports, path attributes, and documentation references.
+The clause can also name a Rust file or qualified paths, as in `Update ledger/mod.rs and all super::lock paths`.
+The parser requires a complete instruction and refuses implied renames or directory moves.
+An item rename must name a valid source and target.
+Each path can occur in only one move across the ticket.
+The gate refuses the finding if it cannot verify any file rename.
+The applied check requires the new file and the removal of the old file.
+A folder of child modules at either name prevents the applied check.
+The new path must be absent at HEAD.
+The gate compares the new file with the old file at HEAD.
+A byte-identical file passes the content check, including a file outside a crate root such as `tests/helper.rs`.
+The gate also permits proven reference edits and changes to the order of `use` and `mod` lines.
+An approved item rename can change a declaration that the gate identifies in the old file.
+The content check refuses any other change to the renamed file.
+In other
 Rust files it allows only the `mod <old>;` line and the path
 segments that name the module: `super::lock`, `self::lock`, `crate::ledger::lock`,
 `ledger::lock` from the module that holds `ledger`, `alpha::ledger::lock` in a file

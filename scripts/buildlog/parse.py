@@ -18,7 +18,9 @@ import shlex
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import BinaryIO, TypedDict
+from typing import BinaryIO, NotRequired, TypedDict
+
+from scripts.lib import conf
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 
@@ -40,7 +42,7 @@ LOCATION = re.compile(r"^\s*--> (\S.*)$")
 # progress counter ("(───)" on a retried attempt) and binary then test.
 TEST_LINE = re.compile(
     r"^\s*(?:TRY (\d+) )?([A-Z][A-Z0-9-]*) \[\s*>?\s*(\d+(?:\.\d+)?)s\]\s+"
-    + r"(?:\((?:\s*\d+/\d+|[─-]+)\)\s+)?(\S+)\s+(\S.*?)\s*$"
+    + r"(?:\((\s*\d+/\d+|[─-]+)\)\s+)?(\S+)\s+(\S.*?)\s*$"
 )
 SUMMARY = re.compile(r"^\s*Summary \[\s*[\d.]+s\]\s+(\d+)(?:/\d+)? tests? run:(.*)$")
 NOT_RESULT = frozenset({"START", "DELAY", "RETRY", "CANCEL", "SKIP", "FLAKY", "SETUP"})
@@ -65,6 +67,11 @@ class TestRow(TypedDict):
     slow: bool
 
 
+class ObservedNextestTests(TypedDict):
+    by_binary: dict[str, list[str]]
+    complete: bool
+
+
 class LogFacts(TypedDict):
     finished_s: float | None
     crates_compiled: int | None
@@ -78,6 +85,7 @@ class LogFacts(TypedDict):
     tests_flaky: int | None
     tests_retried: int | None
     tests: list[TestRow] | None
+    observed_tests: NotRequired[ObservedNextestTests]
     mend_fixes: int | None
     mend_check_s: float | None
     mend_s: float | None
@@ -218,6 +226,31 @@ def step_name(argv: list[str]) -> str:
     return cargo_subcommand(words[1:]) or "cargo"
 
 
+NEXTEST_PASS_LEVELS = frozenset({"pass", "skip", "all"})
+
+
+def nextest_status_is_trusted(argv: Sequence[str], environment: Mapping[str, str]) -> bool:
+    """Require nextest to capture test output and report passing tests."""
+    words, _, effective = command_context(list(argv), os.getcwd(), environment)
+    status_level = effective.get("NEXTEST_STATUS_LEVEL", "pass")
+    progress = effective.get("NEXTEST_SHOW_PROGRESS", "")
+    if effective.get("NEXTEST_NO_CAPTURE", "").lower() in ("1", "true"):
+        return False
+    options = iter(words)
+    for word in options:
+        if word == "--":
+            return not any(arg in ("--nocapture", "--no-capture") for arg in options) and (
+                status_level in NEXTEST_PASS_LEVELS and progress != "only")
+        name, equals, value = word.partition("=")
+        if name in ("--no-capture", "--nocapture"):
+            return False
+        if name == "--status-level":
+            status_level = value if equals else next(options, "")
+        elif name == "--show-progress":
+            progress = value if equals else next(options, "")
+    return status_level in NEXTEST_PASS_LEVELS and progress != "only"
+
+
 def toolchain(argv: list[str]) -> str | None:
     """The `+toolchain` a cargo argv names, as rustc takes it."""
     words = command_words(argv)
@@ -348,57 +381,77 @@ def result_status(word: str) -> str:
 
 def nextest_slow_test_s() -> float:
     """Read the nextest recording threshold at use."""
-    from scripts.lib import conf
-
     return conf.read("test_times").number("NEXTEST_SLOW_TEST_S")
 
 
-def test_results(lines: list[str]) -> tuple[list[TestRow], list[Summary]]:
-    """Per-test rows worth keeping, and the Summary counts.
+@dataclass(frozen=True)
+class NextestResults:
+    timing_rows: list[TestRow]
+    summaries: list[Summary]
+    observed: ObservedNextestTests
 
-    Only lines before the Summary count: nextest reprints the failed and flaky
-    ones after it. A row is kept for a test that failed, was retried, ran past
-    NEXTEST_SLOW_TEST_S or was reported SLOW; the counts cover every test.
+
+def test_results(lines: list[str]) -> NextestResults:
+    """Read result names and keep timing rows for failures, retries and slow tests.
+
+    Captured test output can contain a summary. Use the last summary to
+    exclude any results that nextest repeats after it.
     """
-    tests: dict[tuple[str, str], TestRow] = {}
+    summary_line = len(lines)
     summaries: list[Summary] = []
-    for line in lines:
-        found = SUMMARY.match(line)
-        if found:
+    for position in range(len(lines) - 1, -1, -1):
+        if found := SUMMARY.match(lines[position]):
             counts = summary_counts(found.group(2))
             counts["run"] = int(found.group(1))
             summaries.append(counts)
+            summary_line = position
+            break
+    tests: dict[tuple[str, str], TestRow] = {}
+    unfinished: set[tuple[str, str]] = set()
+    completed = 0
+    for position, line in enumerate(lines):
+        if position == summary_line:
             break
         match = TEST_LINE.match(line)
         if not match:
             continue
-        attempt_text, word, duration, binary, test = match.groups()
+        attempt_text, word, duration, progress, binary, test = match.groups()
         if word in NOT_RESULT:
             continue
+        name = (binary, test)
         row = tests.setdefault(
-            (binary, test),
+            name,
             {"binary": binary, "test": test, "status": "passed", "attempts": 0, "duration_s": None, "slow": False},
         )
         if word == "SLOW":
             row["slow"] = True
+            unfinished.add(name)
             continue
+        if progress and "/" not in progress:
+            unfinished.add(name)
+        else:
+            unfinished.discard(name)
+            completed += 1
         attempt = int(attempt_text) if attempt_text else 1
         if attempt >= row["attempts"]:
             row["attempts"] = attempt
             row["status"] = result_status(word)
             row["duration_s"] = float(duration)
     if not tests:
-        return [], summaries
+        return NextestResults([], summaries, {"by_binary": {}, "complete": False})
     slow_test_s = nextest_slow_test_s()
     rows: list[TestRow] = []
+    names: dict[str, list[str]] = {}
     for row in tests.values():
+        names.setdefault(row["binary"], []).append(row["test"])
         if row["attempts"] == 0:
             row["attempts"] = 1
         if row["status"] == "passed" and row["attempts"] > 1:
             row["status"] = "flaky"
         if row["status"] != "passed" or row["attempts"] > 1 or row["slow"] or (row["duration_s"] or 0) > slow_test_s:
             rows.append(row)
-    return rows, summaries
+    complete = bool(summaries and not unfinished and completed == len(tests) == summaries[0]["run"])
+    return NextestResults(rows, summaries, {"by_binary": names, "complete": complete})
 
 
 def mend_fixes(lines: list[str]) -> int | None:
@@ -424,8 +477,8 @@ def sweep_freed(lines: list[str]) -> int:
     return freed
 
 
-def log_facts(step: str, text: str) -> LogFacts:
-    lines = clean_lines(text)
+def log_facts(step: str, *output: str, trust_nextest_status: bool = True) -> LogFacts:
+    lines = [line for stream in output for line in clean_lines(stream)]
     facts = no_facts()
     finished, mend_check, mend = build_seconds(lines)
     facts["finished_s"] = finished
@@ -435,7 +488,13 @@ def log_facts(step: str, text: str) -> LogFacts:
     facts["compiled_crate_names"] = names
     facts["crates_compiled"] = len(names)
     facts["warnings"], facts["errors"] = diagnostics(lines)
-    rows, summaries = test_results(lines)
+    results = test_results(lines)
+    rows, summaries = results.timing_rows, results.summaries
+    if step == "nextest":
+        if not trust_nextest_status:
+            facts["observed_tests"] = {"by_binary": {}, "complete": False}
+        elif results.observed["by_binary"]:
+            facts["observed_tests"] = results.observed
     if summaries or step == "nextest":
         facts["tests"] = rows
         facts["tests_retried"] = sum(1 for row in rows if row["attempts"] > 1)

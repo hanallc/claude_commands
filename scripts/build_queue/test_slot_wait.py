@@ -7,15 +7,17 @@ import fcntl
 import io
 import json
 import os
+from pathlib import Path
 import socket
 import time
 import unittest
 from unittest import mock
 from typing import cast
 
-from scripts.build_queue import admission_client as client, admission_protocol as wire, slot_wait
+from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service as service, slot_wait
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, reply_bytes
 from scripts.lib.build_slots_test_support import SlotTestConfiguration, private_slot_config
+from scripts.lib.proc_text import read_proc_text
 
 
 class QueueRowNameTests(unittest.TestCase):
@@ -24,17 +26,34 @@ class QueueRowNameTests(unittest.TestCase):
 
 
 class RepositorySlotWaitTests(unittest.TestCase):
+    slot_lock_descriptors: tuple[int, ...] = ()
+
     def pool(self, maximum: int = 1) -> tuple[AdmissionFixture, SlotTestConfiguration]:
         fixture = self.enterContext(AdmissionFixture())
         settings = private_slot_config(fixture.root, repository="widget", maximum=maximum)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, settings.environment)))
+        self.slot_lock_descriptors = ()
+        _ = self.enterContext(mock.patch.object(service, "read_proc_text", side_effect=self.read_fixture_locks))
         settings.slots.mkdir()
         return fixture, settings
 
     def hold(self, settings: SlotTestConfiguration, number: int = 1, repository: str = "widget") -> int:
         stream = self.enterContext((settings.slots / f"{repository}-slot{number}.lock").open("w"))
         fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return stream.fileno()
+        descriptor = stream.fileno()
+        self.slot_lock_descriptors += (descriptor,)
+        return descriptor
+
+    def read_fixture_locks(self, path: Path) -> str:
+        """Read only the fixture locks when the service asks for the lock list."""
+        if path != Path("/proc/locks"):
+            return read_proc_text(path)
+        return "\n".join(
+            line.removeprefix("lock:\t")
+            for descriptor in self.slot_lock_descriptors
+            for line in read_proc_text(Path(f"/proc/self/fdinfo/{descriptor}")).splitlines()
+            if line.startswith("lock:\t")
+        )
 
     def request(self, fixture: AdmissionFixture, settings: SlotTestConfiguration,
                 repository: str = "widget") -> wire.RepositorySlotRequest:

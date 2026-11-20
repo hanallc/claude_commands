@@ -1654,6 +1654,109 @@ class PromptSubmissionTests(unittest.TestCase):
                 self.assertEqual(len(self.typed), 1)
                 self.assertEqual(self.elapsed, 0)
 
+    def test_opening_prompt_checks_the_foreground_group_leader_and_recipient(self) -> None:
+        leader, agent = 23457, 23456
+        script = Path(herdr.__file__).resolve().parents[1] / "lib/relaunch.py"
+        other_script = self.root / "other/scripts/lib/relaunch.py"
+        other_script.parent.mkdir(parents=True)
+        other_script.touch()
+        proc = self.root / "proc"
+        child_process = proc / str(agent)
+        child_process.mkdir(parents=True)
+        parent_process = proc / str(leader)
+        parent_process.mkdir()
+        parent_exe = parent_process / "exe"
+        parent_cmdline = parent_process / "cmdline"
+        parent_stat = parent_process / "stat"
+        read_bytes = Path.read_bytes
+        self.submit_on_enter = 1
+
+        def stat_line(pid: int, program: str, parent: int, start: int) -> str:
+            return f"{pid} ({program}) S {parent} {leader} 23455 0 {leader} " + "0 " * 13 + f"{start}\n"
+
+        for label, program, script_path, command, parent, recipient, accepted in (
+            ("approved script", "python3", script, "run", leader, agent, True),
+            ("other script", "python3", other_script, "run", leader, agent, False),
+            ("parent generation changes", "python3", script, "run", leader, agent, False),
+            ("child generation changes", "python3", script, "run", leader, agent, False),
+            ("direct parent changes", "python3", script, "run", leader, agent, False),
+            ("parent execs", "python3", script, "run", leader, agent, False),
+            ("other program", "editor", script, "run", leader, agent, False),
+            ("other command", "python3", script, "help", leader, agent, False),
+            ("other parent", "python3", script, "run", 23458, agent, False),
+            ("leader as recipient", "python3", script, "run", leader, leader, False),
+        ):
+            with self.subTest(label=label):
+                self.elapsed = 0
+                self.typed.clear()
+                self.enters.clear()
+                _ = self.path.write_bytes(b"")
+                child_stat = child_process / "stat"
+                initial_child_stat = stat_line(agent, "claude", parent, 200)
+                _ = child_stat.write_text(initial_child_stat)
+                _ = parent_stat.write_text(stat_line(leader, program, 23455, 100))
+                parent_exe.unlink(missing_ok=True)
+                parent_exe.symlink_to(self.root / "bin" / program)
+                _ = parent_cmdline.write_bytes(os.fsencode(f"{program}\0{script_path}\0{command}\0"))
+                command_reads = 0
+
+                def read_command(path: Path) -> bytes:
+                    nonlocal command_reads
+                    raw = read_bytes(path)
+                    if path != parent_cmdline:
+                        return raw
+                    command_reads += 1
+                    if label == "parent generation changes":
+                        _ = parent_stat.write_text(stat_line(leader, program, 23455, 100 + command_reads))
+                    if label == "child generation changes":
+                        _ = child_stat.write_text(stat_line(agent, "claude", parent, 200 + command_reads))
+                    if label == "direct parent changes":
+                        _ = child_stat.write_text(stat_line(agent, "claude", 23458, 200))
+                    if label == "parent execs" and command_reads % 2 == 0:
+                        return raw + b"changed-argument\0"
+                    return raw
+
+                # The pane report still shows the original supervisor command.
+                info = {"process_info": {"shell_pid": 23455, "foreground_process_group_id": leader,
+                    "foreground_processes": [{"pid": leader, "name": "python3", "argv": ["python3", str(script), "run"]},
+                                             {"pid": agent, "argv": ["claude"]}]}}
+                with (patch.dict(os.environ, {"HERDR_PLATFORM": "linux"}),
+                      patch.object(herdr, "proc_root", return_value=proc),
+                      patch.object(Path, "read_bytes", read_command),
+                      patch.object(self.client, "result", return_value=info),
+                      patch.object(herdr, "prompt_recipient_process",
+                                   return_value=herdr.PromptRecipientProcess(recipient, "fixture-prompt-recipient")),
+                      redirect_stderr(io.StringIO())):
+                    outcome = self.submit(timeout_ms=6000 if accepted else 1000)
+                if accepted:
+                    self.assertEqual(command_reads, 4)
+                    self.assertIsInstance(outcome, herdr.PromptSubmitted)
+                    self.assertEqual(len(self.typed), 1)
+                    self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
+                else:
+                    self.assertEqual(outcome, herdr.PromptNotSubmitted(
+                        "prompt target is unknown; session retained", self.screen, state="not_sent"))
+                    self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_opening_prompt_reports_each_retained_reason_once_across_polls(self) -> None:
+        def retained_process_info(*_arguments: str) -> dict[str, object]:
+            foreground = [] if self.elapsed < 0.3 else [{"pid": 23456, "name": "claude"}]
+            return {"process_info": {"shell_pid": 23455, "foreground_process_group_id": 23456,
+                                     "foreground_processes": foreground}}
+
+        with (patch.object(self.client, "result", side_effect=retained_process_info) as result,
+              redirect_stderr(io.StringIO()) as errors):
+            outcome = self.submit(timeout_ms=10_000)
+
+        self.assertGreater(result.call_count, 8)
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "herdr agents:destination:p1: native session is unknown; target retained",
+            "herdr agents:destination:p1: target evidence is unknown: agent argv is unavailable; target retained",
+        ])
+        self.assertEqual(outcome, herdr.PromptNotSubmitted(
+            "prompt target is unknown; session retained", self.screen, state="not_sent"))
+        self.assertEqual((self.typed, self.enters), ([], []))
+
     def test_opening_prompt_requires_a_fresh_empty_composer(self) -> None:
         empty = self.screen
         text = "resume the saved work"
@@ -3804,6 +3907,10 @@ class TargetCatastropheTests(StaffTestCase):
         cast(Mock, self.client.pane_activity).return_value = herdr.PaneRunning(("claude",))
         cast(Mock, self.client.native_session).return_value = self.row.current_session
         cast(Mock, self.client.run).return_value = ""
+        visible_screen = herdr.Herdr._visible_screen  # pyright: ignore[reportPrivateUsage]
+        def read_visible_screen(pane: str) -> str:
+            return visible_screen(cast(herdr.Herdr, self.client), pane)
+        self.client.configure_mock(**{"_visible_screen.side_effect": read_visible_screen})
         cast(Mock, self.client.result).return_value = {"process_info": {
             "shell_pid": 998042, "foreground_process_group_id": 998043,
             "foreground_processes": [{"pid": 998043, "name": "claude", "argv": ["claude"]}]}}
@@ -3979,6 +4086,65 @@ class HerdrTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "record failed"):
                 client.prompt("w1:p1", "/resume", target="fixture-submission")
         submit.assert_not_called()
+
+    def test_idle_command_checks_the_destination_before_the_final_composer_read(self) -> None:
+        client = self.herdr
+        pane, terminal, session = "w1:p1", "terminal-1", "fixture-submission"
+        text = "/model gpt-6.2-sol --reasoning=high"
+        for draft in ("", "typed text", " "):
+            screen = f"Earlier output\n  › {draft}\n\n  gpt-6.1-sol medium"
+            responses = [screen, screen, ""]
+            with (self.subTest(draft=draft),
+                  patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(self.root / "evidence")}),
+                  patch.object(client, "readiness",
+                               return_value={"agent_status": herdr.AgentStatus.IDLE, "interactive_ready": True}),
+                  patch.object(client, "native_session", return_value=session) as native,
+                  patch.object(client, "command_terminal", return_value=terminal) as destination,
+                  patch.object(client, "run", side_effect=responses) as run):
+                transport = Mock()
+                transport.attach_mock(native, "conversation")
+                transport.attach_mock(destination, "terminal")
+                transport.attach_mock(run, "run")
+                reads = [
+                    call("pane", "read", pane, "--source", "recent-unwrapped", "--lines", "60", deadline=math.inf),
+                    call("pane", "read", pane, "--source", "visible", "--format", "ansi"),
+                ]
+                if draft:
+                    with self.assertRaisesRegex(herdr_types.HerdrFailure, "^has unsent text$"):
+                        _ = client.idle_command(pane, terminal, text, target=session, codex=True)
+                    self.assertEqual(run.call_args_list, reads)
+                else:
+                    self.assertEqual(client.idle_command(pane, terminal, text, target=session, codex=True),
+                                     ("Earlier output",))
+                    self.assertEqual(run.call_args_list, [*reads, call("agent", "prompt", pane, text)])
+                self.assertEqual([step[0] for step in transport.mock_calls],
+                                 ["run", "conversation", "terminal", "run"] + ([] if draft else ["run"]))
+
+    def test_idle_command_refuses_a_conversation_that_changes_during_the_history_read(self) -> None:
+        client = self.herdr
+        pane, terminal, session = "w1:p1", "terminal-1", "fixture-submission"
+        text = "/model gpt-6.2-sol --reasoning=high"
+        conversation = session
+
+        def read_history(pane: str, lines: int, *, joined: bool, ansi: bool, deadline: float = math.inf) -> str:
+            nonlocal conversation
+            del pane, lines, joined, ansi, deadline
+            conversation = "replacement"
+            return "Earlier output\n  › \n\n  gpt-6.1-sol medium"
+
+        def read_conversation(_pane: str, _kind: str, _timeout: float) -> str:
+            return conversation
+
+        with (patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(self.root / "evidence")}),
+              patch.object(client, "readiness",
+                           return_value={"agent_status": herdr.AgentStatus.IDLE, "interactive_ready": True}),
+              patch.object(client, "native_session", side_effect=read_conversation),
+              patch.object(client, "command_terminal", return_value=terminal),
+              patch.object(client, "read", side_effect=read_history),
+              patch.object(client, "run") as run):
+            with self.assertRaisesRegex(herdr_types.HerdrFailure, "the conversation changed"):
+                _ = client.idle_command(pane, terminal, text, target=session, codex=True)
+        run.assert_not_called()
 
     def test_timed_out_prose_keeps_its_source_in_the_delayed_hook(self) -> None:
         from scripts.hooks import conversation_pause
@@ -8055,6 +8221,56 @@ class RowTabTests(StaffTestCase):
         for text in ("p2", "t1", "private process facts are unavailable"):
             self.assertIn(text, errors.getvalue())
 
+    def test_layout_scan_reports_missing_claude_arguments_only_after_start(self) -> None:
+        configuration = self.root / "configuration"
+        _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\n")
+        proc = self.root / "proc"
+        uptime = proc / "uptime"
+        ticks = os.sysconf("SC_CLK_TCK")
+        process = proc / "991000"
+        process.mkdir()
+        # The relaunch supervisor leads the foreground group.
+        _ = (process / "stat").write_text("991000 (claude) S 990500 990500 990000 0 990500 "
+                                          + "0 " * 13 + str(100 * ticks))
+        pane: dict[str, object] = dict(self.client.tabs[0])
+        record = staff.snapshot()
+        result = self.client.result
+
+        def supervised(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            payload = result(*arguments, deadline=deadline)
+            if arguments[:2] == ("pane", "process-info"):
+                herdr.json_object(payload["process_info"], "test process info")["foreground_process_group_id"] = 990500
+            return payload
+
+        for arguments_arrive in (True, False):
+            with (self.subTest(arguments_arrive=arguments_arrive),
+                  patch.dict(os.environ, config_environment(configuration)),
+                  patch.object(self.client, "result", side_effect=supervised),
+                  herdr.pane_evidence_run(), redirect_stderr(io.StringIO()) as errors):
+                self.client.missing_argv = {"p0"}
+                _ = uptime.write_text("101.0 0.0\n")
+                starting = self.client.scan_row_panes(record, [pane])
+                self.assertEqual(starting.found, {})
+                self.assertEqual(starting.unknown, [herdr.UnknownPane("p0", "t0", "starting")])
+                self.assertEqual(errors.getvalue(), "")
+
+                if arguments_arrive:
+                    self.client.missing_argv.clear()
+                else:
+                    _ = uptime.write_text("120.0 0.0\n")
+                observed = self.client.scan_row_panes(record, [pane])
+                self.assertEqual(self.client.scan_row_panes(record, [pane]), observed)
+                if arguments_arrive:
+                    self.assertEqual(observed.found, {self.rows["unit"].id: [pane]})
+                    self.assertEqual(observed.unknown, [])
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertEqual(observed.found, {})
+                    self.assertEqual(observed.unknown, [
+                        herdr.UnknownPane("p0", "t0", "agent argv is unavailable")])
+                    self.assertEqual(errors.getvalue(),
+                        "herdr fixture:p0 tab t0: pane evidence is unknown: agent argv is unavailable; row placement retained\n")
+
     def test_transfer_continues_for_a_proved_tab_and_keeps_an_unknown_tab(self) -> None:
         unknown = dict(self.client.tabs[2])
         self.client.unknown.add(unknown["pane_id"])
@@ -9048,17 +9264,17 @@ class PaneSessionsTests(unittest.TestCase):
     LIVE: dict[str, object] = {"pid": 101, "name": "claude", "argv": ["claude", "--resume", "recorded-id"]}
     EXITED: dict[str, object] = {"pid": 102, "name": "claude"}
 
-    def sessions(self, *processes: dict[str, object]) -> frozenset[str]:
+    def session(self, *processes: dict[str, object]) -> herdr.ClaudePaneSession:
         observed = herdr.NativeAgentProcess(herdr.EnvironmentThread("recorded-id"), "fixture-start", {})
         with patch.object(herdr, "native_process", return_value=observed):
-            sessions = herdr._pane_sessions({"foreground_processes": list(processes)}, {"pane_id": "w1:p1"})  # pyright: ignore[reportPrivateUsage]
-        assert isinstance(sessions, frozenset)
-        return sessions
+            session = herdr._pane_session({"foreground_processes": list(processes)}, {"pane_id": "w1:p1"})  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(session, herdr.ClaudePaneSession)
+        return session
 
     def test_an_exited_agent_child_beside_the_live_agent_is_ignored(self) -> None:
-        self.assertEqual(self.sessions(self.LIVE, self.EXITED), {"recorded-id"})
-        self.assertEqual(self.sessions(self.EXITED, self.LIVE), {"recorded-id"})
+        self.assertEqual(self.session(self.LIVE, self.EXITED), herdr.ClaudePaneSession("recorded-id", 101))
+        self.assertEqual(self.session(self.EXITED, self.LIVE), herdr.ClaudePaneSession("recorded-id", 101))
 
     def test_an_agent_without_an_argv_and_no_live_agent_is_unknown(self) -> None:
         with self.assertRaisesRegex(herdr_types.HerdrFailure, "agent argv is unavailable"):
-            _ = self.sessions(self.EXITED)
+            _ = self.session(self.EXITED)

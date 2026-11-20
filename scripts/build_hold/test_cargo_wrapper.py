@@ -178,7 +178,7 @@ class CargoWrapperTest(unittest.TestCase):
             [], ["metadata"], ["fmt"], ["tree"], ["--version"], ["--help"],
             ["custom-command"], ["+nightly", "metadata"],
             ["--config", "test", "metadata"], ["--color", "build", "tree"],
-            ["nextest", "--version"], ["clippy", "-V"],
+            ["nextest", "--version"], ["clippy", "-V"], ["mend", "--build-info"],
             ["build", "--help"], ["test", "-h"], ["install", "--help"],
             ["+nightly", "--color", "auto", "nextest", "--version"],
         ):
@@ -197,7 +197,10 @@ class CargoWrapperTest(unittest.TestCase):
             "run", "r", "bench", "doc", "d", "rustc", "rustdoc", "fix",
             "install", "miri", "mend",
         )]
-        calls.extend((["install", "--version", "1.0", "x"], ["nextest", "run", "--", "--help"]))
+        calls.extend((
+            ["install", "--version", "1.0", "x"], ["nextest", "run", "--", "--help"],
+            ["clippy", "--build-info"], ["mend", "--", "--build-info"],
+        ))
         for args in calls:
             with self.subTest(args=args):
                 done = self.invoke(*args)

@@ -98,7 +98,7 @@ def host_name() -> str:
 
 def utc_iso(epoch: float) -> str:
     """Milliseconds, UTC, with the Z suffix SQLite's date functions accept."""
-    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="milliseconds").removesuffix("+00:00") + "Z"
 
 
 def month(epoch: float) -> str:
@@ -276,7 +276,7 @@ def note_error(context: str) -> None:
     try:
         path = root() / ERRORS_NAME
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as handle:
+        with path.open("a", errors="backslashreplace") as handle:
             _ = handle.write(f"{utc_iso(datetime.now(UTC).timestamp())} {context}\n{traceback.format_exc()}\n")
     except OSError:
         pass

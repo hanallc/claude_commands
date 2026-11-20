@@ -808,7 +808,7 @@ window.fetch=async(url,options={})=>{
         cases.extend({'url':'/console/investigations.html#'+urlencode({'owner':ready.owner,'show':old}),
                       'show':new,'count':count,'type':'investigation','item':'','owner':str(ready.owner)}
                      for old,new,count in (('not-read','open',1),('answer ready','open',1),
-                                           ('open','all',2),('read','open',1),('all','all',2)))
+                                           ('open','Waiting',1),('read','open',1),('all','all',2)))
         cases.extend(({'url':'/console/investigations.html#'+urlencode({'owner':owner.id,'show':'all'}),
                        'show':'all','count':1,'type':'investigation','item':'','owner':str(owner.id)},
                       {'url':'/console/investigations.html#'+urlencode({'owner':ready.owner}),

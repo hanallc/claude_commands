@@ -2,18 +2,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import fcntl
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target import aws_target, hana_box, hana_placement, hana_provider, hana_render, hana_spend, ledger
+from scripts.aws_target import admin_secrets, aws_target, deploy, hana_box, hana_placement, hana_provider, hana_render, hana_replacement_record, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, HANA_GUEST_RUNTIME_SETTINGS, git_only, text_setting
 from scripts.lib import conf, process_start
@@ -693,6 +695,233 @@ class HanaBoxTests(CostFixture):
         self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
         self.assertEqual(len(self.provider.starts), 1)
+
+    def unknown_stop_for_release(self) -> dict[str, object]:
+        self.ready()
+        running = self.record()
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
+        self.provider.state = 'stopped'
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPED_UNKNOWN)
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
+        return running
+
+    def run_unknown_stop_release(self, *flags: str) -> tuple[int, str, str]:
+        arguments = ['deploy.py', 'hana-release-unknown-stop', '--directory', str(self.state), *flags]
+        with (mock.patch.object(sys, 'argv', arguments), redirect_stdout(StringIO()) as output,
+              redirect_stderr(StringIO()) as errors,
+              mock.patch.object(deploy, 'Deployment', side_effect=AssertionError('Deployment construction')),
+              mock.patch.object(hana_provider.AwsHanaProvider, '__init__', side_effect=AssertionError('Provider construction')),
+              mock.patch.object(hana_provider.AwsHanaProvider, 'from_settings', side_effect=AssertionError('Provider settings')),
+              mock.patch.object(admin_secrets, 'AdminSecretSession', side_effect=AssertionError('Credential session')),
+              mock.patch.object(admin_secrets, 'credentials_file', side_effect=AssertionError('Credential file'))):
+            status = deploy.main()
+        return status, output.getvalue(), errors.getvalue()
+
+    def test_release_unknown_stop_preview_changes_nothing(self) -> None:
+        _ = self.unknown_stop_for_release()
+        paths = (self.controller.path, self.book.path, self.state / 'controller.lock')
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        calls = list(self.provider.calls)
+        status, output, errors = self.run_unknown_stop_release()
+        self.assertEqual((status, errors), (0, ''))
+        self.assertEqual(output.splitlines(), [
+            'hana-release-unknown-stop: would ask the controller to confirm the stop. Use --approve-release to save the decision.'])
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+        self.assertEqual(self.provider.calls, calls)
+
+    def test_release_unknown_stop_preview_does_not_create_a_missing_lock(self) -> None:
+        lock = self.state / 'controller.lock'
+        lock.unlink()
+        status, output, errors = self.run_unknown_stop_release()
+        self.assertEqual((status, output), (1, ''))
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertFalse(lock.exists())
+
+    def test_release_unknown_stop_refuses_unsafe_saved_state(self) -> None:
+        running = self.unknown_stop_for_release()
+        stopped = self.record()
+        ledger_bytes = self.book.path.read_bytes()
+        for change, expected in (
+                ('state', 'The saved Hana state must be stopped-unknown.'),
+                ('claims', 'Hana still has a claim.'),
+                ('operation', 'A Hana operation is pending.'),
+                ('demand start', 'Hana has a saved demand start.'),
+                ('replacement', 'A saved replacement holds Hana.'),
+                ('open', 'Hana compute exposure is still open.'),
+                ('missing exposure', 'The Hana generation has no saved closed compute exposure.'),
+                ('newer exposure', 'The Hana generation is older than the newest compute exposure.'),
+                ('missing ledger', 'The Hana compute ledger is unavailable.')):
+            with self.subTest(change=change):
+                row = dict(stopped)
+                if change == 'state':
+                    row['state'] = hana_box.Lifecycle.INTERRUPTED.value
+                elif change == 'claims':
+                    row['claims'] = running['claims']
+                elif change == 'operation':
+                    row['operation'] = dict(action='observe', token='fixture-observe', at=self.clock.now,
+                        generation=self.generation(), permit=None, expected_generation=0, execution='')
+                elif change == 'demand start':
+                    row['start'] = running['start']
+                elif change == 'replacement':
+                    hana_replacement_record.save(self.state, hana_replacement_record.ReplacementAttempt(
+                        'fixture-image', 'fixture-attachment', 'fixture-token', self.generation(), 'fixture-digest'))
+                elif change == 'open':
+                    with self.book.transaction() as state:
+                        state.hana_compute[-1] = replace(state.hana_compute[-1], state=ledger.HanaExposureOpen())
+                elif change == 'missing exposure':
+                    with self.book.transaction() as state:
+                        state.hana_compute = []
+                        state.hana_lifecycle_fence = ledger.HanaLifecycleUnfenced()
+                elif change == 'newer exposure':
+                    with self.book.transaction() as state:
+                        latest = state.hana_compute[-1]
+                        generation = latest.generation + 1
+                        state.hana_compute.append(replace(latest, generation=generation))
+                        state.hana_lifecycle_fence = ledger.HanaLifecycleFence(self.clock.now, generation)
+                else:
+                    self.book.path.unlink()
+                before = json.dumps(row)
+                _ = self.controller.path.write_text(before)
+                status, output, errors = self.run_unknown_stop_release('--approve-release')
+                self.assertEqual((status, output, errors.splitlines()), (1, '', ['hana-release-unknown-stop: ' + expected]))
+                self.assertEqual(self.controller.path.read_text(), before)
+                hana_replacement_record.record_path(self.state).unlink(missing_ok=True)
+                _ = self.book.path.write_bytes(ledger_bytes)
+
+    def test_release_unknown_stop_keeps_the_old_row_if_publication_fails(self) -> None:
+        _ = self.unknown_stop_for_release()
+        before = self.controller.path.read_bytes()
+
+        def fail_before_publication(path: Path, content: str) -> None:
+            self.assertEqual(path, self.controller.path)
+            self.assertEqual(ledger.mapping(cast(object, json.loads(content)))['state'], hana_box.Lifecycle.STOPPING.value)
+            with (self.state / 'controller.lock').open('r') as lock, self.assertRaises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            raise OSError('The write failed')
+
+        with mock.patch.object(hana_box, 'write_text_atomic', side_effect=fail_before_publication):
+            status, output, errors = self.run_unknown_stop_release('--approve-release')
+        self.assertEqual((status, output), (1, ''))
+        self.assertEqual(len(errors.splitlines()), 1)
+        self.assertEqual(self.controller.path.read_bytes(), before)
+
+    def test_release_unknown_stop_allows_normal_claim_admission_and_is_safe_to_repeat(self) -> None:
+        running = self.unknown_stop_for_release()
+        stopped = self.record()
+        for key in ('boot', 'delivered'):
+            stopped[key] = running[key]
+            self.assertIsNotNone(stopped[key])
+        _ = self.controller.path.write_text(json.dumps(stopped))
+        ledger_bytes = self.book.path.read_bytes()
+        pending = (0, 'hana-release-unknown-stop: release waits for the controller to confirm the stop\n', '')
+        self.assertEqual(self.run_unknown_stop_release('--approve-release'), pending)
+        released = self.record()
+        for key in ('start', 'boot', 'delivered'):
+            self.assertIsNone(released[key])
+        self.assertEqual(released['state'], hana_box.Lifecycle.STOPPING.value)
+        self.assertEqual(released['stop_cause'], hana_box.StopCause.OPERATOR_RELEASE.value)
+        self.assertEqual(released['unclaimed_stop_generation'], self.generation())
+        self.assertEqual(released['observed_at'], stopped['observed_at'])
+        reason = ledger.text(released, 'reason')
+        self.assertRegex(reason, r'^hana-release-unknown-stop approved at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$')
+        before = self.controller.path.read_bytes(), self.controller.path.stat().st_mtime_ns
+        self.assertEqual(self.run_unknown_stop_release(), pending)
+        self.assertEqual(self.run_unknown_stop_release('--approve-release'), pending)
+        self.assertEqual((self.controller.path.read_bytes(), self.controller.path.stat().st_mtime_ns), before)
+        self.assertEqual(self.book.path.read_bytes(), ledger_bytes)
+        previous_generation = self.generation()
+        self.assertEqual(self.controller.request('execution-two'),
+                         hana_box.ClaimRefused('Hana recovery must settle before another claim'))
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(self.provider.calls[-1].action, hana_box.Action.OBSERVE)
+        already_released = (0, 'hana-release-unknown-stop: already released\n', '')
+        self.assertEqual(self.run_unknown_stop_release(), already_released)
+        self.assertEqual(self.run_unknown_stop_release('--approve-release'), already_released)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimCommitted)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STARTING)
+        self.assertEqual(self.provider.calls[-1].action, hana_box.Action.BOOTSTRAP)
+        exposure = self.book.read_snapshot().hana_compute[-1]
+        self.assertGreater(exposure.generation, previous_generation)
+        self.assertIsInstance(exposure.state, ledger.HanaExposureOpen)
+        for _step in range(3):
+            _ = self.tick()
+        assert isinstance(self.provider.boot, hana_box.VerifiedBoot)
+        self.assertIsInstance(self.controller.permission('execution-two', self.provider.boot.boot_id, self.generation()),
+                              hana_box.CommandPermission)
+
+    def test_release_unknown_stop_preserves_a_confirmed_interruption(self) -> None:
+        _ = self.unknown_stop_for_release()
+        self.assertEqual(self.run_unknown_stop_release('--approve-release')[0], 0)
+        self.assertEqual(self.record()['state'], hana_box.Lifecycle.STOPPING.value)
+        self.provider.cause = hana_box.StopCause.INTERRUPTION
+        self.assertEqual(self.tick(), hana_box.Lifecycle.INTERRUPTED)
+        self.assertEqual(self.provider.calls[-1].action, hana_box.Action.OBSERVE)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+
+    def test_release_unknown_stop_stops_a_running_box_before_settlement(self) -> None:
+        _ = self.unknown_stop_for_release()
+        previous_generation = self.generation()
+        self.assertEqual(self.run_unknown_stop_release('--approve-release')[0], 0)
+        self.provider.state = 'running'
+        call_count = len(self.provider.calls)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertGreater(self.generation(), previous_generation)
+        self.assertEqual(self.record()['unclaimed_stop_generation'], self.generation())
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureOpen)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
+        self.assertEqual([call.action for call in self.provider.calls[call_count:]],
+                         [hana_box.Action.OBSERVE, hana_box.Action.STOP, hana_box.Action.OBSERVE])
+
+    def save_provider_operation(self, action: hana_box.Action, operation: str, at: int) -> None:
+        directory = self.state / 'hana/provider'
+        directory.mkdir(exist_ok=True)
+        path = directory / (operation + '.json')
+        _ = path.write_text(json.dumps(dict(version=1, token=operation, deployment=IDENTITY.deployment,
+            action=action.value, dispatched=True, accepted=True)))
+        os.utime(path, (at, at))
+
+    def save_setup_generation(self, generation: int) -> None:
+        setup = self.state / 'hana/setup.json'
+        saved = ledger.mapping(cast(object, json.loads(setup.read_text())))
+        _ = setup.write_text(json.dumps(saved | {'generation': generation}))
+
+    def test_accepted_start_then_stale_stopped_observation_cannot_release_the_hold(self) -> None:
+        self.assertIsInstance(self.controller.request('execution-one'), hana_box.ClaimCommitted)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STARTING)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STARTING)
+        self.assertEqual(self.provider.calls[-1].action, hana_box.Action.START)
+        self.assertEqual(len(self.provider.starts), 1)
+        generation = self.generation()
+        self.save_setup_generation(generation)
+        self.save_provider_operation(hana_box.Action.START, self.provider.calls[-1].token, self.clock.now)
+        self.provider.state = 'stopped'
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPED_UNKNOWN)
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
+        self.provider.state = 'running'
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.generation(), generation + 1)
+        self.assertEqual(self.record()['stop_cause'], hana_box.StopCause.UNCLAIMED.value)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPED_UNKNOWN)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+
+    def test_saved_accepted_stops_for_both_generations_cannot_release_the_hold(self) -> None:
+        self.unclaimed_restart(hana_box.StopCause.UNKNOWN, hana_box.Lifecycle.STOPPED_UNKNOWN)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPED_UNKNOWN)
+        prior, latest = self.book.read_snapshot().hana_compute[-2:]
+        self.save_setup_generation(prior.generation)
+        for exposure in (prior, latest):
+            assert isinstance(exposure.state, ledger.HanaExposureClosed)
+            self.save_provider_operation(hana_box.Action.STOP, f'fixture-stop-{exposure.generation}', exposure.state.at - 1)
+        for _step in range(2):
+            self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPED_UNKNOWN)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
 
     def assert_saved_stop_survives_a_restart(self) -> None:
         token = ledger.text(ledger.mapping(self.record()['operation']), 'token')
