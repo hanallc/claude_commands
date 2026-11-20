@@ -3094,15 +3094,22 @@ class AdmissionServer:
             held = claim_state.read_claims(paths)
         holder = placement.ResourceHolderUnknown()
         diagnostic: placement.BusyProviderDiagnostic | placement.NoProviderDiagnostic = placement.NO_PROVIDER_DIAGNOSTIC
-        scope = claim_state.target_claim_scope(paths, request.constraints.repository)
+        slotted_linux = (paths.platform == "linux" and isinstance(destination.scope, claim_state.RepositoryScope)
+                         and destination.scope.slot > 0)
+        scope = destination.scope if slotted_linux else claim_state.target_claim_scope(paths, request.constraints.repository)
         for claim in held:
-            if (mac_test.scopes_overlap(claim.scope, scope)
-                    and mac_test.run_holds_work(claim.record)):
-                diagnostic = placement.BusyProviderDiagnostic(destination.target, claim.record["what"], claim.record["since"])
-                session_id = claim.record.get("holder_session", "")
-                if session_id and session_id != claim_state.session_id(key.session):
-                    holder = placement.ResourceHolderSession(session_id)
-                    break
+            if not mac_test.scopes_overlap(claim.scope, scope) or not mac_test.run_holds_work(claim.record):
+                continue
+            # A live copy can yield its slot. The claim check already confirmed that its process is live.
+            if slotted_linux and claim.record.get("copy"):
+                continue
+            if slotted_linux and isinstance(eligibility, placement.AllowedHost):
+                eligibility = placement.TemporaryExclusion("busy")
+            diagnostic = placement.BusyProviderDiagnostic(destination.target, claim.record["what"], claim.record["since"])
+            session_id = claim.record.get("holder_session", "")
+            if session_id and session_id != claim_state.session_id(key.session):
+                holder = placement.ResourceHolderSession(session_id)
+                break
         generation = ""
         for claim in held:
             record = claim.record
@@ -3473,7 +3480,8 @@ done
                                 and scopes_overlap(provider.scope, destination.scope)):
                             retained.add(provider)
                             latest_refusal_at = max(latest_refusal_at, report.received_at)
-                        elif (attempt.assignment.episode == request.episode and attempt.assignment.destination == destination
+                        elif (attempt.assignment.episode == request.episode
+                                and attempt.assignment.destination.target == destination.target
                                 and isinstance(report.outcome, placement.PrelaunchRefused) and report.outcome.reason == "busy"):
                             latest_refusal_at = max(latest_refusal_at, report.received_at)
                     if any(scopes_overlap(claim.reference.scope, destination.scope)

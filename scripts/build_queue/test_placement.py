@@ -1058,21 +1058,76 @@ class PlacementTests(unittest.TestCase):
                  ("disk", 0, False, False, "adopted claim"), ("unreachable", 180, False, False, "adopted claim"),
                  ("disk", 0, True, False, "adopted claim"), ("disk", 0, False, True, "adopted claim"),
                  ("busy", 0, True, False, "foreign claim"), ("busy", 0, False, True, "foreign claim"),
-                 ("busy", 0, False, True, "Linux reservation"))
+                 ("busy", 0, False, True, "Linux reservation"),
+                 ("busy", 0, False, True, "cached Linux slots"),
+                 ("busy", 0, False, False, "reserved Linux slot"))
         for reason, delay, delayed_absence, stale_absence, refusal in cases:
             with self.subTest(reason=reason, delayed_absence=delayed_absence,
                               stale_absence=stale_absence, refusal=refusal), PlacementFixture() as fixture:
                 request = placement_request(fixture)
                 linux_reservation = refusal == "Linux reservation"
-                if linux_reservation:
+                two_slots = refusal in ("cached Linux slots", "reserved Linux slot")
+                if linux_reservation or two_slots:
                     _ = (fixture.root / "build_targets.conf").write_text(
                         "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n")
                     _ = write_config_fixture(fixture.root / "box.conf",
-                        "offload=on\nhost=fixture-box\nkinds=test\nslots=1\n", template="mac_test")
+                        f"offload=on\nhost=fixture-box\nkinds=test\nslots={2 if two_slots else 1}\n", template="mac_test")
                     destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
                     request = replace(request, constraints=replace(request.constraints,
                         selection=placement.PinnedHost(destination.target),
                         candidates=(placement.PlacementCandidate(destination),)))
+                if two_slots:
+                    _ = cast(object, fixture.enter_context(mock.patch.dict(os.environ, {
+                        "BUILD_TARGETS_STATE_DIR": str(fixture.root / "build-targets"),
+                        "VERIFY_PROC_ROOT": str(fixture.proc.path),
+                    })))
+                    repository = fixture.root / "hana"
+                    (repository / ".git").mkdir(parents=True)
+                    candidates = tuple(placement.PlacementCandidate(placement.PlacementDestination(
+                        "ssh", "box", "fixture-box", RepositoryScope("hana", slot=slot), slot)) for slot in (1, 2))
+                    request = replace(request, constraints=replace(request.constraints,
+                        repository=str(repository), candidates=candidates))
+                    keys = tuple(fixture.server.host_evidence_key(request, candidate.destination) for candidate in candidates)
+                    for key in keys:
+                        fixture.server.publish_host_evidence(
+                            placement.FreshHostEvidence(key, fixture.clock.now(), "", ALLOWED_HOST))
+                    original = assignment_for(fixture, request)
+                    self.assertEqual(original.destination.slot, 1)
+                    if refusal == "reserved Linux slot":
+                        owner_pid = 912345
+                        write_process(fixture.proc.path, owner_pid, start="123")
+                        paths = claim_state.state_paths("box")
+                        claim_path = mac_test.claim_path(paths, original.destination.scope)
+                        claim_path.parent.mkdir(parents=True)
+                        mac_test.write_json(claim_path, {
+                            "claim_id": "competing", "episode": "other-episode", "attempt": "other-attempt",
+                            "submitting_session": "other-session", "holder_session": "other-session",
+                            "pid": owner_pid, "proc_start": "123", "what": "competing reservation",
+                            "worktree": str(repository), "since": "2026-10-31T12:00:00+00:00",
+                            "repo_name": "hana", "repo_key": "", "slot": 1,
+                        })
+                    fixture.clock.advance(1)
+                    ended, = fixture.server.handle_request(wire.ClaimFailure("linux-slot-refused", original, reason))
+                    assert isinstance(ended, wire.DispatchStatus)
+                    self.assertEqual(ended.state, placement.ClosedAssignment(reason))
+                    self.assertEqual(ended.retry, placement.RetryAt(fixture.clock.now()))
+                    if stale_absence:
+                        waiting, = fixture.server.handle_request(request)
+                        assert isinstance(waiting, wire.PlacementWait)
+                        self.assertEqual(len(waiting.eligibility), 2)
+                        for candidate in waiting.eligibility:
+                            self.assertIsInstance(candidate.eligibility, placement.EvidenceNeeded)
+                        self.assertNotIn(request.episode, fixture.server.current_assignments)
+                    fixture.clock.advance(1)
+                    with mock.patch.object(offload, "probe_reachability", return_value=offload.ReachableHost()):
+                        for key in keys:
+                            fixture.server.host_requests[key] = request
+                            evidence = fixture.read_host_evidence(key)
+                            fixture.server.publish_host_evidence(evidence)
+                    replacement = assignment_for(fixture, request)
+                    self.assertNotEqual(replacement.attempt, original.attempt)
+                    self.assertEqual(replacement.destination.slot, 1 if stale_absence else 2)
+                    continue
                 cached_free = publish_candidate(fixture, request)
                 original = assignment_for(fixture, request)
                 report: wire.ClaimFailure | wire.ExecutionReport
