@@ -15,7 +15,7 @@ import tempfile
 import time
 import threading
 from collections.abc import Generator, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, tzinfo
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -167,13 +167,18 @@ def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
 
 
 
-BODY_READY_SCRIPT = r"""async function readyReviewCard(row){
- if(!row) throw new Error('The summary row is missing.');
+BODY_READY_SCRIPT = r"""async function waitForReview(ready){
  const end=performance.now()+8000;
- while(!row.querySelector('[data-review-form]')){
-  if(performance.now()>end) throw new Error('The card body did not load: '+row.dataset.key);
+ while(!ready()){
+  if(performance.now()>end) return false;
   await new Promise(resolve=>requestAnimationFrame(resolve));
  }
+ return true;
+}
+async function readyReviewCard(row){
+ if(!row) throw new Error('The summary row is missing.');
+ if(!await waitForReview(()=>row.querySelector('[data-review-form]')))
+  throw new Error('The card body did not load: '+row.dataset.key);
  return row.querySelector('[data-review-form]');
 }
 function nextReviewRefresh(){
@@ -2007,10 +2012,26 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 
     @classmethod
     def firefox(cls) -> Callable[..., object]:
-        if cls.browser_command is None:
-            cls.browser_command = cls.enterClassContext(cls.start_firefox())
-            cls.addClassCleanup(setattr, cls, 'browser_command', None)
-        return cls.browser_command
+        if cls.browser_command is not None:
+            return cls.browser_command
+        with ExitStack() as startup:
+            send = startup.enter_context(cls.start_firefox())
+            _ = startup.callback(setattr, cls, 'browser_command', None)
+            session = startup.pop_all()
+        cls.addClassCleanup(session.close)
+
+        def command(name: str, **parameters: object) -> object:
+            try:
+                return send(name, **parameters)
+            except (OSError, ValueError, AssertionError) as error:
+                try:
+                    session.close()
+                except Exception as cleanup_error:
+                    error.add_note(f'Firefox cleanup failed: {cleanup_error}')
+                raise
+
+        cls.browser_command = command
+        return command
 
     @classmethod
     @contextmanager
@@ -2064,8 +2085,14 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
                 while (character := reader.read(1)) != b':':
                     if not character:
                         raise AssertionError('Firefox closed the Marionette connection.')
+                    if not character.isdigit():
+                        raise AssertionError('Marionette sent an invalid message length.')
                     length.extend(character)
-                return cast(object, json.loads(reader.read(int(length))))
+                size = int(length)
+                payload = reader.read(size)
+                if len(payload) != size:
+                    raise AssertionError('Marionette sent an incomplete message.')
+                return cast(object, json.loads(payload))
 
             sequence = 0
 
@@ -2074,10 +2101,13 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
                 sequence += 1
                 payload = json.dumps([0, sequence, name, parameters]).encode()
                 connection.sendall(str(len(payload)).encode() + b':' + payload)
-                message = cast(list[object], receive())
-                if message[:3] != [1, sequence, None]:
+                message = receive()
+                if not isinstance(message, list):
                     raise AssertionError(f'{name}: {message}')
-                return message[3]
+                fields = cast(list[object], message)
+                if len(fields) != 4 or fields[:3] != [1, sequence, None]:
+                    raise AssertionError(f'{name}: {fields}')
+                return fields[3]
 
             _ = receive()
             _ = command('WebDriver:NewSession', capabilities={})
@@ -2094,8 +2124,9 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
             _ = command('WebDriver:Navigate', url=url)
             yield command
         finally:
-            _ = command('WebDriver:CloseWindow')
-            _ = command('WebDriver:SwitchToWindow', handle=original)
+            if type(self).browser_command is command:
+                _ = command('WebDriver:CloseWindow')
+                _ = command('WebDriver:SwitchToWindow', handle=original)
 
     def run_browser_probe(self, handler: type[BaseHTTPRequestHandler], complete: threading.Event,
                           *, route: str = '/') -> None:
@@ -2802,8 +2833,8 @@ window.fetch=async(url,options)=>{
     'refresh checks the version and retains the pressed Show view');
   const reload=document.createElement('iframe');reload.src='/reload'+location.hash;
   const loaded=new Promise(resolve=>reload.addEventListener('load',resolve,{once:true}));document.body.append(reload);await loaded;
-  await flush();await flush();
-  check(selected('Validating',reload.contentDocument) && reload.contentDocument.querySelector('[data-review]').dataset.show==='Validating',
+  check(await waitForReview(()=>selected('Validating',reload.contentDocument) &&
+    reload.contentDocument.querySelector('[data-review]')?.dataset.show==='Validating'),
     'a reload keeps the shared Show address');reload.remove();
   for(const value of ['all','open']){
    chip(value)?.click();await flush();await flush();
@@ -3348,9 +3379,11 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         _ = self.question()
         _ = self.investigation(False)
         pages = console.read_pages()
+        identities = tuple(page.identity for page in pages)
+        self.assertEqual(identities, tuple(identity for identity, *_ in CONSOLE_PAGES))
         self.assertEqual(next(page.icon for page in pages if page.identity == 'review'), 'inbox', 'F009: use the Review icon')
-        self.assertIn('review',[page.identity for page in pages])
-        self.assertFalse({'changes','questions','investigations'} & {page.identity for page in pages})
+        self.assertIn('review', identities)
+        self.assertFalse({'changes','questions','investigations'}.intersection(identities))
         request = console.NewsRequest(self.root)
         waiting = review_page.waiting_items(request)
         self.assertFalse(any(key.startswith('investigation/') for key in waiting))
