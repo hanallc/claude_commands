@@ -60,8 +60,28 @@ class HanaSpendTests(CostFixture):
         pending = self.book.read_snapshot()
         self.assertFalse(any(row.kind == 'instance' for row in ledger.hana_intervals(pending, now, 60)))
         self.assertTrue(any(row.kind == 'instance' for row in ledger.hana_intervals(pending, now, 60, reserve=True)))
+        journal = self.state / 'hana' / 'provider'
+        journal.mkdir(parents=True)
+        _ = (journal / 'bootstrap.json').write_text(json.dumps({
+            'action': 'bootstrap', 'generation': reserved.exposure.generation, 'dispatched': True, 'accepted': True,
+            'accepted_at': now,
+        }))
         self.controller.reconcile(now, 'running', generation=reserved.exposure.generation)
-        self.assertTrue(any(row.kind == 'instance' for row in ledger.hana_intervals(self.book.read_snapshot(), now, 60)))
+        state = self.book.read_snapshot()
+        self.assertFalse(any(row.kind == 'instance' for row in ledger.hana_intervals(state, now, 60)))
+        _ = (journal / 'start.json').write_text(json.dumps({
+            'action': 'start', 'generation': reserved.exposure.generation, 'dispatched': True, 'accepted': True,
+            'accepted_at': now,
+        }))
+        self.controller.reconcile(now + 60, 'running', generation=reserved.exposure.generation)
+        state = self.book.read_snapshot()
+        compute, = (row for row in ledger.hana_intervals(state, now + 60, 60) if row.kind == 'instance')
+        self.assertEqual(compute.start, now)
+        renewed = self.issued(now + 60, generation=reserved.exposure.generation)
+        self.assertGreater(renewed.exposure.generation, reserved.exposure.generation)
+        state = self.book.read_snapshot()
+        compute, = (row for row in ledger.hana_intervals(state, now + 60, 60) if row.kind == 'instance')
+        self.assertEqual(compute.start, now)
 
     def test_fallback_types_reject_empty_items_and_duplicates(self) -> None:
         configuration = self.root / 'hana_aws.conf'

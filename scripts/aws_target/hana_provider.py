@@ -409,8 +409,15 @@ class AwsHanaProvider:
                                observed: box.BoxObservation) -> bool:
         if operation.action != box.Action.START or observed.state not in ('pending', 'running', 'stopping'):
             return False
-        if (saved.get('dispatched') is True and saved.get('generation') == operation.generation
-                and not remote.mutation_accepted(saved)):
+        if not remote.start_was_dispatched(saved):
+            return False
+        if 'generation' not in saved:
+            # The token identifies this legacy operation. The record has no accounting generation.
+            return saved.get('token') == operation.token
+        generation = saved['generation']
+        if type(generation) is not int or generation != operation.generation:
+            return False
+        if not remote.mutation_accepted(saved):
             saved['accepted'] = True
             self._record_milestone(path, saved, operation, MutationMilestone.OBSERVED_ACCEPTANCE)
         return True

@@ -13,6 +13,7 @@ from statistics import median
 from typing import cast
 
 from scripts.aws_target import hana_spend, ledger
+from scripts.aws_target.remote import HanaStartAccepted
 from scripts.aws_target.ledger import gate_vcpus as gate_vcpus
 from scripts.aws_target.measurement import number
 from scripts.lib import conf
@@ -308,13 +309,16 @@ def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, ho
     seen_generations: set[int] = set()
     now = int(end.timestamp())
     for exposure in snapshot.hana_compute:
-        if exposure.generation in seen_generations or not ledger.hana_compute_accrues(snapshot, exposure):
+        if exposure.generation in seen_generations:
+            continue
+        accepted = ledger.hana_compute_start(snapshot, exposure)
+        if not isinstance(accepted, HanaStartAccepted):
             continue
         seen_generations.add(exposure.generation)
         if exposure.region not in scope.hana_sizes_by_region:
             continue
         stop = min(exposure.state.at, now) if isinstance(exposure.state, ledger.HanaExposureClosed) else now
-        for day, duration in _utc_day_hours(exposure.at, stop, start, end):
+        for day, duration in _utc_day_hours(max(exposure.at, accepted.at), stop, start, end):
             reserved_by_region[exposure.region, day] += duration
     reserved = {(size, region, day): duration for (region, day), duration in reserved_by_region.items()
                 for size in scope.hana_sizes_by_region[region]}
