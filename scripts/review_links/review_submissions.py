@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +54,30 @@ def is_draft_id(value: object) -> bool:
 
 
 @dataclass(frozen=True)
+class CurrentBrowserDraftToken:
+    digest: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class BrowserDraftRecoveryToken:
+    digest: str = field(repr=False)
+
+
+type BrowserDraftAuthorization = CurrentBrowserDraftToken | BrowserDraftRecoveryToken
+_browser_draft_token: ContextVar[BrowserDraftAuthorization | None] = ContextVar("browser_draft_token", default=None)
+
+
+@contextmanager
+def browser_draft_token(authorization: BrowserDraftAuthorization) -> Generator[None]:
+    """Use the HTTP token for this browser draft only."""
+    scope = _browser_draft_token.set(authorization)
+    try:
+        yield
+    finally:
+        _browser_draft_token.reset(scope)
+
+
+@dataclass(frozen=True)
 class SubmissionAddress:
     """The request identity and its original recipient."""
     kind: SubmissionKind
@@ -70,6 +96,7 @@ class NativeSubmissionDestination:
     path: Path
     original_path: Path
     owner: staff.StaffId
+    browser_token_digest: str = field(default="", kw_only=True, repr=False)
 
     @property
     def address(self) -> SubmissionAddress:
@@ -289,9 +316,11 @@ def _read_request_file(path: Path, request_id: str) -> RequestFile:
             owner = fields.get("owner", recipient)
             identity, native_path = fields.get("id"), fields.get("path")
             original_path = fields.get("original_path", native_path)
+            token_digest = fields.get("browser_token_digest", "")
             if (isinstance(kind, str) and kind in SubmissionKind and isinstance(recipient, str)
                     and isinstance(owner, str) and isinstance(identity, str) and isinstance(native_path, str)
-                    and isinstance(original_path, str)):
+                    and isinstance(original_path, str) and isinstance(token_digest, str)
+                    and ("browser_token_digest" not in fields or re.fullmatch(r"[0-9a-f]{64}", token_digest))):
                 kind = SubmissionKind(kind)
                 if (re.fullmatch(NATIVE_ID_PREFIX[kind] + r"[1-9][0-9]*", identity)
                         and Path(native_path).is_absolute() and Path(original_path).is_absolute()):
@@ -304,7 +333,8 @@ def _read_request_file(path: Path, request_id: str) -> RequestFile:
                     if DRAFT_ID.fullmatch(request_id) or BROWSER_DRAFT_ID.fullmatch(request_id):
                         request_id = f"{request_id}-{kind}-{recipient}"
                     return NativeSubmissionDestination(identity, kind, staff.StaffId(recipient), request_id,
-                                                       payload_hash, Path(native_path), Path(original_path), filing_owner)
+                                                       payload_hash, Path(native_path), Path(original_path), filing_owner,
+                                                       browser_token_digest=token_digest)
     raise OSError(f"Cannot read the Review request file at {path}.")
 
 
@@ -344,6 +374,8 @@ def _write_location(path: Path, destination: NativeSubmissionDestination) -> Non
               "original_path": str(destination.original_path), "payload_hash": destination.payload_hash}
     if destination.owner != destination.recipient_id:
         fields["owner"] = destination.owner
+    if destination.browser_token_digest:
+        fields["browser_token_digest"] = destination.browser_token_digest
     _write_request_file(path, fields)
 
 
@@ -750,7 +782,10 @@ def locate_native_submission(address: SubmissionAddress, hint: RequestFile,
             raise
     if isinstance(located, LocatedSubmission):
         if paths and isinstance(hint, NativeSubmissionDestination):
-            located = replace(located, destination=replace(located.destination, original_path=hint.original_path))
+            destination = located.destination
+            token_digest = hint.browser_token_digest if hint.payload_hash == destination.payload_hash else ""
+            located = replace(located, destination=replace(destination, original_path=hint.original_path,
+                                                          browser_token_digest=token_digest))
         return located
     if unreadable is not None:
         raise unreadable
@@ -772,8 +807,8 @@ def _publish_receipt(folder: Path, saved: NativeSubmissionDestination) -> None:
 def _has_receipt_for(saved: NativeSubmissionDestination) -> bool:
     receipt = _request_hint(saved.address, receipt_only=True)
     return (isinstance(receipt, NativeSubmissionDestination)
-            and (receipt.address, receipt.id, receipt.owner, receipt.payload_hash)
-            == (saved.address, saved.id, saved.owner, saved.payload_hash))
+            and (receipt.address, receipt.id, receipt.owner, receipt.payload_hash, receipt.browser_token_digest)
+            == (saved.address, saved.id, saved.owner, saved.payload_hash, saved.browser_token_digest))
 
 
 def _complete_receipt(folder: Path, saved: NativeSubmissionDestination, hint: RequestFile,
@@ -798,7 +833,7 @@ def _complete_receipt(folder: Path, saved: NativeSubmissionDestination, hint: Re
         print(f"Review receipt for {saved.id}: {words}", file=sys.stderr)
     result = EditedSubmission if edited else SavedSubmission
     return result(saved.id, saved.kind, saved.recipient_id, saved.request_id, saved.payload_hash,
-                  saved.path, saved.original_path, saved.owner, record)
+                  saved.path, saved.original_path, saved.owner, record, browser_token_digest=saved.browser_token_digest)
 
 
 def _recipient(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:
@@ -1079,8 +1114,15 @@ def _locked_filed_draft(folder: Path, request_id: str, members: staff.StaffSnaps
     if isinstance(hint, NoRequestFile):
         hint = _read_request_file(folder / "pending.json", request_id)
     if isinstance(hint, NativeSubmissionDestination):
+        token = _browser_draft_token.get()
+        recovery = isinstance(token, BrowserDraftRecoveryToken)
+        # A legacy receipt has no digest to check. Recovery requires an existing native record and files nothing new.
+        if recovery and hint.browser_token_digest and not hmac.compare_digest(hint.browser_token_digest, token.digest):
+            yield NoNativeSubmission()
+            return
         with _locked_request(hint.address, members) as lookup:
-            if _saved_draft(lookup) is not None:
+            saved = _saved_draft(lookup)
+            if saved is not None and (not recovery or saved.destination.browser_token_digest == hint.browser_token_digest):
                 yield lookup
                 return
     yield NoNativeSubmission()
@@ -1246,8 +1288,11 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
 
             def before_write(identity: str, path: Path) -> None:
                 path = path.resolve()
+                token = _browser_draft_token.get() if browser_draft else None
+                token_digest = token.digest if isinstance(token, CurrentBrowserDraftToken) else ""
                 saved = NativeSubmissionDestination(identity, kind, address.recipient_id, request_id,
-                                                    payload_hash, path, path, recipient.id)
+                                                    payload_hash, path, path, recipient.id,
+                                                    browser_token_digest=token_digest)
                 _write_location(pending_file, saved)
                 destinations[:] = [saved]
 
@@ -1267,7 +1312,8 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                     found = _read_native_submission(address, saved.path, saved.owner)
                     if isinstance(found, LocatedSubmission):
                         _check_same_request(found.destination, request, payload_hash, draft=legacy_draft)
-                        return _complete_receipt(folder, found.destination, saved, found.record, first_send=True)
+                        filed = replace(found.destination, browser_token_digest=saved.browser_token_digest)
+                        return _complete_receipt(folder, filed, saved, found.record, first_send=True)
                 _discard_unfiled_send(folder)
                 raise
             saved, = destinations

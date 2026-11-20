@@ -7,11 +7,13 @@ from scripts.lib.checkout_test_support import python_tool_source
 
 import fcntl
 import base64
+import hashlib
 import importlib.util
 import json
 import gzip
 import os
 import re
+import secrets
 import select
 import shlex
 import shutil
@@ -1361,6 +1363,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                     with self.subTest(kind=kind):
                         attempt = replace(request, kind=kind, page_state=None, request_id="r6-" + uuid4().hex)
                         fields = {**asdict(attempt), "token": old_token, "capture_key": capture_key}
+                        stale = self.new_item_http(json.dumps(fields).encode(), finished=True)
+                        self.assertEqual(stale.status, 403, stale.body)
+                        self.assertEqual(json.loads(stale.body)["code"], "stale_token")
+                        fields["token"] = server.new_item_token
                         reply = self.new_item_http(json.dumps(fields).encode(), finished=True)
                         self.assertEqual(reply.status, 409, reply.body)
                         self.assertEqual(json.loads(reply.body), {
@@ -1906,6 +1912,168 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         self.assertEqual(len(investigation.records(request.recipient_id)), 1)
         deliver.assert_called_once()
+
+    def test_restart_recovery_requires_a_recorded_browser_draft_token(self) -> None:
+        _, cache, request = self.page_bug_fixture()
+        request = replace(request, request_id="r6-" + uuid4().hex)
+        with patch.object(change_page, "send_to_staff") as deliver:
+            first = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(first.status, 200, first.body)
+            deliver.assert_called_once()
+        key = cast(dict[str, str], json.loads(first.body))["key"]
+        origin = review_items.submission_origin(cache.get().records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        receipt = review_submissions.image_folder(origin).parent / "receipt.json"
+        before = receipt.read_bytes()
+        fields = {**asdict(request), "token": secrets.token_urlsafe(), "capture_key": uuid4().hex}
+        with (patch.object(cache, "create_submission", wraps=cache.create_submission) as submit,
+              patch.object(review_submissions, "locate_native_submission") as locate,
+              patch.object(change_page, "send_to_staff") as deliver):
+            reply = self.new_item_http(json.dumps(fields).encode(), finished=True)
+            self.assertEqual(reply.status, 403, reply.body)
+            self.assertEqual(json.loads(reply.body)["code"], "stale_token")
+            submit.assert_called_once()
+            locate.assert_not_called()
+            deliver.assert_not_called()
+        self.assertEqual(receipt.read_bytes(), before)
+        self.assertEqual(list(cache.get().records), [key])
+        self.assertEqual(len(investigation.records(request.recipient_id)), 1)
+
+    def test_restart_uses_the_original_browser_token_after_a_wrapped_move(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, cache, request = self.page_bug_fixture(screenshot=True)
+        request = replace(request, request_id="r6-" + uuid4().hex)
+        server = self.server
+        original_token = server.new_item_token
+        digest = hashlib.sha256(original_token.encode("ascii")).hexdigest()
+        screenshot = new_item_dialog.PageScreenshot(base64.b64decode(PNG), new_item_dialog.PageViewport(876, 640, True))
+        with review_submissions.browser_draft_token(review_submissions.CurrentBrowserDraftToken(digest)):
+            filed = cache.create_submission(request, screenshot=screenshot)
+        fields = {**asdict(request), "token": original_token, "capture_key": server.page_captures.start()}
+
+        child = staff.local_snapshot().by_id(request.recipient_id)
+        assert child is not None and isinstance(child.doc, staff.LiveDoc)
+        child_doc = child.doc.path
+        parent_doc = child_doc.with_name("parent-production.md")
+        _ = parent_doc.write_text(child_doc.read_text())
+        parent = fixture_member("showrunner", name="parent", doc=staff.LiveDoc(local_machine(), parent_doc))
+        _ = child_doc.write_text(child_doc.read_text().replace("— running.**", "— wrapped.**"))
+        wrapped_child = replace(child, parent=staff.ReportsTo(parent.id), doc=staff.WrappedDoc(child.doc.machine, child_doc))
+        members = staff.local_snapshot()
+        wrapped = replace(members, rows=tuple(wrapped_child if row.id == child.id else row for row in members.rows))
+        _ = staff.record_path().write_text(wrapped.encode())
+        with (patch.object(tidy_wrapped, "STATE_DIR", record_store.state_root()),
+              patch("scripts.copies.copies.remove_trees")):
+            _ = tidy_wrapped.tidy(child.name, child_doc, identities=update_registration.QuestionStaff.for_record(wrapped))
+        self.assertFalse(filed.saved.path.exists())
+
+        moved_key = f"investigation/{parent.id}/{filed.saved.id}"
+        restarted_cache = review_page.ReviewSnapshotCache(cache.root, start_worker=False)
+        with (patch.object(server, "new_item_token", secrets.token_urlsafe()),
+              patch.object(server, "page_captures", serve.PageCaptures()),
+              patch.object(server, "review_cache", restarted_cache),
+              patch.object(change_page, "send_to_staff") as deliver):
+            unrelated = self.new_item_http(json.dumps({**fields, "token": secrets.token_urlsafe()}).encode(), finished=True)
+            self.assertEqual(unrelated.status, 403, unrelated.body)
+            self.assertEqual(json.loads(unrelated.body)["code"], "stale_token")
+            deliver.assert_not_called()
+            retry = self.new_item_http(json.dumps(fields).encode(), finished=True)
+            self.assertEqual(retry.status, 409, retry.body)
+            result = cast(dict[str, str], json.loads(retry.body))
+            self.assertEqual((result["code"], result["id"], result["key"]), ("already_filed", filed.saved.id, moved_key))
+            deliver.assert_called_once()
+        receipt = review_submissions.image_folder(filed.saved).parent / "receipt.json"
+        receipt_fields = cast(dict[str, object], json.loads(receipt.read_bytes()))
+        self.assertEqual(receipt_fields["browser_token_digest"], digest)
+        self.assertEqual(restarted_cache.get().records[moved_key].owner, parent.id)
+        self.assertEqual([item.id for item in investigation.records(parent.id)], [filed.saved.id])
+
+    def test_legacy_browser_receipt_resumes_delivery_at_once(self) -> None:
+        self.check_legacy_browser_delivery_resume()
+
+    def test_legacy_browser_receipt_resumes_when_local_staff_is_unreadable(self) -> None:
+        self.check_legacy_browser_delivery_resume(local_staff_unreadable=True)
+
+    def test_legacy_browser_pending_file_resumes_delivery_at_once(self) -> None:
+        self.check_legacy_browser_delivery_resume(pending=True)
+
+    def check_legacy_browser_delivery_resume(self, *, local_staff_unreadable: bool = False,
+                                             pending: bool = False) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, cache, request = self.page_bug_fixture(screenshot=True)
+        request = replace(request, request_id="r6-" + uuid4().hex)
+        screenshot = new_item_dialog.PageScreenshot(base64.b64decode(PNG), new_item_dialog.PageViewport(876, 640, True))
+        filed = cache.create_submission(request, screenshot=screenshot)
+        receipt = review_submissions.image_folder(filed.saved).parent / "receipt.json"
+        receipt_fields = cast(dict[str, object], json.loads(receipt.read_bytes()))
+        self.assertNotIn("browser_token_digest", receipt_fields)
+        pending_file = receipt.with_name("pending.json")
+        if pending:
+            _ = receipt.rename(pending_file)
+        server = self.server
+        fields = {**asdict(request), "token": server.new_item_token, "capture_key": server.page_captures.start()}
+        restarted_cache = review_page.ReviewSnapshotCache(cache.root, start_worker=False)
+        members = staff.snapshot()
+        with (patch.object(server, "new_item_token", secrets.token_urlsafe()),
+              patch.object(server, "page_captures", serve.PageCaptures()),
+              patch.object(server, "review_cache", restarted_cache),
+              patch.object(change_page, "send_to_staff") as deliver, ExitStack() as faults):
+            if local_staff_unreadable:
+                _ = faults.enter_context(patch.object(staff, "local_snapshot", side_effect=staff.StaffUnreadable(
+                    "The local staff record is unreadable.")))
+                _ = faults.enter_context(patch.object(staff, "authority_snapshot", return_value=members))
+            reply = self.new_item_http(json.dumps(fields).encode(), finished=True)
+            self.assertEqual(reply.status, 409, reply.body)
+            saved = cast(dict[str, str], json.loads(reply.body))
+            self.assertEqual((saved["code"], saved["id"], saved["key"]), ("already_filed", filed.saved.id, filed.key))
+            deliver.assert_called_once()
+        self.assertEqual(json.loads(receipt.read_bytes()), receipt_fields)
+        self.assertFalse(pending_file.exists())
+        self.assertEqual(list(restarted_cache.get().records), [filed.key])
+        self.assertEqual(len(investigation.records(request.recipient_id)), 1)
+
+    def test_restart_uses_the_original_token_after_native_cleanup_fails(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, cache, request = self.page_bug_fixture(screenshot=True)
+        request = replace(request, request_id="r6-" + uuid4().hex)
+        server = self.server
+        capture_key = server.page_captures.start()
+        screenshot = new_item_dialog.PageScreenshot(base64.b64decode(PNG), new_item_dialog.PageViewport(876, 640, True))
+        _ = server.page_captures.complete(capture_key, screenshot)
+        fields = {**asdict(request), "token": server.new_item_token, "capture_key": capture_key}
+        unlink = Path.unlink
+        failed_cleanup = False
+
+        def unlink_native_temporary(path: Path, missing_ok: bool = False) -> None:
+            nonlocal failed_cleanup
+            target = atomic_file.temporary_target(path.name)
+            if (not failed_cleanup and path.parent.name == "investigations" and target is not None
+                    and (path.parent / target).is_file()):
+                failed_cleanup = True
+                raise OSError("The native temporary file cleanup failed.")
+            unlink(path, missing_ok=missing_ok)
+
+        with patch.object(change_page, "send_to_staff") as deliver:
+            with patch.object(Path, "unlink", autospec=True, side_effect=unlink_native_temporary):
+                first = self.new_item_http(json.dumps(fields).encode(), finished=True)
+            self.assertTrue(failed_cleanup)
+            self.assertEqual(first.status, 200, first.body)
+            saved = cast(dict[str, str], json.loads(first.body))
+            restarted_cache = review_page.ReviewSnapshotCache(cache.root, start_worker=False)
+            with (patch.object(server, "new_item_token", secrets.token_urlsafe()),
+                  patch.object(server, "page_captures", serve.PageCaptures()),
+                  patch.object(server, "review_cache", restarted_cache)):
+                retry = self.new_item_http(json.dumps(fields).encode(), finished=True)
+                self.assertEqual(retry.status, 409, retry.body)
+                recovered = cast(dict[str, str], json.loads(retry.body))
+                self.assertEqual((recovered["code"], recovered["id"], recovered["key"]),
+                                 ("already_filed", saved["id"], saved["key"]))
+            deliver.assert_called_once()
+        self.assertEqual(list(restarted_cache.get().records), [saved["key"]])
+        self.assertEqual(len(investigation.records(request.recipient_id)), 1)
 
     def test_failed_native_write_keeps_the_same_screenshot_for_retry(self) -> None:
         from scripts.review_links.test_review_submissions import PNG

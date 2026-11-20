@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 from functools import partial
 import html
 import gzip
+import hashlib
 import ipaddress
 import json
 import os
@@ -1158,7 +1159,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             valid_token = self.valid_new_item_token(token)
             draft = fields.get("request_id")
             browser_draft = fields.get("page") != "list" and review_submissions.is_draft_id(draft)
-            # The browser draft ID can recover an existing Send after a restart.
+            # A restart retry can use the token saved with the draft.
             if not valid_token and (
                     "capture_key" not in fields or "page_capture" in fields or "discard_capture" in fields
                     or not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token)
@@ -1174,20 +1175,22 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 return
             key = ""
             refusal: new_item_dialog.SubmissionError | None = None
-            if not valid_token:
-                refusal = new_item_dialog.SubmissionScreenshotExpired()
             request: new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry
             try:
-                key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
-                request = new_item_dialog.read_request(fields, has_capture=bool(key))
-                if not key and request.page_state is not None and request.page_state.include_screenshot:
-                    if browser_draft:
-                        refusal = new_item_dialog.SubmissionScreenshotExpired()
-                    elif not review_submissions.DRAFT_ID.fullmatch(request.request_id):
-                        refusal = new_item_dialog.SubmissionScreenshotReload()
-                if key and (not request.page or not isinstance(
-                        request.evidence, (new_item_dialog.PageDataEvidence, new_item_dialog.NoEvidence))):
-                    raise new_item_dialog.SubmissionError("Open the New item dialog from a page owner.")
+                if not valid_token:
+                    assert isinstance(draft, str)
+                    request = new_item_dialog.UnverifiedDraftRetry(draft, new_item_dialog.SubmissionScreenshotExpired())
+                else:
+                    key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
+                    request = new_item_dialog.read_request(fields, has_capture=bool(key))
+                    if not key and request.page_state is not None and request.page_state.include_screenshot:
+                        if browser_draft:
+                            refusal = new_item_dialog.SubmissionScreenshotExpired()
+                        elif not review_submissions.DRAFT_ID.fullmatch(request.request_id):
+                            refusal = new_item_dialog.SubmissionScreenshotReload()
+                    if key and (not request.page or not isinstance(
+                            request.evidence, (new_item_dialog.PageDataEvidence, new_item_dialog.NoEvidence))):
+                        raise new_item_dialog.SubmissionError("Open the New item dialog from a page owner.")
             except (ValueError, RecursionError) as error:
                 if not browser_draft or not isinstance(draft, str):
                     raise
@@ -1204,14 +1207,21 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         legacy_page_draft = (isinstance(request, new_item_dialog.NewItemRequest) and request.page != "list"
                              and review_submissions.DRAFT_ID.fullmatch(request.request_id) is not None)
+        authorization = None
+        if browser_draft and isinstance(token, str):
+            digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+            authorization = (review_submissions.CurrentBrowserDraftToken(digest) if valid_token
+                             else review_submissions.BrowserDraftRecoveryToken(digest))
         try:
             with server.page_captures.for_filing(key if valid_token else "", allow_pending=legacy_page_draft) as capture:
                 pending = isinstance(capture, PageCapturePending)
                 claimed = isinstance(capture, PageCaptureForSavedItem)
                 screenshot = new_item_dialog.NO_PAGE_SCREENSHOT if pending or claimed else capture
                 capture_requested = bool(key) and (not legacy_page_draft or claimed)
-                created = server.review_cache.create_submission(
-                    request, screenshot=screenshot, capture_requested=capture_requested, refusal=refusal)
+                with (review_submissions.browser_draft_token(authorization)
+                      if authorization is not None else nullcontext()):
+                    created = server.review_cache.create_submission(
+                        request, screenshot=screenshot, capture_requested=capture_requested, refusal=refusal)
                 saved = created.saved
                 details = saved.details
                 edited = isinstance(saved, review_submissions.EditedSubmission)
@@ -1251,7 +1261,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(409, {"code": "reload_page", "error": SCREENSHOT_RELOAD})
             return
         except new_item_dialog.SubmissionScreenshotExpired as error:
-            self.json_response(409, {"code": "screenshot_expired", "error": str(error)})
+            if valid_token:
+                self.json_response(409, {"code": "screenshot_expired", "error": str(error)})
+            else:
+                # The dialog refreshes the token and retries the same draft.
+                self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
             return
         except new_item_dialog.SubmissionConflict as error:
             self.json_response(409, {"error": str(error)})
