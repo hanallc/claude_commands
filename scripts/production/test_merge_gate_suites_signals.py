@@ -56,6 +56,15 @@ class GateProcessStateTests(unittest.TestCase):
 
 @final
 class MergeGateSignalsTests(GateSuitesFixture):
+    def create_jobserver(self, path: Path, tokens: bytes) -> None:
+        os.mkfifo(path)
+        descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, descriptor)
+        self.environment["BUILDLOG_JOBSERVER_FIFO"] = str(path)
+        self.supply_jobserver(tokens)
+        status = os.fstat(descriptor)
+        self.write(merge_gate.fifo_size_path(path), f"{status.st_dev} {status.st_ino} {len(tokens)}\n")
+
     def test_recovery_kills_a_term_ignoring_member_after_its_leader_ends(self) -> None:
         self.supply_jobserver(b"Q")
         source = """import subprocess, sys
@@ -198,10 +207,11 @@ sys.stdin.read(1)
                     self.assertEqual(recovery.path.read_text(), original)
                     self.assertEqual(self.jobserver_tokens(), b"QR")
 
-            with mock.patch.dict(os.environ, {"BUILDLOG_JOBSERVER_SLOTS": "2"}):
-                recovery.tokens[:] = [replace(recovery.tokens[0], pool_size=0)]
-                recovery.save()
+            recovery.tokens[:] = [replace(recovery.tokens[0], pool_size=2)]
+            recovery.save()
+            with mock.patch.object(os, "read", wraps=os.read) as read:
                 merge_gate.recover_fifo_slots(pool.descriptor)
+            self.assertFalse(any(call.args[0] == pool.descriptor for call in read.call_args_list))
             self.assertFalse(recovery.path.exists())
             self.assertEqual(self.jobserver_tokens(), b"QR")
 
@@ -221,7 +231,15 @@ sys.stdin.read(1)
                 data["tokens"] = [asdict(token)]
                 invalid[path] = json.dumps(data)
                 self.write(path, invalid[path])
-            for name, update in (("null-folder", {"folders": [None]}), ("large-pid", {"pid": 10**399})):
+            invalid_token = replace(valid.token(pool.descriptor, b"Q", "held"), path="/\ud800")
+            for name, update in (
+                ("null-folder", {"folders": [None]}),
+                ("large-pid", {"pid": 10**399}),
+                ("absolute-unencodable-token", {"tokens": [asdict(invalid_token)]}),
+                ("relative-folder", {"folders": ["relative"]}),
+                ("relative-repo", {"repo": "relative"}),
+                ("relative-scope", {"scope": "relative"}),
+            ):
                 path = directory / f"{name}.json"
                 data = cast(dict[str, object], json.loads(valid.path.read_text()))
                 data.update(update)
@@ -238,6 +256,9 @@ sys.stdin.read(1)
             self.assertEqual(output.getvalue().count("UNRESOLVED: invalid CPU slot value"), 3)
             self.assertIn("UNRESOLVED: invalid folder path", output.getvalue())
             self.assertIn("UNRESOLVED: invalid pid", output.getvalue())
+            self.assertIn("UNRESOLVED: invalid token path: path cannot be encoded", output.getvalue())
+            self.assertIn("UNRESOLVED: invalid repo path", output.getvalue())
+            self.assertIn("UNRESOLVED: invalid scope path", output.getvalue())
 
     def test_gate_scope_sidecar_names_the_slice_before_the_child_starts(self) -> None:
         sidecar = self.state / "gate.cgroup"
@@ -290,6 +311,32 @@ sys.stdin.read(1)
             slot.release()
         self.assertEqual(self.jobserver_tokens(), b"Q")
 
+    def test_cpu_wait_recovers_the_last_slot_from_a_legacy_record(self) -> None:
+        self.configure_gate("program_stop_seconds=0.1")
+        self.create_jobserver(self.root / "legacy-jobserver", b"Q")
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                merge_gate.gate_recovery(self.checkout) as live, merge_gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, merge_gate.SharedCPUPool)
+            dead = merge_gate.GateRecovery(live.path.with_name("dead.json"), str(self.checkout),
+                                           os.getpid(), "ended-owner")
+            token = os.read(pool.descriptor, 1)
+            self.assertEqual(token, b"Q")
+            dead.save()
+            data = cast(dict[str, object], json.loads(dead.path.read_text()))
+            legacy = asdict(dead.token(pool.descriptor, token, "held"))
+            del legacy["pool_size"], legacy["operation"]
+            data["tokens"] = [legacy]
+            self.write(dead.path, json.dumps(data))
+            self.assertEqual(self.jobserver_tokens(), b"")
+
+            pool.deadline = time.monotonic() + 2
+            slot = pool.acquire()
+            self.assertLess(time.monotonic(), pool.deadline)
+            self.assertEqual(slot.token, b"Q")
+            self.assertFalse(dead.path.exists())
+            self.assertEqual(self.jobserver_tokens(), b"")
+        self.assertEqual(self.jobserver_tokens(), b"Q")
+
     def test_fifo_recount_preserves_live_slots_and_available_bytes(self) -> None:
         self.supply_jobserver(b"ABC")
         with mock.patch.dict(os.environ, self.environment, clear=True), \
@@ -306,7 +353,9 @@ sys.stdin.read(1)
                 dead.tokens.append(dead.token(pool.descriptor, b"", "acquiring", pool_size=token.pool_size))
                 dead.save()
                 self.assertEqual(os.read(pool.descriptor, 1), b"B")
-            merge_gate.recover_fifo_slots(pool.descriptor)
+            with mock.patch.object(os, "read", wraps=os.read) as read:
+                merge_gate.recover_fifo_slots(pool.descriptor)
+            self.assertFalse(any(call.args[0] == pool.descriptor for call in read.call_args_list))
             self.assertEqual(self.jobserver_tokens(), b"C+")
             self.assertFalse(dead.path.exists())
             self.assertEqual(merge_gate.read_gate_recovery(live.path), live)
@@ -770,12 +819,8 @@ Path({str(descendant)!r}).write_text(str(child.pid))
                 self.write(self.state / "hold-module", "hold")
                 self.write(self.state / "leak-child", "leak")
                 self.write(self.state / "detached-child", "detached")
-                # Each signal gets its own pool, so a failed subtest leaves no token for the next.
-                pool = self.root / f"jobserver-{sig.name}"
-                os.mkfifo(pool)
-                self.addCleanup(os.close, os.open(pool, os.O_RDWR | os.O_NONBLOCK))
-                self.environment["BUILDLOG_JOBSERVER_FIFO"] = str(pool)
-                self.supply_jobserver(b"Q")
+                # Each signal uses a separate pool.
+                self.create_jobserver(self.root / f"jobserver-{sig.name}", b"Q")
                 parent = self.root / f"interrupted-{sig.name}"
                 parent.mkdir()
                 self.environment["TMPDIR"] = str(parent)

@@ -11,7 +11,7 @@ A job still running at the module time limit fails the gate (default 1800 s).
 After the parallel pass, up to eight failed test modules run once more, alone.
 Time-limited jobs and the type check do not run again.
 Shared gates give each job a scope under the gate slice when scopes are enabled and supported.
-For a private FIFO with old records, BUILDLOG_JOBSERVER_SLOTS can supply its seeded slot count.
+The creator of a private FIFO can publish its initial slot count in a .slots file beside the FIFO.
 --tests-only runs the same suite runner without changing git refs or files.
 Clean trees reuse full passes on the same host. Merge gates run all modules.
 Targeted tests select affected modules from a certified ancestor. --nightly validates a shared clone.
@@ -366,6 +366,14 @@ def fifo_bytes(descriptor: int) -> int:
     return unread[0]
 
 
+def cpu_pool_path() -> Path:
+    return Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve")).absolute()
+
+
+def fifo_size_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.slots")
+
+
 @contextmanager
 def token_operation(descriptor: int, *, deadline: float = math.inf) -> Generator[bool]:
     """Serialize changes to a FIFO. The jobserver device tracks its own slots."""
@@ -500,7 +508,7 @@ class SharedCPUPool:
 
 @contextmanager
 def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
-    path = Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"))
+    path = cpu_pool_path()
     try:
         descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -842,7 +850,7 @@ class GateRecovery:
     def token(self, descriptor: int, value: bytes,
               operation: Literal["acquiring", "held", "returning"], *, pool_size: int = 0) -> HeldGateToken:
         status = os.fstat(descriptor)
-        return HeldGateToken(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"),
+        return HeldGateToken(str(cpu_pool_path()),
                              status.st_dev, status.st_ino, value.hex(), operation, pool_size)
 
     def update_token(self, token: HeldGateToken, replacement: HeldGateToken | None = None) -> None:
@@ -977,6 +985,10 @@ class GateRecoveryUnresolved(GateRefused):
 
 class GateRollbackConflict(GateRecoveryUnresolved):
     """The requested checkout has a commit newer than its rollback record."""
+
+
+class GateFIFOSizeUnresolved(GateRecoveryUnresolved):
+    """The FIFO slot count is missing or inconsistent."""
 
 
 def prove_scope_empty(scope: Path, deadline: float, sample_seconds: float) -> None:
@@ -1148,6 +1160,19 @@ def record_text(value: object, field_name: str) -> str:
     return value
 
 
+def record_path(value: object, field_name: str, *, allow_empty: bool = False) -> str:
+    path = record_text(value, field_name)
+    if allow_empty and not path:
+        return path
+    if not Path(path).is_absolute():
+        raise GateRecordError(f"invalid {field_name}: expected an absolute path")
+    try:
+        _ = os.fsencode(path)
+    except UnicodeEncodeError as error:
+        raise GateRecordError(f"invalid {field_name}: path cannot be encoded") from error
+    return path
+
+
 def record_int(value: object, field_name: str, maximum: int, minimum: int = 0) -> int:
     if type(value) is not int or not minimum <= value <= maximum:
         raise GateRecordError(f"invalid {field_name}: expected an integer from {minimum} to {maximum}")
@@ -1176,18 +1201,18 @@ def parse_gate_recovery(path: Path, payload: object, fifo_identity: tuple[int, i
         # Older records kept the byte count before the read.
         _ = record_int(row.get("available", 0), "available byte count", MAX_PID)
         size = record_int(row.get("pool_size", 0), "pool size", MAX_PID)
-        tokens.append(HeldGateToken(record_text(row.get("path"), "token path"), device, inode, value, operation, size))
+        tokens.append(HeldGateToken(record_path(row.get("path"), "token path"), device, inode, value, operation, size))
     groups: dict[int, str] = {}
     for group, identity in record_object(data.get("groups"), "groups").items():
         if not group.isascii() or not group.isdecimal() or len(group) > 10:
             raise GateRecordError("invalid process group id")
         groups[record_int(int(group), "process group id", MAX_PID, 1)] = record_text(identity, "process group start")
-    folders = [record_text(folder, "folder path") for folder in record_list(data.get("folders"), "folders")]
-    return GateRecovery(path, record_text(data.get("repo"), "repo"), record_int(data.get("pid"), "pid", MAX_PID, 1),
+    folders = [record_path(folder, "folder path") for folder in record_list(data.get("folders"), "folders")]
+    return GateRecovery(path, record_path(data.get("repo"), "repo path"), record_int(data.get("pid"), "pid", MAX_PID, 1),
                         record_text(data.get("start"), "start"), groups, folders, tokens,
                         record_text(data.get("rollback"), "rollback"), record_text(data.get("rollback_head"), "rollback head"),
                         record_text(data.get("rollback_source"), "rollback source"),
-                        scope=record_text(data.get("scope", ""), "scope"))
+                        scope=record_path(data.get("scope", ""), "scope path", allow_empty=True))
 
 
 def read_gate_recovery(path: Path, *, fifo_identity: tuple[int, int] | None = None) -> GateRecovery | None:
@@ -1253,24 +1278,50 @@ def fifo_records(descriptor: int) -> list[tuple[GateRecovery, list[HeldGateToken
     return None if uncertain else records
 
 
+def seeded_fifo_size(descriptor: int) -> int:
+    """Read the creator's device number, inode number, and slot count."""
+    path = fifo_size_path(cpu_pool_path())
+    try:
+        source = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            if not stat.S_ISREG(os.fstat(source).st_mode):
+                raise GateFIFOSizeUnresolved(f"the FIFO slot count file is not a regular file: {path}")
+            value = os.read(source, 64)
+        finally:
+            os.close(source)
+    except FileNotFoundError:
+        return 0
+    except OSError as error:
+        raise GateFIFOSizeUnresolved(f"cannot read FIFO slot count at {path}: {error}") from error
+    match = re.fullmatch(rb"([0-9]{1,20}) ([0-9]{1,20}) ([0-9]{1,10})\n?", value)
+    if match is None:
+        raise GateFIFOSizeUnresolved(f"invalid FIFO slot count file at {path}")
+    device, inode, size = map(int, match.groups())
+    status = os.fstat(descriptor)
+    if (device, inode) != (status.st_dev, status.st_ino):
+        return 0
+    if not size:
+        raise GateFIFOSizeUnresolved(f"invalid FIFO slot count at {path}")
+    return size
+
+
 def fifo_pool_size(descriptor: int, records: list[tuple[GateRecovery, list[HeldGateToken]]], available: int) -> int:
+    seeded = seeded_fifo_size(descriptor)
     sizes = {token.pool_size for _, tokens in records for token in tokens if token.pool_size}
-    setting = os.environ.get("BUILDLOG_JOBSERVER_SLOTS")
+    if seeded:
+        sizes.add(seeded)
     limit = fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ)
-    if setting is not None:
-        if not setting.isascii() or not setting.isdecimal() or len(setting) > 10 or not 1 <= int(setting) <= limit:
-            raise GateRecoveryUnresolved(f"BUILDLOG_JOBSERVER_SLOTS must be from 1 to {limit}")
-        sizes.add(int(setting))
     if len(sizes) > 1 or any(size > limit for size in sizes):
-        raise GateRecoveryUnresolved("the FIFO records disagree with each other or with the pipe size")
+        raise GateFIFOSizeUnresolved("the FIFO slot counts disagree or exceed the pipe size")
     if sizes:
-        return sizes.pop()
+        return seeded or sizes.pop()
     # Before the first tracked read, every slot is still in the FIFO.
     return 0 if records else available
 
 
 def recover_configured_fifo(deadline: float, descriptor: int | None) -> None:
-    path = Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"))
+    path = cpu_pool_path()
+    waiting = descriptor is not None
     try:
         if descriptor is not None:
             recover_fifo_slots(descriptor, deadline=deadline)
@@ -1283,6 +1334,8 @@ def recover_configured_fifo(deadline: float, descriptor: int | None) -> None:
     except FileNotFoundError:
         pass
     except (OSError, GateRecoveryUnresolved) as error:
+        if waiting and isinstance(error, GateFIFOSizeUnresolved):
+            raise
         report_gate_recovery(path, error)
 
 
@@ -1331,21 +1384,16 @@ def recover_fifo_slots(descriptor: int, *, deadline: float = math.inf) -> None:
         available = fifo_bytes(descriptor)
         size = fifo_pool_size(descriptor, records, available)
         if not size:
-            raise GateRecoveryUnresolved("the FIFO slot count is unknown")
-        target = size - live_slots
-        if available > target:
+            raise GateFIFOSizeUnresolved("the FIFO slot count is unknown")
+        restore = size - live_slots - available
+        if restore < 0:
             raise GateRecoveryUnresolved("the FIFO and live gates exceed the recorded slot count")
-        original = os.read(descriptor, available) if available else b""
-        if len(original) != available:
-            if original:
-                _ = os.write(descriptor, original)
-            raise GateRecoveryUnresolved("the FIFO changed during the recount")
-        restore = target - len(original)
-        saved = b"".join(bytes.fromhex(token.value) for _, tokens in dead for token in tokens)
-        # Each byte represents one slot. Keep saved byte values where possible.
-        restored = original + saved[:restore].ljust(restore, b"+")
-        if restored and os.write(descriptor, restored) != len(restored):
-            raise GateRecoveryUnresolved("the FIFO write did not restore the full slot count")
+        if restore:
+            saved = b"".join(bytes.fromhex(token.value) for _, tokens in dead for token in tokens)
+            # Each byte represents one slot. Use saved bytes first.
+            restored = saved[:restore].ljust(restore, b"+")
+            if os.write(descriptor, restored) != restore:
+                raise GateRecoveryUnresolved("the FIFO write did not restore the full slot count")
         # Keep the slot count in a record until the recount clears the last token.
         for record, tokens in sorted(dead, key=lambda item: any(token.pool_size for token in item[1])):
             record.tokens[:] = [token for token in record.tokens if token not in tokens]
