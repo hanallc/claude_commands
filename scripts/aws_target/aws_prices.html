@@ -339,6 +339,11 @@ function drawLaunchState() {
   const section = document.getElementById("launch-state");
   const state = data.launch_state;
   section.dataset.kind = state.kind;
+  if (state.kind === "off") {
+    section.querySelector("p").replaceChildren(
+      element("strong", "Cloud gates are off"), " (cloud_gate.conf enabled=off). Gates run on natedev.");
+    return;
+  }
   const last = state.last_good_at === undefined ? "" : launchTime.format(state.last_good_at * 1000);
   const label = state.kind === "refused" ? `AWS refuses launches (${state.code}).`
     : state.kind === "working" ? "AWS launches work." : "AWS launch state is unknown.";

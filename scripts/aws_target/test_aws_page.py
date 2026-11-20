@@ -365,12 +365,22 @@ class AwsCombinedTableTests(PageCostFixture):
         assert marker is not None, 'The browser must finish the table checks.'
         self.assertEqual(unescape(marker[1]), 'passed')
 
+    def test_disabled_cloud_gates_replace_the_launch_status(self) -> None:
+        self.configure_gate('enabled=off')
+        self.run_browser_checks('', """
+    const block = document.getElementById("launch-state");
+    check(block.dataset.kind === "off", "Disabled cloud gate state");
+    check(block.innerText === "Cloud gates are off (cloud_gate.conf enabled=off). Gates run on natedev.",
+          "The disabled state explains where gates run");
+""", blocked=True)
+
     def test_launch_state_sits_above_spend_and_updates_after_a_good_launch(self) -> None:
         self.run_browser_checks('', """
     const block = document.getElementById("launch-state");
     const message = () => block.querySelector("[role='status']").textContent;
     check(block.nextElementSibling.id === "spend", "Launch state sits above spend");
     check(block.dataset.kind === "refused", "Refusal style");
+    check(!block.innerText.includes("Cloud gates are off"), "The notice is absent when gates are on");
     check(message().includes("AWS refuses launches (Blocked). The account is blocked."),
           "Refusal includes the code and plain reason");
     const {first_at, last_good_at, latest_attempt_at} = data.launch_state;

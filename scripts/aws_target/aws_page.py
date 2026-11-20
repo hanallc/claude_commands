@@ -21,7 +21,7 @@ from pathlib import Path
 from statistics import median
 from typing import Literal, NotRequired, TypedDict
 
-from scripts.aws_target import config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
+from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
@@ -165,6 +165,10 @@ def classify_launch_row(
             return LaunchRowEvidence.NO_ATTEMPT
 
 
+class CloudGatesOff(TypedDict):
+    kind: Literal['off']
+
+
 class NoLaunchEvidence(TypedDict):
     kind: Literal['no-evidence']
 
@@ -185,7 +189,7 @@ class LaunchesRefused(TypedDict):
     last_good_at: NotRequired[float]
 
 
-type LaunchState = NoLaunchEvidence | LaunchesWorking | LaunchesRefused
+type LaunchState = CloudGatesOff | NoLaunchEvidence | LaunchesWorking | LaunchesRefused
 
 
 class QuotaRequestCell(TypedDict):
@@ -479,14 +483,15 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
 
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
-              launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = ()) -> PageData:
+              launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = (),
+              gate_switch: cloud_gate.CloudGateSwitch = cloud_gate.CloudGateSwitch.ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
     regions = dict.fromkeys((*(row[0] for row in placement.rows), *tables.hours.headers[1:]))
     return {
         'read_at': now,
         'render_seconds': 0.0,
-        'launch_state': launch_state(launch_records),
+        'launch_state': {'kind': 'off'} if gate_switch is cloud_gate.CloudGateSwitch.OFF else launch_state(launch_records),
         'spend': spend,
         'settled_notes': list(settled_notes),
         'regions': sorted(regions, key=region_filter_key),
@@ -557,11 +562,11 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     except (OSError, ValueError, KeyError) as error:
         print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
         placement = ()
-    values = conf.read_or_repository('cloud_gate')
+    values = cloud_gate.settings()
     gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
     tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
     data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches(),
-                     settled_notes=settled_amount_notes(watched))
+                     settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
     comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)

@@ -107,6 +107,10 @@ def settings() -> conf.ConfigRead:
     return conf.read_or_repository('cloud_gate')
 
 
+def launch_switch(configuration: conf.ConfigRead) -> CloudGateSwitch:
+    return configuration.value('enabled', CloudGateSwitch, recover_invalid=False)
+
+
 def read(path: Path) -> dict[str, object]:
     return ledger.mapping(cast(object, json.loads(path.read_text())))
 
@@ -1216,7 +1220,7 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
-    if settings().value('enabled', CloudGateSwitch, recover_invalid=False) is CloudGateSwitch.OFF:
+    if launch_switch(settings()) is CloudGateSwitch.OFF:
         return LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')
     directory = attempt.directory
     command_job = attempt.gate_job
