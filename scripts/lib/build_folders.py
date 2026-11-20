@@ -799,12 +799,20 @@ def cleanup_incomplete(descriptor: int, *, active: ForegroundMarker = Foreground
     return False
 
 
+class _RemovalLockState(Enum):
+    ACQUIRED = "the lease permits removal"
+    HELD = "another holder has the lease"
+    UNSAFE = "the lease changed or cleanup is incomplete"
+
+
 def _take_removal_lock(path: Path, directory: int, descriptor: int, *,
-                       wait: bool | build_folder_lock.ProbeTiming) -> bool:
+                       wait: bool | build_folder_lock.ProbeTiming) -> _RemovalLockState:
     timing = _probe_timing(wait=wait) if isinstance(wait, bool) else wait
-    return (build_folder_lock.take_lock(descriptor, fcntl.LOCK_EX, timing)
-            and build_folder_lock.lock_current(path, directory, descriptor)
-            and not cleanup_incomplete(descriptor))
+    if not build_folder_lock.take_lock(descriptor, fcntl.LOCK_EX, timing):
+        return _RemovalLockState.HELD
+    if not build_folder_lock.lock_current(path, directory, descriptor) or cleanup_incomplete(descriptor):
+        return _RemovalLockState.UNSAFE
+    return _RemovalLockState.ACQUIRED
 
 
 def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True,
@@ -830,7 +838,7 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
             return UnreservedRemovalFolder()
         if info.st_nlink > 1:
             return RefusedRemovalLease()
-    if not _take_removal_lock(path, directory, descriptor, wait=wait):
+    if _take_removal_lock(path, directory, descriptor, wait=wait) is not _RemovalLockState.ACQUIRED:
         return RefusedRemovalLease()
     _ = stack.callback(_locks.pop, descriptor, None)
     _locks[descriptor] = path
@@ -950,10 +958,14 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object] | None = None,
         try:
             descriptor = build_folder_lock.open_lock(path, directory, create=True)
             _ = locks.callback(os.close, descriptor)
-            free = _take_removal_lock(path, directory, descriptor, wait=wait)
+            state = _take_removal_lock(path, directory, descriptor, wait=wait)
         except (OSError, ValueError):
-            free = False
-        if not free:
+            state = _RemovalLockState.UNSAFE
+        if state is _RemovalLockState.HELD and allocated is not None:
+            # Another process can still hold the allocation after a fork.
+            # The last context to release the lease can remove the folder.
+            return False
+        if state is not _RemovalLockState.ACQUIRED:
             print(f"build folders: kept {path}; its lease is held or incomplete", file=sys.stderr)
             return False
         return _remove_leased_folder(path, directory, cleanup, temporary=temporary, allocated=allocated)

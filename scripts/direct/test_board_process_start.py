@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 
 from scripts.direct.verify_token_wait_test_support import BOARD
-from scripts.direct import step_record
+from scripts.direct import group_cleanup, step_record
 from scripts.lib import process_group
 from scripts.lib import process_start as identity
 from scripts.lib.shell_test_support import shell_function
@@ -64,13 +64,13 @@ class BoardProcessStartTests(unittest.TestCase):
                 for function, delimiter, expected in (("owned_group_matches", "PYTHON", keep_status),
                                                        ("cleanup_owned_group", "PY", cleanup_status)):
                     body = shell_function(source, function).split("<<'" + delimiter + "'\n", 1)[1].rsplit("\n" + delimiter, 1)[0]
-                    replies = [subprocess.CompletedProcess[str]([], 0, canonical + " S\n", ""),
-                               subprocess.CompletedProcess[str]([], 0, "", "")]
+                    process_start = subprocess.CompletedProcess[str]([], 0, canonical + " S\n", "")
                     errors = io.StringIO()
                     with mock.patch.object(sys, "platform", "darwin"), \
-                         mock.patch.object(sys, "argv", ["-", str(path), str(BOARD.parent.parent / "lib")]), \
-                         mock.patch.object(subprocess, "run", side_effect=replies) as run, \
+                         mock.patch.object(sys, "argv", ["-", str(path)]), \
+                         mock.patch.object(subprocess, "run", return_value=process_start) as run, \
                          mock.patch.object(subprocess, "check_output", return_value="4242 S\n" if expected else ""), \
+                         mock.patch.object(group_cleanup, "send_process_group") as send, \
                          redirect_stderr(errors):
                         try:
                             exec(compile(body, str(BOARD), "exec"), {})
@@ -79,9 +79,15 @@ class BoardProcessStartTests(unittest.TestCase):
                         else:
                             status = 0
                     self.assertEqual(status, expected, errors.getvalue())
-                    expected_queries = 2 if function == "cleanup_owned_group" and not expected else 1
-                    self.assertEqual(run.call_count, expected_queries)
+                    run.assert_called_once()
                     self.assertEqual(run.call_args_list[0].kwargs["env"]["TZ"], "UTC")
+                    if function == "owned_group_matches":
+                        send.assert_not_called()
+                    elif expected:
+                        send.assert_called_once_with(record["group"], 0)
+                    else:
+                        self.assertEqual(send.call_args_list, [
+                            mock.call(record["group"], signal.SIGKILL), mock.call(record["group"], 0)])
 
     def test_unmarked_live_group_requires_matching_identity_for_release(self) -> None:
         for matches in (False, True):

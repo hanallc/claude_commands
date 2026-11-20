@@ -72,7 +72,7 @@ lint_config_enabled() {
 
     def test_refused_internal_mac_pin_accepts_an_unset_caller_pin(self) -> None:
         verify = Path(__file__).with_name("verify.sh")
-        script = shell_functions(verify, "placement_once") + r'''
+        script = shell_functions(verify, "finish_placement_client", "placement_once") + r'''
 set -eu
 unset PINNED_TARGET
 HOLD_WAIT_DIR=$PWD DOC_REPO_TOP=$PWD
