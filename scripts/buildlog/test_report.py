@@ -4,21 +4,25 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import tempfile
 import time
 import unittest
+import zoneinfo
+from importlib import resources
 from contextlib import closing
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
+from zipfile import ZipFile, Path as ZipPath
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 from scripts.buildlog.cli_probe_test_support import measure_cli_work
 
-from scripts.buildlog import disk, ci
+from scripts.buildlog import cli, disk, ci
 from scripts.buildlog import index
 from scripts.buildlog import mac_outcome
 from scripts.buildlog import moments, report, holds, health
@@ -96,6 +100,17 @@ class ReportSpeedTests(unittest.TestCase):
                 self.assertIn("| Held target | 10.0 min", result.stdout)
                 self.assertIn("| Mac ran | Mac passed | Mac failed |", result.stdout)
                 print(result.stdout, flush=True)
+
+    def test_report_command_refuses_an_unknown_user_zone(self) -> None:
+        result = subprocess.run(
+            configured_host_cli(Path("scripts/buildlog/cli.py"), "report", "2026-01-15"),
+            cwd=Path(__file__).resolve().parents[2],
+            env={**os.environ, "USER_ZONE": "Mars/Phobos"},
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("buildlog: USER_ZONE: 'Mars/Phobos' is not a zone name", result.stderr)
 
     def test_report_cli_work_grows_near_linearly_at_the_live_index_size(self) -> None:
         self.addCleanup(time.tzset)
@@ -604,6 +619,66 @@ class ReportTests(unittest.TestCase):
                     self.assertEqual(sorted(call.call_id for call in selected if call.on_report_day), [row[0] for row in expected])
                     self.assertTrue(all(call.ran_on_natedev for call in selected))
         time.tzset()
+
+    def test_report_day_uses_new_york_when_tzdir_is_empty(self) -> None:
+        self.addCleanup(time.tzset)
+        empty_zones = self.root.parent / "empty-zones"
+        empty_zones.mkdir()
+        with mock.patch.dict(os.environ, {"TZ": "UTC0", "TZDIR": str(empty_zones), "USER_ZONE": "America/New_York"}):
+            time.tzset()
+            cli.run_in_user_zone()
+            self.write(
+                self.root / "natedev" / "2026-01.jsonl",
+                call("late", started_at="2026-01-16T02:00:00Z", mac="passed", mac_reason="", mac_s=1),
+                call("next-day", started_at="2026-01-16T05:00:00Z", mac="passed", mac_reason="", mac_s=1),
+            )
+            _ = index.update()
+            with closing(index.read_only()) as connection:
+                day = "2026-01-15"
+                selected = report.reported_mac_calls(connection, day)
+                self.assertEqual([call.call_id for call in selected if call.on_report_day], ["late"])
+                self.assertEqual(report.fetch(connection,
+                    "SELECT id FROM calls WHERE date(started_at, 'localtime') = ?", day), [("late",)])
+
+    def test_report_uses_a_zone_file_from_the_tzdata_package(self) -> None:
+        self.addCleanup(time.tzset)
+        zone = "America/New_York"
+        zone_info = zoneinfo.ZoneInfo(zone)
+        zone_file = next((Path(directory) / zone for directory in zoneinfo.TZPATH
+                          if (Path(directory) / zone).is_file()), None)
+        packaged = zone_file if zone_file is not None else resources.files("tzdata.zoneinfo").joinpath("America", "New_York")
+        archive = self.root.parent / "tzdata.zip"
+        with ZipFile(archive, "w") as output:
+            output.writestr(zone, packaged.read_bytes())
+
+        with ZipFile(archive) as package, mock.patch.dict(os.environ, {"USER_ZONE": zone}):
+            with mock.patch.object(zoneinfo, "TZPATH", ()), mock.patch.object(
+                    resources, "files", return_value=ZipPath(package)) as package_files:
+                cli.run_in_user_zone()
+            package_files.assert_called_once_with("tzdata.zoneinfo")
+            self.assertTrue(Path(os.environ["TZ"].removeprefix(":")).is_file())
+            winter = datetime(2026, 1, 15, 12, tzinfo=UTC)
+            self.assertEqual(timedelta(seconds=time.localtime(winter.timestamp()).tm_gmtoff),
+                             winter.astimezone(zone_info).utcoffset())
+
+    def test_report_rejects_a_process_offset_that_differs_from_the_user_zone(self) -> None:
+        self.addCleanup(time.tzset)
+        winter = datetime(2026, 1, 15, 12, tzinfo=UTC).timestamp()
+        for zone in ("America/New_York", "Europe/London"):
+            with self.subTest(zone=zone), mock.patch.dict(os.environ, {"TZ": "UTC0", "USER_ZONE": zone}):
+                time.tzset()
+                with mock.patch.object(time, "time", return_value=winter), mock.patch.object(
+                        time, "tzset"), self.assertRaisesRegex(ValueError, f"{zone}.*process offset"):
+                    cli.run_in_user_zone()
+
+    def test_report_loads_the_user_zone_at_a_dst_change(self) -> None:
+        self.addCleanup(time.tzset)
+        transition = datetime(2026, 3, 8, 7, tzinfo=UTC).timestamp()
+        before_transition = math.nextafter(transition, -math.inf)
+        with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}), mock.patch.object(
+                time, "time", return_value=before_transition):
+            cli.run_in_user_zone()
+            self.assertEqual(time.localtime(transition).tm_gmtoff, -4 * 3600)
 
     def test_lead_block_has_all_five_facts_before_waiting(self) -> None:
         write_mac_block(datetime(2026, 10, 12, 15, tzinfo=UTC), "mac-holder", "preview")

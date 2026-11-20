@@ -2148,10 +2148,11 @@ class FloorTests(SweepCase):
         usage = os.statvfs_result((4096, 4096, 1000, 500, 500, 0, 0, 0, 0, 255))
         plain_floor = "# range: 0..\nsweep_build_floor_gib=40.5\n"
         host_floor = "# range: 0..\nsweep_build_floor_gib.testhost=55\n"
+        natedev_floor = "# range: 0..\nsweep_build_floor_gib.natedev=733.29\n"
         for host, overrides, expected in (("testhost", "", 1000 * 4096 // 4),
                                           ("testhost", plain_floor, int(40.5 * GIB)),
                                           ("testhost", plain_floor + host_floor, 55 * GIB),
-                                          ("natedev", "", int(733.29 * GIB))):
+                                          ("natedev", natedev_floor, int(733.29 * GIB))):
             with self.subTest(host=host, overrides=overrides):
                 base = self.base()
                 first = base / "first"
@@ -5365,7 +5366,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
 
     def test_above_cleanup_floor_rearms_the_phone_crossing(self) -> None:
         with self.crossing_delivery({}) as delivery:
-            _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_minutes=0\n")
+            _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_minutes=0\nsweep_phone_rearm_gib=5\n")
             base = delivery.base
             send = cast(mock.Mock, sweep.send_floor_alert)
             for free in (140, 320, 140):
@@ -7533,7 +7534,7 @@ class MacFloorTests(SweepCase):
 
     def test_mac_missing_or_lower_floor_refuses_with_one_line(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
-        _ = write_config_fixture(config, "sweep_floor_gib=150\n")
+        _ = write_config_fixture(config, "free_floor_gib=100\nsweep_floor_gib=150\n")
         original = config.read_text()
         for changed in (original.replace("sweep_floor_gib=150", "sweep_floor_gib=99"),
                         original.replace("sweep_floor_gib=150", "")):
@@ -7550,7 +7551,7 @@ class MacFloorTests(SweepCase):
         config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
         _ = write_config_fixture(conf.path("build_targets"), "platform.mac=macos\n")
         _ = write_config_fixture(config,
-            "sweep_floor_gib=101\nmirror_root=~/.local/state/mac-test/test-mirror\n"
+            "free_floor_gib=100\nsweep_floor_gib=101\nmirror_root=~/.local/state/mac-test/test-mirror\n"
             + "sweep_floor_roots=/tmp ~/rust ~/.local/state/mac-test/test-mirror\n")
         claims = floor_claims.ClaimSnapshot(frozenset())
         with (mock.patch.object(floor_claims, "read_claims", return_value=claims),

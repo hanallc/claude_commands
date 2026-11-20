@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from importlib import import_module
 import json
@@ -39,6 +40,7 @@ class StopCause(StrEnum):
     INTERRUPTION = 'interruption'
     UNCLAIMED = 'unclaimed'
     UNCLAIMED_AFTER_INTERRUPTION = 'unclaimed-after-interruption'
+    OPERATOR_RELEASE = 'operator-release'
     UNKNOWN = 'unknown'
 
 
@@ -459,6 +461,67 @@ def record_replacement_stop(path: Path, generation: int, now: int, *, stopped: b
     write_text_atomic(path, json.dumps(_record(row), sort_keys=True) + '\n')
 
 
+class UnknownStopRelease(StrEnum):
+    ALREADY_RELEASED = 'already released'
+    PREVIEW = 'would ask the controller to confirm the stop. Use --approve-release to save the decision.'
+    AWAITING_CONTROLLER = 'release waits for the controller to confirm the stop'
+
+
+class UnknownStopReleaseRefused(ValueError):
+    """The saved Hana state does not permit a release."""
+
+
+def _record_stop_decision(row: BoxRecord, cause: StopCause) -> None:
+    row.state, row.stop_cause, row.delivered = Lifecycle.STOPPING, cause, NoDeliveredPermit()
+    row.unclaimed_stop = (UnclaimedStopDecision(row.generation)
+                          if cause in (StopCause.UNCLAIMED, StopCause.UNCLAIMED_AFTER_INTERRUPTION,
+                                       StopCause.OPERATOR_RELEASE)
+                          else NoUnclaimedStopDecision())
+
+
+def release_unknown_stop(directory: Path, *, approve_release: bool) -> UnknownStopRelease:
+    """Validate the local state and apply an approved release under the controller lock."""
+    path = directory / 'hana' / 'lifecycle.json'
+    with hana_work_lock(directory, existing=True) as access:
+        try:
+            row = _decode(remote.read_record(path))
+        except FileNotFoundError:
+            raise UnknownStopReleaseRefused('Hana has no saved lifecycle.') from None
+        if row.state == Lifecycle.IDLE_STOPPED:
+            return UnknownStopRelease.ALREADY_RELEASED
+        if row.state == Lifecycle.STOPPING and row.stop_cause == StopCause.OPERATOR_RELEASE:
+            return UnknownStopRelease.AWAITING_CONTROLLER
+        if access is file_lock.LockResult.BUSY:
+            raise UnknownStopReleaseRefused('A resource command holds Hana.')
+        if row.state != Lifecycle.STOPPED_UNKNOWN:
+            raise UnknownStopReleaseRefused('The saved Hana state must be stopped-unknown.')
+        if row.claims:
+            raise UnknownStopReleaseRefused('Hana still has a claim.')
+        if isinstance(row.operation, PendingOperation):
+            raise UnknownStopReleaseRefused('A Hana operation is pending.')
+        if isinstance(row.start, DemandStart):
+            raise UnknownStopReleaseRefused('Hana has a saved demand start.')
+        if hana_replacement_record.held(directory):
+            raise UnknownStopReleaseRefused('A saved replacement holds Hana.')
+        try:
+            exposures = ledger.CostLedger(directory).read_snapshot().hana_compute
+        except ledger.LedgerUnavailable:
+            raise UnknownStopReleaseRefused('The Hana compute ledger is unavailable.') from None
+        if any(isinstance(exposure.state, ledger.HanaExposureOpen) for exposure in exposures):
+            raise UnknownStopReleaseRefused('Hana compute exposure is still open.')
+        if not any(exposure.generation == row.generation for exposure in exposures):
+            raise UnknownStopReleaseRefused('The Hana generation has no saved closed compute exposure.')
+        if row.generation != max(exposure.generation for exposure in exposures):
+            raise UnknownStopReleaseRefused('The Hana generation is older than the newest compute exposure.')
+        if not approve_release:
+            return UnknownStopRelease.PREVIEW
+        _record_stop_decision(row, StopCause.OPERATOR_RELEASE)
+        row.boot = BootUnverified()
+        row.reason = 'hana-release-unknown-stop approved at ' + datetime.now(UTC).isoformat(timespec='seconds')
+        write_text_atomic(path, json.dumps(_record(row), sort_keys=True) + '\n')
+        return UnknownStopRelease.AWAITING_CONTROLLER
+
+
 class HanaController:
     """Serialize claims and durable intents before releasing the lock for provider calls."""
 
@@ -819,10 +882,7 @@ class HanaController:
         self._stop(row, now, StopCause.IDLE if _boot_is_current(row, row.boot) else StopCause.UNKNOWN)
 
     def _stop(self, row: BoxRecord, now: int, cause: StopCause) -> None:
-        row.state, row.stop_cause, row.delivered = Lifecycle.STOPPING, cause, NoDeliveredPermit()
-        row.unclaimed_stop = (UnclaimedStopDecision(row.generation)
-                              if cause in (StopCause.UNCLAIMED, StopCause.UNCLAIMED_AFTER_INTERRUPTION)
-                              else NoUnclaimedStopDecision())
+        _record_stop_decision(row, cause)
         _ = self._intent(row, Action.STOP, now)
 
     def _observe(self, row: BoxRecord, observed: BoxObservation, settings: LifecycleSettings, now: int) -> None:
@@ -845,10 +905,14 @@ class HanaController:
                 row.state = Lifecycle.INTERRUPTED
             elif row.state == Lifecycle.STOPPING and row.stop_cause == StopCause.IDLE:
                 row.state = Lifecycle.IDLE_STOPPED
-            elif row.state == Lifecycle.STOPPING and row.stop_cause == StopCause.UNCLAIMED_AFTER_INTERRUPTION:
+            elif row.state == Lifecycle.STOPPING and row.stop_cause in (StopCause.OPERATOR_RELEASE,
+                                                                       StopCause.UNCLAIMED_AFTER_INTERRUPTION):
                 decision = row.unclaimed_stop
-                row.state = (Lifecycle.IDLE_STOPPED if isinstance(decision, UnclaimedStopDecision)
-                             and decision.generation == row.generation else Lifecycle.INTERRUPTED)
+                if isinstance(decision, UnclaimedStopDecision) and decision.generation == row.generation:
+                    row.state = Lifecycle.IDLE_STOPPED
+                else:
+                    row.state = (Lifecycle.STOPPED_UNKNOWN if row.stop_cause == StopCause.OPERATOR_RELEASE
+                                 else Lifecycle.INTERRUPTED)
             elif row.state not in (Lifecycle.IDLE_STOPPED, Lifecycle.INTERRUPTED):
                 row.state = Lifecycle.STOPPED_UNKNOWN
             return

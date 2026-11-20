@@ -458,10 +458,11 @@ It also defines <PassOwnership/>, <Synthesize/>, <FixDispatch/>.
 Before stating any ETA in a message, reply or notice, record it with
 `progress_history.py eta --session-dir "${SESSION_DIR}" --time <HH:MM> --basis stated`
 (`--basis checkpoint` for checkpoint notices, `--basis eta-command` for
-`/unit:eta` and `/unit:eta_breakdown`). Add `--phase-id <id>` when it names a
-phase other than the active one. `<HH:MM>` means today in the user's zone; an
-ETA on a later day takes `<YYYY-MM-DDTHH:MM>`. State the time the recorder
-printed.
+`/unit:eta` and `/unit:eta_breakdown`). Pass `--phase-id <id>` to select the phase.
+When several phases are open, the recorder requires a phase ID.
+Use `<HH:MM>` for today in the user's zone.
+Use `<YYYY-MM-DDTHH:MM>` for a later day.
+State the time the recorder printed.
 
 Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
 `UNIT_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/direct.conf`.
@@ -476,6 +477,8 @@ with
 `progress_history.py start-activity --session-dir "${SESSION_DIR}" --label <label> --activity <what>`
 and close it with
 `finish-activity --session-dir "${SESSION_DIR}" --status <status> --result <outcome>`.
+Pass `--phase-id <id>` to both commands when several phases are open.
+Set `UNIT_PHASE_ID` for a verification call that records an activity in a shared run.
 Keep `--label` to one or two words -- it names the row -- and make `--result` the
 short outcome that row should show: `pass`, `clean`, `no change`. Without one
 the row can only say `done`, which reports that the window closed rather than
