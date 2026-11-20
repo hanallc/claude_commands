@@ -116,13 +116,14 @@ Writers must honor the removal locks through deletion, including during the remo
 A retry with Cargo work validates the source again after these helpers.
 A first removal records source evidence after these helpers.
 Linked checkout creation refuses a source with a removal mark.
-Recursive removal checks the busy locks and recorded borrowers of existing descendant clones.
+Recursive removal checks the busy locks and live Git alternates of existing descendant clones.
 Busy marks and copy records must be regular files.
 Task cleanup removes the clone and clears the removal marks before it tries to remove the lease file and lock file.
 Cleanup holds the lock and checks the identities of those two files before it removes either file.
 Recovery leaves the files if the clone is already absent when recovery starts.
 
-The borrow check keeps sources with recorded borrowers or unreadable copy records.
+The borrow check keeps sources that live Git alternates reference.
+It also keeps sources when it cannot read a copy record.
 It checks the copy folders in the registry and the adopted copies in the holds file.
 It skips an unregistered folder if the folder's parent is directly under the copies root and contains `.git`.
 This exception applies only if the folder contains none of `.git`, `HEAD`, `objects`, or `commondir`.

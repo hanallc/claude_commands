@@ -360,6 +360,15 @@ class CopyTests(TmpSweepCase):
         self.now = self.now + 8 * DAY
         return path
 
+    def borrowing_copies(self, **child_fields: object) -> tuple[Path, Path]:
+        parent = self.copy("parent")
+        child = self.copy("child", **child_fields)
+        for path in (parent, child):
+            _ = subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+            scratch.exclude_copy_metadata(path)
+        _ = write(child / ".git/objects/info/alternates", f"{parent / '.git/objects'}\n")
+        return parent, child
+
     def test_copy_entries_are_individual_and_empty_pair_goes_after_last_copy(self) -> None:
         old = self.copy("old")
         live = self.copy("live", task="gate:live")
@@ -381,8 +390,7 @@ class CopyTests(TmpSweepCase):
         self.assertFalse((path / scratch.BUSY).exists())
 
     def test_sweep_resumes_recordless_removal_and_does_not_keep_a_possible_parent(self) -> None:
-        parent = self.copy("parent")
-        child = self.copy("child", borrows_from=str(parent / ".git"))
+        parent, child = self.borrowing_copies()
 
         def stopped_removal(folder: str) -> None:
             (Path(folder) / copy_record.RECORD).unlink()
@@ -397,8 +405,7 @@ class CopyTests(TmpSweepCase):
         self.assertFalse(parent.exists())
 
     def test_failed_resumed_removal_keeps_its_borrowed_parent(self) -> None:
-        parent = self.copy("parent")
-        child = self.copy("child", borrows_from=str(parent / ".git"))
+        parent, child = self.borrowing_copies()
 
         def stopped_removal(folder: str) -> None:
             (Path(folder) / copy_record.RECORD).unlink()
@@ -608,14 +615,12 @@ class CopyTests(TmpSweepCase):
         self.assertIn(str(path), result.kept[tmp_sweep.UNSAVED_WORK])
 
     def test_borrowed_parent_stays_until_its_last_child_is_gone(self) -> None:
-        parent = self.copy("parent")
-        child = self.copy("child", task="gate:child", borrows_from=str(parent / ".git"))
+        parent, child = self.borrowing_copies(task="gate:child")
         result = self.sweep()
         self.assertTrue(parent.is_dir())
         self.assertTrue(child.is_dir())
         self.assertTrue(any("borrow" in reason and str(parent) in paths for reason, paths in result.kept.items()))
-        _ = (child / copy_record.RECORD).write_text(json.dumps({"task": "until:2000-01-01T0000Z",
-                                                           "borrows_from": str(parent / ".git")}))
+        _ = (child / copy_record.RECORD).write_text(json.dumps({"task": "until:2000-01-01T0000Z"}))
         _ = self.sweep()
         self.assertTrue(parent.is_dir())
         self.assertFalse(child.exists())
