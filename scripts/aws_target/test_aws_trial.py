@@ -47,7 +47,8 @@ def write_guest_config(root: Path) -> None:
         'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
         + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux bubblewrap\n')
     _ = (root / 'test_times.conf').write_text(
-        '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
+        '# range: 0..\nSLOW_TEST_S=1.0\n'
+        + '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
         + '# whole: 1..\nTOP_RUNS=5\n')
 
 
