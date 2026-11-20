@@ -31,7 +31,7 @@ from scripts.aws_target.gate_box import (
     boot_trap as boot_trap, log_push_loop as log_push_loop,
     RUN_FIELDS as RUN_FIELDS, validate_paired_result as validate_paired_result,
 )
-from scripts.aws_target import ledger, cloud_gate
+from scripts.aws_target import ledger, cloud_gate, run_cost
 from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as presign
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
@@ -206,28 +206,48 @@ def module_summary(module: str, rounds: int, runs: Sequence[dict[str, object]]) 
 
 def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, object]],
                   record_query: Callable[[Decimal], None] = lambda _fee: None, *,
-                  check_workers: Callable[[], None] = lambda: None) -> None:
+                  check_workers: Callable[[], None] = lambda: None, cohort: Path | None = None) -> None:
     """Reserve every box before the coordinator permits any launch."""
     check_workers()
     worker.reconcile()
     check_workers()
     worker.charges(record_query)
     check_workers()
-    fallback = Decimal(str(cloud_gate.settings().number('spot_max_usd_per_hour')))
+    values = cloud_gate.settings()
+    fallback = Decimal(str(values.number('spot_max_usd_per_hour')))
+    allowance = Decimal(str(values.number('attempt_allowance_usd')))
+    sizes = values.words('instance_types')
     readings = worker.book.read_bills()
-    day = datetime.fromtimestamp(worker.clock(), UTC).date().isoformat()
-    rate, reserved_type = max((ledger.gate_rate(readings, size, fallback, int(worker.clock()), day).usd_per_hour, size)
-                              for size in cloud_gate.settings().words('instance_types'))
+    now = int(worker.clock())
+    day = datetime.fromtimestamp(now, UTC).date().isoformat()
+    rate, reserved_type = max((ledger.gate_rate(readings, size, fallback, now, day).usd_per_hour, size) for size in sizes)
+    candidates: dict[str, tuple[ledger.GateRateCandidate, ...]] = {}
+    if cohort is not None and values.value('faster_box_max_cost_ratio', conf.decimal) > 1:
+        for request in requests:
+            attempt = ledger.text(request, 'attempt')
+            deployment = cloud_gate.read(cohort / attempt / 'deployment.json')
+            variants = run_cost.deployed_gate_variants(deployment, sizes).variants
+            ranking = worker.ranking_input(variants, ledger.text(request, 'mode'), values)
+            eligible = cloud_gate.gate_rate_candidates(ranking.eligible.variants)
+            if not eligible:
+                raise GateRefused(f'{attempt}: No gate variant meets the deployment and median-time limits')
+            candidates[attempt] = eligible
     policy = read_settings(worker.settings_path)
     state = worker.book.read_snapshot()
-    now = int(worker.clock())
     costs = ledger.costs_from_evidence(state, policy, now)
     daily_future, monthly_future = ledger.gate_future_costs(state, policy, now)
     daily_room = policy.daily_limit_usd - costs.daily.usd - daily_future - policy.limit_reserve_usd
     monthly_room = policy.monthly_limit_usd - costs.monthly.usd - monthly_future - policy.limit_reserve_usd
-    estimate = sum((ledger.box_cost(ledger.BoxRate(rate, 'trial reserve'), ledger.instant(row, 'expires') - now,
-                   policy.box_minimum_seconds) + Decimal(str(cloud_gate.settings().number('attempt_allowance_usd')))
-                    for row in requests), Decimal(0))
+    trial_rates = {variant: ledger.box_rate(readings, variant.instance_type, fallback, now, day,
+                                            region=variant.region).usd_per_hour
+                   for variant in dict.fromkeys(variant for variants in candidates.values() for variant in variants)}
+
+    def estimate_request(row: dict[str, object]) -> Decimal:
+        highest = max((trial_rates[variant] for variant in candidates.get(ledger.text(row, 'attempt'), ())), default=rate)
+        return ledger.box_cost(ledger.BoxRate(highest, 'trial reserve'), ledger.instant(row, 'expires') - now,
+                               policy.box_minimum_seconds) + allowance
+
+    estimate = sum(map(estimate_request, requests), Decimal(0))
     print(f'Paired trial estimate: ${estimate}; daily room: ${daily_room}; monthly room: ${monthly_room}', file=sys.stderr)
     reserved: list[str] = []
     try:
@@ -237,7 +257,7 @@ def reserve_trial(worker: cloud_gate.GateWorker, requests: Sequence[dict[str, ob
             # Use the highest rate until AWS confirms the actual type.
             reply = worker.book.reserve_gate(worker.settings_path, ledger.GateReservation(
                 attempt, int(worker.clock()), ledger.instant(request, 'expires'), fallback,
-                Decimal(str(cloud_gate.settings().number('attempt_allowance_usd'))), instance_type=reserved_type))
+                allowance, state=ledger.GateLaunchPending(candidates.get(attempt, ())), instance_type=reserved_type))
             if isinstance(reply, (ledger.GateCapReached, ledger.GateAttemptEnded)):
                 raise GateRefused(reply.reason)
             reserved.append(attempt)
@@ -427,7 +447,7 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
             for request in pending:
                 request['expires'] = expires
                 cloud_gate.save(folder / ledger.text(request, 'attempt') / 'request.json', request)
-            reserve_trial(worker, pending, record_query, check_workers=check_workers)
+            reserve_trial(worker, pending, record_query, check_workers=check_workers, cohort=folder)
         check_workers()
         try:
             for _process, connection in children:

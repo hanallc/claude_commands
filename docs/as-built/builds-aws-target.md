@@ -1252,11 +1252,37 @@ A G or VT type uses the G and VT quota. Other types use the Standard quota.
 The check uses quotas from the hourly snapshot within `price_max_age_seconds`.
 The worker prints `Cloud gate skips <type> in <region>` for a type above the median time limit.
 If that limit removes every variant, the gate falls back to natedev.
-Within each group, variants with a current price come first, ranked by the expected USD per run.
+The usual order within each group ranks priced variants by the expected USD per run.
 The user, 2026-11-14: "base our spot Requests on lowest price per run".
 If any variant has a current price, equal costs and unpriced variants follow the `instance_types` order, then input order.
 If every variant lacks a current price, the worker preserves input order within each capacity group.
-That cost includes the hourly Spot price times the expected box hours and the remote region transfer charge.
+
+The worker can prefer a faster box within each capacity group.
+Set `faster_box_max_cost_ratio` to 1 to use cost order only.
+Main uses 1. The range is 1 to 10.
+The measured cost ratio in eu-south-2 was 1.32.
+Use /tune to set a higher value only after the user approves it.
+Each fresh rank uses the cheapest eligible priced variant across all capacity groups as its reference.
+The ratio uses Spot compute and transfer costs.
+Each promotion adds at most (ratio − 1) × C in estimated AWS spend, where C is the reference cost.
+The account caps still limit spending. The ratio applies to each promotion.
+A capacity refusal can advance to a box whose cost exceeds the ratio.
+The usual cost order still includes the estimated cost of waiting.
+A speed promotion needs a positive time saving and recent box times for both instance types.
+The worker can use times from other regions for the same type.
+The time comparison includes regional extra seconds and any seconds for a region with no measurements.
+The worker orders promoted variants by estimated AWS spend, then by configured type and input order.
+A slightly faster choice can win over a much faster one. A minimum time saving against the reference, in seconds, needs user approval.
+The worker reports the preferred box and reports the actual box that AWS accepts.
+Live prices affect each fresh rank. Retries use the saved order.
+A capacity refusal advances to the next saved variant.
+The median-time filter can exclude a small box. The expiry can end the scan before the worker reaches that box.
+With the ratio above 1, the ledger takes the highest bill rate from the same set of choices that ranking uses.
+The worker skips any choice whose bill rate exceeds the rate already booked for the attempt.
+The reservation keeps the usual lifetime and allowance. It uses the accepted type and region after AWS confirms the launch.
+Paired trials use the same rank. The AWS page and build report still use their cost estimates and completed runs.
+
+The usual cost includes the hourly Spot price times the expected box hours and the remote region transfer charge.
 It also includes regional extra seconds times `gate_wait_usd_per_minute`, divided by 60.
 `region_extra_gate_seconds={}` holds a JSON map from region names to measured extra seconds.
 Missing regions contribute zero extra seconds.
