@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
-from dataclasses import asdict, replace
+from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout, suppress
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
+from functools import cached_property
 from hashlib import sha256
 from io import StringIO
 import base64
@@ -15,14 +16,16 @@ import gzip
 import json
 import os
 import re
+import select
 import signal
 from pathlib import Path
 import subprocess
 import sys
+from tempfile import TemporaryFile
 import threading
 import time
 from types import SimpleNamespace
-from typing import cast, override
+from typing import BinaryIO, TextIO, cast, override
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -60,15 +63,128 @@ def service_environment(command: Sequence[str]) -> dict[str, str]:
                 for argument in command if argument.startswith('--setenv='))
 
 
+def stop_trial_group(group: int) -> None:
+    with suppress(ProcessLookupError):
+        send_process_group(group, signal.SIGKILL)
+
+
+def fixture_descendants() -> set[int]:
+    """Find fixture children, including children from threads and fork."""
+    descendants: set[int] = set()
+    pending = [os.getpid()]
+    while pending:
+        tasks = Path(f'/proc/{pending.pop()}/task')
+        with suppress(FileNotFoundError, ProcessLookupError, PermissionError):
+            for task in tasks.iterdir():
+                with suppress(FileNotFoundError, ProcessLookupError, PermissionError):
+                    children = {int(pid) for pid in (task / 'children').read_text().split()} - descendants
+                    descendants.update(children)
+                    pending.extend(children)
+    return descendants
+
+
+@dataclass(frozen=True)
+class TrialDiagnostics:
+    stderr: BinaryIO
+    worker_stacks: tuple[Path, ...]
+
+    def read(self) -> str:
+        output: list[bytes] = []
+        with suppress(OSError, ValueError):
+            output.append(os.pread(self.stderr.fileno(), 64 * 1024, 0))
+        for path in self.worker_stacks:
+            with suppress(OSError), path.open('rb') as worker:
+                output.append(worker.read(64 * 1024))
+        return b''.join(output).decode(errors='replace')
+
+
+class CloudGateFixtureWatchdog:
+    """Report a blocked test and stop the child processes before it exits."""
+
+    def __init__(self, name: str, limit_seconds: float) -> None:
+        self.name: str = name
+        self.limit_seconds: float = limit_seconds
+        self.deadline: float = float('inf')
+        self.trials: dict[int, TrialDiagnostics] = {}
+
+    @contextmanager
+    def watch(self) -> Generator[None]:
+        self.deadline = time.monotonic() + self.limit_seconds
+        watchdog = threading.Timer(self.limit_seconds, self.expire)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            yield
+        finally:
+            watchdog.cancel()
+            watchdog.join()
+
+    def expire(self) -> None:
+        trials = self.trials.copy()
+        parent_group = os.getpgrp()
+        groups = set(trials)
+        for pid in fixture_descendants():
+            with suppress(ProcessLookupError):
+                group = os.getpgid(pid)
+                if group == parent_group:
+                    os.kill(pid, signal.SIGKILL)
+                else:
+                    groups.add(group)
+        for group in groups:
+            stop_trial_group(group)
+        _ = os.write(2, f'{self.name}: cloud gate fixture watchdog expired\n'.encode())
+        for diagnostics in trials.values():
+            _ = os.write(2, diagnostics.read().encode())
+        faulthandler.dump_traceback(file=2, all_threads=True)
+        os._exit(1)
+
+    @contextmanager
+    def trial(self, command: Sequence[str], *, stdin: int = subprocess.DEVNULL,
+              worker_stacks: tuple[Path, ...] = ()) -> Generator[tuple[subprocess.Popen[str], TrialDiagnostics]]:
+        # The stdout pipe stays open until every trial worker exits.
+        with TemporaryFile() as errors, subprocess.Popen(
+                command, stdin=stdin, stdout=subprocess.PIPE, stderr=errors, text=True,
+                start_new_session=True) as process:
+            diagnostics = TrialDiagnostics(errors, worker_stacks)
+            self.trials[process.pid] = diagnostics
+            try:
+                yield process, diagnostics
+            finally:
+                try:
+                    stop_trial_group(process.pid)
+                finally:
+                    del self.trials[process.pid]
+
+    def run_trial(self, command: Sequence[str], worker_stacks: tuple[Path, ...]) -> subprocess.CompletedProcess[str]:
+        started = time.monotonic()
+        remaining = max(0, self.deadline - started)
+        # Give workers time to print their stacks before the local timeout.
+        command = [*command, str(started + remaining / 4)]
+        stop_at = started + remaining / 2
+        with self.trial(command, worker_stacks=worker_stacks) as (process, diagnostics):
+            try:
+                stdout, _ = process.communicate(timeout=max(0, stop_at - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                stop_trial_group(process.pid)
+                try:
+                    stdout, _ = process.communicate(timeout=max(0, stop_at + remaining / 4 - time.monotonic()))
+                except subprocess.TimeoutExpired as error:
+                    stdout = (error.stdout or b'').decode(errors='replace')
+                raise AssertionError(
+                    'The cancellation fixture did not exit.\n' + stdout + diagnostics.read()) from None
+            return subprocess.CompletedProcess(command, process.returncode, stdout, diagnostics.read())
+
+
 class CloudGateHangGuard(unittest.TestCase):
+    @cached_property
+    def watchdog(self) -> CloudGateFixtureWatchdog:
+        # The 600-second limit gives one test time to finish under load.
+        return CloudGateFixtureWatchdog(self.id(), TEST_HANG_GUARD_SECS)
+
     @override
     def run(self, result: unittest.TestResult | None = None) -> unittest.TestResult | None:
-        # The guard also covers synchronous waits in setup and cleanup.
-        faulthandler.dump_traceback_later(TEST_HANG_GUARD_SECS, file=2, exit=True)
-        try:
+        with self.watchdog.watch():
             return super().run(result)
-        finally:
-            faulthandler.cancel_dump_traceback_later()
 
 
 class CloudWorkerHoldTests(CloudGateHangGuard, IsolatedBuildHoldTest):
@@ -2541,7 +2657,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(aws_trial.trial_cost(self.book, {'uncertain'}, self.settings, int(self.now) + 2), (Decimal(0), True))
 
     def test_paired_coordinator_interrupt_and_kill_cleanup(self) -> None:
-        script = r'''import multiprocessing, os, signal, sys, threading
+        script = r'''import faulthandler, multiprocessing, os, signal, sys, threading, time
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
@@ -2554,11 +2670,21 @@ at, number, before_launch = float(sys.argv[4]), int(sys.argv[5]), bool(int(sys.a
 coordinator = os.getpid()
 barrier = multiprocessing.get_context('fork').Barrier(2)
 reserve_trial = aws_trial.reserve_trial
+paired_module = aws_trial.paired_module
+trace_at = float(sys.argv[7])
 
 def reserve(*args, **kwargs):
     if before_launch:
         os.kill(coordinator, number)
     return reserve_trial(*args, **kwargs)
+
+def trace_worker(folder, *args, **kwargs):
+    with (folder / 'worker-stacks.log').open('w') as stacks:
+        faulthandler.dump_traceback_later(max(0.001, trace_at - time.monotonic()), file=stacks)
+        try:
+            paired_module(folder, *args, **kwargs)
+        finally:
+            faulthandler.cancel_dump_traceback_later()
 
 @contextmanager
 def slot(repo, sidecar, job, *, group):
@@ -2586,6 +2712,7 @@ def create_api(*args, **kwargs):
     return AwsCli('fixture', 'us-east-1', 1, execute=execute)
 with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
       mock.patch.object(aws_trial, 'reserve_trial', side_effect=reserve),
+      mock.patch.object(aws_trial, 'paired_module', side_effect=trace_worker),
       mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=slot),
       mock.patch.object(cloud_gate.GateWorker, 'charges'), mock.patch.object(cloud_gate.GateWorker, 'reconcile'),
       mock.patch.object(aws_trial.time, 'time', return_value=at)):
@@ -2604,20 +2731,11 @@ with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
                                'base': {'commit': 'base', 'tree': 'base-tree'}, 'changed': {'commit': 'commit', 'tree': 'tree'}}
                     cloud_gate.save(folder / 'request.json', request)
                     cloud_gate.save(folder / 'deployment.json', self.deployment)
-                with subprocess.Popen([sys.executable, '-c', script, str(cohort), str(self.state), str(self.settings),
-                                       str(self.now), str(number), str(int(before_launch))],
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, start_new_session=True) as process:
-                    try:
-                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            send_process_group(process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-                        self.fail('The cancellation fixture did not exit.\n' + stderr)
-                self.assertEqual(process.returncode, 1 if number == signal.SIGINT else -number, stderr)
+                result = self.watchdog.run_trial([sys.executable, '-c', script, str(cohort), str(self.state),
+                    str(self.settings), str(self.now), str(number), str(int(before_launch))],
+                    tuple(cohort / name / 'worker-stacks.log' for name in attempts))
+                stdout, stderr = result.stdout, result.stderr
+                self.assertEqual(result.returncode, 1 if number == signal.SIGINT else -number, stderr)
                 if before_launch:
                     for name in attempts:
                         self.assertTrue((cohort / name / 'released').is_file(), stderr)
@@ -2639,6 +2757,54 @@ with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
                 for path in cohort.glob('*/*.json'):
                     if path.name not in ('request.json', 'deployment.json'):
                         path.unlink()
+
+    @unittest.skipUnless(hasattr(os, 'pidfd_open'), 'The worker exit check uses a Linux pidfd')
+    def test_fixture_watchdog_reports_and_stops_a_blocked_trial(self) -> None:
+        worker = r'''import faulthandler, os, sys, threading
+
+def wait_for_watchdog():
+    faulthandler.dump_traceback_later(float(sys.argv[1]) / 2, file=2)
+    print(os.getpid(), flush=True)
+    threading.Event().wait()
+
+if os.fork() == 0:
+    wait_for_watchdog()
+os._exit(0)
+'''
+        probe = r'''import sys
+from scripts.aws_target.test_cloud_gate import CloudGateFixtureWatchdog
+
+name, limit, worker = sys.argv[1:]
+watchdog = CloudGateFixtureWatchdog(name, float(limit))
+with watchdog.trial([sys.executable, '-c', worker, limit]) as (trial, _):
+    worker_pid = int(trial.stdout.readline())
+    assert trial.wait(timeout=float(limit)) == 0
+    print(worker_pid, trial.pid, flush=True)
+    assert sys.stdin.readline() == 'watch\n'
+    with watchdog.watch():
+        trial.communicate()
+'''
+        limit = 2.0
+        with self.watchdog.trial([sys.executable, '-c', probe, 'blocked trial', str(limit), worker],
+                                 stdin=subprocess.PIPE) as (process, diagnostics):
+            assert process.stdout is not None and process.stdin is not None
+            readers, _, _ = select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS / 2)
+            self.assertTrue(readers, 'The blocked worker did not report its PID')
+            worker_pid, group = map(int, cast(TextIO, process.stdout).readline().split())
+            try:
+                with os.fdopen(os.pidfd_open(worker_pid), 'rb') as worker_exit:
+                    _ = process.stdin.write('watch\n')
+                    process.stdin.flush()
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS / 2)
+                    self.assertTrue(select.select([worker_exit], [], [], TEST_HANG_GUARD_SECS / 2)[0],
+                                    'The worker survived the watchdog')
+                output = diagnostics.read()
+                self.assertEqual(process.returncode, 1, output)
+                self.assertIn('blocked trial: cloud gate fixture watchdog expired', output)
+                self.assertIn('in wait_for_watchdog', output)
+            finally:
+                stop_trial_group(group)
+
 
 class CloudRouteTests(CloudGateHangGuard, CostFixture):
     repo: Path = Path()
