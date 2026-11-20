@@ -954,23 +954,28 @@ def repo_git_work(repo: Path) -> GitWork:
 
 def git_work(path: Path, depth: int = GIT_DEPTH, *, verified_repos: tuple[Path, ...] = ()) -> GitWork:
     """Check all worktrees down to a fixed depth. Never follow links."""
-    try:
-        if path.is_symlink() or not path.is_dir():
+    def check(folder: Path, remaining: int) -> GitWork:
+        if folder.is_symlink() or not folder.is_dir():
             return GitWork.SAVED
-        if (path / ".git").is_symlink():
+        git = folder / ".git"
+        if git.is_symlink():
             return GitWork.UNREADABLE
-        if os.path.lexists(path / ".git") and path not in verified_repos:
-            result = repo_git_work(path)
+        if (os.path.lexists(git) and folder not in verified_repos
+                and not scratch.is_private_stage_checkout(path, folder)):
+            result = repo_git_work(folder)
             if result is not GitWork.SAVED:
                 return result
-        if depth:
-            for entry in path.iterdir():
+        if remaining:
+            for entry in folder.iterdir():
                 if entry.name == ".git":
                     continue
-                result = git_work(entry, depth - 1, verified_repos=verified_repos)
+                result = check(entry, remaining - 1)
                 if result is not GitWork.SAVED:
                     return result
         return GitWork.SAVED
+
+    try:
+        return check(path, depth)
     except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired):
         return GitWork.UNREADABLE
 

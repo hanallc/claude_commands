@@ -628,6 +628,42 @@ class CopyTests(TmpSweepCase):
         self.assertFalse(parent.exists())
         self.assertFalse(child.exists())
 
+        scratch_root = self.tmp / "scratch"
+        for name, marked in (("marked", True), ("unmarked", False)):
+            with self.subTest(stage=name):
+                parent = self.copy("source-" + name)
+                _ = write(parent / "tracked", "saved source")
+                for arguments in (("init", "-q"), ("add", "tracked"), ("commit", "-qm", "source"),
+                                  ("update-ref", "refs/remotes/origin/main", "HEAD")):
+                    _ = subprocess.run(["git", "-C", str(parent), *arguments], check=True, capture_output=True)
+                scratch.exclude_copy_metadata(parent)
+
+                child = scratch_root / name
+                stage = child / scratch.CLONE_STAGE
+                stage.mkdir(parents=True)
+                staged = stage / "checkout"
+                _ = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(parent), str(staged)],
+                                   check=True, capture_output=True)
+                if marked:
+                    _ = (stage / scratch.CLONE_STAGE_OWNER).write_bytes(scratch.clone_stage_identity(stage.stat()))
+                scratch.atomic_record(child / copy_record.RECORD, {
+                    "task": "until:2000-01-01T0000Z", "test_hana_clone": True,
+                    "borrows_from": str(parent / ".git"),
+                })
+                self.assertFalse((child / ".git").exists())
+                self.assertFalse((staged / ".git/index").exists())
+                self.assertEqual(tmp_sweep.repo_git_work(staged), tmp_sweep.GitWork.UNSAVED)
+
+                with mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(scratch_root)}):
+                    result = self.sweep()
+                    self.assertIn(str(parent), result.kept[f"borrowed: {child} still uses its git objects"])
+                    self.assertTrue(parent.is_dir())
+                    if not marked:
+                        self.assertIn(str(child), result.kept[tmp_sweep.UNSAVED_WORK])
+                    self.assertEqual(child.is_dir(), not marked)
+                    _ = self.sweep()
+                self.assertEqual(parent.is_dir(), not marked)
+
 
 class IdleTests(TmpSweepCase):
     def test_unrecorded_folder_uses_the_shared_removal_age(self) -> None:

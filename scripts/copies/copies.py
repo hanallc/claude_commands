@@ -847,6 +847,8 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
         scratch_settings = conf.read("scratch")
     moment = time.time() if now is None else now
     task = scratch.task_or_default(task, moment, scratch_settings=scratch_settings)
+    repository = source.resolve()
+    borrowed = borrowed_root_record(repository)
     destination = scratch.target(task, word, False, scratch_settings=scratch_settings)
     spec = build_folders.BuildFolderSpec(kind="legacy-unique", parent=destination.parent,
                                         suffix_length=0, suffix=destination.name)
@@ -855,8 +857,6 @@ def clone(source: Path, task: str = "", word: str = "hana", now: float | None = 
         if scratch.in_session_folder(path):
             _ = scratch.hold(path, task, "task clone in the session folder", scratch_settings=scratch_settings)
         try:
-            repository = source.resolve()
-            borrowed = borrowed_root_record(repository)
             register_scratch_clone(path, CloneSource.UNAPPROVED, borrows_from=borrowed,
                                    scratch_settings=scratch_settings)
             # The task folder is the checkout, so its cargo build folder has the task folder's name.

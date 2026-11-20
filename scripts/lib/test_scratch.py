@@ -940,6 +940,13 @@ class ScratchTests(unittest.TestCase):
         self.git(source, "commit", "-qm", "source")
         scratch.write_record(source, "until:2000-01-01T0000Z", time.time())
 
+        with self.subTest(stage="root lookup"):
+            root = copy_record.root()
+            with mock.patch.object(copies, "borrowed_root_record", side_effect=copies.CopyError("root lookup failed")):
+                with self.assertRaisesRegex(copies.CopyError, "root lookup failed"):
+                    _ = copies.clone(source, "gate:clone-lookup")
+            self.assertEqual(list(root.glob("*")), [])
+
         for state in ("partial", "marked", "unmarked"):
             task = "gate:clone-failure" if state == "partial" else f"gate:clone-failure-{state}"
 

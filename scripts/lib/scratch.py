@@ -2131,6 +2131,13 @@ def owns_clone_stage(stage: Path) -> bool:
                 and marker.read(128) == clone_stage_identity(status))
 
 
+def is_private_stage_checkout(root: Path, repo: Path) -> bool:
+    """Identify the generated checkout in a marked stage directly under the removal root."""
+    stage = repo.parent
+    return (repo.name == "checkout" and stage.parent == root and stage.name.startswith(CLONE_STAGE)
+            and owns_clone_stage(stage))
+
+
 def verified_mirror_metadata(repo: Path) -> tuple[str, ...]:
     """Return generated filenames only when the mirror record, session, and marker agree."""
     from scripts.mac_test import floor_claims
@@ -2466,9 +2473,7 @@ def _removal_work(path: Path, scratch_settings: conf.ConfigRead, *,
                   publication: PublicationCheck) -> RemovalWorkSaved | KeptFolder:
     repositories: list[Path] = []
     for repo in repos(path, scratch_settings=scratch_settings):
-        stage = repo.parent
-        if (repo.name == "checkout" and stage.parent == path and stage.name.startswith(CLONE_STAGE)
-                and owns_clone_stage(stage)):
+        if is_private_stage_checkout(path, repo):
             continue
         problem = _repo_problem(repo, publication=publication)
         if isinstance(problem, RemotePublicationUnproven):
