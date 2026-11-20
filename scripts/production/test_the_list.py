@@ -427,6 +427,18 @@ class TheListTests(unittest.TestCase):
                          [["--to", OTHER.id, "--recipient-kind", "producer", "--from", "morty"],
                           ["--to", RUNNER.id, "--recipient-kind", "showrunner", "--from", "morty"]])
 
+    def test_assignment_accepts_a_showrunner_notice_held_for_review(self) -> None:
+        item = self.add()
+        self.send_patch.stop()
+        with patch.object(subprocess, "run", side_effect=(
+            subprocess.CompletedProcess([], 0, "SENT: delivered\n", ""),
+            subprocess.CompletedProcess([], 0, "KEPT: showrunner is in a review; delivered at its end\n", ""),
+        )) as send:
+            result = self.command("update", "--id", item.id, "--producer", "dwight", "--source", "morty")
+        self.assertEqual(result, (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).producer, OTHER.id)
+        self.assertEqual([call.args[0][3] for call in send.call_args_list], [OTHER.id, RUNNER.id])
+
     def test_assignment_notifies_showrunner_if_the_producer_retires_after_save(self) -> None:
         item = self.add()
         members = staff.snapshot()
