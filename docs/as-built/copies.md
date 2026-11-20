@@ -116,6 +116,10 @@ It skips an unregistered folder if the folder's parent is directly under the cop
 This exception applies only if the folder contains none of `.git`, `HEAD`, `objects`, or `commondir`.
 The check inspects these entries without following symbolic links.
 
+For an interrupted scratch move, the journal records a task end before recovery can hold the retained source.
+A scoped sweep recovers a move only when its roots include the source and the destination.
+A Git registration protects a worktree only when its backlink points to that worktree.
+
 `copies.py list` reads slot leases and remote mirror rows.
 `copies.py remove` removes owned editable and remote copies; it never removes a shared slot.
 The nightly slot sweep removes old free slots.

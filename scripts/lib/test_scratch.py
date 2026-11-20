@@ -3282,6 +3282,14 @@ print(scratch.target('gate:proof', 'tree', False))
             with self.assertRaises(scratch.FolderRecoveryRequired):
                 _ = scratch.adopt(source, ROW, "stage", visible=True)
 
+            with self.subTest(scope="source only"):
+                scoped = scratch.recover_sweep_operations((source,), dry_run=False,
+                                                          scratch_settings=settings)
+                blocked, = scoped.blocked
+                self.assertTrue(blocked.protects(step.paths.stage))
+                self.assertTrue(journal.path.is_file())
+                self.assertTrue(step.paths.stage.is_dir())
+
             report = scratch.recover_sweep_operations((self.base,), dry_run=False, scratch_settings=settings)
 
             self.assertEqual(report.blocked, ())

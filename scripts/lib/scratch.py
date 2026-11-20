@@ -1669,6 +1669,11 @@ class PublishAdoption:
 
 
 @dataclass(frozen=True)
+class PublishAdoptionAfterTaskEnd(PublishAdoption):
+    """Recover publication and release the hold on the retained source."""
+
+
+@dataclass(frozen=True)
 class NoWorktreeRegistration:
     """Removal has no external Git registration to clean."""
 
@@ -1777,7 +1782,11 @@ def read_folder_step(source: Path, fields: Mapping[str, object]) -> FolderOperat
         if kind == "copy-for-adoption":
             staging = UncreatedStage() if stage_id is None else CreatedStage(operation_id(stage_id))
             return CopyAdoption(paths, staging)
-        return PublishAdoption(paths, operation_id(stage_id))
+        task_ended = fields.get("task_ended", False)
+        if not isinstance(task_ended, bool):
+            raise ValueError("invalid adoption task end")
+        publication = PublishAdoptionAfterTaskEnd if task_ended else PublishAdoption
+        return publication(paths, operation_id(stage_id))
     if kind in ("hide-for-removal", "delete"):
         hidden = read_hidden_path(source, fields["hidden"], ".scratch-operation-")
         target = HiddenRemoval(hidden, read_worktree_registration(fields["registration"]))
@@ -1803,6 +1812,8 @@ class OperationJournal:
                               stage_id=step.staging.identity if isinstance(step.staging, CreatedStage) else None)
             else:
                 fields.update(step="publish-copy", stage_id=step.stage_id)
+                if isinstance(step, PublishAdoptionAfterTaskEnd):
+                    fields["task_ended"] = True
         else:
             registration = step.target.registration
             fields.update(step="delete" if isinstance(step, DeleteRemoval) else "hide-for-removal",
@@ -1914,14 +1925,21 @@ def finish_copy_adoption(removal: CoordinatedRemoval, source: Path, source_id: D
         sync_folder(source.parent)
         sync_folder(paths.hidden.parent)
     task = paths.destination.task
-    existing = removal.holds.get(str(paths.hidden))
-    if existing is None:
+    hidden_name = str(paths.hidden)
+    existing = removal.holds.get(hidden_name)
+    if existing is not None and (existing["task"] != task or not existing.get("release_on_task_end")):
+        raise RemovalRefused(f"{paths.hidden}: the leftover has a different hold")
+    if isinstance(step, PublishAdoptionAfterTaskEnd):
+        if existing is not None:
+            remaining = {name: record for name, record in removal.holds.items() if name != hidden_name}
+            write_holds(remaining, scratch_settings=settings)
+            sync_holds(settings)
+            del removal.holds[hidden_name]
+    elif existing is None:
         _ = hold(paths.hidden, task, "retained source from scratch adoption", release_on_task_end=True,
                  scratch_settings=settings)
-    elif existing["task"] == task and existing.get("release_on_task_end"):
-        sync_holds(settings)
     else:
-        raise RemovalRefused(f"{paths.hidden}: the leftover has a different hold")
+        sync_holds(settings)
     complete_adoption_record(paths.destination, settings, renamed=False)
 
 
@@ -2097,16 +2115,25 @@ def recover_sweep_operations(paths: Iterable[Path] | FolderOperationScope, *, dr
     """Recover pending renames before the sweep judges deletion candidates."""
     if not operation_records(scratch_settings, "*.json"):
         return SweepFolderRecovery((), ())
+    scope = FolderOperationScope.ALL if paths is FolderOperationScope.ALL else resolved_removal_paths(paths)
     blocked: list[BlockedFolderOperation] = []
     registrations: list[ScopedFolderOperation] = []
     with coordinate_removals(scratch_settings=scratch_settings, dry_run=dry_run, wait_for_hold_lock=False) as removal:
         records = operation_records(scratch_settings, "*.json")
-        for pending in scoped_folder_operations(paths, removal, records):
+        for pending in scoped_folder_operations(scope, removal, records):
             if dry_run:
                 blocked.append(pending.blocked(f"{pending.operation.source}: a folder operation needs recovery"))
                 continue
+            operation = pending.operation
+            step = operation.step
+            if scope is not FolderOperationScope.ALL and isinstance(step, (RenameAdoption, CopyAdoption, PublishAdoption)):
+                destination = step.destination if isinstance(step, RenameAdoption) else step.paths.destination
+                if not all(any(path.is_relative_to(root) for root in scope)
+                           for path in (operation.source, destination.path)):
+                    blocked.append(pending.blocked(f"{operation.source}: the sweep scope excludes a move path"))
+                    continue
             try:
-                recovered = recover_folder_operation(removal, pending.operation, scratch_settings)
+                recovered = recover_folder_operation(removal, operation, scratch_settings)
                 if recovered is RecoveredFolderRename.GIT_REGISTRATION_REMAINS:
                     registrations.append(pending)
                 else:
@@ -3885,6 +3912,16 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
         removed.append(path)
         return True
 
+    # Save the task end before recovery can add a hold for the retained source.
+    with locked_holds(scratch_settings=scratch_settings):
+        for path in operation_records(scratch_settings, "*.json"):
+            journal = OperationJournal(path)
+            operation = journal.read()
+            step = operation.step
+            if (isinstance(step, PublishAdoption) and not isinstance(step, PublishAdoptionAfterTaskEnd)
+                    and step.paths.destination.task == task and selected(step.paths.hidden)):
+                journal.save(FolderOperation(operation.source, operation.source_id,
+                                             PublishAdoptionAfterTaskEnd(step.paths, step.stage_id)))
     for folder in folders(scratch_settings=scratch_settings):
         if folder.task == task and selected(folder.path):
             _ = remove_task_folder(folder.path)

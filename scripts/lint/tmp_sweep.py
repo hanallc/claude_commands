@@ -1104,11 +1104,9 @@ def git_work(path: Path, depth: int = GIT_DEPTH, *, verified_repos: tuple[Path, 
             result = repo_git_work(path)
             if result is not GitWork.SAVED:
                 return result
-        if keep_worktree_registrations and (path / ".git").is_file():
-            checkout = git_files.at(path)
-            if (checkout.git_dir.parent == (checkout.common_dir / "worktrees").resolve()
-                    and os.path.lexists(checkout.git_dir / "gitdir")):
-                return GitWork.REGISTERED_WORKTREE
+        if (keep_worktree_registrations and (path / ".git").is_file()
+                and scratch.WorktreeRegistration.of(git_files.at(path)) is not None):
+            return GitWork.REGISTERED_WORKTREE
         if depth:
             for entry in path.iterdir():
                 if entry.name == ".git":
