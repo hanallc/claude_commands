@@ -23,6 +23,7 @@ from uuid import uuid4
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, cargo_seed, conf, copy_record, git_files, git_test_support, scratch
+from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.worktree import worktrees
 
 
@@ -178,7 +179,8 @@ repo_skip=target node_modules .git
         return result.stdout.strip()
 
     def finish_landed(self) -> list[EndResult]:
-        with patch.dict(os.environ, self.environment, clear=True), chdir(self.repository):
+        with (patch.dict(os.environ, self.environment, clear=True), chdir(self.repository),
+              LauncherHangGuard("worktree finish_landed").protect()):
             results = worktrees.end_landed(self.repository, "integration")
         return [{"kind": type(result).__name__, "path": str(result.path),
                  "detail": result.branch if isinstance(result, worktrees.Ended) else result.reason}
@@ -195,7 +197,8 @@ repo_skip=target node_modules .git
         arguments = [str(WORKTREES), "make", str(tree), branch]
         with (patch.dict(os.environ, self.environment, clear=True), chdir(self.repository),
               patch.object(sys, "argv", arguments), io.StringIO() as output,
-              redirect_stdout(output), redirect_stderr(output)):
+              redirect_stdout(output), redirect_stderr(output),
+              LauncherHangGuard("worktree make").protect()):
             self.assertEqual(worktrees.main(), 0, output.getvalue())
 
     def commit(self, tree: Path, path: str, contents: str) -> str:
