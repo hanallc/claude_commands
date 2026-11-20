@@ -13,7 +13,6 @@ import runpy
 import select
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -45,12 +44,13 @@ from scripts.herdr import herdr, worker_panes
 from scripts.production import stall_watch
 from scripts.production.session_pane import HerdrFailure, read_place, agent_status
 from scripts.hooks import context_usage
-from scripts.message import rca
+from scripts.message import rca, sessions
 from scripts.whoami import account, usage_store
 from scripts.whoami.agent_accounts import UsageReadOutcome
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.test_showrunners import stalled_session_reader
-from scripts.production import unit_lookup
+from scripts.agents import pane_record
+from scripts.production import session_staff, unit_lookup
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
@@ -352,8 +352,6 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.config.write_text((f"""# range: 0..
 threshold_percent=1
 # range: 0..
-repeat_minutes=30
-# range: 0..
 stall_minutes={stall_minutes}
 faults_to=natedev
 always=natedev
@@ -395,7 +393,7 @@ always=natedev
 
     def record_session(self, pid: int, session_id: str, name: str, *, running: bool = True) -> Path:
         path = self.root / f"{session_id}.sock"
-        record = {"pid": pid, "sessionId": session_id, "name": name,
+        record = {"pid": pid, "procStart": sessions.process_start(pid), "sessionId": session_id, "name": name,
                   "messagingSocketPath": str(path), "updatedAt": START, "running": running}
         _ = (self.sessions / f"{pid}.json").write_text(json.dumps(record))
         return path
@@ -412,17 +410,21 @@ always=natedev
         _ = (directory / "conf").write_text(f"TARGET=session:{owner.id}\nPROMPT_FILE={prompt}\n{check}")
 
     def unit(self, name: str) -> tuple[int, Path]:
-        child = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        socket_path = self.root / f"{unit_session(name)}.sock"
+        listener = ("import socket, sys, time; "
+                    "sock = socket.socket(socket.AF_UNIX); sock.bind(sys.argv[1]); sock.listen(128); "
+                    "print('listening', flush=True); time.sleep(float(sys.argv[2]))")
+        child = subprocess.Popen([sys.executable, "-c", listener, str(socket_path), str(TEST_HANG_GUARD_SECS)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.children.append(child)
+        assert child.stdout is not None
+        with child.stdout:
+            self.assertEqual(child.stdout.readline(), b"listening\n")
         pane_pid = 10_000 + len(self.panes)
         self.process_rows += [f"{pane_pid} 1 herdr pane", f"{child.pid} {pane_pid} claude --remote-control other-name"]
         pane_id = len(self.panes) + 1
         self.panes[name] = {"pane": PANE, "id": pane_id, "pid": child.pid, "name": "showrunner", "label": f"label-of-{name}"}
-        socket_path = self.record_session(child.pid, unit_session(name), "different-remote-name")
-        # The lookup reads the record itself: it needs the pane the session runs in, and a real socket.
-        held = socket.socket(socket.AF_UNIX)
-        held.bind(str(socket_path))
-        self.addCleanup(held.close)
+        _ = self.record_session(child.pid, unit_session(name), "different-remote-name")
         record_path = self.sessions / f"{child.pid}.json"
         record = cast(dict[str, object], json.loads(record_path.read_text()))
         _ = record_path.write_text(json.dumps({**record, "tmux": ""}))
@@ -1088,6 +1090,57 @@ always=natedev
         self.panes["unit-one"]["agent_status"] = "future-state"
         with mock.patch.object(stall_watch, "end_prompt", side_effect=AssertionError("unknown is not settled")):
             self.assertEqual(self.tick(START + 10).returncode, 0)
+        self.assertEqual(self.prompt_state().read_bytes(), saved)
+        self.assertEqual(self.prompt_followups(), [])
+
+    def test_a_stale_launch_in_an_empty_pane_preserves_another_units_prompt(self) -> None:
+        self.panes["unit-one"].update(agent_status="blocked", pane=EDIT_PROMPT)
+        self.assertEqual(self.tick(START).returncode, 0)
+        saved = self.prompt_state().read_bytes()
+        other = unit_membership("showrunner", "unit-two")
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        launch = pane_record.launch(place.pane, unit_session("unit-one"), str(self.root), {}, ["claude"])
+        shell = herdr.HerdrProcess(991001, place, {"CLAUDE_CODE_SESSION_ID": other.current_session},
+                                   "zsh", str(self.root))
+        with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+              mock.patch.object(herdr.Herdr, "listed", return_value=[{"pane_id": place.pane}]),
+              mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                  "shell_pid": shell.pid, "foreground_process_group_id": shell.pid,
+                  "foreground_processes": [{"pid": shell.pid, "argv": ["zsh"]}],
+              }})):
+            observed = tuple(item for item in unit_lookup._herdr_labeled(  # pyright: ignore[reportPrivateUsage]
+                {}, unit_lookup.ClaudeRegistryEvidence({}, unit_lookup.RecordsRead()), [shell])
+                             if isinstance(item, unit_lookup.LabeledSession))
+        with (mock.patch.object(herdr, "shared_session", return_value=place.session),
+              mock.patch.object(unit_lookup, "observed_session_labels",
+                                return_value=session_staff.SessionLabelObservations(observed)),
+              mock.patch.object(session_staff, "member_sources",
+                                return_value=session_staff.MemberSources((launch,))),
+              mock.patch.object(stall_watch, "end_prompt", wraps=stall_watch.end_prompt) as retire,
+              mock.patch.object(stall_watch, "read_place") as read_pane):
+            self.assertEqual(unit_lookup.checked_unit("showrunner", "unit-one"),
+                             unit_lookup.ProvedAbsentUnit(session_staff.NoUnitPane()))
+            result = self.tick(START + 10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(cast(stall_watch.WatchedUnit, call.args[0]).name != "unit-one"
+                            for call in retire.call_args_list))
+        read_pane.assert_not_called()
+        self.assertEqual(self.prompt_state().read_bytes(), saved)
+        self.assertEqual(self.prompt_followups(), [])
+
+    def test_a_missing_process_start_reports_an_unknown_owner_and_preserves_the_prompt(self) -> None:
+        self.panes["unit-one"].update(agent_status="blocked", pane=EDIT_PROMPT)
+        self.assertEqual(self.tick(START).returncode, 0)
+        saved = self.prompt_state().read_bytes()
+        pid = int(self.panes["unit-one"]["pid"])
+        path = self.sessions / f"{pid}.json"
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        del fields["procStart"]
+        _ = path.write_text(json.dumps(fields))
+        result = self.tick(START + 10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"stall-watch: unit-one: the session record of pid {pid} has no recorded process start",
+                      result.stderr)
         self.assertEqual(self.prompt_state().read_bytes(), saved)
         self.assertEqual(self.prompt_followups(), [])
 

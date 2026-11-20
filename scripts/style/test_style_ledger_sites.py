@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.style.ledger_test_support import legacy_overlapping_tickets
 from scripts.style.ledger_test_support import ticket_owner_id
 
 import os
@@ -723,7 +724,8 @@ class StyleLedgerSitesTests(LedgerTestCase):
         types = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
         # The types read predates the rename ticket but reads exactly the base blob.
         ledger.ticket_add("2001", ticket_owner_id("types"), "read", "types", "crates/alpha", [path], [types])
-        ledger.ticket_assign("2001", "main")
+        with legacy_overlapping_tickets():
+            ledger.ticket_assign("2001", "main")
         _ = ledger.ticket_base("2001")
         findings = tuple(ledger.hold(types, path, line, source.splitlines()[line - 1], "type", "u32", "Count",
                                      self.blob(types), "2001") for line in (2, 3))
@@ -775,7 +777,8 @@ class StyleLedgerSitesTests(LedgerTestCase):
         deleting = self.commit("Delete the types cell")
         self.record_removed(ledger, types, path, deleting, ticket="2001")
         # The rename ticket starts at a byte-identical restoration of the deleted file.
-        ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
+        with legacy_overlapping_tickets():
+            ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
         self.assertEqual(self.git("rev-parse", f"{original}:{path}"), self.git("rev-parse", f"{base}:{path}"))
         ledger.record(types, path, original, self.blob(types), "clean", ticket="2001", worker="late-judge",
                       input_scope=style_ledger.DeclaredInputScope.RULE)
@@ -1338,7 +1341,8 @@ class StyleLedgerSitesTests(LedgerTestCase):
         ledger.ticket_assign("4001", "main")
         _ = ledger.ticket_base("4001")
         finding = ledger.hold(rule, PARENT_FILE, 7, "7", "restructure", "body", "new body", self.blob(rule), "4001")
-        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new", line=2)
+        with legacy_overlapping_tickets():
+            _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new", line=2)
         _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
         before = self.held_rows(ledger.database)
         outcome, = self.follow_approved(ledger, [finding.finding_id])

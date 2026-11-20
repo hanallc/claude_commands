@@ -122,7 +122,9 @@ def launch_place(identity: ShowrunnerLaunch) -> herdr.HerdrPlace | herdr.NotInHe
         raise Refusal(f"cannot locate session {identity.session_id}: {observed.reason}")
     if isinstance(observed, sessions.SessionNotLive):
         return herdr.NotInHerdr()
-    place = herdr.herdr_place_of(observed.pid)
+    place = herdr.process_placement(observed.pid)
+    if isinstance(place, herdr.UnprovedHerdrPlacement):
+        raise Refusal(place.reason)
     if isinstance(place, herdr.NotInHerdr):
         raise Refusal(f"session {identity.session_id} runs outside herdr")
     return place
@@ -320,8 +322,13 @@ def _main(argv: list[str]) -> int:
         checked(child, caller, ending=ending, start_in=cwd, config_dir=account_directory(selected))
         if resume and isinstance(place, herdr.NotInHerdr):
             from scripts.message import sessions
-            if any(item["sessionId"] == resume for item in sessions.live_sessions()):
-                raise Refusal(f"session {resume} is still live")
+            match sessions.session_liveness(resume):
+                case sessions.LiveSessionProcess():
+                    raise Refusal(f"session {resume} is still live")
+                case sessions.SessionLivenessUnknown(reason=reason):
+                    raise Refusal(reason)
+                case sessions.SessionNotLive():
+                    pass
     except (Refusal, OSError, herdr_types.HerdrFailure) as refusal:
         print(f"add_showrunner: {refusal}", file=sys.stderr)
         return 2
@@ -354,9 +361,9 @@ def _main(argv: list[str]) -> int:
             transcript = herdr.SessionTranscript(identity.config_dir, identity.session_id)
             outcome = herdr.submitted_prompt(transcript, prompt, identity.started_at)
             published(transcript)
-            if not isinstance(outcome, herdr.PromptSubmitted):
+            if outcome.state != "confirmed":
                 outcome = herdr.Herdr(place.session).submit_opening_prompt(
-                    place.pane, herdr.OpeningPrompt(prompt, transcript), identity.started_at, 90_000)
+                    place.pane, herdr.OpeningPrompt(prompt, transcript, may_type=False), identity.started_at, 90_000)
         else:
             outcome = launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected,
                              identity=identity, before_prompt=published)
@@ -370,7 +377,10 @@ def _main(argv: list[str]) -> int:
         return 2
     if isinstance(outcome, herdr.ClaudeTrustNotWritten):
         return SESSION_NOT_READY
-    if isinstance(outcome, herdr.PromptNotSubmitted):
+    if outcome.publication_error is not None:
+        print(f"add_showrunner: {child.name}: staff publication failed: {outcome.publication_error}", file=sys.stderr)
+        return 1 if outcome.state == "confirmed" else SESSION_NOT_READY
+    if outcome.state != "confirmed":
         print(f"add_showrunner: {child.name}: opening prompt not submitted: {outcome.reason}", file=sys.stderr)
         return SESSION_NOT_READY
     attach = herdr.attach_hint(child.name, child.name)

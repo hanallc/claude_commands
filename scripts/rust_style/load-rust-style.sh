@@ -1,13 +1,6 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-# python3 goes through the repo shim, which picks an interpreter by VERSION
-# rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.12.
-# Explicit discovery keeps the interpreter shim from writing its cache.
-export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
-PY="${0:A:h}/../lib/py"
-
 list_files=false
 project_root=""
 shuffle=false
@@ -328,11 +321,7 @@ if [[ "$list_files" == true ]]; then
 fi
 
 # ── Helpers ─────────────────────────────────────────────────────
-# Strip frontmatter, and under `--scope edit` also drop body-level `regex:`
-# lines. Those are matcher patterns for banned_words_lib.py (which parses
-# forbidden-words.md straight from disk, not this output) — a model only needs
-# the `### "stem"` term itself to avoid the word. `except:` lines stay: they
-# carry the domain carve-outs.
+# Strip frontmatter. In edit scope, also omit body lines that start with `regex:`.
 strip_frontmatter() {
   if [[ "$scope" == edit ]]; then
     awk 'NR==1 && /^---$/ { skip=1; next } skip && /^---$/ { skip=0; next } skip { next } /^regex:[[:space:]]/ { next } { print }' "$1"
@@ -423,50 +412,6 @@ printf 'Rust style guide loaded — %d %s, %d lines (shared: %d %s, %d lines; pr
   "$bevy_note" \
   "$auto_fix_note" \
   "$scope_note"
-
-counter_state="${HOME}/.claude/state/forbidden-word-counts.json"
-if [[ -s "$counter_state" ]]; then
-  counter_summary="$("$PY" -c '
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-try:
-    raw = json.loads(path.read_text())
-except (OSError, json.JSONDecodeError):
-    sys.exit(0)
-
-items = []
-if isinstance(raw, dict):
-    source = raw.get("words") if isinstance(raw.get("words"), dict) else raw
-    for key, value in source.items():
-        if not isinstance(key, str):
-            continue
-        if isinstance(value, dict):
-            count_value = value.get("count")
-            timestamp = value.get("last_triggered_at") or "never"
-        else:
-            count_value = value
-            timestamp = "unknown"
-        try:
-            count = int(count_value)
-        except (TypeError, ValueError):
-            continue
-        if count >= 0:
-            items.append((key, count, str(timestamp)))
-
-if items:
-    joined = ", ".join(
-        f"{key}={count} last={timestamp}"
-        for key, count, timestamp in sorted(items)
-    )
-    print(f"Local forbidden-word counters: {joined} ({path})")
-' "$counter_state")"
-  if [[ -n "$counter_summary" ]]; then
-    printf '%s\n\n' "$counter_summary"
-  fi
-fi
 
 if [[ ${#member_style_dirs[@]} -gt 0 ]]; then
   printf 'Workspace member style dirs loaded (some rules may not apply to the file you are editing — judge from context):\n'

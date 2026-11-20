@@ -13,6 +13,7 @@ from typing import cast
 import unittest
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_result
 from scripts.aws_target.test_hana_result import attempt_key, command_result
 from scripts.build_hold.owning_session import NoOwningSession
@@ -113,7 +114,7 @@ class HanaRecordTests(unittest.TestCase):
             path = Path(temporary) / 'assignment.json'
             local = placement.PlacementAssignment('episode', 'local-attempt',
                 placement.PlacementDestination('local', 'natedev', 'natedev', RepositoryScope('fixture', 'fixture-repo', 1), 1),
-                placement.SourceKeyKnown('edited-live-source'), placement.SubmittingOwner('natedev', 123, 'start'),
+                execution_identity.SourceKeyKnown('edited-live-source'), placement.SubmittingOwner('natedev', 123, 'start'),
                 NoOwningSession(), 100.0)
             grant = wire.LocalPlacementGranted(local, wire.Admitted('reservation', 1, 'fixture', 'max', 'wave', {}))
             admission_client.write_assignment(path, grant)

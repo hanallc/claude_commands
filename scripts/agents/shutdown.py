@@ -46,7 +46,9 @@ from scripts.production import (
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
+from scripts.worktree.worktrees import release_worktree_pair
 from scripts.agents import (
+    producer_lifecycle,
     producer_transfer,
     restart,
     restart_support,
@@ -95,6 +97,7 @@ class CommandLine(argparse.Namespace):
     excluded: list[str] = []
     finish_step: bool = False
     retired: bool = False
+    resend_opening_prompt: bool = False
     old: str = ""
     new: str = ""
     to_doc: str = ""
@@ -103,6 +106,7 @@ class CommandLine(argparse.Namespace):
     producer: str = ""
     model: str = ""
     effort: str = ""
+    job: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -241,14 +245,16 @@ USAGE = """usage: agents COMMAND
   agents exit NAME [--finish-step] --why TEXT
   agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
+  agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
-  agents retire NAME
+  agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
   agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
   agents remove-stray NAME SESSION
   agents transfer NAME [--model MODEL --effort EFFORT]
+  agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
 """
 
 
@@ -384,7 +390,8 @@ def finish_producer_cleanup(path: Path, cleanup: PendingProducerCleanup, admissi
     transcripts = tuple(sorted(set(cleanup.transcripts) | set(sessions.transcript_locations(cleanup.session))))
     cleanup = replace(cleanup, step=ProducerCleanupStep.ADMISSION, transcripts=transcripts)
     save_producer_cleanup(path, cleanup)
-    if cleanup.admission_matches and admission.exists():
+    admission_identity = cleanup.admission.get("session_id", "")
+    if cleanup.admission_matches and admission_identity in ("", cleanup.session) and admission.exists():
         saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
         if saved == cleanup.admission:
             admission.unlink()
@@ -397,7 +404,7 @@ def finish_producer_cleanup(path: Path, cleanup: PendingProducerCleanup, admissi
             continue
         if current.get("tab_id") != pane.tab:
             raise ValueError(f"{pane.pane}: stray tab identity changed")
-        _ = client.close_retained_pane(pane.pane, terminal=pane.terminal)
+        _ = client.close_retained_pane(pane.pane, terminal=pane.terminal, target=cleanup.session)
         if not isinstance(client.pane_row(pane.pane), herdr.NoPane):
             raise ValueError(f"{pane.pane}: stray pane closure is incomplete")
     cleanup = replace(cleanup, step=ProducerCleanupStep.TRANSCRIPTS)
@@ -435,26 +442,17 @@ def stray_producer_panes(client: herdr.Herdr, identity: str) -> list[StrayProduc
             continue
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
                                  "stray pane process info")
-        proved = False
-        for value in herdr.json_items(info.get("foreground_processes"), "stray pane foreground processes"):
-            process = herdr.json_object(value, "stray pane process")
-            pid = process.get("pid")
-            if not isinstance(observed, herdr.LiveConversation) or pid not in observed.pids:
-                continue
-            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-                raise ValueError("stray pane process has no valid pid")
-            arguments = process.get("argv")
-            if not isinstance(arguments, list):
-                raise ValueError("stray pane process has no arguments")
-            argv = [herdr.json_text(argument, "stray process argument") for argument in cast(list[object], arguments)]
-            matches = herdr.is_claude_process(argv) if observed.kind == "claude" else herdr.is_codex_process(argv)
-            if not matches:
-                raise ValueError(f"{pid}: selected process no longer runs {observed.kind}")
-            native = herdr.native_process(pid, observed.kind)
-            proved = proved or native.current_identity == identity
-        idle_retained = (retained_identity == identity
-                         and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell))
-        if proved or idle_retained:
+        foreground = herdr.foreground_pane_owner(info)
+        if isinstance(foreground, herdr.UnprovedForegroundOwner):
+            continue
+        if isinstance(foreground, herdr.NoForegroundAgent):
+            matches = (retained_identity == identity
+                       and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell))
+        else:
+            matches = (isinstance(observed, herdr.LiveConversation)
+                       and foreground.pid in observed.pids and foreground.kind == observed.kind
+                       and herdr.read_foreground_pane_owner(foreground, pane).current_identity == identity)
+        if matches:
             selected.append(StrayProducerPane(pane["pane_id"], herdr.json_text(pane.get("terminal_id"), "stray terminal")))
     return selected
 
@@ -479,15 +477,22 @@ def remove_stray_producer(name: str, session: str) -> int:
         if admission.exists():
             saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
         retained = pane_record.read_strict(client.session)
-        admission_matches = saved.get("session_id") == identity
-        for pane in panes:
-            if saved.get("pane") == pane.pane and saved.get("terminal") == pane.terminal:
-                admission_matches = True
-            entry = retained.get(pane.pane)
-            if entry is not None and saved.get("pane") == pane.pane:
-                owner = record.by_member_reference(pane_launch.reference_id(entry))
-                retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
-                admission_matches = admission_matches or retained_identity == identity
+        admission_identity = saved.get("session_id", "")
+        admission_matches = admission_identity == identity
+        if admission_identity == "":
+            for pane in panes:
+                if saved.get("pane") != pane.pane:
+                    continue
+                if saved.get("terminal") == pane.terminal:
+                    admission_matches = True
+                    break
+                entry = retained.get(pane.pane)
+                if entry is not None:
+                    owner = record.by_member_reference(pane_launch.reference_id(entry))
+                    retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
+                    if retained_identity == identity:
+                        admission_matches = True
+                        break
         observed = herdr.read_conversation(identity)
         if isinstance(observed, herdr.UnknownConversation):
             raise ValueError(observed.reason)
@@ -669,6 +674,11 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("producer", metavar="NAME")
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
+    command = commands.add_parser("add-producer")
+    _ = command.add_argument("producer", metavar="NAME")
+    _ = command.add_argument("--model", default="")
+    _ = command.add_argument("--effort", default="")
+    _ = command.add_argument("--job", default="")
     for verb in ("pause", "exit", "resume"):
         command = commands.add_parser(verb)
         selection = command.add_mutually_exclusive_group(required=True)
@@ -676,6 +686,7 @@ def main(argv: list[str] | None = None) -> int:
         _ = selection.add_argument("--production", default="")
         if verb == "resume":
             _ = command.add_argument("--retired", action="store_true")
+            _ = command.add_argument("--resend-opening-prompt", action="store_true")
             _ = command.add_argument("--to")
             _ = command.add_argument("--why", default="resumed by name")
         else:
@@ -684,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--except", dest="excluded", action="append", default=[])
     command = commands.add_parser("retire")
     _ = command.add_argument("session")
+    _ = command.add_argument("--to")
     command = commands.add_parser("rename")
     _ = command.add_argument("old")
     _ = command.add_argument("new")
@@ -719,10 +731,16 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--session", dest="account", required=True)
     options = parser.parse_args(arguments, namespace=CommandLine())
     try:
+        if options.command == "resume" and options.resend_opening_prompt:
+            if options.production or options.retired:
+                raise ValueError("--resend-opening-prompt needs one producer name and an active pane")
+            return _result_code(stop_resume.resend_producer_opening(options.session, to=options.to or ""))
         if options.command == "remove-stray":
             return remove_stray_producer(options.producer, options.session)
         if options.command == "transfer":
             return producer_transfer.transfer(options.producer, model=options.model, effort=options.effort)
+        if options.command == "add-producer":
+            return producer_lifecycle.add(options.producer, model=options.model, effort=options.effort, job=options.job)
         if options.command == "stop" and options.all:
             return restart.stop_all(dry_run=options.dry_run,
                                     only=tuple(item for item in options.only.split(",") if item),
@@ -794,10 +812,23 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"{report['machine']}: unavailable (rc {report['rc']})")
             return 0
         if options.command == "rename":
+            if (producer_lifecycle.pending_rename(options.old)
+                    or producer_lifecycle.pending_admission(options.old)
+                    or producer_lifecycle.lookup(options.old, staff.initial_snapshot()) is not None):
+                if options.to_doc or options.to_branch:
+                    raise ValueError("producer rename keeps the document folder and has no branch option")
+                return producer_lifecycle.rename(options.old, options.new, rename_repair_displays)
             return rename_named_member(options.old, options.new, to_doc=options.to_doc, to_branch=options.to_branch)
         if options.command == "retire":
+            if (producer_lifecycle.pending_admission(options.session)
+                    or producer_lifecycle.lookup(options.session, staff.initial_snapshot()) is not None):
+                return producer_lifecycle.retire(options.session, to=options.to)
+            if options.to:
+                raise ValueError("--to is only for producer retirement")
             return retire_named_unit(options.session)
         if options.command == "resume" and options.retired:
+            if producer_lifecycle.lookup(options.session, staff.initial_snapshot()) is not None:
+                return _result_code(producer_lifecycle.restore(options.session, to=options.to, why=options.why))
             recovery_account = (accounts.NamedAccount(options.to, accounts.account_dir(options.to))
                                 if options.to else accounts.CURRENT_ACCOUNT_SETTINGS)
             return recover_named_unit(options.session, account=recovery_account)
@@ -1232,6 +1263,7 @@ def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[
         result = retirement_git(unit, "worktree", "remove", "--force", str(unit.worktree), settings=settings)
         if result.returncode:
             return [retirement_failure(result)]
+        release_worktree_pair(unit.worktree)
         print(f"removed: worktree {unit.worktree}")
     if unit.branch:
         if retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings).returncode == 0:
@@ -2190,6 +2222,13 @@ def rename_repair_displays(row: staff.StaffRow) -> bool:
         write_text_atomic(path, json.dumps(raw, indent=2) + "\n")
         changed = True
     client = herdr.Herdr(herdr.shared_session())
+    if row.kind == "producer":
+        panes = restart.read_row_panes([row], client)
+        if isinstance(panes, restart.RowPanesUnreadable):
+            raise ValueError(f"{row.name}: cannot read producer panes: {panes.reason}")
+        for _, pane in panes:
+            changed = client.retitle(pane, row.name) or changed
+        return changed
     spaces: set[str] = set()
     for pane in client.panes():
         native_sessions: set[str] = set()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.build_queue import execution_identity
 from scripts.lib.checkout_test_support import copy_runtime, write_python_tool
 
 from collections.abc import Callable, Sequence
@@ -17,7 +18,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast, override
+from typing import ClassVar, Literal, NotRequired, TypedDict, cast, override
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_start as process_identity
@@ -45,6 +46,16 @@ STATE_SCRIPT = Path(__file__).with_name("mac_test.py")
 FILTER = "package(hana) & (test(a) | test(b))"
 
 WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
+
+
+def write_mac_target_registry(directory: Path, settings_name: str) -> None:
+    _ = (directory / "build_targets.conf").write_text(
+        "targets=mac\n"
+        + "kind.mac=ssh\n"
+        + "platform.mac=macos\n"
+        + f"settings.mac={settings_name}\n",
+        encoding="utf-8",
+    )
 
 
 def assigned_adapter_main() -> int:
@@ -118,6 +129,15 @@ def mirror_use_payload(case: unittest.TestCase, argv: Sequence[str]) -> list[str
     case.assertIn("--repository", words[:boundary])
     case.assertIn("--session", words[:boundary])
     return [*argv[:-1], words[boundary + 3]]
+
+
+def split_mac_run_command(remote: str) -> tuple[list[str], str]:
+    """Get the invocation words and the cleanup commands."""
+    for status in (f" || echo {offload.MAC_NEXTTEST_SETUP_FAILURE}", "; echo mac_exit=$?"):
+        invocation, separator, cleanup = remote.rpartition(status)
+        if separator:
+            return shlex.split(invocation), cleanup
+    raise AssertionError(f"Missing Mac status command in {remote!r}")
 
 
 class SelectorEvent(TypedDict):
@@ -228,6 +248,18 @@ exec(compile(Path(__file__).read_text(), __file__, "exec"), globals())
 
 
 class OffloadCommandFixture(unittest.TestCase):
+    tools_root: ClassVar[Path | None] = None
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.tools_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="offload-tools-")))
+        cls.addClassCleanup(setattr, cls, "tools_root", None)
+
+    def private_tools(self) -> Path:
+        return self.tools_root if self.tools_root is not None else self.root / "tools"
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -294,6 +326,7 @@ class OffloadCommandFixture(unittest.TestCase):
             (self.bin_directory / name).symlink_to(stub)
         self.config = {
             "mirror_root": "~/" + FIXTURE_MIRROR_ROOT,
+            "mirror_busy_backoff_s": "120",
             "offload": "on",
             "host": "mac",
             "connect_timeout_s": "6",
@@ -341,7 +374,7 @@ class OffloadCommandFixture(unittest.TestCase):
             self.addCleanup(os.close, descriptor)
         self.sync_config()
         self.sync_fixture()
-        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
+        write_mac_target_registry(self.root, self.config_path.name)
         _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         self.environment = {
             **os.environ, **interpreter_cache_environment(self.root / "cache"),
@@ -359,7 +392,9 @@ class OffloadCommandFixture(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "STAFF_FILE": str(self.root / "staff.json"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+            "PYTHONPYCACHEPREFIX": str(self.private_tools() / "bytecode"),
         }
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
         self.start_admission()
 
     def start_admission(self) -> None:
@@ -400,8 +435,8 @@ class OffloadCommandFixture(unittest.TestCase):
         destination = placement.PlacementDestination(provider, target, host, scope, 1 if provider == "ssh" else 0)
         local = admission.request(owner=owner, episode=uuid.uuid4().hex, step=verb)
         source_key = treekey.tree_key(str(repository))
-        source = (placement.SourceKeyKnown(source_key) if source_key is not None
-                  else placement.SourceKeyUnavailable("the fixture has no tree key"))
+        source = (execution_identity.SourceKeyKnown(source_key) if source_key is not None
+                  else execution_identity.SourceKeyUnavailable("the fixture has no tree key"))
         constraints = placement.PlacementConstraints(source, ("cargo", verb), str(repository), "hana",
             session_owner.owning_session(self.environment if environment is None else environment),
             (placement.PlacementCandidate(destination),), placement.PinnedHost(target))
@@ -620,11 +655,16 @@ raise SystemExit(offload.main())
         )
 
     def claim_stub_runner(self) -> Path:
-        checkout = self.root / "claim-runner"
-        copy_runtime(checkout)
-        runner_directory = checkout / "scripts/mac_test"
-        self.write_executable(runner_directory / "mac_test.py", CLAIM_STUB)
-        return runner_directory / "offload.py"
+        tools = self.private_tools()
+        checkout = tools / "claim-runner"
+        if not checkout.exists():
+            tools.mkdir(exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="claim-runner-", dir=tools) as directory:
+                staging = Path(directory) / "checkout"
+                copy_runtime(staging)
+                self.write_executable(staging / "scripts/mac_test/mac_test.py", CLAIM_STUB)
+                _ = staging.rename(checkout)
+        return checkout / "scripts/mac_test/offload.py"
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -918,7 +958,8 @@ raise SystemExit(offload.main())
         self.assertEqual(len(self.events_for("rsync")), 1)
         remote = self.events_for("ssh")[-1]["args"][-1]
         self.assertIn("lint nextest", remote)
-        return shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+        words, _ = split_mac_run_command(remote)
+        return words
 
     def assert_stable_copy_sends_key(self) -> None:
         # A later stable copy must send its key after the earlier copy omitted it.

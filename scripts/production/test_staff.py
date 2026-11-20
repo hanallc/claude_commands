@@ -8,6 +8,7 @@ import io
 import json
 import multiprocessing
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -793,6 +794,20 @@ class DocumentLookupTests(StaffCommandTestCase):
 
 
 class StaffTests(StaffCommandTestCase):
+    def test_retired_producer_keeps_its_id_through_unrelated_writes_and_snapshot_round_trips(self) -> None:
+        producer = fixture_member("producer", name="planner")
+        mark = staff.RetiredProducer("claude:sonnet:high")
+        stopped = staff.set_producer_retirement(producer.id, mark)
+        _ = fixture_member("showrunner", name="another-production")
+        record = staff.StaffSnapshot.decode(staff.snapshot().encode())
+        self.assertEqual(record.by_id(producer.id), stopped)
+        self.assertIsNone(record.by_path(producer.name))
+        self.assertIsNone(record.by_current_session(producer.current_session))
+        self.assertNotIn(producer, staff.active(record, "producer"))
+        restored = staff.set_producer_retirement(producer.id, staff.Active())
+        self.assertEqual(restored, producer)
+        self.assertEqual(staff.snapshot().by_path(producer.name), restored)
+
     def test_owner_lookup_returns_the_unit_for_a_worker_reference(self) -> None:
         showrunner, unit, worker = self.tree()
         record = staff.local_snapshot()
@@ -1614,6 +1629,63 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual([command[0] for command in self.ssh_commands()], ["transfer-producer"])
         self.assertEqual(moved, replace(morty, current_session=session, home=home, worktree=folder))
         self.assertEqual(staff.by_id(morty.id), moved)
+
+        with self.subTest(operation="producer creation"):
+            registry = self.root / "models.conf"
+            _ = registry.write_text("[producers]\n")
+            marker = f"mac:{'1' * 32}"
+            with (self.machine("mac"),
+                  mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0"})):
+                _ = staff.producer_creation_registry("claim", "dwight", marker, "claude:sonnet:high")
+                self.assertEqual(staff.producer_creation_registry("read", "Dwight"),
+                                 staff.RecordedProducerCreation("dwight", marker))
+                with self.assertRaisesRegex(staff.StaffRefused, "the creation record is on mac"):
+                    _ = staff.producer_creation_registry("claim", "Dwight", f"natedev:{'1' * 32}", "claude:sonnet:high")
+                with self.assertRaisesRegex(staff.StaffRefused, "the creation record is on mac"):
+                    _ = staff.producer_creation_registry("finish", "dwight", f"natedev:{'1' * 32}")
+                self.assertEqual(staff.producer_creation_registry("read", "dwight"),
+                                 staff.RecordedProducerCreation("dwight", marker))
+                _ = staff.producer_creation_registry("finish", "Dwight", marker)
+                self.assertEqual(staff.producer_creation_registry("read", "dwight"),
+                                 staff.ProducerCreationRegistryStatus.ABSENT)
+            self.assertIn("dwight=claude:sonnet:high", registry.read_text())
+            self.assertEqual([command[:2] for command in self.ssh_commands()[1:]],
+                             [["producer-creation", action] for action in
+                              ("claim", "read-named", "claim", "finish", "read-named", "finish", "read-named")])
+
+    def test_old_caller_reads_a_marker_from_the_new_owner(self) -> None:
+        registry = self.root / "models.conf"
+        marker = f"mac:{'1' * 32}"
+        _ = registry.write_text(f"[producer_creations]\ndwight={marker}\n")
+        with (self.machine("mac"),
+              mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0"})):
+            result = subprocess.run(["ssh", "-o", "BatchMode=yes", "natedev",
+                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
+                + "producer-creation read --name=Dwight --marker= --profile= --json"],
+                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout, json.dumps(marker) + "\n")
+
+    def test_new_caller_reads_a_marker_from_the_old_owner(self) -> None:
+        marker = f"mac:{'1' * 32}"
+        actions: list[str] = []
+
+        def old_owner(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            remote = shlex.split(command[-1])
+            self.assertEqual(remote[2], "producer-creation")
+            self.assertIn("--name=Dwight", remote)
+            action = remote[3]
+            actions.append(action)
+            if action == "read-named":
+                return subprocess.CompletedProcess(command, 2, "", "usage: staff.py producer-creation ...\n"
+                    + "staff.py producer-creation: error: argument creation_action: invalid choice: 'read-named' "
+                    + "(choose from 'read', 'claim', 'finish')\n")
+            self.assertEqual(action, "read")
+            return subprocess.CompletedProcess(command, 0, json.dumps(marker), "")
+
+        with self.machine("mac"), mock.patch.object(subprocess, "run", side_effect=old_owner):
+            self.assertEqual(staff.producer_creation_registry("read", "Dwight"),
+                             staff.RecordedProducerCreation("Dwight", marker))
+        self.assertEqual(actions, ["read-named", "read"])
 
     def test_a_producer_launch_folder_owns_no_path_and_two_producers_share_it(self) -> None:
         _, unit, _ = self.tree()

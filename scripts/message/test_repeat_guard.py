@@ -84,7 +84,7 @@ else:
         return send.Result('sent','fake sink')
     def transport(command,stdin,timeout):
         options=send.parse(command[2:])._replace(shown_sender=send.ShownSender(g.NOTICE_SENDER))
-        with patch.object(roster,'roster',return_value=roster.Roster([],[])), patch.object(send,'resolve_recipient',return_value=send.CodexSessionRecipient('codex:owner','owner','owner',send.codex_daemon.CodexDaemon(Path(root),Path(root)/'unused.sock'))), patch.object(send,'codex_session',accept), patch.object(send,'user',accept), patch.object(send,'wrong_template',return_value=None):
+        with patch.object(roster,'roster',return_value=roster.Roster([],[])), patch.object(send,'resolve_recipient',return_value=send.CodexSessionRecipient('codex:owner','owner','owner',send.codex_daemon.CodexDaemon(Path(root),Path(root)/'unused.sock'))), patch.object(send,'deliver_codex',accept), patch.object(send,'user',accept), patch.object(send,'wrong_template',return_value=None):
             result=send.send(options)
         return send_result.EXIT[result.outcome],result.outcome.upper()+': '+result.detail,''
     sys.stdin=io.StringIO(json.dumps(request))
@@ -235,7 +235,7 @@ print(json.dumps(held))
                 _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(child.returncode, -signal.SIGKILL)
 
-    def test_child_test_budget_preserves_the_system_sitecustomize(self) -> None:
+    def test_site_hooks_apply_to_callers_and_stay_out_of_guard_workers(self) -> None:
         site = self.home / "nix-site"
         site.mkdir()
         _ = (site / "guard_site_probe.py").write_text("ready = True\n")
@@ -251,6 +251,16 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         self.assertEqual(child.returncode, 0, child.stderr)
         self.assertEqual(json.loads(child.stdout), [True, False, TEST_HANG_GUARD_SECS])
         self.assertEqual(child.stderr, "")
+
+        loaded = site / "worker-loaded-sitecustomize"
+        _ = (site / "sitecustomize.py").write_text(
+            f"with open({str(loaded)!r}, 'w') as marker: marker.write('loaded')\n")
+        with patch.dict(os.environ, {"PYTHONPATH": str(site), "SEND_REPEAT_CONFIG": str(self.limits_file(self.limits))}):
+            held = [guard.check(self.root, self.attempt(at=at)).held for at in range(3)]
+            guard.transport_result("watchdog", "session:morty", "stopped", "delivered")
+        self.assertEqual(held, [False, False, True])
+        self.assertEqual(len((self.root.parent / "transports.jsonl").read_text().splitlines()), 1)
+        self.assertFalse(loaded.exists())
 
     def test_unknown_prose_compares_exactly_even_when_values_look_volatile(self) -> None:
         for values in (("10:00", "11:00", "12:00"),

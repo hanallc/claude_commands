@@ -25,6 +25,7 @@ from importlib import import_module
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast, overload
 from zoneinfo import ZoneInfo
@@ -981,9 +982,11 @@ def outstanding_file(reference: str, *, identities: QuestionStaff | None = None)
 
 
 def outstanding_path(production: QuestionScope) -> Path:
-    root = state_root()
-    owner = production.owner
-    return root / "outstanding" / f"{owner.id}.json"
+    return outstanding_path_for_owner(production.owner.id)
+
+
+def outstanding_path_for_owner(owner: staff.StaffId) -> Path:
+    return state_root() / "outstanding" / f"{owner}.json"
 
 
 @dataclass(frozen=True)
@@ -1066,7 +1069,7 @@ def question_records_for_document(doc: Path | staff.StaffRow, identities: Questi
     return selected_question_records(sorted(paths), statuses, owner_ids, sources, owner, strict=strict)
 
 
-def _review_question_path(folder: QuestionFolder, request_id: str) -> Path:
+def review_question_path(folder: QuestionFolder, request_id: str) -> Path:
     digest = hashlib.sha256(request_id.encode()).hexdigest()
     return folder.path / f"question-{folder.owner}-review-{digest}.md"
 
@@ -1102,11 +1105,14 @@ def read_review_question(path: Path, owner: str = "") -> QuestionRecord:
 
 
 def selected_question_records(paths: list[Path], statuses: tuple[str, ...], owner_ids: set[staff.StaffId] | None,
-                              sources: list[Path] | None = None, owner: str = "", *, strict: bool = True) -> list[QuestionRecord]:
+                              sources: list[Path] | None = None, owner: str = "", *, strict: bool = True,
+                              allowed_owners: tuple[staff.StaffId, ...] = ()) -> list[QuestionRecord]:
     """Select by status and owner before decoding the question registration."""
     def wanted(issue: Issue) -> bool:
         production = record_store.record_owner(record_store.RecordKind.QUESTION, issue, owner)
-        if issue.value("record_type") != "question" or owner and production != owner:
+        if issue.value("record_type") != "question":
+            return False
+        if allowed_owners and production not in allowed_owners or owner and production != owner:
             return False
         if owner_ids is not None:
             owner_ids.add(production)
@@ -1127,9 +1133,9 @@ def selected_question_records(paths: list[Path], statuses: tuple[str, ...], owne
 
 
 def question_records_for_owner(owner: staff.StaffId, *, statuses: tuple[str, ...] = (),
-                               owner_ids: set[staff.StaffId] | None = None) -> list[QuestionRecord]:
-    paths = sorted(_known_question_paths(owner))
-    return selected_question_records(paths, statuses, owner_ids, owner=owner, strict=False)
+                               owner_ids: set[staff.StaffId] | None = None, strict: bool = False) -> list[QuestionRecord]:
+    paths = sorted(_known_question_paths(owner, strict=strict))
+    return selected_question_records(paths, statuses, owner_ids, owner=owner, strict=strict)
 
 
 def unowned_question_records(identities: QuestionStaff, *, statuses: tuple[str, ...] = (),
@@ -1169,12 +1175,27 @@ def _question_records(issues: list[Issue], *, legacy_owner: str = "") -> list[Qu
     return records
 
 
+def pending_review_reply(record: QuestionRecord) -> bool:
+    """Return whether a sent Question still accepts a scoped reply."""
+    return record.status == "open" and "review_submission" in record.item and "followup" in record.item
+
+
+@contextmanager
+def wrap_question_locks(*owners: staff.StaffId) -> Generator[None]:
+    """Lock Question stores in staff ID order."""
+    with ExitStack() as locks:
+        for owner in sorted(set(owners)):
+            _ = locks.enter_context(outstanding_lock(outstanding_path_for_owner(owner)))
+            _ = locks.enter_context(_question_number_lock(owner))
+        yield
+
+
 def close_questions(document: Path, identities: QuestionStaff) -> None:
     """Close the production's questions and retain their records for history."""
     owner = identities.owner(document).id
     with outstanding_lock(outstanding_file(owner, identities=identities)), _question_number_lock(owner), ExitStack() as rollback:
         closing = [replace(record, status="closed") for record in question_records_for_document(document, identities, strict=True)
-                   if record.status == "open"]
+                   if record.status == "open" and not pending_review_reply(record)]
         texts = [_question_text(record) for record in closing]
         with question_numbers() as numbers:
             for record, text in zip(closing, texts, strict=True):
@@ -1300,7 +1321,11 @@ def _file_question(record: QuestionRecord,
             return filed
 
 
-def write_question_record(record: QuestionRecord) -> None:
+def write_question_record(record: QuestionRecord, *, assign_id: bool = False) -> None:
+    if assign_id and not _numbered_question_id(record):
+        with _question_number_lock(record.owner):
+            _ = _publish_question(record)
+        return
     text = _question_text(record)
     _write_question_text(record, text)
 
@@ -1359,10 +1384,19 @@ def _question_text(record: QuestionRecord, *, new_record: bool = False) -> str |
     ])
 
 
-def record_review_log(source: Path | QuestionRecord, words: str, who: str = "nate") -> None:
+def record_review_log(source: Path | QuestionRecord, words: str, who: str = "nate", *,
+                      owner: staff.StaffId | None = None, check: Callable[[], object] | None = None) -> None:
     """Keep the user's action on the canonical question record."""
-    record = _question_records([Issue(source, frontmatter(source))])[0] if isinstance(source, Path) else source
+    if isinstance(source, Path):
+        fields = record_store.read_header(source, strict=True)
+        record, = _question_records([Issue(source, fields)], legacy_owner=owner or "")
+    else:
+        record = source
+    if owner is not None and record.owner != owner:
+        raise RegistrationFailure("questions", f"{record.path}: the question owner changed")
     with (outstanding_lock(state_root() / "outstanding" / f"{record.owner}.json"), _question_number_lock(record.owner)):
+        if check is not None:
+            _ = check()
         record = _current_question(record, "questions")
         events = review_events.decode(record.item.get("review_log", ""))
         event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, words)
@@ -1500,13 +1534,25 @@ def questions_table(production: QuestionScope, *, identities: QuestionStaff | No
         print("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
 
 
+_held_outstanding_locks: ContextVar[frozenset[Path]] = ContextVar("held_outstanding_locks", default=frozenset())
+
+
 @contextmanager
 def outstanding_lock(outstanding: Path) -> Generator[None]:
-    """Lock the list during reads and writes. Never take this lock twice in one process."""
-    outstanding.parent.mkdir(parents=True, exist_ok=True)
-    with outstanding.with_suffix(".lock").open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    """Lock the owner's records. Reuse the lock in the same call context."""
+    path = outstanding.with_suffix(".lock").resolve()
+    held = _held_outstanding_locks.get()
+    if path in held:
         yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        token = _held_outstanding_locks.set(held | {path})
+        try:
+            yield
+        finally:
+            _held_outstanding_locks.reset(token)
 
 
 def legacy_entries(outstanding: Path) -> list[OutstandingItem]:
@@ -1793,7 +1839,7 @@ def _ask_recipient(production: QuestionScope, text: str, parts: QuestionParts,
                            followup=PendingFollowup(text=outgoing.words, sent=sent),
                            waiting_why=outgoing.waiting_why,
                            review_submission=new_item_dialog.stored_submission(outgoing.details))
-    path = _review_question_path(folder, outgoing.details.request_id)
+    path = review_question_path(folder, outgoing.details.request_id)
     record = QuestionRecord(path, folder.owner, folder.owner, item, "open")
     with outstanding_lock(outstanding_path(production)):
         return _file_question(record, outgoing.before_write)
@@ -2544,7 +2590,8 @@ def main() -> int:
     for action in ("register", "time", "log", "questions", "open", "next", "mark-important", "ask", "answer", "withdraw",
                    "reply", "questions-table", "migrate-questions"):
         subcommand = commands.add_parser(action, description=ASK_DESCRIPTION if action == "ask" else None)
-        _ = subcommand.add_argument("--production", type=str, required=action not in ("ask", "questions-table"))
+        _ = subcommand.add_argument("--production", type=str,
+                                    required=action not in ("ask", "answer", "withdraw", "questions-table"))
         if action == "register":
             # Accepted and unused: a showrunner started before its name was looked up still passes it.
             _ = subcommand.add_argument("--session")
@@ -2591,15 +2638,17 @@ def main() -> int:
         name = cast(str | None, args.production)
         if name is None:
             assert identities is not None
-            if action == "ask":
-                unit = cast(str, args.unit)
+            if action in ("ask", "answer", "withdraw"):
+                unit = cast(str, args.unit) if action == "ask" else ""
                 caller = identities.record.by_current_session(staff.caller_identity())
                 if not unit and caller is not None and caller.kind == "producer":
                     name = str(caller.id)
                 elif unit:
                     name = unit_lookup.unit_parent(unit, session_staff.StoredReference(unit), record=identities.record).name
-                else:
+                elif action == "ask":
                     raise RegistrationFailure(action, "pass --unit <staff id> or --production <name>")
+                else:
+                    commands.choices[action].error("the following arguments are required: --production")
             else:
                 name = identities.production_of(staff.caller_identity())
                 if name is None:

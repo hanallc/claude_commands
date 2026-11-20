@@ -6,7 +6,9 @@ import os
 import stat
 import time
 import tomllib
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -69,6 +71,25 @@ class RegistryRead:
 
 
 @dataclass(frozen=True)
+class ReadCurrentRegistry:
+    """Read the registry for this call."""
+
+
+CURRENT_REGISTRY = ReadCurrentRegistry()
+_liveness_registry = ContextVar[RegistryRead | ReadCurrentRegistry]("liveness_registry", default=CURRENT_REGISTRY)
+
+
+@contextmanager
+def use_registry_for_liveness(registry: RegistryRead) -> Generator[None]:
+    """Use this registry for liveness checks that do not supply their own read."""
+    token = _liveness_registry.set(registry)
+    try:
+        yield
+    finally:
+        _liveness_registry.reset(token)
+
+
+@dataclass(frozen=True)
 class SessionRetryPolicy:
     registry_reads: int
     registry_delay_seconds: float
@@ -79,10 +100,10 @@ def retry_policy() -> SessionRetryPolicy:
     path = Path(__file__).resolve().parents[2] / "config/session_retries.toml"
     with path.open("rb") as source:
         values = cast(dict[str, object], tomllib.load(source))
-    count = values["registry_reads"]
+    count = values.get("registry_reads")
     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
         raise ValueError(f"{path}: registry_reads must be a positive integer")
-    delay = values["registry_delay_seconds"]
+    delay = values.get("registry_delay_seconds")
     if not isinstance(delay, (int, float)) or isinstance(delay, bool) or not 0 <= delay < float("inf"):
         raise ValueError(f"{path}: registry_delay_seconds must be finite and nonnegative")
     return SessionRetryPolicy(count, float(delay))
@@ -93,9 +114,23 @@ class RegistryRecordGone:
     """The file vanished, or its filename's process is proven gone."""
 
 
-def read_registry(*, dependencies: Callable[[Path], None] | None = None) -> RegistryRead:
-    """Keep unreadable directories and records visible to complete observers."""
-    directory = sessions_dir()
+@dataclass(frozen=True)
+class ConfiguredRegistryDirectory:
+    """Use the registry directory selected by the current environment."""
+
+
+CONFIGURED_REGISTRY_DIRECTORY = ConfiguredRegistryDirectory()
+
+
+def registry_unreadable_reason(paths: tuple[Path, ...]) -> str:
+    return "session registry unreadable: " + ", ".join(map(str, paths))
+
+
+def read_registry(*, directory: Path | ConfiguredRegistryDirectory = CONFIGURED_REGISTRY_DIRECTORY,
+                  dependencies: Callable[[Path], None] | None = None) -> RegistryRead:
+    """Report a directory that cannot be listed and any unreadable session records."""
+    if isinstance(directory, ConfiguredRegistryDirectory):
+        directory = sessions_dir()
     try:
         paths = [path for path in directory.iterdir() if path.suffix == ".json"]
     except OSError:
@@ -290,9 +325,6 @@ class SessionProcesses:
 
 
 def _session_observations(session_id: str, registry: RegistryRead) -> Iterator[LiveSessionProcess | SessionLivenessUnknown]:
-    if sessions_dir() in registry.unreadable:
-        yield SessionLivenessUnknown("session registry unreadable: " + str(sessions_dir()))
-        return
     for observation in registry.entries:
         registered = observation.record
         if registered["sessionId"] != session_id:
@@ -303,13 +335,18 @@ def _session_observations(session_id: str, registry: RegistryRead) -> Iterator[L
             observed = process_liveness(registered["pid"], registered.get("procStart", ""))
             if not isinstance(observed, SessionNotLive):
                 yield observed
+    if registry.unreadable:
+        yield SessionLivenessUnknown(registry_unreadable_reason(registry.unreadable))
 
 
 def session_liveness(session_id: str, registry: RegistryRead | None = None,
                      ) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:
     """Find a running session and its pid, preserving unknown registry or process identity.
     A caller that checks many sessions reads the registry once and passes it."""
-    return next(_session_observations(session_id, read_registry() if registry is None else registry), SessionNotLive())
+    reading = _liveness_registry.get() if registry is None else registry
+    if isinstance(reading, ReadCurrentRegistry):
+        reading = read_registry()
+    return next(_session_observations(session_id, reading), SessionNotLive())
 
 
 def session_processes(session_id: str) -> SessionProcesses | SessionLivenessUnknown:
@@ -326,31 +363,49 @@ def live_session(record: SessionRecord) -> bool:
     return running_session(record) and messaging_socket_exists(record)
 
 
-def _readable_records() -> Iterator[SessionRecord]:
-    yield from (item.record for item in read_registry().entries)
-
-
-def _running(records: Iterable[SessionRecord]) -> list[SessionRecord]:
-    return sorted((record for record in records if running_session(record)),
+def _matching_records(records: Iterable[SessionRecord], matches: Callable[[SessionRecord], bool]) -> list[SessionRecord]:
+    return sorted((record for record in records if matches(record)),
                   key=lambda record: record["updatedAt"], reverse=True)
 
 
 def running_records(registry: RegistryRead) -> list[SessionRecord]:
     """Every running record of one registry read, newest first, including processes without sockets."""
-    return _running(item.record for item in registry.entries)
+    return _matching_records((item.record for item in registry.entries), running_session)
 
 
-def running_sessions() -> list[SessionRecord]:
-    """Every running record, newest first, including processes without sockets."""
-    return _running(_readable_records())
+@dataclass(frozen=True)
+class RunningSessionEnumeration:
+    """Keep the observed running sessions and the paths that prevent a complete read."""
+
+    records: tuple[SessionRecord, ...]
+    unreadable: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class RunningSessionDiscoveryFailed:
+    """An error prevented enumeration of running sessions."""
+
+    reason: str
+
+
+def enumerate_running_sessions(*, registry: RegistryRead | ReadCurrentRegistry = CURRENT_REGISTRY
+                               ) -> RunningSessionEnumeration | RunningSessionDiscoveryFailed:
+    try:
+        if isinstance(registry, ReadCurrentRegistry):
+            registry = read_registry()
+        return RunningSessionEnumeration(tuple(running_records(registry)), registry.unreadable)
+    except (OSError, ValueError) as error:
+        return RunningSessionDiscoveryFailed(f"session registry discovery failed: {error}")
+
+
+def running_sessions(*, registry: RegistryRead | ReadCurrentRegistry = CURRENT_REGISTRY) -> list[SessionRecord]:
+    """Return observed running records, newest first."""
+    return running_records(read_registry() if isinstance(registry, ReadCurrentRegistry) else registry)
 
 
 def live_sessions() -> list[SessionRecord]:
-    """Every running record with a messaging socket, newest first."""
-    return sorted(
-        (record for record in _readable_records() if live_session(record)),
-        key=lambda record: record["updatedAt"], reverse=True,
-    )
+    """Return observed running records with a messaging socket, newest first."""
+    return _matching_records((item.record for item in read_registry().entries), live_session)
 
 
 def transcript_locations(session_id: str) -> list[Path]:

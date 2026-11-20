@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.build_queue import admission_records
 
 import json
+import re
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
@@ -12,6 +13,7 @@ from xml.etree import ElementTree
 from typing import cast
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import memory_feed, progress_profile as progress
+from scripts.build_queue import test_memory_feed
 from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
@@ -81,7 +83,7 @@ class MemoryHoverTests(unittest.TestCase):
     def test_tooltip_colors_only_fields_that_name_staff(self) -> None:
         data = {"waiters": [{"name": "Compile", "unit": "builder", "showrunner": "helper",
                 "runner": "worker", "worker": "builder", "kind": "repository-slot",
-                "because": "builder", "runs_on": "builder", "why": "builder"}]}
+                "title": {"unit": "builder", "step": "Compile"}, "because": "builder", "runs_on": "builder", "why": "builder"}]}
         body = str(self.page_expression("(()=>{" + self.role_setup()
             + "return tooltipHtml('wait:fixture-wait-0',data);})()", data, walk=True))
         grid = ElementTree.fromstring(body)
@@ -148,9 +150,11 @@ class MemoryHoverTests(unittest.TestCase):
                                 (["a<&", "b"], "Queued, a<& followed by b and then in submission order")):
             with self.subTest(units=units):
                 data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "queued_priority_units": units,
-                    "walk": [{"name": "running", "queued": True}],
+                    "walk": [{"name": "running", "queued": True}, {"name": "second running", "queued": True}],
                     "waiters": [{"name": "first", "since": 100, "detail": "research", "pid": 200}]}
-                rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+                running_title, rendered = cast(list[str], self.page_expression(
+                    "(renderWalk(data), [$('walk-title').textContent, $('walk').innerHTML])", data, walk=True))
+                self.assertEqual(running_title, "Running, in start order (2)")
                 root = ElementTree.fromstring(f"<root>{rendered}</root>")
                 chart = root.find("./div[@class='walk-chart']")
                 assert chart is not None
@@ -158,7 +162,7 @@ class MemoryHoverTests(unittest.TestCase):
                 assert header is not None
                 title = header.find("./span[@class='queue-title section-head']")
                 assert title is not None
-                self.assertEqual(title.text, expected)
+                self.assertEqual("".join(title.itertext()), f"{expected} (1)")
                 self.assertEqual(title.get("title"), expected)
                 room = chart.find("./div[@class='wrow room']")
                 assert room is not None
@@ -167,9 +171,71 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(children[children.index(header) + 1].get("data-tip"), "wait:fixture-wait-0")
                 table_rows = root.findall(".//tbody/tr")
                 self.assertEqual([row.get("class") for row in table_rows],
-                                 ["tools", "", "room", "queue-head", "wait wait-first"])
+                                 ["tools", "", "", "room", "queue-head", "wait wait-first"])
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='place']"), "1")
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']/span"), "first")
+
+    def test_verify_column_and_tooltip_use_the_recorded_call(self) -> None:
+        data: dict[str, object] = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
+            "walk": [{"name": "demo nextest", "queued": True, "started_at": 100, "used": 1,
+                      "reserved": 0, "counted": 1, "verify": {"verb": "final", "step": "nextest",
+                          "call": "verify final demo", "position": 2, "total": 2}}],
+            "waiters": [{"name": "demo clippy", "since": 100, "need": 1, "reason": "free memory",
+                         "verify": {"verb": "example", "step": "clippy", "position": 1, "total": 1,
+                                    "call": "verify example demo --name sample"}},
+                        {"name": "rust-analyzer", "since": 100, "need": 1, "reason": "free memory"},
+                        {"name": "demo check", "unit": "builder", "detail": "checkout",
+                         "since": 100, "need": 1,
+                         "why": "the build in the same Cargo folder",
+                         "reason": "waits for the build in the same Cargo folder",
+                         "verify": {"verb": "check", "step": "check", "position": 1, "total": 1,
+                                    "call": "verify check demo"}},
+                        {"kind": "repository-slot", "name": "demo build", "unit": "builder",
+                         "since": 100, "need": 0, "reason": "waits for a free slot",
+                         "verify": {"verb": "build", "step": "build", "position": 1, "total": 1,
+                                    "call": "verify build demo"}}]}
+        rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        self.assertEqual([cell.text for cell in root.findall(".//th[@class='verify']")], ["Verify", "Verify"])
+        for key, verb, step, call in (
+            ("row:fixture-run-0", "final", "nextest (2 of 2)", "verify final demo"),
+            ("wait:fixture-wait-0", "example", "clippy", "verify example demo --name sample"),
+            ("wait:fixture-wait-1", "", "", ""),
+            ("wait:fixture-wait-2", "check", "check", "verify check demo"),
+            ("wait:fixture-wait-3", "build", "build", "verify build demo"),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(root.findtext(f".//tr[@data-tip='{key}']/td[@class='verify']"), verb)
+                tip = str(self.page_expression(f"tooltipHtml('{key}', data)", data, walk=True))
+                grid = ElementTree.fromstring(tip)
+                labels = {cell.text: grid[index + 1].text for index, cell in enumerate(grid) if cell.tag == "dt"}
+                if verb:
+                    self.assertEqual(labels["Step"], step)
+                    self.assertEqual(labels["Call"], call)
+                    self.assertEqual(grid[-2].text, "Call")
+                    self.assertEqual(grid[-1].get("class"), "call group")
+                else:
+                    self.assertNotIn("Step", labels)
+                    self.assertNotIn("Call", labels)
+        self.assertEqual(root.findtext(".//div[@data-tip='wait:fixture-wait-2']//span[@class='wait-note']"),
+                         "waits for the build in the same Cargo folder")
+        for key, name in (("wait:fixture-wait-2", "demo check"), ("wait:fixture-wait-3", "demo build")):
+            row = root.find(f".//tr[@data-tip='{key}']")
+            assert row is not None
+            self.assertEqual(row.findtext("th[@class='step']/span"), name)
+            self.assertEqual(row.findtext("td[@class='unit']/span"), "builder")
+
+    def test_unavailable_memory_keeps_the_verify_tooltip_fields(self) -> None:
+        verify = {"verb": "final", "step": "nextest", "position": 2, "total": 2, "call": "verify final demo"}
+        data = {"walk": [{"kind": "mac-build", "name": "demo nextest", "used": {"kind": "MacMemoryUnavailable"},
+                          "verify": verify}],
+                "waiters": [{"name": "demo nextest", "head_room": {"unavailable": True}, "verify": verify}]}
+        for key in ("row:fixture-run-0", "wait:fixture-wait-0"):
+            with self.subTest(key=key):
+                rows = cast(list[dict[str, object]], self.page_expression(f"tooltipRows('{key}', data)", data))
+                self.assertEqual([(row["label"], row["value"]) for row in rows],
+                                 [("demo nextest", "unavailable"), ("Step", "nextest (2 of 2)"),
+                                  ("Call", "verify final demo")])
 
     def test_the_done_column_uses_each_counter_and_preserves_unknown_progress(self) -> None:
         for phase, unit, done, total, percent, expected in (
@@ -291,6 +357,7 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(name=name, unit=counter["unit"]):
                 hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", {"read_at": 400, "walk": [{
                     "name": name, "unit": "fixture", "showrunner": "fixture-production", "started_at": 100,
+                    "title": {"unit": "fixture", "step": name},
                     "used": 1, "reserved": 0.5, "counted": 1.5, "queued": True, "keep_text": "",
                     "need": memory_feed.gib(hold.memory.need), "need_part": True, "progress": counter}]}))
                 self.assertEqual(hover[0], f"fixture · {name}  running 5 min")
@@ -339,6 +406,7 @@ class MemoryHoverTests(unittest.TestCase):
         about = "Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc."
         row = {"name": "natemerge integrate", "queued": True, "used": 1, "reserved": 0, "counted": 1,
                "showrunner": "builds", "unit": "natemerge", "runner": "unit director",
+               "title": {"unit": "natemerge", "step": "integrate"},
                "about": about, "changes": "sdlc branch"}
         data = {"read_at": 200, "walk": [row], "waiters": [{**row, "need": 2, "since": 100, "why": "its turn"}]}
         for key in ("row:fixture-run-0", "wait:fixture-wait-0"):
@@ -350,6 +418,27 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertIn((about, "caption"), cells[2:4])
                 fields = [(cell.text, grid[index+1].text) for index, cell in enumerate(grid) if cell.tag == "dt"]
                 self.assertEqual(fields[1:3], [("Changes", "sdlc branch"), ("Showrunner", "builds")])
+
+    def test_fixed_final_route_names_natedev_and_its_reason_in_the_tooltip(self) -> None:
+        from datetime import UTC
+        from scripts.build_queue import admission_client, execution_identity, placement, target_availability
+        from scripts.build_targets import target_config
+        from scripts.mac_test import claim_state
+        from scripts.build_hold.owning_session import NoOwningSession
+
+        mac = placement.PlacementDestination("mac", "mac", "fixture-mac", claim_state.WHOLE_MAC)
+        local = placement.PlacementDestination("local", "natedev", "fixture-local", claim_state.WHOLE_MAC)
+        constraints = placement.PlacementConstraints(execution_identity.SourceKeyKnown("source"), ("cargo", "check"),
+            "/fixture", "", NoOwningSession(), (placement.PlacementCandidate(mac,
+                placement.FixedExclusion("full gate runs on natedev")), placement.PlacementCandidate(local)))
+        route = admission_client.constrained_step_route(target_config.ANY_ELIGIBLE_TARGET, constraints)
+        shown = memory_feed.step_runs_on(route, target_availability.MacRoutes((), {}, UTC), "check", "/fixture", "")
+        data = {"read_at": 200, "waiters": [{"name": "cargo-liner check", "since": 100, "need": 5,
+            "runs_on": shown.text(), "because": shown.reason}]}
+        hover = str(self.page_expression("tipText('wait:fixture-wait-0', data)", data))
+        self.assertIn("Runs on  natedev only", hover)
+        self.assertIn("full gate runs on natedev", hover)
+        self.assertNotIn("natedev or Mac", hover)
 
     def test_a_ci_hover_keeps_its_ci_line(self) -> None:
         data = {"read_at": 200, "walk": [{"name": "hana CI", "ci": True, "ci_label": "hana CI · runner-1",
@@ -451,7 +540,7 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Done", "Step", "Dur", "Unit", "Pid", "Target", "vCPU", "Slot", "Tokens"])
+                                 ["Stage", "Done", "Step", "Dur", "Verify", "Unit", "Pid", "Target", "vCPU", "Slot", "Tokens"])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:fixture-run-{index}']")
@@ -465,10 +554,10 @@ class MemoryHoverTests(unittest.TestCase):
                 queue_headers = table.findall("./tbody/tr[@class='queue-head']")
                 spacers = root.findall("./div[@class='walk-chart']/div[@class='walk-chart-head queue-head']")
                 self.assertEqual(len(queue_headers), int(waiting))
-                self.assertEqual(len(spacers), int(waiting))
+                self.assertEqual(len(spacers), 1)
                 if waiting:
                     self.assertEqual([cell.text for cell in queue_headers[0]],
-                                     ["#", "Done", "Step", "Waiting", "Unit", "Pid", "Target", "vCPU"])
+                                     ["#", "Done", "Step", "Waiting", "Verify", "Unit", "Pid", "Target", "vCPU"])
                     self.assertTrue(all(cell.get("scope") == "col" for cell in queue_headers[0]))
                     for index, expected in enumerate(("1", "cloud", "2")):
                         row = table.find(f"./tbody/tr[@data-tip='wait:fixture-wait-{index}']")
@@ -510,6 +599,7 @@ class MemoryHoverTests(unittest.TestCase):
                                 ("MacTestingCounter", "testing"), ("MacStageUnavailable", "—")):
             with self.subTest(stage=stage):
                 row = {"kind": "mac-build", "name": "hana nextest", "unit": "trunk", "pid": 710001,
+                       "title": {"unit": "trunk", "step": "hana nextest"},
                        "machine": "mac", "vcpus": 12, "repository": "hana", "showrunner": "hana", "started_at": 100, "read_at": 190,
                        "used": 3.5, "stage": {"kind": stage}}
                 data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200, "walk": [row], "waiters": []}
@@ -543,8 +633,9 @@ class MemoryHoverTests(unittest.TestCase):
         root = ElementTree.fromstring(f"<root>{result[0]}</root>")
         row = root.find(".//tr[@data-tip='row:fixture-run-0']")
         assert row is not None
-        self.assertEqual([row[index].text for index in (0, 3, 5, 7)], ["—", "—", "—", "—"])
-        self.assertEqual(row[4][0].text, "—")
+        for column in ("place", "duration", "pid", "vcpus"):
+            self.assertEqual(row.findtext(f"td[@class='{column}']"), "—")
+        self.assertEqual(row.findtext("td[@class='unit']/span"), "—")
         self.assertEqual(result[1].count("unavailable"), 1)
 
     def test_queue_notes_appear_once_in_their_row_tooltips(self) -> None:
@@ -699,6 +790,25 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual(fields["Swap coming back"], "1.0 GiB")
         self.assertEqual(fields["Target"], "2.0 GiB")
 
+    def test_repository_slot_renders_the_unit_and_script_title(self) -> None:
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        data = fixture.copies_slot_page("python3 /fixture/check.service.sh", source="/fixture/startup",
+                                       unit="startup", staff_id="staff-startup")
+        row, = data["waiters"]
+        key = row.get("key")
+        self.assertIsNotNone(key)
+        body = cast(list[str], self.page_expression(
+            f"(renderWalk(data), [$('walk').innerHTML, tooltipHtml('wait:{key}',data)])",
+            cast(object, json.loads(memory_feed.page_json(data))), walk=True))
+        unit = re.search(r'<tr class="wait wait-first"[^>]*>.*?<td class="unit"><span class="cell-text">([^<]*)</span></td>',
+                         body[0])
+        self.assertIsNotNone(unit)
+        assert unit is not None
+        self.assertEqual(unit[1], "startup")
+        self.assertEqual("".join(ElementTree.fromstring(body[1])[0].itertext()), "startup · check.service.sh")
+
     def test_repository_slot_wait_has_no_memory_group(self) -> None:
         data = {"waiters": [{"kind": "repository-slot", "name": "widget build", "need": 0,
                             "since": 100, "reason": "waits for a free widget slot", "runs_on": "natedev"}]}
@@ -846,6 +956,8 @@ function fitLabels() {}
         for kind, rows in (("run", payload["walk"]), ("wait", payload["waiters"])):
             for index, row in enumerate(cast(list[dict[str, object]], rows)):
                 _ = row.setdefault("key", f"fixture-{kind}-{index}")
+                _ = row.setdefault("title", {"unit": "", "step": row.get("ci_label") or row["name"]})
+                _ = row.setdefault("unit", "")
         result = subprocess.run([executable, "-e", javascript], input=json.dumps(payload),
             text=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

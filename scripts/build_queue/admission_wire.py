@@ -5,13 +5,17 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+from scripts.build_queue import execution_identity
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, GateJobNotRecorded, NotVerifyCall,
+    StepJob, VerifyStep)
 from scripts.build_targets import target_config
 
 if TYPE_CHECKING:
@@ -82,9 +86,42 @@ class LocalPlace:
 
 
 @dataclass(frozen=True)
+class NoCloudGroup:
+    """The cloud request needs one slot."""
+
+
+NO_CLOUD_GROUP = NoCloudGroup()
+
+
+@dataclass(frozen=True)
+class CloudGroup:
+    """All members of this trial need slots in the same pass."""
+    key: str
+    size: int
+    started_at: float
+    coordinator: Owner
+
+    def __post_init__(self) -> None:
+        if not self.key or self.size < 1:
+            raise ValueError("a cloud group needs a key and a positive size")
+        if not math.isfinite(self.started_at) or self.started_at <= 0:
+            raise ValueError("a cloud group needs a valid start time")
+        if self.coordinator.pid < 1 or not self.coordinator.start_time:
+            raise ValueError("a cloud group needs a coordinator identity")
+
+
+@dataclass(frozen=True)
 class CloudPlace:
     """The admission request runs on this cloud target."""
     target: str
+    group: CloudGroup | NoCloudGroup = NO_CLOUD_GROUP
+
+
+def cloud_queue_order(place: CloudPlace, since: float) -> tuple[float, int, str]:
+    """Use the trial start time for grouped requests."""
+    if isinstance(group := place.group, CloudGroup):
+        return group.started_at, 0, group.key
+    return since, 1, ""
 
 
 @dataclass(frozen=True)
@@ -104,6 +141,8 @@ class Identity:
     step: str
     folder: str
     unit: str = ""
+    verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
+    job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -267,13 +306,26 @@ class TokenWaitRequest(CallerCode):
 
 
 @dataclass(frozen=True)
+class WaitingForCloudSlot:
+    """The request has no cloud reservation."""
+
+
+@dataclass(frozen=True)
+class ReservedCloudSlot:
+    """The request has a reservation and waits for its box launch."""
+
+
+@dataclass(frozen=True)
 class CloudSlotWait:
-    """The cloud wait holds the used slot count and slot limit."""
+    """The queued cloud row states whether it holds a slot."""
     used: int
     slots: int
+    state: WaitingForCloudSlot | ReservedCloudSlot = field(default_factory=WaitingForCloudSlot)
 
     @property
     def text(self) -> str:
+        if isinstance(self.state, ReservedCloudSlot):
+            return "waits for launch"
         return f"waits for a cloud slot: {self.used} of {self.slots} in use"
 
 
@@ -392,7 +444,7 @@ class PlacementRequest(CallerCode):
     since: float
     profile: records.StepProfile | records.ProgramProfile
     constraints: placement.PlacementConstraints
-    identity: Identity = Identity("", "", "", "")
+    identity: Identity = field(default_factory=lambda: Identity("", "", "", ""))
     run: RunIdentity | NoRun = NO_RUN
     local: LocalAdmissionContext | LocalAdmissionUnavailable = LocalAdmissionUnavailable("not supplied")
     prerequisite: placement.LocalExecutionPrerequisite = field(default_factory=lambda: placement.TokenNotRequired())
@@ -452,6 +504,7 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
                                    transport_for: Callable[[target_config.SshTarget], ExecutionTransport],
                                    read_bytes: Callable[[Path], bytes]) -> str:
     """Hash the configuration for placement or an adapter refusal."""
+    from scripts.build_targets.execution_transport import HanaControlTransport
     from scripts.lib import conf
 
     paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
@@ -459,10 +512,14 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
         paths.add(settings.path)
     for target in targets:
         if isinstance(target, target_config.SshTarget) and target.name == target_name:
-            from scripts.aws_target import hana_placement
-
             paths.add(target.settings)
-            if isinstance(transport_for(target), hana_placement.HanaControlTransport):
+            if target.platform != "linux":
+                continue
+            try:
+                transport = transport_for(records.ssh_target_settings(target, settings))
+            except conf.Unusable:
+                continue
+            if isinstance(transport, HanaControlTransport):
                 paths.add(conf.path("aws_target"))
     digest = hashlib.sha256()
     for path in sorted(paths):
@@ -471,6 +528,10 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
             contents = read_bytes(path)
         except FileNotFoundError:
             contents = b"missing"
+        except OSError as error:
+            # The provider reads and reports its own settings error.
+            digest.update(b"\0unreadable\0")
+            contents = type(error).__name__.encode()
         digest.update(contents)
     return digest.hexdigest()
 
@@ -503,7 +564,7 @@ class ExecutionReport(CallerCode):
     request_id: str
     assignment: placement.PlacementAssignment
     claim: placement.ProviderClaimReference | placement.NoProviderClaim
-    evidence: placement.ExecutionEvidence
+    evidence: execution_identity.ExecutionEvidence
     outcome: placement.AttemptOutcome = field(default_factory=lambda: placement.AttemptOutcomeUnavailable("not supplied"))
     path: placement.DispatchPathState = field(default_factory=lambda: placement.DispatchPathPending("not confirmed"))
 
@@ -540,6 +601,7 @@ class Assignment:
     assignment: placement.PlacementAssignment
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
+    hana_image_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -549,6 +611,7 @@ class LocalPlacementGranted:
     grant: Admitted
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
+    hana_image_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -575,6 +638,7 @@ Request = (RepositorySlotRequest | ServiceEstimateRequest | AdmitRequest | Launc
 Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | Wait | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
          | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply)
 
+_GROUPED_CLOUD_ADMIT = "cloud_group_admit"
 _REQUESTS: dict[str, type] = {
     "repository_slot": RepositorySlotRequest,
     "service_estimate": ServiceEstimateRequest, "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
@@ -584,6 +648,7 @@ _REQUESTS: dict[str, type] = {
     "placement": PlacementRequest, "placement_status": PlacementStatusRequest, "claim_failure": ClaimFailure,
     "consume_permission": ConsumePermission, "execution_report": ExecutionReport,
     "prerequisite": PrerequisiteReport, "cancel_placement": CancelPlacement,
+    _GROUPED_CLOUD_ADMIT: AdmitRequest,
 }
 REPLY_TYPES: dict[str, type] = {
     "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
@@ -639,6 +704,10 @@ def _write_wire_record(value: object) -> object:
     if (record.get("kind") in ("AdmitRequest", "ServiceEstimateRequest")
             and record.get("route") == codec.snapshot_value(records.DIRECT_CARGO)):
         del record["route"]
+    if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
+        del record["group"]
+    if record.get("kind") == "CloudSlotWait" and record.get("state") == {"kind": "WaitingForCloudSlot"}:
+        del record["state"]
     # Phase 33: a config change introduces other shares after deployment of the new service.
     if record.get("kind") == "ShapeRankedPeak" and record.get("share_percent") == 10:
         record["kind"] = "ShapeP90"
@@ -699,6 +768,10 @@ def _validate_cleanup(request: Request) -> None:
 
 def encode_request(request: Request) -> str:
     _validate_cleanup(request)
+    if (isinstance(request, AdmitRequest) and isinstance(request.place, CloudPlace)
+            and isinstance(request.place.group, CloudGroup)):
+        # An older service must refuse the request before it can grant one slot.
+        return encode_envelope(request, {_GROUPED_CLOUD_ADMIT: AdmitRequest})
     return encode_envelope(request, _REQUESTS)
 
 

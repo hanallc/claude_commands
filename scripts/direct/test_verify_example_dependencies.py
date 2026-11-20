@@ -20,6 +20,7 @@ class ExampleDependencyTests(SeededExampleWorkspaceFixture):
         self.assertEqual(sum(call.startswith("nextest run ") for call in self.calls_made()), 1)
 
     def test_an_edit_to_a_path_dependency_during_the_run_records_no_pass(self) -> None:
+        self.prepare_edit_after_watch_snapshot()
         result = self.side_by_side_phases("gamma/src/lib.rs")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("the tree changed while test ran, so this result was not recorded", result.stdout)

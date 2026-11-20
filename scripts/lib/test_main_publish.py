@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import os
-from contextlib import redirect_stderr
+from collections.abc import Generator
+from contextlib import contextmanager, redirect_stderr
 from functools import cached_property
 import io
 from pathlib import Path, PurePosixPath
@@ -15,9 +16,20 @@ from typing import final, override
 import unittest
 from unittest import mock
 
-from scripts.lib import land_main, main_publish
+from scripts.lib import land_main, main_publish, main_sync, waiting_rows
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+@contextmanager
+def pending_rows() -> Generator[list[waiting_rows.WaitingChange]]:
+    with waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
+        rows = list(pending.changes)
+        rows.extend(waiting_rows.WaitingChange(stem, key, save.value, "", publish_on_main=False, save_order=save.order)
+                    for stem, keys in pending.accepted.items() for key, save in keys.items()
+                    if isinstance(save, waiting_rows.AcceptedSave)
+                    and not any((row.stem, row.key) == (stem, key) for row in pending.changes))
+        yield rows
 
 
 @final
@@ -345,6 +357,27 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.head(), repo.remote_tip())
         self.assertEqual((repo.checkout / "remote.txt").read_text(), "remote work\n")
 
+    def test_ready_refuses_a_target_computed_before_claude_sync_advances_head(self) -> None:
+        repo = self.repository
+        peer = self.other_writer()
+        _ = repo.git(peer, "commit", "--allow-empty", "-qm", "First peer commit")
+        stale = repo.git(peer, "rev-parse", "HEAD")
+        _ = repo.git(peer, "push", "-q", "origin", "main")
+        move_to = waiting_rows.move_to
+
+        def advance(checkout: Path, target: str, *, fast_forward: bool = False, expected_head: str = "") -> None:
+            self.assertEqual(target, stale)
+            _ = repo.git(peer, "commit", "--allow-empty", "-qm", "Second peer commit")
+            _ = repo.git(peer, "push", "-q", "origin", "main")
+            self.assertEqual(main_sync.sync(checkout).state, main_sync.ADVANCED)
+            move_to(checkout, target, fast_forward=fast_forward, expected_head=expected_head)
+
+        with mock.patch.object(waiting_rows, "move_to", advance):
+            with self.assertRaisesRegex(main_publish.Refusal, "HEAD changed while the publisher prepared the move"):
+                main_publish.ready(repo.checkout)
+        self.assertEqual(repo.head(), repo.remote_tip())
+        self.assertNotEqual(repo.head(), stale)
+
     def test_ready_keeps_a_waiting_value_live_when_origin_changes_the_same_file(self) -> None:
         repo = self.repository
         clone = self.other_writer()
@@ -426,7 +459,9 @@ class MainPublishTests(PublicationTestCase):
         clone = self.other_writer()
         config = clone / "config/example.conf"
         _ = config.write_text(config.read_text().replace("amount=2", "amount=3"))
-        _ = repo.git(clone, "commit", "-qam", "approved value from another writer")
+        _ = shutil.copyfile(repo.checkout / waiting_rows.ORDER_PATH, clone / waiting_rows.ORDER_PATH)
+        _ = repo.git(clone, "add", "config/example.conf", waiting_rows.ORDER_PATH)
+        _ = repo.git(clone, "commit", "-qm", "approved value from another writer")
         advanced = self.advance_origin(clone)
         count = repo.git(repo.origin, "rev-list", "--count", "main")
 
@@ -438,6 +473,25 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.git(repo.checkout, "rev-list", "--count", "HEAD"), count)
         self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
         self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
+
+    def test_same_value_retry_publishes_only_the_order_when_the_peer_commits_the_value(self) -> None:
+        repo = self.repository
+        _ = self.rejected_tune()
+        clone = self.other_writer()
+        config = clone / "config/example.conf"
+        _ = config.write_text(config.read_text().replace("amount=2", "amount=3"))
+        _ = repo.git(clone, "commit", "-qam", "approved value from another writer")
+        advanced = self.advance_origin(clone)
+
+        repeated = self.retry_tune()
+
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(repeated.stdout, "already amount=3\n")
+        self.assertEqual(repo.head(), repo.remote_tip())
+        self.assertEqual(repo.git(repo.checkout, "rev-parse", "HEAD^"), advanced)
+        self.assertEqual(repo.git(repo.checkout, "diff", "--name-only", advanced, "HEAD"), waiting_rows.ORDER_PATH)
+        self.assertEqual(waiting_rows.published_orders(repo.checkout, "HEAD"), {"example": {"amount": 1}})
+        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
 
     def test_ready_rebases_tune_zone_and_installed_zone_commits_in_order(self) -> None:
         repo = self.repository

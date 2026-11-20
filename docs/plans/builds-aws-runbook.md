@@ -111,10 +111,12 @@ After this change reaches the installed scripts:
 
 Later reads run through the existing timer.
 `GateGpuTrialScalerPolicy` allows `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota` in every candidate region.
+It also allows `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` for only the Standard Spot and the G and VT Spot quotas.
+That permission reads the quota increase requests and their status; the snapshot does not use it yet.
 The deployed stack gets this policy only from `~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources`.
 Until the user runs that command, each hourly read logs the refused read and sends the `aws.snapshot_failed` alert.
 The command reads prices and quotas at its end; `aws_page.py publish` then shows them at once.
-The snapshot makes only these two read calls.
+The snapshot makes only two read calls: `ec2:DescribeSpotPriceHistory` and `servicequotas:GetServiceQuota`.
 It does not use Cost Explorer or create resources.
 
 `prices` reads deployed-region configuration and candidate-region configuration without duplicates.
@@ -135,11 +137,19 @@ A requested quota does not prove an applied quota.
 On the AWS page, expand **How to open the quota cases in AWS** under **Quotas** for the sign-in steps.
 
 `quota-status` reports the applied quotas and their request history without creating a request or writing local state.
-It uses the same regions, quota codes, and encrypted administrator credentials as `quota-request`.
+It reads the same regions and quota codes as `quota-request`.
+It uses the saved read-only plan key.
+If the plan key is missing, run `deploy.py plan-identity --approve-resources` on natedev.
+If the plan key is locked, run `github-warmup` in a terminal on natedev.
+If AWS rejects the plan key during any call, the command stops and prints one line on stderr.
+Run `deploy.py plan-identity --check` to check a rejected plan key.
 Each region starts one block with its name as the heading.
-Each quota prints its applied vCPUs once, followed by aligned request columns.
-Requests appear newest first by update time, or creation time when no update time exists.
-Dates use the zone from `config/user_zone.conf`, with `USER_ZONE` as an override.
+Each quota shows its applied and needed vCPUs.
+The newest request shows its status, requested vCPUs, and age.
+The command selects the newest request and calculates its age from its creation time.
+If a request has no creation time, the command uses its last update time.
+If a request has neither date, the command shows `age unknown`.
+The command keeps unknown status text and counts the request as open.
 A quota with no history prints `No requests.`
 The final summary lists regions whose applied GPU quota fits the trial and requests that remain open.
 The trial and report share the vCPU calculation over the types in `gpu_size_trial_spot_max_usd_per_hour`.
@@ -152,26 +162,17 @@ Example from the test fake:
 
 ```text
 us-east-1
-  Standard Spot: 128 vCPUs applied
-    Asked vCPUs  Status       Case ID       Updated
-            129  CASE_OPENED  case-fixture  2026-01-15 13:59:00 HST
-            128  APPROVED     -             2026-01-14 13:59:00 HST
-
-us-west-2
-  Standard Spot: 128 vCPUs applied
-    No requests.
-  G and VT Spot: 4 vCPUs applied
-    Asked vCPUs  Status   Case ID  Updated
-              4  PENDING  -        2026-01-14 13:59:00 HST
-
-eu-north-1
-  G and VT Spot: 4 vCPUs applied
+  Standard Spot: 120 vCPUs applied, 128 vCPUs needed
+    Newest request: CASE_OPENED for 129 vCPUs (3h old).
+  G and VT Spot: 32 vCPUs applied, 4 vCPUs needed
     No requests.
 
-Summary: GPU trial needs 32 vCPUs; quota fits: no region has enough applied quota; open requests: us-east-1 Standard Spot 129 vCPUs (CASE_OPENED), us-west-2 G and VT Spot 4 vCPUs (PENDING)
+Summary: GPU trial needs 32 vCPUs; quota fits: us-east-1; open requests: us-east-1 Standard Spot 129 vCPUs (CASE_OPENED)
 ```
-A regional failure prints only its error code and makes the command exit with status 1 after the remaining regions.
-The report includes case IDs and omits account IDs, ARNs, and request IDs.
+
+Other regional failures print the error code or class and permit the remaining quota reads.
+Any quota failure makes the command exit with status 1.
+The report omits account IDs, case IDs, request IDs, and ARNs.
 It calls only `GetServiceQuota` and `ListRequestedServiceQuotaChangeHistoryByQuota` through the AWS CLI.
 The AWS CLI reads every page of request history.
 [AWS provides Service Quotas at no additional charge](https://aws.amazon.com/about-aws/whats-new/2023/03/service-quotas-additional-regions/).
@@ -182,7 +183,7 @@ The administrator IAM policy needs these actions:
 2. `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota`.
 3. `servicequotas:RequestServiceQuotaIncrease`.
 
-`quota-status` needs only the first two actions, which this list already includes.
+The plan identity policy grants `quota-status` the first two actions in `ReadSetupInputs`.
 
 ## Deploy gate resources
 
@@ -219,16 +220,15 @@ If a timing write fails, `up` prints a warning and continues.
 The gate path uses the official NixOS image.
 Saved regional image copies remain subject to normal teardown.
 
-An unchanged regional request still calls `cloudformation deploy`.
-The AWS CLI creates a change set and waits for its result before it detects an empty change set.
-`--no-fail-on-empty-changeset` controls the exit status; it does not skip this work.
-The deployment wrapper captures the AWS CLI output.
-The regional progress lines therefore show work that was previously silent.
-The regional template has no generated timestamp or UserData.
-The recorded Nix revision belongs to the deployment manifest, not the regional template.
-Local templates alone cannot prove whether AWS created resources, updated resources, or returned an empty change set.
-A future optimization could compare the live template and effective parameters before deployment.
-It must also check the stack status before it skips deployment.
+`up` always runs the home stack update and checks each regional stack.
+It skips regional deployment when the template, stack name, and parameters match the last successful deployment.
+The live stack ID and last update time must also match the saved values.
+The live status must be `CREATE_COMPLETE` or `UPDATE_COMPLETE`.
+The output reports the skip and measures the region's elapsed time.
+The first run without saved digests deploys every region and saves each digest after success.
+An unreadable or invalid `regional-stack-digests.json` produces one warning and deploys every region.
+CloudFormation deployment can take several minutes per changed region.
+For a home-only change, regional time goes to network and image preparation and stack status checks.
 
 ## Foundation maintenance
 
@@ -452,6 +452,10 @@ The setup command needs no active target or slot capacity.
 5. Run `scripts/aws_target/deploy.py hana-setup` to read the local resource plan.
 6. Run `scripts/aws_target/deploy.py hana-setup --approve-resources` after resource approval.
 7. Confirm that the command reports a stopped box.
+
+After you confirm Hana is stopped, run `deploy.py hana-release-unknown-stop --approve-release` to record your approval. The command makes no AWS call.
+Hana refuses claims until the controller confirms the stop. If the controller finds Hana running, it stops Hana first.
+Run `deploy.py hana-release-unknown-stop` again to check for `already released`.
 
 `hana-image` converts the image to a raw disk and uploads it to one EBS snapshot with coldsnap.
 Coldsnap applies the cost tag with `--tag Key=...,Value=...` during the upload.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import socket
@@ -13,6 +14,7 @@ import unittest
 from pathlib import Path
 from dataclasses import replace
 from collections.abc import Iterator
+from contextlib import redirect_stderr, redirect_stdout
 from typing import cast, override
 from unittest import mock
 
@@ -116,13 +118,15 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertEqual(observed.pids, (os.getpid(), os.getpid()))
         self.assertEqual(absent, sessions.SessionProcesses(()))
 
-    def test_unreadable_record_does_not_change_a_session_answer(self) -> None:
+    def test_unreadable_record_keeps_a_positive_match_but_cannot_prove_absence(self) -> None:
         self.record("live.json", session_id="attached")
-        _ = (self.sessions / "broken.json").write_text("{broken")
+        path = self.sessions / "broken.json"
+        _ = path.write_text("{broken")
+        unknown = sessions.SessionLivenessUnknown(f"session registry unreadable: {path}")
         with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
-            self.assertEqual(sessions.session_processes("attached"), sessions.SessionProcesses((os.getpid(),)))
+            self.assertEqual(sessions.session_processes("attached"), unknown)
             self.assertEqual(sessions.session_liveness("attached"), sessions.LiveSessionProcess(os.getpid()))
-            self.assertEqual(sessions.session_liveness("absent"), sessions.SessionNotLive())
+            self.assertEqual(sessions.session_liveness("absent"), unknown)
 
     def test_remote_control_reads_present_missing_empty_and_unreadable_fields(self) -> None:
         self.record(f"{os.getpid()}.json")
@@ -441,21 +445,16 @@ class SessionLookupTests(ShutdownTestCase):
     def test_missing_registry_returns_unknown(self) -> None:
         self.sessions.rmdir()
         result = self.run_cli("socket", "session:missing")
-        self.assertEqual((result.returncode, result.stdout), (3, ""))
-        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (3, "", "sessions: one or more registry files could not be read\n"))
 
     def test_registry_that_cannot_be_listed_returns_unknown(self) -> None:
-        self.sessions.chmod(0)
-        self.addCleanup(self.sessions.chmod, 0o700)
-        try:
-            _ = list(self.sessions.iterdir())
-        except PermissionError:
-            pass
-        else:
-            self.skipTest("current user can list a mode-zero directory")
-        result = self.run_cli("socket", "session:missing")
-        self.assertEqual((result.returncode, result.stdout), (3, ""))
-        self.assertEqual(len(result.stderr.splitlines()), 1)
+        with (mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
+              mock.patch.object(Path, "iterdir", side_effect=PermissionError(self.sessions)),
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+            code = sessions.main([str(SCRIPT), "socket", "session:missing"])
+        self.assertEqual((code, output.getvalue()), (3, ""))
+        self.assertEqual(errors.getvalue(), "sessions: one or more registry files could not be read\n")
 
     def test_corrupt_registry_record_returns_unknown(self) -> None:
         _ = (self.sessions / "broken.json").write_text("{")
@@ -535,7 +534,9 @@ class SessionLookupTests(ShutdownTestCase):
             for error, expected in ((ProcessLookupError(), ()), (PermissionError(), (path,)), (None, (path,))):
                 with self.subTest(error=error), mock.patch.object(os, "kill", side_effect=error):
                     self.assertEqual(sessions.read_registry().unreadable, expected)
-                    self.assertEqual(sessions.session_liveness("stopped"), sessions.SessionNotLive())
+                    liveness = (sessions.SessionLivenessUnknown(f"session registry unreadable: {path}")
+                                if expected else sessions.SessionNotLive())
+                    self.assertEqual(sessions.session_liveness("stopped"), liveness)
 
     def test_record_removed_between_unreadable_read_and_reread_is_dropped(self) -> None:
         path = self.sessions / "4242.json"

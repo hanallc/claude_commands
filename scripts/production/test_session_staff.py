@@ -17,6 +17,7 @@ from scripts.message import process_table
 from scripts.production import session_staff as labels, staff, staff_sources
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, fixture_session, unit_membership
 from scripts.herdr import herdr, pane_launch
+from scripts.herdr.test_herdr import codex_foreground_cases
 
 
 class StatusDiscoveryTests(StaffTestCase):
@@ -155,6 +156,47 @@ class StatusDiscoveryTests(StaffTestCase):
             self.assertEqual(saved, {**entry, "environment": {"ENABLE_TOOL_SEARCH": "true"}})
             self.assertEqual(labels.repair_marks(), [])
 
+    def test_repair_preserves_the_retained_codex_launch_in_both_process_orders(self) -> None:
+        from scripts.agents import pane_record
+        from scripts.message import sessions
+
+        parent = unit_membership("build", "parent")
+        child = unit_membership("build", "child")
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        saved = pane_record.launch(place.pane, parent.id, str(self.root), {}, ["codex"], kind="codex")
+        candidate = pane_record.launch(place.pane, child.id, str(self.root), {}, ["claude"], kind="claude")
+        record = sessions.SessionRecord(pid=457, sessionId=child.id, name="child", procStart="1",
+                                        updatedAt=1, messagingSocketPath="", tmux="", formerNames=[])
+        processes = [herdr.HerdrProcess(456, place, {}, "codex", str(self.root)),
+                     herdr.HerdrProcess(457, place, {}, "claude", str(self.root))]
+        directory = self.root / "retained"
+        path = directory / "agents.json"
+        with (codex_foreground_cases(self.root) as cases,
+              mock.patch.object(pane_record, "RECORD_DIR", directory),
+              mock.patch.object(pane_record, "running_launch", return_value=candidate),
+              mock.patch.object(sessions, "running_sessions", return_value=[record]),
+              mock.patch.object(herdr, "herdr_places", return_value={457: place}),
+              mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.PaneSessionReport(parent.id), "1", {})) as native,
+              mock.patch.object(herdr.Herdr, "result") as result):
+            for case, order in zip(cases[:2], (processes, processes[::-1]), strict=True):
+                with (self.subTest(case=case.name),
+                      mock.patch.object(herdr, "herdr_processes", return_value=order)):
+                    result.return_value = {"process_info": case.info}
+                    pane_record.write(place.session, saved)
+                    before = path.read_bytes()
+                    self.assertEqual(labels.repair_marks(), [])
+                    self.assertEqual(path.read_bytes(), before)
+
+            result.return_value = {"process_info": {"foreground_processes": [
+                {"pid": 457, "argv": ["claude"], "cwd": str(self.root)}]}}
+            native.return_value = herdr.NativeAgentProcess(herdr.EnvironmentThread(child.id), "1", {})
+            candidate.update(pid=457, proc_start="2")
+            self.assertEqual(labels.repair_marks(), [])
+            candidate["proc_start"] = "1"
+            self.assertEqual(len(labels.repair_marks()), 1)
+            self.assertEqual(pane_record.read_strict(place.session)[place.pane].get("staff_id"), child.id)
+
     def test_pane_parents_selects_only_local_pane_workers_from_the_record(self) -> None:
         runner = fixture_member("showrunner", name="pane-show", doc=staff.LiveDoc("natedev", self.root / "show.md"))
         selected = fixture_member("unit", name="pane", parent=runner.id,
@@ -183,7 +225,15 @@ class StatusDiscoveryTests(StaffTestCase):
                      herdr.HerdrProcess(910002, labels.Place("agents", "w2:p1"),
                                        {"CLAUDE_CODE_SESSION_ID": healthy.current_session}, "zsh", "")]
         errors = StringIO()
+
+        def read(*arguments: str) -> dict[str, object]:
+            pid, program = (910001, "claude") if arguments[-1] == "w1:p1" else (910002, "zsh")
+            return {"process_info": {"shell_pid": pid, "foreground_process_group_id": pid,
+                                     "foreground_processes": [{"pid": pid, "argv": [program]}]}}
+
         with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
+              mock.patch.object(herdr.Herdr, "listed", return_value=[{"pane_id": "w1:p1"}, {"pane_id": "w2:p1"}]),
+              mock.patch.object(herdr.Herdr, "result", side_effect=read),
               mock.patch.object(process_table, "snapshot", return_value={
                   910001: process_table.Process(910001, 1, "claude", "claude")}),
               mock.patch.object(herdr, "herdr_processes", return_value=processes), redirect_stderr(errors)):
@@ -196,6 +246,21 @@ class StatusDiscoveryTests(StaffTestCase):
         states = grouped.status_units("show")
         self.assertIsInstance(states["broken"].claude, labels.ClaudeUnknown)
         self.assertIsInstance(states["healthy"].claude, labels.ClaudeNotRunning)
+
+    def test_empty_shell_does_not_hide_an_unreadable_pane_for_the_unit(self) -> None:
+        row = unit_membership("show", "unit")
+        place = labels.Place("agents", "w1:p1")
+        candidate = labels.UnprovedPaneIdentity(frozenset({row.current_session}))
+        empty = labels.LabeledSession("", labels.ClaudeNotRunning(), place,
+                                      identity=candidate, empty=herdr.ObservedEmpty(place, 910001))
+        unknown = labels.LabeledSession("", labels.ClaudeUnknown("process info denied"),
+                                        labels.Place("agents", "w2:p1"), identity=candidate)
+        record = staff.snapshot()
+        sources = labels.MemberSources(())
+        for observations in ((empty, unknown), (unknown, empty)):
+            with self.subTest(observations=observations):
+                report = labels.group_labeled_sessions(observations, record=record, sources=sources)
+                self.assertEqual(report.checked_unit("show", row.name), labels.UnknownUnit("process info denied"))
 
     def test_denied_thread_read_reports_only_when_the_pane_holds_staff(self) -> None:
         row = unit_membership("show", "unit")
@@ -272,6 +337,7 @@ class StatusDiscoveryTests(StaffTestCase):
         errors = StringIO()
         with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
               mock.patch.object(herdr, "herdr_processes", return_value=processes),
+              mock.patch.object(herdr.Herdr, "listed", return_value=[{"pane_id": place.pane}]),
               mock.patch("scripts.production.unit_lookup.sessions.read_registry", return_value=sessions.RegistryRead((), (self.root / "910001.json",))),
               redirect_stderr(errors), labels.anomalies() as lines):
             observed = unit_lookup.observed_session_labels(record=staff.snapshot())

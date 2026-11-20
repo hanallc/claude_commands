@@ -59,12 +59,13 @@ import math
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
+from scripts.build_queue import execution_identity
 from scripts.lib.test_phase import (
     CallRecord,
     NoCallRecord,
@@ -80,7 +81,7 @@ from scripts.lib.test_phase import (
     UnreadableTestPhaseRecord as UnreadableTestPhaseRecord,
 )
 
-from scripts.buildlog import cgroup_capture, store, step_context
+from scripts.buildlog import cgroup_capture, parse, store, step_context
 from scripts.buildlog.repository import (
     GIT_TIMEOUT_S as GIT_TIMEOUT_S,
     MANIFEST_IDENTITY_PREFIX,
@@ -526,8 +527,6 @@ def new_id(host: str, epoch: float) -> str:
 
 
 def rustc_version(argv: list[str], cwd: str) -> str | None:
-    from scripts.buildlog import parse
-
     words = ["rustc"]
     chosen = parse.toolchain(argv)
     if chosen:
@@ -699,8 +698,6 @@ def completed_test_phase_charge(reservation_id: str) -> TestPhaseChargeUse | NoT
 
 def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
-    from scripts.buildlog import parse
-
     loaded = cast(object, json.loads(sampling_context))
     if not isinstance(loaded, dict):
         raise ValueError("test-phase sampling context is not an object")
@@ -939,6 +936,7 @@ class HanaStepContext:
     repo_identity: str
     cwd: str
     target_dir: str
+    environment: Mapping[str, str] = field(default_factory=dict[str, str])
 
 
 def placement_step_fields() -> dict[str, object]:
@@ -973,7 +971,7 @@ def fallback_step_fields(assignment_path: Path) -> dict[str, object]:
     except FileNotFoundError:
         return {}
     from scripts.aws_target import hana_result
-    from scripts.build_queue import admission_protocol as wire, admission_wire, placement
+    from scripts.build_queue import admission_protocol as wire, admission_wire
 
     row = hana_result.object_fields(cast(object, json.loads(content)))
     if type(row.get('version')) is not int or row['version'] != 1:
@@ -990,7 +988,7 @@ def fallback_step_fields(assignment_path: Path) -> dict[str, object]:
     return {'step_link': json.dumps([link.call_id, link.episode], separators=(',', ':')),
             'placement_episode': assignment.episode, 'placement_attempt': assignment.attempt,
             'attempt_role': 'fallback', 'is_final_result': True,
-            **({'source_key': assignment.source_key.key} if isinstance(assignment.source_key, placement.SourceKeyKnown) else {})}
+            **({'source_key': assignment.source_key.key} if isinstance(assignment.source_key, execution_identity.SourceKeyKnown) else {})}
 
 
 def _publish_hana_step(row: dict[str, object], output: bytes) -> PublishedStep:
@@ -1025,22 +1023,32 @@ def _hana_step_row(key: hana_result.HanaAttemptKey, link: hana_result.LogicalSte
             'call_id': link.call_id, **hana_result.linked_step_fields(key, link, 'remote', final)}
 
 
+def captured_log_facts(step: str, source: str, argv: Sequence[str], environment: Mapping[str, str],
+                       *streams: bytes) -> parse.LogFacts:
+    try:
+        trust = step != "nextest" or parse.nextest_status_is_trusted(argv, environment)
+        return parse.log_facts(step, *(stream.decode("utf-8", "replace") for stream in streams),
+                               trust_nextest_status=trust)
+    except Exception:  # noqa: BLE001 -- a parser failure must preserve the step result
+        store.note_error(f"parse {step} {source}")
+        return parse.no_facts()
+
+
 def publish_hana_result(accepted: hana_result.AcceptedHanaResult, link: hana_result.LogicalStepLink,
                         context: HanaStepContext) -> PublishedStep:
     """Publish only a result accepted under the execution journal lock."""
-    from scripts.buildlog import parse
     from scripts.aws_target import hana_result
 
     result = accepted.result
-    output = result.stdout + result.stderr
     row = _hana_step_row(result.key, link, context, result.host, result.started_at, result.finished_at,
                          result.status, True)
     row.update({'argv': list(result.argv), 'source_key': result.source_key, 'source_commit': result.commit,
                 'sha': result.commit[:12], 'toolchain_identity': result.toolchain,
                 'duration_s': result.execution_seconds,
                 'peak_mem_bytes': result.memory.bytes if isinstance(result.memory, hana_result.MeasuredPeak) else None,
-                **parse.log_facts(context.step, output.decode('utf-8', 'replace'))})
-    return _publish_hana_step(row, output)
+                **captured_log_facts(context.step, str(row['id']), result.argv, context.environment,
+                                     result.stdout, result.stderr)})
+    return _publish_hana_step(row, result.stdout + result.stderr)
 
 
 def publish_hana_loss(key: hana_result.HanaAttemptKey, link: hana_result.LogicalStepLink,
@@ -1071,7 +1079,6 @@ def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
 
 def step(args: list[str]) -> None:
     import hashlib
-    from scripts.buildlog import parse
     from scripts.buildlog import treekey
 
     status_text, start_text, end_text, tty_text, held, peak = args[:6]
@@ -1125,10 +1132,7 @@ def step(args: list[str]) -> None:
         log: str | None = None
         if not tty and held and os.path.isfile(held):
             data = Path(held).read_bytes()
-            try:
-                facts = parse.log_facts(name, data.decode("utf-8", "replace"))
-            except Exception:  # noqa: BLE001 -- a parser bug loses the facts, never the record
-                store.note_error(f"parse {name} {held}")
+            facts = captured_log_facts(name, held, argv, os.environ, data)
             if status != 0:
                 log = _log_relative_path(host, start, record_id)
         output_roots = step_context.step_output_roots(argv, cwd) if name != "sweep" else CargoOutputUnavailable("sweep step")

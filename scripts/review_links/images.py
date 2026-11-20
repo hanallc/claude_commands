@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import hmac
 import html
+import json
 import secrets
 import shutil
 import sys
@@ -18,8 +19,9 @@ from types import MappingProxyType
 from typing import cast
 from urllib.parse import parse_qs
 
-from scripts.lib import conf, file_lock
+from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.user_zone import shown_time
+from scripts.production.delivery_state import QuestionSendState
 from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
@@ -37,23 +39,34 @@ ACTIONS = frozenset(("delete", "question", *ANSWERS))
 
 
 class QuestionDelivery(StrEnum):
-    WAITING_FOR_OWNER = "Waiting for the owner"
+    ACCEPTED = "Waiting for the owner"
+    SENDING = "Question saved. Sending to the owner."
     RETRY = "Not sent. Press Ask question again with the same words."
     UNCONFIRMED = "The send result is unknown. Enter the same words and press Ask question to send it again."
 
+    @property
+    def waits(self) -> bool:
+        return self in (self.ACCEPTED, self.SENDING)
 
-NO_OPEN_QUESTIONS: Mapping[str, QuestionDelivery] = MappingProxyType({})
+
+type ImageQuestionDelivery = QuestionDelivery | change_page.ResendBlocked
+NO_OPEN_QUESTIONS: Mapping[str, ImageQuestionDelivery] = MappingProxyType({})
 
 
 @dataclass(frozen=True)
 class ImageReview:
     record: image_store.ImageRecord
-    open_questions: Mapping[str, QuestionDelivery] = NO_OPEN_QUESTIONS
+    open_questions: Mapping[str, ImageQuestionDelivery] = NO_OPEN_QUESTIONS
 
     def visible(self) -> bool:
         if self.open_questions:
-            return any(delivery is not QuestionDelivery.WAITING_FOR_OWNER for delivery in self.open_questions.values())
+            return any(isinstance(delivery, change_page.ResendBlocked) or not delivery.waits
+                       for delivery in self.open_questions.values())
         return "feedback_at" not in self.record
+
+    def refresh(self) -> bool:
+        return any(isinstance(delivery, change_page.ResendBlocked) or delivery.waits
+                   for delivery in self.open_questions.values())
 
 
 class AnswerNotSent(Exception):
@@ -100,37 +113,34 @@ def records(root: Path) -> list[image_store.ImageRecord]:
     return sorted(found, key=lambda record: record["registered_at"])
 
 
-def question_delivery(status: change_page.DeliveryStatus, page: change_page.ReviewPage,
-                      row: str) -> QuestionDelivery:
+def question_delivery(status: change_page.DeliveryStatus, saved: change_page.SavedQuestionDelivery
+                      ) -> ImageQuestionDelivery:
     """Read the delivery state while the caller holds the delivery lock."""
-    intent = status.slots(page, row).verdict
-    if isinstance(intent, change_page.DeliveryIntent) and (
-            status.startup_recovery_pending.is_set() or status.owns_live_attempt(page, row, intent)):
-        return QuestionDelivery.WAITING_FOR_OWNER
-    dispatch = status.image_question_dispatch(page, row)
-    if not isinstance(dispatch, change_page.NoImageQuestionDispatch) and (
-            dispatch["state"] == "accepted" or status.owns_live_claim(page, row, dispatch["attempt"])):
-        return QuestionDelivery.WAITING_FOR_OWNER
-    if isinstance(status.failed_delivery(page, row), change_page.FailedDelivery):
-        return QuestionDelivery.RETRY
-    if not isinstance(dispatch, change_page.NoImageQuestionDispatch):
-        return QuestionDelivery.UNCONFIRMED
-    if isinstance(intent, change_page.DeliveryIntent) or status.image_question_intent_was_not_saved(page, row):
-        return QuestionDelivery.RETRY
-    # Older records can have a sent question without a dispatch mark.
-    return QuestionDelivery.WAITING_FOR_OWNER
+    delivery = change_page.question_delivery_view(status, saved)
+    match delivery.state:
+        case QuestionSendState.CLAIMED | QuestionSendState.SENDING:
+            return QuestionDelivery.SENDING
+        case QuestionSendState.READY | QuestionSendState.PREPARED:
+            if status.startup_recovery_pending.is_set():
+                return QuestionDelivery.SENDING
+            return QuestionDelivery.RETRY
+        case QuestionSendState.FAILED:
+            return QuestionDelivery.RETRY
+        case QuestionSendState.UNKNOWN:
+            return delivery if isinstance(delivery, change_page.ResendBlocked) else QuestionDelivery.UNCONFIRMED
+        case QuestionSendState.SENT | QuestionSendState.QUEUED:
+            return QuestionDelivery.ACCEPTED
 
 
 def image_review(status: change_page.DeliveryStatus, record: image_store.ImageRecord) -> ImageReview:
-    open_ids = [saved['question_id'] for saved in record.get('questions', []) if saved['answer'] is None]
-    if not open_ids:
+    open_questions = [question_record.read(saved) for saved in record.get('questions', []) if saved['answer'] is None]
+    if not open_questions:
         return ImageReview(record)
-    source = images_root(status.root) / record['id'] / image_store.RECORD
-    page = change_page.ReviewPage(source, source.parent, (), '')
+    target = change_page.image_question_target(images_root(status.root) / record['id'] / image_store.RECORD, record)
     with status.locked():
         return ImageReview(record, {
-            identity: question_delivery(status, page, f"{change_page.IMAGE_QUESTION_ROW_PREFIX}{record['id']}/{identity}")
-            for identity in open_ids
+            question.question_id: question_delivery(status, target.saved(question))
+            for question in open_questions
         })
 
 
@@ -192,20 +202,27 @@ def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
 
-def question_html(question: question_record.Question, open_questions: Mapping[str, QuestionDelivery]) -> str:
-    if question.answer is not None:
-        return page_question.answered_question_html(question)
+def question_html(question: question_record.Question, open_questions: Mapping[str, ImageQuestionDelivery]) -> str:
+    answer = question.answer
+    if answer is not None:
+        return page_question.answered_question_html(question, answer)
     content = page_question.open_question_html(question)
-    delivery = open_questions.get(question.question_id, QuestionDelivery.WAITING_FOR_OWNER)
-    if delivery is QuestionDelivery.WAITING_FOR_OWNER:
+    delivery = open_questions.get(question.question_id, QuestionDelivery.ACCEPTED)
+    if delivery is QuestionDelivery.ACCEPTED:
         return content
-    words = html.escape(question.words, quote=True)
-    return content.removesuffix('</section>') + f'<p role="status" data-resend-question="{words}">{delivery}</p></section>'
+    if isinstance(delivery, change_page.ResendBlocked):
+        notice = f'<p role="status" data-resend-blocked>{html.escape(delivery.reason)}</p>'
+    elif delivery is QuestionDelivery.SENDING:
+        notice = f'<p role="status">{delivery}</p>'
+    else:
+        words = html.escape(question.words, quote=True)
+        notice = f'<p role="status" data-resend-question="{words}">{delivery}</p>'
+    return content.removesuffix('</section>') + notice + '</section>'
 
 
 def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int,
          names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT, *,
-         open_questions: Mapping[str, QuestionDelivery] = NO_OPEN_QUESTIONS) -> str:
+         open_questions: Mapping[str, ImageQuestionDelivery] = NO_OPEN_QUESTIONS) -> str:
     """Show the caption as the title, then the aligned details, the image or pair, the feedback field and the answer buttons."""
     pair = "before" in record
     pictures = "".join(picture(record, label, file) for label, file in shown_files(record))
@@ -217,6 +234,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     shown_owner = names.html(record["owner"], name) + f" ({member.kind})" if member is not None else html.escape(owner)
     questions = sorted((question_record.read(saved) for saved in record.get('questions', [])),
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
+    round_id = feedback_round(answered_question_ids(record))
     closing_buttons = ('<button type="submit" name="action" value="approved">Approved</button>'
                        '<button type="submit" name="action" value="not approved">Not Approved</button>'
                        '<button type="submit" name="action" value="feedback">Send Feedback</button>')
@@ -233,6 +251,7 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + '<form method="post" data-image-form>'
             + f'<input type="hidden" name="image" value="{record["id"]}">'
             + f'<input type="hidden" name="token" value="{request_token(token, record["id"])}">'
+            + f'<input type="hidden" name="feedback_round" value="{round_id}">'
             + f'<label for="feedback-{record["id"]}">Feedback</label>'
             + f'<textarea id="feedback-{record["id"]}" name="feedback" rows="{feedback_rows}"></textarea>'
             + page_frame.review_action_groups(closing_buttons, returning_buttons)
@@ -247,23 +266,25 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     names = staff_names.StaffNames(members)
     settings = conf.read("review_links")
     rows = settings.whole("feedback_rows")
+    card_motion = page_frame.CardMotion.read(settings)
     waiting: list[str] = []
     cards: list[str] = []
-    refresh_when_owner_answers = False
+    refresh_needed = False
     for record in records(root):
         review = image_review(status, record)
         if review.visible():
             cards.append(card(record, token, members, rows, names, open_questions=review.open_questions))
         elif review.open_questions:
             waiting.append(record['id'])
-        refresh_when_owner_answers |= QuestionDelivery.WAITING_FOR_OWNER in review.open_questions.values()
+        refresh_needed |= review.refresh()
     answer_refresh_seconds = settings.number("page_refresh_seconds")
-    refresh_seconds = answer_refresh_seconds if refresh_when_owner_answers else 0
+    refresh_seconds = answer_refresh_seconds if refresh_needed else 0
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
     content = (STYLE + page_frame.title("Images", "images")
                + f'<p hidden data-image-waiting role="status">{waiting_text}</p>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-script="{SCRIPT_VERSION}" data-refresh-seconds="{refresh_seconds}"'
+               + f' {card_motion.attributes()}'
                + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}">'
                + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
                + '<noscript>Enable JavaScript to answer on an image.</noscript>'
@@ -276,7 +297,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     """Save a question for deferred delivery; keep feedback and delete actions as before."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
-    if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action"} or any(
+    if not {"image", "token"} <= set(fields) <= {"image", "token", "feedback", "action", "feedback_round"} or any(
             len(value) != 1 for value in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
@@ -291,7 +312,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     if action == 'question':
         return ask_question(root, identity, fields.get('feedback', [''])[0], status)
     if action in ANSWERS:
-        send_answer(root, identity, action, fields.get("feedback", [""])[0].strip())
+        round_id = fields["feedback_round"][0] if "feedback_round" in fields else None
+        send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id)
         return change_page.NoMessageDelivery()
     with file_lock.exclusive(images_root(root) / LOCK):
         try:
@@ -306,10 +328,8 @@ def ask_question(root: Path, identity: str, words: str, status: change_page.Deli
     store = image_store.ImageQuestionStore(images_root(root))
     folder = store.folder(identity)
     record = image_store.read_record(folder)
-    command = ('~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py answer '
-               + '--id {item} --question {question_id} --text "<answer>"')
-    return page_question.ask(store, identity, staff.StaffId(record['owner']), folder / image_store.RECORD,
-        change_page.IMAGE_QUESTION_ROW_PREFIX+identity, record['caption'], words, command, status)
+    target = change_page.image_question_target(folder / image_store.RECORD, record)
+    return page_question.ask(store, target, words, status, resend_unknown=True)
 
 
 def answer_question(root: Path, identity: str, question_id: str, text: str) -> None:
@@ -330,32 +350,59 @@ def answer_message(record: image_store.ImageRecord, answer: str, feedback: str) 
         + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))
 
 
-def send_answer(root: Path, identity: str, answer: str, feedback: str) -> None:
-    """Send feedback, then hide the image unless a question received an answer during delivery."""
+def answered_question_ids(record: image_store.ImageRecord) -> set[str]:
+    return {question["question_id"] for question in record.get("questions", []) if question["answer"] is not None}
+
+
+def feedback_round(answered: set[str]) -> str:
+    return hashlib.sha256("\n".join(sorted(answered)).encode()).hexdigest()
+
+
+def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None) -> None:
+    """Hide the image only if no question received an answer after the first submission."""
     if answer == "feedback" and not feedback:
         raise question_record.AnswerRefused("enter feedback")
-    folder = images_root(root) / identity
-    try:
-        record = image_store.read_record(folder)
-    except (OSError, ValueError) as error:
-        raise question_record.AnswerRefused(f"no image {identity}") from error
-    answered_question_ids = {question['question_id'] for question in record.get('questions', [])
-                            if question['answer'] is not None}
+    directory = images_root(root)
+    folder = directory / identity
+    lock = directory / LOCK
+    with file_lock.exclusive(lock):
+        try:
+            record = image_store.read_record(folder)
+        except (OSError, ValueError) as error:
+            raise question_record.AnswerRefused(f"no image {identity}") from error
+        parts = [record["registered_at"], answer, feedback]
+        if round_id is not None:
+            parts.append(round_id)
+        attempt = json.dumps(parts)
+        key = change_page.review_delivery_key(folder / image_store.RECORD, identity, attempt)
+        snapshot = folder / (".review-link-feedback-" + key.removeprefix("review:"))
+        try:
+            previously_answered = set(snapshot.read_text(encoding="utf-8").splitlines())
+        except FileNotFoundError:
+            previously_answered = answered_question_ids(record)
+            if round_id is not None and round_id != feedback_round(previously_answered):
+                raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.")
+            atomic_file.write_text_atomic(snapshot, "".join(f"{item}\n" for item in sorted(previously_answered)),
+                                          new_file_mode=0o600)
+        else:
+            # A prior attempt can leave the file visible after a failed directory sync.
+            atomic_file.sync_folder(folder)
     settings = conf.read("review_links")
-    failures = change_page.send_with_retries(SENDER, (staff.StaffId(record["owner"]),),
+    owner = staff.StaffId(record["owner"])
+    failures = change_page.send_with_retries(SENDER, (owner,),
                                              answer_message(record, answer, feedback), settings.whole("delivery_tries"),
-                                             settings.number("delivery_pause_seconds"))
+                                             settings.number("delivery_pause_seconds"), key=key)
     if failures:
         raise AnswerNotSent(failures[-1].error)
-    with file_lock.exclusive(images_root(root) / LOCK):
+    with file_lock.exclusive(lock):
         try:
             current = image_store.read_record(folder)
         except (OSError, ValueError):
             # The owner deleted the image while the message was on its way.
             return
-        # Each question accepts one answer. A new answer takes priority over this older feedback.
-        if any(question['answer'] is not None and question['question_id'] not in answered_question_ids
-               for question in current.get('questions', [])):
+        if current["registered_at"] != record["registered_at"] or current["owner"] != owner:
+            return
+        if answered_question_ids(current) - previously_answered:
             return
         current["feedback_at"] = datetime.now(UTC).isoformat(timespec="seconds")
         image_store.write_record(folder, current)
@@ -397,13 +444,13 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-images] article:not(.pair),[data-empty]{max-width:680px;margin-inline:auto}}
 </style>"""
 
-SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r"""(() => {
-const motion = createCardMotion();
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + r"""(() => {
 const empty = document.querySelector('[data-empty]');
 const groups = document.querySelector('[data-image-groups]');
 const layout = document.querySelector('[data-image-layout]');
 const waiting = document.querySelector('[data-image-waiting]');
 let list = document.querySelector('[data-images]');
+const motion = createCardMotion(() => list);
 let sending = 0;
 let refreshRequest = 0;
 const refreshSeconds = () => list.dataset.refreshSeconds;
@@ -447,6 +494,7 @@ function showGroups() {
 function bind(root) {
   root.querySelectorAll('form[data-image-form]').forEach(form => form.addEventListener('submit', async event => {
     event.preventDefault();
+    if (cardSubmitBlocked(form)) return;
     const question = event.submitter?.value === 'question';
     const feedback = event.submitter?.value === 'feedback', status = form.querySelector('[data-image-status]');
     delete status.dataset.refreshFailed;
@@ -458,16 +506,15 @@ function bind(root) {
       status.textContent = 'Enter feedback first.';
       return;
     }
-    // The card fades before removal; a failed request restores the card.
+    // Remove the card after the fade. Restore the card if the request fails.
     const card = form.closest('article'), home = card.parentNode, next = card.nextSibling;
     const body = new URLSearchParams(new FormData(form, event.submitter));
     status.textContent = '';
     let postFailed = false;
+    setCardSubmitting(form, true);
     sending++;
-    if (!question) await motion.removeCard(card, apply);
-    const buttons = [...form.querySelectorAll('button')];
-    buttons.forEach(button => button.disabled = true);
     try {
+      if (!question) await motion.removeCard(card, apply);
       const response = await fetch(location.pathname, {method: 'POST', body});
       if (!response.ok) {
         const reason = await response.json().then(body => body.reason, () => '');
@@ -475,7 +522,7 @@ function bind(root) {
       }
       if (question) {
         const words = form.elements.feedback.value.trim();
-        const otherResend = [...card.querySelectorAll('[data-resend-question]')]
+        const otherResend = [...card.querySelectorAll('[data-resend-question],[data-resend-blocked]')]
           .some(notice => notice.dataset.resendQuestion !== words);
         if (otherResend) {
           form.elements.feedback.value = '';
@@ -494,7 +541,7 @@ function bind(root) {
       apply();
     } finally {
       sending--;
-      buttons.forEach(button => button.disabled = false);
+      setCardSubmitting(form, false);
       if (question && !postFailed) void pageRefresh.refresh(true);
       else void refresh().catch(error => {
         if (postFailed) return;

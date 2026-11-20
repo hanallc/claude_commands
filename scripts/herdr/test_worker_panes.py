@@ -6,6 +6,7 @@ import json
 import fcntl
 import math
 import os
+import pty
 import shutil
 import sys
 import time
@@ -20,10 +21,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
 from typing import Literal, cast, final, override
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 from weakref import finalize
 
-from scripts.production import staff, worker_admission
+from scripts.production import fake_unit_host, staff, worker_admission
 from scripts.herdr import herdr_types
 from scripts.agents import pane_record, restart, stop_resume
 from scripts.agents.stop_results import SourceReleased
@@ -38,7 +39,7 @@ from scripts.accounts import accounts
 from scripts.whoami import agent_accounts
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.direct import progress_history
-from scripts.agents import detached_run_process, worker_lifecycle
+from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 
@@ -70,9 +71,12 @@ def live_detached_run(run: Path, row: staff.StaffRow) -> Generator[None]:
     path = run / "detached_runs" / (row.name + ".json")
     with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "detached_runs.py", "supervise", str(path)],
                           stdin=subprocess.PIPE, text=True) as supervisor:
-        write_text_atomic(path, json.dumps({"worker": row.name, "staff_id": row.id,
-                                           "run_id": row.name, "log": str(path.with_suffix(".log")),
-                                           "status": "running", "pid": supervisor.pid}))
+        record: detached_runs.RunRecord = {
+            "worker": row.name, "staff_id": row.id, "run_id": row.name, "log": str(path.with_suffix(".log")),
+            "status": "running", "pid": supervisor.pid, "command": ["true"], "label": "private verification",
+            "started_at": time.time(), "session_dir": str(run), "director_dir": str(run), "done_message_file": "",
+        }
+        write_text_atomic(path, json.dumps(record))
         try:
             yield
         finally:
@@ -935,8 +939,8 @@ class WorkerPaneTests(StaffTestCase):
         if not state.exists():
             run.mkdir(exist_ok=True)
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
-                "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
-                          "status": "active"}, "pass": {}, "events": [],
+                "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
+                                 "status": "active"}], "pass": {}, "events": [],
                 "history_file": str(run / "history.jsonl"),
                 "main_agent": {"session_id": self.parent.current_session, "family": "claude",
                                "model": "fixture", "effort": "high"}}))
@@ -999,7 +1003,9 @@ class WorkerPaneTests(StaffTestCase):
                 _ = progress_history.begin_dispatch(run, slot="impl", phase=phase, role="impl",
                     worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
                 before = self.staff_state()
-                if operation in {"finish-phase", "finish-run"}:
+                if operation == "finish-phase":
+                    self.record_command(operation, "--phase-id", phase, "--status", "completed", at=3)
+                elif operation == "finish-run":
                     self.record_command(operation, "--status", "completed", at=3)
                 else:
                     self.record_command("finish-pass", "--status", "interrupted", "--orphaned-launcher", at=3)
@@ -2114,6 +2120,16 @@ class WorkerPaneTests(StaffTestCase):
             self.assertIsInstance(worker_panes.can_close(opened), worker_panes.Kept)
             self.assertIsInstance(self.start(role="review"), worker_panes.StartRefused)
 
+            path = run / unit_runs.STATE_FILE
+            state = cast(dict[str, object], json.loads(path.read_text()))
+            passes = cast(dict[str, dict[str, object]], state["pass"])
+            passes["newer-slot"] = {"worker_id": opened.row.id, "instance_id": "newer-pass",
+                                    "started_at": 1, "status": "completed"}
+            write_text_atomic(path, json.dumps(state))
+            self.reply_to_dispatch(opened.row, "newer-pass")
+            self.assertIsInstance(worker_panes.can_close(opened), worker_panes.CloseAllowed)
+            self.assertIsInstance(self.start(role="review"), worker_panes.OpenWorker)
+
     def test_failed_unpublished_close_reports_one_anomaly(self) -> None:
         for failure in (False, OSError("TEST close failed\nsecond line")):
             with self.subTest(failure=failure):
@@ -2581,8 +2597,13 @@ class WorkerPaneTests(StaffTestCase):
                     destination_run = self.worker_run("a-destination", "unit", self.parent.current_session, director_run=True)
                     self.assertNotEqual(worker_panes.worker_run(row), destination_run)
                 record = source_run / "detached_runs/private-run.json"
-                write_text_atomic(record, json.dumps({"worker": row.name, "staff_id": row.id,
-                    "status": "running" if detached else "finished", "pid": 998901}))
+                saved: detached_runs.RunRecord = {
+                    "worker": row.name, "staff_id": row.id, "run_id": record.stem, "log": str(record.with_suffix(".log")),
+                    "status": "running" if detached else "finished", "pid": 998901, "command": ["true"],
+                    "label": "private verification", "started_at": time.time(), "session_dir": str(source_run),
+                    "director_dir": str(source_run), "done_message_file": "",
+                }
+                write_text_atomic(record, json.dumps(saved))
                 before = self.staff_state(), self.world.foreground.copy(), len(self.world.launches), self.world.stops.copy()
 
                 def release(source: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend | staff.BackendUnavailable) -> SourceReleased:
@@ -3801,6 +3822,235 @@ class WorkerPaneTests(StaffTestCase):
             closed = worker_panes.close(self.parent.id, staff.WorkerName.parse(renamed.name))
         self.assertIsInstance(closed, worker_panes.UncertainWorker)
         self.assertEqual(self.world.closed, [])
+
+    def test_codex_with_foreground_children_receives_the_detached_result_and_proves_sibling_absence(self) -> None:
+        from scripts.message import send
+
+        row = self.worker("impl", family="codex")
+        absent = self.worker("review")
+        pane = "w1:p1"
+        self.world.add(row, pane, family="codex")
+        self.world.locations[pane]["agent_session"] = {"value": row.current_session}
+        pid = self.world.foreground[pane][0]
+        child = pid + 100
+        grandchild = child + 1
+        process = self.world.processes[pid]
+        self.world.processes[pid] = replace(process, identity=herdr.LaunchArgument(row.current_session))
+        read = self.world.result
+        record = staff.snapshot()
+        body = "Detached run: fixture-run\nRun finished: fixture checks"
+        fifo = self.root / "grandchild-stdin"
+        os.mkfifo(fifo)
+        for exiting in (False, True):
+            with self.subTest(exiting=exiting):
+                # The intermediate process is outside the reported foreground group.
+                fake_unit_host.process(os.environ, child, pid, ["sh"], {})
+                fake_unit_host.process(os.environ, grandchild, child, [] if exiting else ["python3"], {})
+                child_process = self.world.process_root / str(grandchild)
+                if exiting:
+                    stat = child_process / "stat"
+                    write_text_atomic(stat, stat.read_text().replace("(fixture) S", "(fixture) Z"))
+                else:
+                    stdin = child_process / "fd" / "0"
+                    stdin.parent.mkdir()
+                    stdin.symlink_to(fifo)
+
+                def result(*args: str, deadline: float = math.inf) -> dict[str, object]:
+                    reply = read(*args, deadline=deadline)
+                    if args == ("pane", "process-info", "--pane", pane):
+                        info = herdr.json_object(reply["process_info"], "fixture process info")
+                        processes = herdr.json_items(info["foreground_processes"], "fixture foreground processes")
+                        extra: dict[str, object] = {"pid": grandchild, "name": "python3"}
+                        if not exiting:
+                            extra["argv"] = ["python3", "fixture.py"]
+                        info["foreground_processes"] = [extra, *processes]
+                    return reply
+
+                with (patch.object(self.world, "result", side_effect=result),
+                      patch.object(self.world, "prompt", wraps=self.world.prompt) as prompt,
+                      patch.object(send, "delivery_timeout", return_value=1.0),
+                      patch.object(send, "_send", return_value=send.Result("sent", "fixture holder")) as holder,
+                      redirect_stderr(io.StringIO()) as errors):
+                    states = {state.row.id: state for state in worker_panes.observe(self.parent.id, record)}
+                    delivery = send.deliver_worker_text(row, record, body, sender="detached-runs", timeout=1)
+
+                self.assertIsInstance(states[row.id], worker_panes.OpenWorker)
+                self.assertIsInstance(states[absent.id], worker_panes.ClosedWorker)
+                self.assertNotIn("absence is unproved", errors.getvalue())
+                self.assertIsInstance(delivery, send.PaneTextDelivered)
+                prompt.assert_called_once_with(pane, body, target=row.current_session, proof=herdr.SubmitStarts(1000),
+                                               on_submission=ANY)
+                holder.assert_not_called()
+
+    def test_codex_without_arguments_never_gives_its_pane_to_a_registered_claude_child(self) -> None:
+        from scripts.message import send
+
+        codex = self.worker("impl", family="codex")
+        claude = self.worker("review")
+        pane = "w1:p1"
+        self.world.add(codex, pane, family="codex")
+        self.world.locations[pane]["agent_session"] = {"value": codex.current_session}
+        codex_pid = self.world.foreground[pane][0]
+        claude_pid = codex_pid + 100
+        arguments = ["claude", "--resume", claude.current_session]
+        fake_unit_host.process(os.environ, claude_pid, codex_pid, arguments, {})
+        self.world.processes[claude_pid] = herdr.NativeAgentProcess(
+            herdr.EnvironmentThread(claude.current_session), "fixture-generation", {})
+        read = self.world.result
+
+        def result(*args: str, deadline: float = math.inf) -> dict[str, object]:
+            reply = read(*args, deadline=deadline)
+            if args == ("pane", "process-info", "--pane", pane):
+                info = herdr.json_object(reply["process_info"], "fixture process info")
+                info["foreground_processes"] = [{"pid": codex_pid, "name": "codex"},
+                                                {"pid": claude_pid, "name": "claude", "argv": arguments}]
+            return reply
+
+        record = staff.snapshot()
+        body = "Detached run: fixture-run\nRun finished: fixture checks"
+        with (patch.object(self.world, "result", side_effect=result),
+              patch.object(send, "delivery_timeout", return_value=1.0),
+              patch.object(send, "_send", return_value=send.Result("sent", "fixture holder")) as holder,
+              redirect_stderr(io.StringIO())):
+            scan = self.world.scan_row_panes(record, [self.world.locations[pane]])
+            delivery = send.deliver_worker_text(claude, record, body, sender="detached-runs", timeout=1)
+
+        self.assertEqual(self.prompts(), [])
+        self.assertNotIn(claude.id, scan.found)
+        self.assertEqual(scan.unknown, [herdr.UnknownPane(
+            pane, "w1:t1", "agent argv is unavailable. Foreground programs are codex, claude")])
+        self.assertEqual(delivery, send.Result("sent", "fixture holder"))
+        holder.assert_called_once()
+        options = cast(send.Options, holder.call_args.args[0])
+        self.assertEqual(options.to, f"session:{self.parent.current_session}")
+        self.assertTrue(send.body_text(options).endswith("\n" + body))
+
+    def test_foreground_identity_readers_choose_codex_over_its_claude_child(self) -> None:
+        codex = self.worker("impl", family="codex")
+        claude = self.worker("review")
+        pane = "w1:p1"
+        self.world.add(codex, pane, family="codex")
+        pid, _, codex_arguments = self.world.foreground[pane]
+        child = pid + 100
+        claude_arguments = ["claude", "--resume", claude.current_session]
+        fake_unit_host.process(os.environ, pid, 1, codex_arguments, {})
+        fake_unit_host.process(os.environ, child, pid, claude_arguments, {})
+        self.world.processes[child] = herdr.NativeAgentProcess(
+            herdr.EnvironmentThread(claude.current_session), "fixture-generation", {})
+        location = self.world.locations[pane]
+        terminal = str(location["terminal_id"])
+        codex_process: dict[str, object] = {"pid": pid, "name": "codex"}
+        child_process = {"pid": child, "name": "claude", "argv": claude_arguments}
+        reply = {"process_info": {"shell_pid": pid - 1, "foreground_process_group_id": pid,
+                                  "foreground_processes": [child_process, codex_process]}}
+        with (patch.object(self.world, "result", return_value=reply),
+              patch.object(self.world, "pane_row", return_value=location)):
+            for has_argv in (True, False):
+                if has_argv:
+                    codex_process["argv"] = codex_arguments
+                else:
+                    del codex_process["argv"]
+                with self.subTest(reader="pane_agent_process", has_argv=has_argv):
+                    if has_argv:
+                        self.assertEqual(self.world.pane_agent_process(pane, terminal),
+                                         herdr.AgentProcessIdentity(pid, 1))
+                    else:
+                        with self.assertRaisesRegex(herdr_types.HerdrFailure, "argv is unavailable"):
+                            _ = self.world.pane_agent_process(pane, terminal)
+                with self.subTest(reader="retained launch", has_argv=has_argv):
+                    if has_argv:
+                        self.assertEqual(pane_launch.native_sessions(self.world, location), {codex.current_session})
+                    else:
+                        with self.assertRaisesRegex(herdr_types.HerdrFailure, "argv is unavailable"):
+                            _ = pane_launch.native_sessions(self.world, location)
+
+    def test_codex_result_checks_descendant_stdin_without_losing_pane_identity(self) -> None:
+        from scripts.message import send
+
+        row = self.worker("impl", family="codex")
+        absent = self.worker("review")
+        pane = "w1:p1"
+        self.world.add(row, pane, family="codex")
+        self.world.locations[pane]["agent_session"] = {"value": row.current_session}
+        pid = self.world.foreground[pane][0]
+        child = pid + 100
+        shell = 999070
+        self.world.shells[pane] = shell
+        fake_unit_host.process(os.environ, shell, 1, ["sh"], {})
+        shell_stat = self.world.process_root / str(shell) / "stat"
+        fifo = self.root / "tool-stdin"
+        os.mkfifo(fifo)
+        body = "Detached run: fixture-run\nRun finished: fixture checks"
+        read = self.world.result
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        terminal = Path(os.ttyname(slave))
+        tty_device = terminal.stat().st_rdev
+        leader, fields = shell_stat.read_text().rsplit(")", 1)
+        columns = fields.split()
+        columns[4] = str(tty_device)
+        write_text_atomic(shell_stat, leader + ") " + " ".join(columns))
+
+        for stdin, program, draft in (("tty", "editor", False), ("tty", "editor", True),
+                                       ("unreadable", "editor", False), ("pipe", "claude", False),
+                                       ("exited", "editor", False)):
+            with self.subTest(stdin=stdin, draft=draft):
+                fake_unit_host.process(os.environ, child, pid, [program, "private-argument"], {})
+                fd = self.world.process_root / str(child) / "fd" / "0"
+                fd.parent.mkdir(exist_ok=True)
+                fd.unlink(missing_ok=True)
+                if stdin == "exited":
+                    child_stat = fd.parent.parent / "stat"
+                    write_text_atomic(child_stat, child_stat.read_text().replace("(fixture) S", "(fixture) Z"))
+                if stdin in ("tty", "pipe"):
+                    fd.symlink_to(terminal if stdin == "tty" else fifo)
+
+                def result(*args: str, deadline: float = math.inf) -> dict[str, object]:
+                    reply = read(*args, deadline=deadline)
+                    if args == ("pane", "process-info", "--pane", pane):
+                        info = herdr.json_object(reply["process_info"], "fixture process info")
+                        processes = herdr.json_items(info["foreground_processes"], "fixture foreground processes")
+                        info["foreground_processes"] = [*processes,
+                            {"pid": child, "name": program, "argv": [program, "private-argument"]}]
+                    return reply
+
+                def native(process: int, kind: str, reported: str = "") -> herdr.NativeAgentProcess:
+                    if process == child:
+                        raise herdr.NativeRegistryUnavailable("the Claude child has no session")
+                    return self.world.native_process(process, kind, reported)
+
+                record = staff.snapshot()
+                self.world.commands.clear()
+                with (patch.object(self.world, "result", side_effect=result),
+                      patch.object(herdr, "native_process", side_effect=native),
+                      patch.object(send, "delivery_timeout", return_value=1.0),
+                      patch.object(send, "_send", return_value=send.Result("sent", "fixture holder")) as holder,
+                      redirect_stderr(io.StringIO()) as errors, ExitStack() as fixture):
+                    if draft:
+                        _ = fixture.enter_context(patch.object(self.world, "composer",
+                            return_value=herdr.ComposerInput("Keep this draft.")))
+                    states = {state.row.id: state for state in worker_panes.observe(self.parent.id, record)}
+                    delivery = send.deliver_worker_text(row, record, body, sender="detached-runs", timeout=1)
+
+                self.assertIsInstance(states[row.id], worker_panes.OpenWorker)
+                self.assertIsInstance(states[absent.id], worker_panes.ClosedWorker)
+                self.assertEqual(errors.getvalue(), "")
+                if stdin in ("pipe", "exited"):
+                    self.assertIsInstance(delivery, send.PaneTextDelivered)
+                    self.assertEqual(len(self.prompts()), 1)
+                    self.assertEqual(self.prompts()[0][:3], ("agent", "prompt", pane))
+                    self.assertIn(body, self.prompts()[0][3])
+                    holder.assert_not_called()
+                else:
+                    self.assertEqual(self.prompts(), [])
+                    self.assertEqual(delivery, send.Result("sent", "fixture holder"))
+                    holder.assert_called_once()
+                    options = cast(send.Options, holder.call_args.args[0])
+                    self.assertEqual(options.to, f"session:{self.parent.current_session}")
+                    reason = ("terminal held by editor" if stdin == "tty" else
+                              "terminal may be held by editor because its stdin is unavailable")
+                    self.assertEqual(send.body_text(options), f"Worker {row.name}: anomaly: {reason}\n{body}")
 
     def test_unknown_pane_in_the_parents_tab_leaves_an_absent_worker_uncertain(self) -> None:
         absent = self.worker("absent")

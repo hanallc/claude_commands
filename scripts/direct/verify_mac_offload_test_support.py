@@ -495,7 +495,7 @@ fi
 '''
 
 
-ASSIGNED_RUNNER_SETUP = r'''
+ASSIGNED_RUNNER_SETUP = rf'''
 if "--assignment-file" in arguments:
     import atexit
     import io
@@ -503,8 +503,8 @@ if "--assignment-file" in arguments:
     from contextlib import redirect_stdout
 
     with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root:
-        exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+        exec(package_root.read(), {{"__file__": package_root.name}})
+    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
     from scripts.mac_test import mac_test as assigned_mac_test, claim_state
     from scripts.lib import process_start
 
@@ -532,7 +532,7 @@ if "--assignment-file" in arguments:
     start = process_start.process_start(os.getpid())
     assert isinstance(start, process_start.Started)
     holder = placement.ClaimHolderIdentity(assignment.owner.host, os.getpid(), start.start)
-    permission_deadline = time.monotonic() + 10
+    permission_deadline = time.monotonic() + {TEST_HANG_GUARD_SECS}
     while True:
         permission = admission_client.consume_permission(wire.ConsumePermission(uuid.uuid4().hex, assignment, reference, holder))
         if isinstance(permission, wire.FirstAuthorization):
@@ -548,7 +548,7 @@ if "--assignment-file" in arguments:
         output.write(assignment.attempt + "\n")
 
     fixture_outcome = placement.AttemptOutcomeUnavailable("the execution has not settled")
-    fixture_evidence = placement.ExecutionEvidenceUnavailable("the execution has not settled", time.time())
+    fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the execution has not settled", time.time())
     fixture_cleanup_confirmed = False
 
     def finish_assigned() -> None:
@@ -588,7 +588,7 @@ result = Path(arguments[arguments.index("--result") + 1])
 ''' + ASSIGNED_RUNNER_SETUP + r'''
 if "--assignment-file" in arguments:
     fixture_outcome = placement.PrelaunchRefused("runner")
-    fixture_evidence = placement.ExecutionNotStarted()
+    fixture_evidence = execution_identity.ExecutionNotStarted()
     fixture_cleanup_confirmed = True
 if "--copy" in arguments:
     # A Mac copy started by copy_watch.py. With TEST_COPY_CLAIM (mac_test.py)
@@ -638,7 +638,7 @@ if "--copy" in arguments:
         wait_for_file(root / "copy-release")
     if "--assignment-file" in arguments:
         fixture_outcome = placement.AttemptCompleted(int(os.environ.get("TEST_COPY_STATUS", "1")))
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
     result.write_text("mac=" + os.environ.get("TEST_COPY_MAC", "failed") + "\nreason=\nseconds="
                       + os.environ.get("TEST_COPY_SECONDS", "2.5") + "\n", encoding="utf-8")
     release_copy_claim()
@@ -667,7 +667,7 @@ def decline(reason: str, seconds: str) -> None:
     if "--assignment-file" in arguments:
         fixture_outcome = (placement.AttemptDeclined(reason) if reason in ("no_tests", "lost")
                            else placement.PrelaunchRefused(reason))
-        fixture_evidence = placement.ExecutionNotStarted()
+        fixture_evidence = execution_identity.ExecutionNotStarted()
     refusal = root / "placement-refusal.json"
     ready = refusal.with_suffix(".ready")
     ready.write_text(json.dumps({"reason": reason or "runner", "attempt": attempt,
@@ -722,10 +722,10 @@ if verb_answer.exists():
 if "--assignment-file" in arguments:
     if (mode == "passed" and runner_status == 0) or (mode == "failed" and runner_status not in (0, 75)):
         fixture_outcome = placement.AttemptCompleted(runner_status)
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
     elif mode == "lost":
         fixture_outcome = placement.AttemptDeclined("lost")
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
 if mode in ("passed", "failed", "lost"):
     print("mac_test: running on the Mac (macOS, host Mac); tree copied in 0.0 s", flush=True)
 if mode == "none":
@@ -1204,7 +1204,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                     "ENV",
                 }
                 # Fixture calls must not update the outer run or use its folders.
-                and not name.startswith(("BASH_FUNC_", "UNIT_"))
+                and not name.startswith(("BASH_FUNC_", "UNIT_", "GIT_"))
             },
             "HOME": str(self.home),
             "PATH": stub_build_tool_path(self.bin_directory),

@@ -119,8 +119,8 @@ Recommendation: A until S8. If nate picks N1-B or N1-C, B follows.
 
 1. Delete `Cargo.toml`, `Cargo.lock`, `rust/` and `taplo.toml` at the repo root. The generic gate code then finds no Rust: `hooks/checkpoint_gate.py:883`, `production/checkpoint_gate.py:83-109`, `merge_checkpoint.py:827-834`. No code change there.
 2. Docs: `config/mac_test.conf:56-57` and `docs/direct/final_gate_commit.md:11-15` are true again with no edit. Mark the old reader plan as replaced by this plan.
-3. Config, with nate's go: delete `install_folder`, `build_limit_seconds` and `build_stop_grace_seconds` in `config/style_reader.conf`, then delete `~/.local/state/style/reader` (7.2 MiB).
-4. Leftovers: delete the two scratch copies `reader-start-716d7d` and `reader-store-62d7e7` and their outputs under `/build/cargo/scratch` (1.3 GiB) through `scratch.py`. Clean the reader target in the Mac mirror of `.claude` through the Mac queue only.
+3. Config, with nate's go: delete `install_folder`, `build_limit_seconds` and `build_stop_grace_seconds` in `config/style_reader.conf`, then delete `~/.local/state/style/reader` (7.2 MiB). Done 2026-11-18 (nate's go through dwight: "delete").
+4. Leftovers: delete the two scratch copies `reader-start-716d7d` and `reader-store-62d7e7` and their outputs under `/build/cargo/scratch` (1.3 GiB) through `scratch.py`. Clean the reader target in the Mac mirror of `.claude` through the Mac queue only. Done 2026-11-18.
 5. Not in this phase: `config/cloud_gate.conf:111` keeps cargo and rustc on the AWS box. builds removes them only after a `gate_trial.py` pass without them, with nate's go.
 
 **Proof:** one `~/.claude` merge and one checkpoint commit with no Rust step and no `verify.sh doc` pass; one AWS gate with zero style failures.
@@ -201,7 +201,17 @@ Provisional: S2 designs the API from the uses and can change these phases. The S
 | S7 | 11 | Timing, memory, Mac proof against the S1 targets | both | S6 |
 | S8 | 12 | Shadow comparison, switch with nate's go, removal of Python selection | `~/.claude` | S7 |
 
-S3 and S4 run at the same time. Each speed phase reports its result against its target: **milestone 7**.
+S3 and S4 run one after the other: a unit holds one Rust build-queue item at a time (nate, 2026-11-18). Each speed phase reports its result against its target: **milestone 7**.
+
+S3 runs as five phases in series, from the S3 inventory (2026-11-18). Each phase is one cargo-liner checkpoint:
+
+1. `s3-cache`: typed facts apart from their wire format; the blob fact cache in `selection.sqlite` by blob id and reader version; misses parse on all cores.
+2. `s3-ledger`: read-only ledger access and the `finding` subcommand with its first answer, the source anchor, and the `observed` ledger revision.
+3. `s3-declarations`: `finding` adds declaration outcomes and site evidence.
+4. `s3-rename`: `finding` adds rename permission and the applied check.
+5. `s3-footprint`: `finding` adds footprints; the S3 measure (needed blobs, cold time, the stop point).
+
+Code with no consumer cannot land, so each S3 phase extends `finding`, its consumer. The `next` request and reply types (`NextOutcome`, `SelectedTicket`) move to S5, which builds `next` (style-unit, 2026-11-18).
 
 ### `syn` and reuse
 

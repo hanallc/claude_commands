@@ -262,6 +262,8 @@ Only proof that the producer runs on the target permits a skip.
 Unreadable live account evidence prevents the stop, start, and home change.
 The [producer launch contract](shutdown-and-restart.md#producer-launch-and-admission) defines the shared move and publication checks.
 An empty group can still select its account.
+The preview and move report an incomplete member list when the Claude registry is unreadable.
+The move saves the group selection and limits session moves to members with live evidence.
 Each member has an independent result.
 A single-session move refuses a grouped session and names the group operation.
 The move path creates no ready mark, conductor, follow command, or cancellation step.
@@ -423,14 +425,39 @@ The `board` is `accounts.status_board()`: the table the console Accounts page dr
 The reader finds the Claude transcript by session ID across project folders.
 Claude model and effort come from the latest real assistant message.
 Codex model and effort come from the latest `turn_context`.
-The model reader scans at most 128 KiB from the end of a plain file.
-For a compressed file, it streams the records and caches the result in memory by path, size, and modification time.
-`session_model_cache_entries` in `config/accounts.conf` sets the limit for each process.
-The cache evicts the least recently used result when a new result exceeds the limit.
+The model reader scans a plain file backward in 16 KiB blocks until it finds the newest model row.
+`session_model_scan_kib` in `config/accounts.conf` limits the scan.
+The default is 8192 KiB. The setting accepts 128 to 32768 KiB.
+The reader checks one byte before the range to detect a row that starts at the limit.
+A damaged complete model row gives `unknown`. The reader skips damaged output rows.
+An unfinished last row can leave an earlier model in effect.
+A scan that reaches the limit without a model row gives `unknown`.
+
+A status scan loads the plain transcript cache once and saves changes atomically.
+The cache file is `$XDG_CACHE_HOME/claude/session-models.json`.
+If `XDG_CACHE_HOME` is unset, the reader uses `~/.cache`.
+The cache retains the largest transcripts up to `session_model_cache_entries`.
+The cache drops entries whose encoded fields exceed 32 KiB.
+A missing or damaged cache starts a fresh scan.
+Unchanged transcripts need no reads. On growth, the reader checks hashes at both ends of the old content.
+The reader also checks the cached model row before it reuses that row.
+A rewrite that preserves the sampled edges and the cached model row can escape detection.
+If the hashes match, the reader checks new bytes and any unfinished row within the scan range.
+If the file grows during the scan, the next scan reads the bytes from that append.
+If an unfinished row starts before the range, the reader checks only the new bytes.
+The reader uses a cached model row only while the row remains in range.
+The reader scans again after replacement or truncation.
+For a compressed file, the reader streams the records and caches the result in the process.
+The compressed cache evicts the least recently used result at `session_model_cache_entries`.
 A missing Claude transcript gives `unknown`.
 Live process options apply when the reader can establish that no turn was recorded.
-The peer count document carries known model counts by account and role.
+The peer count document carries model counts and session names by account and role.
 The Models table puts the remainder of each role count in the `unknown` row.
+Hover over a positive count or focus it to see the session names in order.
+The tooltip uses the staff name or the Claude registry name.
+If neither name is available, the tooltip uses the first eight characters of the session ID.
+The tooltip includes the machine for each peer session.
+An older peer count adds a line such as `2 more on mac` for sessions without names.
 `config/statusline.conf` holds each account color under `account.<label>`.
 `ROLE_COLOR_KEYS` maps each role group to its color key:
 
@@ -447,6 +474,22 @@ The account details include the dot, label, swatch, allowance, reset, credits, a
 A separated row shows the account details again.
 A lone producer row shows all account details.
 The helper preserves the complete input rows for later sorts.
+The Accounts page shows a Lucide warning triangle or urgent octagon beside the weekly percentage.
+`accounts_quota_warning_percent` and `accounts_quota_urgent_percent` in `config/review_links.conf` start at 10 and 5.
+The warning value must be greater than the urgent value.
+The Accounts entry shows the most urgent active icon during the console count refresh.
+The row, the sidebar and Clear use stored weekly readings for accounts that are currently signed in.
+Select a row icon to read the alert and clear it for that account.
+Clear keeps the percentage color and stores the cleared level and reset time on the server.
+A cleared warning can return as urgent. A cleared urgent alert hides both levels.
+The page, sidebar, and Clear use the same rule to identify a weekly window.
+Two reset times name the same window when they differ by less than `accounts_quota_same_window_seconds`.
+The setting starts at 3600 seconds in `config/review_links.conf`.
+The clear record survives a page refresh and a server restart.
+After the weekly reset, a low reading in the new window can show an alert again.
+If a reading has no reset time, Clear keeps the last reset time in the account's clear record.
+The server keeps the clear records in `console/.accounts-quota-cleared.json` under the review root.
+If the file is malformed, the table shows the problem, the sidebar hides the icon and Clear refuses to write.
 Each named header on the Accounts page has a sort control.
 The first selection sets the order for that column.
 
@@ -485,6 +528,18 @@ The swatch opens a color chooser with Try, Save, and Cancel.
 Try changes every label and swatch of that key locally without a request.
 Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
+Save records the value and its order in the settings journal before it writes the live value.
+Natedev issues the orders from a persistent counter. The published commit carries them in `config/settings-orders.json`.
+Each pull holds the journal lock from the ancestry check through restore.
+The Mac accepts an SSH live write only when its order is greater than the accepted order.
+The journal retains the accepted order after the tree includes that order and the pending value clears.
+Restore changes only the keys with pending values in the live files.
+The move marker records the plan before Git changes the checkout and records each completed Git step.
+At the source commit, recovery reverses the recorded changes and keeps separate staged edits.
+At the target commit, recovery completes the planned writes if the files still match their recorded versions.
+If recovery cannot account for a change, it keeps the marker and gives the command to inspect the file.
+When you remove a key by hand in Git, keep its entry in `config/settings-orders.json`.
+A peer commit with the saved value and no order still needs a commit that records the order.
 A host added later whose name matches a model ID suffix makes that model's color key a host override.
 The page pauses refresh while the chooser is open.
 A board line of a selected Claude group carries its account and group.

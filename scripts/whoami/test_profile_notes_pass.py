@@ -96,8 +96,6 @@ class ProfileNotesPassTests(unittest.TestCase):
         _ = (self.home / "showrunners.conf").write_text(("""# range: 0..
 threshold_percent=2
 # range: 0..
-repeat_minutes=30
-# range: 0..
 stall_minutes=5
 faults_to=fixture
 always=

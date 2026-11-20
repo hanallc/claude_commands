@@ -174,8 +174,7 @@ class BerthHookTests(unittest.TestCase):
         _ = (directory / "phases" / phase / "files").write_text("src/lib.rs\n")
         _ = (directory / "progress_history_state.json").write_text(json.dumps({
             "run_id": directory.name, "owner_staff_id": parent.id, "history_file": str(self.root / (directory.name + ".jsonl")),
-            "open_phases": [],
-            "phase": {"id": phase, "instance_id": "instance-" + phase, "status": "active"},
+            "open_phases": [{"id": phase, "instance_id": "instance-" + phase, "status": "active"}],
         }))
 
     def held_hook(self, patch: str) -> str:
@@ -388,7 +387,7 @@ class BerthHookTests(unittest.TestCase):
         _ = (directory / phase_reservation.STATE_FILE).write_text(json.dumps(
             {"kind": "enrolled_awaiting_first_touch", "phase": "7"}))
         _ = (run / "progress_history_state.json").write_text(json.dumps({
-            "owner_staff_id": self.owner_id, "phase": {"id": "7", "status": "active"}}))
+            "owner_staff_id": self.owner_id, "open_phases": [{"id": "7", "status": "active"}]}))
         return run
 
     def test_a_seat_of_a_side_run_checks_its_own_runs_phase_not_the_markers(self) -> None:
@@ -490,8 +489,7 @@ class BerthHookTests(unittest.TestCase):
         records = [{"id": phase, "status": "active"} for phase in phases]
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
             "owner_staff_id": self.owner_id,
-            "phase": records[-1] if records else {"id": "15", "status": "completed"},
-            "open_phases": records[:-1]}))
+            "open_phases": records}))
 
     def map_phase_session(self, phase: str) -> None:
         """Berth's session map names the phase's own session, as a check acquired under it leaves it."""

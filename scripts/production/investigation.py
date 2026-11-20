@@ -60,6 +60,13 @@ class Investigation:
     kind: InvestigationKind = InvestigationKind.INVESTIGATION
     submission: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
 
+    @property
+    def source_owner(self) -> staff.StaffId:
+        if isinstance(self.submission, new_item_dialog.ReviewSubmission):
+            return new_item_dialog.request_recipient(new_item_dialog.SubmissionKind(self.kind.value),
+                                                     self.submission.request_id)
+        return self.owner
+
 
 _NO_REVIEW_SUBMISSION = new_item_dialog.NoReviewSubmission()
 _held_recipients: ContextVar[frozenset[Path]] = ContextVar("investigation_locks", default=frozenset())
@@ -74,15 +81,19 @@ class Investigations(record_store.NumberedRecords):
 
     @override
     @contextmanager
-    def locked(self) -> Generator[None]:
+    def locked(self, *, check: Callable[[], object] | None = None) -> Generator[None]:
         path = self.lock_path().resolve()
         held = _held_recipients.get()
         if path in held:
+            if check is not None:
+                _ = check()
             yield
             return
         with super().locked():
             token = _held_recipients.set(held | {path})
             try:
+                if check is not None:
+                    _ = check()
                 yield
             finally:
                 _held_recipients.reset(token)
@@ -135,7 +146,7 @@ def investigation_numbers() -> AbstractContextManager[record_store.LockedRecordN
     return record_store.record_numbers(record_store.RecordKind.INVESTIGATION, _seed_id)
 
 
-def _record_ids(owner: staff.StaffId, *, strict: bool = False) -> Iterator[tuple[Path, str]]:
+def review_record_ids(owner: staff.StaffId, *, strict: bool = False) -> Iterator[tuple[Path, str]]:
     """Find native investigation records in the active store and archives."""
     roots = record_store.known_folders(record_store.RecordKind.INVESTIGATION, owner, strict=strict)
     for path in record_store.stored_paths(roots, strict=strict):
@@ -145,12 +156,12 @@ def _record_ids(owner: staff.StaffId, *, strict: bool = False) -> Iterator[tuple
 
 def review_record_paths(owner: staff.StaffId, *, strict: bool = False) -> Iterator[Path]:
     """Find the paths of stored investigations."""
-    yield from (path for path, _ in _record_ids(owner, strict=strict))
+    yield from (path for path, _ in review_record_ids(owner, strict=strict))
 
 
 def _record_path(store: Investigations, identity: str, *, strict: bool = True) -> Path:
     _ = store.path(identity)
-    paths = [path for path, number in _record_ids(store.owner, strict=strict) if number == identity]
+    paths = [path for path, number in review_record_ids(store.owner, strict=strict) if number == identity]
     if len(paths) > 1:
         raise InvestigationError(f"{identity}: more than one investigation has this ID for owner {store.owner}")
     if not paths:
@@ -179,6 +190,14 @@ def read_review_record(path: Path) -> Investigation:
     store = _store(review_owner(path))
     identity = store.field(path.stem, "id", path=path)
     return _load(store, identity, path)
+
+
+def open_review_investigations(owner: staff.StaffId) -> Iterator[tuple[Path, Investigation]]:
+    """Find user filings that still need an answer or review."""
+    for path, identity in review_record_ids(owner, strict=True):
+        header = record_store.read_header(path, keys=frozenset(("state", "review_submission")), strict=True)
+        if header.get("state") != [InvestigationState.READ] and header.get("review_submission"):
+            yield path, _load(_store(owner), identity, path)
 
 
 def find_review_submission(owner: staff.StaffId, kind: InvestigationKind, request_id: str
@@ -365,10 +384,11 @@ def _answer(store: Investigations, identity: str, text: str, question_id: str,
         return item, True
 
 
-def mark_read(owner: staff.StaffId, identity: str, words: str = "") -> Investigation:
+def mark_read(owner: staff.StaffId, identity: str, words: str = "", *,
+              check: Callable[[], object] | None = None) -> Investigation:
     """Mark an answer read once; accept an exact repeat without writing."""
     store = _store(owner)
-    with store.locked():
+    with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
         if item.state == InvestigationState.READ:
@@ -381,12 +401,13 @@ def mark_read(owner: staff.StaffId, identity: str, words: str = "") -> Investiga
         return item
 
 
-def review_action(owner: staff.StaffId, identity: str, action: str, words: str, *, reply_token: str = "") -> Investigation:
+def review_action(owner: staff.StaffId, identity: str, action: str, words: str, *, reply_token: str = "",
+                  check: Callable[[], object] | None = None) -> Investigation:
     """Record feedback or a question and keep each previous answer in the log."""
     if not words.strip():
         raise InvestigationError("enter your words")
     store = _store(owner)
-    with store.locked():
+    with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
         replace_wait = (item.state == InvestigationState.OPEN and action == 'question' and bool(reply_token)
@@ -411,19 +432,20 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
         return item
 
 
-def record_review_log(owner: staff.StaffId, identity: str, words: str) -> None:
+def record_review_log(owner: staff.StaffId, identity: str, words: str, *,
+                      check: Callable[[], object] | None = None) -> None:
     store = _store(owner)
-    with store.locked():
+    with store.locked(check=check):
         path = _record_path(store, identity)
         item = _load(store, identity, path)
         event = ReviewLog(datetime.now(timezone.utc), 'nate', words)
         _ = _save(store, replace(item, log=review_events.append(item.log, event)), path)
 
 
-def change_waiting(record: Investigation, action: str, words: str) -> None:
+def change_waiting(record: Investigation, action: str, words: str, *, check: Callable[[], object] | None = None) -> None:
     """Update a waiting investigation selected by its owner and ID."""
     store = _store(record.owner)
-    with store.locked():
+    with store.locked(check=check):
         path = _record_path(store, record.id)
         item = _load(store, record.id, path)
         if item.submission != record.submission or item.state != InvestigationState.OPEN:
