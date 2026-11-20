@@ -3699,21 +3699,20 @@ done
                 assert isinstance(replay.reply, wire.Admitted)
                 return wire.LocalPlacementGranted(saved.assignment, replay.reply, diagnostics, disk_exclusions, stale_hana)
             coordinator_runs = coordinator_runs_mac_command(request, saved.assignment.destination)
-            if isinstance(saved.permission, placement.PermissionConsumed):
-                if coordinator_runs:
-                    return self._placement_status(saved.assignment, "launch permission was already consumed")
+            if coordinator_runs:
+                if isinstance(saved.permission, placement.PermissionAvailable):
+                    refusal = self._mac_launch_refusal(request, saved)
+                    if isinstance(refusal, wire.DispatchStatus):
+                        return refusal
+                    # Save permission before the coordinator receives the assignment.
+                    key = execution_identity.attempt_key(saved.assignment.episode, saved.assignment.attempt)
+                    self.assignments[key] = replace(saved, permission=placement.PermissionConsumed(self.clock.now()))
+                    self.persist()
+            elif isinstance(saved.permission, placement.PermissionConsumed):
                 return wire.PlacementWait(request.episode, request.since, 1,
                     self.placement_eligibility.get(request.episode, ()),
                     provider_diagnostics=diagnostics, mac_disk_exclusions=disk_exclusions,
                     retry_notices=retry_notices)
-            if coordinator_runs:
-                refusal = self._mac_launch_refusal(request, saved)
-                if isinstance(refusal, wire.DispatchStatus):
-                    return refusal
-                # The Mac command can launch when the coordinator receives this assignment.
-                key = execution_identity.attempt_key(saved.assignment.episode, saved.assignment.attempt)
-                self.assignments[key] = replace(saved, permission=placement.PermissionConsumed(self.clock.now()))
-                self.persist()
             return wire.Assignment(saved.assignment, diagnostics, disk_exclusions, stale_hana)
         terminal = [saved for saved in self.assignments.values() if saved.assignment.episode == request.episode
                     and isinstance(saved.state, placement.ClosedAssignment) and saved.state.reason in ("completed", "cancelled")]

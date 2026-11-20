@@ -2221,11 +2221,17 @@ process.stdout.write(JSON.stringify({
         routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)
         with mock.patch.object(target_availability.build_targets, "step_policy",
                                return_value=target_config.ExcludedTarget(MAC, "off")):
-            for route in (target_config.ANY_ELIGIBLE_TARGET, target_config.MAC_ONLY, target_config.PinnedTarget("mac")):
+            for route, eligible_targets, runs_on in (
+                (target_config.ANY_ELIGIBLE_TARGET, ["natedev"], "natedev only"),
+                (target_config.MAC_ONLY, [], ""),
+                (target_config.PinnedTarget("mac"), [], ""),
+            ):
                 with self.subTest(route=route):
                     notes = memory_feed.target_notes(route, routes, "nextest", "/fixture/hana", "hana")
                     self.assertEqual(notes["because"], "enabled.mac is off")
                     self.assertEqual(notes["mac_text"], "Mac: no, enabled.mac is off")
+                    self.assertEqual(notes["targets"], eligible_targets)
+                    self.assertEqual(notes["runs_on"], runs_on)
 
     def test_target_notes_name_what_holds_the_mac_only_for_a_mac_only_step_while_something_holds_it(self) -> None:
         routes = target_availability.MacRoutes((snapshot(MAC, targets.Free()), snapshot(NATEDEV, targets.Free())), {}, UTC)

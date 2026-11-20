@@ -2320,6 +2320,34 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             assert isinstance(completed, wire.DispatchStatus)
             self.assertEqual(completed.state, placement.ClosedAssignment("completed"))
 
+    def test_coordinator_retries_a_lost_mac_assignment_with_either_switch_value(self) -> None:
+        for switch in ("on", "off"):
+            with self.subTest(switch=switch), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                request = replace(request, constraints=replace(request.constraints,
+                    command_kind="run", selection=placement.PinnedHost("mac")))
+                _ = publish_candidate(fixture, request)
+                peer = fixture.connect(request)
+                for _ in range(4):
+                    fixture.server.run_once(0)
+                peer.close()
+
+                state = service.read_state(fixture.state_dir)
+                key = state.current_assignments[request.episode]
+                saved = state.assignments[key]
+                self.assertIsInstance(saved.permission, placement.PermissionConsumed)
+                fixture.clock.advance(1)
+                if switch == "off":
+                    _ = write_config_fixture(fixture.root / "build_targets.conf", "enabled.mac=off\n")
+
+                self.assertEqual(fixture.connect(request).replies(), [wire.Assignment(saved.assignment)])
+                self.assertEqual(service.read_state(fixture.state_dir).assignments[key].permission, saved.permission)
+
+                other = placement_request(fixture)
+                resend = replace(request, owner=other.owner, run=other.run)
+                self.assertEqual(fixture.connect(resend).replies(),
+                    [wire.Refused("placement episode changed its owner, start, run or purpose")])
+
     def test_only_manual_mac_commands_can_launch_with_the_switch_off(self) -> None:
         cases = ((placement.PlacedMacWork(), "run"),
                  *((placement.ManualMacCommand(), kind) for kind in placement.MAC_RUN_KINDS))
