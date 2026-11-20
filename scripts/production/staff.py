@@ -36,6 +36,10 @@ if TYPE_CHECKING:
     import argparse
 
 OWNER_MACHINE = "natedev"
+MERGE_CHECKOUT_FIELD = "Merge checkout"
+LIVE_DOCUMENT_SUFFIX = "-live.md"
+SHOWRUNNER_NOTES_DIR = ".showrunner-notes"
+CARGO_LINER_PRODUCTION = "cargo-liner"
 StaffId = NewType("StaffId", str)
 Kind = Literal["showrunner", "unit", "worker", "producer"]
 _KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "producer")
@@ -567,6 +571,10 @@ def _document_checkout(path: Path) -> CheckoutDocument | OutsideGitCheckout | Un
     return CheckoutDocument(checkout.common_dir, document.relative_to(checkout.toplevel))
 
 
+def declares_merge_checkout(lines: Sequence[str]) -> bool:
+    return any(line.startswith(f"- **{MERGE_CHECKOUT_FIELD}:**") for line in lines)
+
+
 @dataclass(frozen=True)
 class StaffSnapshot:
     rows: tuple[StaffRow, ...]
@@ -684,6 +692,13 @@ class StaffSnapshot:
             if isinstance(candidate, UnreadableGitCheckout):
                 continue
             if candidate == identity:
+                try:
+                    if declares_merge_checkout(row.doc.path.read_text(encoding="utf-8").splitlines()):
+                        continue
+                except FileNotFoundError:
+                    pass
+                except (OSError, UnicodeError) as error:
+                    raise StaffRefused(f"{row.doc.path}: cannot read production document: {error}") from error
                 matches.append(row)
         if len(matches) > 1:
             names = ", ".join(str(row.id) for row in matches)
@@ -2119,10 +2134,25 @@ def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc) -> StaffRow:
                             "--state", "live" if isinstance(doc, LiveDoc) else "wrapped"])
 
     def edit(rows: list[StaffRow]) -> StaffRow:
+        from scripts.agents import remote
+
         row = _required(rows, showrunner)
         if row.kind not in ("showrunner", "producer"):
             raise StaffRefused("set-doc requires a showrunner or producer")
-        changed = replace(row, doc=_keep_location_fields(doc, row.doc))
+        location = doc
+        if row.kind == "showrunner" and doc.machine == remote.local_machine():
+            try:
+                enrolled = declares_merge_checkout(doc.path.read_text(encoding="utf-8").splitlines())
+            except FileNotFoundError:
+                enrolled = False
+            if enrolled:
+                path = doc.path.resolve(strict=True)
+                if any(other.id != row.id and isinstance(other.doc, LiveDoc | WrappedDoc)
+                       and other.doc.machine == doc.machine and other.doc.path.resolve() == path
+                       for other in rows):
+                    raise StaffRefused(f"{path}: another staff row already owns this document")
+                location = replace(doc, path=path)
+        changed = replace(row, doc=_keep_location_fields(location, row.doc))
         rows[rows.index(row)] = changed
         return changed
 
