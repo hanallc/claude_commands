@@ -165,8 +165,9 @@ PYTHON
     registry_read_probe "$TEST_DIR" "$MODELS_CONFIG_FILE"
     bash "$SCRIPT_DIR/default_models.sh" direct.impl gpt-test:medium > "$TEST_DIR/editor-output" \
         || fail "the inherited editor write failed"
-    [[ "$(wc -l < "$TEST_REGISTRY_READS")" -eq 2 ]] \
-        || fail "the inherited editor read outside its two publication reads: $(cat "$TEST_REGISTRY_READS")"
+    # The local save reads under the lock and returns the text it saved.
+    [[ "$(wc -l < "$TEST_REGISTRY_READS")" -eq 1 ]] \
+        || fail "the inherited editor must read the registry once for the local save: $(cat "$TEST_REGISTRY_READS")"
     grep -q '^impl=gpt-test:medium$' "$MODELS_CONFIG_FILE" \
         || fail "the inherited editor did not publish its row"
 )

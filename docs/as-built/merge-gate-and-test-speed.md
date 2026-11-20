@@ -212,7 +212,7 @@ The regression tests observe complete operations and child processes.
 | Test | Observation |
 |---|---|
 | `test_resolve_reuses_the_stored_role_and_live_model_identity` | Worker reuse reads the registry zero times with both operation snapshots cleared. |
-| `test_inherited_editor_writes_without_catalog_sync` | An inherited editor publishes its row with exactly two registry reads. |
+| `test_inherited_editor_writes_without_catalog_sync` | An inherited editor saves its row with one registry read under the lock. |
 | `test_sync_codex_catalog.sh` | Lock contention produces no registry reads; an acquired lock permits reads before an invalid cache fails. |
 | `test_failed_catalog_sync_warns_and_returns_the_current_configuration` | Both fresh factories warn after sync failure and return the current path and text. |
 
