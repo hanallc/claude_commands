@@ -5,6 +5,7 @@ from scripts.lib import atomic_file, cancellation
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 import functools
 import io
@@ -312,7 +313,7 @@ class QueuePlaceFixture(ExitStack):
             self.children.append(child)
             self.supply_process(child.pid, GIB)
             if self.complete_scoped_launch and argv[0] == "systemd-run":
-                _ = child.wait(timeout=3)
+                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
             return child
 
         _ = self.enter_context(mock.patch.object(subprocess, "Popen", side_effect=start))
@@ -332,7 +333,7 @@ class QueuePlaceFixture(ExitStack):
                             if line.startswith("0::"))
         if self.private_slice not in Path(holder_scope).parts:
             _ = self.callback(subprocess.run, ["systemctl", "--user", "stop", self.private_slice],
-                              capture_output=True, timeout=3, check=False)
+                              capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
 
     @property
     def directory(self) -> Path:
@@ -1415,7 +1416,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     self.assertEqual(fixture.history(), [])
                     self.assertTrue((directory / "cgroup.procs").read_text().split())
                     stopped = subprocess.run(["systemctl", "--user", "stop", directory.name],
-                                             capture_output=True, timeout=3, check=False)
+                                             capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
                     self.assertEqual(stopped.returncode, 0, stopped.stderr)
                     check()
                     check()
@@ -1430,7 +1431,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         pass
                     if scope_name:
                         _ = subprocess.run(["systemctl", "--user", "stop", Path(scope_name).name],
-                                           capture_output=True, timeout=3, check=False)
+                                           capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
                     if program_pid:
                         try:
                             send_process_group(program_pid, signal.SIGKILL)
@@ -1442,6 +1443,43 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
 
     def test_scope_survives_holder_death_after_its_leader_exits_before_popen_returns(self) -> None:
         self.assert_scope_survives_holder_death(leader_exits=True)
+
+    def test_holder_death_after_program_publication_prevents_execution(self) -> None:
+        published = threading.Event()
+        resume = threading.Event()
+        write_record = atomic_file.write_text_atomic
+
+        def pause_after_publication(path: Path, value: str) -> None:
+            write_record(path, value)
+            published.set()
+            LauncherHangGuard("Resume the wrapper after the holder exits").event(resume)
+
+        with (tempfile.TemporaryDirectory() as directory,
+              subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+                               stdin=subprocess.PIPE) as holder,
+              ThreadPoolExecutor(max_workers=1) as worker,
+              mock.patch.object(atomic_file, "write_text_atomic", new=pause_after_publication),
+              mock.patch.object(os, "execvp") as execute):
+            holder_start = records.process_start_time(holder.pid)
+            wrapper_start = records.process_start_time(os.getpid())
+            assert holder_start is not None and wrapper_start is not None
+            owner = wire.Owner(holder.pid, holder_start)
+            record = Path(directory) / "program.json"
+            scope = "/sys/fs/cgroup/fixture.scope"
+            guard = LauncherHangGuard("Program startup while the holder exits")
+            startup = worker.submit(queue.program_start, record, owner, ["fixture-program"], scope=scope)
+            try:
+                guard.event(published)
+                expected = queue.ProgramStart(owner, wire.Owner(os.getpid(), wrapper_start), scope)
+                self.assertEqual(record.read_text(), wire.encode_record(expected))
+                holder.kill()
+                self.assertEqual(holder.wait(timeout=guard.remaining()), -signal.SIGKILL)
+            finally:
+                resume.set()
+            with self.assertRaisesRegex(queue.QueuePlaceRefused, "the queue place holder exited during program publication"):
+                guard.result(startup)
+            execute.assert_not_called()
+            self.assertFalse(record.exists())
 
     def test_holder_death_before_scope_publication_prevents_program_execution(self) -> None:
         self.require_transient_scope()
