@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import io
-from contextlib import redirect_stderr
+from contextlib import ExitStack, redirect_stderr, redirect_stdout, suppress
 import json
 import os
-import runpy
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import time
+from time import monotonic as wall_monotonic
 import unittest
 from threading import current_thread, main_thread
 from types import ModuleType
@@ -23,7 +28,7 @@ from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
-from typing import cast, override
+from typing import ClassVar, cast, override
 from zoneinfo import ZoneInfo
 
 from scripts.agents import detached_runs
@@ -33,7 +38,6 @@ from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import showrunners, staff
 from scripts.agents.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, fixture_member, fixture_runtime_id
@@ -105,53 +109,18 @@ def executable(path: Path, source: str) -> None:
 # A marked worker is python, not sleep: the Mac hides a system binary's environment from ps.
 MARKED_SLEEPER = [sys.executable, "-c", f"import time; time.sleep({TEST_HANG_GUARD_SECS})"]
 
-def setUpModule() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them."""
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+WATCH_DEFAULTS = r"""sender_batch_seconds=90
+sender_cleanup_seconds=2
+delivery_reserve_seconds=10
+prompt_grace_seconds=120
+login_limit_pattern=Login reached its time limit
+paused_status_pattern=\bpaus(?:e[ds]?|ing)\b
+external_wait_pattern=\b(?:wait(?:ing)?|held|holding|blocked)\b.*?\b(?:on|for)\s+(?:the\s+)?(?P<owner>.+)
+external_owner_pattern=^(?:(?:showrunner|user|owner|someone|somebody|session)|unit(?!\s+tests?\b)|(?:another|other|a)\s+(?:unit|session)|[\w.-]+-unit|(?:session|codex):[\w-]+(?:\.[\w-]+)*)(?![\w-]|\.\w)
+holding_party_pattern=(?<![\w-])(?<!\w\.)(?:(?:showrunner|user|you|your)|(?:another|other|a)\s+(?:unit|session)|[\w.-]+-unit|(?:session|codex):[\w-]+(?:\.[\w-]+)*)(?![\w-]|\.\w)
+"""
 
-
-class StallWatchTests(unittest.TestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.root: Path = Path()
-        self.watches: dict[str, stall_watch.WatchedUnit] = {}
-        self.bin: Path = Path()
-        self.notifier: Path = Path()
-        self.sessions: Path = Path()
-        self.sessions_script: Path = Path()
-        self.config: Path = Path()
-        self.projects: Path = Path()
-        self.state: Path = Path()
-        self.ps_file: Path = Path()
-        self.send_log: Path = Path()
-        self.rca_log: Path = Path()
-        self.fail_file: Path = Path()
-        self.environment: dict[str, str] = {}
-        self.panes: dict[str, dict[str, str | int]] = {}
-        self.process_rows: list[str] = []
-        self.children: list[subprocess.Popen[bytes]] = []
-        # The retired units and the state mark on a unit's herdr pane, where a test sets one.
-        self.retired: set[str] = set()
-        self.states: dict[str, str] = {}
-        self.run_records: dict[str, list[dict[str, object]]] = {}
-        self.unheld_runs: set[str] = set()
-        self.director_overrides: dict[str, str] = {}
-
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(short_socket_directory()))
-        _ = cast(object, self.enterContext(mock.patch.multiple(
-            unit_runs, RUN_ROOT=self.root / "held", FORMER_RUN_ROOT=self.root / "former-held")))
-        self.environment["HERDR_PANE_RECORD_DIR"] = str(self.root / "pane-records")
-        self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        self.bin = self.root / "bin"
-        self.bin.mkdir()
-        self.notifier = self.root / "notifier"
-        self.notifier.mkdir()
-        self.sessions = self.root / "sessions"
-        self.sessions.mkdir()
-        self.sessions_script = self.root / "sessions.py"
-        _ = self.sessions_script.write_text("""import json, os, pathlib, sys
+SESSION_LOOKUP = """import json, os, pathlib, sys
 records = [json.loads(path.read_text()) for path in pathlib.Path(os.environ['NOTIFIER_SESSIONS_DIR']).glob('*.json')]
 command, target = sys.argv[1:]
 errors = json.loads(os.environ.get('STALL_TEST_SESSION_ERRORS', '[]'))
@@ -174,7 +143,148 @@ for record in records:
         print(record['sessionId'])
         raise SystemExit(0)
 raise SystemExit(1)
-""")
+"""
+SESSION_LOOKUP_CODE = compile(SESSION_LOOKUP, "fixture/sessions.py", "exec")
+
+
+SENDER = """#!/usr/bin/env python3
+import json, os, socket, sys
+args = sys.argv[1:]
+retire = args[:1] == ['retire']
+record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text', 'text-id', 'need')
+          if '--' + name in args}
+if retire:
+    record['command'] = 'retire'
+if '--value' in args:
+    record['values'] = dict(args[i + 1].split('=', 1) for i, arg in enumerate(args) if arg == '--value')
+line = (repr(record) + '\\n').encode()
+fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+os.write(fd, line)
+os.close(fd)
+if barrier := os.environ.get('STALL_TEST_SEND_BARRIER'):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        peer.settimeout(float(os.environ['STALL_TEST_HANG_GUARD_SECS']))
+        peer.connect(barrier)
+        if peer.recv(1) != b'+':
+            raise SystemExit('send barrier closed before all senders arrived')
+with open(os.environ['STALL_TEST_FAIL_FILE']) as targets:
+    fail = json.load(targets)
+# A failed retire is send.py's FAILED, exit 3; "retire" in the fail list fails only retires.
+if retire:
+    raise SystemExit(3 if 'retire' in fail else 0)
+raise SystemExit(1 if record['to'] in fail else 0)
+"""
+SENDER_CODE = compile(SENDER, "fixture/send.py", "exec")
+
+
+@dataclass(frozen=True)
+class FixtureProcessExit:
+    """The output of a fixture command that completes at launch."""
+    args: list[str]
+    returncode: int = 0
+    output: str = ""
+
+    def communicate(self, *, timeout: float) -> tuple[str, str]:
+        del timeout
+        return self.output, ""
+
+
+@dataclass(frozen=True)
+class ListeningPeer:
+    """A fixture listener that can serve another case before its deadline."""
+    process: subprocess.Popen[bytes]
+    deadline: float
+
+
+def stop_child(child: subprocess.Popen[bytes]) -> None:
+    if child.stdin is not None:
+        child.stdin.close()
+    child.terminate()
+    try:
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
+
+
+def setUpModule() -> None:
+    """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
+class StallWatchTests(unittest.TestCase):
+    listener_root: ClassVar[Path]
+    listeners: ClassVar[list[ListeningPeer]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        cls.listener_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="sw-peers-", dir="/tmp")))
+        cls.listeners = []
+        cls.addClassCleanup(cls.close_listeners)
+
+    @classmethod
+    def close_listeners(cls) -> None:
+        for listener in cls.listeners:
+            stop_child(listener.process)
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.root: Path = Path()
+        self.watches: dict[str, stall_watch.WatchedUnit] = {}
+        self.bin: Path = Path()
+        self.notifier: Path = Path()
+        self.sessions: Path = Path()
+        self.sessions_script: Path = Path()
+        self.config: Path = Path()
+        self.projects: Path = Path()
+        self.state: Path = Path()
+        self.ps_file: Path = Path()
+        self.send_log: Path = Path()
+        self.rca_log: Path = Path()
+        self.fail_file: Path = Path()
+        self.environment: dict[str, str] = {}
+        self.panes: dict[str, dict[str, str | int]] = {}
+        self.process_rows: list[str] = []
+        self.children: list[subprocess.Popen[bytes]] = []
+        self.unit_count: int = 0
+        self.hosted: list[tuple[HostedUnit, int]] = []
+        # The retired units and the state mark on a unit's herdr pane, where a test sets one.
+        self.retired: set[str] = set()
+        self.states: dict[str, str] = {}
+        self.run_records: dict[str, list[dict[str, object]]] = {}
+        self.unheld_runs: set[str] = set()
+        self.director_overrides: dict[str, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="sw-", dir="/tmp")))
+        _ = cast(object, self.enterContext(mock.patch.multiple(
+            unit_runs, RUN_ROOT=self.root / "held", FORMER_RUN_ROOT=self.root / "former-held")))
+        defaults = self.root / "watch-defaults.conf"
+        _ = defaults.write_text(WATCH_DEFAULTS)
+        _ = self.enterContext(mock.patch.object(stall_watch, "WATCH_DEFAULTS", defaults))
+        configuration = {
+            "production": "# range: 0..\nPROMPT_ALERT_SECONDS=60\n",
+            "rca": "# range: 0.001..\nsend_seconds=300\n",
+            "staff": ("# range: 0.001..\nOPERATION_LOCK_SECONDS=30\n# range: 0.001..\nREMOTE_SECONDS=20\n"
+                      + f"PRODUCER_WORKSPACE=producers\nPRODUCER_FOLDER_ROOT={self.root / 'producers'}\n"),
+            "shutdown": "# range: 5e-324..\nSTART_SECONDS=20\n# range: 5e-324..\nSTAY_SECONDS=10\n",
+        }
+        for name, contents in configuration.items():
+            _ = (self.root / f"{name}.conf").write_text(contents)
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root),
+            "STAFF_CONFIG": str(self.root / "staff.conf"), "STALL_WATCH_CONFIG": str(self.root / "stall_watch.conf")}))
+        self.environment["HERDR_PANE_RECORD_DIR"] = str(self.root / "pane-records")
+        self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.notifier = self.root / "notifier"
+        self.notifier.mkdir()
+        self.sessions = self.root / "sessions"
+        self.sessions.mkdir()
+        self.sessions_script = self.root / "sessions.py"
+        _ = self.sessions_script.write_text(SESSION_LOOKUP)
         self.projects = self.root / "projects"
         self.projects.mkdir()
         self.state = self.root / "stall-state"
@@ -189,40 +299,7 @@ raise SystemExit(1)
         self.addCleanup(self.close_processes)
         # Shell builtins print the rows; a cat child would double the starts for each snapshot.
         executable(self.bin / "ps", "#!/bin/sh\nwhile IFS= read -r row; do printf '%s\\n' \"$row\"; done < \"$STALL_TEST_PS_FILE\"\n")
-        # The record is a Python literal, and json loads only for a fail list. A json import adds
-        # about 60% to the start time of this stub, and stall_watch starts it for each delivery.
-        executable(self.bin / "send.py", """#!/usr/bin/env python3
-import os, sys, time
-args = sys.argv[1:]
-retire = args[:1] == ['retire']
-record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text', 'text-id', 'need')
-          if '--' + name in args}
-if retire:
-    record['command'] = 'retire'
-if '--value' in args:
-    record['values'] = dict(args[i + 1].split('=', 1) for i, arg in enumerate(args) if arg == '--value')
-line = (repr(record) + '\\n').encode()
-fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-os.write(fd, line)
-os.close(fd)
-expected = int(os.environ.get('STALL_TEST_SEND_TOGETHER', '0'))
-deadline = time.monotonic() + float(os.environ['STALL_TEST_HANG_GUARD_SECS'])
-while expected and len(open(os.environ['STALL_TEST_SEND_LOG']).readlines()) < expected:
-    if time.monotonic() >= deadline:
-        raise SystemExit('send barrier did not receive every concurrent delivery')
-    time.sleep(0.01)
-with open(os.environ['STALL_TEST_FAIL_FILE']) as targets:
-    text = targets.read()
-if text == '[]':
-    fail = []
-else:
-    import json
-    fail = json.loads(text)
-# A failed retire is send.py's FAILED, exit 3; "retire" in the fail list fails only retires.
-if retire:
-    raise SystemExit(3 if 'retire' in fail else 0)
-raise SystemExit(1 if record['to'] in fail else 0)
-""")
+        executable(self.bin / "send.py", SENDER)
         # rca.py's own sends: the owner message and its reminder.
         executable(self.bin / "rca-send.py", """#!/usr/bin/env python3
 import json, os, sys
@@ -231,8 +308,14 @@ record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'ke
 with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
     log.write(json.dumps(record) + '\\n')
 """)
+        inherited = ("PATH", "TMPDIR", "LANG", "LC_ALL", "USER_ZONE", "CLAUDE_PYTHON", "PYTHONPATH",
+                     "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE", "CONF_READ_LOG",
+                     "BUILDLOG_DIR", "BUILDLOG_LIVE_MEMORY_TRIPWIRE")
         self.environment = {
-            **os.environ,
+            **{name: os.environ[name] for name in inherited if name in os.environ},
+            **{name: value for name, value in self.environment.items() if not name.startswith("GIT_")},
+            "CONF_DIR": str(self.root),
+            "CODEX_HOME": str(self.root / "codex"),
             "HOME": str(self.root),
             "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
             "SHOWRUNNERS_CONFIG": str(self.config),
@@ -243,6 +326,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
             "STALL_WATCH_STATE_DIR": str(self.state),
             "STALL_WATCH_CONFIG": str(self.root / "stall_watch.conf"),
+            "STALL_TEST_WATCH_DEFAULTS": str(defaults),
             "STALL_WATCH_SESSIONS": str(self.sessions_script),
             "STALL_WATCH_PROJECTS_DIR": str(self.projects),
             "STALL_WATCH_PS": "ps",
@@ -250,6 +334,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             "STALL_TEST_PS_FILE": str(self.ps_file),
             "STALL_TEST_SEND_LOG": str(self.send_log),
             "XDG_STATE_HOME": str(self.root / "state"),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
             "RCA_SEND": str(self.bin / "rca-send.py"),
             "STALL_TEST_RCA_LOG": str(self.rca_log),
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
@@ -352,8 +437,6 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.config.write_text((f"""# range: 0..
 threshold_percent=1
 # range: 0..
-repeat_minutes=30
-# range: 0..
 stall_minutes={stall_minutes}
 faults_to=natedev
 always=natedev
@@ -386,12 +469,7 @@ always=natedev
 
     def close_processes(self) -> None:
         for child in self.children:
-            child.terminate()
-            try:
-                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
-            except subprocess.TimeoutExpired:
-                _ = child.kill()
-                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
+            stop_child(child)
 
     def record_session(self, pid: int, session_id: str, name: str, *, running: bool = True) -> Path:
         path = self.root / f"{session_id}.sock"
@@ -411,38 +489,78 @@ always=natedev
         check = f"CHECK=zsh /scripts/production/production_check.sh {owner.id}\n"
         _ = (directory / "conf").write_text(f"TARGET=session:{owner.id}\nPROMPT_FILE={prompt}\n{check}")
 
-    def unit(self, name: str) -> tuple[int, Path]:
-        socket_path = self.root / f"{unit_session(name)}.sock"
-        listener = ("import socket, sys, time; "
-                    "sock = socket.socket(socket.AF_UNIX); sock.bind(sys.argv[1]); sock.listen(128); "
-                    "print('listening', flush=True); time.sleep(float(sys.argv[2]))")
-        child = subprocess.Popen([sys.executable, "-c", listener, str(socket_path), str(TEST_HANG_GUARD_SECS)],
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self.children.append(child)
+    def unit_listener(self, slot: int, peer_path: Path) -> ListeningPeer:
+        reuse_slot = slot < len(self.listeners)
+        if reuse_slot:
+            previous = self.listeners[slot]
+            if wall_monotonic() < previous.deadline and previous.process.poll() is None:
+                return previous
+            stop_child(previous.process)
+            peer_path.unlink(missing_ok=True)
+        source = """import os, select, socket, sys, time
+path = sys.argv[1]
+deadline = float(sys.argv[2])
+with socket.socket(socket.AF_UNIX) as sock:
+    sock.bind(path)
+    try:
+        sock.listen(128)
+        print('listening', flush=True)
+        while (remaining := deadline - time.monotonic()) > 0:
+            readable, _, _ = select.select([sock, sys.stdin], [], [], remaining)
+            if sock not in readable or sys.stdin in readable:
+                break
+            connection, _ = sock.accept()
+            connection.close()
+    finally:
+        os.unlink(path)
+"""
+        deadline = wall_monotonic() + TEST_HANG_GUARD_SECS
+        child = subprocess.Popen([sys.executable, "-c", source, str(peer_path), str(deadline)],
+                                 env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+        listener = ListeningPeer(child, deadline)
+        if reuse_slot:
+            self.listeners[slot] = listener
+        else:
+            self.listeners.append(listener)
         assert child.stdout is not None
         with child.stdout:
             self.assertEqual(child.stdout.readline(), b"listening\n")
+        return listener
+
+    def unit(self, name: str) -> tuple[int, Path]:
+        socket_path = self.root / f"{unit_session(name)}.sock"
+        peer_path = self.listener_root / str(self.unit_count)
+        pid = self.unit_listener(self.unit_count, peer_path).process.pid
+        self.unit_count += 1
+        socket_path.symlink_to(peer_path)
         pane_pid = 10_000 + len(self.panes)
-        self.process_rows += [f"{pane_pid} 1 herdr pane", f"{child.pid} {pane_pid} claude --remote-control other-name"]
+        self.process_rows += [f"{pane_pid} 1 herdr pane", f"{pid} {pane_pid} claude --remote-control other-name"]
         pane_id = len(self.panes) + 1
-        self.panes[name] = {"pane": PANE, "id": pane_id, "pid": child.pid, "name": "showrunner", "label": f"label-of-{name}"}
-        _ = self.record_session(child.pid, unit_session(name), "different-remote-name")
-        record_path = self.sessions / f"{child.pid}.json"
+        self.panes[name] = {"pane": PANE, "id": pane_id, "pid": pid, "name": "showrunner", "label": f"label-of-{name}"}
+        _ = self.record_session(pid, unit_session(name), "different-remote-name")
+        record_path = self.sessions / f"{pid}.json"
         record = cast(dict[str, object], json.loads(record_path.read_text()))
         _ = record_path.write_text(json.dumps({**record, "tmux": ""}))
         transcript = self.projects / "project" / f"{unit_session(name)}.jsonl"
         transcript.parent.mkdir(exist_ok=True)
         _ = transcript.write_text("{}\n")
         os.utime(transcript, (START - 3600, START - 3600))
-        return child.pid, socket_path
+        return pid, socket_path
 
-    def tick(self, at: float, *, together: int = 0, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
-        _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
+    @property
+    def unit_one_pid(self) -> int:
+        return int(self.panes["unit-one"]["pid"])
+
+    def write_panes(self) -> None:
         units = [
             HostedUnit(str(data.get("session", "agents")), f"w{data['id']}:p1",
                        {"CODEX_THREAD_ID": unit_session(name)}, str(data["pane"]),
                        str(data.get("agent_status", "idle")), label=str(data["label"]))
             for name, data in self.panes.items()]
+        hosted = [(unit, int(data["pid"])) for unit, data in zip(units, self.panes.values(), strict=True)]
+        if hosted == self.hosted:
+            return
         fake_unit_host.write(self.environment, units)
         # Supply the workspace field required by the shared pane snapshot parser.
         responses_path = Path(self.environment["FAKE_HERDR_RESPONSES"])
@@ -454,34 +572,49 @@ always=natedev
                 pane["workspace_id"] = "w1"
             response["stdout"] = json.dumps(payload)
         _ = responses_path.write_text(json.dumps(responses))
-        for unit, data in zip(units, self.panes.values()):
-            fake_unit_host.place_process(self.environment, int(data["pid"]), unit.pane, exec_shell=True)
-        # Staff sessions identify the directors in these temporary run records.
+        for unit, pid in hosted:
+            fake_unit_host.place_process(self.environment, pid, unit.pane, exec_shell=True)
+        self.hosted = hosted
+
+    def tick(self, at: float, *, real_ps: bool = False, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
+        _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
+        self.write_panes()
+        self.write_run_records()
+        return self.run_tick(at, real_ps=real_ps, subprocess_cli=subprocess_cli)
+
+    def write_run_records(self) -> None:
+        """Publish the staff and history evidence for this pass."""
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
-        for record in runs.iterdir():
-            record.unlink()
+        records: dict[str, list[dict[str, object]]] = {}
         for name in self.panes:
             state = self.states.get(name, "") or "running"
             if state == "standing-by":
                 continue
-            events = [{"event_type": "run_started", "run_started_at": 1.0,
-                       "working_dir": str(Path(f"/tmp/no-worktree-of-{name}").resolve()),
-                       "main_agent": {"session_id": unit_session(name)}},
-                      *([{"event_type": "run_finished"}] if state == "run-finished" else [])]
-            _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
-        for run_id, events in self.run_records.items():
-            _ = (runs / f"{run_id}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
-        for history in sorted(runs.iterdir()):
-            folder = self.root / "held" / history.stem
-            if history.stem in self.unheld_runs:
+            records[name] = [
+                {"event_type": "run_started", "run_started_at": 1.0,
+                 "working_dir": str(Path(f"/tmp/no-worktree-of-{name}").resolve()),
+                 "main_agent": {"session_id": unit_session(name)}},
+                *([{"event_type": "run_finished"}] if state == "run-finished" else []),
+            ]
+        records.update(self.run_records)
+        histories = {runs / f"{name}.jsonl": events for name, events in records.items()}
+        for history in runs.iterdir():
+            if history not in histories:
+                history.unlink()
+        for history, events in sorted(histories.items()):
+            name = history.stem
+            contents = "".join(json.dumps(event) + "\n" for event in events).encode()
+            if not history.exists() or history.read_bytes() != contents:
+                _ = history.write_bytes(contents)
+            if name in self.unheld_runs:
                 continue
+            folder = self.root / "held" / name
             folder.mkdir(parents=True, exist_ok=True)
-            events = self.run_records.get(history.stem, [])
             first = events[0] if events else {}
             main_agent = first.get("main_agent", {})
-            session = self.director_overrides.get(history.stem, unit_session(history.stem))
-            if history.stem not in self.director_overrides and isinstance(main_agent, dict):
+            session = self.director_overrides.get(name, unit_session(name))
+            if name not in self.director_overrides and isinstance(main_agent, dict):
                 candidate = cast(dict[str, object], main_agent).get("session_id")
                 if isinstance(candidate, str):
                     session = candidate
@@ -494,31 +627,58 @@ always=natedev
                 run_state[unit_runs.OWNER_FIELD] = owner.id
             _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(run_state))
             if owner is not None:
-                history_events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
-                if any(event.get("event_type") == "run_finished" for event in history_events):
+                if any(event.get("event_type") == "run_finished" for event in events):
                     if isinstance(owner.run, staff.OpenRun):
                         _ = staff.clear_run(owner.id, folder)
-                else:
+                elif owner.run != staff.OpenRun(folder):
                     _ = staff.set_run(owner.id, staff.OpenRun(folder))
 
-        environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
-                       "STALL_TEST_SEND_TOGETHER": str(together)}
+    def run_tick(self, at: float, *, real_ps: bool, subprocess_cli: bool) -> subprocess.CompletedProcess[str]:
+        environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at)}
         if subprocess_cli:
-            wrapper = ("import runpy,sys; from pathlib import Path; from scripts.lib import unit_runs; "
-                       + "unit_runs.RUN_ROOT=Path(sys.argv[1]); unit_runs.FORMER_RUN_ROOT=Path(sys.argv[2]); "
-                       + "runpy.run_path(sys.argv[3],run_name='__main__')")
-            return subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", wrapper, str(self.root / "held"),
+            checkout = SCRIPT.resolve().parents[2]
+            wrapper = """import os, runpy, sys
+from pathlib import Path
+from scripts.lib import conf_reads, unit_runs
+unit_runs.RUN_ROOT = Path(sys.argv[1])
+unit_runs.FORMER_RUN_ROOT = Path(sys.argv[2])
+script = Path(sys.argv[3]).resolve()
+defaults = (script.parents[2] / 'config/stall_watch.conf').resolve()
+read_text = conf_reads.read_text
+conf_reads.read_text = lambda path: read_text(
+    os.environ['STALL_TEST_WATCH_DEFAULTS'] if Path(path).resolve() == defaults else path
+)
+runpy.run_path(str(script), run_name='__main__')
+"""
+            return subprocess.run([str(checkout / "scripts/lib/py"), "-c", wrapper, str(self.root / "held"),
                                    str(self.root / "former-held"), str(SCRIPT)], env=environment,
-                                  capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                                  cwd=checkout, capture_output=True, text=True,
+                                  check=False, timeout=TEST_HANG_GUARD_SECS)
         # Keep herdr.run_program, its sanitized environment, and every parser.
         # Only the recording fake's interpreter startup is removed.
         real_run = subprocess.run
+        real_start = cast(Callable[..., subprocess.Popen[str]], subprocess.Popen)
         session_module = ModuleType("stall_watch_fixture_sessions")
         session_module.__file__ = str(self.sessions_script)
 
         def sessions_main() -> int:
-            _ = runpy.run_path(str(self.sessions_script), run_name="__main__")
+            exec(SESSION_LOOKUP_CODE, {})
             return 0
+
+        def start(command: list[str], *arguments: object, **options: object) -> subprocess.Popen[str] | FixtureProcessExit:
+            if not real_ps and command == ["ps", "-eo", "pid=,ppid=,args="]:
+                output = self.ps_file.read_text()
+                return FixtureProcessExit(command, output=output)
+            if command[:2] == [sys.executable, str(self.bin / "send.py")] and "STALL_TEST_SEND_BARRIER" not in environment:
+                with mock.patch.object(sys, "argv", command[1:]):
+                    try:
+                        exec(SENDER_CODE, {})
+                    except SystemExit as result:
+                        status = result.code if isinstance(result.code, int) else int(result.code is not None)
+                    else:
+                        status = 0
+                return FixtureProcessExit(command, status)
+            return real_start(command, *arguments, **options)
 
         def run(command: list[str], *, capture_output: bool, text: bool, check: bool,
                 timeout: float | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -527,13 +687,19 @@ always=natedev
                 self.assertFalse(check)
                 self.assertIsNotNone(env, "herdr must pass its sanitized environment")
                 assert env is not None
-                return invoke_cli(fake_herdr, lambda: fake_herdr.main(command[1:]), command[1:], env, Path.cwd())
+                for key in ("FAKE_HERDR_LOG", "FAKE_HERDR_RESPONSES", "HERDR_PROC"):
+                    self.assertEqual(env.get(key), os.environ.get(key))
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    status = fake_herdr.main(command[1:])
+                return subprocess.CompletedProcess(command, status, stdout.getvalue(), stderr.getvalue())
             if command[:2] == [sys.executable, str(self.sessions_script)] and current_thread() is main_thread():
                 return invoke_cli(session_module, sessions_main, command[2:],
                                   dict(os.environ) if env is None else env, Path.cwd())
             return real_run(command, capture_output=capture_output, text=text, check=check, timeout=timeout, env=env)
 
         with (mock.patch.object(subprocess, "run", run),
+              mock.patch.object(subprocess, "Popen", start),
               mock.patch.object(account, "process_config_dir",
                                 return_value=account.ConfiguredClaudeFolder(self.root / ".claude")),
               mock.patch.object(usage_store, "store_file", return_value=self.root / "usage.json"),
@@ -666,6 +832,19 @@ always=natedev
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("inspected showrunner/unit-one:", result.stdout)
         self.assertEqual(self.sent(), [])
+
+    def test_staff_run_selection_uses_history_filenames(self) -> None:
+        director = unit_session("unit-one")
+        for alternate, selected in (("active-run", "unit-one"), ("unit-one-active", "unit-one")):
+            with self.subTest(alternate=alternate):
+                self.run_records = {alternate: [{
+                    "event_type": "run_started", "run_started_at": 2.0, "working_dir": str(self.root),
+                    "main_agent": {"session_id": director},
+                }]}
+                self.write_run_records()
+                owner = staff.local_snapshot().by_current_session(director)
+                assert owner is not None
+                self.assertEqual(owner.run, staff.OpenRun(self.root / "held" / selected))
 
     def test_damaged_held_history_preserves_only_its_units_state(self) -> None:
         _ = self.unit("unit-two")
@@ -964,7 +1143,7 @@ always=natedev
         self.assertEqual(len(self.sent()), 2)
         # A rename changes the herdr label and the Claude name. The mark, and so the unit, stays.
         self.panes["unit-one"].update(session="renamed-by-the-user", label="renamed-by-the-user")
-        record_path = self.sessions / f"{self.children[0].pid}.json"
+        record_path = self.sessions / f"{self.unit_one_pid}.json"
         record = cast(dict[str, object], json.loads(record_path.read_text()))
         _ = record_path.write_text(json.dumps({**record, "name": "renamed-by-the-user"}))
         self.assertEqual(self.tick(START + 301).returncode, 0)
@@ -2073,7 +2252,7 @@ always=natedev
                     path.unlink()
                 self.send_log.unlink(missing_ok=True)
                 # The recording ps fixture models the unit's worker launcher, then its termination.
-                director_pid = self.children[0].pid
+                director_pid = self.unit_one_pid
                 self.process_rows.append(f"{director_pid + 1} {director_pid} bash scripts/agents/agent_bg.sh running")
                 for at in (START, START + 300):
                     result = self.tick(at)
@@ -2591,7 +2770,7 @@ always=natedev
         self.assertEqual(len(self.sent()), 2)
         worker = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.children.append(worker)
-        self.process_rows.append(f"{worker.pid} {self.children[0].pid} bash running")
+        self.process_rows.append(f"{worker.pid} {self.unit_one_pid} bash running")
         _ = self.tick(START + 360)
         _ = self.process_rows.pop()
         _ = self.tick(START + 361)
@@ -2689,7 +2868,7 @@ always=natedev
                 if command:
                     worker = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     self.children.append(worker)
-                    claude_pid = self.children[0].pid
+                    claude_pid = self.unit_one_pid
                     self.process_rows.append(f"{worker.pid} {claude_pid} {command} running")
                 observed: dict[staff.StaffId, list[worker_panes.WorkerPane]] = {
                     director.id: [worker_panes.OpenWorker(pane_worker, "w2:p1", "worker-terminal", status)]}
@@ -2790,7 +2969,7 @@ always=natedev
 
     def test_defunct_worker_process_does_not_count_as_running_work(self) -> None:
         _ = self.tick(START)
-        claude_pid = self.children[0].pid
+        claude_pid = self.unit_one_pid
         self.process_rows.append(f"999999 {claude_pid} bash scripts/agents/agent_bg.sh <defunct>")
         _ = self.tick(START + 300)
         self.assertEqual(len(self.sent()), 2)
@@ -2899,11 +3078,11 @@ always=natedev
 
     def test_unreadable_session_records_are_reported_and_the_unit_is_skipped(self) -> None:
         # The unit's own record cannot be read, which says nothing about whether its Claude runs.
-        _ = (self.sessions / f"{self.children[0].pid}.json").write_text(
+        _ = (self.sessions / f"{self.unit_one_pid}.json").write_text(
             json.dumps({"pid": "unreadable", "sessionId": "", "name": "", "running": False}))
         result = self.tick(START)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"stall-watch: unit-one: the session record of pid {self.children[0].pid} could not be read", result.stderr)
+        self.assertIn(f"stall-watch: unit-one: the session record of pid {self.unit_one_pid} could not be read", result.stderr)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
 
@@ -2947,7 +3126,7 @@ always=natedev
         original = stall_watch.tick
         for fault in ("timeout", "exit"):
             with self.subTest(fault=fault):
-                executable(self.bin / "ps", "#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n"
+                executable(self.bin / "ps", "#!/usr/bin/env python3\nimport signal\nsignal.pause()\n"
                            if fault == "timeout" else "#!/bin/sh\nexit 7\n")
                 began = time.monotonic()
                 deadline = began + 1.5
@@ -2965,7 +3144,7 @@ always=natedev
                 # The pending retire is independent of process liveness; inspection is not.
                 with (mock.patch.object(stall_watch, "tick", side_effect=bounded_tick),
                       mock.patch.object(stall_watch, "reconcile_prompts", return_value=pending)):
-                    result = self.tick(START + 300)
+                    result = self.tick(START + 300, real_ps=True)
                 self.assertLessEqual(time.monotonic(), deadline)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stderr.count("stall-watch: process snapshot:"), 1, result.stderr)
@@ -2984,12 +3163,10 @@ always=natedev
     def test_sender_timeout_kills_a_grandchild_holding_the_output_pipe(self) -> None:
         script = self.root / "relay.py"
         pid_file = self.root / "grandchild.pid"
-        _ = script.write_text("import os, signal, subprocess, sys, time\n"
-            + "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        _ = script.write_text("import subprocess, sys\n"
+            + "child = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'])\n"
             + "open(sys.argv[1], 'w').write(str(child.pid))\n"
-            + "def reap(sig, frame):\n    child.wait(); raise SystemExit(0)\n"
-            + "signal.signal(signal.SIGCHLD, reap)\n"
-            + "time.sleep(60)\n")
+            + "child.wait()\n")
         state = self.root / "retiring.prompt.json"
         _ = state.write_text("saved retire state\n")
         _ = self.watch_settings(sender_batch_seconds="0.4", sender_cleanup_seconds="0.4")
@@ -3085,8 +3262,6 @@ always=natedev
                                      {"old-alert", "pending-relay"})
 
     def test_sender_batch_and_cleanup_budgets_are_reread_from_config(self) -> None:
-        script = self.root / "short-relay.py"
-        _ = script.write_text("import time\ntime.sleep(0.2)\n")
         for batch, cleanup, delivered in (("0.1", "0.1", False), ("1", "0.1", True),
                                           ("1", "0.75", False)):
             with self.subTest(batch=batch, cleanup=cleanup):
@@ -3095,13 +3270,25 @@ always=natedev
                 stall_watch.save_prompt(state, stall_watch.PromptWait(session_id="retired", created=START,
                     key="old", since=START, alerted=True, tool="", retiring=True))
                 errors = io.StringIO()
-                began = time.monotonic()
-                deadline = began + 0.8
+                clock = [0.0]
+                deadline = 0.8
+
+                def relay_finishes(process: subprocess.Popen[str], work_deadline: float,
+                                   cleanup_deadline: float) -> subprocess.CompletedProcess[str] | stall_watch.CommandFailure:
+                    if work_deadline < 0.2:
+                        clock[0] = cleanup_deadline
+                        return stall_watch.CommandFailure("timeout")
+                    clock[0] = 0.2
+                    return subprocess.CompletedProcess(process.args, 0, "", "")
+
                 with (mock.patch.dict(os.environ, self.environment), redirect_stderr(errors),
+                      mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+                      mock.patch.object(subprocess, "Popen", return_value=mock.Mock(args=["relay"])),
+                      mock.patch.object(stall_watch, "finish_process", side_effect=relay_finishes),
                       mock.patch.object(stall_watch, "retry_cases")):
                     stall_watch.send_all([stall_watch.Delivery(state, "retire",
-                        [sys.executable, str(script)])], START, deadline=deadline)
-                self.assertLessEqual(time.monotonic(), deadline)
+                        ["relay"])], START, deadline=deadline)
+                    self.assertLessEqual(time.monotonic(), deadline)
                 self.assertEqual(state.exists(), not delivered)
                 self.assertEqual(errors.getvalue(), "" if delivered else "stall-watch: retire: send timeout\n")
 
@@ -3110,10 +3297,29 @@ always=natedev
         _ = self.unit("unit-three")
         self.configure({"showrunner": ["unit-one", "unit-two", "unit-three"]})
         _ = self.tick(START)
-        result = self.tick(START + 300, together=6)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stderr, "", "every sender must complete the concurrency barrier")
-        self.assertEqual(len(self.sent()), 6)
+        address = self.root / "send-barrier.sock"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, ThreadPoolExecutor(max_workers=1) as server:
+            listener.bind(str(address))
+            listener.listen(6)
+            listener.settimeout(TEST_HANG_GUARD_SECS)
+
+            def release() -> None:
+                with ExitStack() as peers:
+                    connections = [peers.enter_context(listener.accept()[0]) for _ in range(6)]
+                    for connection in connections:
+                        connection.sendall(b"+")
+
+            event = server.submit(release)
+            self.environment["STALL_TEST_SEND_BARRIER"] = str(address)
+            try:
+                result = self.tick(START + 300)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "", "every sender must complete the concurrency barrier")
+                self.assertEqual(len(self.sent()), 6)
+                event.result(timeout=TEST_HANG_GUARD_SECS)
+            finally:
+                with suppress(OSError):
+                    listener.shutdown(socket.SHUT_RDWR)
 
     def test_bad_unheld_history_header_and_tail_do_not_affect_units(self) -> None:
         scan = unit_runs.held_by_session

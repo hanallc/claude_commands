@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.style.ledger_test_support import add_saved_reservation_path, legacy_overlapping_tickets
 from scripts.style.ledger_test_support import ticket_owner_id
 
 import unittest
@@ -460,10 +461,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
     def test_pipeline_growth_merge_refuses_legacy_overlap_even_after_predecessor_merged(self) -> None:
         ledger, _, second = self.pipeline_tickets()
         _ = self.git("update-ref", "refs/heads/style/main", second)
-        # A ledger written by the earlier implementation can already contain overlapping footprints.
-        with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("UPDATE tickets SET files=? WHERE id='2'",
-                                   (json.dumps([self.sources[0], self.sources[2]]),))
+        add_saved_reservation_path(ledger, "2", self.sources[0], style_ledger.ReservationRole.SOURCE)
         with self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[0]):
             _ = ledger.ticket_merge("10")
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
@@ -2179,7 +2177,8 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         ledger, issue, base = self.binding_ticket(source, ((2, "old", "fresh"),))
         path = self.sources[0]
         rule = self.rule("prefer-type-named-fields-and-bindings")
-        judging = self.judging_ticket(ledger, rule, path)
+        with legacy_overlapping_tickets():
+            judging = self.judging_ticket(ledger, rule, path)
         second = ledger.hold(rule, path, 4, source.splitlines()[3], "rename", "second", "next", self.blob(rule), judging)
         other_issue = self.root / "second.md"
         ledger.file_held(second.finding_id, other_issue)
@@ -2189,7 +2188,8 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             _ = connection.execute("UPDATE tickets SET crate='.' WHERE id='1'")
         ledger.ticket_add("10001", ticket_owner_id("names-second"), "proposal", "names", ".", [path], [rule],
                           proposal=str(other_issue), finding_ids=(second.finding_id,))
-        ledger.ticket_assign("10001", "main")
+        with legacy_overlapping_tickets():
+            ledger.ticket_assign("10001", "main")
         self.assertEqual(ledger.ticket_base("10001"), base)
         self.write(path, source.replace("old", "fresh").replace("second", "next"))
         checkpoint = self.commit("Two separately approved binding renames")

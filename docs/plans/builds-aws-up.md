@@ -1,6 +1,6 @@
 # AWS deployment: current commands
 
-The permanent builder was removed on 2026-11-04.
+The permanent builder was removed on 2026-11-10.
 The former twelve-stage builder deployment no longer exists.
 Builder startup, bootstrap, idle shutdown, Tailscale enrollment, activation, and routing proof code have been removed.
 
@@ -12,7 +12,7 @@ It does not register an AWS SSH build target.
 After complete removal, create the foundation at the user's terminal:
 
 1. Run `deploy.py prepare` to validate inputs and record the foundation plan.
-2. Run `deploy.py apply --approve-resources` to create the Budget and scaler foundation with compute disabled.
+2. Run `deploy.py apply --approve-resources` to create the Budget and scaler foundation.
 3. Run `deploy.py up --approve-resources` to deploy gate resources.
 
 Foundation application confirms the private scaler credential file.
@@ -21,7 +21,8 @@ Historical costs remain in the ledger after removal.
 
 Use `deploy.py prices` for regional Spot prices and quota evidence.
 Use `deploy.py quota-request` for regional quota requests.
-Use `aws_target.py tick` for account charges and cached gate prices.
+Use `aws_target.py tick` for Hana lifecycle recovery and account charges.
+Use `aws_target.py snapshot` for regional prices and quotas.
 Use `deploy.py down` to review the removal plan.
 Use `deploy.py down --approve-destroy` for approved resource removal.
 

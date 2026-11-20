@@ -7,14 +7,94 @@ import json
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
+from scripts.production import staff
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
+OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "rebuilds", "review"))
+TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
+HEADING_ACTIONS = '<div class="page-heading-actions">'
+
+
+def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.StaffSnapshot,
+               dialog: Callable[[], str]) -> bytes:
+    """Add the shared owner control to one served console document."""
+    from scripts.review_links import staff_names
+
+    main = re.search(rb"<main(?=[\s>])[^>]*>", content)
+    if main is None or b'data-page-owner="' in content:
+        return content
+    name = staff_names.StaffNames(members).html(owner.id, owner.name)
+    label = html.escape(f"New item for {owner.name}", quote=True)
+    control = (f'<div class="page-owner" data-page-owner="{page}"><span class="page-owner-name">{name}</span>'
+               + f'<button type="button" data-owner-new aria-label="{label}" title="{label}">'
+               + icon_svg("message-circle-question") + '</button></div>').encode()
+    actions = HEADING_ACTIONS.encode()
+    heading = TITLE_ELEMENT.search(content, main.end())
+    if heading is not None and content.startswith(actions, heading.end()):
+        at = heading.end() + len(actions)
+        content = content[:at] + control + content[at:]
+    elif heading is not None:
+        row = b'<div class="page-heading">' + heading[0] + actions + control + b'</div></div>'
+        content = content[:heading.start()] + row + content[heading.end():]
+    else:
+        content = content[:main.end()] + actions + control + b'</div>' + content[main.end():]
+    head = re.search(rb"<head(?=[\s>])[^>]*>", content)
+    if head is not None:
+        content = content[:head.end()] + PAGE_SCRIPT_ERRORS.encode() + content[head.end():]
+    row_style = HEADING_STYLE.encode()
+    style = OWNER_STYLE.encode()
+    if BUTTON_STATES.encode() not in content:
+        style = b'<style>' + BUTTON_STATES.encode() + b'</style>' + style
+    if row_style not in content:
+        style = b'<style>' + row_style + b'</style>' + style
+    content = content.replace(b'</head>', style + b'</head>', 1)
+    if b'id="review-new-item"' not in content:
+        content = content.replace(b'</body>', dialog().encode() + b'</body>', 1)
+    return content
+
+
+HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}'
+                 + '.page-heading>h1{margin:0}'
+                 + '.page-heading-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;'
+                 + 'max-width:100%;margin-inline-start:auto}'
+                 + '@media(max-width:360px){.page-heading-compact{flex-wrap:nowrap;column-gap:8px}'
+                 + '.page-heading-compact>.page-heading-actions{min-width:0;gap:6px}}')
+
+
+OWNER_STYLE = """<style>
+.page-owner{display:flex;align-items:center;gap:8px;min-width:0;font:600 14px/1.4 system-ui,sans-serif}
+.page-owner-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.page-owner button{display:grid;place-items:center;flex:none;width:36px;height:36px;min-height:36px;
+margin:0;padding:7px;background:var(--card);color:var(--ink-2);border:1px solid var(--line);border-radius:8px;cursor:pointer}
+.page-owner svg{width:18px;height:18px}
+</style>"""
+
+
+PAGE_SCRIPT_ERRORS = r"""<script>(() => {
+ const errors = [];
+ window.consoleScriptErrors = errors;
+ const clip = (value, length) => value.match(new RegExp('^.{0,' + length + '}', 'su'))[0];
+ function remember(message, source = '', line = 0, column = 0) {
+  errors.push({message: clip(message.trim() || 'Script error', 512), source: clip(source, 2048),
+               line, column, at: new Date().toISOString()});
+  if (errors.length > 20) errors.shift();
+ }
+ window.addEventListener('error', event => {
+  if (event instanceof ErrorEvent) remember(event.message, event.filename, event.lineno, event.colno);
+ });
+ window.addEventListener('unhandledrejection', event => {
+  const reason = event.reason;
+  remember(reason instanceof Error ? reason.message :
+           typeof reason === 'string' ? reason : 'Unhandled promise rejection');
+ });
+})();</script>"""
 
 
 def icon_svg(name: str) -> str:
@@ -25,7 +105,7 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str, *, action: str = "") -> str:
+def title(text: str, page: str, *, action: str = "", compact_actions: bool = False) -> str:
     """Build the title and refresh status with an optional action beside the title."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
@@ -38,7 +118,8 @@ def title(text: str, page: str, *, action: str = "") -> str:
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
     if action:
-        heading = f'<div class="page-heading">{heading}{action}</div>'
+        layout = "page-heading page-heading-compact" if compact_actions else "page-heading"
+        heading = f'<div class="{layout}">{heading}{HEADING_ACTIONS}{action}</div></div>'
     return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
@@ -112,10 +193,11 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  async function present(value,began,own,initial=false){
   try{
   if(!Number.isFinite(value.readAt) || !Number.isFinite(value.renderSeconds)) throw new Error('The data has no render time.');
-  if(initial){last=value;failure=value.failure || '';draw();}
+  if(initial){last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;failure=value.failure || '';draw();}
   await frame();if(own!==request) return;
   if(held()){pending={value,began,own};draw();return;}
-  last=value;trip=(performance.now()-began)/1000;failure=value.failure || '';reading=false;pending=null;draw();
+  last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;
+  trip=(performance.now()-began)/1000;failure=value.failure || '';reading=false;pending=null;draw();
   }catch(error){failed(error,own);}
  }
  async function refresh(supersede=false){
@@ -214,8 +296,7 @@ STYLE = (BUTTON_STATES
          + 'main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
          + 'main:has(>.page-status):not(.page-wide){max-width:1124px}'
          + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px;color:var(--ink,CanvasText)}'
-         + '.page-heading{position:relative;margin-bottom:8px}'
-         + '.page-heading>.page-title{margin:0}'
+         + HEADING_STYLE
          + '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}'
          + r'''
 .page-status{display:flex;align-items:center;flex-wrap:wrap;gap:6px 0;font:14px/1.5 system-ui,sans-serif;
@@ -363,9 +444,34 @@ document.addEventListener('click',event=>{
 });
 })();'''
 
-# Both pages use these durations and complete a cancelled motion before the next motion.
-MOTION_SCRIPT = r'''function createCardMotion(){
- const fadeOutMs=180, fadeInMs=270;
+
+CARD_SUBMIT_SCRIPT = r'''function cardSubmitBlocked(form,fading=false){
+ return !form.isConnected || Boolean(form.dataset.sending) || fading;
+}
+function setCardSubmitting(form,submitting,controls=form){
+ if(submitting) form.dataset.sending='true';else delete form.dataset.sending;
+ controls.querySelectorAll('button').forEach(button=>button.disabled=submitting);
+}
+'''
+
+
+@dataclass(frozen=True)
+class CardMotion:
+    fade_out_ms: int
+    fade_in_ms: int
+
+    @classmethod
+    def read(cls, settings: conf.ConfigRead) -> CardMotion:
+        return cls(settings.whole("card_fade_out_ms"), settings.whole("card_fade_in_ms"))
+
+    def attributes(self) -> str:
+        return f'data-card-fade-out-ms="{self.fade_out_ms}" data-card-fade-in-ms="{self.fade_in_ms}"'
+
+
+# Complete a cancelled motion before the next motion starts.
+MOTION_SCRIPT = r'''function createCardMotion(content){
+ const fadeOutMs=()=>Number(content().dataset.cardFadeOutMs);
+ const fadeInMs=()=>Number(content().dataset.cardFadeInMs);
  const reduced=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  let generation=0, animations=[], commit=()=>{}, pending=Promise.resolve();
  function finish(){
@@ -384,12 +490,12 @@ MOTION_SCRIPT = r'''function createCardMotion(){
    element.scrollIntoView({block:'start',behavior:reduced() ? 'instant' : 'smooth'});
  }
  function fadeIn(target){
-  return play(target,[{opacity:0,transform:'translateY(4px)'},{opacity:1,transform:'none'}],fadeInMs);
+  return play(target,[{opacity:0,transform:'translateY(4px)'},{opacity:1,transform:'none'}],fadeInMs());
  }
  async function fadeCard(previous,target,reveal,alwaysScroll=false){
   finish();const operation=generation;commit=reveal;
   if(reduced()){finish();scroll(target,alwaysScroll);return;}
-  if(previous?.isConnected) await play(previous,[{opacity:1},{opacity:0}],fadeOutMs);
+  if(previous?.isConnected) await play(previous,[{opacity:1},{opacity:0}],fadeOutMs());
   if(operation!==generation) return;
   commit=()=>{};reveal();scroll(target,alwaysScroll);
   if(target?.isConnected) await fadeIn(target);
@@ -417,11 +523,11 @@ MOTION_SCRIPT = r'''function createCardMotion(){
    card.remove();removed();
    if(!reduced()) siblings.forEach((item,index)=>{
     const offset=tops[index]-item.getBoundingClientRect().top;
-    if(offset) void play(item,[{transform:`translateY(${offset}px)`},{transform:'none'}],fadeInMs);
+    if(offset) void play(item,[{transform:`translateY(${offset}px)`},{transform:'none'}],fadeInMs());
    });
   };
   commit=()=>{card.remove();removed();};
-  if(!reduced()) await play(card,[{opacity:1},{opacity:0}],fadeOutMs);
+  if(!reduced()) await play(card,[{opacity:1},{opacity:0}],fadeOutMs());
   if(operation!==generation) return;
   commit=()=>{};closeGap();
  }

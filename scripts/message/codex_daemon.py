@@ -74,7 +74,12 @@ class QueueTimedOut:
     seconds: float
 
 
-QueueResult = Queued | QueueFailed | QueueTimedOut
+@dataclass(frozen=True)
+class QueueUnconfirmed:
+    reason: str
+
+
+QueueResult = Queued | QueueFailed | QueueTimedOut | QueueUnconfirmed
 
 
 @dataclass(frozen=True)
@@ -148,6 +153,7 @@ class _WebSocket:
 
     def __init__(self, path: Path, deadline: _OperationDeadline) -> None:
         self._deadline = deadline
+        self.writes = 0
         self._socket = socket.socket(socket.AF_UNIX)
         try:
             self._prepare_operation()
@@ -182,6 +188,7 @@ class _WebSocket:
     def _send_bytes(self, payload: bytes) -> None:
         self._prepare_operation()
         self._socket.sendall(payload)
+        self.writes += 1
         _ = self._deadline.remaining_seconds()
 
     def _receive_exact(self, size: int) -> bytes:
@@ -236,11 +243,19 @@ class _WebSocket:
             return cast("dict[str, object]", cast("object", parsed))
 
 
+class _RequestRejected(ConnectionError):
+    """The daemon returned a JSON-RPC error for this request."""
+
+
 @final
 class _DaemonClient:
     def __init__(self, path: Path, deadline: _OperationDeadline) -> None:
         self._websocket = _WebSocket(path, deadline)
         self._next_id = 1
+
+    @property
+    def writes(self) -> int:
+        return self._websocket.writes
 
     def close(self) -> None:
         self._websocket.close()
@@ -264,7 +279,7 @@ class _DaemonClient:
             error = _as_dict(response.get("error"))
             if error:
                 reason = _as_string(error.get("message")) or "unknown JSON-RPC error"
-                raise ConnectionError(f"{method}: {reason}")
+                raise _RequestRejected(f"{method}: {reason}")
             result = response.get("result")
             if not isinstance(result, dict):
                 raise ValueError(f"{method}: response has no result object")
@@ -343,9 +358,11 @@ def loaded_sessions(
             client.close()
 
 
-def _queue_socket(socket_path: Path, thread_id: str, text: str, timeout: float) -> QueueResult:
+def _queue_socket(socket_path: Path, thread_id: str, text: str, timeout: float,
+                  *, message_id: str = "") -> QueueResult:
     deadline = _OperationDeadline.starting_now(timeout)
     client: _DaemonClient | None = None
+    before_queue: int | None = None
     try:
         client = _DaemonClient(socket_path, deadline)
         _ = client.call("initialize", {
@@ -353,17 +370,23 @@ def _queue_socket(socket_path: Path, thread_id: str, text: str, timeout: float) 
             "capabilities": {"experimentalApi": True},
         })
         client.notify("initialized")
+        before_queue = client.writes
         _ = client.call("thread/queue/add", {
             "threadId": thread_id,
-            "clientUserMessageId": f"message-{os.urandom(16).hex()}",
+            "clientUserMessageId": message_id or f"message-{os.urandom(16).hex()}",
             "input": [{"type": "text", "text": text}],
         })
         _ = deadline.remaining_seconds()
         return Queued()
-    except TimeoutError:
-        return QueueTimedOut(timeout)
-    except (ConnectionError, OSError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, ValueError) as error:
+        submitted = before_queue is not None and client is not None and client.writes > before_queue
+        if isinstance(error, TimeoutError):
+            if message_id and submitted:
+                return QueueUnconfirmed(f"Codex queue acceptance is unconfirmed after {timeout:g} s")
+            return QueueTimedOut(timeout)
         reason = str(error).splitlines()[0] if str(error).splitlines() else type(error).__name__
+        if message_id and submitted and not isinstance(error, _RequestRejected):
+            return QueueUnconfirmed(reason)
         return QueueFailed(reason)
     finally:
         if client is not None:
@@ -379,7 +402,11 @@ def queue(
     thread_id: str,
     text: str,
     timeout: float | ConfiguredQueueTimeout = ConfiguredQueueTimeout.CURRENT,
+    *,
+    message_id: str = "",
 ) -> QueueResult:
     """Queue only through the live daemon that supplied the recipient's row."""
-    return _queue_socket(daemon.socket, thread_id, text,
-                         queue_timeout_seconds() if isinstance(timeout, ConfiguredQueueTimeout) else timeout)
+    seconds = queue_timeout_seconds() if isinstance(timeout, ConfiguredQueueTimeout) else timeout
+    if message_id:
+        return _queue_socket(daemon.socket, thread_id, text, seconds, message_id=message_id)
+    return _queue_socket(daemon.socket, thread_id, text, seconds)

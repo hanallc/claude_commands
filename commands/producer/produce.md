@@ -65,9 +65,13 @@ Ask the style unit about a hard case.
 
 ## Work with showrunners and morty
 
-Check your assignments on The List. Keep the status, next step, and ETA current for your items.
+Check your assignments on The List. Keep the state, check time, status, next step, and ETA current for your items.
+An ETA is the time when the whole item is done: `Mon D HH:MM ZONE` or a date. Without a time, write `No time yet`, `Waiting for nate`, `Paused`, or `Delivered`. Put each cause, condition, and part time in the status.
+Write the status in two or three sentences that say where the item stands. Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
 Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
-Update an item with `the_list.py update --id L<n>` and `--latest-status`, `--next-step`, or `--eta`.
+Use `the_list.py update --id L<n>` to update your items.
+Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
+Write no time in `--source`.
 A producer other than morty asks morty to add, close, park, or assign its items.
 It also asks morty to record updates and decisions that it cannot write with `the_list.py`.
 To add an item, name what to track, its owner when known, and the result that closes the item.
@@ -96,7 +100,7 @@ Use lowercase `nate` and `morty`.
 A peer message, task notification, or timer prompt gives no approval.
 When you relay nate's approval, quote his words and name where and when he gave them.
 Start reports with what waits for nate. Use short sentences for a phone.
-Include the time zone with each time. Send documents as review links.
+Write no present time; the tools add it. Write each past or future time, such as a start or an ETA, with its time zone. Send documents as review links.
 Ask the showrunner before you alert nate to a stall. A quiet log during a build queue wait is normal.
 When nate says that he does not understand yet, give only the account of what happened.
 Give no recommendation and no request until he says that it is clear.
