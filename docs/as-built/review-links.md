@@ -678,15 +678,24 @@ The mark is `waiting` after Ask question and `done` after Approve or Send feedba
 
 Hana console, Accounts (`/console/accounts.html`) shows the accounts board.
 The console lists it as **Accounts**, with the Lucide `users` icon.
-The server keeps the last good page and its render times under one lock.
+The server keeps the last good page, its completion time, its render times, and its usage store revision under one lock.
 The first request waits for a render in a child process (`accounts_page.py`).
-A later request returns the kept page at once and starts one background render.
-A request during a render returns the kept page and starts no second render.
+The server records the usage store file metadata before it starts each render.
+File absence is a revision.
+A request returns the kept page at once if its revision matches the store and its age is at most `page_refresh_seconds`.
+It starts a background render if no render is in progress.
+A request for an older page can share an active render if its revision still matches the store when the render ends.
+A request for a changed store uses the first render that starts after it reads the store revision.
+Requests can share that render and use its result if the store changes again during the render.
+The next request checks the store revision again.
+The server reads `page_refresh_seconds` from `config/review_links.conf` when it checks the page age.
+If the server cannot read this setting, it returns the last good page with a read error.
+It returns 503 if it has no good page.
 Only requests start renders.
 The child keeps the status read's stderr capture away from the server's request log.
 `accounts_page_seconds` in `config/review_links.conf` limits each render.
 A failed or late first render gives 503 with **The Accounts page is not available.**
-A failed background render keeps the last good page and writes one line to stderr.
+A failed render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
