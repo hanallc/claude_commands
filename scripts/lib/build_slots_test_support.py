@@ -7,7 +7,7 @@ from pathlib import Path
 
 from scripts.buildlog.store import host_name
 from scripts.lib.git_test_support import write_fixture_git_config
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,17 @@ class SlotTestConfiguration:
     cargo: Path
     machine: str
     environment: Mapping[str, str]
+
+
+def write_private_slot_roots(settings: Path, root: Path, machine: str) -> None:
+    """Set private slot and cargo roots for the host and the default."""
+    if not settings.exists():
+        _ = write_config_fixture(settings)
+    lines = [line for line in settings.read_text().splitlines()
+             if not line.startswith(("roots.slots", "roots.slot_cargo"))]
+    lines.extend((f"roots.slots={root / 'default-slots'}", f"roots.slots.{machine}={root / 'slots'}",
+                  f"roots.slot_cargo={root / 'default-cargo'}", f"roots.slot_cargo.{machine}={root / 'cargo'}"))
+    _ = settings.write_text("\n".join(lines) + "\n")
 
 
 def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaultMaximum = 2,

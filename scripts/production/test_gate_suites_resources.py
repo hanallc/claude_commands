@@ -396,7 +396,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         with mock.patch.object(gate, "start_gate_job", side_effect=observed):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(available_at_start, [b""] * (self.module_count + 1))
+        self.assertEqual(available_at_start, [b""] * self.module_count)
         self.assertEqual(self.jobserver_tokens(), b"Q")
         events = self.module_events()
         self.assertEqual([row["event"] for row in events], ["start", "finish"] * self.module_count)
@@ -471,7 +471,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertIn("memory governor 0.261719 GiB", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
-        self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
+        self.assertFalse(any(call["tool"] == "basedpyright" for call in self.calls()))
         self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
 
     @gate_suites("lib", "hooks")

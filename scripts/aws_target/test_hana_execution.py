@@ -232,6 +232,22 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertIsInstance(self.settle(), execution.HanaSettled)
         self.assertFalse(execution.claim_dispatch_pending(self.root, self.reference))
 
+    def test_execution_journal_keeps_the_guest_result_timing(self) -> None:
+        self.assertIsInstance(self.dispatch(), execution.DispatchSent)
+        timing: hana_protocol.HanaCommandTiming = {
+            'unit_exited_at': 1011, 'unit_exit_observed_at': 1011.25,
+            'lease_free_at': 1011.5, 'upload_started_at': 1012,
+        }
+        observation = replace(self.objects.observe_execution(self.key), terminated=True, lease_free=True,
+                              observed_at=1013, timing=timing)
+        reply = hana_protocol.decode_observation(hana_protocol.encode_observation(observation))
+        with mock.patch.object(self.objects, 'observe_execution', return_value=reply):
+            self.assertEqual(execution.observe_execution(self.root, self.request, self.objects), observation.evidence)
+        path = execution.execution_path(self.root, self.key.claim_id)
+        row = result.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual(result.object_fields(row['observation'])['timing'], timing)
+        self.assertEqual(execution.read_dispatch_observation(self.root, self.request), observation)
+
     def test_lost_authorization_starts_zero_commands_and_closes_only_the_original_dispatch(self) -> None:
         def lost(request: wire.ConsumePermission) -> wire.FirstAuthorization:
             _ = self.consume(request)
@@ -331,6 +347,27 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertIsInstance(self.settle(), execution.HanaSettled)
         self.assertFalse(self.objects.accept())
         self.assertFalse(self.objects.accepted)
+
+    def test_fence_settlement_saves_the_upload_start_time_in_the_execution_journal(self) -> None:
+        _ = self.dispatch()
+        observe = self.objects.observe_execution
+        initial = replace(observe(self.key), timing={'unit_exited_at': 997})
+        with mock.patch.object(self.objects, 'observe_execution', return_value=initial):
+            _ = execution.observe_execution(self.root, self.request, self.objects)
+        timing: hana_protocol.HanaCommandTiming = {'upload_started_at': 998}
+
+        def observe_fence(key: result.HanaAttemptKey, *,
+                          timeout_s: float | None = None) -> hana_protocol.HanaCommandObservation:
+            observation = observe(key, timeout_s=timeout_s)
+            self.assertTrue(observation.fenced)
+            return replace(observation, timing=timing)
+
+        with mock.patch.object(self.objects, 'observe_execution', side_effect=observe_fence):
+            self.assertIsInstance(self.settle(), execution.HanaSettled)
+        saved = execution.read_dispatch_observation(self.root, self.request)
+        assert isinstance(saved, hana_protocol.HanaCommandObservation)
+        self.assertTrue(saved.fenced)
+        self.assertEqual(saved.timing, {'unit_exited_at': 997, 'upload_started_at': 998})
 
     def test_failed_fence_missing_observation_or_held_lease_retains_cleanup(self) -> None:
         _ = self.dispatch()

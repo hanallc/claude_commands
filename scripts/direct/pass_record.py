@@ -1059,7 +1059,7 @@ def start_pass(args: argparse.Namespace,
         if launcher_command and not active.get("launcher_command"):
             active["launcher_command"] = launcher_command
             changed = True
-        if (status_file and active.get("status") == "active" and not active.get("assign_status_file")
+        if (status_file and active.get("status") in ("active", "refused") and not active.get("assign_status_file")
                 and not dispatch_delivery(active).line and isinstance(hook_completion(active), NoHookCompletion)):
             active["assign_status_file"] = status_file
             changed = True

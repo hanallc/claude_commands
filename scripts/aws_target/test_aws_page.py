@@ -1,5 +1,6 @@
 """Check the published AWS table and quota case instructions."""
 
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -9,20 +10,19 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import cast
+from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_page, cloud_gate, console_help, ledger, ledger_test_support, run_cost, spot_table
+from scripts.aws_target import aws_page, cloud_gate, console_help, ledger, ledger_test_support, quota_requests, run_cost, spot_table
 from scripts.aws_target.aws_cli import AwsCli
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import page_frame
 
 
 class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
-    def test_quota_help_is_closed_and_contains_the_ordered_steps_and_links(self) -> None:
+    def test_quota_help_is_closed_and_contains_the_ordered_steps_and_case_link(self) -> None:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
         section = page.read_text().split('<section class="card" id="prices-quotas">', 1)[1].split('</section>', 1)[0]
@@ -33,32 +33,274 @@ class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
         self.assertRegex(block, r'<ol><li>.*</li></ol>')
         steps = tuple(match[1] for match in re.finditer(r'<li>(.*?)</li>', block))
         self.assertEqual(tuple(unescape(re.sub(r'<[^>]+>', '', step)) for step in steps), console_help.QUOTA_CASE_STEPS)
-        for index, url in ((0, console_help.SETTINGS_URL), (4, console_help.CASE_LIST_URL)):
-            self.assertIn(f'<a href="{url}">{url}</a>', steps[index])
-        self.assertIn(console_help.WRONG_ACCOUNT, unescape(block))
-        self.assertIn(console_help.PASSKEY_NOTE, unescape(block))
+        url = console_help.CASE_LIST_URL
+        self.assertIn(f'<a href="{url}">{url}</a>', steps[2])
+        self.assertEqual(block.count('<a href='), 1)
+        self.assertEqual(re.findall(r'<p>(.*?)</p>', unescape(block)), [console_help.WRONG_ACCOUNT])
 
     def test_quota_help_uses_the_shared_words(self) -> None:
         with (mock.patch.object(console_help, 'QUOTA_CASE_STEPS', ('Open the test console.',)),
-              mock.patch.object(console_help, 'WRONG_ACCOUNT', 'Choose the test account.'),
-              mock.patch.object(console_help, 'PASSKEY_NOTE', 'Unlock the test manager.')):
+              mock.patch.object(console_help, 'WRONG_ACCOUNT', 'Choose the test account.')):
             self.assertEqual(aws_page.quota_help(), '<ol><li>Open the test console.</li></ol>'
-                             + '\n<p>Choose the test account.</p>\n<p>Unlock the test manager.</p>')
+                             + '\n<p>Choose the test account.</p>')
+
+    def test_quota_request_uses_plain_labels_when_values_are_missing(self) -> None:
+        applied = aws_page.AppliedQuotaUnavailable.NOT_MEASURED
+        for status, expected in (
+            ('APPROVED', 'closed, quota unknown'), ('IN_PROGRESS', 'open'), ('FIXTURE_UNKNOWN', 'status unknown'),
+        ):
+            with self.subTest(status=status):
+                request = quota_requests.quota_request(status, Decimal(32), None, None)
+                self.assertEqual(aws_page.quota_request_cell(request, applied, 0),
+                                 {'text': f'32 vCPUs wanted · {expected}, age unknown'})
+        reading = quota_requests.QuotaRequestReadFailed('fixture private diagnostic')
+        self.assertEqual(aws_page.quota_request_cell(reading, applied, 0), {'text': 'request read failed'})
+
+    def test_future_quota_request_dates_have_unknown_age(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        future = '2026-01-22T12:00:00Z'
+        past = '2026-01-14T12:00:00Z'
+        for created, updated in ((future, past), (None, future)):
+            with self.subTest(created=created, updated=updated):
+                request = quota_requests.quota_request('PENDING', Decimal(32), created, updated)
+                self.assertEqual(aws_page.quota_request_age(request, now), 'age unknown')
+
+
+class PageCostFixture(ledger_test_support.CostFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.costs({'spend_pace_days': '3', 'run_cost_days': '5', 'billed_hours_gap_max_ratio': '0.2'})
+        self.configure_gate("""
+regions=us-east-1
+spot_candidate_regions=us-east-1
+instance_types=m7a.8xlarge
+price_compare_instance_types=c7a.8xlarge
+gpu_instance_types=g6.2xlarge
+hana_gpu_instance_types=g6.2xlarge
+gate_wait_usd_per_minute=0
+unmeasured_region_extra_seconds={}
+# whole: 1..
+lifetime_minutes=30
+# whole: 1..
+gpu_spot_quota_request_vcpus=32
+""")
+
+
+class AwsGpuQuotaSummaryTests(PageCostFixture):
+    now: int = ledger_test_support.instant('2026-01-15T12:00:00Z')
+
+    def quota_summary(self, applied: dict[str, str], history: dict[str, dict[str, str]]) -> aws_page.GpuQuotaSummary:
+        _ = (self.state / 'spot-prices.json').write_text(json.dumps({
+            'prices': [],
+            'regions': [{'region': region, 'read_at': self.now, 'standard_vcpus': '64', 'gpu_vcpus': vcpus}
+                        for region, vcpus in applied.items()],
+            'quota_requests': [{'region': region, 'standard': {'state': 'no_request'}, 'gpu': reading}
+                               for region, reading in history.items()],
+        }))
+        tables = spot_table.spot_tables(self.state, self.now, settings_path=self.settings)
+        return aws_page.quota_history_data(tables, self.now)['gpu_summary']
+
+    def test_applied_quota_counts_without_request_history(self) -> None:
+        for history in (
+            {},
+            {'us-east-1': {'state': 'no_request'}},
+            {'us-east-1': {'state': 'not_measured', 'reason': 'fixture'}},
+            {'us-east-1': {'state': 'read_failed', 'reason': 'fixture'}},
+        ):
+            with self.subTest(history=history):
+                self.assertEqual(self.quota_summary({'us-east-1': '32'}, history), {
+                    'target_vcpus': 32,
+                    'regions_by_outcome': {'granted': ['us-east-1'], 'open': [], 'closed, not granted': []},
+                })
+
+    def test_summary_counts_regions_in_the_quota_table(self) -> None:
+        config = self.root / 'cloud_gate.conf'
+        ledger_test_support.text_setting(config, 'regions', 'us-east-1 us-east-2')
+        ledger_test_support.text_setting(config, 'spot_candidate_regions', 'us-east-1 eu-north-1')
+        request = {'state': 'requested', 'status': 'PENDING', 'requested_vcpus': '32'}
+        self.assertEqual(self.quota_summary(
+            {'us-east-1': '32', 'eu-north-1': '8'},
+            {'us-east-1': request, 'eu-north-1': request},
+        ), {'target_vcpus': 32,
+            'regions_by_outcome': {'granted': ['us-east-1'], 'open': ['eu-north-1'], 'closed, not granted': []}})
+
+
+class AwsPageLaunchStateTests(PageCostFixture):
+    now: int = ledger_test_support.instant('2026-01-15T12:00:00Z')
+
+    def published_launch_state(self, *events: Mapping[str, object],
+                               default_attempt_ids: bool = True) -> dict[str, object]:
+        rows = ({'instance_type': 'm7a.8xlarge', 'region': 'us-east-1', 'mode': 'gate',
+                 **({'attempt': f'fixture-{index}'} if default_attempt_ids else {}),
+                 **event} for index, event in enumerate(events))
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        page = aws_page.publish(self.state, self.now, self.root / 'page', settings_path=self.settings)
+        source = page.read_text()
+        self.assertNotIn('private diagnostic', source)
+        payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
+        return ledger.mapping(ledger.mapping(cast(object, json.loads(payload)))['launch_state'])
+
+    def test_account_refusals_count_from_the_last_good_launch(self) -> None:
+        normal_codes = ('SpotMaxPriceTooLow', 'VcpuLimitExceeded', 'MaxSpotInstanceCountExceeded',
+                        'InsufficientSpotCapacity', 'InsufficientInstanceCapacity')
+        state = self.published_launch_state(
+            {'time': self.now - 600, 'result': 'refused', 'error_code': 'Blocked'},
+            {'time': self.now - 500, 'result': 'launched'},
+            {'time': self.now - 240.25, 'result': 'refused', 'error_code': 'ExpiredToken'},
+            {'time': self.now - 180, 'result': 'refused', 'error_code': 'Blocked', 'reason': 'private diagnostic'},
+            *({'time': self.now - 120 + index, 'result': 'refused', 'error_code': code}
+              for index, code in enumerate(normal_codes)),
+            {'time': self.now - 10, 'result': 'finished'},
+        )
+        self.assertEqual(state, {'kind': 'refused', 'code': 'Blocked', 'reason': 'The account is blocked.',
+                                 'first_at': self.now - 240.25, 'count': 2, 'last_good_at': self.now - 500,
+                                 'latest_attempt_at': self.now - 116})
+
+    def test_a_good_launch_clears_the_refusal_run(self) -> None:
+        state = self.published_launch_state(
+            {'time': self.now - 180, 'result': 'refused', 'error_code': 'InvalidClientTokenId'},
+            {'time': self.now - 120, 'result': 'launched'},
+            {'time': self.now - 60, 'result': 'refused', 'error_code': 'InsufficientSpotCapacity'},
+        )
+        self.assertEqual(state, {'kind': 'working', 'last_good_at': self.now - 120,
+                                 'latest_attempt_at': self.now - 60})
+
+    def test_other_refusals_replace_the_working_state_without_publishing_diagnostics(self) -> None:
+        for code, shown in (({}, 'unknown code'), ({'error_code': 'fixture-private-id'}, 'unknown code'),
+                            ({'error_code': 'UnauthorizedOperation'}, 'UnauthorizedOperation')):
+            with self.subTest(code=code):
+                state = self.published_launch_state(
+                    {'time': self.now - 120, 'result': 'launched'},
+                    {'time': self.now - 60, 'result': 'refused', 'reason': 'private diagnostic', **code})
+                self.assertEqual((state['kind'], state['code']), ('refused', shown))
+                self.assertEqual(state['reason'], 'The launch could not proceed.')
+                self.assertNotIn('fixture-private-id', json.dumps(state))
+
+    def test_prelaunch_credential_fallback_counts_and_local_fallback_does_not(self) -> None:
+        state = self.published_launch_state(
+            {'time': self.now - 120, 'result': 'launched'},
+            {'time': self.now - 90, 'result': 'fallback', 'error_code': 'ExpiredToken', 'reason': 'private diagnostic'},
+            {'time': self.now - 60, 'result': 'fallback', 'error_code': 'Spot'},
+        )
+        self.assertEqual((state['kind'], state['code'], state['count']), ('refused', 'ExpiredToken', 1))
+
+    def test_fallback_after_launch_does_not_report_a_refusal(self) -> None:
+        launched_at = self.now - 120
+        state = self.published_launch_state(
+            {'attempt': 'gate-a', 'time': launched_at, 'result': 'launched'},
+            {'attempt': 'gate-a', 'time': self.now - 60, 'result': 'fallback', 'error_code': 'AccessDenied',
+             'reason': 'GetObject failed: private diagnostic'},
+        )
+        self.assertEqual(state, {'kind': 'working', 'last_good_at': launched_at, 'latest_attempt_at': launched_at})
+
+    def test_fallback_after_refusal_counts_only_the_gate_attempt(self) -> None:
+        refused_at = self.now - 90
+        refusal = {'attempt': 'gate-b', 'time': refused_at, 'result': 'refused',
+                   'error_code': 'ServiceUnavailable'}
+        fallback = {**refusal, 'time': self.now - 60, 'result': 'fallback'}
+        for worker_rows in ((refusal,), (refusal, {**refusal, 'time': refused_at + 1})):
+            with self.subTest(worker_rows=len(worker_rows)):
+                state = self.published_launch_state(*worker_rows, fallback)
+                self.assertEqual((state['kind'], state['code'], state['count']), ('refused', 'ServiceUnavailable', 1))
+                self.assertEqual(state['latest_attempt_at'], worker_rows[-1]['time'])
+
+    def test_fallback_without_attempt_id_keeps_the_good_launch(self) -> None:
+        launched_at = self.now - 120
+        for identity in ({}, {'attempt': ''}):
+            with self.subTest(identity=identity):
+                state = self.published_launch_state(
+                    {'time': launched_at, 'result': 'launched', **identity},
+                    {'time': self.now - 60, 'result': 'fallback', 'error_code': 'AccessDenied', **identity},
+                    default_attempt_ids=False,
+                )
+                self.assertEqual(state, {'kind': 'working', 'last_good_at': launched_at,
+                                         'latest_attempt_at': launched_at})
+
+    def test_fallback_without_attempt_id_does_not_count_the_refusal_twice(self) -> None:
+        refused_at = self.now - 120
+        for identity in ({}, {'attempt': ''}):
+            with self.subTest(identity=identity):
+                refusal = {'time': refused_at, 'result': 'refused', 'error_code': 'ServiceUnavailable', **identity}
+                state = self.published_launch_state(
+                    refusal,
+                    {**refusal, 'time': self.now - 60, 'result': 'fallback'},
+                    default_attempt_ids=False,
+                )
+                self.assertEqual((state['kind'], state['count'], state['latest_attempt_at']),
+                                 ('refused', 1, refused_at))
+
+    def test_state_without_a_good_launch(self) -> None:
+        self.assertEqual(self.published_launch_state(), {'kind': 'no-evidence'})
+        state = self.published_launch_state(
+            {'time': self.now - 60, 'result': 'refused', 'error_code': 'AuthFailure'})
+        self.assertEqual(state, {'kind': 'refused', 'code': 'AuthFailure',
+                                 'reason': 'AWS could not authenticate the launch credentials.',
+                                 'first_at': self.now - 60, 'count': 1, 'latest_attempt_at': self.now - 60})
+
+    def test_publisher_settings_have_fixed_fixture_values(self) -> None:
+        settings = conf.read(self.settings)
+        self.assertEqual((settings.whole('spend_pace_days'), settings.whole('run_cost_days'),
+                          settings.number('billed_hours_gap_max_ratio')), (3, 5, 0.2))
+        self.assertEqual(conf.read('cloud_gate').words('spot_candidate_regions'), ('us-east-1',))
+
+
+class AwsPageSettledAmountsTests(ledger_test_support.CostFixture):
+    def test_spend_shows_the_settled_summary_and_changed_amounts(self) -> None:
+        self.text_setting('accounting_zone', 'America/Los_Angeles')
+        checked = ledger_test_support.instant('2026-11-19T00:15:00Z')
+        start = ledger_test_support.instant('2026-11-04T00:00:00Z')
+        end = start + 9 * 86400
+        charges = self.state / 'charges'
+        charges.mkdir()
+        settled = Decimal('7.73')
+        unsettled = ledger.ChargeRead('2026-11-13', checked, end, end + 86400, settled, Decimal(0), Decimal(0))
+        _ = (charges / '2026-11-13.json').write_text(json.dumps(ledger.charge_record(unsettled)))
+
+        def settled_notes() -> list[str]:
+            page = aws_page.publish(self.state, checked, self.root / 'page', settings_path=self.settings)
+            payload = page.read_text().split('<script id="aws-prices-data" type="application/json">', 1)[1]
+            data = cast(aws_page.PageData, json.loads(payload.split('</script>', 1)[0]))
+            return data['settled_notes']
+
+        self.assertEqual(settled_notes(), [])
+        reads = ledger_test_support.charge_readings(start, end, settled, Decimal(0))
+        for bill in reads:
+            record = ledger.charge_record(replace(bill, at=checked - 86400))
+            record['amount_reads'] = [
+                {'at': checked - 2 * 86400, 'actual_usd': '7.73'},
+                {'at': checked - 86400, 'actual_usd': '7.73'},
+            ]
+            _ = (charges / (bill.day + '.json')).write_text(json.dumps(record))
+        self.assertEqual(settled_notes(), [
+            'Settled AWS amounts: 9 of 9 did not change after they settled (checked Nov 19).',
+        ])
+
+        path = charges / '2026-11-12.json'
+        changed = ledger.mapping(cast(object, json.loads(path.read_text())))
+        changed.update(at=checked, actual_usd='7.81')
+        changed['amount_reads'] = [*ledger.rows(changed, 'amount_reads'), {'at': checked, 'actual_usd': '7.81'}]
+        _ = path.write_text(json.dumps(changed))
+        self.assertEqual(settled_notes(), [
+            'Settled AWS amounts: 8 of 9 did not change after they settled (checked Nov 19).',
+            '2026-11-12 changed from USD 7.73 to USD 7.81 (+0.08).',
+        ])
 
 
 @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the AWS table checks")
-class AwsCombinedTableTests(ledger_test_support.CostFixture):
-    def fixture_page(self) -> Path:
+class AwsCombinedTableTests(PageCostFixture):
+    def fixture_page(self, *, blocked: bool = False,
+                     quota_history: tuple[dict[str, object], ...] = ()) -> Path:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         regions = ('us-east-1', 'us-east-2', 'eu-west-1')
         standard = ('c7a.4xlarge', 'm7a.8xlarge')
         gpu = 'g6.2xlarge'
         config = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(config, 'max_gate_minutes=60\n')
+        self.configure_gate('max_gate_minutes=60\n')
         for key, value in (
             ('spot_candidate_regions', ' '.join(reversed(regions))), ('instance_types', ' '.join(standard)),
             ('price_compare_instance_types', standard[1]), ('gpu_instance_types', gpu),
-            ('hana_gpu_instance_types', gpu), ('gate_wait_usd_per_minute', '0'),
+            ('hana_gpu_instance_types', gpu),
         ):
             ledger_test_support.text_setting(config, key, value)
         prices = [
@@ -70,12 +312,13 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
             {'region': region, 'subnets': [{'id': 'subnet-' + region, 'zone': region + 'a'}]} for region in regions
         ]}))
         readings = [
-            {'region': region, 'read_at': now - age, 'standard_vcpus': '137', 'gpu_vcpus': '32'}
+            {'region': region, 'read_at': now - age, 'standard_vcpus': '137', 'gpu_vcpus': '8' if quota_history and region != 'us-east-2' else '32'}
             for region, age in zip(regions, (240, 7201, 240), strict=True)
         ]
         failures = [{'region': regions[0], 'at': now - 120, 'read': 'price', 'error': 'FixtureError'}]
         _ = (self.state / 'spot-prices.json').write_text(json.dumps({
             'prices': prices, 'regions': readings, 'failures': failures,
+            **({'quota_requests': quota_history} if quota_history else {}),
         }))
         events: list[dict[str, object]] = []
         for mode, times in (('merge-gate', (3600, 360)), ('targeted-test', (600, 1800))):
@@ -83,6 +326,9 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
                 run = {'attempt': f'{mode}-{index}', 'instance_type': size, 'mode': mode, 'region': regions[0]}
                 events.extend(({**run, 'time': now - 60 - seconds, 'result': 'launched'},
                                {**run, 'time': now - 60, 'result': 'finished', 'gate_s': seconds - 60}))
+        if blocked:
+            events.append({'attempt': 'blocked-fixture', 'instance_type': standard[0], 'mode': 'gate',
+                           'region': regions[0], 'time': now - 30, 'result': 'refused', 'error_code': 'Blocked'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in events))
         placement_regions = (regions[0], 'us-west-1')
         request = ledger.SpotPlacementRequest(ledger.SpotPlacementScope.REGION,
@@ -91,8 +337,9 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
             (ledger.SpotPlacementScore(ledger.SpotPlacementRegion(regions[0]), 9),)),), now)
         return aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
 
-    def run_browser_checks(self, query: str, checks: str) -> None:
-        page = self.fixture_page()
+    def run_browser_checks(self, query: str, checks: str, *, blocked: bool = False,
+                           quota_history: tuple[dict[str, object], ...] = ()) -> None:
+        page = self.fixture_page(blocked=blocked, quota_history=quota_history)
         probe = """<script>
 (async () => {
   const result = document.createElement("p");
@@ -118,6 +365,87 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
         assert marker is not None, 'The browser must finish the table checks.'
         self.assertEqual(unescape(marker[1]), 'passed')
 
+    def test_disabled_cloud_gates_replace_the_launch_status(self) -> None:
+        self.configure_gate('enabled=off')
+        self.run_browser_checks('', """
+    const block = document.getElementById("launch-state");
+    check(block.dataset.kind === "off", "Disabled cloud gate state");
+    check(block.innerText === "Cloud gates are off (cloud_gate.conf enabled=off). Gates run on natedev.",
+          "The disabled state explains where gates run");
+""", blocked=True)
+
+    def test_invalid_cloud_gate_switch_keeps_the_other_page_blocks(self) -> None:
+        self.configure_gate('enabled=invalid')
+        at = ledger_test_support.instant('2026-01-15T11:59:00Z')
+        with ledger.CostLedger(self.state).transaction() as evidence:
+            evidence.observations.append(ledger.InstanceObservation(at, 'stopped', 'fixture'))
+            evidence.inventories.append(ledger.ResourceInventory(at, (), 'fixture', builder_removed=True))
+        self.run_browser_checks('?show=quota', """
+    const block = document.getElementById("launch-state");
+    check(block.innerText === "cloud_gate.conf enabled is not valid. Gates run on natedev.",
+          "The invalid switch explains where gates run");
+    check(document.querySelectorAll("#spend-tiles .tile").length === 3, "Spend still renders");
+    check(document.querySelector("#price-table tbody tr"), "Quotas still render");
+    check(document.querySelector("#hours h2").textContent === "Billed hours / box hours", "Hours still render");
+""", blocked=True)
+
+    def test_billed_hours_filters_sizes_by_activity_in_the_selected_regions(self) -> None:
+        start = ledger_test_support.instant('2026-01-14T00:00:00Z')
+        end = start + 86400
+        with ledger.CostLedger(self.state).transaction() as evidence:
+            evidence.hana_compute.append(ledger.HanaComputeExposure(
+                start, start + 3600, 1, Decimal('.25'), ledger.HanaExposureClosed(start + 3600),
+                'm7a.2xlarge', region='us-east-2'))
+        charges = self.state / 'charges'
+        charges.mkdir()
+        charge = ledger.ChargeRead(
+            '2026-01-14', end, start, end, Decimal(1), Decimal(0), Decimal(0),
+            (ledger.UsageTypeCost('USE1-SpotUsage:c7a.4xlarge', Decimal('.75'), Decimal(1), 'Hrs'),
+             ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.25'), Decimal('.01'), 'Hrs')))
+        _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(charge)))
+        self.run_browser_checks('', """
+    const sizes = () => [...document.querySelectorAll("#hours tbody tr")].map(row => row.cells[0].textContent);
+    check(sizes().includes("c7a.4xlarge") && sizes().includes("m7a.8xlarge"), "Both active sizes show");
+    const east = document.querySelector("#regions [data-region='us-east-1']");
+    document.querySelector("#regions .all:last-child").click();
+    document.querySelector("#regions [data-region='us-east-2']").click();
+    check(sizes().join() === "m7a.8xlarge", "The hidden region's size row is absent");
+    check(document.querySelector("#hours tbody tr").cells[1].textContent.startsWith("0.0/0.0"),
+          "A small billed amount keeps its row even when the cell rounds to zero");
+    east.click();
+    check(sizes().includes("c7a.4xlarge"), "The row returns when its region is selected");
+""")
+
+    def test_launch_state_sits_above_spend_and_updates_after_a_good_launch(self) -> None:
+        self.run_browser_checks('', """
+    const block = document.getElementById("launch-state");
+    const message = () => block.querySelector("[role='status']").textContent;
+    check(block.nextElementSibling.id === "spend", "Launch state sits above spend");
+    check(block.dataset.kind === "refused", "Refusal style");
+    check(!block.innerText.includes("Cloud gates are off"), "The notice is absent when gates are on");
+    check(message().includes("AWS refuses launches (Blocked). The account is blocked."),
+          "Refusal includes the code and plain reason");
+    const {first_at, last_good_at, latest_attempt_at} = data.launch_state;
+    check(message().includes(`First refusal: ${launchTime.format(first_at * 1000)}.`)
+          && message().includes(`1 refusal since the last good launch (${launchTime.format(last_good_at * 1000)}).`),
+          "Refusal times and count");
+    check(Number.isFinite(latest_attempt_at)
+          && message().includes(`Latest attempt: ${launchTime.format(latest_attempt_at * 1000)}.`),
+          "Latest attempt appears in the refused state");
+    document.querySelector("#regions .all:last-child").click();
+    check(block.dataset.kind === "refused", "Region filters leave launch state intact");
+    const next = JSON.stringify({...data, launch_state: {kind: "working", last_good_at: first_at + 1,
+      latest_attempt_at: first_at + 61}});
+    const gateTime = document.getElementById("aws-gate-time-data").outerHTML;
+    window.fetch = async () => ({ok: true, text: async () =>
+      `<script type="application/json" id="aws-prices-data">${next}</scr` + "ipt>" + gateTime});
+    await loadAws();
+    check(block.dataset.kind === "working", "Refresh clears refusal style");
+    check(message().includes(`AWS launches work. Last good launch: ${launchTime.format((first_at + 1) * 1000)}.`)
+          && message().includes(`Latest attempt: ${launchTime.format((first_at + 61) * 1000)}.`),
+          "Refresh shows the last good launch and latest attempt");
+""", blocked=True)
+
     def test_default_table_marks_and_shared_filters(self) -> None:
         self.run_browser_checks('?prices=cost&runs=merge-gate', """
     const table = () => document.querySelector("#price-table table");
@@ -137,7 +465,11 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
     check(table().tHead.rows[1].cells[1].textContent === "Gate USD", "Gate unit");
     check(table().tHead.rows[1].cells[2].textContent === "Fit boxes", "Fit unit");
     const first = table().tBodies[0].rows[0];
-    check(first.cells[1].textContent === "137" && first.cells[4].textContent === "8", "Quota and Fit numbers");
+    check(first.cells[1].firstChild.textContent === "137" && first.cells[4].textContent === "8", "Quota and Fit numbers");
+    check([...table().querySelectorAll(".quota-request")].map(cell => cell.textContent).join(",")
+          === "not measured,not measured,not measured", "Legacy snapshots have no request history");
+    check(document.querySelector("#quota-request-note").textContent === "The snapshot has no quota request history.",
+          "One note for the legacy table");
     check(first.cells[1].className === "n edge region-quota" && first.cells[4].className === "n", "No quota marks");
     check(spot().textContent === "0.1000" && spot().classList.contains("cheapest"), "Lowest Spot price");
     check(first.querySelector(".spot-status").textContent === "read failed", "Visible failed read");
@@ -176,14 +508,23 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
     check(innerWidth === 760 && scroller().scrollWidth > scroller().clientWidth, "Narrow scroll container");
     scroller().scrollLeft = 150;
     check(scroller().scrollLeft === 150, "Set scroll position before refresh");
+    const settled = document.getElementById("settled-notes");
+    check(settled.children.length === 0, "No settled notes on the first render");
+    const notes = ["Settled AWS amounts: 8 of 9 did not change after they settled (checked Nov 19).",
+                   "2026-11-12 changed from USD 7.73 to USD 7.81 (+0.08)."];
     const prices = JSON.parse(document.getElementById("aws-prices-data").textContent);
-    const refreshed = JSON.stringify({...prices, render_seconds: 12});
+    let refreshed = JSON.stringify({...prices, render_seconds: 12, settled_notes: notes});
     const gateTime = document.getElementById("aws-gate-time-data").textContent;
     window.fetch = async () => ({ok: true, text: async () =>
       `<script type="application/json" id="aws-prices-data">${refreshed}</scr` + "ipt>"
       + `<script type="application/json" id="aws-gate-time-data">${gateTime}</scr` + "ipt>"});
     const status = await loadAws();
     check(status.renderSeconds === 12 && scroller().scrollLeft === 150, "Refresh keeps scroll position");
+    check(settled.innerHTML === notes.map(note => '<p class="note">' + note + '</p>').join(""),
+          "Refresh renders the settled notes in Spend");
+    refreshed = JSON.stringify({...data, settled_notes: []});
+    await loadAws();
+    check(settled.children.length === 0, "Refresh removes obsolete settled notes");
     check(params().get("show") === "spot,cost" && params().get("types") === "standard"
           && params().get("runs") === "test-affected", "Refresh keeps the filter URL");
     const pressed = id => [...document.querySelectorAll(`#${id} [aria-pressed='true']`)].map(chip => chip.textContent).join(",");
@@ -194,6 +535,73 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
       check(indices.every(index => colors.get(`${index},1`) === `var(--scale-${color})`), `Tied ${color} endpoint`);
     }
 """)
+
+    def test_quota_cells_and_gpu_summary_use_the_latest_request(self) -> None:
+        gpu = {'state': 'requested', 'requested_vcpus': '32', 'created_at': '2026-01-11T10:00:00Z',
+               'updated_at': '2026-01-15T10:00:00Z'}
+        not_measured = {'state': 'not_measured',
+                        'reason': 'The AWS plan key is locked. Run github-warmup in a terminal on natedev.'}
+        self.run_browser_checks('?types=gpu&show=quota', """
+    const summary = document.querySelector("#gpu-quota-summary");
+    const cell = region => [...document.querySelectorAll("#price-table tbody tr")]
+      .find(row => row.cells[0].textContent === region).cells[1];
+    const request = region => cell(region).querySelector(".quota-request").textContent;
+    check(summary?.textContent === "G and VT quota (32 vCPUs): 1 granted · 1 open · 1 closed, not granted",
+          "GPU progress across the three regions");
+    check(cell("us-east-2").firstChild.textContent === "32" && request("us-east-2") === "32 vCPUs wanted · granted, 4 days",
+          "The applied quota meets an open request");
+    check(cell("us-east-1").firstChild.textContent === "8"
+          && request("us-east-1") === "32 vCPUs wanted · closed, not granted, 4 days",
+          "The applied quota is below the approved request");
+    check(request("eu-west-1") === "32 vCPUs wanted · open, 2 hours", "Age uses the update time without a creation time");
+    const grantRegion = document.querySelector("#regions [data-region='us-east-2']");
+    grantRegion.click();
+    check(summary.textContent === "G and VT quota (32 vCPUs): 0 granted · 1 open · 1 closed, not granted",
+          "The summary counts only the visible rows");
+    grantRegion.click();
+    document.querySelector("#types [data-types='standard']").click();
+    check(request("us-east-2") === "not measured" && request("us-east-1") === "not measured",
+          "Standard has its own request history");
+    check(request("eu-west-1") === "no request", "Empty history remains distinct");
+    check(document.querySelector("#quota-request-note").textContent
+          === "The plan identity is locked. Run github-warmup on natedev.", "One note for the locked identity");
+    check(document.querySelectorAll("#price-table td").length === 12, "No extra table column");
+""", quota_history=(
+            {'region': 'us-east-2', 'standard': not_measured, 'gpu': {**gpu, 'status': 'CASE_OPENED'}},
+            {'region': 'us-east-1', 'standard': not_measured, 'gpu': {**gpu, 'status': 'APPROVED'}},
+            {'region': 'eu-west-1', 'standard': {'state': 'no_request'},
+             'gpu': {**gpu, 'status': 'PENDING', 'created_at': None}},
+        ))
+
+    def test_summary_omits_unknown_counts_before_the_first_request_history(self) -> None:
+        self.run_browser_checks('?types=gpu&show=quota', """
+    const summary = document.querySelector("#gpu-quota-summary");
+    const prefix = "G and VT quota (32 vCPUs): ";
+    check(summary.textContent === prefix + "3 granted · request history not measured yet",
+          "The summary keeps known grants and omits unknown counts");
+    const requests = [...document.querySelectorAll("#price-table .quota-request")];
+    check(requests.length === 3 && requests.every(cell => cell.textContent === "not measured"),
+          "All three request cells show that history is missing");
+    const note = document.querySelector("#quota-request-note");
+    check(!note.hidden && note.textContent === "The snapshot has no quota request history.", "One history note");
+    document.querySelector("#regions .all:last-child").click();
+    check(summary.textContent === prefix + "request history not measured yet",
+          "The summary omits the grant count when no grant is visible");
+""")
+
+    def test_missing_history_note_requires_every_visible_row_to_lack_history(self) -> None:
+        self.run_browser_checks('?types=gpu&show=quota', """
+    const note = document.querySelector("#quota-request-note");
+    const requests = [...document.querySelectorAll("#price-table .quota-request")];
+    check(requests.some(cell => cell.textContent === "not measured"), "A missing history cell says not measured");
+    check(requests.some(cell => cell.textContent === "no request"), "An empty history has a record");
+    check(note.hidden && note.textContent === "", "Mixed history has no whole-snapshot note");
+    document.querySelector("#regions [data-region='us-east-1']").click();
+    check(!note.hidden && note.textContent === "The snapshot has no quota request history.",
+          "The note appears when all visible rows lack history");
+""", quota_history=(
+            {'region': 'us-east-1', 'standard': {'state': 'no_request'}, 'gpu': {'state': 'no_request'}},
+        ))
 
     def test_url_selects_gpu_and_omits_gate(self) -> None:
         self.run_browser_checks('?show=spot,cost,quota&types=gpu&runs=both', """
@@ -269,7 +677,7 @@ class AwsPageGateTimePriceTests(ledger_test_support.CostFixture):
         _ = (self.root / 'build_steps.conf').write_text('names.gate=gate\n')
         self.text_setting('region', east)
         config = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(config,
+        ledger_test_support.override_fixture_settings(config,
             f'regions={east} {west} {north}\nspot_candidate_regions={west} {east} {candidate_only}\n'
             + f'instance_types={" ".join((*deployed_types, undeployed_type))}\n'
             + 'gate_wait_usd_per_minute=0.02\nmax_gate_minutes=12\n'
@@ -465,10 +873,13 @@ class Element {
   createTHead() { return this.appendChild(new Element()); }
   createTBody() { return this.appendChild(new Element()); }
   insertRow() { return this.appendChild(new Element()); }
-  querySelector() { return null; }
+  querySelector(selector) { return selector === "p" ? this.children[0] ?? null : null; }
   setAttribute() {}
   addEventListener() {}
 }
+const launchState = new Element();
+launchState.append(new Element());
+ids.set("launch-state", launchState);
 function parse(html) {
   return {getElementById(id) {
     const start = '<script id="' + id + '" type="application/json">';

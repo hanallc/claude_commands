@@ -35,7 +35,7 @@ from scripts.test_times.gate_record import (
     folder_scan_strings, module_read_record,
 )
 
-SCHEMA_VERSION = 44
+SCHEMA_VERSION = 45
 
 
 # These indexes support repeated queries over the current schema.
@@ -416,6 +416,20 @@ SAMPLE_COLUMNS: list[Column] = [
     ("zram", "TEXT", "JSON zram storage at the sample time"),
 ]
 
+SCCACHE_SAMPLE_COLUMNS: list[Column] = [
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "machine's short host name"),
+    ("at", "TEXT", "UTC ISO sample time"),
+    ("boot_id", "TEXT", "kernel boot ID for the server start time"),
+    ("server_started_us", "INTEGER", "service main process start in microseconds since boot"),
+    ("rust_compile_requests", "INTEGER", "Rust cache hits plus misses since server start"),
+    ("rust_hits", "INTEGER", "Rust cache hits since server start"),
+    ("rust_misses", "INTEGER", "Rust cache misses since server start"),
+    ("rust_hit_rate", "REAL", "Rust hit fraction since server start; NULL without requests"),
+    ("cache_size", "INTEGER", "cache disk use in bytes; NULL when unavailable"),
+    ("max_cache_size", "INTEGER", "cache capacity in bytes; NULL when unavailable"),
+]
+
 MEMORY_SNAPSHOT_COLUMNS: list[Column] = [
     ("src", "TEXT", "source file"),
     ("host", "TEXT", "machine's short host name"),
@@ -533,6 +547,7 @@ TABLES: dict[str, tuple[list[Column], str, str]] = {
     "ci_jobs": (CI_JOB_COLUMNS, "", "their jobs"),
     "ci_steps": (CI_STEP_COLUMNS, "PRIMARY KEY (job_id, number)", "the jobs' steps"),
     "samples": (SAMPLE_COLUMNS, "", "one 60 s machine memory sample; counters reset on reboot"),
+    "sccache_samples": (SCCACHE_SAMPLE_COLUMNS, "", "one hourly sccache reading; counters reset on restart"),
     "memory_snapshots": (MEMORY_SNAPSHOT_COLUMNS, "", "slice and zram counters at a requested instant"),
 }
 
@@ -708,6 +723,7 @@ def schema_statements() -> list[str]:
     statements.append("CREATE INDEX calls_started ON calls (started_at)")
     statements.append("CREATE INDEX ci_jobs_run ON ci_jobs (run_id, attempt)")
     statements.append("CREATE INDEX samples_host_at ON samples (host, at)")
+    statements.append("CREATE INDEX sccache_samples_host_at ON sccache_samples (host, at)")
     statements.append("CREATE INDEX memory_snapshots_at ON memory_snapshots (at)")
     for view, (_, select) in VIEWS.items():
         statements.append(f"CREATE VIEW {view} AS {select}")
@@ -1072,6 +1088,10 @@ def add_sample(connection: sqlite3.Connection, record: dict[str, object], src: s
     insert(connection, "samples", pick({**record, "src": src}, SAMPLE_COLUMNS))
 
 
+def add_sccache_sample(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "sccache_samples", pick({**record, "src": src}, SCCACHE_SAMPLE_COLUMNS))
+
+
 def add_memory_snapshot(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
     insert(connection, "memory_snapshots", pick({**record, "src": src}, MEMORY_SNAPSHOT_COLUMNS))
 
@@ -1150,7 +1170,7 @@ def add_ssh_attempt(connection: sqlite3.Connection, record: dict[str, object], s
 
 
 ADDERS = {"gate_run": add_gate_run, "ssh_attempt": add_ssh_attempt, "queue_bump": add_queue_bump, "mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
-          "memory_snapshot": add_memory_snapshot}
+          "memory_snapshot": add_memory_snapshot, "sccache_sample": add_sccache_sample}
 
 
 def forget(connection: sqlite3.Connection, src: str) -> None:
