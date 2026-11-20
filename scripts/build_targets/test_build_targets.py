@@ -154,7 +154,7 @@ print(json.dumps({'opens': opens, 'modules': sorted(sys.modules)}))
                                     "CLAUDE_CODE_SESSION_ID": "",
                                     "NOTIFIER_SESSIONS_DIR": str(root / "sessions")})
                 _ = (configuration / "build_targets.conf").write_text(
-                    f"targets=natedev,{target}\nkind.natedev=local\nplatform.natedev=linux\n"
+                    f"enabled.mac=on\ntargets=natedev,{target}\nkind.natedev=local\nplatform.natedev=linux\n"
                     + f"kind.{target}=ssh\nplatform.{target}={'linux' if target == 'aws' else 'macos'}\n"
                     + f"settings.{target}={'aws_target' if target == 'aws' else 'mac_test'}.conf\n")
                 claims = root / "mac-state" / "claims"
@@ -1665,13 +1665,13 @@ class RecordedStepKindTests(unittest.TestCase):
         target = targets.SshTarget("mac", "macos", Path("/fixture/mac.conf"))
         unreadable = eligibility.UnreadableBackoff("bad")
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("dummy", 1, 1), 1, 1, 1, "1", {})
-        with mock.patch.object(eligibility, "read_config", return_value=config), \
+        with mock.patch.object(eligibility, "read_placement_config", return_value=config), \
              mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.KnownRepository("hana")) as checks:
             result = build_targets.step_policy(target, Path("/fixture/hana"), "hana", "final", backoff=unreadable)
         self.assertEqual(result, eligibility.KnownRepository("hana"))
         self.assertEqual([call.kwargs["kind"] for call in checks.call_args_list], ["check", "test"])
         self.assertTrue(all(call.kwargs["backoff"] is unreadable for call in checks.call_args_list))
-        with mock.patch.object(eligibility, "read_config", return_value=config), \
+        with mock.patch.object(eligibility, "read_placement_config", return_value=config), \
              mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.IneligibleMacStep("state")):
             self.assertEqual(build_targets.step_policy(target, Path("/fixture/hana"), "hana", "check", backoff=unreadable),
                              targets.ExcludedTarget(target, "state"))

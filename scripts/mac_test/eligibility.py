@@ -251,7 +251,7 @@ def read_placement_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS
 def placement_enabled(platform: target_config.Platform) -> bool:
     """Read the Mac switch only for placements that use macOS."""
     return (platform != "macos"
-            or machine_switch.read(machine_switch.Machine.MAC) is machine_switch.MachineSwitch.ON)
+            or target_config.read_machine_switch(machine_switch.Machine.MAC) is machine_switch.MachineSwitch.ON)
 
 
 def repository_identity(repo_root: Path) -> RepositoryIdentity:
