@@ -315,8 +315,10 @@ class UnitWatchdogTests(unittest.TestCase):
 
         unread_names = LaunchNamesNotRead()
 
-        def tab(identity: str, *, names: LaunchNames | LaunchNamesNotRead = unread_names) -> herdr.TabSession:
+        def tab(reference: str, *, names: LaunchNames | LaunchNamesNotRead = unread_names) -> herdr.TabSession:
             _ = names
+            row = self.current_staff().by_member_reference(reference)
+            identity = str(row.current_session) if row is not None else reference
             return herdr.TabSession(identity, self.units[identity]["name"], "fixture", identity)
 
         def signal_claude(pid: int, requested: int) -> None:

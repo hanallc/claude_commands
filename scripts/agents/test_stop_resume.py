@@ -3903,7 +3903,14 @@ class StopResumeTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         self.add_beta()
         for platform in ("linux", "darwin"):
-            with self.subTest(platform=platform), patch.object(moves, "store_file", return_value=self.root / platform / "moves.jsonl"), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "019b3a40-4250-7000-8000-000000000102"}), patch.object(stop_resume, "_detach", wraps=self.real_detach), patch.object(sys, "platform", platform), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "", "")) as run, patch.object(subprocess, "Popen") as popen:
+            with (self.subTest(platform=platform),
+                  patch.object(moves, "store_file", return_value=self.root / platform / "moves.jsonl"),
+                  patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.entry["session_id"]}),
+                  patch.object(stop_resume, "_detach", wraps=self.real_detach),
+                  patch.object(restart, "producer_launch", return_value=("claude", {}, [])),
+                  patch.object(sys, "platform", platform),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "", "")) as run,
+                  patch.object(subprocess, "Popen") as popen):
                 self.client.rows[0]["agent_session"] = None
                 result = stop_resume.move_sessions(["beta", "alpha"], "claude4", why="limit", warn_seconds=3, cause="auto")
                 self.assertFalse(moves.store_file().exists())
@@ -3944,8 +3951,13 @@ class StopResumeTests(unittest.TestCase):
 
     def test_detached_batch_uses_the_same_moves_and_logs_each_member(self) -> None:
         log = self.root / "batch.log"
-        self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),
-                                 sessions.SessionNotLive(), sessions.SessionNotLive(), sessions.SessionNotLive()]
+
+        def liveness(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+            if identity == self.entry["session_id"] and not self.kill.called:
+                return sessions.LiveSessionProcess(123)
+            return sessions.SessionNotLive()
+
+        self.live.side_effect = liveness
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "019b3a40-4250-7000-8000-000000000102"}), patch.object(subprocess, "run") as run, patch.object(subprocess, "Popen") as popen:
             result = stop_resume.main(["batch", "--target", "claude4", "--why", "limit", "--cause", "auto", "--log", str(log), "alpha", "missing"])
@@ -4671,12 +4683,12 @@ class StopResumeTests(unittest.TestCase):
                       patch.object(stop_resume, "_same_process", return_value=True),
                       patch.object(showrunners, "tell") as tell):
                     self.assertEqual(stop_resume.move_sessions([identity], target, why="auto: head", cause="auto",
-                        source_accounts={identity: "claude1" if family == "claude" else source}), [up])
+                        source_accounts={identity: "claude1" if family == "claude" else target}), [up])
                 entries = moves.read_moves()
                 self.assertEqual([entry["kind"] for entry in entries], ["requested", "confirmed"])
                 request = entries[0]
                 assert request["kind"] == "requested"
-                self.assertEqual((request["from"], request["to"]), ("claude1" if family == "claude" else source, target))
+                self.assertEqual((request["from"], request["to"]), (source, target))
                 self.assertEqual(request["tool"], family)
                 resume.assert_called_once_with(identity, why="auto: head", to=target, client=self.client)
                 tell.assert_not_called()

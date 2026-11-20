@@ -41,7 +41,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.agents import stop_resume
-from scripts.herdr import pane_launch
+from scripts.herdr import herdr, pane_launch
 from scripts.agents.test_support import write_machine_config
 from scripts.message import send as message_send
 from scripts.whoami import run_out
@@ -129,6 +129,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(redirect_stderr(io.StringIO()))
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.home / "herdr-panes"))
+        _ = self.enterContext(patch.object(herdr, "herdr_binary", return_value="/nonexistent/herdr"))
         _ = self.enterContext(patch.object(transcripts, "subprocess", SimpleNamespace(
             run=partial(subprocess.run, env={"PATH": os.environ.get("PATH", os.defpath)}), PIPE=subprocess.PIPE)))
         _ = cast(object, self.enterContext(scratch_account_home(self.home, {
@@ -174,6 +175,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(patch.object(inventory, "unregistered_showrunners", return_value=[]))
         self.moves = FakeSessionMoves(self.moved)
         _ = self.enterContext(patch.object(stop_resume, "move_sessions", side_effect=self.moves))
+        _ = self.enterContext(patch.object(stop_resume, "_send_move_push"))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("unfaked subprocess")))
         self.notifications = []
         _ = self.enterContext(patch.object(refusal_watch, "_notify_no_room", side_effect=self.notified))
@@ -1221,6 +1223,7 @@ class RefusalWatchTests(unittest.TestCase):
 
         with (patch.object(stop_resume, "move_sessions", new=move_live_sessions),
               patch.object(staff, "initial_snapshot", side_effect=self.membership),
+              patch.object(pane_launch, "current_kind", return_value="claude"),
               patch.object(stop_resume, "_build_holders", return_value={}),
               patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound),
               patch.object(stop_resume, "_record_launches"),
@@ -2589,8 +2592,12 @@ class RefusalWatchTests(unittest.TestCase):
         token = stop_resume._batch_process.set(True)  # pyright: ignore[reportPrivateUsage]
         self.addCleanup(stop_resume._batch_process.reset, token)  # pyright: ignore[reportPrivateUsage]
         with patch.object(stop_resume, "move_sessions", new=REAL_SESSION_MOVES), \
+                patch.object(staff, "initial_snapshot", side_effect=self.membership), \
+                patch.object(pane_launch, "current_kind", return_value="claude"), \
+                patch.object(stop_resume, "_tab_of", side_effect=stop_resume.SessionNotFound), \
+                patch.object(stop_resume, "running_on_account", return_value=sessions.SessionNotLive()), \
                 patch.object(stop_resume, "_build_holders", side_effect=[held, held, {}]), \
-                patch.object(stop_resume, "monotonic", side_effect=[0.0, 0.0, 1800.0]), \
+                patch.object(stop_resume, "monotonic", side_effect=[0.0, 1800.0]), \
                 patch("time.sleep"), \
                 patch.object(stop_resume, "_move_now", side_effect=move_now) as moved:
             _ = self.cli()
