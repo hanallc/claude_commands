@@ -64,8 +64,9 @@ print('mac_exit=0')
 
 
 LOCAL_MAC_SSH = """\
-import shlex, subprocess, sys
+import shlex, signal, subprocess, sys
 command = shlex.split(sys.argv[-1])
+signal.signal(signal.SIGINT, signal.SIG_DFL)
 raise SystemExit(subprocess.run(command, start_new_session=True).returncode)
 """
 
@@ -120,9 +121,10 @@ else:
 """
 
 CALL_ROUTE = """\
-import os, sys
+import os, signal, sys
 from pathlib import Path
 
+signal.signal(signal.SIGINT, signal.SIG_DFL)
 sys.path.insert(0, os.environ['MAC_GATE_FIXTURE_ROOT'])
 from scripts.mac_test import mac_gate
 from scripts.production.merge_gate import SuiteMode
@@ -374,6 +376,10 @@ class MacGateTests(unittest.TestCase):
             with self.subTest(explicit=explicit), tempfile.TemporaryDirectory(dir=self.root) as temporary:
                 self.cancel_route(Path(temporary), explicit=explicit)
 
+    def test_route_cancellation_with_an_ignored_sigint(self) -> None:
+        self.install_held_module()
+        self.cancel_route(self.root, explicit=True, ignore_sigint=True)
+
     def test_route_cancellation_reports_a_close_failure(self) -> None:
         self.install_held_module()
         self.cancel_route(self.root, explicit=True, cleanup_refused=True)
@@ -382,7 +388,7 @@ class MacGateTests(unittest.TestCase):
         self.cancel_route(self.root, explicit=True, prepare_bundle=True)
 
     def cancel_route(self, root: Path, *, explicit: bool, cleanup_refused: bool = False,
-                     prepare_bundle: bool = False) -> None:
+                     prepare_bundle: bool = False, ignore_sigint: bool = False) -> None:
         environment = {**queue_fixture(root, LOCAL_MAC_SSH),
                        **copies_environment(root),
                        'MAC_GATE_FIXTURE_ROOT': str(Path(__file__).resolve().parents[2])}
@@ -406,6 +412,10 @@ class MacGateTests(unittest.TestCase):
         try:
             caller = [sys.executable, '-c', CALL_ROUTE, str(self.repo), str(callback),
                       str(reader) if explicit else '']
+            if ignore_sigint:
+                caller = [sys.executable, '-c',
+                          'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_IGN); '
+                          + 'os.execv(sys.executable, sys.argv[1:])', *caller]
             result = root / 'route.log'
             with result.open('w+') as output, subprocess.Popen(
                 caller, env=environment, stdout=output, stderr=output, pass_fds=(reader,) if explicit else (),
