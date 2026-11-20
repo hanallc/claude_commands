@@ -2517,9 +2517,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     waiters: dict[int, MemoryWaitRow] = {}
     checks = {row.waiter.pid: row.room for row in explanation.line.steps}
     order_holds = {row.waiter.pid: row.decision.order_hold for row in explanation.line.steps}
-    if isinstance(explanation.head, admission_records.HeadExplanation):
-        checks[explanation.head.waiter.pid] = explanation.head.room
-        order_holds[explanation.head.waiter.pid] = explanation.head.decision.order_hold
+    head = explanation.head
+    if isinstance(head, admission_records.HeadExplanation):
+        checks[head.waiter.pid] = head.room
+        order_holds[head.waiter.pid] = head.decision.order_hold
     waiting = parsed.view.waiting
     positions = {waiter.pid: place for place, waiter in enumerate(waiting, 1)}
     for place, waiter in enumerate(waiting, 1):
@@ -2563,6 +2564,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         **slot_place(build_slot_number(waiter.folder, host_name(), slot_roots, home=slot_homes[host_name()]),
                                      waiter.folder, host_name()),
                         **job_notes(job, identity.unit, names)}
+        if isinstance(head, admission_records.HeadExplanation) and (waiter.pid, waiter.since) == (head.waiter.pid, head.waiter.since):
+            waiters[place]["first_in_line"] = True
+            if head.decision.state == "hold":
+                waiters[place]["head_room"] = head_room(head.room, captured, ram)
     work_rows: list[RunRow | CloudRunRow | MacBuildRow | MacReadingUnavailableRow] = list(walk)
     mac_status = queue_view.mac_reading_status(mac_reading, explanation.now)
     if mac_status:
@@ -2664,17 +2669,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 matched_units.add(work_row["unit"])
         unmatched_priority_text = "\n".join(text for unit, text in priorities.items() if unit not in matched_units)
         unmatched_priority_entries = [entry for entry in explanation.priority.entries if entry["unit"] not in matched_units]
-    if waiting_rows:
-        head_pid = waiting_rows[0]["pid"]
-        if isinstance(explanation.head, admission_records.HeadExplanation):
-            head = explanation.head.waiter
-            head_pid = head.run.pid if isinstance(head.run, LiveBuildRun) else head.pid
-        for waiting_row in waiting_rows:
-            if waiting_row["pid"] == head_pid:
-                waiting_row["first_in_line"] = True
-                if isinstance(explanation.head, admission_records.HeadExplanation) and explanation.head.decision.state == "hold":
-                    waiting_row["head_room"] = head_room(explanation.head.room, explanation.room, ram)
-                break
     for step_row in (*work_rows, *waiting_rows):
         step_row["key"] = step_key(step_row)
     pressure = explanation.decided_from.pressure

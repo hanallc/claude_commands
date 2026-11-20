@@ -3160,22 +3160,29 @@ process.stdout.write(JSON.stringify({
         checking = frozenset({admission_records.waiter_owner(older)})
         landing_held = frozenset({admission_records.waiter_owner(landing)})
         policy = admission_policy_fixture()
-        for name, waiters, expired, held, next_need, starts in (
-            ("before route deadline", (older, younger), frozenset[str](), frozenset[str](), 9 * gib, ()),
-            ("past route deadline", (older, younger), checking, frozenset[str](), gib, (400,)),
-            ("past route deadline with landing hold", (older, landing, younger), checking, landing_held, gib, (400,)),
+        for name, waiters, expired, held, next_need, starts, first_in_line in (
+            ("before route deadline", (older, younger), frozenset[str](), frozenset[str](), 9 * gib, (), (300,)),
+            ("past route deadline", (older, younger), checking, frozenset[str](), gib, (400,), (400,)),
+            ("past route deadline with landing hold", (older, landing, younger), checking, landing_held, gib, (400,), (400,)),
+            ("only bypassed gates", (older, landing), checking, landing_held, 0, (), ()),
         ):
             with self.subTest(route_check=name):
                 evidence = replace(inputs, ordered=[(Path(str(row["pid"])), row) for row in waiters],
                     cloud_route_waiters=checking, cloud_route_waiters_past_deadline=expired, landing_waiters=held)
                 result = gate.admission_pass(evidence, evidence.now, policy)
-                report = gate.queue_read_from_pass(evidence, policy, result).explanation
+                reading = gate.queue_read_from_pass(evidence, policy, result)
+                report = reading.explanation
                 assert isinstance(report.room, admission_records.MemoryRoom)
                 status = memory_feed.memory_status(report, report.room, active_local_builds=0)
                 self.assertEqual(status["next_need_bytes"], next_need)
                 self.assertEqual([row["pid"] for row in report.ordered], [row["pid"] for row in waiters])
                 self.assertEqual(tuple(row["pid"] for row, decision in zip(report.ordered, result.rows, strict=True)
                                        if isinstance(decision.admission, gate.ProposedAdmission)), starts)
+                with mock.patch.object(admission_client, "view", return_value=reading):
+                    page = memory_feed.reading()
+                self.assertEqual([row["pid"] for row in page["waiters"]], [row["pid"] for row in waiters])
+                self.assertEqual(tuple(row["pid"] for row in page["waiters"] if row.get("first_in_line")), first_in_line)
+                self.assertEqual(page["memory_status"]["next_need_bytes"], status["next_need_bytes"])
 
     def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
         for cargo_use in (0, 2 * admission_records.GIB):
