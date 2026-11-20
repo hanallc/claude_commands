@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -146,7 +146,25 @@ class SavedSubmission(NativeSubmissionDestination):
 
 @dataclass(frozen=True)
 class EditedSubmission(SavedSubmission):
-    """The request ID names a saved item with different content."""
+    """The draft already names a saved item."""
+
+
+@dataclass(frozen=True)
+class ListDraftFiling:
+    """The fields and capture prepared for the first filing of a List draft."""
+
+    request: NewItemRequest
+    screenshot: new_item_dialog.SubmissionScreenshot
+    capture_requested: bool
+    refusal: SubmissionError | None = None
+
+
+@dataclass(frozen=True)
+class ListDraftSend:
+    """A List draft with fields to read only if no saved item exists."""
+
+    request_id: str
+    prepare: Callable[[], ListDraftFiling]
 
 
 @dataclass(frozen=True)
@@ -329,7 +347,7 @@ def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[
     payload: list[object] = [request.kind, words, asdict(request.evidence), _image_fingerprints(uploads)]
     if request.page:
         payload.append(request.page)
-    if request.page_recipient == new_item_dialog.PageRecipient.LIST_OWNER:
+    if request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         payload.append(request.page_recipient)
     return _fingerprint(payload)
 
@@ -559,7 +577,7 @@ def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapsh
     marker = f"page-{page}"
     if list_recipient is not None:
         marker += f"-{list_recipient}"
-    elif page_recipient == new_item_dialog.PageRecipient.LIST_OWNER:
+    elif page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         marker += f"-recipient-{address.recipient_id}"
     page_marker = folder / marker
     standard = _draft_address(address.kind, address.recipient_id, fingerprint)
@@ -921,6 +939,14 @@ def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffS
         if isinstance(producer, staff.StaffRow) and producer.id == address.recipient_id:
             return producer
         raise SubmissionConflict("The List owner is unavailable. Open New item again.")
+    if choice == new_item_dialog.PageRecipient.SELECTED:
+        row = _recipient(address.recipient_id, members)
+        settings = conf.read_or_repository("console")
+        owner = page_owner(page, settings, members)
+        producer = list_producer(settings, members)
+        if not _is_recipient_choice(row, members, owner=owner, producer=producer):
+            raise SubmissionConflict(f"{row.name} is unavailable. Choose another recipient.")
+        return row
     if page == "list":
         recipient = _available_page_owner(address.recipient_id, members, allow_producer=True)
     else:
@@ -969,17 +995,39 @@ def proposal_folder(recipient: staff.StaffRow) -> Path | NoNativeFolder:
     return NoNativeFolder(SubmissionKind.PROPOSAL)
 
 
-def recipient_options(members: staff.StaffSnapshot) -> list[RecipientOption]:
-    """List active recipients and indicate who can receive proposals."""
-    options: list[RecipientOption] = []
+def _is_recipient_choice(row: staff.StaffRow, members: staff.StaffSnapshot, *,
+                         owner: staff.StaffRow | PageOwnerUnavailable,
+                         producer: staff.StaffRow | PageOwnerUnavailable) -> bool:
+    return (_page_owner_is_active(row, members)
+            and (row == owner or row == producer or _submission_owner_is_active(row, members)))
+
+
+_NO_PAGE_OWNER = PageOwnerUnavailable()
+
+
+def _recipient_choices(members: staff.StaffSnapshot, *,
+                       owner: staff.StaffRow | PageOwnerUnavailable = _NO_PAGE_OWNER
+                       ) -> Iterable[staff.StaffRow]:
     producer = list_producer(conf.read_or_repository("console"), members)
     for row in (*staff.active(members, "showrunner"), *staff.active(members, "producer")):
         try:
-            active = row == producer or _submission_owner_is_active(row, members)
+            if _is_recipient_choice(row, members, owner=owner, producer=producer):
+                yield row
         except OSError:
             continue
-        if not active:
-            continue
+
+
+def has_recipient_choice(members: staff.StaffSnapshot) -> bool:
+    """Check whether the dialog has a recipient without reading Proposal folders."""
+    return any(_recipient_choices(members))
+
+
+def recipient_options(members: staff.StaffSnapshot, *,
+                      owner: staff.StaffRow | PageOwnerUnavailable = _NO_PAGE_OWNER
+                      ) -> list[RecipientOption]:
+    """List active recipients and indicate who can receive proposals."""
+    options: list[RecipientOption] = []
+    for row in _recipient_choices(members, owner=owner):
         try:
             can_receive_proposals = isinstance(proposal_folder(row), Path)
         except OSError:
@@ -1059,17 +1107,24 @@ def _locked_browser_request(address: SubmissionAddress, members: staff.StaffSnap
                 return
         if refusal is not None:
             raise refusal
-        owners = {address.recipient_id}
-        while True:
-            with investigation.recipient_locks(*owners):
-                current = staff.snapshot()
-                recipient = _send_recipient(address, page, current, page_recipient)
-                if recipient.id not in owners:
-                    owners.add(recipient.id)
-                    continue
-                target = SubmissionAddress(address.kind, recipient.id, f"{address.request_id}-{address.kind}-{recipient.id}")
-                yield SubmissionLookup(_request_hint(target), NoNativeSubmission(), current, target, recipient)
-                return
+        with _locked_browser_recipient(address, page, page_recipient) as lookup:
+            yield lookup
+
+
+@contextmanager
+def _locked_browser_recipient(address: SubmissionAddress, page: str, page_recipient: new_item_dialog.PageRecipient
+                              ) -> Generator[SubmissionLookup]:
+    owners = {address.recipient_id}
+    while True:
+        with investigation.recipient_locks(*owners):
+            current = staff.snapshot()
+            recipient = _send_recipient(address, page, current, page_recipient)
+            if recipient.id not in owners:
+                owners.add(recipient.id)
+                continue
+            target = SubmissionAddress(address.kind, recipient.id, f"{address.request_id}-{address.kind}-{recipient.id}")
+            yield SubmissionLookup(_request_hint(target), NoNativeSubmission(), current, target, recipient)
+            return
 
 
 @contextmanager
@@ -1106,18 +1161,69 @@ def _discard_unfiled_send(folder: Path) -> None:
     atomic_file.sync_folder(folder)
 
 
+def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None) -> SavedSubmission:
+    if not is_draft_id(send.request_id):
+        raise SubmissionError("Invalid List draft ID.")
+    folder, _ = _prepare_request_folder(send.request_id)
+    with exclusive(folder / ".lock"):
+        with _locked_filed_draft(folder, send.request_id, members) as lookup:
+            if isinstance(lookup, SubmissionLookup) and isinstance(lookup.native, LocatedSubmission):
+                item = lookup.native
+                if item.details.page != "list":
+                    raise SubmissionConflict("This draft belongs to another page.")
+                return _complete_receipt(folder, item.destination, lookup.hint, item.record, edited=True)
+        alias = folder / "list-receipt-key"
+        try:
+            key = alias.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            pass
+        else:
+            with scoped_submission(read_submission_key(key), members=members) as item:
+                saved = item.destination
+                return _complete_receipt(_request_folder(saved.request_id), saved, _request_hint(saved.address),
+                                         item.record, edited=True)
+        filing = send.prepare()
+        request = filing.request
+        if request.page != "list" or request.request_id != send.request_id:
+            raise SubmissionError("Invalid List draft request.")
+        return _submit(request, members=members, screenshot=filing.screenshot,
+                       capture_requested=filing.capture_requested, refusal=filing.refusal)
+
+
+def _legacy_list_draft(address: SubmissionAddress, words: str, uploads: tuple[_ImageUpload, ...],
+                      members: staff.StaffSnapshot | None) -> SavedSubmission | None:
+    """Recover old List filings when the original words, kind, images and recipient match."""
+    legacy_id = "r2-" + address.request_id[3:]
+    fingerprint = _fingerprint([legacy_id, address.kind, words, _image_fingerprints(uploads)])
+    folder = _request_folder(f"r4-{fingerprint}")
+    if not folder.is_dir():
+        return None
+    address = replace(address, request_id=legacy_id)
+    with exclusive(folder / ".lock"):
+        for candidate in _list_draft_candidates(folder, address, fingerprint):
+            with _locked_request(candidate, members, list_recipient=address.recipient_id) as lookup:
+                item = _saved_draft(lookup, list_recipient=address.recipient_id)
+                if item is None or address.recipient_id not in (item.destination.recipient_id, item.destination.owner):
+                    continue
+                saved = item.destination
+                return _complete_receipt(_request_folder(saved.request_id), saved, lookup.hint, item.record, edited=True)
+    return None
+
+
 def submit(
-    request: NewItemRequest | new_item_dialog.UnverifiedDraftRetry, *, members: staff.StaffSnapshot | None = None,
+    request: NewItemRequest | new_item_dialog.UnverifiedDraftRetry | ListDraftSend, *, members: staff.StaffSnapshot | None = None,
     screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
     capture_requested: bool = False, refusal: SubmissionError | None = None,
 ) -> SavedSubmission:
     """Save the native item or recover the first Send for this draft."""
     if isinstance(request, new_item_dialog.UnverifiedDraftRetry):
         return _recover_unverified_draft(request.request_id, members, request.error)
+    if isinstance(request, ListDraftSend):
+        return _submit_list_draft(request, members)
     if request.page == "list":
-        # Route old clients through the same List draft lookup as current clients.
         if BROWSER_DRAFT_ID.fullmatch(request.request_id):
-            request = replace(request, request_id="r2-" + request.request_id[3:])
+            filing = ListDraftFiling(request, screenshot, capture_requested, refusal)
+            return _submit_list_draft(ListDraftSend(request.request_id, lambda: filing), members)
         return _submit(request, members=members, screenshot=screenshot,
                        capture_requested=capture_requested, refusal=refusal)
     try:
@@ -1133,12 +1239,15 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     check_recipient_id(request.recipient_id)
     request_id = read_request_id(request.request_id)
     kind = read_kind(request.kind)
-    if request.page and (request.page not in page_frame.OWNER_PAGES or kind == SubmissionKind.PROPOSAL):
+    if request.page and request.page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     if not request.page and request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         raise SubmissionError("Select a recipient from the New item dialog.")
+    if request.page and kind == SubmissionKind.PROPOSAL:
+        request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
     legacy_draft = DRAFT_ID.fullmatch(request_id) is not None
     browser_draft = BROWSER_DRAFT_ID.fullmatch(request_id) is not None
+    list_draft = browser_draft and request.page == "list"
     if request_id.startswith(("r2-", "r3-", "r4-", "r5-", "r6-")) and not (legacy_draft or browser_draft):
         raise SubmissionError("Invalid draft request ID.")
     address = (SubmissionAddress(kind, request.recipient_id, request_id) if legacy_draft or browser_draft
@@ -1146,12 +1255,19 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
     words = read_words(request.words, "Your words")
     evidence = read_evidence(asdict(request.evidence))
     uploads = _decode_images(request.images)
+    if list_draft:
+        previous = _legacy_list_draft(address, words, uploads, members)
+        if previous is not None:
+            alias = _request_folder(request_id) / "list-receipt-key"
+            atomic_file.write_text_atomic(alias, previous.key, new_file_mode=0o600)
+            atomic_file.sync_folder(alias.parent)
+            return previous
     state = request.page_state
     missing_capture = capture_requested and isinstance(screenshot, new_item_dialog.NoPageScreenshot)
     unverified = refusal is not None or missing_capture
     if refusal is None and (missing_capture or isinstance(screenshot, new_item_dialog.FiledPageScreenshot)):
         refusal = new_item_dialog.SubmissionScreenshotExpired()
-    if refusal is not None and not (legacy_draft or browser_draft):
+    if refusal is not None and (list_draft or not (legacy_draft or browser_draft)):
         raise refusal
 
     payload_hash = ""
@@ -1172,13 +1288,15 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             evidence = NoEvidence()
         if state is not None:
             state = replace(state, viewport=screenshot.viewport, include_screenshot=True)
-    elif state is not None and not legacy_draft:
+    elif state is not None and not (legacy_draft or list_draft):
         state = replace(state, viewport=None, include_screenshot=False)
     request = replace(request, kind=kind, evidence=evidence, page_state=state)
     folder: Path | None = None
     request_exists = False
     try:
-        if browser_draft:
+        if list_draft:
+            locked = _locked_browser_recipient(address, request.page, request.page_recipient)
+        elif browser_draft:
             locked = _locked_browser_request(address, members, page=request.page,
                                              page_recipient=request.page_recipient, refusal=refusal)
         elif legacy_draft:

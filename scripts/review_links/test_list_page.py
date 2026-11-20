@@ -191,7 +191,8 @@ document.body.append(result);
     def test_browser_new_item_opens_the_dialog_and_reveals_the_saved_row(self) -> None:
         root = self.root / "reviews"
         _ = self.add("An existing List item")
-        initial = list_page.render(root, include_counts=False).decode()
+        initial = page_frame.with_owner(list_page.render(root, include_counts=False), "list", MORTY,
+                                        staff.StaffSnapshot((MORTY,)), new_item_dialog.render).decode()
         item = self.add("A new List item")
         fresh = list_page.render(root, include_counts=False).decode()
         setup = r"""<script>
@@ -206,7 +207,7 @@ window.fetch=async (path,options={})=>{
  }
  const request=new URL(path,location.href);
  requests.push([request.pathname+request.search,options.body && JSON.parse(options.body)]);
- if(request.search==='?page=list') return Response.json({token:'fixture',recipients:[{id:owner,name:'morty'}]});
+ if(request.search==='?page=list') return Response.json({token:'fixture',page_owner:owner,recipients:[{id:owner,name:'morty'}]});
  if(options.body && JSON.parse(options.body).page_capture) return Response.json({});
  return Response.json({id:'Q1',key:'fixture-review-key',list_key:created});
 };
@@ -220,8 +221,8 @@ window.fetch=async (path,options={})=>{
   observer.observe(target,{subtree:true,childList:true,attributes:true});
   if(test()){observer.disconnect();resolve();}
  });
- const button=document.querySelector('.page-heading-actions [data-list-new]');
- check(button?.textContent==='+New item','The New item button is beside the List title.');
+ const buttons=document.querySelectorAll('.page-heading-actions button'),button=buttons[0];
+ check(buttons.length===1 && button.hasAttribute('data-owner-new'),'The owner button is the only title action.');
  const dialog=document.querySelector('#review-new-item');
  check(document.querySelectorAll('#review-new-item').length===1,'The List mounts one shared dialog.');
  const existing=document.querySelector('[data-list-item]');
@@ -267,7 +268,7 @@ window.fetch=async (path,options={})=>{
                     "status": status, "body": body})), virtual_time_ms=3000)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
-    def test_list_title_actions_fit_at_320_pixels(self) -> None:
+    def test_list_owner_button_fits_at_320_pixels(self) -> None:
         owner = replace(MORTY, name="cargo-liner")
         markup = page_frame.with_owner(list_page.render(self.root / "reviews", include_counts=False),
                                        "list", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render)
@@ -276,13 +277,13 @@ window.fetch=async (path,options={})=>{
  const failures=[];
  try{
   await document.fonts.ready;
-  const title=document.querySelector('.page-heading h1'), button=document.querySelector('[data-list-new]');
+  const title=document.querySelector('.page-heading h1'), button=document.querySelector('[data-owner-new]');
   const heading=title.parentElement.getBoundingClientRect(), bounds=title.getBoundingClientRect();
   const line=parseFloat(getComputedStyle(title).lineHeight);
   if(innerWidth!==320 || Math.abs(bounds.height-line)>1){
    failures.push('The List title fits on one line at 320 px.');
   }
-  const controls=[button,document.querySelector('[data-owner-new]'),document.querySelector('.page-owner-name')];
+  const controls=[button,document.querySelector('.page-owner-name')];
   if(controls.some(control=>{
    const box=control.getBoundingClientRect();
    return box.width<=0 || box.left<bounds.right || box.right>heading.right+1 ||
@@ -290,8 +291,9 @@ window.fetch=async (path,options={})=>{
   }) || bounds.height>heading.height || heading.height>button.offsetHeight+1){
    failures.push('The List controls fit beside the title at 320 px.');
   }
-  if(button.innerText.trim()!=='+' || button.getAttribute('aria-label')!=='New item' || button.title!=='New item'){
-   failures.push('The narrow New item button shows only + and keeps its name.');
+  if(title.parentElement.querySelectorAll('button').length!==1 ||
+     button.getAttribute('aria-label')!=='New item for cargo-liner'){
+   failures.push('The page owner button is the only action beside the title.');
   }
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});

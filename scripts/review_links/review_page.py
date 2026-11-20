@@ -554,7 +554,8 @@ class ReviewSnapshotCache:
         return self.publish_item(current, key, item, members), item
 
     def create_submission(
-        self, request: new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry, *,
+        self, request: (new_item_dialog.NewItemRequest | new_item_dialog.UnverifiedDraftRetry
+                        | review_submissions.ListDraftSend), *,
         screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
         capture_requested: bool = False,
         refusal: new_item_dialog.SubmissionError | None = None,
@@ -948,7 +949,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +snapshot.card_motion.attributes()+' '
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
-        +page_frame.title('Review', 'review', action=new_item_dialog.title_button('review'))
+        +page_frame.title('Review', 'review')
         +'<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
         +'<input type="search" id="list-search" placeholder="Filter by id or words"></div>'
         +'<div class="review-queue">'
@@ -966,7 +967,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +CARD_COLUMNS+'<thead><tr>'+headers+'</tr></thead>'
         +'<tbody data-window-before></tbody><tbody data-window-after></tbody>'
         +'</table><p data-empty hidden>No items in this view.</p></div></div></div>'
-        +new_item_dialog.render()+'<script>'+SCRIPT+'</script>')
+        +'<script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
 
@@ -1156,7 +1157,7 @@ QUESTION_COLOR_RULE = '.question{--type-color:#b99aff}'
 STYLE = '<style>' + QUESTION_COLOR_RULE + '''
 main:has(>[data-review]){max-width:1124px}
 [data-review]{display:flex;flex-wrap:wrap;align-items:center;column-gap:16px}
-[data-review]>:is(.page-heading,.review-queue){flex:0 0 100%;min-width:0}
+[data-review]>:is(.page-title,.page-heading,.review-queue){flex:0 0 100%;min-width:0}
 [data-review]>:is(.page-status,.record-filter-words){margin:0}
 [data-review]>.page-status{flex:1 1 0;min-width:0}
 [data-review]>.page-status>[data-status-reason]{white-space:normal;overflow-wrap:anywhere;min-width:0}
@@ -1927,9 +1928,6 @@ function applyReviewIndex(payload){
 bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
 setInterval(updateHandoffAges,5000);
-document.querySelector('[data-review-new]').addEventListener('click',event=>{
- window.reviewNewItem.open({trigger:event.currentTarget});
-});
 document.addEventListener('review-item-saved',()=>{
  const notice=content.querySelector('[data-review-notice]');
  notice.textContent='';notice.hidden=true;

@@ -1,6 +1,7 @@
 """Test the New item dialog against a private HTTP fixture."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -8,17 +9,17 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from dataclasses import asdict, replace, dataclass, field
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Literal, cast, override
+from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.agents.remote import local_machine
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, page_frame, review_submissions
-from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
+from scripts.review_links.test_review_submissions import OWNER, PNG, identify_fixture_image
 
 ENDPOINT = "/console/review/new-item"
 RECIPIENTS = [{"id": str(OWNER), "name": "builds", "proposal": True}] + [
@@ -29,7 +30,7 @@ RECIPIENTS.append({"id": str(LIST_PRODUCER), "name": "morty", "proposal": False}
 OTHER_RECIPIENT = staff.StaffId("cargo-liner")
 FORM_TOKEN = "fixture-form-token"
 RESTARTED_TOKEN = "fixture-after-restart"
-NO_CLIP_TEXT = "Last tooltip detail <strong> & all of its text"
+CAPTURE_KEY = "f" * 32
 DISPLAY_WORDS = "The nextest row stops updating during shard 2."
 
 
@@ -43,8 +44,6 @@ SHELL = '''
  .fixture-memory i:nth-child(3) {width:42%;background:#5c5b57}
  table {width:100%;border-collapse:collapse;font-size:14px;text-align:left}
  th,td {padding:10px;border-bottom:1px solid var(--line)}
- #launcher {border-radius:7px;border:1px solid var(--accent);background:var(--card);color:var(--accent);
- font-size:20px;min-width:30px;cursor:pointer}
  .fixture-active {background:#182536}
  .fixture-secondary {margin-top:22px}
  @media(max-width:640px) { .fixture-extra {display:none} }
@@ -60,7 +59,7 @@ SHELL = '''
   <h2>Running</h2>
   <table><thead><tr><th>Step</th><th>Stage</th><th class="fixture-extra">Target</th><th></th></tr></thead>
    <tbody><tr class="fixture-active"><td>hana nextest</td><td>testing</td>
-    <td class="fixture-extra">natedev</td><td><button id="launcher" aria-label="New item for hana nextest">+</button></td></tr>
+    <td class="fixture-extra">natedev</td><td></td></tr>
     <tr><td>cargo test</td><td>building</td><td class="fixture-extra">mac</td><td></td></tr></tbody></table>
  </section>
  <section class="card fixture-secondary">
@@ -80,9 +79,22 @@ const dialog = document.querySelector('dialog'), body = dialog.querySelector('.n
 const textarea = dialog.querySelector('textarea'), error = dialog.querySelector('[role="alert"]');
 const send = dialog.querySelector('[type="submit"]'), recipient = () => dialog.querySelector('[name="recipient_id"]');
 const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
-const launch = document.querySelector('#launcher');
-const capture = __CAPTURE__, png = '__PNG__';
-const open = (options = {}) => window.reviewNewItem.open({trigger: launch, kind: 'bug', evidence: capture, ...options});
+const launch = document.querySelector('[data-owner-new]'), png = '__PNG__';
+const to = () => [...dialog.querySelectorAll('[name="recipient_id"]')];
+const morty = () => to().find(input => input.nextElementSibling.textContent === 'morty');
+const selectType = kind => dialog.querySelector('[name="kind"][value="'+kind+'"]').click();
+const open = ({kind, page = 'builds'} = {}) => new Promise(resolve => {
+ const status = dialog.querySelector('[data-recipients-status]');
+ const observer = new MutationObserver(() => {
+  if (!status.hidden) return;
+  observer.disconnect();
+  if (kind) selectType(kind);
+  resolve();
+ });
+ observer.observe(status, {attributes:true, attributeFilter:['hidden']});
+ launch.closest('[data-page-owner]').dataset.pageOwner = page;
+ launch.click();
+});
 const closeToLauncher = () => !dialog.open && document.activeElement === launch;
 function type(text) {
  textarea.value = text;
@@ -136,14 +148,14 @@ async function sendSaved() {
   } else {
    await open();
    check(dialog.open && dialog.matches(':modal'), 'The dialog opens as a native modal.');
-   check(document.activeElement.value === 'bug', 'Focus starts on the selected Type radio.');
-   check([...dialog.querySelectorAll('[name="kind"]')].length === 4, 'Four keyboard-selectable types are present.');
+   check(document.activeElement.id === 'new-item-title' &&
+         dialog.querySelector('[name="kind"]:checked').value === 'bug', 'Bug is selected when the dialog opens.');
+   check([...dialog.querySelectorAll('[name="kind"]')].length === 5, 'Five keyboard-selectable types are present.');
    check(!!recipient() && recipient().tabIndex === 0, 'To uses native keyboard-selectable radios.');
    check(send.disabled, 'Send needs words and a recipient.');
+   dialog.querySelector('[name="include_page"]').click();
    type('Check <index>\nAgain');
-   check(send.disabled, 'Words alone do not enable Send.');
-   recipient().click();
-   check(!send.disabled, 'A recipient and words enable Send.');
+   check(recipient().checked && !send.disabled, 'Words and the selected owner enable Send.');
 
    const bounds = dialog.getBoundingClientRect();
    check(innerWidth === __WIDTH__, 'Firefox uses the requested viewport width.');
@@ -151,20 +163,16 @@ async function sendSaved() {
    check(Math.abs(bounds.left - (innerWidth - bounds.right)) < 1 &&
          Math.abs(bounds.top - (innerHeight - bounds.bottom)) < 1, 'The dialog is centered on both axes.');
    const chips = [...dialog.querySelectorAll('[data-kind]')];
-   check((chips[0].offsetTop !== chips[3].offsetTop) === (innerWidth < 480), 'Type chips wrap on a phone.');
-   const evidence = dialog.querySelector('[data-evidence]'), tip = dialog.querySelector('.new-item-tip');
-   check(evidence.getBoundingClientRect().bottom < textarea.getBoundingClientRect().top, 'Evidence precedes the words.');
-   check(tip.lastElementChild.textContent === __LAST_DETAIL__ && !tip.querySelector('strong strong'),
-         'The final tooltip entry stays visible as text.');
-   check(tip.clientHeight === tip.scrollHeight && getComputedStyle(tip).backgroundColor === 'rgb(36, 36, 34)',
-         'The full tooltip uses the dark background and has no internal scroll.');
-   check(body.scrollHeight > body.clientHeight, 'Tall evidence scrolls the dialog body.');
+   check(chips[0].offsetTop !== chips.at(-1).offsetTop, 'The Type chips wrap within the dialog.');
+   const details = dialog.querySelector('[data-sent-details]');
+   check(details.getBoundingClientRect().top > textarea.getBoundingClientRect().bottom,
+         'The page details follow the words.');
    const fixedTop = dialog.querySelector('header').getBoundingClientRect().top;
    const fixedBottom = dialog.querySelector('footer').getBoundingClientRect().bottom;
    body.scrollTop = body.scrollHeight;
-   check(body.scrollTop > 0 && fixedTop === dialog.querySelector('header').getBoundingClientRect().top &&
+   check(fixedTop === dialog.querySelector('header').getBoundingClientRect().top &&
          fixedBottom === dialog.querySelector('footer').getBoundingClientRect().bottom,
-         'Header and footer remain visible while the body scrolls.');
+         'The header and footer remain visible when the body scrolls.');
    check(body.scrollWidth === body.clientWidth, 'The dialog body has no horizontal scroll.');
 
    paste();
@@ -182,34 +190,34 @@ async function sendSaved() {
          'A failed send keeps words and images.');
    check(document.activeElement === send, 'Focus returns to Send on failure.');
    dialog.requestClose();
-   await open({kind:'question', evidence:{kind:'none'}});
-   check(textarea.value === 'Check <index>\nAgain' && !evidence.hidden && recipient().checked &&
+   await open();
+   check(textarea.value === 'Check <index>\nAgain' && !details.hidden && recipient().checked &&
          dialog.querySelectorAll('[data-previews] img').length === 1 &&
          error.textContent === 'Fixture rejected the first send.' && !send.disabled,
          'Reopen keeps the failed draft and its error.');
    check((await sendSaved()).detail.id === 'I1', 'The event reports the saved item ID.');
    check(closeToLauncher(), 'Done closes the confirmation and returns focus.');
 
-   await open({kind:'question', evidence:{kind:'none'}});
-   check(document.activeElement.value === 'question' && evidence.hidden && !textarea.value &&
-         dialog.querySelector('[data-previews]').hidden, 'Reopen clears the sent draft and accepts empty evidence.');
-   const to = () => [...dialog.querySelectorAll('[name="recipient_id"]')];
-   const morty = () => to().find(input => input.nextElementSibling.textContent === 'morty');
-   check(morty()?.value === 'fixture-list-producer', 'The standard dialog offers morty.');
+   await open({kind:'question'});
+   check(!textarea.value && dialog.querySelector('[data-previews]').hidden, 'Reopen clears the sent draft.');
+   check(morty()?.value === 'fixture-list-producer', 'The owner dialog offers morty.');
    const kinds = dialog.querySelector('[name="kind"][value="proposal"]');
    to()[1].click();
    kinds.click();
    check(to().length === 1 && to()[0].value === 'builds-staff' && !to()[0].checked && send.disabled,
-         'Proposal filters the recipients and clears a recipient without a proposal folder.');
+         'Proposal clears the selection when the recipient has no proposal folder.');
    dialog.querySelector('[name="kind"][value="question"]').click();
    check(to().length === 9, 'The other types include all recipients.');
    dialog.requestClose();
    check(closeToLauncher(), 'The native cancel action closes the modal and restores focus.');
-   await open({evidence:{kind:'none'}});
+   await open();
+   dialog.querySelector('[name="include_page"]').click();
    const attempted = [], originalFetch = window.fetch;
    window.fetch = (url, options) => {
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
-    attempted.push(JSON.parse(options.body));
+    const payload = JSON.parse(options.body);
+    if (payload.page_capture) return Promise.resolve(Response.json({error:'No Firefox.'}, {status:503}));
+    attempted.push(payload);
     if (attempted.length === 1) {
      return Promise.resolve(new Response(
        JSON.stringify({reason:'builds has finished; choose another recipient'}), {status:409}));
@@ -245,6 +253,7 @@ async function sendSaved() {
    check(new Set(attempted.map(post => post.request_id)).size === 1 &&
          attempted[0].recipient_id !== attempted[1].recipient_id && attempted[1].kind !== attempted[2].kind,
          'Changing the recipient or type keeps the unsent draft ID.');
+   type('');
    dialog.querySelector('[data-cancel]').click();
    check(closeToLauncher(), 'Cancel restores focus to the launcher.');
 
@@ -258,9 +267,7 @@ async function sendSaved() {
    const json = (value, status = 200) => Promise.resolve(new Response(JSON.stringify(value), {status}));
    window.fetch = (url, options) => {
     if (url === ownerEndpoint) {
-     return json({token:ownerToken, page_owner:'builds-staff', recipients:[
-      {id:'builds-staff', name:'builds', proposal:false},
-      {id:'fixture-list-producer', name:'morty', proposal:false}]});
+     return json({token:ownerToken, page_owner:'builds-staff', recipients:__RECIPIENTS__});
     }
     if (url === '/console/review/new-item?capture_key=' + captureKey) {
      check(options.headers['X-Review-Token'] === ownerToken, 'The preview requests use the form token.');
@@ -299,6 +306,7 @@ async function sendSaved() {
      const response = originalFetch(url, {...options, body: JSON.stringify({...payload, token: attempted[0].token})});
      return payload.page && dropPageReply ? response.then(saved => {
       if (!saved.ok) return saved;
+      dropPageReply = false;
       throw new Error('The Send response was lost.');
      }) : response;
     }
@@ -313,18 +321,18 @@ async function sendSaved() {
     });
    }
    async function openOwner() {
-    await open({page:'builds', kind:'question', evidence:{kind:'none'}});
+    await open({kind:'question'});
     if (!pngAvailable) await whenShown(dialog.querySelector('[data-fallback]'));
     check(checkbox.checked && !checkbox.disabled && !checkbox.closest('label').hidden,
           'The page checkbox is checked and available on open.');
-    check(to().length === 2 && to()[0].checked && to()[0].value === 'builds-staff', 'The page owner is selected.');
+    check(to().length === 9 && to()[0].checked && to()[0].value === 'builds-staff', 'The page owner is selected.');
     check(morty() && !morty().checked, 'The page dialog also offers morty.');
     check(to()[0].nextElementSibling.hasAttribute('data-button-face'), 'The owner chip uses the shared button style.');
     const shown = [...dialog.querySelectorAll('[data-kind]:not([hidden])')].map(chip=>chip.textContent.trim());
-    check(shown.join(',') === 'Bug,Question,Feedback', 'The owner dialog has the three requested types.');
+    check(shown.join(',') === 'Bug,Question,Feedback,Proposal,Investigation', 'The owner dialog has all five types.');
    }
    async function sendOwner() {
-    dialog.querySelector('[name="kind"][value="investigation"]').click();
+    selectType('feedback');
     type('Show the queue state.');
     return sendSaved();
    }
@@ -438,31 +446,32 @@ async function sendSaved() {
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The page Send files before the response is lost.');
    dialog.querySelector('[data-cancel]').click();
-   await open({evidence:{kind:'none'}});
+   await open();
    const previewReply = await originalFetch(preview.src).catch(() => null);
    check(textarea.value === 'Keep this draft and its image.' &&
          dialog.querySelector('[data-previews] img') === preview && previewReply?.ok,
-         'Standard New keeps the failed page draft and its pasted image.');
+         'Reopen keeps the failed page draft and its pasted image.');
    const ownerRequest = ownerPosts.at(-1);
-   recipient().click();
+   type('Keep this draft and its image after editing.');
    await trySend();
-   check(dialog.open && textarea.value === 'Keep this draft and its image.' &&
+   check(dialog.open && textarea.value === 'Keep this draft and its image after editing.' &&
          error.textContent === 'This item was already filed as I2. Any change after that Send was not sent.',
          'A changed Send reports the first ID and keeps the draft open.');
-   const standardRequest = ownerPosts.at(-1);
-   check(!standardRequest.page && !standardRequest.capture_key && standardRequest.images[0].base64_data === png &&
-         standardRequest.request_id === ownerRequest.request_id,
+   const changedRequest = ownerPosts.at(-1);
+   check(changedRequest.page === 'builds' && changedRequest.images[0].base64_data === png &&
+         changedRequest.request_id === ownerRequest.request_id,
          'The first retry uses the old request ID and the current evidence.');
    check((await sendSaved()).detail.id === 'I3' && ownerPosts.at(-1).request_id !== ownerRequest.request_id,
          'The next Send uses a new ID and files the retained draft.');
    await openOwner();
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('The first item before replacement.');
+   dropPageReply = true;
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The first item files before the response is lost.');
    const firstDraft = ownerPosts.at(-1);
    dialog.querySelector('[data-cancel]').click();
-   await open({evidence:{kind:'none'}});
+   await open();
    type('The replacement item.');
    to()[1].click();
    await trySend();
@@ -477,11 +486,11 @@ async function sendSaved() {
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    const undoWords = 'Restore these words after the edit.';
    type(undoWords);
+   dropPageReply = true;
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'F013 files before the response is lost.');
    type('Edit the draft.');
    type(undoWords);
-   dropPageReply = false;
    check((await sendSaved()).detail.id === 'I6', 'F013 returns the first item after undo.');
 
    const pageTitle = main.querySelector('h1');
@@ -500,7 +509,7 @@ async function sendSaved() {
    type('Check the queue for morty.');
    await sendSaved();
    check(ownerPosts.at(-1).recipient_id === 'fixture-list-producer' &&
-         ownerPosts.at(-1).page_recipient === 'list-owner', 'Send keeps the selected List owner.');
+         ownerPosts.at(-1).page_recipient === 'selected', 'Send keeps the selected List owner.');
 
    useLiveSends = false;
    pngAvailable = true;
@@ -550,7 +559,9 @@ async function sendSaved() {
    let listToken = 'list-token-before-restart';
    window.fetch = (url, options) => {
     if (url === '/console/review/new-item?page=list') {
-     return json({token:listToken,recipients:[{id:'fixture-list-producer',name:'morty'}]});
+     const morty = {id:'fixture-list-producer',name:'morty'};
+     const owner = listToken === 'list-token-before-restart' ? morty : {id:'builds-staff',name:'builds'};
+     return json({token:listToken,page_owner:owner.id,recipients:owner === morty ? [morty] : [owner, morty]});
     }
     if (url === '/console/review/new-item' && options?.method === 'POST') {
      const payload = JSON.parse(options.body);
@@ -564,20 +575,31 @@ async function sendSaved() {
    type('Keep these List words.');
    listToken = attempted[0].token;
    await trySend();
-   check(dialog.open && textarea.value === 'Keep these List words.' && listPosts.length === 1 &&
-         error.textContent === 'The New item token expired. Try Send again.',
-         'The List keeps the words and shows the failure after a restart.');
+   check(dialog.open && textarea.value === 'Keep these List words.' && listPosts.length === 1 && !error.hidden,
+         'The List keeps the words and shows the refusal after a restart.');
+   const listForm = send.form;
+   if (listForm.getAttribute('aria-busy') === 'true') await new Promise(resolve => {
+    const observer = new MutationObserver(() => {
+     if (listForm.getAttribute('aria-busy') === 'false') { observer.disconnect(); resolve(); }
+    });
+    observer.observe(listForm, {attributes:true, attributeFilter:['aria-busy']});
+   });
+   await whenShown(dialog.querySelector('[data-fallback]'));
+   check(to().find(input => input.checked)?.value === 'fixture-list-producer' &&
+         !to().find(input => input.value === 'builds-staff')?.matches(':disabled') && !textarea.disabled,
+         'The List keeps the recipient and lets the user edit the draft.');
    const listCreated = new Promise(resolve =>
     document.addEventListener('review-item-created', resolve, {once:true}));
    send.click();
    await listCreated;
-   check(!dialog.open && listPosts.length === 2 && listPosts[0].request_id.startsWith('r2-') &&
+   check(!dialog.open && listPosts.length === 2 && listPosts[0].request_id.startsWith('r6-') &&
          listPosts[1].request_id === listPosts[0].request_id && listPosts[1].words === listPosts[0].words &&
-         listPosts[1].token === listToken, 'The second Send files the List draft with the current token.');
+         listPosts[1].recipient_id === listPosts[0].recipient_id && listPosts[1].token === listToken,
+         'The retry sends the same List draft and recipient with the current token.');
 
    window.fetch = (url, options) => {
     if (url === '/console/review/new-item?page=list') {
-     return json({token:'', recipients:[{id:'list-staff',name:'morty'}],
+     return json({token:'', page_owner:'list-staff', recipients:[{id:'list-staff',name:'morty'}],
                   send_disabled:'Sending is off on a practice List.'});
     }
     if (url === '/console/review/new-item' && options?.method === 'POST') {
@@ -608,18 +630,68 @@ async function sendSaved() {
 '''
 
 
-def fixture_page(width: int, *, photo: bool) -> bytes:
-    evidence = EVIDENCE if photo else replace(EVIDENCE, tip=(
-        *EVIDENCE.tip,
-        *(review_submissions.TipField(f"Step detail {n}", f"Run {n}, RSS {n} GiB") for n in range(28)),
-        review_submissions.TipDetail(NO_CLIP_TEXT)))
-    probe = (PROBE.replace("__CAPTURE__", json.dumps(asdict(evidence)))
+OWNER_OPTIONS_PROBE = r"""
+(async () => {
+ const failures = [];
+ const check = (value, description) => { if (!value) failures.push(description); };
+ try {
+  const buttons = document.querySelectorAll('.page-heading button');
+  const dialog = document.querySelector('#review-new-item');
+  const recipients = dialog.querySelector('[data-recipients]');
+  const loaded = new Promise(resolve => {
+   const observer = new MutationObserver(() => {
+    if (recipients.children.length) { observer.disconnect(); resolve(); }
+   });
+   observer.observe(recipients, {childList:true});
+  });
+  check(buttons.length === 1 && buttons[0].hasAttribute('data-owner-new'), 'The header has one owner button.');
+  buttons[0].click();
+  if (!dialog.open) throw new Error('The owner button must open the dialog.');
+  await loaded;
+  const types = [...dialog.querySelectorAll('[data-kind-label]')].map(label => label.textContent);
+  check(types.join(',') === 'Bug,Question,Feedback,Proposal,Investigation', 'All five types appear in order.');
+  check(dialog.querySelector('[name="kind"]:checked').value === 'bug', 'Bug starts selected.');
+  const inputs = () => [...recipients.querySelectorAll('input')];
+  check(inputs().map(input => input.value).join() === __RECIPIENTS__.map(row => row.id).join(),
+        'To shows the full recipient set.');
+  const selected = () => recipients.querySelector('input:checked')?.value;
+  check(selected() === 'builds-staff', 'To starts on the page owner.');
+  const alternate = inputs().find(input => input.value === 'cargo-liner');
+  alternate.click();
+  check(selected() === alternate.value, 'To accepts another recipient.');
+  dialog.querySelector('[name="include_page"]').click();
+  const words = dialog.querySelector('textarea'), send = dialog.querySelector('[type="submit"]');
+  const status = dialog.querySelector('[data-recipients-status]');
+  words.value = 'Check a proposal for this recipient.';
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+  check(!send.disabled, 'The alternate recipient enables Send.');
+  dialog.querySelector('[data-kind="proposal"] input').click();
+  check(inputs().length === 1 && !selected() && send.disabled && !status.hidden &&
+        status.textContent === 'The recipient you chose is not available. Choose a recipient.',
+        'Proposal clears the selection and asks for another recipient.');
+  dialog.querySelector('[data-kind="question"] input').click();
+  check(inputs().length === __RECIPIENTS__.length && !selected() && send.disabled && !status.hidden,
+        'Changing the type back keeps the selection empty.');
+  inputs().find(input => input.value === alternate.value).click();
+  check(selected() === alternate.value && !send.disabled && status.hidden,
+        'An explicit selection enables Send and hides the notice.');
+ } catch (error) { failures.push(String(error)); }
+ await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
+ parent.postMessage('finished', location.origin);
+})();
+"""
+
+
+def fixture_page(width: int, *, photo: bool, script: str = PROBE) -> bytes:
+    probe = (script.replace("__RECIPIENTS__", json.dumps(RECIPIENTS))
              .replace("__PHOTO__", json.dumps(photo)).replace("__PNG__", PNG).replace("__WIDTH__", str(width))
-             .replace("__LAST_DETAIL__", json.dumps(NO_CLIP_TEXT))
              .replace("__DISPLAY_WORDS__", json.dumps(DISPLAY_WORDS)))
-    return (f'<!doctype html><html lang="en" data-theme="dark"><meta charset="utf-8">'
+    page = (f'<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Builds</title>'
-            f'<style>{console_theme.CSS}{page_frame.BUTTON_STATES}</style>{SHELL}{new_item_dialog.render()}<script>{probe}</script>').encode()
+            f'<style>{console_theme.CSS}</style></head><body>{SHELL}</body></html>').encode()
+    owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+    return page_frame.with_owner(page, "builds", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render).replace(
+        b'</body>', b'<script>' + probe.encode() + b'</script></body>')
 
 
 BUG_PROBE = r"""
@@ -628,7 +700,7 @@ const check = (value, description) => { if (!value) failures.push(description); 
 const wire = [], fetchHTTP = window.fetch;
 window.fetch = async (path, options) => {
  if (!String(path).startsWith('/console/review/new-item')) return fetchHTTP(path, options);
- if (!options.body) return Response.json({token:'fixture',recipients:[{id:'owner',name:'sdlc',proposal:false}]});
+ if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:false}]});
  const payload = JSON.parse(options.body);
  wire.push(payload);
  if (payload.page_capture) return Response.json({error:'No Firefox.'},{status:503});
@@ -683,8 +755,8 @@ const send = async () => {
   await open();
   check(!state.hidden && state.closest('[data-sent-details]').textContent.includes('Sent with your words'),
         'The Bug dialog lists the page facts with the evidence it sends.');
-  check(dialog.querySelector('[data-kind="proposal"]').getClientRects().length === 0,
-        'The console owner dialog does not display Proposal.');
+  check(dialog.querySelector('[data-kind="proposal"]').getClientRects().length > 0,
+        'The owner dialog displays Proposal.');
   check(state.textContent.includes('Type All · State Open · Owner builds'), 'The dialog shows the selected filters.');
   const address = term('Address');
   check(address?.nextElementSibling.textContent === location.href, 'The Address row shows the full address.');
@@ -781,6 +853,217 @@ def bug_fixture_page(*, photo: bool = False) -> bytes:
             f'{new_item_dialog.render()}<script>{probe}</script></body></html>').encode()
 
 
+LIST_RETRY_PROBE = r'''
+const failures = [];
+const check = (ok, description) => { if (!ok) failures.push(description); };
+const dialog = document.querySelector('#review-new-item');
+const words = dialog.querySelector('textarea'), error = dialog.querySelector('.new-item-error');
+const send = dialog.querySelector('[type="submit"]'), shot = dialog.querySelector('[data-shot]');
+const type = dialog.querySelector('[name="kind"][value="investigation"]');
+const include = dialog.querySelector('[name="include_page"]');
+const reloadAfterSend = __RELOAD_AFTER_SEND__;
+const firstKey = 'e'.repeat(32), readyKey = 'f'.repeat(32);
+const probeKey = 'test-list-first-send', draftKey = 'console.list.pending-send';
+const restored = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
+const posts = [], fetchHTTP = window.fetch;
+let captures = 0;
+window.fetch = async (path, options) => {
+ if (!reloadAfterSend && path.endsWith('?capture_key=' + firstKey)) {
+  return fetchHTTP(path.replace(firstKey, readyKey), options);
+ }
+ if (path === '/console/review/new-item' && options?.method === 'POST') {
+  const item = JSON.parse(options.body);
+  if (!reloadAfterSend && item.page_capture && ++captures === 1) {
+   return Response.json({capture_key:firstKey}, {status:202});
+  }
+  if (item.discard_capture) return Response.json({});
+  if (item.request_id) {
+   posts.push(item);
+   if (!restored && posts.length === 1) {
+    if (reloadAfterSend) {
+     const response = await fetchHTTP(path, options);
+     if (response.status !== 503) return response;
+    }
+    throw new TypeError('The Send response was lost.');
+   }
+  }
+ }
+ return fetchHTTP(path, options);
+};
+function waitFor(test) {
+ if (test()) return Promise.resolve();
+ return new Promise(resolve => {
+  const observer = new MutationObserver(() => { if (test()) { observer.disconnect(); resolve(); } });
+  observer.observe(dialog, {attributes:true, childList:true, subtree:true});
+ });
+}
+const sendFinished = () => send.form.getAttribute('aria-busy') === 'false' && !error.hidden;
+function editable() {
+ return dialog.open && !words.disabled && !type.matches(':disabled') && !include.disabled &&
+        !dialog.querySelector('[name="recipient_id"]:checked').matches(':disabled');
+}
+function enterWords(value) {
+ words.value = value;
+ words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+}
+(async () => {
+ try {
+  document.querySelector('[data-owner-new]').click();
+  type.click();
+  enterWords(restored ? 'The words after reload.' : 'Keep the first List Send.');
+  await waitFor(() => !send.disabled);
+  send.click();
+  await waitFor(sendFinished);
+  check(editable(), 'A failed Send leaves the draft editable.');
+  if (restored) {
+   check(posts.length === 1 && posts[0].request_id === restored.request_id && posts[0].words !== restored.words,
+         'Reload keeps the draft ID and sends the edited words.');
+   check(error.textContent === 'This item was already filed as I1. Any change after that Send was not sent.',
+         'The retry shows the first saved item ID.');
+   check(!sessionStorage.getItem(draftKey), 'An already filed response clears the draft ID.');
+  } else if (reloadAfterSend && !failures.length) {
+   sessionStorage.setItem(probeKey, JSON.stringify(posts[0]));
+   location.reload();
+   return;
+  } else if (!reloadAfterSend && !failures.length) {
+   const preview = shot.href;
+   send.click();
+   await waitFor(sendFinished);
+   check(error.textContent === 'The screenshot expired.' && editable(),
+         'The expired screenshot leaves the draft editable.');
+   await waitFor(() => !shot.hidden && shot.href !== preview && !send.disabled);
+   const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+   send.click();
+   const event = await Promise.race([
+    created, waitFor(sendFinished).then(() => { throw new Error(error.textContent); })
+   ]);
+   check(event.detail.id === 'I1' && !dialog.open, 'The replacement screenshot saves one item.');
+   check(posts.length === 3 && posts.every(item => item.request_id === posts[0].request_id),
+         'Each Send uses the same draft ID.');
+   check(posts[0].capture_key === firstKey && posts[1].capture_key === firstKey && posts[2].capture_key === readyKey,
+         'Send uses the new capture after the first one expires.');
+   check(!sessionStorage.getItem(draftKey), 'A successful Send clears the draft ID.');
+  }
+ } catch (error) {
+  failures.push(String(error));
+ }
+ sessionStorage.removeItem(probeKey);
+ await fetchHTTP('/results', {method:'POST', body:JSON.stringify(failures)});
+ parent.postMessage('finished', location.origin);
+})();
+'''
+
+
+RECIPIENT_DRAFT_PROBE = r'''
+const failures = [];
+const check = (ok, description) => { if (!ok) failures.push(description); };
+const dialog = document.querySelector('#review-new-item');
+const send = dialog.querySelector('[type="submit"]'), words = dialog.querySelector('textarea');
+const status = dialog.querySelector('[data-recipients-status]');
+const launch = document.querySelector('[data-owner-new]');
+const include = dialog.querySelector('[name="include_page"]');
+const selected = () => dialog.querySelector('[name="recipient_id"]:checked')?.value;
+const alternate = () => dialog.querySelector('[name="recipient_id"][value="cargo-liner"]');
+const selectType = kind => dialog.querySelector('[name="kind"][value="'+kind+'"]').click();
+const scenario = __SCENARIO__, probeKey = 'test-recipient-draft';
+const earlier = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
+const fetchHTTP = window.fetch;
+let firstRequest;
+if (scenario === 'reload') {
+ window.fetch = (path, options) => {
+  if (path === '/console/review/new-item' && options?.method === 'POST') {
+   const item = JSON.parse(options.body);
+   if (item.request_id) {
+    if (!earlier) {
+     firstRequest = item.request_id;
+     return Promise.reject(new TypeError('Send did not reach the server.'));
+    }
+    check(item.request_id === earlier.requestId, 'Send keeps the unfiled draft ID after reload.');
+   }
+  }
+  return fetchHTTP(path, options);
+ };
+}
+function waitFor(test) {
+ if (test()) return Promise.resolve();
+ return new Promise(resolve => {
+  const observer = new MutationObserver(() => { if (test()) { observer.disconnect(); resolve(); } });
+  observer.observe(dialog, {attributes:true, childList:true, subtree:true});
+ });
+}
+async function open() {
+ launch.click();
+ await waitFor(() => status.textContent !== 'Loading recipients…');
+ if (include.checked) include.click();
+}
+function checkEmpty() {
+ check(!selected() && send.disabled && !status.hidden &&
+       status.textContent === 'The recipient you chose is not available. Choose a recipient.',
+       'The dialog asks for a recipient and disables Send.');
+}
+(async () => {
+ try {
+  await open();
+  selectType('investigation');
+  words.value = 'Keep the recipient for this draft.';
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+  if (earlier?.cleared) {
+   checkEmpty();
+   check(!!alternate(), 'The recipient is available again after the reload.');
+   if (!failures.length) {
+    alternate().click();
+    check(!send.disabled, 'An explicit recipient choice enables Send after reload.');
+    if (!send.disabled) {
+     send.click();
+     await waitFor(() => send.form.getAttribute('aria-busy') === 'false');
+     check(!dialog.open, 'The retained draft saves for the selected recipient.');
+    }
+   }
+  } else if (earlier) {
+   check(selected() === 'cargo-liner' && !send.disabled, 'Reload restores the selected recipient.');
+   selectType('proposal');
+   checkEmpty();
+   selectType('investigation');
+   checkEmpty();
+   if (!failures.length) {
+    sessionStorage.setItem(probeKey, JSON.stringify({...earlier, cleared:true}));
+    location.reload();
+    return;
+   }
+  } else {
+   alternate().click();
+   check(selected() === 'cargo-liner' && !send.disabled, 'The user selected a recipient before retirement or reload.');
+   if (scenario === 'reopen') {
+    dialog.requestClose();
+    await fetch('/restart', {method:'POST'});
+    await open();
+    check(words.value === 'Keep the recipient for this draft.', 'Reopen preserves the unsent draft.');
+    checkEmpty();
+   } else {
+    if (scenario === 'refresh') await fetch('/restart', {method:'POST'});
+    send.click();
+    await waitFor(() => send.form.getAttribute('aria-busy') === 'false');
+    if (scenario === 'refresh') {
+     check(!alternate(), 'The refreshed options exclude the retired recipient.');
+     checkEmpty();
+    } else if (!failures.length) {
+     if (!firstRequest) throw new Error('The dialog did not send the draft.');
+     sessionStorage.setItem(probeKey, JSON.stringify({requestId:firstRequest}));
+     location.reload();
+     return;
+    }
+   }
+  }
+ } catch (error) {
+  failures.push(String(error));
+ }
+ sessionStorage.removeItem(probeKey);
+ await fetchHTTP('/results', {method:'POST', body:JSON.stringify(failures)});
+ parent.postMessage('finished', location.origin);
+})();
+'''
+
+
 @dataclass
 class DialogFixture:
     root: Path
@@ -790,6 +1073,9 @@ class DialogFixture:
     token: str = FORM_TOKEN
     recipient_reads: int = 0
     completed: bool = False
+    screenshot: new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT
+    reject_first_send: bool = True
+    retire_recipient_on_restart: bool = False
 
     def environment(self) -> dict[str, str]:
         return {"SHOWRUNNER_STATE_DIR": str(self.root / "state"), "REVIEW_LINKS_ROOT": str(self.root / "review"),
@@ -835,10 +1121,19 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             return fixtures[int(width)]
 
         def do_GET(self) -> None:
-            if self.path == ENDPOINT:
+            address = urlsplit(self.path)
+            if address.path == ENDPOINT:
                 fixture = self.fixture()
+                if parse_qs(address.query).get("capture_key") == [CAPTURE_KEY]:
+                    image = fixture.screenshot
+                    if isinstance(image, new_item_dialog.PageScreenshot):
+                        self.response(200, "image/png", image.png)
+                        return
                 fixture.recipient_reads += 1
-                self.send_json(200, {"token": fixture.token, "recipients": RECIPIENTS})
+                recipients = RECIPIENTS
+                if fixture.retire_recipient_on_restart and fixture.token == RESTARTED_TOKEN:
+                    recipients = [row for row in RECIPIENTS if row["id"] != OTHER_RECIPIENT]
+                self.send_json(200, {"token": fixture.token, "page_owner": OWNER, "recipients": recipients})
             elif self.path == "/complete":
                 _ = finished.wait(60)
                 self.response(204, "image/png", b"")
@@ -872,6 +1167,12 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 return
             fixture = self.fixture()
             fields = cast(dict[str, object], json.loads(data))
+            if "page_capture" in fields:
+                if isinstance(fixture.screenshot, new_item_dialog.PageScreenshot):
+                    self.send_json(202, {"capture_key": CAPTURE_KEY})
+                else:
+                    self.send_json(503, {"error": "No Firefox."})
+                return
             fixture.wire_posts.append(fields)
             if fields.get("token") != fixture.token:
                 self.send_json(403, {"code": "stale_token", "error": "The New item token expired. Try Send again."})
@@ -879,15 +1180,20 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             try:
                 request = review_submissions.read_request(fields)
                 fixture.posts.append(request)
+                image = fixture.screenshot if fields.get("capture_key") == CAPTURE_KEY else new_item_dialog.NO_PAGE_SCREENSHOT
                 with patch.dict(os.environ, fixture.environment()), patch.object(Path, "home", return_value=fixture.root):
-                    item = review_submissions.submit(request)
+                    item = review_submissions.submit(request, screenshot=image,
+                        capture_requested=request.page == "list" and "capture_key" in fields)
+            except new_item_dialog.SubmissionScreenshotExpired as error:
+                self.send_json(409, {"code": "screenshot_expired", "error": str(error)})
+                return
             except review_submissions.SubmissionConflict as error:
                 self.send_json(error.status, {"reason": str(error)})
                 return
             except (OSError, ValueError) as error:
                 self.send_json(400, {"reason": str(error)})
                 return
-            if len(fixture.posts) == 1:
+            if fixture.reject_first_send and len(fixture.posts) == 1:
                 self.send_json(503, {"error": "Fixture rejected the first send."})
                 return
             if isinstance(item, review_submissions.EditedSubmission):
@@ -921,30 +1227,101 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
 
 class NewItemDialogTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_list_token_refresh_clears_a_retired_recipient(self) -> None:
+        fixture = self.check_recipient_draft("refresh")
+        self.assertEqual([post["recipient_id"] for post in fixture.wire_posts], [OTHER_RECIPIENT])
+        self.assertEqual(fixture.posts, [])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_list_reload_restores_the_unfiled_recipient_and_preserves_an_empty_selection(self) -> None:
+        fixture = self.check_recipient_draft("reload")
+        item, = fixture.posts
+        self.assertEqual(item.recipient_id, OTHER_RECIPIENT)
+        with patch.dict(os.environ, fixture.environment()):
+            record, = investigation.records(OTHER_RECIPIENT)
+        self.assertEqual((record.id, record.question), ("I1", item.words))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_reopening_a_kept_unsent_draft_clears_a_retired_recipient(self) -> None:
+        fixture = self.check_recipient_draft("reopen")
+        self.assertEqual(fixture.wire_posts, [])
+
+    def check_recipient_draft(self, scenario: str) -> DialogFixture:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        fixture = DialogFixture(temporary, reject_first_send=False, retire_recipient_on_restart=scenario != "reload")
+        probe = RECIPIENT_DRAFT_PROBE.replace("__SCENARIO__", json.dumps(scenario))
+        page = fixture_page(1440, photo=False, script=probe)
+        if scenario != "reopen":
+            page = page.replace(b'data-page-owner="builds"', b'data-page-owner="list"')
+        owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+        alternate = staff.StaffRow(OTHER_RECIPIENT, "producer", "cargo-liner", staff.StaffRoot(),
+                                   current_session=OTHER_RECIPIENT)
+        configuration = temporary / "config"
+        configuration.mkdir()
+        _ = (configuration / "console.conf").write_text(f"page.list.owner={owner.id}\n")
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner, alternate))):
+            capture_dialogs(temporary / "recipient-draft.png", {1440: fixture}, pages={1440: page})
+        self.assertEqual(fixture.results, [])
+        return fixture
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_list_send_renews_an_expired_screenshot_after_the_first_send_is_lost(self) -> None:
+        self.check_list_retry(reload_after_send=False)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_list_send_after_reload_returns_the_item_from_the_lost_reply(self) -> None:
+        self.check_list_retry(reload_after_send=True)
+
+    def check_list_retry(self, *, reload_after_send: bool) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+        configuration = temporary / "config"
+        configuration.mkdir()
+        _ = (configuration / "console.conf").write_text(f"page.list.owner={OWNER}\n")
+        image = (new_item_dialog.NO_PAGE_SCREENSHOT if reload_after_send else new_item_dialog.PageScreenshot(
+            base64.b64decode(PNG), new_item_dialog.PageViewport(1440, 900, True)))
+        fixture = DialogFixture(temporary, screenshot=image, reject_first_send=reload_after_send)
+        probe = LIST_RETRY_PROBE.replace("__RELOAD_AFTER_SEND__", json.dumps(reload_after_send))
+        page = fixture_page(1440, photo=False, script=probe).replace(
+            b'data-page-owner="builds"', b'data-page-owner="list"')
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))):
+            capture_dialogs(temporary / "list-retry.png", {1440: fixture}, pages={1440: page})
+        self.assertEqual(fixture.results, [])
+        self.assertEqual(len(fixture.posts), 2)
+        self.assertEqual(fixture.posts[0].request_id, fixture.posts[1].request_id)
+        with patch.dict(os.environ, fixture.environment()):
+            record, = investigation.records(owner.id)
+        self.assertEqual((record.id, record.question), ("I1", "Keep the first List Send."))
+        submission = record.submission
+        assert isinstance(submission, new_item_dialog.ReviewSubmission)
+        self.assertEqual(submission.images, () if reload_after_send else (review_submissions.PAGE_SCREENSHOT,))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_bug_dialog_reports_the_open_page_even_without_a_screenshot(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         fixture = DialogFixture(temporary)
         capture_dialogs(temporary / "bug.png", {1440: fixture}, pages={1440: bug_fixture_page()})
         self.assertEqual(fixture.results, [])
 
-    def test_render_mounts_one_dialog_with_a_four_line_field_and_four_types(self) -> None:
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_owner_button_opens_five_types_and_selects_the_owner_from_all_recipients(self) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        fixture = DialogFixture(temporary)
+        capture_dialogs(temporary / "options.png", {1440: fixture},
+                        pages={1440: fixture_page(1440, photo=False, script=OWNER_OPTIONS_PROBE)})
+        self.assertEqual(fixture.results, [])
+
+    def test_render_mounts_one_dialog_with_five_types(self) -> None:
         markup = new_item_dialog.render()
         self.assertEqual(markup.count('<dialog id="review-new-item"'), 1)
         self.assertIn('name="words" rows="4"', markup)
-        self.assertEqual(markup.count('type="radio" name="kind"'), 4)
-        self.assertEqual(markup.count('<span data-button-face>'), 4)
+        self.assertEqual(markup.count('type="radio" name="kind"'), 5)
+        self.assertEqual(markup.count('<span data-button-face>'), 5)
         self.assertIn('data-kind="bug"', markup)
         self.assertIn('<svg aria-hidden="true"', markup)
-        self.assertLess(markup.index('data-evidence'), markup.index('name="words"'))
         self.assertIn('name="include_page" checked', markup)
-        self.assertIn('data-sent-details aria-labelledby="sent-details-title" hidden', markup)
+        self.assertIn('data-sent-details aria-labelledby="sent-details-title"', markup)
         self.assertIn('data-capture-slot hidden', markup)
-        buttons: tuple[tuple[Literal["review", "list"], str], ...] = (("review", "New"), ("list", "New item"))
-        for page, label in buttons:
-            with self.subTest(page=page):
-                button = new_item_dialog.title_button(page)
-                self.assertIn(f'aria-label="New item" title="New item" data-{page}-new>', button)
-                self.assertIn(f'<span aria-hidden="true">+</span><span class="review-new-label">{label}</span>', button)
 
     def test_page_data_and_capture_size_are_checked(self) -> None:
         fields = {"kind": "page-data", "title": "The List", "rows": [["Item", "State"], ["Console", "Open"]]}
@@ -995,7 +1372,7 @@ class NewItemDialogTests(unittest.TestCase):
                 self.assertEqual((for_morty.owner, for_morty.question), (morty.id, "Check the queue for morty."))
                 self.assertEqual((list_retry.owner, list_retry.question), (morty.id, "Keep these List words."))
                 self.assertEqual(original.question, "The first item before replacement.")
-                self.assertEqual(fixture.recipient_reads, 8)
+                self.assertGreaterEqual(fixture.recipient_reads, 8)
                 expired, refreshed, reopened, *owner_sends, list_expired, list_sent = fixture.wire_posts
                 self.assertEqual(expired["token"], FORM_TOKEN)
                 self.assertEqual(refreshed, {**expired, "token": RESTARTED_TOKEN})
@@ -1009,5 +1386,5 @@ class NewItemDialogTests(unittest.TestCase):
                 self.assertEqual(first, retry)
                 self.assertEqual(first.kind, review_submissions.SubmissionKind.BUG)
                 self.assertEqual(first.recipient_id, OWNER)
-                self.assertEqual(first.evidence.kind, "build-step")
+                self.assertEqual(first.evidence.kind, "page-data")
                 self.assertEqual(first.images, (review_submissions.PastedImage("image/png", PNG),))

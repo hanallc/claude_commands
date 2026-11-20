@@ -237,6 +237,7 @@ class ImageReference:
 class PageRecipient(StrEnum):
     PAGE_OWNER = "page-owner"
     LIST_OWNER = "list-owner"
+    SELECTED = "selected"
 
 
 @dataclass(frozen=True)
@@ -506,7 +507,7 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
     data = _mapping(value, "New item")
     page = _text(data.get("page", ""), "Console page", 32, allow_empty=True)
     kind = read_kind(data.get("kind"))
-    if page and (page not in page_frame.OWNER_PAGES or kind == SubmissionKind.PROPOSAL):
+    if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     try:
         page_recipient = PageRecipient(data.get("page_recipient", PageRecipient.PAGE_OWNER))
@@ -606,21 +607,15 @@ def read_words(value: object, label: str) -> str:
 
 
 
-KINDS = ((SubmissionKind.QUESTION, "Question", "circle-help"),
+KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
+         (SubmissionKind.QUESTION, "Question", "circle-help"),
+         ("feedback", "Feedback", "message-circle-question"),
          (SubmissionKind.PROPOSAL, "Proposal", "lamp"),
-         (SubmissionKind.INVESTIGATION, "Investigation", "microscope"),
-         (SubmissionKind.BUG, "Bug", "bug"))
-
-
-def title_button(page: Literal["list", "review"]) -> str:
-    """Place the New item button beside the page title."""
-    label = "New item" if page == "list" else "New"
-    return (f'<button class="review-new" type="button" aria-label="New item" title="New item" data-{page}-new>'
-            + f'<span aria-hidden="true">+</span><span class="review-new-label">{label}</span></button>')
+         (SubmissionKind.INVESTIGATION, "Investigation", "microscope"))
 
 
 def render() -> str:
-    """Mount once and open with window.reviewNewItem.open({trigger, kind, evidence})."""
+    """Render the dialog that the page owner button opens."""
     chips = "".join(
         f'<label class="new-item-chip" data-kind="{kind}"><input type="radio" name="kind" value="{kind}">'
         + f'<span data-button-face>{page_frame.icon_svg(icon)}<span data-kind-label>{label}</span></span></label>'
@@ -639,13 +634,9 @@ def render() -> str:
    <fieldset><legend>To</legend><p data-recipients-status role="status" hidden></p>
     <div class="new-item-chips" data-recipients></div>
    </fieldset>
-   <section data-evidence aria-labelledby="new-item-evidence-title" hidden>
-    <h3 id="new-item-evidence-title">Evidence</h3>
-    <div class="new-item-evidence"></div>
-   </section>
    <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
     placeholder="Type your words. You can paste an image." required></textarea>
-   <section class="page-state-box sent-details" data-sent-details aria-labelledby="sent-details-title" hidden>
+   <section class="page-state-box sent-details" data-sent-details aria-labelledby="sent-details-title">
     <h4 id="sent-details-title">Sent with your words</h4>
     <div data-bug-page-state hidden>
      <dl class="page-state"></dl>
@@ -663,8 +654,8 @@ def render() -> str:
     </div>
     <p data-capture-expired role="status" hidden>The screenshot expired. A new one is being taken. Send again when it shows.</p>
     <p data-fallback role="status" hidden>Screenshot unavailable. Visible text from this page goes instead (up to {MAX_PAGE_ROWS} rows).</p>
+    <div class="new-item-previews" data-previews hidden></div>
    </section>
-   <div class="new-item-previews" data-previews hidden></div>
   </div>
   <footer>
    <p data-send-disabled role="status" hidden></p>
@@ -695,14 +686,6 @@ PAGE_STATE_STYLE = '''
 
 
 STYLE = '''
-.page-heading-actions>.review-new{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;
-min-height:36px;background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--accent);
-padding:5px 14px;margin:0;flex:none;white-space:nowrap}
-.review-new>[aria-hidden]{font-size:1.2em;line-height:1}
-@media(max-width:360px){
- .page-heading-actions>.review-new{justify-content:center;min-width:36px;padding:5px}
- .review-new-label{display:none}
-}
 #review-new-item {
  position: fixed; inset: 0; box-sizing: border-box; margin: auto; padding: 0;
  width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px);
@@ -796,46 +779,6 @@ padding:5px 14px;margin:0;flex:none;white-space:nowrap}
  width: 14px; height: 14px; border: 2px solid var(--line);
  border-top-color: var(--accent); border-right-color: var(--accent); border-radius: 50%;
 }
-#review-new-item .new-item-evidence {
- background: #141413; color: #f0efec; border: 1px solid #34332f; border-radius: 8px;
- padding: 10px; font-size: 12px; min-width: 0; overflow-wrap: anywhere;
-}
-#review-new-item .new-item-evidence h4 { font-size: inherit; margin: 0 0 4px; }
-#review-new-item .new-item-evidence-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 8px; }
-#review-new-item .new-item-muted { color: #c3c2b7; }
-#review-new-item .new-item-cells {
- display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 10px; margin: 7px 0 10px;
-}
-#review-new-item .new-item-cells div { min-width: 0; max-width: 100%; }
-#review-new-item .new-item-cells dt { font-weight: 600; color: #c3c2b7; }
-#review-new-item .new-item-cells dd, #review-new-item .new-item-tip dd { margin: 0; white-space: pre-wrap; }
-#review-new-item .new-item-memory { padding: 8px 0; border-block: 1px solid #34332f; margin-bottom: 8px; }
-#review-new-item .new-item-memory p { margin: 0; }
-#review-new-item .new-item-memory strong { font-size: 16px; }
-#review-new-item .new-item-cap { color: #ef7372; font-weight: 650; }
-#review-new-item .new-item-memory-bar { display: flex; height: 12px; margin: 6px 0; }
-#review-new-item .new-item-memory-bar span { min-width: 0; background: var(--segment); border-radius: 2px; }
-#review-new-item .new-item-memory-legend { display: flex; flex-wrap: wrap; gap: 3px 12px; color: #c3c2b7; }
-#review-new-item .new-item-memory-legend span::before {
- content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 4px;
- border-radius: 2px; background: var(--segment);
-}
-#review-new-item [data-tone="build"] { --segment: #3987e5; }
-#review-new-item [data-tone="free"] { --segment: #199e70; }
-#review-new-item [data-tone="tools"] { --segment: #c98500; }
-#review-new-item [data-tone="system"] { --segment: #9585e0; }
-#review-new-item [data-tone="other"] { --segment: #6c6b66; }
-#review-new-item .new-item-tip {
- background: #242422; color: #f0efec; border: 1px solid #34332f; border-radius: 8px;
- padding: 10px 12px; font-size: .85rem; line-height: 1.45;
-}
-#review-new-item .new-item-tip dl { margin: 0; }
-#review-new-item .new-item-tip dl > div {
- display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 12px;
-}
-#review-new-item .new-item-tip dd { text-align: right; font-variant-numeric: tabular-nums; }
-#review-new-item .new-item-tip p { margin: 3px 0; color: #c3c2b7; white-space: pre-wrap; }
-#review-new-item .new-item-tip h4 { font-weight: 700; }
 #review-new-item .new-item-previews:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
 #review-new-item .new-item-preview {
  position: relative; border: 1px solid var(--line, #34332f); border-radius: 7px;
@@ -863,7 +806,6 @@ padding:5px 14px;margin:0;flex:none;white-space:nowrap}
  #review-new-item header { padding-block: 14px 12px; }
  #review-new-item footer { padding-bottom: 14px; }
  #review-new-item .new-item-body { gap: 14px; }
- #review-new-item .new-item-cells { display: grid; grid-template-columns: repeat(auto-fit, minmax(42px, 1fr)); }
 }
 '''
 
@@ -875,7 +817,6 @@ SCRIPT = r'''(() => {
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
- const evidenceSection = dialog.querySelector('[data-evidence]');
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
  const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
@@ -890,8 +831,12 @@ SCRIPT = r'''(() => {
  const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
- let launcher, opening, evidence, token, recipients, images = [], sending = false;
- let draftNonce, keepDraft = false, ownerPage = '', pageOwnerId = '';
+ const listSendKey = 'console.list.pending-send';
+ const listDraftId = /^r6-[0-9a-f]{32}$/;
+ let launcher, opening, token, recipients, images = [], sending = false;
+ let draftId, keepDraft = false, ownerPage = '';
+ // Null means the user must choose again. An empty string means the page has no default.
+ let selectedRecipient = '';
  let captureSession, pageContext, savedItem;
 
  function node(tag, text = '', css = '') {
@@ -899,57 +844,6 @@ SCRIPT = r'''(() => {
   element.textContent = text;
   if (css) element.className = css;
   return element;
- }
-
- function captionAndValue(label, value) {
-  const row = node('div');
-  row.append(node('dt', label), node('dd', value));
-  return row;
- }
-
- function showEvidence() {
-  const box = evidenceSection.querySelector('.new-item-evidence');
-  box.replaceChildren();
-  evidenceSection.hidden = evidence.kind !== 'build-step';
-  if (evidenceSection.hidden) return;
-  const heading = node('div', '', 'new-item-evidence-heading');
-  heading.append(node('h4', evidence.title), node('span', evidence.owner, 'new-item-muted'));
-  const cells = node('dl', '', 'new-item-cells');
-  for (const cell of evidence.cells) cells.append(captionAndValue(cell.label, cell.value));
-
-  const memory = node('div', '', 'new-item-memory');
-  memory.append(node('h4', 'Overall memory'));
-  const figures = node('div', '', 'new-item-evidence-heading'), free = node('p');
-  free.append(node('strong', evidence.memory.free_for_next_gib.toFixed(1) + ' GiB'),
-              ' Free for the next step');
-  figures.append(free, node('p', 'Queue cap ' + evidence.memory.queue_cap_gib.toFixed(1) + ' GiB', 'new-item-cap'));
-  memory.append(figures);
-  const bar = node('div', '', 'new-item-memory-bar');
-  bar.setAttribute('aria-hidden', 'true');
-  const legend = node('div', '', 'new-item-memory-legend');
-  for (const segment of evidence.memory.segments) {
-   const section = node('span'), key = node('span', segment.label + ' ' + segment.gib.toFixed(1) + ' GiB');
-   section.dataset.tone = key.dataset.tone = segment.tone;
-   section.style.flexGrow = String(segment.gib);
-   bar.append(section);
-   legend.append(key);
-  }
-  if (legend.childElementCount) memory.append(bar, legend);
-
-  const tip = node('div', '', 'new-item-tip'), tipHeading = node('div', '', 'new-item-evidence-heading');
-  tipHeading.append(node('h4', evidence.tip_title), node('strong', evidence.tip_status));
-  tip.append(tipHeading);
-  let table = null;
-  for (const entry of evidence.tip) {
-   if (entry.kind === 'field') {
-    if (!table) { table = node('dl'); tip.append(table); }
-    table.append(captionAndValue(entry.label, entry.value));
-   } else {
-    table = null;
-    tip.append(node('p', entry.text));
-   }
-  }
-  box.append(heading, cells, memory, tip);
  }
 
  function setError(reason) {
@@ -964,29 +858,40 @@ SCRIPT = r'''(() => {
 
  function showRecipients() {
   if (!recipients) return;
-  const selected = recipientChips.querySelector('input:checked')?.value;
-  const available = recipients.filter(recipient => form.elements.kind.value !== 'proposal' || recipient.proposal);
-  const choice = available.some(recipient => recipient.id === selected) ? selected : pageOwnerId;
+  const proposal = form.elements.kind.value === 'proposal';
+  const available = recipients.filter(recipient => !proposal || recipient.proposal);
+  if (selectedRecipient && !available.some(recipient => recipient.id === selectedRecipient)) {
+   selectedRecipient = null;
+   storeListDraft();
+  }
   recipientChips.replaceChildren();
   for (const recipient of available) {
    const chip = node('label', '', 'new-item-chip'), input = node('input');
    input.type = 'radio';
    input.name = 'recipient_id';
    input.value = recipient.id;
-   input.checked = recipient.id === choice;
+   input.checked = recipient.id === selectedRecipient;
    const face = node('span', recipient.name);
    face.setAttribute('data-button-face', '');
    chip.append(input, face);
    recipientChips.append(chip);
   }
-  recipientStatus.textContent = available.length ? '' : 'No recipients are available.';
-  recipientStatus.hidden = !!available.length;
+  recipientStatus.textContent = selectedRecipient === null
+   ? 'The recipient you chose is not available. Choose a recipient.'
+   : available.length ? '' : 'No recipients are available.';
+  recipientStatus.hidden = !recipientStatus.textContent;
  }
 
  function editDraft(event) {
+  if (sending) return;
   if (event?.target.name === 'kind') {
    showRecipients();
    showBugPage();
+  }
+  if (event?.target.name === 'recipient_id') {
+   selectedRecipient = event.target.value;
+   storeListDraft();
+   recipientStatus.hidden = true;
   }
   if (event?.target === includePage) startCapture();
   showSentDetails();
@@ -1005,6 +910,7 @@ SCRIPT = r'''(() => {
  }
 
  words.addEventListener('paste', event => {
+  if (sending) return;
   const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/'));
   if (!files.length) return;
   event.preventDefault();
@@ -1016,6 +922,11 @@ SCRIPT = r'''(() => {
       files.some(file => !file.size || file.size > limits.imageBytes)) {
    setError('Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
   }
+  addImagePreviews(files);
+  editDraft();
+ });
+
+ function addImagePreviews(files) {
   for (const file of files) {
    const row = node('div', '', 'new-item-preview'), photo = node('img');
    const url = URL.createObjectURL(file);
@@ -1030,9 +941,8 @@ SCRIPT = r'''(() => {
    images.push(image);
    previews.append(row);
   }
-  previews.hidden = false;
-  editDraft();
- });
+  previews.hidden = !images.length;
+ }
 
  function pastedData(file) {
   return new Promise((resolve, reject) => {
@@ -1061,7 +971,7 @@ SCRIPT = r'''(() => {
  }
 
  async function loadOptions(signal) {
-  const path = ownerPage ? endpoint + '?' + new URLSearchParams({page: ownerPage}) : endpoint;
+  const path = endpoint + '?' + new URLSearchParams({page: ownerPage});
   const response = await fetch(path, {cache: 'no-store', signal});
   const data = await responseData(response, 'Could not load recipients.');
   if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || (!data.token && !data.send_disabled)) {
@@ -1076,7 +986,6 @@ SCRIPT = r'''(() => {
   sendNotice.hidden = !data.send_disabled;
   includePage.closest('label').hidden = !sendNotice.hidden;
   recipients = data.recipients;
-  pageOwnerId = ownerPage ? data.page_owner ?? (recipients.length === 1 ? recipients[0].id : '') : '';
   showRecipients();
  }
 
@@ -1157,7 +1066,7 @@ SCRIPT = r'''(() => {
  }
 
  function isPageBug() {
-  return ownerPage && form.elements.kind.value === 'bug';
+  return form.elements.kind.value === 'bug';
  }
 
  function showBugPage() {
@@ -1187,7 +1096,7 @@ SCRIPT = r'''(() => {
 
  function showSentDetails() {
   const image = captureSession?.image;
-  const include = !!ownerPage && includePage.checked && sendNotice.hidden;
+  const include = includePage.checked && sendNotice.hidden;
   const unavailable = include && (image === null || !hasCaptureSpace(image));
   slot.hidden = !include || unavailable;
   taking.hidden = !!image;
@@ -1214,7 +1123,7 @@ SCRIPT = r'''(() => {
     {cache: 'no-store', headers: {'X-Review-Token': session.token}, signal: session.controller.signal});
    if (!response.ok) return null;
    const blob = await response.blob();
-   return captureSession === session ? {key, size: blob.size, url: URL.createObjectURL(blob)} : null;
+   return captureSession === session ? {key, size: blob.size, blob, url: URL.createObjectURL(blob)} : null;
   }).catch(() => null).then(image => {
    if (captureSession !== session) return null;
    session.image = image;
@@ -1228,8 +1137,9 @@ SCRIPT = r'''(() => {
   const signal = opening.signal;
   const fresh = await loadOptions(signal).catch(() => null);
   if (signal.aborted) return;
-  if (fresh) token = fresh.token;
+  if (fresh) setOptions(fresh);
   startCapture(true);
+  showSentDetails();
  }
 
  function discardCapture(used = false) {
@@ -1251,22 +1161,29 @@ SCRIPT = r'''(() => {
   session.image = null;
  }
 
- function setPageMode(page) {
-  sentDetails.hidden = !page;
-  if (page) sentDetails.append(previews);
-  else sentDetails.after(previews);
-  const bug = form.querySelector('[data-kind="bug"]');
-  if (page) bug.parentElement.prepend(bug);
-  else bug.parentElement.append(bug);
-  for (const label of form.querySelectorAll('[data-kind]')) {
-   const input = label.querySelector('input');
-   const hidden = page ? input.value === 'proposal' : false;
-   label.hidden = hidden;
-   input.disabled = hidden;
-   if (input.value === 'investigation') {
-    // Feedback uses the native investigation record and its reply.
-    label.querySelector('[data-kind-label]').textContent = page ? 'Feedback' : 'Investigation';
-   }
+ function storedListDraft() {
+  try {
+   const stored = sessionStorage.getItem(listSendKey);
+   if (!stored) return null;
+   if (listDraftId.test(stored)) return {id: stored, recipient: null};
+   const draft = JSON.parse(stored);
+   if (typeof draft?.id !== 'string' || !listDraftId.test(draft.id)) return null;
+   const recipient = typeof draft.recipient === 'string' && draft.recipient ? draft.recipient : null;
+   return {id: draft.id, recipient};
+  } catch (_) { return null; }
+ }
+
+ function storeListDraft() {
+  if (ownerPage !== 'list' || !draftId) return;
+  try {
+   sessionStorage.setItem(listSendKey, JSON.stringify({id: draftId, recipient: selectedRecipient}));
+  } catch (_) {}
+ }
+
+ function finishDraft() {
+  draftId = undefined;
+  if (ownerPage === 'list') {
+   try { sessionStorage.removeItem(listSendKey); } catch (_) {}
   }
  }
 
@@ -1288,6 +1205,7 @@ SCRIPT = r'''(() => {
   dialog.close();
   keepDraft = !sent && !result && Boolean(words.value || images.length);
   if (!keepDraft) {
+   if (ownerPage !== 'list') draftId = undefined;
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
    previews.replaceChildren();
@@ -1309,28 +1227,29 @@ SCRIPT = r'''(() => {
   updateSend();
  }
 
- async function open({trigger, kind = 'question', evidence: capture = {kind: 'none'}, page = ''} = {}) {
+ async function open(trigger, page) {
   if (dialog.open || sending) return;
-  const changedMode = ownerPage !== page;
   ownerPage = page;
-  pageContext = page ? collectPageContext() : undefined;
-  setPageMode(page);
-  launcher = trigger || document.activeElement;
+  pageContext = collectPageContext();
+  launcher = trigger;
   token = '';
+  if (ownerPage === 'list' && !draftId) {
+   const stored = storedListDraft();
+   if (stored) {
+    draftId = stored.id;
+    selectedRecipient = stored.recipient;
+   }
+  }
+  const newDraft = !keepDraft && !draftId;
+  if (newDraft) selectedRecipient = '';
   sendNotice.hidden = true;
   includePage.closest('label').hidden = false;
-  if (!keepDraft) form.reset();
-  if (!keepDraft || changedMode) {
-   evidence = structuredClone(capture);
-   recipients = null;
-   includePage.checked = includePage.defaultChecked;
+  recipients = null;
+  recipientChips.replaceChildren();
+  if (!keepDraft) {
+   form.reset();
    setError('');
-   recipientChips.replaceChildren();
-   const kinds = [...form.querySelectorAll('input[name="kind"]:not(:disabled)')];
-   if (!keepDraft || !kinds.some(input => input.checked)) {
-    (kinds.find(input => input.value === kind) || kinds[0]).checked = true;
-   }
-   showEvidence();
+   form.elements.kind.value = 'bug';
   }
   recipientStatus.textContent = 'Loading recipients…';
   recipientStatus.hidden = false;
@@ -1340,12 +1259,13 @@ SCRIPT = r'''(() => {
   const controller = new AbortController();
   opening = controller;
   dialog.showModal();
-  const focus = keepDraft ? words : page ? dialog.querySelector('h2') : form.querySelector('input[name="kind"]:checked');
+  const focus = keepDraft ? words : dialog.querySelector('h2');
   focus.focus({preventScroll: true});
   body.scrollTop = 0;
   try {
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
+   if (newDraft) selectedRecipient = data.page_owner || '';
    setOptions(data);
    startCapture();
    showSentDetails();
@@ -1367,29 +1287,26 @@ SCRIPT = r'''(() => {
   event.preventDefault();
   if (send.disabled) return;
   const onList = ownerPage === 'list';
-  let saved, key = '';
+  let saved, captureKey = '';
+  setError('');
+  setSending(true);
   try {
-   const kind = form.elements.kind.value, recipient = recipientChips.querySelector('input:checked');
-   if (!recipient) throw new Error('Select a recipient.');
-   if (!draftNonce) {
-    draftNonce = Array.from(crypto.getRandomValues(new Uint8Array(16)),
-                            byte => byte.toString(16).padStart(2, '0')).join('');
+   const type = form.elements.kind.value, selected = recipientChips.querySelector('input:checked');
+   const kind = type === 'feedback' ? 'investigation' : type;
+   if (!selected) throw new Error('Select a recipient.');
+   if (!draftId) {
+    draftId = 'r6-' + Array.from(crypto.getRandomValues(new Uint8Array(16)),
+                                byte => byte.toString(16).padStart(2, '0')).join('');
    }
-   const payload = {request_id: (onList ? 'r2-' : 'r6-') + draftNonce, kind, recipient_id: recipient.value,
-                    words: words.value, ...(ownerPage && {page: ownerPage,
-                     ...(recipient.value !== pageOwnerId && {page_recipient: 'list-owner'})})};
-   if (!slot.hidden && !shot.hidden) {
-    key = captureSession?.image?.key;
-    if (!key) throw new Error('The screenshot is unavailable.');
-   }
+   storeListDraft();
+   const screenshot = slot.hidden || shot.hidden ? null : captureSession?.image;
+   captureKey = screenshot?.key || '';
    const bug = isPageBug();
-   const data = bug || !fallback.hidden ? pageContext.data : ownerPage ? {kind: 'none'} : evidence;
-   const state = bug && pageContext.state;
-   setError('');
-   setSending(true);
+   const evidence = bug || !fallback.hidden ? pageContext.data : {kind: 'none'};
    const files = await Promise.all(images.map(image => pastedData(image.file)));
-   const item = {...payload, evidence: data, images: files,
-                 ...(key && {capture_key: key}), ...(state && {page_state: state})};
+   const item = {request_id: draftId, kind, recipient_id: selected.value, words: words.value,
+                 page: ownerPage, page_recipient: 'selected', evidence, images: files,
+                 ...(captureKey && {capture_key: captureKey}), ...(bug && {page_state: pageContext.state})};
    const sendItem = () => post({...item, token});
    let result;
    try {
@@ -1397,7 +1314,8 @@ SCRIPT = r'''(() => {
    } catch (failure) {
     if (onList || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
-    token = fresh.token;
+    setOptions(fresh);
+    if (selectedRecipient !== selected.value) return;
     result = await sendItem();
    }
    if (typeof result.id !== 'string' || !/^[QPI][1-9][0-9]*$/.test(result.id)) {
@@ -1405,34 +1323,33 @@ SCRIPT = r'''(() => {
    }
    saved = result;
   } catch (failure) {
-   if (onList) {
+   if (failure?.filedId) {
+    finishDraft();
+    setError('This item was already filed as ' + failure.filedId + '. Any change after that Send was not sent.');
+    discardCapture();
+    void renewCapture();
+   } else {
     setError(failure?.message || 'Could not send this item.');
-    if (failure?.staleToken || failure?.screenshotExpired || failure instanceof TypeError) {
+    if (failure?.screenshotExpired && includePage.checked) {
+     discardCapture(!onList);
+     void renewCapture();
+    } else if (onList && failure?.staleToken) {
      discardCapture();
      const signal = opening.signal;
      const fresh = await loadOptions(signal).catch(() => null);
      if (!signal.aborted && fresh) {
       setOptions(fresh);
+      if (selectedRecipient === null) setError('');
       startCapture(true);
      }
     }
-   } else if (failure?.filedId) {
-    setError('This item was already filed as ' + failure.filedId + '. Any change after that Send was not sent.');
-    draftNonce = undefined;
-    discardCapture();
-    void renewCapture();
-   } else if (failure?.screenshotExpired && includePage.checked) {
-    discardCapture(true);
-    void renewCapture();
-   } else {
-    setError(failure?.message || 'Could not send this item.');
    }
   } finally {
    setSending(false);
   }
   if (saved) {
-   draftNonce = undefined;
-   discardCapture(Boolean(key));
+   finishDraft();
+   discardCapture(Boolean(captureKey));
    if (onList) {
     close({sent: true});
     dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
@@ -1445,15 +1362,9 @@ SCRIPT = r'''(() => {
   }
  });
 
- window.reviewNewItem = {open};
  document.addEventListener('click', event => {
-  const listButton = event.target.closest('[data-list-new]');
-  if (listButton) {
-   void open({trigger: listButton, page: 'list'});
-   return;
-  }
   const trigger = event.target.closest('[data-owner-new]');
   const page = trigger?.closest('[data-page-owner]')?.dataset.pageOwner;
-  if (page) void open({trigger, page, kind: 'bug'});
+  if (page) void open(trigger, page);
  });
 })();'''
