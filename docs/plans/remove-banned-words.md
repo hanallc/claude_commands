@@ -1,6 +1,6 @@
 # Remove the banned-word system
 
-> **Status: IMPLEMENTATION PLAN — phased, direct-ready.**
+> **Status: Source changes complete. Deployment and state cleanup are pending.**
 > **As-built disposition: amend** — `docs/as-built/hook-dispatch.md` and `docs/as-built/merge-gate-and-test-speed.md`
 
 ## Delegation Context
@@ -16,7 +16,9 @@
 
 ## Phases
 
-### Phase 1 — Disable the hook routes · status: todo
+### Phase 1 — Disable the hook routes · status: done
+
+Commit `56fd8993f` disabled the routes and replaced the hooks with temporary stubs.
 
 **Depends on:** none
 
@@ -58,7 +60,9 @@ The repo and installed settings already use the dispatcher. The second PostToolU
 
 **Acceptance gate:** Run `scripts.hooks.test_hook_dispatch`, `scripts.hooks.test_post_tool_use_banned_words`, and `scripts.hooks.test_stop_banned_words` separately. Check both installed dispatch tables and parse each settings file. Prove that all three legacy paths exit 0 without writing a count or a log. Confirm that no active session retains a direct registration before Phase 2.
 
-### Phase 2 — Remove the commands, scanner, and counters · status: todo
+### Phase 2 — Remove the commands, scanner, and counters · status: done
+
+Commit `89e4f9075` removed the commands, scanner, and counters.
 
 **Depends on:** Phase 1
 
@@ -106,7 +110,12 @@ The repo and installed settings already use the dispatcher. The second PostToolU
 
 **Acceptance gate:** Run `scripts.hooks.test_hook_dispatch`, `scripts.hooks.test_build_hold_guard`, `scripts.hooks.test_codex_hooks`, `scripts.lint.test_style_review`, `scripts.lib.test_user_zone`, and `scripts.production.test_merge_gate_suites_types` separately. Check a Rust and a non-Rust review report. Confirm that the loader still prints the guide and leaves an old counter untouched. Check the installed command list and generated skill directory for all four deletions.
 
-### Phase 3 — Retire the rule and remove deployed state · status: todo
+### Phase 3 — Retire the rule and remove deployed state · status: done (source)
+
+Commit `992b17d51` removed the source instructions and settings keys.
+After merge, deploy the source changes and regenerate the installed Codex skills.
+The style repository owner removes the rule and the charter reference.
+The director handles the tickets and state cleanup.
 
 **Depends on:** Phase 2
 

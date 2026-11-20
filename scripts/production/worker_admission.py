@@ -257,12 +257,18 @@ HANDOFF_SOURCE_PREFIX = "Full source transcript: "
 
 @dataclass(frozen=True)
 class TornTranscriptRecord:
-    """A transcript line is not complete JSON."""
+    """A transcript line is invalid or incomplete."""
+
+
+@dataclass(frozen=True)
+class IncompleteTranscriptTail(TornTranscriptRecord):
+    """The last transcript line has no newline yet."""
 
 
 class TranscriptRecordBoundary(Enum):
     ALL_RECORDS = "include the final record without a newline"
     COMPLETE_LINES = "read only records that end with a newline"
+    COMPLETE_LINES_WITH_TAIL = "read complete lines and report any incomplete final line"
 
 
 def transcript_records(source: Path, *, offset: int = 0,
@@ -272,7 +278,9 @@ def transcript_records(source: Path, *, offset: int = 0,
     with open_transcript(source) as stream:
         _ = stream.seek(offset)
         for line in stream:
-            if boundary is TranscriptRecordBoundary.COMPLETE_LINES and not line.endswith(b"\n"):
+            if boundary is not TranscriptRecordBoundary.ALL_RECORDS and not line.endswith(b"\n"):
+                if boundary is TranscriptRecordBoundary.COMPLETE_LINES_WITH_TAIL:
+                    yield IncompleteTranscriptTail()
                 break
             try:
                 fields = cast(object, json.loads(line))

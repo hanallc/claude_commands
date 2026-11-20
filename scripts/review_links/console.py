@@ -446,6 +446,7 @@ function createForYouNotifier(openCard){
  document.getElementById('close-actions').addEventListener('click',close);
  function escape(event){
   if(event.key!=='Escape' || panel.hidden) return;
+  if(event.target.matches?.('[data-filter-words]') && event.target.value) return;
   event.preventDefault();event.stopPropagation();close();
  }
  addEventListener('keydown',escape,true);
@@ -638,20 +639,19 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     frame = document.createElement('iframe');
     frame.dataset.consolePage = entry.dataset.page;
     frame.hidden = true;
-    const target = placeOf(entry, new URL(location.href).searchParams.get(placeKey(entry.dataset.page)));
+    const savedPlace = () => placeOf(entry, new URL(location.href).searchParams.get(placeKey(entry.dataset.page)));
+    const target = savedPlace();
     const restored = history.state?.reviewPlace;
     if (entry.dataset.page === 'review' && restored?.place === target) frame.reviewPlace = restored;
     frame.src = target;
-    let place = frame.src;
     frame.addEventListener('load', () => {
       let loaded = false;
       try { loaded = frame.contentWindow.location.origin === location.origin; } catch (_) {}
       if (!loaded) {
         // A refused load, such as during a server restart, shows the browser's error page; load the page again.
-        setTimeout(() => { frame.src = place; }, Number(shell.dataset.frameRetrySeconds) * 1000);
+        setTimeout(() => { frame.src = savedPlace(); }, Number(shell.dataset.frameRetrySeconds) * 1000);
         return;
       }
-      place = frame.contentWindow.location.href;
       record(entry);
       frame.contentWindow.addEventListener('hashchange', () => record(entry));
       frame.contentWindow.addEventListener('keydown', actions.escape, true);

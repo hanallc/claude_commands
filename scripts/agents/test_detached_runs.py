@@ -51,7 +51,7 @@ from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, session_staff, test_worker, unit_lookup, worker, worker_admission
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session
 
 WORKER = "unit-impl"
 THREAD_ONE = fixture_runtime_id("detached-run-thread-one")
@@ -2220,6 +2220,32 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual((len(self.notices), target), (1, director.id))
         self.assertIn(f"Detached run: {record['run_id']}", text)
         self.assertIn("Private land completed.", text)
+
+    def test_a_showrunner_starts_a_new_session_and_hears_its_result_with_a_shared_name(self) -> None:
+        showrunner, = staff.snapshot().find(kind="showrunner")
+        unit = fixture_member("unit", name=showrunner.name, parent=showrunner.id)
+        self.assertEqual(unit.name, showrunner.name)
+        self.assertNotEqual(unit.id, showrunner.id)
+        run_dir = self.fixture.root / "showrunner-state"
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": showrunner.current_session}),
+              patch.object(treekey, "tree_key", return_value="private-tree"),
+              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(detached_runs.main(["start", "--session-dir", str(run_dir), "--", "private-land"]),
+                             0, output.getvalue())
+        spawn.assert_called_once()
+        self.assertIs(cast(object, spawn.call_args.kwargs["start_new_session"]), True)
+        path, = (run_dir / detached_runs.DETACHED_RUNS_DIR).glob("*.json")
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual((record["session_dir"], record["worker"], record["staff_id"], record.get("pane_dispatch_id")),
+                         (str(run_dir), showrunner.name, showrunner.id, ""))
+        write_text_atomic(Path(record["log"]), "Private land completed.\n")
+        self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
+        self.assertEqual(self.inputs, [])
+        (target, message), = self.notices
+        self.assertEqual(target, showrunner.id)
+        self.assertIn(f"Detached run: {record['run_id']}", message)
+        self.assertIn("Private land completed.", message)
 
     def test_a_pane_workers_run_keeps_its_owner_when_options_name_another_worker(self) -> None:
         row = self.fixture.worker("TEST-command-owner", family="codex")

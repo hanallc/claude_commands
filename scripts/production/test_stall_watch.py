@@ -1399,7 +1399,9 @@ runpy.run_path(str(script), run_name='__main__')
         self.panes["unit-one"].update(pane=EDIT_PROMPT, agent_status="blocked")
         transcript = self.projects / "project/204f532d-a97a-59e7-a6a7-caf86af3f5ee.jsonl"
         _ = transcript.write_text(tool_call("Edit", {"file_path": "note.txt"}, START - 30))
+        from scripts.accounts import accounts
         from scripts.agents import stop_resume
+        destination = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.root / ".claude2"))
         wall = [float(START)]
         # Observation starts before stop/resume, even when pane reading finishes afterwards.
         def resumed(session: str, **options: object) -> stop_resume.ClaudeUp:
@@ -1417,6 +1419,7 @@ runpy.run_path(str(script), run_name='__main__')
         with (mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
               mock.patch.object(time, "time", side_effect=lambda: wall[0]),
               mock.patch("scripts.production.stall_watch.STATE_DIR", self.state),
+              mock.patch.object(accounts, "check_move_target", return_value=destination),
               mock.patch.object(stop_resume, "_record_launches"),
               mock.patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("204f532d-a97a-59e7-a6a7-caf86af3f5ee")),
               mock.patch.object(stop_resume, "resume", side_effect=resumed),
