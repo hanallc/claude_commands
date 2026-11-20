@@ -86,7 +86,7 @@ def deliver(root: Path, machine: str) -> None:
                                   check=False, timeout=send_budget.seconds())
             outcome = send_result.send_outcome(sent.returncode, sent.stdout)
             accepted = (isinstance(outcome, send_result.ConfirmedSendOutcome)
-                        and outcome.header.outcome in {"sent", "skipped", "queued"})
+                        and outcome.header.outcome in {"sent", "skipped", "queued", "kept"})
         except (OSError, subprocess.TimeoutExpired):
             pass
         if accepted:

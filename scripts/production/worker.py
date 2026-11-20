@@ -65,6 +65,7 @@ class DispatchSubmitted:
 class DispatchComplete:
     reply: str
     anomalies: tuple[str, ...] = ()
+    restored_done: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,13 +145,14 @@ def _prompt_names_completion(text: str, completion_id: str) -> bool:
             or f"End your final reply with this line alone: DONE {completion_id}\n" in text)
 
 
-NO_LATE_RESULT_IDS: frozenset[str] = frozenset()
+NO_RESULT_IDS: frozenset[str] = frozenset()
 
 
 def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
                        line: str | DispatchPrompt, completion: DoneReply | FinalReply, *,
                        stop_at_done: bool = False, accept_late_done: bool = False,
-                       late_result_ids: frozenset[str] = NO_LATE_RESULT_IDS) -> TranscriptReceipt:
+                       late_result_ids: frozenset[str] = NO_RESULT_IDS,
+                       other_pass_results: frozenset[str] = NO_RESULT_IDS) -> TranscriptReceipt:
     """Read prompt acceptance and its reply through the shared transcript parser."""
     submitted = False
     responding = False
@@ -194,6 +196,7 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
                         "End your final reply with DONE ", "End your final reply with this line alone: DONE ")):
                     responding = False
                 elif submitted:
+                    results.difference_update(other_pass_results)
                     if not responding:
                         results.intersection_update(late_result_ids)
                     if not results:
@@ -285,15 +288,23 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
         return _receipt_records(row, backend, require_transcript=require_transcript)
 
     directory = run / worker_lifecycle.DETACHED_RUNS_DIR
-    if isinstance(pane_pass, progress_history.StoppedPassReceipt):
-        deliveries = detached_runs.worker_results(directory, row, since=0, pane_dispatch_id=pane_pass.instance_id)
-        transcript = transcript_receipt(records(), line, DoneReply(dispatch_id), accept_late_done=True,
-                                        late_result_ids=frozenset(deliveries))
+    prompt: str | DispatchPrompt = line
+    done = DoneReply(dispatch_id)
+    stopped = isinstance(pane_pass, progress_history.StoppedPassReceipt)
+    late_result_ids = other_pass_results = NO_RESULT_IDS
+    if stopped:
+        deliveries, other_passes = detached_runs.worker_results(directory, row, since=0,
+                                                               pane_dispatch_id=pane_pass.instance_id)
+        late_result_ids = frozenset(deliveries)
+        other_pass_results = frozenset(other_passes)
     else:
         deliveries = {}
-        transcript = transcript_receipt(records(), line, DoneReply(dispatch_id))
+    transcript = transcript_receipt(records(), prompt, done, accept_late_done=stopped,
+                                    late_result_ids=late_result_ids, other_pass_results=other_pass_results)
     if isinstance(transcript.receipt, DispatchNotSubmitted):
-        transcript = transcript_receipt(records(), DispatchPrompt(dispatch_id), DoneReply(dispatch_id))
+        prompt = DispatchPrompt(dispatch_id)
+        transcript = transcript_receipt(records(), prompt, done, accept_late_done=stopped,
+                                        late_result_ids=late_result_ids, other_pass_results=other_pass_results)
     reply = transcript.receipt
     if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
         return reply
@@ -303,14 +314,24 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
             detached_runs.live_runs(directory, row.name, identity=row.id))
     if isinstance(pane_pass, progress_history.StoppedPassReceipt):
         live = [record for record in live if record.get("pane_dispatch_id") == pane_pass.instance_id]
-    elif isinstance(pane_pass, worker_panes.PassDetachedResults):
-        deliveries = detached_runs.worker_results(directory, row, since=pane_pass.started_at,
-                                                  pane_dispatch_id=pane_pass.instance_id, include_legacy_pass=True)
     else:
-        passed = worker_panes.worker_pass(row, run)
-        started = passed.get("started_at", 0)
-        since = float(started) if isinstance(started, (int, float)) else 0
-        deliveries = detached_runs.worker_results(directory, row, since=since)
+        if isinstance(pane_pass, worker_panes.PassDetachedResults):
+            since, instance = pane_pass.started_at, pane_pass.instance_id
+        else:
+            passed = worker_panes.worker_pass(row, run)
+            started = passed.get("started_at", 0)
+            since = float(started) if isinstance(started, (int, float)) else 0
+            instance = passed.get("instance_id")
+        live = [record for record in live if not detached_runs.result_is_from_another_pass(record, instance)]
+        deliveries, other_passes = detached_runs.worker_results(directory, row, since=since,
+            pane_dispatch_id=instance if isinstance(instance, str) else "", include_legacy_pass=True)
+        if isinstance(reply, DispatchAwaitingReply) and other_passes.intersection(reply.runs):
+            transcript = transcript_receipt(records(), prompt, done, other_pass_results=frozenset(other_passes))
+            recovered = transcript.receipt
+            if isinstance(recovered, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
+                return recovered
+            reply = (replace(recovered, restored_done=True)
+                     if isinstance(recovered, DispatchComplete) and recovered == reply.matching_done else recovered)
     unseen = deliveries.keys() - transcript.received_runs
     pending = unseen.union(record["run_id"] for record in live)
     if isinstance(reply, DispatchAwaitingReply):

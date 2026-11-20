@@ -20,6 +20,7 @@ export UNIT_HISTORY_DIR="$scratch/history" PLAN_DELEGATE_HISTORY_DIR="$scratch/h
 export MODELS_CONFIG_FILE="$scratch/models.conf"
 export MODELS_CONFIG_PUBLISH=0
 export CONF_DIR="$scratch" PLAN_DELEGATE_CONFIG="$scratch/direct.conf"
+export STAFF_FILE="$scratch/staff.json"
 unset CLAUDE_CODE_SESSION_ID
 : > "$MODELS_CONFIG_FILE"
 # Fix the demo's thresholds so local tuning cannot change its examples.
@@ -44,6 +45,15 @@ MAX_REVIEW_CANCELLATIONS=1
 ROUTING_FROM_ROUND=4
 # whole: 1..
 ASTRA_AFTER_FAILED_FIXES=2
+CONFIG
+cat > "$CONF_DIR/machines.conf" <<'CONFIG'
+aliases=natedev mac
+# one of: linux, darwin
+natedev.platform=linux
+natedev.hosts=natedev
+# one of: linux, darwin
+mac.platform=darwin
+mac.hosts=Nates-MacBook-Pro-2023
 CONFIG
 
 F() { "$tools_dir/../lib/py" "$tools_dir/findings.py" "$@" --session-dir "$scratch/run"; }

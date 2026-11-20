@@ -440,6 +440,29 @@ else:
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
         self.assertEqual(len(list((self.root / "slots").glob("*-slot*.lease.json"))), 1)
 
+    def test_doc_with_an_old_copy_call_reports_that_verify_must_run_again(self) -> None:
+        verify = self.root / "home/.claude/scripts/direct/verify.sh"
+        source = verify.read_text(encoding="utf-8")
+        current = r'''set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
+            --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" -- "$@"'''
+        legacy = 'set -- "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE"'
+        self.assertEqual(source.count(current), 1)
+        _ = verify.write_text(source.replace(current, legacy), encoding="utf-8")
+
+        process, log, _ = self.start_doc(command=("bash", str(verify), "doc", "alpha"))
+        status = process.wait(TEST_HANG_GUARD_SECS)
+        output = log.read_text(encoding="utf-8")
+        self.assertIn("copies: hold requires --tree. Run verify.sh again.", output)
+        self.assertNotEqual(status, 0, output)
+        self.assertNotIn("the following arguments are required", output)
+        self.assertFalse(self.events.exists())
+        self.assertEqual(self.pass_records(), [])
+
+        retry = self.verify("alpha")
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        self.assertEqual(len(self.cargo_calls()), 1)
+        self.assertEqual(len(self.pass_records()), 1)
+
     def test_doc_replaces_checkout_and_reuses_target_preserving_unchanged_mtimes(self) -> None:
         stamp = 1_000_000_000_000_000_000
         probe = '''

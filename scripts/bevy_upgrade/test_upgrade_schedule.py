@@ -98,6 +98,11 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(args, ["--to", f"session:{self.current_id}", "--from", "bevy-upgrade", "--key",
                                 f"bevy-upgrade-{self.owner_id}", "--summary", "Two changes", "--text", "line one\nline two"])
 
+    def test_a_notice_kept_for_review_counts_as_accepted(self) -> None:
+        outcome = f"KEPT: session:{self.current_id} is in a review; delivered at its end"
+        with mock.patch.dict(os.environ, {"SEND_OUTCOME": outcome}):
+            self.assertTrue(upgrade_schedule.tell_showrunner(self.owner_id, "changes", "body"))
+
     def test_empty_address_sends_nothing_and_explains_non_delivery(self) -> None:
         stderr = io.StringIO()
         with mock.patch.object(staff.StaffSnapshot, "by_id", return_value=None), contextlib.redirect_stderr(stderr):
