@@ -245,21 +245,19 @@ Tool setup runs after the guard and requires the bounded data mount.
 A failed setup or missing disk cannot prevent the guard from requesting poweroff.
 The mount bounds both device discovery and mount execution through `mount_timeout_seconds`.
 
-The root receiver writes the permit to `/run/hana-aws/work-permit.json`.
-It writes the generation to `/run/hana-aws/generation`.
-Keep both files private and owned by root.
 The receiver service runs as root with `UMask=0077`.
-The permit fields are `expires_at` (UTC epoch seconds), `generation`, and `boot_id`.
+The receiver installs the private, root-owned record `/run/hana-aws/active-work-permit.json`.
+The record holds `expires_at` in UTC epoch seconds, `generation`, and `boot_id`.
 The boot ID must match `/proc/sys/kernel/random/boot_id`.
-The guard and watchdog only read the permit and identity files.
+The receiver uses a private temporary file and an atomic rename under the shared lock.
+The receiver acknowledges a new permit after the rename succeeds.
+The guard, watchdog, and command admission read the same record for the permit and generation.
+The receiver, guard, and watchdog ignore the legacy `work-permit.json` and `generation` files.
+A folder with only legacy permit files starts with no installed permit and expects a prior generation of zero.
 Missing, unreadable, malformed, expired, or mismatched permits grant no permission.
 `permit_max_seconds=1800` bounds one renewal window.
 A permit beyond that window grants no permission.
 The controller can renew permission for longer steps.
-For a changed permit, the receiver uses an atomic rename under the shared lock.
-It then writes the generation in a separate operation.
-If the generation write fails, a retry can confirm the same fresh permit without repairing the generation file.
-The guard, watchdog, and command admission still require the permit generation to match that file.
 
 On the first read, safety records the permit's boot-clock deadline in `/run/hana-aws/permit-deadline.json`.
 An unchanged permit retains that deadline across later reads and service restarts.
@@ -437,7 +435,8 @@ Each bootstrap, start, or publication attempt still needs accepted spending.
 A publication includes the expected prior generation and the current execution identity.
 Command permission requires a current active claim, verified boot, acknowledged permit, and accepted spending.
 Renewal retains the execution identity and advances the permit generation.
-A refused or lost publication does not extend the guest deadline.
+A failed install leaves the active permit unchanged.
+An exact replay can acknowledge the installed permit while it is fresh.
 The controller reserves exposure until stop confirmation through the Phase C ledger.
 It reconciles automatic restarts without a caller, including while placement is disabled.
 An automatic restart cannot reuse an interrupted execution's boot challenge.
@@ -448,8 +447,6 @@ Its `recover()` method reads status without repeating a mutation.
 It must distinguish a completed request from an unresolved request before reporting `MutationSettled`.
 The provider refreshes bootstrap access before a demand start.
 It must verify root receiver responses against deployment and demand-start identities.
-It installs the renewed permit first and the generation second, and acknowledges publication after both writes.
-A retry after a failed generation write can acknowledge while the generation file is old; this is a known defect.
 `hana_provider.AwsHanaProvider` supplies the concrete AWS provider.
 The controller constructs it with the scaler profile and a sanitized credential environment.
 An unprovisioned tick makes no provider call.
@@ -1609,7 +1606,23 @@ The runner retains inherited slot locks through command execution.
 
 ## Hana result transport
 
+The command runs in a transient systemd service with `ExitType=main`.
+The runner detects Cargo exit even when a descendant keeps an output pipe open.
+When the runner observes Cargo exit, it measures the bytes pending on each pipe.
+It reads those bytes within the transport size limit, closes both pipes, and returns the Cargo status.
+The payload exits after the runner returns and the payload cleans up its temporary files.
+When the payload exits, systemd stops the service and kills remaining processes with `KillMode=control-group`.
+The receiver requires launcher exit, an empty command cgroup, and a free maker lease before it uploads the result.
+It also requires this evidence before it confirms a fence for a running command.
+The execution journal stores the systemd exit time, first free lease probe, and upload start under `observation.timing`.
+The receiver also records when it first confirms unit exit.
+After a restart, the receiver can read the journal without the original launcher object.
+The receiver retries a missing journal entry on each pass until it records the exit time or confirms departure.
+The systemd exit time is absent if the guest cannot read the matching journal entry.
+Each time uses Unix seconds on the guest.
+
 The guest sends `result.json` with both compiler output streams and the command status.
+A unit timeout takes precedence over a complete result because cleanup can still be in progress.
 The JSON limit is 32 MiB.
 The guest and sender use `result_transfer_timeout_s` for the upload and download.
 The guest uses curl for the upload and keeps the signed URL out of process arguments.
@@ -1621,6 +1634,8 @@ The receiver reads and processes the fence before the permit in every pass.
 A control step can fail during a read, a write, decoding, or validation.
 The receiver continues to process the other control requests in the same pass.
 A fence sends SIGKILL to the upload process and reaps it before the receiver acknowledges the fence.
+The fence observation includes the upload start time when the receiver has recorded it.
+During settlement, the controller saves the fence observation when it carries timing.
 The receiver records an upload attempt before the PUT and records its result before it publishes the observation.
 After a restart, the receiver records an unconfirmed upload as `HanaResultUploadFailed` and reports the loss.
 Command and fence documents and execution observations have a 64 KiB protocol limit.
