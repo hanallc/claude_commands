@@ -822,6 +822,7 @@ class Deployment:
         admin_secrets.refuse_plain_admin(self.settings_path)
         with self._require_hana_control('prepare --workload hana'):
             self._refuse_hana_replacement()
+            _ = read_settings(self.settings_path)
             inputs = self._hana_inputs()
             settings, parameters = inputs.settings, inputs.parameters
             decision = self._guard()

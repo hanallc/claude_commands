@@ -246,6 +246,34 @@ class HanaSetupTests(CostFixture):
             1, 2, 3, conf.read(self.workload).whole('aws_timeout_s'),
             conf.read(self.settings).whole('preflight_max_age_s'), 'fixture-scaler')
 
+    def test_prepare_refuses_invalid_spending_before_aws_reads_or_ledger_saves(self) -> None:
+        self.save_image()
+        self.replace('monthly_limit_usd', '-1')
+        settings = self.base_settings()
+        subject = self.subject(FakeAws(self.clock))
+        setup = self.state / 'hana/setup.json'
+        _ = setup.write_text(json.dumps({
+            'requested': True, 'stack': conf.read(self.workload).text('stack_name'), 'region': IDENTITY.region,
+            'deployment': IDENTITY.deployment, 'instance': IDENTITY.instance,
+        }))
+        reads: list[str] = []
+
+        def reply(operation: str, *arguments: str, service: str, timeout_s: float | None) -> dict[str, object]:
+            _ = arguments, service, timeout_s
+            reads.append(operation)
+            if operation == 'describe-stacks':
+                return {'Stacks': [{'StackStatus': 'CREATE_COMPLETE',
+                    'Parameters': [{'ParameterKey': 'VpcId', 'ParameterValue': 'fixture-vpc'}]}]}
+            self.assertEqual(operation, 'describe-instances')
+            return {'Reservations': [{'Instances': [{'InstanceId': IDENTITY.instance, 'VpcId': 'fixture-vpc',
+                'SubnetId': 'fixture-subnet', 'Placement': {'AvailabilityZone': settings.availability_zone}}]}]}
+
+        with mock.patch.object(deploy, 'read_deployment_settings', return_value=settings), fake_aws_calls(reply), \
+                mock.patch.object(ledger.CostLedger, '_save') as save:
+            with self.assertRaisesRegex(ValueError, 'monthly_limit_usd'):
+                _ = subject.prepare_hana()
+        self.assertEqual((reads, save.call_count), ([], 0))
+
     def test_setup_requires_current_preparation_before_any_aws_call(self) -> None:
         self.save_image()
         fake = FakeAws(self.clock)
