@@ -424,11 +424,13 @@ class GateWorker:
         cloud_progress.publish(self.sidecar, replace(log_cloud_progress(text, self.size_vcpus, self.clock()),
             region=self.box_region, zone=self.box_zone))
 
-    def charges(self, record_query: Callable[[Decimal], None] = lambda _fee: None) -> None:
+    def charges(self, record_query: Callable[[Decimal], None] = lambda _fee: None, *,
+                before_page: Callable[[], None] = lambda: None) -> None:
         now = int(self.clock())
         def fetch(start: int, end: int) -> tuple[ledger.ChargeRead, ...]:
             policy = read_settings(self.settings_path)
-            readings = fetch_account_charges(self.api, start, end, now, policy.cost_explorer_read_usd)
+            readings = fetch_account_charges(self.api, start, end, now, policy.cost_explorer_read_usd,
+                                             before_page=before_page)
             record_query(sum((reading.query_usd for reading in readings), Decimal(0)))
             return readings
         _ = self.book.refresh_charges(self.settings_path, now, fetch)

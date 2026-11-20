@@ -528,13 +528,15 @@ USAGE_ONLY = json.dumps({'Not': {'Dimensions': {'Key': 'RECORD_TYPE', 'Values': 
 
 
 def fetch_account_charges(api: AwsCli, start: int, end: int, now: int,
-                          read_usd: Decimal) -> tuple[ledger.ChargeRead, ...]:
+                          read_usd: Decimal, *,
+                          before_page: Callable[[], None] = lambda: None) -> tuple[ledger.ChargeRead, ...]:
     """Read daily account costs by usage type and count every API page."""
     period = f'Start={datetime.fromtimestamp(start, UTC):%Y-%m-%d},End={datetime.fromtimestamp(end, UTC):%Y-%m-%d}'
     days: dict[str, ledger.ChargeRead] = {}
     token = ''
     pages = 0
     while True:
+        before_page()
         arguments = ['--time-period', period, '--granularity', 'DAILY', '--metrics', 'UnblendedCost', 'UsageQuantity',
                      '--group-by', 'Type=DIMENSION,Key=USAGE_TYPE', '--filter', USAGE_ONLY, '--no-paginate']
         if token:
