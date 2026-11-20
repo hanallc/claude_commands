@@ -408,13 +408,12 @@ def load_config() -> CopiesConfiguration:
     path, values = config_settings()
     try:
         registry = Path(values["remote_registry"]).expanduser()
-        delay = float(values["wait_seconds"])
         git_timeout = float(values["git_timeout_seconds"])
         guard_timeout = float(values["guard_timeout_seconds"])
         if not registry.is_absolute():
             raise ValueError("remote_registry must be absolute")
-        if any(not math.isfinite(value) or value <= 0 for value in (delay, git_timeout, guard_timeout)):
-            raise ValueError("wait_seconds, git_timeout_seconds and guard_timeout_seconds must be finite and positive")
+        if any(not math.isfinite(value) or value <= 0 for value in (git_timeout, guard_timeout)):
+            raise ValueError("git_timeout_seconds and guard_timeout_seconds must be finite and positive")
     except (KeyError, ValueError) as error:
         raise CopyError(f"{path}: invalid copies configuration: {error}") from error
     allow_list = {key.removeprefix("allow."): reason for key, reason in values.items()
@@ -2415,8 +2414,8 @@ def step_owner(source: Path) -> str:
 def run_slot_step(source: Path, args: CopyArguments) -> int:
     """Try the slot once and pass its lease to the command tree."""
     command = command_tail(args.command)
-    if not command or not args.tree or not args.capacity_file:
-        raise CopyError("a slot step needs a tree, capacity file and command")
+    if not command or not args.capacity_file:
+        raise CopyError("a slot step needs a capacity file and a command")
     # Print the tree from the same commit object that supplies the commit ID.
     revisions = git(source, "log", "-1", "--format=%H%n%T", "--no-show-signature", "--no-notes",
                     "--no-decorate", "--no-color", "--encoding=UTF-8", "HEAD", "--").decode().splitlines()
@@ -2582,7 +2581,7 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="run a command in a private source copy")
     hold = commands.add_parser("hold", help="run a step in a slot or hold a remote source copy")
     _ = hold.add_argument("--repo", required=True)
-    _ = hold.add_argument("--tree", required=True)
+    _ = hold.add_argument("--tree", default="")
     _ = hold.add_argument("--step", default="hold")
     _ = hold.add_argument("--capacity-file", default="")
     _ = hold.add_argument("--scratch", action="store_true")
@@ -2623,6 +2622,8 @@ def main(argv: list[str] | None = None) -> int:
                     register_remote(mirror)
             return 0
         if args.action == "hold":
+            if not args.tree:
+                raise CopyError("hold requires --tree. Run verify.sh again.")
             source = Path(args.repo or "").expanduser().resolve()
             if not args.scratch:
                 return run_slot_step(source, args)

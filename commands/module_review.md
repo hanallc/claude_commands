@@ -89,8 +89,6 @@ Before evaluating:
 2. Load the Rust style guide: zsh ~/.claude/scripts/rust_style/load-rust-style.sh
 
 If the output mentions a saved file path, Read that file. Apply the loaded rules — especially `when-to-split-a-module.md` for the over-large-file criterion (~500 lines non-test + at least one other signal) — when forming findings. Cite the rule filename for each finding it informs.
-
-The style guide includes `forbidden-words.md`. Apply that file's rules to every word of every finding you return.
 ```
 
 

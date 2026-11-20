@@ -987,7 +987,7 @@ def _recover_pass(event: WorkerEvent, row: staff.StaffRow, run: Path, passed: di
     instance = str(passed["instance_id"])
     receipt = _completion_receipt(event, row, run, delivery, require_transcript=require_transcript)
     if (not isinstance(receipt, worker.DispatchComplete)
-            or event.kind == EventKind.TURN_END and receipt.reply != event.reply
+            or event.kind == EventKind.TURN_END and receipt.reply != event.reply and not receipt.restored_done
             or worker.is_stage_one_review(delivery, instance)):
         return receipt
     path = Path(delivery.reply_file)
@@ -1149,7 +1149,8 @@ def _handle_locked(event: WorkerEvent,
                                        Path(delivery.reply_file), "", "")
             return ignore_turn("the submitted dispatch has no final reply", close_pane=False)
         anomalies = receipt.anomalies if isinstance(receipt, worker.DispatchComplete) else ()
-        if event.kind == EventKind.TURN_END and (not reply or reply != event.reply):
+        if (event.kind == EventKind.TURN_END and (not reply or reply != event.reply)
+                and not (isinstance(receipt, worker.DispatchComplete) and receipt.restored_done)):
             reason = "the transcript reply is empty" if not reply else "the transcript reply differs from the turn reply"
             return ignore_turn(reason, close_pane=False)
         stale_done = _stale_done_detail(reply, delivery.completion_id)

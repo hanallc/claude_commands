@@ -17,6 +17,7 @@ from enum import Enum
 from decimal import Decimal
 import time
 from typing import Literal, NamedTuple, cast
+from zoneinfo import ZoneInfo
 
 from scripts.buildlog import ci, holds
 from scripts.buildlog import index
@@ -845,6 +846,47 @@ class CounterNotRecorded(Enum):
 class UsageWindow:
     start: datetime
     end: datetime
+
+
+class RustCacheCounters(NamedTuple):
+    host: str
+    boot_id: str
+    server_started_us: int
+    hits: int
+    misses: int
+
+    def server(self) -> tuple[str, str, int]:
+        return self.host, self.boot_id, self.server_started_us
+
+
+def sccache_hit_rate(connection: sqlite3.Connection, first: date, last: date) -> str:
+    """Sum observed Rust cache deltas within each server life."""
+    zone = user_zone()
+    start = store.utc_iso(datetime.combine(first, datetime.min.time(), zone).timestamp())
+    end = store.utc_iso(datetime.combine(last + timedelta(days=1), datetime.min.time(), zone).timestamp())
+    rows = fetch(connection, "SELECT host, boot_id, server_started_us, rust_hits, rust_misses FROM sccache_samples"
+                 + " WHERE at >= ? AND at < ? AND " + natedev_host_predicate("sccache_samples")
+                 + " ORDER BY host, at, rowid", start, end)
+    hits = misses = 0
+    previous: RustCacheCounters | None = None
+    for row in rows:
+        host, boot_id, server_start, raw_hits, raw_misses = row
+        started, hit_count, miss_count = map(recorded_number, (server_start, raw_hits, raw_misses))
+        if not (isinstance(host, str) and isinstance(boot_id, str) and boot_id
+                and isinstance(started, int) and started > 0
+                and isinstance(hit_count, int) and isinstance(miss_count, int)):
+            continue
+        current = RustCacheCounters(host, boot_id, started, hit_count, miss_count)
+        if previous is not None and current.server() == previous.server():
+            added_hits = current.hits - previous.hits
+            added_misses = current.misses - previous.misses
+            if added_hits >= 0 and added_misses >= 0:
+                hits += added_hits
+                misses += added_misses
+        previous = current
+    requests = hits + misses
+    rate = f"{hits / requests:.2%} ({hits:,} hits, {misses:,} misses)" if requests else "unavailable (no deltas with requests)"
+    return f"Rust sccache hit rate ({first} to {last}): {rate}"
 
 
 def usage_window(day: str = "") -> UsageWindow:
@@ -2325,7 +2367,13 @@ def spend_analysis(spends: Sequence[ledger.DailySpend], monthly_limit: Decimal, 
             '', f'32-CPU gate compute is {month.gate_share:.0%} of the spend on those days.', '']
 
 
-def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
+class ReportDaySelection(Enum):
+    EXPLICIT_DATE = 'explicit_date'
+    CURRENT_DAY = 'current_day'
+
+
+def aws_section(connection: sqlite3.Connection, day: str, *,
+                day_selection: ReportDaySelection = ReportDaySelection.EXPLICIT_DATE) -> list[str]:
     """Render local costs and comparison estimates without contacting AWS or a peer."""
     settings = conf.path('aws_target')
     directory = ssh_target_state_directory('aws')
@@ -2333,11 +2381,18 @@ def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
     today = datetime.fromtimestamp(instant, UTC).date().isoformat()
     current_report = day == datetime.fromtimestamp(instant, user_zone()).date().isoformat()
     last_estimate_day = today if current_report else day
+    usage_zone = ZoneInfo('UTC')
+    use_current_day = day_selection is ReportDaySelection.CURRENT_DAY
+    usage_day = today if use_current_day else day
     spend: aws_spend.Spend | measurement.MeasurementUnavailable = aws_spend.NO_SPEND
     try:
         inputs = measurement.read_inputs(aws_config.account_settings_path(), directory)
+        if isinstance(inputs.settings, aws_config.SpendingSettings):
+            usage_zone = inputs.settings.accounting_zone
+            if use_current_day:
+                usage_day = datetime.fromtimestamp(instant, usage_zone).date().isoformat()
         snapshot = measurement.read_measurement(settings, directory, instant, inputs=inputs)
-        usage = measurement.daily_usage(settings, directory, day, instant, inputs=inputs)
+        usage = measurement.daily_usage(settings, directory, usage_day, instant, inputs=inputs)
         spend = aws_spend.spend_from(inputs, snapshot, directory, instant, last_estimate_day)
     except (OSError, ValueError, ArithmeticError) as error:
         snapshot = measurement.MeasurementUnavailable(str(error))
@@ -2345,7 +2400,8 @@ def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
     if isinstance(spend, measurement.MeasurementUnavailable):
         spend = aws_spend.NO_SPEND
     shown = list(spend.days)
-    saving = aws_report.estimate_wait_saved(connection, day, 'aws', bounds=day_range(day))
+    start, end = measurement.accounting_day_bounds(date.fromisoformat(usage_day), instant, usage_zone)
+    saving = aws_report.estimate_wait_saved(connection, usage_day, 'aws', bounds=(store.utc_iso(start), store.utc_iso(end)))
     lines = ['### AWS', '', *aws_report.daily_spend_lines(shown, spend.daily_limit, today)]
     try:
         pace_days = conf.read(settings).whole('spend_pace_days')
@@ -2513,7 +2569,8 @@ def linked_steps_section(connection: sqlite3.Connection, day: str) -> list[str]:
 
 
 @target_predicate_scope()
-def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = None) -> str:
+def report(connection: sqlite3.Connection, day: str, *,
+           day_selection: ReportDaySelection = ReportDaySelection.EXPLICIT_DATE) -> str:
     found = kinds(connection, day)
     hosts = cast(
         int,
@@ -2536,7 +2593,8 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
     lines += launches_section(connection, day)
     for kind in found:
         lines += kind_section(connection, day, kind, hosts)
-    lines += memory_pressure_section(connection, day, hosts, usage_day=usage_day)
+    memory_day = '' if day_selection is ReportDaySelection.CURRENT_DAY else day
+    lines += memory_pressure_section(connection, day, hosts, usage_day=memory_day)
     lines += cpu_disk_pressure_section(connection, day)
     calls, calls_line = calls_section(connection, day)
     port_lint, port_lint_line = port_lint_section(connection, day)
@@ -2547,7 +2605,7 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
         + moments_section(connection, day)
         + tests_by_target_lines(test_calls)
         + mac_section(connection, day)
-        + aws_section(connection, day)
+        + aws_section(connection, day, day_selection=day_selection)
         + mac_copies_lines(copies)
         + port_lint
         + ci

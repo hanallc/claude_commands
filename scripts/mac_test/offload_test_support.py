@@ -69,6 +69,7 @@ def assigned_adapter_main() -> int:
         result = offload.run_offload(controller, config, request, started)
     status = offload.write_result(result, request.result, request.last_decline, request.verb,
                                  request.target, controller.attempt_evidence, request.fetch)
+    offload.report_result_details(request, result)
     offload.persist_attempt(request, result, controller.attempt_evidence, started)
     return status
 
