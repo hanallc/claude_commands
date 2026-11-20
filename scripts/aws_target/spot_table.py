@@ -10,7 +10,7 @@ from statistics import median
 from typing import Literal
 
 from scripts.aws_target import ledger, run_cost
-from scripts.aws_target.aws_target import SnapshotFailure, gate_sizes, gpu_price_sizes, largest_gate_vcpus, read_snapshot, snapshot_failures
+from scripts.aws_target.aws_target import SnapshotFailure, gpu_price_sizes, hours_check_scope, largest_gate_vcpus, read_snapshot, snapshot_failures
 from scripts.lib import conf
 
 
@@ -164,7 +164,7 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None,
     home = configuration.text('region')
     inputs = gate_pricing if gate_pricing is not None else run_cost.read_gate_pricing_inputs(
         directory, now, values, configuration)
-    hours, hours_note = billed_hours(directory, now, regions, gate_sizes(values), days, home,
+    hours, hours_note = billed_hours(directory, now, regions, hours_check_scope(values), days, home,
                                      configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')))
     return SpotTables(
         tuple(reads),
@@ -311,22 +311,23 @@ def paid_run_cell(billed: list[run_cost.FinishedGateRun], due: int, allocations:
     return f'{run_cost.billed_cost_per_run(billed, allocations):.4f}' + (f' ({due} bill due)' if due else '')
 
 
-def billed_hours(directory: Path, now: int, regions: tuple[str, ...], sizes: tuple[str, ...], days: int, home: str,
+def billed_hours(directory: Path, now: int, regions: tuple[str, ...], scope: run_cost.SpotHoursScope, days: int, home: str,
                  builder: str, max_ratio: Decimal) -> tuple[Table, str]:
     """The billed Spot hours against the recorded box hours of each type and region, and the note under them."""
     title = 'Billed hours / box hours'
     end = datetime.fromtimestamp(now, UTC)
     try:
-        checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, builder, sizes,
+        checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, builder, scope,
                                        max_ratio)
     except ledger.LedgerUnavailable:
         return Table(title, ('type', *regions), frozenset(), (), 'columns'), 'No billed hours: the cost ledger is not readable.'
     # A region that is no longer a candidate keeps its column while it has hours in the window.
     columns = (*regions, *sorted({region for _size, region in checks} - set(regions)))
     rows = tuple((size, *(hours_cell(checks.get((size, region))) for region in columns))
-                 for size in sizes if any(key[0] == size for key in checks))
+                 for size in scope.sizes if any(key[0] == size for key in checks))
     note = (f'AWS billed Spot hours / recorded box hours, last {days} days, on the days with a bill. '
-            + f'The gap in parentheses is the difference over the box hours. Over: the gap is above {max_ratio:.0%}. '
+            + 'The gap in parentheses is the distance outside the range divided by the bound on that side. '
+            + f'Over marks a gap above {max_ratio:.0%}. '
             + 'Not billed: no day has a bill yet.')
     return Table(title, ('type', *columns), frozenset(range(1, len(columns) + 1)), rows, 'columns'), note
 
@@ -338,5 +339,6 @@ def hours_cell(check: run_cost.HoursCheck | None) -> str:
     if check.billed_hours is None:
         return 'not billed'
     gap = f' ({check.hours_gap_ratio:.0%})' if check.hours_gap_ratio is not None else ''
-    return f'{check.billed_hours:.1f}/{check.box_hours:.1f}{gap}' + (' over' if check.hours_gap_over else '')
+    reserved = f' + {check.hana_reserved_hours:.2f} reserved' if check.hana_reserved_hours else ''
+    return f'{check.billed_hours:.1f}/{check.box_hours:.1f}{reserved}{gap}' + (' over' if check.hours_gap_over else '')
 

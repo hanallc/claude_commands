@@ -21,13 +21,15 @@ import sys
 import time
 from typing import cast, final
 
-from scripts.aws_target import ledger, measurement, price_days, run_cost
+from scripts.aws_target import hana_spend, ledger, measurement, price_days, run_cost
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
 from scripts.lib import conf
+from scripts.message import send_budget, send_result
+from scripts.message.session_send import send_argv
 from scripts.notify import push_texts
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -44,6 +46,7 @@ SNAPSHOT_ERROR_PATTERNS = (
 SNAPSHOT_DUMP_LINE = re.compile(
     r'(?i)^(?:(?:request|response|headers?)\b|'
     + r'(?:[a-z0-9]+(?:-[a-z0-9]+)+|authorization|host|date|connection|cookie)\s*:|[{\[<])')
+HOURS_GAP_RECIPIENT = 'staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d'
 
 
 def largest_gate_vcpus(instance_types: tuple[str, ...]) -> int:
@@ -138,6 +141,18 @@ def gate_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
     """Every type a cloud gate can launch or compare."""
     return tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'),
                                 *gpu_price_sizes(values))))
+
+
+def hours_check_scope(gate: conf.ConfigRead) -> run_cost.SpotHoursScope:
+    sizes = gate_sizes(gate)
+    try:
+        configuration = conf.read_or_repository('hana_aws')
+        region = configuration.text('region')
+        primary = configuration.text('instance_type')
+        hana = (primary, *hana_spend.read_fallback_instance_types(configuration, primary))
+    except conf.Unusable:
+        return run_cost.SpotHoursScope(sizes, {})
+    return run_cost.SpotHoursScope(tuple(dict.fromkeys((*sizes, *hana))), {region: hana})
 
 
 def spot_placement_requests(values: conf.ConfigRead) -> tuple[ledger.SpotPlacementRequest, ...]:
@@ -281,23 +296,45 @@ def placement_snapshot(settings_path: Path, directory: Path, *, execute: AwsExec
         print(f'aws_target: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
 
 
-def hours_gap_push(day: str, size: str, region: str, check: run_cost.HoursCheck, limit: Decimal) -> push_texts.RenderedPush:
-    gap = f'{check.hours_gap_ratio:.0%}' if check.hours_gap_ratio is not None else 'all billed hours'
-    return push_texts.render('aws.hours_gap', day=day, size=size, region=region, billed=f'{check.billed_hours or 0:.2f}',
-                             box=f'{check.box_hours:.2f}', gap=gap, limit=f'{limit:.0%}')
+def hours_gap_message(day: str, size: str, region: str, check: run_cost.HoursCheck, limit: Decimal) -> str:
+    gap = (f'The gap is {check.hours_gap_ratio:.0%}.' if check.hours_gap_ratio is not None
+           else 'The gap covers all billed hours.')
+    reservation = ((f'The ledger also reserves {check.hana_reserved_hours:.2f} h of Hana box time in that region for that day.',)
+                   if check.hana_reserved_hours else ())
+    return '\n'.join((
+        'AWS Spot hours differ from the cost ledger.',
+        f'On {day} UTC, AWS billed {check.billed_hours or 0:.2f} h of {size} Spot in {region}.',
+        f'The cost ledger records {check.box_hours:.2f} h for that size, region, and day.',
+        *reservation,
+        f'{gap} The limit is {limit:.0%}.',
+        'File an investigation for this gap and add it to the list.',
+    ))
 
 
-def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[], float] = time.time,
-                      notify: Callable[[str, push_texts.RenderedPush, float], bool] = snapshot_failure_notice) -> int:
-    """Send one user notice for each gate type, region and UTC day whose billed hours differ from its box hours."""
+def send_hours_gap(message: str, delivery_timeout: float) -> bool:
+    """Check whether send.py confirms delivery or accepts the message for bob's queue."""
+    command = send_argv('--to', HOURS_GAP_RECIPIENT, '--from', 'AWS hours check',
+                        '--timeout', f'{delivery_timeout:g}', '--text', message)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False,
+                                timeout=send_budget.seconds(delivery_timeout))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    return isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in ('sent', 'skipped', 'queued')
+
+
+def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[], float] = time.time) -> int:
+    """Send bob one message per type, region, and UTC day above the gap limit."""
     configuration = conf.read(settings_path)
     limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
     end = datetime.fromtimestamp(clock(), UTC)
-    start = end - timedelta(days=configuration.whole('run_cost_days'))
+    days = configuration.whole('run_cost_days')
+    start = end - timedelta(days=days)
     try:
+        scope = hours_check_scope(conf.read_or_repository('cloud_gate'))
         checks = run_cost.day_hours_checks(ledger.CostLedger(directory), start, end, configuration.text('region'),
-                                           configuration.text('instance_type'),
-                                           gate_sizes(conf.read_or_repository('cloud_gate')), limit)
+                                           configuration.text('instance_type'), scope, limit)
     except (ledger.LedgerUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
         print(f'aws_target: hours check unavailable: {type(error).__name__}: {error}', file=sys.stderr)
         return 1
@@ -313,11 +350,11 @@ def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[
         key = f'aws-hours-gap:{size}:{region}:{day}'
         if not check.hours_gap_over or key in claimed:
             continue
-        # Save the claim before delivery so a slow send never repeats.
-        claimed.add(key)
-        save()
-        if not notify(key, hours_gap_push(day, size, region, check, limit), configuration.number('snapshot_notification_timeout_s')):
-            claimed.discard(key)
+        message = hours_gap_message(day, size, region, check, limit)
+        if send_hours_gap(message, configuration.number('snapshot_notification_timeout_s')):
+            claimed.add(key)
+            save()
+        else:
             print(f'aws_target: hours gap notice for {size} in {region} on {day} remains pending', file=sys.stderr)
             status = 1
     save()
