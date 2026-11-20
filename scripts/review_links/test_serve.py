@@ -15,6 +15,7 @@ import re
 import select
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -26,8 +27,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
-from http.client import HTTPConnection, RemoteDisconnected
-from io import StringIO
+from functools import partial
+from http.client import HTTPConnection, RemoteDisconnected, parse_headers
+from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import ANY, Mock, call, patch
 
@@ -208,6 +210,134 @@ class ReviewLinksServerTests(unittest.TestCase):
     def new_item_body(self, request: new_item_dialog.NewItemRequest) -> bytes:
         return json.dumps({**asdict(request), "token": self.server.new_item_token},
                           ensure_ascii=False, separators=(",", ":")).encode()
+
+    def test_remote_staff_reads_reuse_the_snapshot_until_it_expires(self) -> None:
+        case = self.review_fixture(changes=1)
+        change = next(item for item in review_items.read(case.root) if item.type == review_items.ReviewType.CHANGE)
+        keeper = staff.StaffId("fixture-list-owner")
+        item = the_list.add(keeper, "Read the published review", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        _ = the_list.link(keeper, item.id, (change.key,), source="nate")
+        seconds = conf.read("review_links").number("staff_snapshot_seconds")
+        for mode, expected in (
+            ("owner", ((200, 1), (200, 2), (200, 3))),
+            ("remote", ((200, 1), (200, 1), (200, 2))),
+            ("remote failure", ((503, 2), (503, 3), (200, 4))),
+        ):
+            self.server.clear_staff_snapshot()
+            now = 100.0
+            delay = seconds / 2 if mode == "remote failure" else 0
+            finished = now + delay
+            reads = 0
+
+            def read() -> staff.StaffSnapshot:
+                nonlocal now, reads
+                reads += 1
+                if mode == "remote failure" and now < finished + seconds:
+                    if reads == 1:
+                        now += delay
+                    raise staff.StaffUnreadable("The staff authority is unavailable.")
+                return staff.local_snapshot()
+
+            with (self.subTest(mode=mode),
+                  patch.object(staff, "is_owner", lambda: mode == "owner"),
+                  patch.object(staff, "authority_snapshot", read),
+                  patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+                  patch.object(time, "monotonic", lambda: now)):
+                for at, (status, count) in zip((now, finished + seconds * 0.75, finished + seconds + 1), expected):
+                    now = at
+                    self.assertEqual(self.new_item_http().status, status)
+                    self.assertEqual(reads, count)
+                    if mode == "remote" and now == finished:
+                        for query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
+                            with self.subTest(query=query), patch.object(self.server, "root", case.root):
+                                response = self.request(f"{list_page.PAGE_PATH}?{query}")
+                                self.assertEqual(response.status, 200)
+                                if query == list_page.COUNTS_AND_LINKS_QUERY:
+                                    self.assertIn(f">{change.id}</a>".encode(), response.body)
+                                self.assertEqual(reads, count)
+
+    def test_post_discards_the_cached_staff_snapshot(self) -> None:
+        configuration = self.root.parent / "cache-config"
+        _ = shutil.copytree(conf.path("review_links").parent, configuration)
+        _ = write_config_fixture(configuration / "disks.conf", f"output_folder={self.root / 'disks'}\n")
+        _ = write_config_fixture(configuration / "memory_feed.conf", f"output_folder={self.root / 'builds'}\n")
+        complete = threading.Event()
+        reads: list[staff.StaffSnapshot] = []
+        during_post: list[tuple[int, int]] = []
+        get_recipients = self.new_item_http
+
+        class StaffCacheFixtureHandler(serve.ReviewLinksHandler):
+            @override
+            def do_POST(self) -> None:
+                try:
+                    super().do_POST()
+                finally:
+                    complete.set()
+
+            @override
+            def new_item_post(self) -> None:
+                during_post.append((get_recipients().status, len(reads)))
+                super().new_item_post()
+
+        def read() -> staff.StaffSnapshot:
+            members = staff.local_snapshot()
+            reads.append(members)
+            return members
+
+        def post_action(path: str, body: str) -> int:
+            complete.clear()
+            status = self.post(path, body)[0]
+            self.assertTrue(complete.wait(TEST_HANG_GUARD_SECS))
+            return status
+
+        def new_item() -> int:
+            self.server.clear_staff_snapshot()
+            before = len(reads)
+            complete.clear()
+            status = self.new_item_http(b"{").status
+            self.assertTrue(complete.wait(TEST_HANG_GUARD_SECS))
+            self.assertEqual(during_post, [(200, before + 1)])
+            return status
+
+        with (patch.dict(os.environ, {"CONF_DIR": str(configuration),
+                                      "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
+                                      "XDG_STATE_HOME": str(self.root.parent / "state")}),
+              patch.object(accounts_page, "TUNE", (sys.executable, "-c", "pass")),
+              patch.object(self.server, "RequestHandlerClass", StaffCacheFixtureHandler),
+              patch.object(self.server, "verified_tailscale_address", self.server.bound_address)):
+            cache = self.server.review_cache
+            cache.invalidate()
+            cache.synchronize()
+            previous = cache.get()
+            with (patch.object(staff, "is_owner", lambda: False),
+                  patch.object(staff, "authority_snapshot", read),
+                  patch.object(time, "monotonic", lambda: 100.0)):
+                self.assertEqual(reads, [])
+                self.assertEqual(self.new_item_http().status, 200)
+                self.assertEqual(len(reads), 1)
+                for action, submit, status, additional_reads in (
+                    ("console", lambda: self.request("/console/").status, 200, 0),
+                    ("news", partial(post_action, "/console/news", "open=review"), 200, 0),
+                    ("Accounts color", partial(post_action, accounts_page.PAGE_PATH, "key=role.worker&value=%23010203"), 200, 0),
+                    ("new item", new_item, 400, 2),
+                ):
+                    with self.subTest(action=action):
+                        before = len(reads)
+                        self.assertEqual(submit(), status)
+                        self.assertEqual(self.new_item_http().status, 200)
+                        count = before + additional_reads
+                        self.assertEqual(len(reads), count)
+                        for _ in range(2):
+                            cache.invalidate()
+                            cache.synchronize()
+                            current = cache.get()
+                            self.assertIsNot(current, previous)
+                            self.assertEqual(len(reads), count)
+                            self.assertIs(current.members, reads[-1])
+                            previous = current
+                        self.assertEqual(self.new_item_http().status, 200)
+                        self.assertEqual(len(reads), count)
 
     def test_new_item_options_and_refusals(self) -> None:
         case = self.review_fixture()
@@ -1309,17 +1439,74 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_files_are_served_with_the_required_utf8_content_types(self) -> None:
         text = "review café — ready\n"
-        for filename, content_type in (
-            ("notes.md", "text/plain; charset=utf-8"),
-            ("notes.txt", "text/plain; charset=utf-8"),
-            ("notes.html", "text/html; charset=utf-8"),
+        feed = json.dumps({"reading": text}, ensure_ascii=False)
+        for filename, content_type, payload in (
+            ("notes.md", "text/plain; charset=utf-8", text),
+            ("notes.txt", "text/plain; charset=utf-8", text),
+            ("notes.html", "text/html; charset=utf-8", text),
+            ("memory.json", "text/plain; charset=utf-8", feed),
         ):
             with self.subTest(filename=filename):
-                _ = (self.root / filename).write_text(text, encoding="utf-8")
+                _ = (self.root / filename).write_text(payload, encoding="utf-8")
                 reply = self.request("/" + filename)
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(reply.content_type, content_type)
-                self.assertEqual(reply.body.decode("utf-8"), text)
+                self.assertEqual(reply.body.decode("utf-8"), payload)
+
+        path = "/memory.json"
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(connection.close)
+        gzip_headers = {"Accept-Encoding": "gzip"}
+        connection.request("GET", path, headers=gzip_headers)
+        response = connection.getresponse()
+        wire = response.read()
+        etag = response.getheader("ETag", "")
+        modified = response.getheader("Last-Modified", "")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Encoding"), "gzip")
+        self.assertEqual(response.getheader("Content-Length"), str(len(wire)))
+        self.assertEqual(response.getheader("Vary"), "Accept-Encoding")
+        self.assertEqual(gzip.decompress(wire).decode("utf-8"), feed)
+
+        for method, validators, status in (
+            ("HEAD", {}, 200),
+            ("GET", {"If-None-Match": etag}, 304),
+            ("GET", {"If-Modified-Since": modified}, 200),
+        ):
+            with self.subTest(method=method, validators=validators):
+                headers = {"Host": "127.0.0.1", "Connection": "close", **gzip_headers, **validators}
+                fields = "".join(f"{name}: {value}\r\n" for name, value in headers.items())
+                with (socket.create_connection(("127.0.0.1", self.port), TEST_HANG_GUARD_SECS) as client,
+                      client.makefile("rb") as reply):
+                    client.sendall(f"{method} {path} HTTP/1.0\r\n{fields}\r\n".encode())
+                    raw = reply.read()
+                head, delimiter, body = raw.partition(b"\r\n\r\n")
+                self.assertTrue(delimiter)
+                status_line, _, raw_headers = head.partition(b"\r\n")
+                self.assertEqual(status_line.split()[1:2], [str(status).encode()])
+                received = parse_headers(BytesIO(raw_headers))
+                self.assertEqual(received["ETag"], etag)
+                self.assertEqual(received["Last-Modified"], modified)
+                self.assertEqual(received["Vary"], "Accept-Encoding")
+                if status == 200:
+                    self.assertEqual(received["Content-Encoding"], "gzip")
+                    self.assertEqual(received["Content-Length"], str(len(wire)))
+                if method == "HEAD" or status == 304:
+                    self.assertEqual(body, b"")
+                else:
+                    self.assertEqual(gzip.decompress(body).decode("utf-8"), feed)
+
+        file = self.root / "memory.json"
+        stamp = file.stat()
+        updated = feed.replace("ready", "saved").encode()
+        atomic_file.write_bytes_atomic(file, updated)
+        os.utime(file, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        connection.request("GET", path, headers={**gzip_headers, "If-None-Match": etag, "If-Modified-Since": modified})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertNotEqual(response.getheader("ETag"), etag)
+        self.assertEqual(response.getheader("Last-Modified"), modified)
+        self.assertEqual(gzip.decompress(response.read()), updated)
 
     def test_review_request_passes_the_selected_show_view(self) -> None:
         snapshot = review_page.build_snapshot(self.review_fixture().root)
