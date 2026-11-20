@@ -12,7 +12,9 @@ import time
 from types import CodeType
 from typing import cast
 import unittest
+from unittest.mock import patch
 
+from scripts.lib import scratch
 from scripts.lib.python_startup import sitecustomize as startup
 from scripts.lint import tmp_sweep
 
@@ -50,7 +52,7 @@ def init_annotations(code: CodeType) -> dict[str, object]:
 
 def cache(test: unittest.TestCase) -> tuple[str, str]:
     """Make a 0700 cache root for test; return it and the folder of this Python."""
-    temporary = tempfile.TemporaryDirectory()
+    temporary = tempfile.TemporaryDirectory(dir="/tmp")
     test.addCleanup(temporary.cleanup)
     root = os.path.join(temporary.name, "cache")
     os.mkdir(root, 0o700)
@@ -110,7 +112,10 @@ class DataclassCodeTests(unittest.TestCase):
         Path(unread).touch()
         now = time.time()
         os.utime(unread, (now - 15 * DAY, now - 15 * DAY))
-        self.assertEqual(tmp_sweep.prune_dataclass_code(root, now, 14), 1)
+        holds = Path(root).parent / "holds.json"
+        _ = holds.write_text("{}\n", encoding="utf-8")
+        with patch.dict(os.environ, {"CONF_DIR": str(holds.parent), scratch.HOLDS_ENV: str(holds)}):
+            self.assertEqual(tmp_sweep.prune_dataclass_code(root, now, 14), 1)
         self.assertEqual(sorted(os.listdir(root)), [sys.implementation.cache_tag])
         self.assertEqual(len(os.listdir(folder)), 1)
 

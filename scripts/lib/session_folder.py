@@ -13,6 +13,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import time
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
@@ -147,6 +148,22 @@ def read_record(folder: Path) -> FolderRecord | None:
         raw = cast(object, json.loads((folder / RECORD).read_text(encoding="utf-8")))
     except (OSError, ValueError):
         return None
+    return folder_record(raw)
+
+
+def read_record_at(folder: int) -> FolderRecord | None:
+    """Read the record in an open directory without following a link."""
+    try:
+        fd = os.open(RECORD, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+        with os.fdopen(fd, encoding="utf-8") as source:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            return folder_record(cast(object, json.load(source)))
+    except (OSError, ValueError):
+        return None
+
+
+def folder_record(raw: object) -> FolderRecord | None:
     if not isinstance(raw, dict):
         return None
     fields = cast(dict[str, object], raw)

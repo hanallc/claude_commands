@@ -48,14 +48,31 @@ class ScratchGuardTests(unittest.TestCase):
         self.home, self.temp = base / "home", base / "temp"
         # session_root is the former root; new_root is the session root, absent until a test makes it.
         self.session_root, self.new_root = base / "sessions", base / "session"
-        self.enterContext(mock.patch.dict(os.environ, {"SESSION_FORMER_ROOT": str(self.session_root),
-                                                       "SESSION_TEMP_ROOT": str(self.new_root)}))
+        staff = base / "staff.json"
+        _ = staff.write_text('{"schema": 2, "rows": []}', encoding="utf-8")
+        config = base / "config"
+        config.mkdir()
+        _ = (config / "build_folders.conf").write_text(
+            f"roots.scratch={base / 'scratch' / 'tasks'}\nroots.workspace={base / 'scratch' / 'copies'}\n",
+            encoding="utf-8",
+        )
+        self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(config), "TMPDIR": str(self.temp), "STAFF_FILE": str(staff),
+            "SESSION_FORMER_ROOT": str(self.session_root), "SESSION_TEMP_ROOT": str(self.new_root),
+            "SESSION_PREVIOUS_ROOT": "", "PYTHONDONTWRITEBYTECODE": "1",
+        }))
         # The home folders a real home holds; a new folder directly in home is refused.
         (self.home / "rust" / "hana").mkdir(parents=True)
         (self.home / "worktrees").mkdir()
         self.temp.mkdir()
         # A name no real folder in /tmp holds, so the real /tmp root judges it as new.
         self.name = f"scratch-guard-{secrets.token_hex(6)}"
+
+    def test_hook_uses_fixture_configuration_under_the_private_root(self) -> None:
+        config = Path(os.environ["CONF_DIR"])
+        self.assertEqual(config.parent, self.temp.parent)
+        self.assertTrue((config / "build_folders.conf").is_file())
+        self.assert_refused(f"mkdir {self.temp / 'new'}", str(self.temp / "new"))
 
     def run_hook(self, command: str | list[str], cwd: Path | None = None, tool: str = "Bash",
                  temp: Path | None = None) -> str:

@@ -22,7 +22,7 @@ def folder(name: str, size: int, children: list[Folder] | None = None) -> Folder
 
 class ReadSessionsTests(unittest.TestCase):
     def test_sessions_show_largest_first_with_held_folders_and_state(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             root = Path(os.path.realpath(directory)) / "session"
             for name, session_id in (("fps", "a1"), ("lfo", "b2"), ("demo-impl", ""), ("bare", None)):
                 (root / name).mkdir(parents=True)
@@ -58,7 +58,7 @@ class ReadSessionsTests(unittest.TestCase):
         self.assertEqual([row["held"] for row in report["sessions"][1:]], [[], [], []])
 
     def test_a_report_reads_the_session_registry_once(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             root = Path(directory)
             for name in ("fps", "lfo"):
                 (root / name).mkdir()
@@ -76,7 +76,7 @@ class ReadSessionsTests(unittest.TestCase):
                          [("fps", "ended"), ("lfo", "ended")])
 
     def test_a_report_includes_folders_in_both_roots(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             base = Path(directory)
             root, previous = base / "session", base / "previous"
             for parent, name in ((root, "current"), (previous, "older")):
