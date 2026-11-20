@@ -36,7 +36,7 @@ from scripts.aws_target.ledger_test_support import (
 )
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
-from scripts.build_queue import cloud_progress
+from scripts.build_queue import cloud_progress, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.production import merge_gate
 from scripts.lib.git_test_support import write_fixture_git_config
@@ -369,6 +369,10 @@ class SigningTests(unittest.TestCase):
 
 @final
 class PairedWaitTests(CostFixture):
+    def cleanup_environment(self) -> dict[str, str]:
+        connection = trial.PairedCleanupConnection.configured(self.settings)
+        return {trial.PAIRED_CLEANUP_CONNECTION_ENV: json.dumps(snapshot_codec.snapshot_value(connection))}
+
     def cleanup_api(self, terminated: list[str]) -> AwsCli:
         def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
             if 'terminate-instances' in arguments:
@@ -569,6 +573,89 @@ class PairedWaitTests(CostFixture):
                             ['--paired-cleanup', str(cohort)], self.settings, self.state), 0)
                 self.assertCountEqual(requested, regions)
 
+    def test_cleanup_requests_termination_after_marker_write_and_config_fail(self) -> None:
+        cohort = self.root / 'trial'
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        self.record_attempt(cohort, 'running', running=True)
+        terminated: list[str] = []
+        errors = StringIO()
+        with (mock.patch.dict(os.environ, {**self.cleanup_environment(), 'SERVICE_RESULT': 'timeout'}),
+              mock.patch.object(cloud_gate, 'save', side_effect=OSError('fixture disk is full')) as save,
+              mock.patch.object(trial.conf, 'read', side_effect=OSError('fixture config read failed')),
+              mock.patch.object(trial, 'AwsCli', return_value=self.cleanup_api(terminated)),
+              redirect_stderr(errors)):
+            self.assertEqual(trial.paired_cleanup_main(
+                ['--paired-cleanup', str(cohort)], self.settings, self.state), 1)
+        save.assert_called_once_with(cohort / trial.SERVICE_TIMEOUT_FILE, {'wait': trial.TrialWait.SERVICE_RUNTIME.name})
+        self.assertEqual(terminated, ['i-fixture'])
+        self.assertIn('fixture disk is full', errors.getvalue())
+        self.assertIn('fixture config read failed', errors.getvalue())
+
+    def test_coordinator_requests_termination_despite_config_read_failure(self) -> None:
+        cohort = self.root / 'trial'
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        self.record_attempt(cohort, 'running', running=True)
+        terminated: list[str] = []
+        with (mock.patch.dict(os.environ, self.cleanup_environment()),
+              mock.patch.object(cloud_gate, 'settings', side_effect=OSError('fixture config read failed')),
+              mock.patch.object(trial, 'AwsCli', return_value=self.cleanup_api(terminated)),
+              redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+            self.assertEqual(trial.coordinate_trial(cohort, self.state, self.settings), 1)
+        self.assertEqual(terminated, ['i-fixture'])
+
+    def test_cleanup_uses_the_launch_record_when_ledger_evidence_fails(self) -> None:
+        cohort = self.root / 'trial'
+        ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
+            (ledger.PricedResource('fixture', Decimal(0)),), 'fixture'))
+        self.record_attempt(cohort, 'running', running=True)
+        terminated: list[str] = []
+        with (mock.patch.object(ledger.CostLedger, 'read_snapshot', side_effect=OSError('fixture ledger read failed')),
+              mock.patch.object(trial, 'AwsCli', return_value=self.cleanup_api(terminated)),
+              redirect_stderr(StringIO())):
+            self.assertEqual(trial.paired_cleanup_main(
+                ['--paired-cleanup', str(cohort)], self.settings, self.state), 1)
+        self.assertEqual(terminated, ['i-fixture'])
+
+    def test_regional_termination_returns_while_one_request_is_still_running(self) -> None:
+        blocked, other = 'us-east-1', 'us-west-2'
+        api_timeout = 0.05
+        release = threading.Event()
+        requested: list[str] = []
+        join_thread = threading.Thread.join
+
+        def require_bounded_join(thread: threading.Thread, timeout: float | None = None) -> None:
+            assert timeout is not None
+            self.assertLessEqual(timeout, api_timeout)
+            self.assertTrue(thread.daemon)
+            join_thread(thread, timeout)
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertIn('terminate-instances', arguments)
+            self.assertTrue(threading.current_thread().daemon)
+            region = arguments[arguments.index('--region') + 1]
+            requested.append(region)
+            if region == blocked:
+                _ = release.wait(TEST_HANG_GUARD_SECS)
+            return subprocess.CompletedProcess(arguments, 0, '{}', '')
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', blocked, api_timeout, execute),
+            ledger.CostLedger(self.state), self.settings, self.root / 'reservation.cgroup')
+        errors = StringIO()
+        try:
+            with (mock.patch.object(threading.Thread, 'join', new=require_bounded_join),
+                  redirect_stderr(errors)):
+                result = worker.request_terminations([
+                    cloud_gate.GateTermination('blocked', 'i-blocked', blocked),
+                    cloud_gate.GateTermination('other', 'i-other', other),
+                ])
+        finally:
+            release.set()
+        self.assertCountEqual(requested, [blocked, other])
+        self.assertEqual(result.unresponsive_regions, frozenset({blocked}))
+        self.assertIn(f'Termination unconfirmed in {blocked}', errors.getvalue())
+
     def test_trial_launch_decision_times_out_and_releases_the_slot(self) -> None:
         self.configure_gate('paired_admission_timeout_s=0.03\n')
         slot = cloud_gate.CloudReservation(self.root / 'reservation.cgroup')
@@ -655,6 +742,24 @@ class PairedWaitTests(CostFixture):
             trial.reserve_trial(worker, [])
         self.assertIs(timeout.exception.wait_for, trial.TrialWait.COST_REFRESH)
         self.assertIsInstance(timeout.exception.__cause__, subprocess.TimeoutExpired)
+
+    def test_trial_charge_refresh_checks_deadline_after_processing_the_reply(self) -> None:
+        clock = mock.Mock(return_value=0.0)
+        refresh_timeout = cloud_gate.settings().number('paired_cost_refresh_timeout_s')
+
+        def charges(_record_query: Callable[[Decimal], None], *, page_timeout: Callable[[float], float],
+                    after_page: Callable[[], None]) -> None:
+            _ = page_timeout(1)
+            after_page()
+            clock.return_value = refresh_timeout
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-1', 1), trial.trial_ledger(self.state),
+            self.settings, self.root / 'reservation.cgroup')
+        with (mock.patch.object(trial, 'time', mock.Mock(wraps=time, monotonic=clock)),
+              mock.patch.object(worker, 'reconcile'), mock.patch.object(worker, 'charges', new=charges),
+              self.assertRaises(trial.TrialWaitExpired) as timeout):
+            trial.reserve_trial(worker, [])
+        self.assertIs(timeout.exception.wait_for, trial.TrialWait.COST_REFRESH)
 
     def test_trial_charge_refresh_reads_twenty_one_fast_pages(self) -> None:
         ledger.CostLedger(self.state).record_inventory(ledger.ResourceInventory(int(time.time()),
@@ -807,6 +912,24 @@ with (mock.patch.object(aws_trial, 'stop_workers', side_effect=aws_trial.TrialWa
               self.assertRaisesRegex(trial.TrialServiceStopUnconfirmed, 'systemctl returned 5')):
             _ = trial.paired_service(['systemd-run', '--unit=fixture-unit'], 'fixture-unit')
         self.assertIn(str(trial.TrialWaitExpired(trial.TrialWait.SERVICE)), errors.getvalue())
+
+    def test_service_runtime_marker_takes_precedence_after_terminal_timeout_and_stop(self) -> None:
+        cohort = self.root / 'trial'
+        cohort.mkdir()
+
+        def command(arguments: Sequence[str], wait_for: trial.TrialWait, **_options: object
+                    ) -> subprocess.CompletedProcess[str]:
+            if wait_for is trial.TrialWait.SERVICE:
+                raise trial.TrialWaitExpired(wait_for)
+            self.assertIs(wait_for, trial.TrialWait.SERVICE_STOP)
+            cloud_gate.save(cohort / trial.SERVICE_TIMEOUT_FILE, {'wait': trial.TrialWait.SERVICE_RUNTIME.name})
+            return subprocess.CompletedProcess(arguments, 0, '', '')
+
+        with (mock.patch.object(trial, 'trial_command', side_effect=command) as run,
+              self.assertRaises(trial.TrialWaitExpired) as timeout):
+            _ = trial.paired_service(['systemd-run', '--paired-worker', str(cohort)], 'fixture-unit')
+        self.assertIs(timeout.exception.wait_for, trial.TrialWait.SERVICE_RUNTIME)
+        self.assertEqual(run.call_count, 2)
 
     def test_trial_service_reads_the_timeout_even_when_exec_stop_post_cannot_read_config(self) -> None:
         cohort = self.root / 'trial'
@@ -1133,6 +1256,10 @@ class Sample(unittest.TestCase):
             with self.subTest(signal=number):
                 def interrupted(command: Sequence[str], unit: str) -> int:
                     self.assertEqual(len(set(self.remote_branches()) - set(branches)), 2)
+                    prefix = '--setenv=' + trial.PAIRED_CLEANUP_CONNECTION_ENV + '='
+                    saved, = (word.removeprefix(prefix) for word in command if word.startswith(prefix))
+                    connection = trial.PairedCleanupConnection.configured(self.settings)
+                    self.assertEqual(cast(object, json.loads(saved)), snapshot_codec.snapshot_value(connection))
                     stop_reply = subprocess.CompletedProcess(['systemctl'], 0, '', '')
                     with mock.patch.object(trial, 'trial_command', side_effect=[KeyboardInterrupt, stop_reply]) as run:
                         result = service(command, unit)
