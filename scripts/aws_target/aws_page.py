@@ -52,6 +52,10 @@ class TableData(TableRowsData):
     title: str
 
 
+class BilledHoursData(TableData):
+    active_regions_by_size: dict[str, list[str]]
+
+
 class EstimateData(TypedDict):
     region: str
     summary: str
@@ -169,6 +173,10 @@ class CloudGatesOff(TypedDict):
     kind: Literal['off']
 
 
+class InvalidCloudGateSetting(TypedDict):
+    kind: Literal['invalid']
+
+
 class NoLaunchEvidence(TypedDict):
     kind: Literal['no-evidence']
 
@@ -189,7 +197,7 @@ class LaunchesRefused(TypedDict):
     last_good_at: NotRequired[float]
 
 
-type LaunchState = CloudGatesOff | NoLaunchEvidence | LaunchesWorking | LaunchesRefused
+type LaunchState = CloudGatesOff | InvalidCloudGateSetting | NoLaunchEvidence | LaunchesWorking | LaunchesRefused
 
 
 class QuotaRequestCell(TypedDict):
@@ -224,7 +232,7 @@ class PageData(TypedDict):
     quota_history: QuotaHistoryData
     cached_spot_status: dict[str, Literal['read failed', 'old']]
     runs: list[RunCostData]
-    hours: TableData
+    hours: BilledHoursData
     hours_note: str
     hours_reserved_by_region: dict[str, str]
 
@@ -354,8 +362,12 @@ def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: 
     return {'unavailable': '', 'tiles': tiles, 'forecast': forecast}
 
 
-def launch_state(records: Sequence[dict[str, object]]) -> LaunchState:
-    """Count each refused gate attempt once since the last good launch."""
+def launch_state(records: Sequence[dict[str, object]], gate_switch: cloud_gate.CloudGateSetting) -> LaunchState:
+    """Show the switch state or the latest launch evidence."""
+    if gate_switch is cloud_gate.CloudGateSwitch.OFF:
+        return {'kind': 'off'}
+    if isinstance(gate_switch, cloud_gate.InvalidCloudGateSwitch):
+        return {'kind': 'invalid'}
     requested_attempts = {attempt for row in records if row.get('result') in ('launched', 'refused')
                           and isinstance(attempt := row.get('attempt'), str) and attempt}
     counted_refusals: set[str] = set()
@@ -485,14 +497,14 @@ def quota_history_data(tables: spot_table.SpotTables, now: int) -> QuotaHistoryD
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
               placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
               launch_records: Sequence[dict[str, object]] = (), settled_notes: Sequence[str] = (),
-              gate_switch: cloud_gate.CloudGateSwitch = cloud_gate.CloudGateSwitch.ON) -> PageData:
+              gate_switch: cloud_gate.CloudGateSetting = cloud_gate.CloudGateSwitch.ON) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
     regions = dict.fromkeys((*(row[0] for row in placement.rows), *tables.hours.headers[1:]))
     return {
         'read_at': now,
         'render_seconds': 0.0,
-        'launch_state': {'kind': 'off'} if gate_switch is cloud_gate.CloudGateSwitch.OFF else launch_state(launch_records),
+        'launch_state': launch_state(launch_records, gate_switch),
         'spend': spend,
         'settled_notes': list(settled_notes),
         'regions': sorted(regions, key=region_filter_key),
@@ -510,7 +522,9 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
                   'no_estimate': costs.summary_of(None),
                   'refused': table_data(costs.refused), 'launched': table_data(costs.launched)}
                  for costs in tables.runs],
-        'hours': table_data(tables.hours),
+        'hours': {**table_data(tables.hours), 'active_regions_by_size': {
+            size: sorted(active_regions) for size, active_regions in tables.hours.active_regions_by_size.items()
+        }},
         'hours_note': tables.hours.note,
         'hours_reserved_by_region': dict(tables.hours.reserved_by_region),
     }

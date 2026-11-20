@@ -224,7 +224,9 @@ function visible(table) {
   const columns = table.headers.map((_header, index) => index)
     .filter(index => index === 0 || table.region_axis !== "columns" || shown.has(table.headers[index]));
   const rows = table.rows.map((_row, index) => index)
-    .filter(index => table.region_axis !== "rows" || shown.has(table.rows[index][0]));
+    .filter(index => table.region_axis !== "rows" || shown.has(table.rows[index][0]))
+    .filter(index => !table.active_regions_by_size
+      || table.active_regions_by_size[table.rows[index][0]].some(region => shown.has(region)));
   return { columns, rows };
 }
 
@@ -342,6 +344,11 @@ function drawLaunchState() {
   if (state.kind === "off") {
     section.querySelector("p").replaceChildren(
       element("strong", "Cloud gates are off"), " (cloud_gate.conf enabled=off). Gates run on natedev.");
+    return;
+  }
+  if (state.kind === "invalid") {
+    section.querySelector("p").replaceChildren(
+      element("strong", "cloud_gate.conf enabled is not valid."), " Gates run on natedev.");
     return;
   }
   const last = state.last_good_at === undefined ? "" : launchTime.format(state.last_good_at * 1000);

@@ -1,6 +1,7 @@
 """Read the local Spot snapshot and the run ledger into tables for the AWS page."""
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -38,6 +39,7 @@ class Table:
 
 @dataclass(frozen=True, kw_only=True)
 class BilledHoursTable(Table):
+    active_regions_by_size: Mapping[str, list[str]]
     note: str
     reserved_by_region: Mapping[str, str]
 
@@ -328,19 +330,25 @@ def billed_hours(directory: Path, now: int, regions: tuple[str, ...], scope: run
                                        max_ratio)
     except ledger.LedgerUnavailable:
         return BilledHoursTable(title, ('type', *regions), frozenset(), (), 'columns',
-                                note='No billed hours: the cost ledger is not readable.', reserved_by_region={})
+                                active_regions_by_size={}, note='No billed hours: the cost ledger is not readable.', reserved_by_region={})
     # A region that is no longer a candidate keeps its column while it has hours in the window.
     columns = (*regions, *sorted({region for _size, region in checks} - set(regions)))
-    active_sizes = {size for (size, _region), check in checks.items() if check.billed_hours or check.box_hours}
+    active_regions_by_size: defaultdict[str, list[str]] = defaultdict(list)
+    for (size, region), check in checks.items():
+        if check.billed_hours or check.box_hours:
+            active_regions_by_size[size].append(region)
     rows = tuple((size, *(hours_cell(checks.get((size, region))) for region in columns))
-                 for size in scope.sizes if size in active_sizes)
+                 for size in scope.sizes if size in active_regions_by_size)
     # Each eligible size in a region uses the same Hana allowance on billed days.
     reserved_by_region = {region: f'{check.hana_reserved_hours:.1f}' for (_size, region), check in checks.items()
                           if check.billed_hours is not None and check.hana_reserved_hours}
+    percentage = format(max_ratio, '%').removesuffix('%')
+    if '.' in percentage:
+        percentage = percentage.rstrip('0').rstrip('.')
     note = (f'Each cell shows billed Spot hours / recorded box hours on billed days in the last {days} days. '
-            + f'Over marks billed hours more than {max_ratio:.0%} outside the range from box hours to box hours plus any Hana allowance.')
+            + f'Over marks gaps above {percentage}% after the Hana allowance, which applies only to sizes Hana can use.')
     return BilledHoursTable(title, ('type', *columns), frozenset(range(1, len(columns) + 1)), rows, 'columns',
-                            note=note, reserved_by_region=reserved_by_region)
+                            active_regions_by_size=active_regions_by_size, note=note, reserved_by_region=reserved_by_region)
 
 
 def hours_cell(check: run_cost.HoursCheck | None) -> str:

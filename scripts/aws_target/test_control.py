@@ -1452,8 +1452,16 @@ class HoursCheckTests(CostFixture):
         # The other region has no Spot hours on the billed day.
         self.assertEqual(cells[self.size][self.other], '0.0/0.5 (100%) over')
         self.assertEqual(cells[gpu][self.home], 'not billed')
-        self.assertIn(f'more than {self.limit:.0%}', tables.hours.note)
+        self.assertIn(f'above {self.limit:.0%}', tables.hours.note)
         self.assertEqual(tables.hours.title, 'Billed hours / box hours')
+
+    def test_billed_hours_legend_shows_the_exact_gap_limit(self) -> None:
+        for ratio, pct in (('0.155', '15.5%'), ('0.150', '15%'), ('0.0000123', '0.00123%')):
+            with self.subTest(ratio=ratio):
+                self.replace('billed_hours_gap_max_ratio', ratio)
+                hours = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+                self.assertIn(f' {pct} ', hours.note)
+                self.assertIn('sizes Hana can use', hours.note)
 
     def test_spot_table_keeps_gate_hours_and_shows_the_hana_allowance(self) -> None:
         day = self.day(1)
