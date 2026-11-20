@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -37,7 +37,7 @@ class MeasurementInputs:
     settings: SpendingSettings | MeasurementUnavailable
 
 
-def read_inputs(settings_path: Path, directory: Path) -> MeasurementInputs:
+def read_inputs(configuration: Path | conf.ConfigRead, directory: Path) -> MeasurementInputs:
     book = ledger.CostLedger(directory)
     try:
         state = book.read_snapshot()
@@ -46,7 +46,7 @@ def read_inputs(settings_path: Path, directory: Path) -> MeasurementInputs:
             raise
         state = ledger.LedgerEvidence()
     try:
-        settings: SpendingSettings | MeasurementUnavailable = read_settings(settings_path)
+        settings: SpendingSettings | MeasurementUnavailable = read_settings(configuration)
     except (OSError, ValueError, ArithmeticError) as error:
         settings = MeasurementUnavailable(str(error))
     return MeasurementInputs(state, settings)
@@ -59,10 +59,10 @@ def record_go_live(directory: Path, now: int) -> None:
         _ = create_text_atomic(path, json.dumps({'at': now}) + '\n')
 
 
-def read_status_measurement(settings_path: Path, directory: Path, now: int, *,
+def read_status_measurement(configuration: Path | conf.ConfigRead, directory: Path, now: int, *,
                             inputs: MeasurementInputs | None = None) -> AwsStatusMeasurement | MeasurementUnavailable:
     try:
-        source = read_inputs(settings_path, directory) if inputs is None else inputs
+        source = read_inputs(configuration, directory) if inputs is None else inputs
         state, settings = source.state, source.settings
         permission = ledger.decode_permission(state.decision)
         try:
@@ -79,15 +79,15 @@ def read_status_measurement(settings_path: Path, directory: Path, now: int, *,
         return MeasurementUnavailable(str(error))
 
 
-def read_measurement(settings_path: Path, directory: Path, now: int, *,
+def read_measurement(configuration: Path | conf.ConfigRead, directory: Path, now: int, *,
                      inputs: MeasurementInputs | None = None) -> AwsMeasurement | MeasurementUnavailable:
-    status = read_status_measurement(settings_path, directory, now, inputs=inputs)
+    status = read_status_measurement(configuration, directory, now, inputs=inputs)
     if isinstance(status, MeasurementUnavailable):
         return status
     try:
         go_live_row = mac_test.read_json_object(directory / 'go-live.json')
         go_live = ledger.instant(go_live_row, 'at') if go_live_row is not None else MeasurementUnavailable('go-live time is not recorded')
-        readings = tuple(read_charge(path) for path in sorted((directory / 'charges').glob('*.json')))
+        readings = ledger.CostLedger(directory).validated_bills(now)
         return AwsMeasurement(status.permission, status.costs, status.events,
                               status.monthly_limit_usd, readings, go_live)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
@@ -122,10 +122,18 @@ def accounting_day_bounds(day: date, now: int, zone: ZoneInfo) -> tuple[int, int
     return start, min(now, end)
 
 
-def daily_usage(settings_path: Path, directory: Path, day: str, now: int, *,
-                inputs: MeasurementInputs | None = None) -> DailyUsage | MeasurementUnavailable:
+def daily_usage(settings_path: Path, directory: Path, day: str, now: int) -> DailyUsage | MeasurementUnavailable:
+    book = ledger.CostLedger(directory)
     try:
-        source = read_inputs(settings_path, directory) if inputs is None else inputs
+        inputs = read_inputs(settings_path, directory)
+        return daily_usage_from(inputs, book, day, now, book.refused_bill_records(now))
+    except (OSError, ValueError, ArithmeticError) as error:
+        return MeasurementUnavailable(str(error))
+
+
+def daily_usage_from(source: MeasurementInputs, book: ledger.CostLedger, day: str, now: int,
+                     refused: Sequence[ledger.RefusedBillRecord]) -> DailyUsage | MeasurementUnavailable:
+    try:
         if isinstance(source.settings, MeasurementUnavailable):
             return source.settings
         accounting_day = date.fromisoformat(day)
@@ -135,10 +143,24 @@ def daily_usage(settings_path: Path, directory: Path, day: str, now: int, *,
         costs = ledger.costs_from_evidence(source.state, source.settings, end, window=accounting_day)
         uptime = sum(row.confirmed_uptime_s for row in costs.intervals)
         usd = ledger.period_cost(costs.intervals, start, end)
-        book = ledger.CostLedger(directory)
-        if source.state.gate_reservations or any(ledger.is_billed_day(row) for row in book.read_bills()):
-            usd = ledger.period_cost((charge for spend in book.spend_days(source.settings, now)
-                                      for charge in spend.intervals), start, end)
+        first_utc_day = datetime.fromtimestamp(start, UTC).date()
+        last_utc_day = datetime.fromtimestamp(max(start, end - 1), UTC).date()
+        estimate_days = {day.isoformat(): day for record in refused for day in record.days
+                         if first_utc_day <= day <= last_utc_day}
+        use_spend_days = bool(source.state.gate_reservations or book.validated_bills(now))
+        if use_spend_days or estimate_days:
+            spends = book.spend_days(source.settings, now, estimate_days=tuple(estimate_days.values()))
+            if use_spend_days:
+                usd = ledger.period_cost((charge for spend in spends for charge in spend.intervals), start, end)
+            else:
+                # A local accounting day can overlap two UTC days.
+                for spend in spends:
+                    if (estimate_day := estimate_days.get(spend.day)) is None:
+                        continue
+                    left, right = ledger.period_bounds(estimate_day, ZoneInfo('UTC'))
+                    left, right = max(left, start), min(right, end)
+                    usd += (ledger.period_cost(spend.intervals, left, right)
+                            - ledger.period_cost(costs.intervals, left, right))
         return DailyUsage(uptime, usd)
     except (OSError, ValueError, ArithmeticError) as error:
         return MeasurementUnavailable(str(error))

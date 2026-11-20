@@ -23,7 +23,7 @@ from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
-from scripts.aws_target import ledger, measurement, run_cost
+from scripts.aws_target import config as aws_config, ledger, measurement, run_cost
 from scripts.aws_target.ledger_test_support import numeric_settings
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
 
@@ -128,11 +128,15 @@ class AwsReportTests(MeasurementFixture):
         account = self.root / 'account/aws_target.conf'
         account.parent.mkdir()
         _ = account.write_bytes(self.settings.read_bytes())
-        numeric_settings(account, {'daily_limit_usd': '7'})
-        self.costs({'daily_limit_usd': '1'})
-        with self.subTest(settings='installed account'), mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(account)}):
+        numeric_settings(account, {'daily_limit_usd': '7', 'gate_type_window_days': '1'})
+        self.costs({'daily_limit_usd': '1', 'gate_type_window_days': '5'})
+        with (self.subTest(settings='installed account'),
+              mock.patch.dict(os.environ, {'AWS_TARGET_CONFIG': str(account)}),
+              mock.patch.object(aws_config, 'account_settings_path', wraps=aws_config.account_settings_path) as resolve):
             output = self.render()
+            resolve.assert_called_once_with()
             self.assertIn('of the $7.00 daily limit', output)
+            self.assertIn('UTC 2026-01-15 through 2026-01-15 (1 days)', output)
             self.assertIn('**Today (UTC 2026-01-15, estimate):', output)
             self.assertNotIn('AWS measurement unavailable', output)
 
@@ -216,6 +220,10 @@ class AwsReportTests(MeasurementFixture):
                 # A us-east-1 usage type has no region prefix; the runs have no region, so they ran in the home region.
                 ledger.UsageTypeCost('SpotUsage:m7a.8xlarge', Decimal('.30'), Decimal('.1'), 'Hrs'),))
         _ = (charges / '2026-01-14.json').write_text(json.dumps(ledger.charge_record(reading)))
+        idle = ledger.ChargeRead('2026-01-13', NOW, MIDNIGHT - 2 * 86400, MIDNIGHT - 86400,
+                                 Decimal('.006'), Decimal(0), Decimal(0))
+        _ = (charges / '2026-01-13.json').write_text(json.dumps(ledger.charge_record(idle)))
+        _ = (charges / 'private-alias.json').write_text(json.dumps(ledger.charge_record(idle)))
         events: list[dict[str, object]] = []
         for attempt, mode, at, box_s, gate_s in (
             ('merge-bill', 'merge-gate', MIDNIGHT - 3600, 120, 60),
@@ -236,6 +244,9 @@ class AwsReportTests(MeasurementFixture):
         bill = '| 2026-01-14 | $1.10 | $0.30 | $0.20 | $0.00 | $0.40 | $0.20 | 2 | bill |'
         self.assertIn(today, section)
         self.assertIn(bill, section)
+        self.assertIn('- 2026-01-13: amount below USD 0.01 uses the estimate', section)
+        self.assertIn('- 2026-01-13: file name, day label, or bounds do not match a full UTC day', section)
+        self.assertNotIn('private-alias', section)
         self.assertLess(section.index(today), section.index(bill))
         self.assertEqual(section.count('\n|---'), 3)
         self.assertIn('| All shown days | 2 | 0m 52s | 1m 45s | 2 | 0m 22s | 0m 45s | $0.1500 |', section)
@@ -406,7 +417,7 @@ class AwsReportTests(MeasurementFixture):
              'reason': 'fixture ' * 100},
         ]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in events))
-        comparison = aws_report.gate_type_report(self.state, DAY, 1)
+        comparison = aws_report.gate_type_report(self.state, DAY, 1, home='us-east-1')
         lines = [line for line in comparison.tables if line.startswith('- Cloud gate uses natedev:')]
         self.assertEqual(len(lines), 2)
         self.assertIn('Reason unavailable', lines[0])
@@ -419,7 +430,7 @@ class AwsReportTests(MeasurementFixture):
             {'time': NOW - 120, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'launched'},
             {'time': NOW, 'attempt': 'one', 'instance_type': 'm7a.8xlarge', 'mode': 'targeted-test', 'result': 'finished', 'gate_s': 60}]
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in launches))
-        comparison = aws_report.gate_type_report(self.state, DAY, 14)
+        comparison = aws_report.gate_type_report(self.state, DAY, 14, home='us-east-1')
         lines = comparison.tables
         self.assertIn('| m7a.8xlarge | — | not billed yet (1) | not billed yet (1) |', lines)
         self.assertFalse(any(line.startswith('| All types |') for line in lines))
@@ -428,7 +439,7 @@ class AwsReportTests(MeasurementFixture):
 
     def test_gate_type_comparison_uses_shared_files_without_a_steps_query(self) -> None:
         with read_only_evidence(self, self.root):
-            comparison = aws_report.gate_type_report(self.state, DAY, 14)
+            comparison = aws_report.gate_type_report(self.state, DAY, 14, home='us-east-1')
         lines = comparison.tables
         self.assertIn('| Machine type | Merge gates | Targeted tests | All runs |', lines)
         self.assertIn('| All shown days | 0 | — | — | 0 | — | — | — |', lines)
@@ -452,6 +463,8 @@ class AwsReportTests(MeasurementFixture):
                 output = self.render()
                 self.assertIn(f'- Gate type comparison unavailable: {reason}', output)
                 self.assertEqual(output.count('Gate type comparison unavailable:'), 1)
+                if filename.startswith('charges/'):
+                    self.assertIn(f'- {DAY}: invalid bill format', output)
                 self.assertIn('### AWS\n', output)
                 self.assertNotIn('AWS: up ', output)
                 self.assertIn('Mac copies: none started.', output)

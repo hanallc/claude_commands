@@ -634,6 +634,10 @@ Provider errors expose safe action names rather than cloud identifiers or signed
 The provider persists its operation before dispatch and holds a separate mutation lock.
 Existing writes store the lifecycle generation and UTC epoch seconds for dispatch, acceptance, or cancellation.
 Acceptance writes identify a direct response or a bootstrap observation.
+The scaler gives `StartInstances` one attempt.
+The provider saves a definite service refusal as `start_refusal_code` before returning the error.
+The record contains the code only.
+A later active observation takes precedence over the refusal for accounting.
 Recovery takes that lock without blocking an active mutation.
 Recovery fences an operation that has not reached dispatch.
 A late worker cannot dispatch that fenced operation.
@@ -913,13 +917,35 @@ Paired trials use this booked cost for completed gates.
 Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
+An unbilled day is idle only if every run exposure that starts before its end has a confirmed closure before its start.
+An expired permit or reservation still counts until the ledger confirms closure.
+The page, spending guard, and admission use the usual prices and bill carry on run days.
+After the latest bill, an unbilled idle day carries retained resource costs and unknown usage types.
+It skips usage linked to runs and uses the usual accounting for Cost Explorer fees.
+The page, spending guard, and admission use the same idle-day rule.
+The guard keeps any higher established charges.
+The ledger and hours table exclude a closed Hana exposure only when its START record has a valid `start_refusal_code`.
+A possible start or an observed acceptance in any generation of the exposure keeps the full exposure.
+Legacy cancellations and stopped states retain the full exposure when the journal has no refusal code.
 Reports keep the existing reconciliation floors.
 The account checks adjust the existing total for each qualifying UTC day inside the limit window.
 They subtract that day's existing usage and add the newest qualifying AWS amount.
-An account bill qualifies when the name, day label, and bounds match one full UTC day.
+The page and the guard's complete-day adjustment use strict `read_saved_bill`, and admission retains `read_charge` to preserve all existing counts and refusals.
+The later `one-day-amount` phase joins the readers and protects the count with one `LegacyCountAddition`.
+The file name, day label, and bounds must match one full UTC day.
 The bill must exclude credits and give at least USD 0.01 before rounding.
 The newest read time must be valid and cannot be in the future.
-The charge file keeps each read time and amount. A legacy file without a list supplies one read.
+The check rejects duplicate JSON fields and invalid amount histories.
+The history times must increase and the last entry must match the newest read.
+A legacy file without a history supplies one read.
+The page and daily usage use an accepted bill for its UTC day.
+If a refused bill names a day, its estimate excludes saved reconciliation adjustments for that day.
+For a refused day, estimates include local charges such as Hana storage that starts before the newest bill.
+The spend view includes an earlier refused day when it has local charges.
+The page shows one notice when a displayed amount includes a refused day.
+The notice lists the dates from the file name and the bill when the page uses their estimates.
+The tooltip and buildlog report give the UTC day and reason for each applicable record.
+Each publication loads the account settings once.
 Known limit. Concurrent refreshes can record one USD 0.01 fee for two Cost Explorer reads.
 Within the lookback, the last `cost_explorer_unchanged_reads` reads after the UTC day ends must report the same amount.
 Reads less than `cost_explorer_interval_seconds` apart count once.

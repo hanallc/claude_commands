@@ -6,17 +6,21 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 import json
+from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.aws_target import config, hana_spend, ledger
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, instant, text_setting
+from scripts.aws_target import config, hana_spend, ledger, spend
+from scripts.aws_target.ledger_test_support import (
+    SpendReferenceFixture, git_only, install_hana_spending_settings, instant, numeric_settings, text_setting,
+)
 from scripts.lib import conf
 
 
-class HanaSpendTests(CostFixture):
+class HanaSpendTests(SpendReferenceFixture):
     book: ledger.CostLedger  # pyright: ignore[reportUninitializedInstanceVariable]
     controller: hana_spend.HanaSpending[hana_spend.PermitSettings]  # pyright: ignore[reportUninitializedInstanceVariable]
     workload: hana_spend.PermitSettings  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -43,6 +47,286 @@ class HanaSpendTests(CostFixture):
         self.assertIsInstance(result, hana_spend.PermitIssued)
         assert isinstance(result, hana_spend.PermitIssued)
         return result
+
+    def assert_account_projection(self, candidate: ledger.LedgerEvidence, now: int,
+                                  day: Decimal, month: Decimal) -> None:
+        decision = self.book.placement_spending_preview(candidate, self.settings, now)
+        costs, policy = decision.evidence.costs, decision.evidence.policy
+        assert isinstance(costs, ledger.CostEstimate) and isinstance(policy, config.SpendingSettings)
+        self.assertEqual((costs.daily.usd + decision.evidence.reserved_daily_fixed_usd + policy.limit_reserve_usd,
+                          costs.monthly.usd + decision.evidence.reserved_monthly_fixed_usd + policy.limit_reserve_usd),
+                         (day, month))
+        # Compare each admission count at equality and at the next Decimal value.
+        policy = replace(policy, daily_limit_usd=day.next_plus(), monthly_limit_usd=month.next_plus())
+        for settings, reason in ((policy, ''), (replace(policy, daily_limit_usd=day), 'daily_limit'),
+                                 (replace(policy, monthly_limit_usd=month), 'monthly_limit')):
+            self.assertEqual(self.book.reservation_cap(candidate, settings, now, costs), reason)
+
+    def test_row_n01_both_hana_checks_refuse_the_wrong_name_bill(self) -> None:
+        prior = self.start - 86400
+        with self.book.transaction() as state:
+            state.inventories = [ledger.ResourceInventory(prior, (), 'fixture inventory', builder_removed=True)]
+            state.observations = [
+                ledger.InstanceObservation(prior, 'terminated', 'fixture observation'),
+                ledger.InstanceObservation(self.start - 10800, 'running', 'fixture observation'),
+                ledger.InstanceObservation(self.start, 'terminated', 'fixture observation'),
+            ]
+        amount = Decimal(8)
+        bill = ledger.ChargeRead('2026-01-14', self.start, prior, self.start, amount, Decimal(0), Decimal(0),
+            (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', amount, Decimal(3), 'Hrs'),), False)
+        charges = self.state / 'charges'
+        charges.mkdir()
+        _ = (charges / 'alias.json').write_text(json.dumps(ledger.charge_record(bill)))
+        self.costs({'fallback_usd_per_hour': '1', 'monthly_limit_usd': '4'})
+        guard = self.book.guard(self.settings, 'admission', self.start, lambda _notice: True, clock=lambda: self.start)
+        self.assertIsInstance(guard, ledger.SpendingAllowed)
+        self.assertEqual(self.book.accrued_cost(self.settings, self.start, window='month').limit_count, Decimal(3))
+        self.controller.settings = replace(self.workload, spot_max_usd_per_hour=Decimal(0),
+                                           gp3_usd_per_gib_month=Decimal(0))
+        expiry = self.start + self.workload.permit_max_seconds
+        refusal = hana_spend.PermitRefused('monthly_limit')
+        with self.subTest(path='preview'):
+            self.assertEqual(self.controller.preview_start(self.start, expiry), refusal)
+        with self.subTest(path='commit'):
+            self.assertEqual(self.controller.reserve_start(self.start, expiry), refusal)
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
+        self.assertEqual(self.book.read_snapshot().hana_storage, [])
+        self.replace('monthly_limit_usd', str(amount.next_plus()))
+        self.assertEqual(self.controller.preview_start(self.start, expiry), hana_spend.StartAffordable(expiry))
+        self.assertIsInstance(self.controller.reserve_start(self.start, expiry), hana_spend.StartReserved)
+
+    def test_row_73_hana_refuses_when_a_zero_cost_gate_fits(self) -> None:
+        start = self.start - 86400
+        bill = ledger.ChargeRead('2026-01-14', self.start, start, self.start, Decimal(2), Decimal(0), Decimal(0),
+                                 (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(2)),), False)
+        with self.book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation('fixture-completed', start, start + 10800,
+                Decimal(1), Decimal(0), ledger.GateTerminated(start + 10800, 'i-fixture'),
+                instance_type='m7a.2xlarge', region='us-east-2'))
+        _ = self.book.refresh_charges(self.settings, self.start, lambda _start, _end: (bill,))
+        self.costs({'monthly_limit_usd': '2.50'})
+        self.assertEqual(self.book.accrued_cost(self.settings, self.start, window='month').limit_count, Decimal(3))
+        gate = ledger.GateReservation('fixture-zero', self.start, self.start + 3600, Decimal(0), Decimal(0),
+                                      instance_type='m7a.8xlarge', region='us-east-2')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, gate), ledger.GateReserved)
+        self.controller.settings = replace(self.workload, spot_max_usd_per_hour=Decimal(0),
+                                           gp3_usd_per_gib_month=Decimal(0))
+        expires = self.start + self.workload.permit_max_seconds
+        self.assertEqual(self.controller.preview_start(self.start, expires), hana_spend.PermitRefused('monthly_limit'))
+        self.assertEqual(self.controller.reserve_start(self.start, expires), hana_spend.PermitRefused('monthly_limit'))
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
+        self.assertEqual(self.book.read_snapshot().hana_storage, [])
+
+    def test_rows_74_and_75_keep_storage_reserve_and_hana_budget_operator(self) -> None:
+        amount = Decimal(2)
+        bill = ledger.ChargeRead('2026-01-14', self.start, self.start - 86400, self.start, amount,
+            Decimal(0), Decimal(0), (ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', amount),), False)
+        _ = self.book.refresh_charges(self.settings, self.start, lambda _start, _end: (bill,))
+        storage = ledger.HanaStorageExposure(self.start, Decimal(30))
+        with self.book.transaction() as state:
+            state.hana_storage.append(storage)
+        now = self.start + 43200
+        page = spend.read_spend(self.settings, self.state, now, '2026-01-15')
+        assert isinstance(page, spend.Spend)
+        self.assertEqual(tuple((row.day, row.usd) for row in page.days),
+                         (('2026-01-15', Decimal('.50')), ('2026-01-14', Decimal(2))))
+        self.assert_account_projection(self.book.read_snapshot(), now, Decimal(1), Decimal(3))
+        expiry = now + self.workload.permit_max_seconds
+        self.controller.settings = replace(self.workload, daily_budget_usd=Decimal('.75'),
+                                           spot_max_usd_per_hour=Decimal(0))
+        refusal = hana_spend.PermitRefused('hana_daily_budget_usd')
+        self.assertEqual(self.controller.preview_start(now, expiry), refusal)
+        self.assertEqual(self.controller.reserve_start(now, expiry), refusal)
+        self.assertEqual(self.controller.reserve_storage(now), refusal)
+
+        self.controller.settings = replace(self.controller.settings, daily_budget_usd=Decimal(1))
+        self.assertEqual(self.controller.preview_start(now, expiry), hana_spend.StartAffordable(expiry))
+        self.assertEqual(self.controller.reserve_storage(now), hana_spend.StorageReserved(storage))
+        self.costs({'daily_limit_usd': '1', 'monthly_limit_usd': '1'})
+        refusal = hana_spend.PermitRefused('daily_limit')
+        self.assertEqual(self.controller.preview_start(now, expiry), refusal)
+        self.assertEqual(self.controller.reserve_start(now, expiry), refusal)
+        self.assertEqual(self.controller.reserve_storage(now), refusal)
+        self.assertEqual(self.book.read_snapshot().hana_storage, [storage])
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
+
+    def test_row_76_both_hana_checks_apply_the_proposal_once(self) -> None:
+        self.controller.settings = replace(self.workload, root_gib=20, data_gib=10, gp3_usd_per_gib_month=Decimal(1),
+                                           spot_max_usd_per_hour=Decimal(1), permit_max_seconds=3600)
+        expires = self.start + 3600
+        self.assertEqual(tuple(self.book.accrued_cost(self.settings, self.start, window=window).limit_count
+                               for window in ('day', 'month')), (Decimal(0), Decimal(0)))
+        for period in ('daily', 'monthly'):
+            with self.subTest(period=period):
+                cap = f'{period}_limit_usd'
+                self.replace(cap, '2')
+                refusal = hana_spend.PermitRefused(f'{period}_limit')
+                self.assertEqual(self.controller.preview_start(self.start, expires), refusal)
+                self.assertEqual(self.controller.reserve_start(self.start, expires), refusal)
+                self.replace(cap, str(Decimal(2).next_plus()))
+        captured: list[ledger.LedgerEvidence] = []
+        preview = self.book.placement_spending_preview
+
+        def capture_preview(state: ledger.LedgerEvidence, settings: Path, now: int) -> ledger.SpendingDecision:
+            captured.append(state)
+            return preview(state, settings, now)
+
+        with mock.patch.object(self.book, 'placement_spending_preview', side_effect=capture_preview):
+            self.assertEqual(self.controller.preview_start(self.start, expires), hana_spend.StartAffordable(expires))
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
+        self.assertEqual(self.book.read_snapshot().hana_storage, [])
+        candidate, = captured
+        self.assert_account_projection(candidate, self.start, Decimal(2), Decimal(2))
+        reserved = self.controller.reserve_start(self.start, expires)
+        assert isinstance(reserved, hana_spend.StartReserved)
+        saved = self.book.read_snapshot()
+        self.assertEqual(saved.hana_compute, [reserved.exposure])
+        self.assertEqual(saved.hana_compute, candidate.hana_compute)
+        self.assertEqual(saved.hana_storage, candidate.hana_storage)
+        self.assert_account_projection(saved, self.start, Decimal(2), Decimal(2))
+
+    def test_row_77_saved_affordability_can_outlast_the_live_cap(self) -> None:
+        now = self.start + 36000
+        self.book.observe(ledger.InstanceObservation(now, 'running', 'fixture observation'))
+        with self.book.transaction() as state:
+            state.hana_storage.append(ledger.HanaStorageExposure(self.start, Decimal(15)))
+        workload_path = self.root / 'hana_aws.conf'
+        numeric_settings(workload_path, {'spot_max_usd_per_hour': '1'})
+        with workload_path.open('a') as handle:
+            _ = handle.write('# whole: 1..5\npreview_max_age_s=5\n')
+        private = conf.read(workload_path, load=conf.read_bytes)
+        lifecycle = self.state / 'hana' / 'lifecycle.json'
+        controller = hana_spend.HanaSpending(self.book, self.settings, hana_spend.read_settings(private))
+        refusal = hana_spend.PermitRefused('daily_limit')
+        for delay, rate, reuse in ((2, '1800', True), (30, '120', False)):
+            with self.subTest(delay=delay):
+                later = now + delay
+                self.costs({'daily_limit_usd': '1.50', 'monthly_limit_usd': '1.50', 'fallback_usd_per_hour': rate,
+                            'spot_max_usd_per_hour': rate})
+                first_states: list[ledger.LedgerEvidence] = []
+                preview = self.book.placement_spending_preview
+
+                def save_preview(state: ledger.LedgerEvidence, settings: Path, at: int) -> ledger.SpendingDecision:
+                    first_states.append(state)
+                    return preview(state, settings, at)
+
+                times = iter((float(now), float(later)))
+                ticks = iter((0.0, float(delay)))
+                clock = SimpleNamespace(time=lambda: next(times), monotonic=lambda: next(ticks))
+                with (mock.patch.object(hana_spend, 'time', clock),
+                      mock.patch.object(hana_spend, '_REPOSITORY_GATE_CONFIG', self.root / 'cloud_gate.conf'),
+                      mock.patch.object(self.book, 'placement_spending_preview', side_effect=save_preview)):
+                    first = hana_spend.preview_placement_start(self.book, self.settings, private, lifecycle)
+                    second = hana_spend.preview_placement_start(self.book, self.settings, private, lifecycle)
+                self.assertEqual(first, hana_spend.StartAffordable(now + controller.settings.permit_max_seconds))
+                self.assertEqual(len(first_states), 1 if reuse else 2)
+                self.assertEqual(second, first if reuse else refusal)
+                self.assert_account_projection(first_states[0], now, Decimal(1), Decimal(1))
+                with self.decision_book(self.book) as guard_book:
+                    first_guard = guard_book.guard(self.settings, 'admission', now, lambda _notice: True,
+                                                   clock=lambda: now)
+                    self.assertIsInstance(first_guard, ledger.SpendingAllowed)
+                    later_guard = guard_book.guard(self.settings, 'admission', later, lambda _notice: True,
+                                                   clock=lambda: later)
+                    self.assertIsInstance(later_guard, ledger.SpendingRefused)
+                    assert isinstance(later_guard, ledger.SpendingRefused)
+                    self.assertEqual(later_guard.reason, 'daily_limit')
+                checked_states: list[ledger.LedgerEvidence] = []
+                live = self.book.spending_decision
+
+                def save_live(state: ledger.LedgerEvidence, settings: Path, at: int) -> ledger.SpendingDecision:
+                    checked_states.append(state)
+                    return live(state, settings, at)
+
+                with mock.patch.object(self.book, 'spending_decision', side_effect=save_live):
+                    self.assertEqual(controller.reserve_start(later, later + controller.settings.permit_max_seconds), refusal)
+                candidate, = checked_states
+                self.assert_account_projection(candidate, later, Decimal(2), Decimal(2))
+                self.assertEqual(self.book.read_snapshot().hana_compute, [])
+                for at, compute in ((now, Decimal(0)), (later, Decimal(1))):
+                    page = spend.read_spend(self.settings, self.state, at, '2026-01-15')
+                    assert isinstance(page, spend.Spend)
+                    self.assertEqual(page.days[0].usd, compute + Decimal(15 * (at - self.start)) / Decimal(30 * 86400))
+                    self.assertIsNone(spend.month_spend(page.days, datetime.fromtimestamp(at, UTC).date(), 3))
+
+    def test_row_n07_renewal_replaces_the_old_rate_and_extends_the_deadline(self) -> None:
+        for day, old_day, old_month, old_total, new_total in (
+            ('2026-01-16', '2026-01-15', '2026-01', 3, 8),
+            ('2026-02-01', '2026-01-31', '2026-01', 2, 6),
+        ):
+            with self.subTest(day=day):
+                self.book = ledger.CostLedger(self.root / day)
+                self.controller = hana_spend.HanaSpending(self.book, self.settings, replace(
+                    self.workload, spot_max_usd_per_hour=Decimal(2), gp3_usd_per_gib_month=Decimal(0),
+                    daily_budget_usd=Decimal(20), permit_max_seconds=7200))
+                midnight = instant(f'{day}T00:00:00Z')
+                start, now, expiry = midnight - 3600, midnight + 3600, midnight + 10800
+                old = ledger.HanaComputeExposure(start, midnight + 7200, 1, Decimal(1),
+                    instance_type=self.workload.instance_type, region=self.workload.region, observed_active=True)
+                with self.book.transaction() as state:
+                    state.inventories.append(ledger.ResourceInventory(start, (), 'fixture inventory', builder_removed=True))
+                    state.observations.append(ledger.InstanceObservation(start, 'terminated', 'fixture account inventory'))
+                    state.hana_compute.append(old)
+                saved = self.book.read_snapshot()
+                self.assert_account_projection(saved, now, Decimal(2), Decimal(old_total))
+                page = spend.read_spend(self.settings, self.book.directory, now, day)
+                assert isinstance(page, spend.Spend)
+                self.assertEqual((page.days[0].day, page.days[0].usd), (day, Decimal(1)))
+                self.assertIsNone(spend.month_spend(page.days, datetime.fromtimestamp(now, UTC).date(), 3))
+                self.assertEqual(self.controller.preview_start(now, expiry),
+                                 hana_spend.PermitRefused('Confirm the previous stop before another start'))
+                old_daily, old_monthly = ledger.spending_periods(
+                    ledger.hana_intervals(saved, now, 0, reserve=True), ZoneInfo('UTC'))
+                self.assertEqual(old_daily, {old_day: Decimal(1), day: Decimal(2)})
+                expected_old_months = {old_month: Decimal(3)} if day.startswith(old_month) else {
+                    old_month: Decimal(1), day[:7]: Decimal(2)}
+                self.assertEqual(old_monthly, expected_old_months)
+                self.assertEqual(self.controller.issue(now, old.expires, 'fixture-boot', expected_generation=1),
+                                 hana_spend.PermitRefused('The permit expired or its deadline did not increase'))
+                self.costs({'daily_limit_usd': '6'})
+                self.assertEqual(self.controller.issue(now, expiry, 'fixture-boot', expected_generation=1),
+                                 hana_spend.PermitRefused('daily_limit'))
+                self.assertEqual(self.book.read_snapshot().hana_compute, [old])
+                self.costs({'daily_limit_usd': str(Decimal(6).next_plus()), 'monthly_limit_usd': str(new_total)})
+                self.assertEqual(self.controller.issue(now, expiry, 'fixture-boot', expected_generation=1),
+                                 hana_spend.PermitRefused('monthly_limit'))
+                self.assertEqual(self.book.read_snapshot().hana_compute, [old])
+                self.costs({'monthly_limit_usd': str(Decimal(new_total).next_plus())})
+                renewed = self.controller.issue(now, expiry, 'fixture-boot', expected_generation=1)
+                assert isinstance(renewed, hana_spend.PermitIssued)
+                self.assertEqual((renewed.exposure.at, renewed.exposure.expires, renewed.exposure.usd_per_hour),
+                                 (start, expiry, Decimal(2)))
+                candidate = self.book.read_snapshot()
+                self.assertEqual(candidate.hana_compute, [renewed.exposure])
+                daily, monthly = ledger.spending_periods(
+                    ledger.hana_intervals(candidate, now, 0, reserve=True), ZoneInfo('UTC'))
+                self.assertEqual(daily, {old_day: Decimal(2), day: Decimal(6)})
+                expected_months = {old_month: Decimal(8)} if day.startswith(old_month) else {
+                    old_month: Decimal(2), day[:7]: Decimal(6)}
+                self.assertEqual(monthly, expected_months)
+                self.assert_account_projection(candidate, now, Decimal(6), Decimal(new_total))
+                self.costs({'daily_limit_usd': '35', 'monthly_limit_usd': '400'})
+
+    def test_row_n13_hana_preview_and_commit_refuse_exact_account_equality(self) -> None:
+        amount = Decimal('12.00000000000000000000000001')
+        self.costs({'limit_reserve_usd': str(amount)})
+        self.controller.settings = replace(self.workload, spot_max_usd_per_hour=Decimal(0),
+                                           gp3_usd_per_gib_month=Decimal(0))
+        expiry = self.start + self.workload.permit_max_seconds
+        self.assertEqual(tuple(self.book.accrued_cost(self.settings, self.start, window=window).limit_count
+                               for window in ('day', 'month')), (amount, amount))
+        self.costs({'daily_limit_usd': str(amount.next_plus()), 'monthly_limit_usd': str(amount.next_plus())})
+        self.assertEqual(self.controller.preview_start(self.start, expiry), hana_spend.StartAffordable(expiry))
+        for period in ('daily', 'monthly'):
+            with self.subTest(period=period):
+                self.costs({'daily_limit_usd': '35', 'monthly_limit_usd': '100', f'{period}_limit_usd': str(amount)})
+                expected = hana_spend.PermitRefused(f'{period}_limit')
+                self.assertEqual(self.controller.preview_start(self.start, expiry), expected)
+                self.assertEqual(self.controller.reserve_start(self.start, expiry), expected)
+                self.assertEqual(self.book.read_snapshot().hana_compute, [])
+                self.assertEqual(self.book.read_snapshot().hana_storage, [])
+        self.costs({'daily_limit_usd': str(amount.next_plus()), 'monthly_limit_usd': str(amount.next_plus())})
+        self.assertIsInstance(self.controller.reserve_start(self.start, expiry), hana_spend.StartReserved)
 
     def test_start_reserves_compute_and_storage_before_returning_permit(self) -> None:
         result = self.issued(self.start)
@@ -125,6 +409,22 @@ class HanaSpendTests(CostFixture):
         self.assertEqual(first.exposure.region, self.workload.region)
         self.assertEqual(renewed.exposure.region, first.exposure.region)
         self.assertEqual(renewed.exposure.instance_type, first.exposure.instance_type)
+
+    def test_observed_hana_keeps_its_exposure_after_renewal_and_refusal(self) -> None:
+        first = self.issued(self.start)
+        self.controller.reconcile(self.start, 'running', generation=first.exposure.generation)
+        renewed = self.issued(self.start + 1, generation=first.exposure.generation)
+        journal = self.state / 'hana' / 'provider'
+        journal.mkdir(parents=True)
+        _ = (journal / 'renewed-start.json').write_text(json.dumps({
+            'action': 'start', 'generation': renewed.exposure.generation, 'dispatched': True,
+            'start_refusal_code': 'Blocked',
+        }))
+        stop = self.start + 120
+        self.controller.reconcile(stop, 'stopped', generation=renewed.exposure.generation)
+        state = self.book.read_snapshot()
+        interval, = (row for row in ledger.hana_intervals(state, stop, 60) if row.kind == 'instance')
+        self.assertEqual((interval.start, interval.end), (self.start, stop))
 
     def test_unconfirmed_stop_retains_full_exposure_after_expiry(self) -> None:
         issued = self.issued(self.start)
