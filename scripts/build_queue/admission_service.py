@@ -1831,6 +1831,10 @@ class AdmissionServer:
             rows.append((self.state_dir / records.waiter_owner(row), row))
         return sorted(rows, key=lambda item: gate.waiter_order(item[1]))
 
+    @staticmethod
+    def _priority_name(row: records.Waiter) -> str:
+        return row.get("ci_runner") or row.get("unit", "")
+
     def _queue_order(self) -> tuple[list[tuple[Path, records.RankedWaiter]], records.QueuePriority | records.NoQueuePriority]:
         rows = self._ordered_waiters()
         if isinstance(self.priority, records.NoQueuePriority):
@@ -1840,11 +1844,12 @@ class AdmissionServer:
         sessions: list[str] = []
         ranking_rows: list[tuple[Path, records.Waiter]] = []
         for path, row in rows:
-            if runner := row.get("ci_runner"):
+            name = self._priority_name(row)
+            if name != row.get("unit", ""):
                 ci_waiters[path] = row
                 row = row.copy()
-                row["unit"] = runner
-            elif not row.get("unit"):
+                row["unit"] = name
+            elif not name:
                 sessions.append(row.get("session_id", ""))
             ranking_rows.append((path, row))
         labels: Mapping[str, gate.UnitMembership] = gate.priority_labels(sessions) if sessions else {}
@@ -4736,10 +4741,11 @@ done
                 return self._mutation_reply(key, wire.Ok())
             rows = [waiting.row for waiting in self.waiters.values()]
             rows.extend(record.queue_waiter for record in self.reservations.values())
-            recorded_sessions = {row.get("session_id", "") for row in rows if row.get("unit", "")}
-            units = {label.unit for session, label in labels.items() if session not in recorded_sessions}
-            units.update(row.get("unit", "") for row in rows if row.get("unit", ""))
-            if request.unit == "—" or request.unit not in units:
+            recorded_names = [(row.get("session_id", ""), name) for row in rows if (name := self._priority_name(row))]
+            recorded_sessions = {session for session, _ in recorded_names}
+            known_names = {label.unit for session, label in labels.items() if session not in recorded_sessions}
+            known_names.update(name for _, name in recorded_names)
+            if request.unit == "—" or request.unit not in known_names:
                 return self._mutation_reply(key, wire.Refused(
                     f"unknown unit {request.unit}; the queue priority did not change"))
             changed = True
