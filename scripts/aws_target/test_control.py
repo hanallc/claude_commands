@@ -354,14 +354,15 @@ gate_wait_usd_per_minute=0
         merge_gates = spot_table.spot_tables(self.state, int(self.clock.now), settings_path=self.settings).runs[0]
         tables = {table.title: table for table in merge_gates.tables}
 
-        # The fixture lowest zone price is 0.25 USD/h, so 6 minutes cost 0.0250 and 12 minutes 0.0500.
+        # At 0.25 USD/h, 6 minutes cost 0.0250 USD and 12 minutes cost 0.0500 USD.
+        # The other region adds the configured transfer charge of 0.00015 USD before rounding.
         # One refused request came before one launch of the fast type at home; the other region has no requests.
         # No bill covers the runs yet; the other region has no runs of its own.
         self.assertEqual(tables[fast].rows, (
             (home, '0.2500', '6.0', '1', '0.0250', 'bill due', '1 bill due', '0'),
-            (other, '0.2500', '6.0', '1 elsewhere', '0.0250', 'no runs', 'no runs', '0')))
+            (other, '0.2500', '6.0', '1 elsewhere', '0.0252', 'no runs', 'no runs', '0')))
         self.assertEqual([row[:5] for row in tables[slow].rows], [(home, '0.2500', '12.0', '1', '0.0500'),
-                                                                 (other, '0.2500', '12.0', '1 elsewhere', '0.0500')])
+                                                                 (other, '0.2500', '12.0', '1 elsewhere', '0.0502')])
         for size in self.compare:
             self.assertEqual([row[2:] for row in tables[size].rows], [('—', '0', '—', 'no runs', 'no runs', '0')]
                              * len(self.regions))
