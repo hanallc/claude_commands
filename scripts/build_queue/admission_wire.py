@@ -17,6 +17,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, GateJobNotRecorded, NotVerifyCall,
     StepJob, VerifyStep)
 from scripts.build_targets import target_config
+from scripts.production.land_runs import LandingTestReference, NoLandingTestReference
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
@@ -143,6 +144,7 @@ class Identity:
     unit: str = ""
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    landing_test: LandingTestReference | NoLandingTestReference = field(default=NoLandingTestReference(), kw_only=True)
 
 
 @dataclass(frozen=True, kw_only=True)

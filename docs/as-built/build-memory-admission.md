@@ -27,6 +27,18 @@ It refuses a nested verify step while the same reservation and holder (pid and s
 The memory and cargo-token entry points use the same check before waiting.
 Markers for other queues, dead holders, reused pids, and released reservations do not block a step.
 
+### Landing test precedence
+
+The land line, a live dequeue claim, or a live landing record protects checkpoint work.
+Admission holds `claude_commands` requests for `merge-gate`, `targeted-test`, `test`, `t`, and `nextest` during protection.
+A `LandingTestReference` in the request permits tests for its live land.
+Program requests resolve the source repository before admission.
+Local memory grants, cloud slot grants, and routed assignments use the same check.
+The service checks again before it consumes permission to start a routed assignment.
+A held test stays in the queue and shows `waits for the merge test`.
+It cannot become the head or retain a continuation slot.
+It keeps its original queue time when protection ends.
+
 ### Installed writers and private test state
 
 Only the installed scripts under `~/.claude/scripts` may change shared build state.

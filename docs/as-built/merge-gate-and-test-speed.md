@@ -718,7 +718,12 @@ Git, executable stand-ins, and selected unit and child-handoff cases retain real
 ### Land line
 
 `land_queue.py` keeps the order in which the land runner takes items: `add`, `move`, `remove`, `list`, `next`.
-The runner takes each item with `next` under the line lock, so an item lands once and an edit never loses an item.
+The runner takes each item with `next` under the line lock.
+`next` records the runner's PID and start time before it removes the item.
+The running land replaces the claim when it registers the commits.
+Admission checks claims and registrations against the process start time.
+An ended process cannot keep the line protected.
+Admission reads the land line and ignores the runner's paused entries in `held.txt`.
 The units board reads the line to show `<Nth> in line` for a checkpoint that waits to land.
 
 ### Queued checkpoint batches
@@ -732,6 +737,8 @@ A batch can contain one item.
 
 1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
    Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
+   The live record protects the whole land, including test retries and whole-machine checks.
+   Checkpoint test commands inherit its reference through `BUILDLOG_LANDING_TEST_REFERENCE`.
 2. Fetch the merge branch and the unit branches from origin.
    Fetch all origin heads only if an item still needs a commit or a fresh tracking ref.
    Resolve every item to a commit before writing the record or starting a merge.

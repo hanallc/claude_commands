@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections.abc import Generator
@@ -259,8 +260,8 @@ def remove(label: str) -> None:
         _ = items.pop(position(items, label))
 
 
-def take_next() -> str:
-    """Check the first item before removal and format its label and batch path."""
+def take_next(claimant: int) -> str:
+    """Record the runner's claim before removing the first item."""
     with edited() as items:
         if not items:
             return ""
@@ -268,6 +269,7 @@ def take_next() -> str:
         label, batch = item["label"], item["batch"]
         check_label(label)
         check_batch_path(batch)
+        land_runs.claim(claimant, [*item["commits"], *(entry.commit for entry in batch_commits(batch))])
         _ = items.pop(0)
         return f"{label} {batch}" if batch else label
 
@@ -299,7 +301,8 @@ def parser() -> argparse.ArgumentParser:
         _ = where.add_argument("--before")
     removed = commands.add_parser("remove", help="remove an item")
     _ = removed.add_argument("label")
-    _ = commands.add_parser("next", help="remove the first item and print its label and any batch path")
+    next_item = commands.add_parser("next", help="claim the first item and print its label and batch path")
+    _ = next_item.add_argument("--claimant", type=int, default=os.getppid(), help="PID of the land runner")
     _ = commands.add_parser("list", help="print the line")
     return root
 
@@ -311,6 +314,7 @@ class Arguments(argparse.Namespace):
     commit: list[str] | None = None
     first: bool = False
     before: str | None = None
+    claimant: int = 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -324,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
             case "remove":
                 remove(args.label)
             case "next":
-                output = take_next()
+                output = take_next(args.claimant)
                 if output:
                     print(output)
             case _:

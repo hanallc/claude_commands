@@ -2004,10 +2004,15 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
 
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
     ordered = ranked_queue_waiters(inputs)
-    candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
+    candidate = first_queued_waiter((row for _, row in ordered
+        if records.waiter_owner(row) not in inputs.landing_test_waits), inputs.pending_remote_starts)
     queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
     safety = policy.safety_bytes
-    returned_claims: set[str] = set()
+    returned_claims = {slot.slot.reservation for slot in inputs.slots
+                       if isinstance(slot, ContinuationSlot) and slot.owner in inputs.landing_test_waits}
+    if returned_claims:
+        inputs = replace(inputs, slots=tuple(slot for slot in inputs.slots
+            if not isinstance(slot, ContinuationSlot) or slot.slot.reservation not in returned_claims))
     while True:
         room = inputs_room(inputs, policy)
         kept, used = (room.kept, room.used) if isinstance(room, MemoryRoom) else (0, 0)
@@ -2067,7 +2072,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     decisions: list[WaiterAdmission] = []
     clear = isinstance(inputs.pressure, NoPressureHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
-    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)), inputs.pending_remote_starts)
+    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)
+        and records.waiter_owner(row) not in inputs.landing_test_waits), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
     head_can_start_alone = not inputs.reservations and all(
         not slot_in_force(slot, inputs.now)
@@ -2088,6 +2094,10 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     first_held_other_than_gpu: Waiter | NoWaiter = NoWaiter()
     for _, row in ordered:
         owner = records.waiter_owner(row)
+        if owner in inputs.landing_test_waits:
+            decision = AdmissionDecision("hold", row["need"], kept, safety, used, free_passes=False)
+            decisions.append(WaiterAdmission(row, decision, waiter_state(row), placement.CargoFolderFree()))
+            continue
         claim = claims.get(owner)
         held = claim.slot.bytes if claim is not None else 0
         need = row["need"]
@@ -2205,8 +2215,10 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         within = isinstance(decision.room.basis, WithinSlot)
         remote_start_pending = owner in inputs.pending_remote_starts
         local_wait = inputs.local_waits.get(owner)
-        if isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
-            reason: WaitReason = entry.state
+        if owner in inputs.landing_test_waits:
+            reason: WaitReason = records.WaitsForLandingTest()
+        elif isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
+            reason = entry.state
         else:
             if isinstance(entry.cargo_folder, placement.CargoFolderWait):
                 cause: HeadCause = entry.cargo_folder
@@ -2239,7 +2251,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
             rank += 1
             proposal = ProposedAdmission(rank, spacing)
         blocker: BlockingIndex | NoSingleBlocker | BlockerNotRequested = BlockerNotRequested()
-        if owner in inputs.blockers_for and decision.state == "hold" and isinstance(entry.state, QueuedWaiter):
+        if (owner in inputs.blockers_for and owner not in inputs.landing_test_waits
+                and decision.state == "hold" and isinstance(entry.state, QueuedWaiter)):
             if not endings:
                 endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,)), policy), now, policy)
                                 for ended in range(len(inputs.running)))
@@ -2398,7 +2411,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                                     cause=cast(HeadAdmissionStatus, admission.reason).cause)
         else:
             line.append(LineWaiter(step, own.state == "admit", own, *decision_checks(own, step.need, available)))
-    if waiting and isinstance(first, NoWaiter):
+    if any(not isinstance(step.reason, records.WaitsForLandingTest) for step in waiting) and isinstance(first, NoWaiter):
         first = TokenWaitersOnly()
     # The compiler source records scan evidence for the alert. The queue view uses sources for swap ownership.
     running = tuple(replace(step, measured=replace(step.measured, anonymous_source=records.NoSource()))

@@ -3030,7 +3030,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if review_list is not None:
                     record_changes(checkout, review_list, production, args.merge_branch)
                 return 0
-            with gate_recovery(checkout):
+            with gate_recovery(checkout), land_runs.landing([args.checkpoint], [f"{args.unit} {args.phase}"]):
                 return merge_checkpoint(args)
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)

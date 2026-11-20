@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib.process_start import Started, process_start
+from scripts.production.production_doc import ProductionDocument
 from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, merge_gate
 
 
@@ -92,6 +94,26 @@ class LandRunTests(unittest.TestCase):
         assert landed is not None
         self.assertTrue(landed["landed"])
         self.assertEqual(len(land_runs.results_path().read_text().splitlines()), 2)
+
+    def test_a_red_merge_test_retries_with_the_same_live_reference(self) -> None:
+        references: list[object] = []
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            environment = cast(dict[str, str], options["env"])
+            reference = land_runs.LandingTestReference(environment["BUILDLOG_LANDING_TEST_REFERENCE"])
+            self.assertIn(reference, land_runs.running_test_references())
+            references.append(reference)
+            return subprocess.CompletedProcess(command, 1, "", "red\n")
+
+        production = cast(ProductionDocument, cast(object, SimpleNamespace()))
+        step = checkpoint_gate.CheckpointTestStep("merge test 1", ["run-test"], self.root)
+        with (patch.object(land_runs, "process_start", return_value=Started("10")),
+              patch.object(subprocess, "run", side_effect=run),
+              contextlib.redirect_stdout(io.StringIO()), land_runs.landing(["a" * 40])):
+            with self.assertRaises(checkpoint_gate.RedCheckpointTests):
+                _ = checkpoint_gate.run_test_steps(production, [step], frozenset(), frozenset(), self.root / "test.log")
+            self.assertEqual(references, [land_runs.test_reference()] * 2)
+        self.assertEqual(land_runs.running_test_references(), frozenset())
 
     def test_the_results_keep_only_the_newest_rows_and_skip_bad_rows(self) -> None:
         with patch.object(land_runs, "KEPT_RESULTS", 3):

@@ -303,7 +303,7 @@ class SnapshotCodecTests(unittest.TestCase):
         self.assertEqual(set(causes), set(get_args(records.HeadCause)))
         snapshot = wait_reply(records.NeedsMemory()).snapshot
         reasons: list[records.WaitReason] = [*causes.values(), records.TokenWaitingWaiter(1000.0),
-                                             records.NatedevHeld("fps", "Phase 3 timing")]
+                                             records.NatedevHeld("fps", "Phase 3 timing"), records.WaitsForLandingTest()]
         reasons += [snapshot_with_head_cause(snapshot, cause).head_reason for cause in causes.values()]
         self.assertEqual({type(reason) for reason in reasons}, set(get_args(records.WaitReason)))
         for revision in OLDER_CLIENTS:
@@ -318,9 +318,9 @@ class SnapshotCodecTests(unittest.TestCase):
                         older_reason = cast(object, getattr(parse_reply(line), "reason"))
                         older_cause = (cast(object, getattr(older_reason, "cause"))
                                        if type(older_reason).__name__ == "HeadAdmissionStatus" else older_reason)
-                        self.assertEqual(type(older_cause).__name__,
-                                         "BehindHead" if isinstance(cause, (records.GpuSlotWait, records.NatedevHeld, placement.CargoFolderWait))
-                                         else type(cause).__name__)
+                        legacy = isinstance(cause, (records.GpuSlotWait, records.NatedevHeld,
+                            records.WaitsForLandingTest, placement.CargoFolderWait))
+                        self.assertEqual(type(older_cause).__name__, "BehindHead" if legacy else type(cause).__name__)
 
     def test_the_pinned_ci_client_reads_a_natedev_hold_as_a_wait_and_the_current_client_keeps_it(self) -> None:
         held = records.NatedevHeld("fps", "Phase 3 timing")

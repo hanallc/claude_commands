@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections.abc import Collection, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
+from uuid import uuid4
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
@@ -31,6 +34,37 @@ class LandRecord(TypedDict):
     start: str
     commits: list[str]
     owners: NotRequired[list[str]]
+    test_reference: NotRequired[str]
+
+
+@dataclass(frozen=True)
+class LandingTestReference:
+    token: str
+
+
+@dataclass(frozen=True)
+class NoLandingTestReference:
+    pass
+
+
+_TEST_REFERENCE: ContextVar[LandingTestReference | NoLandingTestReference] = ContextVar(
+    "landing_test_reference", default=NoLandingTestReference())
+_TEST_REFERENCE_ENV = "BUILDLOG_LANDING_TEST_REFERENCE"
+
+
+def test_reference() -> LandingTestReference | NoLandingTestReference:
+    reference = _TEST_REFERENCE.get()
+    if isinstance(reference, LandingTestReference):
+        return reference
+    token = os.environ.get(_TEST_REFERENCE_ENV, "")
+    return LandingTestReference(token) if token else NoLandingTestReference()
+
+
+def test_environment() -> dict[str, str]:
+    reference = test_reference()
+    if isinstance(reference, LandingTestReference):
+        return {**os.environ, _TEST_REFERENCE_ENV: reference.token}
+    return dict(os.environ)
 
 
 class LandResult(TypedDict):
@@ -54,6 +88,58 @@ def lands_dir() -> Path:
     return state_dir() / "lands"
 
 
+def _claims_dir() -> Path:
+    return state_dir() / "land_claims"
+
+
+def _write_land(path: Path, record: LandRecord) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, json.dumps(record) + "\n")
+
+
+def claim(pid: int, commits: Sequence[str]) -> None:
+    """Record a dequeued land while the runner starts its merge command."""
+    owner = process_start(pid)
+    if not isinstance(owner, Started):
+        raise ValueError("the land runner has no live process identity")
+    _write_land(_claims_dir() / f"{pid}.json", {"pid": pid, "start": owner.start, "commits": list(commits)})
+
+
+def _active_records(directory: Path, *, prune: bool = False) -> Generator[tuple[Path, LandRecord]]:
+    try:
+        paths = sorted(directory.glob("*.json"))
+    except OSError:
+        return
+    for path in paths:
+        try:
+            record = cast(LandRecord, json.loads(path.read_text()))
+            if not isinstance(cast(object, record["pid"]), int) or not isinstance(cast(object, record["start"]), str):
+                continue
+            owner = process_start(record["pid"])
+            if owner == Started(record["start"]):
+                yield path, record
+            elif prune and not isinstance(owner, Unreadable):
+                path.unlink(missing_ok=True)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+
+
+def _accept_claim(commits: Sequence[str]) -> None:
+    for path, claim_record in _active_records(_claims_dir()):
+        if any(holds(claim_record["commits"], commit) for commit in commits):
+            path.unlink(missing_ok=True)
+
+
+def running_test_references() -> frozenset[LandingTestReference | NoLandingTestReference]:
+    """Read live claims before registrations so the handoff keeps protection."""
+    references: set[LandingTestReference | NoLandingTestReference] = {
+        NoLandingTestReference() for _ in _active_records(_claims_dir())}
+    for _, record in _active_records(lands_dir()):
+        token = record.get("test_reference", "")
+        references.add(LandingTestReference(token) if token else NoLandingTestReference())
+    return frozenset(references)
+
+
 def results_path() -> Path:
     return state_dir() / "land_results.jsonl"
 
@@ -66,12 +152,16 @@ def landing(commits: Sequence[str], owners: Sequence[str] = ()) -> Generator[Non
         yield
         return
     path = lands_dir() / f"{os.getpid()}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    record: LandRecord = {"pid": os.getpid(), "start": identity.start, "commits": list(commits), "owners": list(owners)}
-    write_text_atomic(path, json.dumps(record) + "\n")
+    reference = LandingTestReference(uuid4().hex)
+    record: LandRecord = {"pid": os.getpid(), "start": identity.start, "commits": list(commits), "owners": list(owners),
+                          "test_reference": reference.token}
+    _write_land(path, record)
+    scope = _TEST_REFERENCE.set(reference)
     try:
+        _accept_claim(commits)
         yield
     finally:
+        _TEST_REFERENCE.reset(scope)
         path.unlink(missing_ok=True)
 
 
@@ -81,21 +171,13 @@ def running_lands() -> dict[str, str]:
     It removes the record of a land that ended.
     """
     commits: dict[str, str] = {}
-    try:
-        paths = sorted(lands_dir().glob("*.json"))
-    except OSError:
-        return {}
-    for path in paths:
+    for _, record in _active_records(lands_dir(), prune=True):
         try:
-            record = cast(LandRecord, json.loads(path.read_text()))
-            pid, start, listed, owners = record["pid"], record["start"], record["commits"], record.get("owners", [])
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            owners = record.get("owners", [])
+            commits.update((commit, owners[index] if index < len(owners) else "")
+                           for index, commit in enumerate(record["commits"]))
+        except (KeyError, TypeError):
             continue
-        owner = process_start(pid)
-        if owner == Started(start):
-            commits.update((commit, owners[index] if index < len(owners) else "") for index, commit in enumerate(listed))
-        elif not isinstance(owner, Unreadable):
-            path.unlink(missing_ok=True)
     return commits
 
 

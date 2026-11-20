@@ -1158,6 +1158,7 @@ INFER_PROFILE_AT_USE = InferProfileAtUse()
 
 def step_identity(step: str, worktree: str) -> wire.Identity:
     from scripts.build_queue import admission_records as records
+    from scripts.production import land_runs
 
     identity = records.waiter_identity(step, worktree)
     if not identity["session_id"] and (reference := os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")):
@@ -1172,7 +1173,7 @@ def step_identity(step: str, worktree: str) -> wire.Identity:
             identity["session_id"] = member.current_session
             identity["session_name"] = member.name
     return wire.Identity(identity["session_id"], identity["session_name"], identity["step"],
-                         identity["folder"], identity.get("unit", ""))
+                         identity["folder"], identity.get("unit", ""), landing_test=land_runs.test_reference())
 
 
 def verify_call() -> records.VerifyStep:
@@ -1197,13 +1198,18 @@ def step_request(argv: list[str], cwd: str, owner: wire.Owner, since: float, sid
                  episode: str, profile: records.InferFromArgv | wire.Profile | InferProfileAtUse = INFER_PROFILE_AT_USE,
                  *, run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
                  ) -> wire.AdmitRequest:
-    from scripts.build_queue import step_estimator, admission_records as records
-    from scripts.buildlog import store
+    from scripts.build_queue import landing_test_gate, step_estimator, admission_records as records
+    from scripts.buildlog import repository, store
 
     if isinstance(run, wire.NoRun):
         run = parse_run_identity(os.environ.get("BUILDLOG_RUN", ""))
     if isinstance(profile, InferProfileAtUse):
         profile = records.INFER_FROM_ARGV
+    if (isinstance(profile, records.ProgramProfile) and profile.step in landing_test_gate.TEST_STEPS
+            and isinstance(profile.repository, records.UnknownRepository)):
+        key = repository.repository_key(cwd)
+        if key != store.UNKNOWN_IDENTITY:
+            profile = replace(profile, repository=records.RepositoryIdentity(key, key.rsplit("/", 1)[-1]))
     config = records.read_memory_config()
     estimate = step_estimator.step_estimate(argv, cwd, profile, lambda: datetime.fromtimestamp(CLOCK.now(), UTC),
                                   store.root(), config.policy, first_peak_bytes=config.program_first_peaks["cargo"],

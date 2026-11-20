@@ -1562,7 +1562,7 @@ def need_in_next_part(steps: Sequence[admission_records.RunningStep]) -> bool:
 
 
 WaitCause = Literal["memory", "its turn", "Cargo token", "GPU slot", "build slot", "memory pressure",
-                    "AWS slot", "build hold", "Mac", "the build in the same Cargo folder"]
+                    "AWS slot", "build hold", "Mac", "the build in the same Cargo folder", "the merge test"]
 
 
 def wait_why(reason: admission_records.WaitReason) -> WaitCause:
@@ -1586,6 +1586,8 @@ def wait_why(reason: admission_records.WaitReason) -> WaitCause:
             return "memory"
         case admission_records.NatedevHeld():
             return "build hold"
+        case admission_records.WaitsForLandingTest():
+            return "the merge test"
         case admission_records.ReadingUnavailable() | admission_records.PressureUnavailable():
             return "memory"
         case admission_records.ReadyForAdmission():
@@ -3069,7 +3071,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         with staff.supplied_snapshot(staff_display.members):
             cloud_labels = model.cloud_labels
         cloud_slots_used = sum(isinstance(row.wait, admission_records.ReadyForAdmission)
-            or isinstance(row.wait.state, ReservedCloudSlot) for row in rows)
+            or isinstance(row.wait, wire.CloudSlotWait) and isinstance(row.wait.state, ReservedCloudSlot) for row in rows)
         interval = queue_view.cloud_push_interval()
         cloud_waiters: dict[wire.Owner, CloudWaitRow] = {}
         for cloud in rows:
@@ -3094,7 +3096,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 **call_notes(cloud.identity.verify, cloud.identity.step,
                              "" if isinstance(cloud.identity.verify, admission_records.VerifyCall)
                              else recorded_process_call(cloud.owner.pid, cloud.owner.start_time)),
-                "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
+                "detail": identity.unit, "machine": "aws" if isinstance(cloud.wait, admission_records.ReadyForAdmission) else "",
                 "vcpus": information.vcpus,
                 "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),
                 "activity": (cloud.progress.stage if isinstance(cloud.progress, cloud_progress.CloudProgress) and cloud.progress.stage
@@ -3102,13 +3104,15 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                              else information.state), "failed_modules": information.failed_modules,
                 "progress": cloud_row_progress(cloud.counter),
                 "stale": isinstance(information.update, queue_view.CloudUpdateLate)
-                         and not isinstance(cloud.wait, wire.CloudSlotWait),
+                         and isinstance(cloud.wait, admission_records.ReadyForAdmission),
                 "late_age": queue_view.cloud_update_age(information.update.seconds)
                     if isinstance(information.update, queue_view.CloudUpdateLate)
-                    and not isinstance(cloud.wait, wire.CloudSlotWait) else "",
+                    and isinstance(cloud.wait, admission_records.ReadyForAdmission) else "",
                 **job_notes(job, names, step=cloud.identity.step, verify=cloud.identity.verify)}
-            if isinstance(cloud.wait, wire.CloudSlotWait):
-                cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": cloud.wait.text,
+            if not isinstance(cloud.wait, admission_records.ReadyForAdmission):
+                reason = (cloud.wait.text if isinstance(cloud.wait, wire.CloudSlotWait)
+                          else reason_phrase(cloud.wait, ()))
+                cloud_waiters[cloud.owner] = {**values, "since": cloud.since, "reason": reason,
                     "runs_on": CLOUD_RUNS_ON, "because": "natedev when AWS cannot start", "targets": ["aws"]}
             else:
                 work_rows.append({**values, "started_at": cloud.started_at or cloud.since})

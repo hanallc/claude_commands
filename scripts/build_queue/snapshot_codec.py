@@ -73,6 +73,8 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         return {**record, "source_key": source}
     if writing and record.get("verify") == {"kind": "NotVerifyCall"}:
         del record["verify"]
+    if writing and record.get("landing_test") == {"kind": "NoLandingTestReference"}:
+        del record["landing_test"]
     if schema.__module__ == "scripts.build_queue.admission_records":
         if writing and schema.__name__ == "QueueInputs":
             # Pinned clients require this inactive field in the wire record.
@@ -131,7 +133,8 @@ def legacy_pressure_shape(record: dict[str, object]) -> dict[str, object]:
 GPU_SLOT_SUFFIX = "_gpu_slot"
 NATEDEV_HOLD_SUFFIX = "_natedev_hold"
 CARGO_FOLDER_SUFFIX = "_cargo_folder"
-LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX)
+LANDING_TEST_SUFFIX = "_landing_test"
+LEGACY_WAIT_SUFFIXES = (GPU_SLOT_SUFFIX, NATEDEV_HOLD_SUFFIX, CARGO_FOLDER_SUFFIX, LANDING_TEST_SUFFIX)
 
 
 @lru_cache(maxsize=None)
@@ -159,6 +162,8 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
             head, suffix = f"the natedev hold by {wait['holder']} for {wait['purpose']}", NATEDEV_HOLD_SUFFIX
         elif wait.get("kind") == "CargoFolderWait":
             head, suffix = "the build in the same Cargo folder", CARGO_FOLDER_SUFFIX
+        elif wait.get("kind") == "WaitsForLandingTest":
+            head, suffix = "the merge test", LANDING_TEST_SUFFIX
         else:
             continue
         shaped[key] = {"kind": "BehindHead", "head_name": head, "joined_at": 0.0, "head_session_id": ""}

@@ -122,7 +122,7 @@ class CloudRow:
     started_at: float
     progress: cloud_progress.CloudProgress | cloud_progress.NoCloudProgress
     counter: progress_profile.ProgressCounter | progress_profile.NoCounter
-    wait: CloudSlotWait | records.ReadyForAdmission
+    wait: CloudSlotWait | records.ReadyForAdmission | records.WaitsForLandingTest
 
 
 @dataclass(frozen=True)

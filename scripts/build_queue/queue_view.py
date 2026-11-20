@@ -760,7 +760,8 @@ class CloudWork:
 def cloud_work(row: wire.CloudRow, now: float, stale_pushes: int,
                interval: CloudPushInterval | CloudPushIntervalUnavailable) -> CloudWork:
     progress = row.progress
-    state = (row.wait.text if isinstance(row.wait, wire.CloudSlotWait) else progress.state
+    state = (admission_records.reason_phrase(row.wait, ()) if isinstance(row.wait, admission_records.WaitsForLandingTest)
+             else row.wait.text if isinstance(row.wait, wire.CloudSlotWait) else progress.state
              if isinstance(progress, cloud_progress.CloudProgress) else "progress " + progress.reason)
     modules = (f"{row.counter.done} of {row.counter.total} modules"
                if isinstance(row.counter, progress_profile.ProgressCounter) else "modules unknown")
@@ -790,7 +791,7 @@ def cloud_detail(row: wire.CloudRow) -> str:
 
 
 def cloud_status(row: wire.CloudRow, work: CloudWork) -> Line:
-    if isinstance(row.wait, wire.CloudSlotWait):
+    if not isinstance(row.wait, admission_records.ReadyForAdmission):
         return (Span(" · ".join(filter(None, (work.state, cloud_detail(row))))),)
     text = " · ".join(filter(None, (work.state, cloud_detail(row), work.modules, cloud_failed_modules(work))))
     return (Span(text),)
@@ -804,7 +805,7 @@ def cloud_failed_modules(work: CloudWork) -> str:
 
 
 def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
-    if isinstance(row.wait, wire.CloudSlotWait):
+    if not isinstance(row.wait, admission_records.ReadyForAdmission):
         return cloud_status(row, work)
     parts = (work.state if work.state != "running" else "",
              cloud_detail(row),
@@ -843,7 +844,7 @@ def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow | wir
     def order(row: wire.CloudRow | wire.RepositorySlotRow) -> tuple[float, int, str]:
         return cloud_queue_order(row.place, row.since) if isinstance(row, wire.CloudRow) else (row.since, 1, "")
 
-    for cloud in sorted([*(row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)), *slot_rows],
+    for cloud in sorted([*(row for row in cloud_rows(model) if not isinstance(row.wait, admission_records.ReadyForAdmission)), *slot_rows],
                         key=order):
         order_time = order(cloud)[0]
         position = next((index for index, row in enumerate(rows)

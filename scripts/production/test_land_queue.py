@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-from scripts.production import land_queue, unit_phases
+from scripts.build_queue import landing_test_gate
+from scripts.lib.process_start import Gone, Started
+from scripts.production import land_queue, land_runs, unit_phases
 from zoneinfo import ZoneInfo
 
 
@@ -64,6 +66,29 @@ class LandQueueTests(unittest.TestCase):
     def test_next_prints_only_the_label_for_an_item_with_only_commits(self) -> None:
         self.assertEqual(self.run_line("add", "builds hashes", "--commit", "a" * 40), (0, "", ""))
         self.assertEqual(self.run_line("next"), (0, "builds hashes\n", ""))
+
+    def test_dequeue_keeps_protection_until_the_registered_land_ends(self) -> None:
+        commit = "a" * 40
+        self.assertEqual(self.run_line("add", "builds first", "--commit", commit)[0], 0)
+        self.assertIsInstance(landing_test_gate.read(), landing_test_gate.QueuedLandingTests)
+        with patch.object(land_runs, "process_start", return_value=Started("10")):
+            self.assertEqual(self.run_line("next", "--claimant", "123"), (0, "builds first\n", ""))
+            self.assertEqual(land_queue.read_items(), [])
+            self.assertEqual(landing_test_gate.read(), landing_test_gate.RunningLandingTests(frozenset()))
+            with land_runs.landing([commit]):
+                reference = land_runs.test_reference()
+                assert isinstance(reference, land_runs.LandingTestReference)
+                self.assertEqual(landing_test_gate.read(), landing_test_gate.RunningLandingTests(frozenset({reference})))
+            self.assertIsInstance(landing_test_gate.read(), landing_test_gate.NoProtectedLandingTests)
+
+    def test_a_dead_or_replaced_claimant_stops_protecting_tests(self) -> None:
+        self.assertEqual(self.run_line("add", "builds first", "--commit", "a" * 40)[0], 0)
+        with patch.object(land_runs, "process_start", return_value=Started("10")):
+            self.assertEqual(land_queue.take_next(123), "builds first")
+            self.assertIsInstance(landing_test_gate.read(), landing_test_gate.RunningLandingTests)
+        for owner in (Gone(), Started("11")):
+            with self.subTest(owner=type(owner).__name__), patch.object(land_runs, "process_start", return_value=owner):
+                self.assertIsInstance(landing_test_gate.read(), landing_test_gate.NoProtectedLandingTests)
 
     def test_add_refuses_a_batch_path_with_white_space(self) -> None:
         batch = self.batch("setup wait", "aws hana-setup-wait " + "a" * 40)
