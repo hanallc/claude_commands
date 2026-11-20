@@ -145,14 +145,14 @@ def read_production(reference: str | staff.StaffRow, record: staff.StaffSnapshot
         raise Refusal(f"cannot read production doc: {error}") from error
 
 
-def read_new_production(doc: Path, name: str) -> ProductionDocument:
+def read_new_production(doc: Path, name: str, *, resume_branch: str = "") -> ProductionDocument:
     """Read a new production document with its specified staff name."""
     try:
         doc = doc.expanduser().resolve(strict=True)
         lines = doc.read_text(encoding="utf-8").splitlines()
         merge_checkout = optional_field(lines, MERGE_CHECKOUT_FIELD)
         if isinstance(merge_checkout, FieldPresent):
-            return _read_enrolled(doc, name, lines, merge_checkout)
+            return _read_enrolled(doc, name, lines, merge_checkout, resume_branch=resume_branch)
         merge_branch = production_field(lines, "Merge branch")
         checkout = Path(production_field(lines, "Showrunner checkout")).expanduser().resolve()
         log = Path(production_field(lines, "Log"))
@@ -163,7 +163,8 @@ def read_new_production(doc: Path, name: str) -> ProductionDocument:
         raise Refusal(f"cannot read production doc: {error}") from error
 
 
-def _read_enrolled(doc: Path, name: str, lines: list[str], declared: FieldPresent) -> ProductionDocument:
+def _read_enrolled(doc: Path, name: str, lines: list[str], declared: FieldPresent,
+                   *, resume_branch: str = "") -> ProductionDocument:
     try:
         main_path = Path(cell_value(declared.text))
         if not main_path.is_absolute():
@@ -181,7 +182,8 @@ def _read_enrolled(doc: Path, name: str, lines: list[str], declared: FieldPresen
         branch = production_field(lines, "Merge branch")
         if integration == main or integration.common_dir != main.common_dir:
             raise Refusal("Showrunner checkout must be a separate worktree of the same repository")
-        if git_files.head(integration) != git_files.OnBranch(branch):
+        head = git_files.head(integration)
+        if head != git_files.OnBranch(branch) and (not resume_branch or head != git_files.OnBranch(resume_branch)):
             raise Refusal(f"{integration.toplevel}: expected the checkout on {branch}")
         relative_log = Path(production_field(lines, "Log"))
         log = (main.toplevel / relative_log).resolve()
@@ -309,6 +311,8 @@ def protected_checkouts() -> frozenset[ProtectedCheckout]:
             try:
                 lines = doc.read_text(encoding="utf-8").splitlines()
             except FileNotFoundError:
+                if doc.name.endswith(LIVE_DOCUMENT_SUFFIX):
+                    raise
                 lines = []
             declared = optional_field(lines, MERGE_CHECKOUT_FIELD)
             if isinstance(declared, FieldPresent):
