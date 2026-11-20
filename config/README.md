@@ -772,7 +772,6 @@ Mac runs read `connect_timeout_s` from `mac_test.conf` and round it up for SSH.
 | `mac_run_launch` | `/tmp/mac_run_hana.command` | Remote Terminal command for the Mac run. |
 | `mac_run_status` | `/tmp/mac_run_hana.status` | Remote exit record for the Mac run. |
 | `mac_run_example_seconds` | `20` | Time for each demo example. |
-| `mac_run_claim_seconds` | `600` | Maximum time to wait for the Mac claim. |
 | `mac_run_deployment_target` | `14.0` | Minimum macOS version for the test build. |
 | `mac_run_status_grace_seconds` | `60` | Extra time to wait for the exit record. |
 | `mac_run_poll_seconds` | `1` | Delay between exit record checks. |

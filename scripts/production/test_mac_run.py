@@ -338,7 +338,7 @@ class MacRunTests(unittest.TestCase):
             + "\nterminate_grace_seconds=3\n")
         copies_config = self.config_path.parent / "copies.conf"
         _ = write_config_fixture(copies_config, f"remote_registry={self.root / 'mirrors'}\n"
-                                 + "owner.verify=verify\nwait_seconds=0.01\n"
+                                 + "owner.verify=verify\n"
                                  + "git_timeout_seconds=10\nguard_timeout_seconds=10\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)

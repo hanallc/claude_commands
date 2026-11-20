@@ -408,13 +408,12 @@ def load_config() -> CopiesConfiguration:
     path, values = config_settings()
     try:
         registry = Path(values["remote_registry"]).expanduser()
-        delay = float(values["wait_seconds"])
         git_timeout = float(values["git_timeout_seconds"])
         guard_timeout = float(values["guard_timeout_seconds"])
         if not registry.is_absolute():
             raise ValueError("remote_registry must be absolute")
-        if any(not math.isfinite(value) or value <= 0 for value in (delay, git_timeout, guard_timeout)):
-            raise ValueError("wait_seconds, git_timeout_seconds and guard_timeout_seconds must be finite and positive")
+        if any(not math.isfinite(value) or value <= 0 for value in (git_timeout, guard_timeout)):
+            raise ValueError("git_timeout_seconds and guard_timeout_seconds must be finite and positive")
     except (KeyError, ValueError) as error:
         raise CopyError(f"{path}: invalid copies configuration: {error}") from error
     allow_list = {key.removeprefix("allow."): reason for key, reason in values.items()
