@@ -1203,7 +1203,7 @@ class ClientTests(unittest.TestCase):
             admissions: list[wire.AdmitRequest] = []
             expired_orders: list[float] = []
             handle = fixture.server.handle_request
-            read_line = client._line
+            read_line = cast(Callable[[socket.socket, bytearray, float], bytes], getattr(client, "_line"))
             exchange = LauncherHangGuard("Estimator retry replies")
 
             def receive_reply(connection: socket.socket, pending: bytearray, deadline: float) -> bytes:
