@@ -13,7 +13,6 @@ import multiprocessing
 from multiprocessing.connection import Connection
 import os
 import pathlib
-import re
 import shlex
 import shutil
 import signal
@@ -37,7 +36,8 @@ from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import cloud_progress
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.production import merge_gate
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import config_environment
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -47,8 +47,27 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 class GuestTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(dir='/tmp')))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, config_environment(root))))
+        _ = (root / 'cloud_gate.conf').write_text(
+            'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
+            + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux\n')
+        _ = (root / 'test_times.conf').write_text(
+            '# whole: 1..\nGATE_FAILURE_LOG_KIB=64\n'
+            + '# whole: 1..\nTOP_RUNS=5\n')
+        _ = (root / 'merge_gate.conf').write_text('# range: 1..\nGATE_TIME_LIMIT_FACTOR=1.5\n')
+        _ = (root / 'buildlog.conf').write_text(
+            '# range: 0..\nINDEX_UNUSED_DAYS=2\n'
+            + '# range: 0..\nINDEX_TOUCH_MINUTES=60\n'
+            + '# whole: 1..\nINDEX_SPILL_PAGES=65536\n')
+        _ = (root / 'build_folders.conf').write_text(
+            f'roots.system={root}\nroots.gate={root}\n'
+            + '# whole: 1..\nnames.suffix_length=8\n'
+            + 'names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_\n'
+            + 'patterns.legacy-unique={purpose}{suffix}\n'
+            + 'patterns.tool={purpose}{suffix}\n'
+            + '# range: 0.001..60\nlocks.probe_wait_seconds=0.25\n'
+            + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n')
 
     def test_user_data_fits_ec2_limit_with_module_times_and_400_character_signed_links(self) -> None:
         prefix = 'https://fixture.invalid/object?X-Amz-Signature='
@@ -250,7 +269,8 @@ class GuestTests(unittest.TestCase):
                 _ = (root / 'stat').write_text('cpu 500 0 100 20000 5000 0 0 400 20000 20000\n')
                 return run
             with (mock.patch.dict(os.environ, {'MERGE_GATE_BASEDPYRIGHT': str(types), 'MERGE_GATE_PYTHON': sys.executable,
-                                                 'GATE_BOX_DIR': str(root), 'box_dir': str(root)}),
+                                                 'GATE_BOX_DIR': str(root), 'box_dir': str(root),
+                                                 'BUILDLOG_DIR': str(root / 'buildlog')}),
                   mock.patch.object(sys, 'path', list(sys.path)),
                   mock.patch.object(gate_box, 'CANDIDATE_GUEST', candidate),
                   mock.patch.object(gate_box, '__file__', str(repo / 'scripts/aws_target/gate_box.py')),
@@ -346,11 +366,11 @@ class PairedTrialTests(CostFixture):
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
+        for name in tuple(os.environ):
+            if name in ('GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS') or name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')):
+                del os.environ[name]
+        os.environ['GIT_CONFIG_GLOBAL'] = str(write_fixture_git_config(self.root))
         shipped = Path(__file__).resolve().parents[2]
-        # The fixture pins its branch prefix, so a tuned live prefix changes no test.
-        _ = (self.root / 'cloud_gate.conf').write_text(re.sub(
-            r'(?m)^trial_branch_prefix=.*$', 'trial_branch_prefix=gate-trial',
-            (shipped / 'config/cloud_gate.conf').read_text()))
         self.repo = self.root / 'repo'
         self.repo.mkdir()
         for args in (('init', '-q'), ('config', 'user.name', 'Fixture'), ('config', 'user.email', 'fixture@example.invalid')):
@@ -387,8 +407,17 @@ class Sample(unittest.TestCase):
         self.changed = trial.checked_git(self.repo, 'rev-parse', 'HEAD')
         self.origin = self.root / 'origin.git'
         _ = subprocess.run(['git', 'clone', '--bare', str(self.repo), str(self.origin)], check=True, capture_output=True)
-        path = self.root / 'cloud_gate.conf'
-        _ = write_config_fixture(path, f'clone_url={self.origin}\n')
+        _ = (self.root / 'cloud_gate.conf').write_text(
+            f'clone_url={self.origin}\n'
+            + f'credential_file={self.root / "credentials"}\n'
+            + 'regions=us-east-2 us-west-2\n'
+            + 'trial_branch_prefix=gate-trial\n'
+            + '# whole: 1..9\nslots=9\n'
+            + '# whole: 1..60\nlifetime_minutes=20\n'
+            + '# range: 0.01..300\ngit_network_timeout_s=60\n'
+            + '# range: 1..3600\nmodule_time_limit_s=1800\n'
+            + '# range: 1..600\ntermination_timeout_s=120\n'
+            + '# range: 1..120\napi_timeout_s=30\n')
 
     def test_expired_sweep_preserves_a_racing_coordinator_termination(self) -> None:
         now = 1700000000
@@ -573,7 +602,7 @@ class Sample(unittest.TestCase):
         before = self.remote_branches()
         config = self.root / 'cloud_gate.conf'
         lifetime = 5
-        _ = write_config_fixture(config, f'lifetime_minutes={lifetime}\n')
+        _ = config.write_text(config.read_text().replace('lifetime_minutes=20', f'lifetime_minutes={lifetime}'))
 
         def first_service(_command: Sequence[str], _unit: str) -> int:
             live = self.remote_branches()
@@ -581,7 +610,7 @@ class Sample(unittest.TestCase):
             folder = next((self.state / 'paired-trials').iterdir())
             request = cloud_gate.read(next(folder.glob('*/request.json')))
             self.assertEqual(request['expires'], now + lifetime * 60)
-            _ = write_config_fixture(config, 'lifetime_minutes=1\n')
+            _ = config.write_text(config.read_text().replace(f'lifetime_minutes={lifetime}', 'lifetime_minutes=1'))
 
             def second_service(_command: Sequence[str], _unit: str) -> int:
                 remote = self.remote_branches()
