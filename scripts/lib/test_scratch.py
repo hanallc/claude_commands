@@ -921,19 +921,21 @@ class ScratchTests(unittest.TestCase):
                 self.assertTrue(cargo_mark.is_file())
                 self.assertTrue(task_mark.is_file())
                 events: list[str] = []
-                unlink = Path.unlink
+                delete_entry = scratch.delete_entry
 
-                def observe_unlink(mark: Path, *, missing_ok: bool = False) -> None:
+                def observe_delete(mark: Path | scratch.AnchoredRemoval, kind: scratch.RemovalKind, *,
+                                   missing_ok: bool = False,
+                                   scratch_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> None:
                     if mark in (cargo_mark, task_mark):
                         events.append("cargo" if mark == cargo_mark else "task")
                         if mark == cargo_mark:
                             self.assertTrue(task_mark.is_file())
-                    unlink(mark, missing_ok=missing_ok)
+                    delete_entry(mark, kind, missing_ok=missing_ok, scratch_settings=scratch_settings)
 
                 pending = scratch.pending_removal(path)
                 assert isinstance(pending, copy_record.Registered)
                 with (mock.patch.object(scratch, "clean_cargo_outputs"),
-                      mock.patch.object(Path, "unlink", observe_unlink)):
+                      mock.patch.object(scratch, "delete_entry", observe_delete)):
                     if entry == "task":
                         self.assertEqual(scratch.end(task), [path])
                     elif entry == "selected":

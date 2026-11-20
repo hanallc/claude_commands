@@ -1414,15 +1414,16 @@ def new_worker(word: str = "", *,
     parent = inherited_temporary_parent().resolve()
     parent.mkdir(parents=True, exist_ok=True)
     path = parent / "-".join((*parts, random_suffix(scratch_settings), *([word] if word else [])))
-    path.mkdir()
-    try:
-        task = worker_task(worker.id)
-        write_record(path, task, time.time(), throwaway=True, scratch_settings=scratch_settings)
-        _ = hold(path, task, "worker assignment folder", scratch_settings=scratch_settings)
-    except BaseException:
-        with suppress(OSError, ScratchHoldsUnreadable):
-            delete_entry(path, RemovalKind.TREE, missing_ok=True, scratch_settings=scratch_settings)
-        raise
+    with locked_holds(scratch_settings=scratch_settings):
+        path.mkdir()
+        try:
+            task = worker_task(worker.id)
+            write_record(path, task, time.time(), throwaway=True, scratch_settings=scratch_settings)
+            _ = hold(path, task, "worker assignment folder", scratch_settings=scratch_settings)
+        except BaseException:
+            with suppress(OSError, ScratchHoldsUnreadable):
+                delete_entry(path, RemovalKind.TREE, missing_ok=True, scratch_settings=scratch_settings)
+            raise
     return path
 
 
