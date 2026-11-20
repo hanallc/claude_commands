@@ -5138,12 +5138,16 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
             return reply
 
         admission.server.reply_filter = capture
-        for command, options, step in (("check", ("--no-cache",), "check"), ("lint", ("--check",), "clippy")):
-            with self.subTest(command=command):
+        cases = (("check", ("--no-cache",), "check", ""), ("lint", ("--check",), "clippy", ""),
+                 ("check", ("--no-cache",), "check", str(self.root / "outer-copy")),
+                 ("lint", ("--check",), "clippy", str(self.root / "outer-copy")))
+        for command, options, step, enclosing_copy in cases:
+            with self.subTest(command=command, enclosing_copy=enclosing_copy):
                 grants.clear()
                 observed_grants.clear()
                 result = subprocess.run(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
-                    env=self.environment, start_new_session=True, capture_output=True, text=True,
+                    env={**self.environment, "COPIES_STEP_SOURCE": enclosing_copy},
+                    start_new_session=True, capture_output=True, text=True,
                     check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual([grant[0] for grant in grants], [step])
@@ -5303,7 +5307,12 @@ class ShellTests(unittest.TestCase):
     def test_launch_wait_limit_refuses_without_a_reservation(self) -> None:
         self.admission.free(0)
         self.admission.hold_starts()
-        result = self.shell('buildlog_wait_for_memory; printf "step started\\n"', launch=True, BUILDLOG_MEM_WAIT_LIMIT_S="1")
+        client_script = self.admission.root / "clocked-queue-client.py"
+        _ = client_script.write_text("from __future__ import annotations\nimport sys\n"
+            + inspect.getsource(queue_leave_client_main) + "\nsys.exit(queue_leave_client_main(sys.argv[1:]))\n")
+        result = self.shell('BUILDLOG_QUEUE_PLACE_SCRIPT="$TEST_QUEUE_CLIENT"; '
+            + 'buildlog_wait_for_memory; printf "step started\\n"', launch=True, BUILDLOG_MEM_WAIT_LIMIT_S="1",
+            TEST_QUEUE_CLIENT=str(client_script), PYTHONPATH=str(Path(__file__).resolve().parents[2]))
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr.count("waiting for memory since "), 1)
@@ -5420,10 +5429,11 @@ class ShellTests(unittest.TestCase):
 
 
 def queue_leave_client_main(argv: list[str]) -> int:
-    """Advance the client clock at its first held answer."""
+    """Advance the client clock when the service sends its first wait reply."""
+    import os
     import time
     from unittest.mock import patch
-    from scripts.build_queue import admission_client as client, admission_records, queue_place
+    from scripts.build_queue import admission_client as client, queue_place
 
     class HeldWaitClock:
         def __init__(self) -> None:
@@ -5441,16 +5451,29 @@ def queue_leave_client_main(argv: list[str]) -> int:
 
     clock = HeldWaitClock()
     report = client.WaitOutput.__call__
-    advanced = False
+    check_leave = client.AcquisitionRetry.left_queue
+    first_wait = False
+    checked = False
 
     def held(output: client.WaitOutput, reply: wire.Wait) -> None:
-        nonlocal advanced
+        nonlocal first_wait
         report(output, reply)
-        if not advanced:
-            clock.elapsed += admission_records.read_memory_config().running_pass_seconds
-            advanced = True
+        if not first_wait and argv[0] == "launch":
+            clock.elapsed += int(os.environ["BUILDLOG_MEM_WAIT_LIMIT_S"])
+        first_wait = True
 
-    with patch.object(client, "CLOCK", clock), patch.object(client.WaitOutput, "__call__", held):
+    def leave_on_wait(retry: client.AcquisitionRetry) -> bool:
+        nonlocal checked
+        if first_wait and not checked and retry.next_leave != float("inf"):
+            checked = True
+            retry.next_leave = clock.monotonic()
+            left = check_leave(retry)
+            retry.next_leave = float("inf")
+            return left
+        return check_leave(retry)
+
+    with (patch.object(client, "CLOCK", clock), patch.object(client.WaitOutput, "__call__", held),
+          patch.object(client.AcquisitionRetry, "left_queue", leave_on_wait)):
         return queue_place.main(argv)
 
 
@@ -5656,7 +5679,7 @@ class QueueLeaveTests(unittest.TestCase):
         step = 'nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; LINT_TEST_WIDTH=logical; run_nextest --workspace'
         result = self.run_step(None, free, step)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
+        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"], result.stdout + result.stderr)
         # The memory wait ends before the build. The build ends before the launcher takes tokens.
         self.assertEqual(waited.read_text().splitlines(), ["waited"])
         self.assertEqual(calls.read_text().splitlines(), [
