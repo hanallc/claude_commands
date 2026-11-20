@@ -283,6 +283,7 @@ class _Chrome(_Browser):
             )
             hook = self.command("Page.addScriptToEvaluateOnNewDocument", {"source": script}, session)
             with self.page(destination, reduced_motion=reduced_motion, window_size=window_size):
+                _ = self.command("Page.bringToFront", {}, session)
                 _ = self.command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hook["identifier"]}, session)
                 try:
                     response = self.command("Runtime.evaluate",
@@ -911,7 +912,6 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
 const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
 const shot=new URLSearchParams(location.search).has('shot');
 const waitingKey=WAITING_KEY;
-const report=async()=>{await fetch('/results',{method:'POST',body:JSON.stringify(failures)});};
 const listFrame=document.querySelector('iframe:not([hidden])');
 const direct=!listFrame;
 const animationFrames=win=>new Promise(resolve=>win.requestAnimationFrame(()=>win.requestAnimationFrame(resolve)));
@@ -988,10 +988,10 @@ async function inspect(){
   check(box.width<=1060 && Math.abs(box.left+box.right-win.innerWidth)<=20,'The desktop dialog is centered.');
   check(ready.documentElement.scrollWidth<=ready.defaultView.innerWidth,'The card fits the desktop width.');
  }
- if(direct){await report();return;}
+ if(direct) return;
  if(shot){
   check(win.matchMedia('(prefers-color-scheme:dark)').matches,'The desktop uses dark mode.');
-  await report();return;
+  return;
  }
  if(!phone){
   dialog.dispatchEvent(new win.PointerEvent('pointerdown',{clientX:0,clientY:0,bubbles:true}));
@@ -1203,9 +1203,13 @@ async function inspect(){
  check(new URL(listURL).pathname===win.location.pathname && filters.get('show')==='working' &&
   filters.get('q')==='linked reviews' && doc.querySelector('#list-search').value==='linked reviews' &&
   !row().querySelector('[data-detail]').hidden,'The List keeps the filters, search, and open row.');
- await report();
 }
-(listFrame || window).addEventListener('load',()=>{void inspect().catch(error=>{failures.push(String(error));void report();});},{once:true});
+async function inspectAndReport(){
+ try{await inspect();}
+ catch(error){failures.push(String(error));}
+ if(!navigator.sendBeacon('/results',JSON.stringify(failures))) throw new Error('Could not queue the probe result.');
+}
+(listFrame || document).addEventListener(listFrame ? 'load' : 'DOMContentLoaded',inspectAndReport,{once:true});
 if(shot){const image=new Image();image.hidden=true;image.src='/complete';document.body.append(image);}
 </script>'''.replace('WAITING_KEY', json.dumps(waiting_key))
         shell = shell.replace('</body>', probe + '</body>')
@@ -4470,6 +4474,7 @@ observer.observe(original.parentNode,{childList:true});
  const unpark=form.querySelector('[value="unpark"]');
  check(!row.hidden && chip.dataset.filterCount==='1','Parked includes the item before the question.');
  unpark.focus();
+ check(document.hasFocus() && document.activeElement===unpark,'Unpark starts with focus on its button.');
  submit('unpark');
  await finishPost({parked:'false',parked_until:'',waiting_for_answer:'true',open_question:'true',unpark_outcome:'cleared'});
  check(row.hidden && chip.dataset.filterCount==='0','The waiting item leaves Parked and its count.');
@@ -5818,6 +5823,8 @@ window.fetch=async(path,options={})=>{
   waiting_for_answer:item.dataset.waitingForAnswer,
  });
  try{
+  if(!window.top.document.hasFocus())
+   await new Promise(resolve=>window.top.addEventListener('focus',resolve,{once:true}));
   document.querySelector('OPEN_CONTROL').click();
 ''' + steps + '''
  }catch(error){failures.push(String(error));}
