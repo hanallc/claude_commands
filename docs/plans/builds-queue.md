@@ -3296,6 +3296,16 @@ Evidence: at 10:50 the head-stall watch reported a 53 min stall. It was natemerg
 
 Tests: rows in the existing head-stall tests for a hold, no hold, and a hold past its release time. Each fails first where the behavior is new.
 
+### Phase 44dz — Fixture child runs carry the runner's session  · status: in progress
+**From builds, 2026-11-20 11:15 EST (base red, urgent).** natemerge merge test 1 failed in `scripts/copies/test_slot_order.py` and `scripts/direct/test_verify_doc_checkout.py`.
+
+Cause: the fixtures gave their child runs a made-up session id. During natemerge's own build hold, the live hold enforcer saw those runs as another session's builds and stopped them.
+
+1. Part 1 (92b5f3bc54): the slot-order fixture member uses the runner's session. Merged in bb12 as 06c55bdc0.
+2. Part 2 (0f0b1158b4): the shared helper `build_fixture_sessions` in `staff_test_support.py`, applied to 18 more test files.
+3. Part 3 (b268c1270a): the helper in `test_agent_exec.py` and `verify_token_wait_test_support.py`. In bb13.
+4. Left out: `test_verify_token_handoff.py` conflicts with `devtools-testorphans`; builds sent it to devtools through sdlc.
+
 ### Phase 44dv — Admission tests run on the Mac, with no skip  · status: todo
 **From builds, 2026-11-20 05:30 EST (found by report).** After the group merges; not urgent. User rule: tests run on the Mac too; no Mac skip.
 
