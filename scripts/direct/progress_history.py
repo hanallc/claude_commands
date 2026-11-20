@@ -1847,6 +1847,18 @@ class DispatchPromptRefused(RuntimeError):
         super().__init__(f"Active pass {conflict.instance_id} has different prompt content")
 
 
+def _same_launcher(active: dict[str, object], launcher_command: list[str]) -> bool:
+    saved_command = active.get("launcher_command")
+    if not launcher_command:
+        return False
+    if launcher_command == saved_command:
+        return True
+    return (active.get("status") in ("active", "refused")
+            and bool(active.get("worker_id") and active.get("worker_name"))
+            and isinstance(saved_command, list)
+            and launcher_command == _worker_launcher(cast(list[str], saved_command), _string(active.get("worker_name"))))
+
+
 def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                     fields: dict[str, object], launcher_command: list[str], *,
                     dispatch_owned: bool,
@@ -1855,12 +1867,7 @@ def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
         return NoMatchedDispatch()
     if active.get("kind", "") != fields.get("kind", ""):
         return NoMatchedDispatch()
-    saved_command = active.get("launcher_command")
-    current_command: object = (_worker_launcher(cast(list[str], saved_command), _string(active.get("worker_name")))
-                       if isinstance(saved_command, list) and active.get("worker_id") and active.get("worker_name")
-                       else cast(object, saved_command))
-    same_launcher = bool(launcher_command) and (launcher_command == saved_command or (
-        active.get("status") in ("active", "refused") and launcher_command == current_command))
+    same_launcher = _same_launcher(active, launcher_command)
     stage_two = False
     if dispatch_owned and fields.get("prompt_file") != active.get("prompt_file"):
         delivery = dispatch_delivery(active)
@@ -1881,7 +1888,7 @@ def _dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
             if active.get("status") == "active":
                 return ActiveDispatchPromptConflict(_string(active.get("worker_name")), _string(active.get("instance_id")))
             return NoMatchedDispatch()
-    if launcher_command and saved_command and not same_launcher:
+    if launcher_command and active.get("launcher_command") and not same_launcher:
         return NoMatchedDispatch()
     if not all(active.get(key, "") == value for key, value in fields.items()
                if key != "prompt_file" or not stage_two):
@@ -1901,12 +1908,7 @@ def launch_slot(session_dir: Path, slot: str, launcher_command: list[str]) -> st
 
 
 def _launch_slot(passes: dict[str, dict[str, object]], slot: str, launcher_command: list[str]) -> str:
-    return next((name for name, passed in passes.items()
-                 if launcher_command and (passed.get("launcher_command") == launcher_command or (
-                     passed.get("status") in ("active", "refused")
-                     and passed.get("worker_id") and passed.get("worker_name")
-                     and isinstance(saved := passed.get("launcher_command"), list)
-                     and _worker_launcher(cast(list[str], saved), _string(passed.get("worker_name"))) == launcher_command))), slot)
+    return next((name for name, passed in passes.items() if _same_launcher(passed, launcher_command)), slot)
 
 
 @dataclass(frozen=True)
@@ -1933,6 +1935,27 @@ def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.Wor
     if isinstance(selected, ActiveDispatchPromptConflict):
         return selected
     return selected.action if isinstance(selected.action, MatchedDispatch) else NoMatchedDispatch()
+
+
+def recorded_dispatch_prompt(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
+                             work: DispatchWork, launcher_command: list[str]) -> Path | NoMatchedDispatch:
+    """Find the saved prompt before a retry prepares new content."""
+    if not _state_path(session_dir).is_file():
+        return NoMatchedDispatch()
+    state = _read_state(session_dir)
+    passes = _pass_slots(state)
+    passed = passes.get(_launch_slot(passes, slot, launcher_command))
+    opened = _open_phase_named(state, phase)
+    if (passed is None or opened is None or passed.get("status") not in ("active", "refused")
+            or _pass_phase_instance(passed) != _string(opened.get("instance_id"))
+            or not _same_launcher(passed, launcher_command)):
+        return NoMatchedDispatch()
+    saved = _string(passed.get("prompt_file"))
+    if saved:
+        prompt = Path(saved)
+        if all(passed.get(key, "") == value for key, value in _dispatch_fields(role, prompt, work).items()):
+            return prompt
+    return NoMatchedDispatch()
 
 
 def _dispatch_fields(role: staff.WorkerRole, prompt: Path,

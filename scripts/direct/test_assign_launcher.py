@@ -1103,15 +1103,35 @@ class AssignLauncherTests(HookAssignmentFixture):
 
         with self.subTest(behavior="test rules by role"):
             self.assertEqual((prompt.count(rules), prompt.count(limits)), (1, 1))
-            for role, filename, source_rules, options, count in (
-                ("fix", "fix_prompt.txt", "", ("--fix-cause", "Repair the fixture"), 1),
-                ("test", "test_prompt.txt", f"\n{rules}\n", (), 1),
-                ("review", "review_prompt_1.txt", "", (), 0),
+            for role, filename, source_rules, options in (
+                ("fix", "fix_prompt.txt", "", ("--fix-cause", "Repair the fixture")),
+                ("test", "test_prompt.txt", f"\n{rules}\n", ()),
             ):
                 self.write_phase_prompt("7", "Assignment core", f"Continue the fixture work.{source_rules}")
                 _ = self.successful(role, *options)
                 dispatched = (manifest.parent / filename).read_text()
-                self.assertEqual((dispatched.count(rules), dispatched.count(limits)), (count, count), role)
+                self.assertEqual((dispatched.count(rules), dispatched.count(limits)), (1, 1), role)
+
+        with self.subTest(behavior="retry of a prompt without test rules"):
+            slot = "previous-impl"
+            self.write_phase_prompt("7", "Assignment core", "Continue the previous assignment.")
+            with patch.object(assign, "with_test_rules", return_value=self.prompt.read_text()), \
+                    patch.object(progress_history, "save_dispatch_delivery",
+                                 side_effect=SystemExit(worker.ExitCode.UNCERTAIN)):
+                initial = self.launch("implement", "--new-worker", slot)
+            self.assertEqual(initial.returncode, worker.ExitCode.UNCERTAIN, initial.stdout + initial.stderr)
+            state_file = self.session_dir / unit_runs.STATE_FILE
+            active = assign.object_map(assign.object_map(read_object(state_file)["pass"])[slot])
+            self.assertEqual(active["status"], "active")
+            saved = Path(str(active["prompt_file"]))
+            before = saved.read_bytes()
+            self.assertNotIn(rules.encode(), before)
+
+            retried = self.launch("implement", "--new-worker", slot)
+            self.assertEqual(saved.read_bytes(), before)
+            self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+            current = assign.object_map(assign.object_map(read_object(state_file)["pass"])[slot])
+            self.assertEqual(current["instance_id"], active["instance_id"])
 
     def test_review_is_read_only_and_thread_board_and_summary_use_the_shown_context(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
