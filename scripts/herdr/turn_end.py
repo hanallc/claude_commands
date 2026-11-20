@@ -243,14 +243,24 @@ def _stopped_notice(row: staff.StaffRow, parent: staff.StaffRow, run: Path, pass
 
 
 def _recorded_stop_notice(run: Path, notice: progress_history.StoppedPassNotice) -> worker_panes.StoppedRunPassCompletion:
-    if notice.delivered:
-        return worker_panes.StoppedRunPassCompletion(TurnOutcome.STOPPED, _no_notice)
-    director = staff.snapshot().by_id(notice.director_id)
+    record = staff.snapshot()
+    director = record.by_id(notice.director_id)
     if director is None:
+        if notice.delivered:
+            return worker_panes.StoppedRunPassCompletion(TurnOutcome.STOPPED, _no_notice)
         raise ValueError(f"{notice.director_id}: stopped pass notice recipient is not in staff")
-    passed: dict[str, object] = {"worker_id": notice.worker_id, "phase": {"id": notice.phase_id}}
-    decision = _prepare_notice(notice.worker_name, director, run, passed, notice.instance_id,
-                               TurnOutcome.STOPPED, Path(), "", notice.reason, notice_type=TurnOutcome.STOPPED)
+    decision = TurnDecision(TurnOutcome.STOPPED, _no_notice)
+    if not notice.delivered:
+        passed: dict[str, object] = {"worker_id": notice.worker_id, "phase": {"id": notice.phase_id}}
+        decision = _prepare_notice(notice.worker_name, director, run, passed, notice.instance_id,
+                                   TurnOutcome.STOPPED, Path(), "", notice.reason, notice_type=TurnOutcome.STOPPED)
+    row = record.by_id(notice.worker_id)
+    if row is not None and row.reports_to(director.id):
+        passed = worker_panes.worker_pass(row, run, record=record)
+        completion = progress_history.hook_completion(passed)
+        if (passed.get("instance_id") == notice.instance_id and isinstance(completion, progress_history.HookCompletion)
+                and completion.outcome == TurnOutcome.STOPPED):
+            decision = _close_stopped_after_notice(row, director, run, notice.instance_id, completion, decision)
     return worker_panes.StoppedRunPassCompletion(decision.outcome, decision.send_notice)
 
 
@@ -326,7 +336,9 @@ def stop_pass(run: Path, stopped: detached_runs.RunRecord,
             receipt = _recover_pass(event, current, run, passed, delivery, require_transcript=True)
             if isinstance(receipt, worker.DispatchEvidenceUnknown):
                 return worker_panes.Kept(receipt.reason)
-            if (isinstance(receipt, (worker.DispatchComplete, worker.DispatchWaitingForRuns, worker.DispatchAwaitingReply))
+            wait_for_results = isinstance(receipt, worker.DispatchWaitingForRuns) and not (
+                isinstance(receipt.reply, worker.DispatchSubmitted) and receipt.runs == (stopped["run_id"],))
+            if (isinstance(receipt, (worker.DispatchComplete, worker.DispatchAwaitingReply)) or wait_for_results
                     or receipt in (TurnOutcome.WAITING_ON_RUNS, TurnOutcome.WAITING_ON_REPLY)):
                 return worker_panes.Kept("the pass has a reply pending completion")
             if not isinstance(receipt, progress_history.HookCompletion):
@@ -540,15 +552,20 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
                                     sender_native_id=completion.sender_native_id)
     if completion.pane_closed and completion.role_released:
         progress_history.save_hook_completion(run, instance, replace(completion, finished=True))
+        if completion.outcome in (TurnOutcome.DONE, TurnOutcome.LATE_DONE):
+            passed = worker_panes.worker_pass(row, run)
+            started = passed.get("started_at")
+            if passed.get("instance_id") == instance and isinstance(started, (int, float)):
+                detached_runs.acknowledge_worker_completion(run, row, instance, float(started))
         if isinstance(pane, worker.CloseCompletedPane):
             _remove_completed_restart(row, delivery)
     return outcome
 
 
 def _remove_completed_restart(row: staff.StaffRow, delivery: progress_history.DispatchDelivery) -> None:
+    shutdown_record.forget([str(row.id)])
     if delivery.actions.end_worker:
         _ = staff.retire(row.id)
-    shutdown_record.forget([str(row.id)])
 
 
 def _completion_diagnostics_path(run: Path, instance: str) -> Path:
@@ -776,10 +793,6 @@ def _close_stopped_after_notice(row: staff.StaffRow, parent: staff.StaffRow, run
                 return
             receipt = _stopped_receipt(instance, progress_history.dispatch_delivery(passed))
             recovered = _record_stopped_reply(current, run, receipt, saved)
-            if not isinstance(recovered, progress_history.HookCompletion):
-                reason = recovered.reason if isinstance(recovered, worker.DispatchEvidenceUnknown) else recovered.value
-                _ = after_unlock.callback(report, reason)
-                return
             try:
                 with redirect_stderr(io.StringIO()):
                     closed = worker_panes.close(parent.id, name, lock=hold)
@@ -788,8 +801,9 @@ def _close_stopped_after_notice(row: staff.StaffRow, parent: staff.StaffRow, run
                 _ = after_unlock.callback(report, str(error))
                 return
             if isinstance(closed, worker_panes.Closed):
-                progress_history.save_hook_completion(run, instance, replace(recovered, pane_closed=True))
-            else:
+                latest = recovered if isinstance(recovered, progress_history.HookCompletion) else saved
+                progress_history.save_hook_completion(run, instance, replace(latest, pane_closed=True))
+            elif isinstance(closed, worker_panes.UncertainWorker) or isinstance(recovered, progress_history.HookCompletion):
                 _ = after_unlock.callback(report, closed.blocker if isinstance(closed, worker_panes.Kept) else closed.reason)
 
     return replace(decision, send_notice=send_notice)
@@ -1040,10 +1054,8 @@ def _handle_locked(event: WorkerEvent,
                 return TurnOutcome.STOPPED
             if not close_pane:
                 return _ignored(event, reason, row.name)
-            # The Codex capacity stop cancels the pass, and a live detached run keeps the stopped pane at the
-            # shell. The run end closes that pane. The canceled pass gates the pane scan.
-            stopped = (event.kind == EventKind.RUN_FINISHED and passed.get("status") == "canceled" and isinstance(
-                worker_panes.observe_worker(parent.id, row, record), worker_panes.StoppedWorker))
+            # A run can hold a canceled pass's pane until the run ends.
+            stopped = event.kind == EventKind.RUN_FINISHED and passed.get("status") == "canceled"
             if event.kind == EventKind.TURN_END or stopped:
                 dispatch = worker_panes.worker_dispatch_state(row, run, hold)
                 if not isinstance(dispatch, worker_panes.DispatchHoldsWorker):
@@ -1071,12 +1083,8 @@ def _handle_locked(event: WorkerEvent,
                 if event.kind == EventKind.RUN_FINISHED or (
                         event.kind == EventKind.TURN_END and marker in ("", receipt.completion_id)):
                     recovered = _record_stopped_reply(row, run, receipt, stopped)
-                    if event.kind == EventKind.RUN_FINISHED and (
-                            isinstance(recovered, worker.DispatchEvidenceUnknown) or recovered in (
-                                StoppedReplyRecovery.WAITING_ON_RUNS, StoppedReplyRecovery.WAITING_ON_REPLY)):
-                        return replace(decision, outcome=TurnOutcome.WAITING_ON_REPLY)
-                    if isinstance(recovered, progress_history.HookCompletion):
-                        return _close_stopped_after_notice(row, parent, run, instance, recovered, decision)
+                    latest = recovered if isinstance(recovered, progress_history.HookCompletion) else stopped
+                    return _close_stopped_after_notice(row, parent, run, instance, latest, decision)
                 return decision
             return _ignored(event, "the recorder has not ended the stopped pass", row.name)
         client = herdr.Herdr(herdr.shared_session())
@@ -1188,7 +1196,8 @@ def report_quota_refusals() -> list[str]:
 def run_finished(owner: staff.StaffId) -> detached_runs.CompletionReplay:
     """Keep the run completion available when the transcript is unavailable."""
     outcome = handle(WorkerEvent("", EventKind.RUN_FINISHED), owner=owner)
-    if outcome in (TurnOutcome.RETRY_EVIDENCE, TurnOutcome.SUBMITTED, TurnOutcome.WAITING_ON_REPLY):
+    if outcome in (TurnOutcome.UNCERTAIN, TurnOutcome.RETRY_EVIDENCE, TurnOutcome.SUBMITTED,
+                   TurnOutcome.WAITING_ON_RUNS, TurnOutcome.WAITING_ON_REPLY):
         return detached_runs.CompletionReplay.RETRY
     return detached_runs.CompletionReplay.HANDLED
 

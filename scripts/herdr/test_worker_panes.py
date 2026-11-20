@@ -971,8 +971,10 @@ class WorkerPaneTests(StaffTestCase):
                 write_text_atomic(prompt, "Preserve the source behavior.\n")
                 _ = progress_history.begin_dispatch(run, slot="impl", phase="earlier", role="impl",
                     worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
-                self.record_command("finish-pass", "--status", status, "--orphaned-launcher", at=3)
                 before = self.staff_state()
+                self.record_command("finish-pass", "--status", status, "--orphaned-launcher", at=3)
+                if status == "canceled":
+                    self.assertEqual(self.world.closed, [*expected, (pane, "terminal-" + pane)])
                 result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
                 self.assertIsInstance(result, worker_panes.Closed)
                 expected.append((pane, "terminal-" + pane))

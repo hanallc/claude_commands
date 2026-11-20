@@ -777,14 +777,17 @@ class RecordedCompletionEvidence(Protocol):
                             detached_results: PassDetachedResults) -> CloseAllowed | Kept: ...
 
 
-def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, object]) -> CloseAllowed | Kept:
-    """Require the saved stage and its reply before a pass can release its evidence."""
+def recorded_completion_close(row: staff.StaffRow, run: Path, passed: dict[str, object], *,
+                              worker_is_working: bool = False) -> CloseAllowed | Kept:
+    """Accept a finished hook or check the saved reply against the transcript."""
     from scripts.direct import progress_history
 
+    completion = progress_history.hook_completion(passed)
+    if isinstance(completion, progress_history.HookCompletion) and completion.finished:
+        return Kept("agent state is working") if worker_is_working else CloseAllowed()
     delivery = progress_history.dispatch_delivery(passed)
     if not delivery.line or not delivery.completion_id:
         return Kept("the dispatch has no saved completion id")
-    completion = progress_history.hook_completion(passed)
     reply_file = completion.reply_file if isinstance(completion, progress_history.HookCompletion) else delivery.reply_file
     receipts = cast(RecordedCompletionEvidence, cast(object, import_module("scripts.production.worker")))
     return receipts.completion_close_evidence(row, delivery, run=run, reply_file=reply_file)
@@ -914,6 +917,8 @@ def _pass_dispatch_state(row: staff.StaffRow, run: Path, passed: dict[str, objec
                          dispatch: object, *, live_runs_checked: bool) -> WorkerDispatchState:
     from scripts.direct import progress_history
 
+    if status == "canceled":
+        return ReleasedWorkerPass.ENDED
     delivery = progress_history.dispatch_delivery(passed)
     completion = progress_history.hook_completion(passed)
     active = status == "active" and bool(delivery.line)
@@ -976,23 +981,25 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
         return Kept(state.blocker)
     from scripts.direct import progress_history
 
+    working = isinstance(worker, OpenWorker) and worker.status == herdr.AgentStatus.WORKING
     if isinstance(state, CompletedWorkerPass):
         passed = worker_pass(worker.row, directory)
         if progress_history.dispatch_delivery(passed).line:
-            completion = recorded_completion_close(worker.row, directory, passed)
+            completion = recorded_completion_close(worker.row, directory, passed, worker_is_working=working)
         elif isinstance(worker, StoppedWorker):
             return CloseAllowed()
         else:
             completion = _completed_turn(worker.row, state.dispatch_id)
     elif state is ReleasedWorkerPass.ENDED:
         passed = worker_pass(worker.row, directory)
+        if passed.get("status") == "canceled":
+            if isinstance(worker, OpenWorker) and not worker.status.idle:
+                return Kept(f"agent state is {worker.status.value}")
+            return CloseAllowed()
         hook = progress_history.hook_completion(passed)
-        if (isinstance(hook, progress_history.HookCompletion) and hook.outcome == "stopped"
-                and isinstance(worker, OpenWorker) and not worker.status.idle):
-            return Kept(f"agent state is {worker.status.value}")
         delivery = progress_history.dispatch_delivery(passed)
         if delivery.line:
-            completion = recorded_completion_close(worker.row, directory, passed)
+            completion = recorded_completion_close(worker.row, directory, passed, worker_is_working=working)
         elif isinstance(worker, StoppedWorker):
             return CloseAllowed()
         elif isinstance(hook, progress_history.HookCompletion) and hook.outcome in ("done", "late DONE"):
@@ -1675,6 +1682,36 @@ def close(parent: StaffId, name: WorkerName, *,
             _retire_launch(row, client, record)
             _layout(parent, evidence)
             return Closed()
+
+
+def close_canceled_worker(run: Path, identity: StaffId, instance: str) -> None:
+    """Close the idle pane only if the canceled pass is still current."""
+    try:
+        record = staff.snapshot()
+        row = record.by_id(identity)
+        if row is None or row.kind != "worker":
+            return
+        parent = record.parent_of(row)
+        if parent is None:
+            return
+        name = WorkerName.parse(row.name)
+        with worker_lock(parent.id, name, blocking=True) as hold:
+            if isinstance(hold, Kept) or not hold.owns(row) or worker_run(row) != run:
+                return
+            current = worker_pass(row, run)
+            if current.get("instance_id") != instance or current.get("status") != "canceled":
+                return
+            with redirect_stderr(io.StringIO()) as diagnostics:
+                closed = close(parent.id, name, lock=hold)
+            if isinstance(closed, Closed):
+                _ = sys.stderr.write(diagnostics.getvalue())
+                return
+            reason = closed.blocker if isinstance(closed, Kept) else closed.reason
+            print(f"anomaly: {row.name}: canceled pane kept: {' '.join(reason.splitlines())}", file=sys.stderr)
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+            staff.StaffRefused, staff.StaffUnreadable) as error:
+        print(f"anomaly: {identity}: canceled pane close failed: {' '.join(str(error).splitlines())}",
+              file=sys.stderr)
 
 
 def forget_restart(row: staff.StaffRow) -> None:

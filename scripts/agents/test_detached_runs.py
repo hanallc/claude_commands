@@ -2645,6 +2645,11 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIsInstance(completion, progress_history.HookCompletion)
         assert isinstance(completion, progress_history.HookCompletion)
         self.assertEqual((completion.outcome, completion.details, completion.reply_file), ("stopped", (reason,), ""))
+        self.assertTrue(completion.pane_closed)
+        self.assertEqual(self.fixture.world.closed[-1], ("w1:p1", "terminal-w1:p1"))
+        member = staff.snapshot().by_id(row.id)
+        assert member is not None
+        self.assertEqual(member.current_session, row.current_session)
         self.assertEqual(worker_panes.worker_dispatch_state(row, self.run_dir), worker_panes.ReleasedWorkerPass.ENDED)
         worker_name = staff.WorkerName.parse(row.name)
         self.assertEqual(worker.select_worker(self.fixture.parent.id, "impl", staff.snapshot()), worker_name)
@@ -2721,6 +2726,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         progress_history.save_dispatch_delivery(self.run_dir, dispatch,
             progress_history.DispatchDelivery(line, dispatch, str(reply)))
         agent.append(pane, "user", line)
+        self.fixture.world.locations[pane]["agent_status"] = "working"
         path = self.create_stopped_run(row, dispatch)
         with patch.object(detached_runs, "_group_is_live", return_value=False):
             self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
@@ -2748,7 +2754,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         agent.pane_commands(self)
         cases = ((True, ""), (False, ""), (False, "new prompt"), (False, "new DONE"), (False, "detached result"),
                  (False, "assign after result"), (False, "retry after result"), (False, "retry after reassignment"),
-                 (False, "assign during retry"))
+                 (False, "assign during retry"), (False, "restore with pending reply"), (True, "early DONE"))
         for before_stop, later in cases:
             with self.subTest(before_stop=before_stop, later=later):
                 agent.notices.clear()
@@ -2760,27 +2766,78 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
                 result = f"The work is complete.\nDONE {dispatch}"
                 agent.append(pane, "user", delivery.line)
+                path = self.create_stopped_run(row, dispatch)
                 if before_stop:
+                    if later != "early DONE":
+                        finished = worker_lifecycle.read_json_object(path)
+                        finished["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+                        write_text_atomic(path, json.dumps(finished))
                     agent.append(pane, "assistant", result)
                     self.fixture.world.locations[pane]["agent_status"] = "done"
-                path = self.create_stopped_run(row, dispatch)
+                else:
+                    self.fixture.world.locations[pane]["agent_status"] = "working"
+                if later == "early DONE":
+                    self.fixture.world.locations[pane]["agent_status"] = "working"
+                    with (patch.object(detached_runs, "_group_is_live", return_value=False),
+                          patch.object(send, "deliver_worker_text",
+                                       return_value=send.Result("retry", "worker is working")) as submit,
+                          contextlib.redirect_stderr(io.StringIO())):
+                        self.assertEqual(detached_runs.main(["deliver", str(path)]), 1)
+                    submit.assert_called_once()
+                    self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+                    self.assertFalse(reply.exists())
+                    self.assertEqual(agent.notices, [])
+                    self.assertIn(pane, self.fixture.world.locations)
+                    self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), True)
+                    with self.subTest(delivery="early DONE after holder fallback"):
+                        self.fixture.world.locations[pane]["agent_status"] = "blocked"
+                        finished = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+                        self.assertEqual(detached_runs.deliver(finished, detached_runs.CompletedCommand(143)),
+                                         "sent: private director")
+                        self.assertIn(f"Detached run: {finished['run_id']}", agent.notices[-1])
+                        self.fixture.world.locations[pane]["agent_status"] = "done"
+                        event = turn_end.WorkerEvent(str(row.current_session), reply=result)
+                        self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.WAITING_ON_REPLY)
+                        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "active")
+                        self.assertFalse(reply.exists())
+                        self.assertIn(pane, self.fixture.world.locations)
+                        final = f"The stopped run has ended.\nDONE {dispatch}"
+                        agent.append(pane, "assistant", final)
+                        final_event = turn_end.WorkerEvent(str(row.current_session), reply=final)
+                        self.assertEqual(turn_end.handle(final_event), turn_end.TurnOutcome.DONE)
+                        self.assertEqual(reply.read_text().rstrip(), final)
+                        self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
+                    continue
                 with patch.object(detached_runs, "_group_is_live", return_value=False):
                     self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
                 if not before_stop:
+                    self.fixture.world.locations[pane]["agent_status"] = "done"
                     agent.append(pane, "assistant", result)
                     late_reply = reply.with_name(f"reply_late_{dispatch}.txt")
-                    if later in ("detached result", "assign after result"):
+                    if later in ("detached result", "assign after result", "restore with pending reply"):
                         write_text_atomic(late_reply, result)
                         finished = self.record(row, "late-result")
                         finished.update(status="finished", exit_code=0, pane_dispatch_id=dispatch,
                                         delivery=f"sent: worker {row.name} at {pane}")
                         write_text_atomic(Path(finished["log"]).with_suffix(".json"), json.dumps(finished))
                         agent.append(pane, "user", "Detached run: late-result")
+                        if later == "restore with pending reply":
+                            with contextlib.redirect_stderr(io.StringIO()) as errors, contextlib.redirect_stdout(io.StringIO()):
+                                self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.OK)
+                            self.assertEqual(errors.getvalue(), "")
+                            self.assertNotIn(pane, self.fixture.world.locations)
+                            self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "canceled")
+                            member = staff.by_id(row.id)
+                            assert member is not None
+                            self.assertEqual(member.current_session, row.current_session)
+                            continue
+                        self.fixture.world.locations[pane]["agent_status"] = "working"
                         with contextlib.redirect_stderr(io.StringIO()) as errors, contextlib.redirect_stdout(io.StringIO()):
                             self.assertEqual(worker.restore(self.fixture.parent.id), worker.ExitCode.UNCERTAIN)
                         self.assertEqual(errors.getvalue().splitlines(),
                                          ["impl: a detached run result awaits a matching DONE"])
                         self.assertIn(pane, self.fixture.world.locations)
+                        self.fixture.world.locations[pane]["agent_status"] = "done"
                         if later == "assign after result":
                             prompt = reply.with_name("replacement-assignment.txt")
                             write_text_atomic(prompt, "Start the replacement pass.")
@@ -2993,6 +3050,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         dispatch, reply = self.begin_pane_pass(row)
         old_delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
         agent.append(pane, "user", old_delivery.line)
+        self.fixture.world.locations[pane]["agent_status"] = "working"
         path = self.create_stopped_run(row, dispatch)
         with patch.object(detached_runs, "_group_is_live", return_value=False):
             self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
@@ -3221,6 +3279,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertIn("the command group has no confirmed end", errors.getvalue())
                 pending = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                 self.assertEqual(pending["status"], "running")
+                self.assertNotIn("finished_at", pending)
                 identities = frozenset((row.id,))
                 self.assertEqual(detached_runs.live_runs(path.parent, row.name), [pending])
                 self.assertEqual(detached_runs.live_runs_for_staff(path.parent, identities), [pending])
@@ -3232,6 +3291,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 self.assertIn("phase 40: waiting on runs", agent.notices[0])
                 self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
             with patch.object(detached_runs, "_group_is_live", return_value=False):
+                pending["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+                write_text_atomic(path, json.dumps(pending))
+                agent.append(pane, "assistant", result)
                 self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [pending["run_id"]])
             self.assertEqual(detached_runs.live_runs_in_folders({self.run_dir: identities}), [])
         completion = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir))
@@ -3447,6 +3509,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
     def test_stop_and_phase_finish_keep_the_pass_outcome_and_status_together(self) -> None:
         row = self.fixture.worker("impl", family="codex")
         self.fixture.world.add(row, "w1:p1", family="codex")
+        self.fixture.world.locations["w1:p1"]["agent_status"] = "working"
         commit = progress_history.stop_dispatch
         state_path = self.run_dir / unit_runs.STATE_FILE
         for phase_first in (True, False):

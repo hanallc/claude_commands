@@ -2647,7 +2647,7 @@ def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
         return sum(_close_slot_pass(session_dir, state, slot, "canceled", plan_history.now_epoch()) for slot in slots)
 
 
-def _finish_pass(args: argparse.Namespace) -> None:
+def _finish_pass(args: argparse.Namespace) -> CanceledWorkerPass | NoCanceledPane:
     session_dir = _session_dir(args)
     status = _arg_string(args, "status")
     orphaned = bool(getattr(args, "orphaned_launcher", False))
@@ -2665,15 +2665,21 @@ def _finish_pass(args: argparse.Namespace) -> None:
     # still running.
     slot = _team_slot()
     state = _read_state(session_dir)
+    current = _open_passes(state).get(slot, {})
     if instance_id := _optional_arg(args, "pass_instance_id"):
-        if _open_passes(state).get(slot, {}).get("instance_id") != instance_id:
-            return
+        if current.get("instance_id") != instance_id:
+            return NoCanceledPane.NONE
     closed = _close_slot_pass(session_dir, state, slot, status, plan_history.now_epoch())
     if orphaned and not closed:
         raise SystemExit(
             "No pass is open in this slot, so no launcher was orphaned and "
             + "nothing was recorded"
         )
+    identity = _string(current.get("worker_id"))
+    instance = _string(current.get("instance_id"))
+    if closed and status == "canceled" and identity and instance:
+        return CanceledWorkerPass(session_dir, staff.StaffId(identity), instance)
+    return NoCanceledPane.NONE
 
 
 def _resolve_worker_agent(task: str) -> AgentIdentity:
@@ -7092,6 +7098,19 @@ class InterruptedWorkerPasses:
     worker_ids: tuple[staff.StaffId, ...] = ()
 
 
+@dataclass(frozen=True)
+class CanceledWorkerPass:
+    """Identify the exact canceled pass when the recorder releases its lock."""
+
+    run: Path
+    worker_id: staff.StaffId
+    instance: str
+
+
+class NoCanceledPane(Enum):
+    NONE = "the command has no canceled worker pane to close"
+
+
 class KeptWorkerPane(Protocol):
     @property
     def blocker(self) -> str: ...
@@ -7795,6 +7814,10 @@ def _run_recorder_command(args: argparse.Namespace) -> None:
         passes: object = getattr(args, "interrupted_worker_passes", result)
         if isinstance(passes, InterruptedWorkerPasses):
             _close_interrupted_workers(passes)
+        elif isinstance(passes, CanceledWorkerPass):
+            close = cast(Callable[[Path, staff.StaffId, str], None],
+                         import_module("scripts.herdr.worker_panes").close_canceled_worker)
+            close(passes.run, passes.worker_id, passes.instance)
 
 
 def main() -> None:
