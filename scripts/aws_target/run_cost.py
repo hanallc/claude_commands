@@ -398,18 +398,25 @@ class RunEvidence:
             return None, 0, 0
         return Decimal(refused) / max(launched, 1), refused, launched
 
-    def expected_usd(self, price: Decimal, size: str, region: str, modes: tuple[str, ...], wait_usd_per_minute: Decimal,
-                     default_seconds: Decimal, *, unmeasured_extra_s: Decimal) -> Decimal:
-        """Spot price for the median box time, plus the wait cost of the expected refusals first.
-
-        A region without its own runs borrows the other regions' box time and adds unmeasured_extra_s for its transfers."""
+    def expected_box_time(self, size: str, region: str, modes: tuple[str, ...], default_seconds: Decimal,
+                          unmeasured_extra_s: Decimal) -> tuple[Decimal, BoxTimeSource | NoBoxTimeMeasurement]:
+        """Estimate box seconds and identify the source of the measurement."""
         seconds, source = self.box_seconds(size, region, modes)
-        seconds = seconds or [time for kind in dict.fromkeys(map(_run_kind, modes)) for time in self.by_mode.get(kind, [])]
-        box = ((Decimal(median(seconds)) if seconds else default_seconds)
+        baseline = seconds or [time for kind in dict.fromkeys(map(_run_kind, modes)) for time in self.by_mode.get(kind, [])]
+        box = ((median(baseline) if baseline else default_seconds)
                + (Decimal(0) if source is BoxTimeSource.OWN else unmeasured_extra_s))
+        return box, source if seconds else NoBoxTimeMeasurement()
+
+    def refusal_wait_usd(self, size: str, region: str, wait_usd_per_minute: Decimal) -> Decimal:
         # Capacity refusals do not depend on the run kind, so every request counts.
         refusals = self.refusals_per_launch(size, region, EVERY_KIND)[0] or Decimal(0)
-        return price * box / 3600 + refusals * self.refusal_wait_s * wait_usd_per_minute / 60
+        return refusals * self.refusal_wait_s * wait_usd_per_minute / 60
+
+    def expected_usd(self, price: Decimal, size: str, region: str, modes: tuple[str, ...], wait_usd_per_minute: Decimal,
+                     default_seconds: Decimal, *, unmeasured_extra_s: Decimal) -> Decimal:
+        """Estimate compute and the cost of waiting for capacity."""
+        box, _ = self.expected_box_time(size, region, modes, default_seconds, unmeasured_extra_s)
+        return price * box / 3600 + self.refusal_wait_usd(size, region, wait_usd_per_minute)
 
 
 @dataclass(frozen=True)
@@ -469,6 +476,13 @@ def gate_break_even(
 
 
 @dataclass(frozen=True)
+class GatePlacementEstimate:
+    aws_spend_usd: Decimal
+    order_cost_usd: Decimal
+    same_type_seconds: Decimal | NoBoxTimeMeasurement
+
+
+@dataclass(frozen=True)
 class GateRunPricing:
     """The policy and run evidence that rank priced gate variants."""
     evidence: RunEvidence
@@ -492,14 +506,19 @@ class GateRunPricing:
                    region_numbers(values, 'region_extra_gate_seconds'),
                    region_numbers(values, 'unmeasured_region_extra_seconds'))
 
-    def expected_usd(self, price: Decimal, size: str, region: str) -> Decimal:
-        box_and_refusals = self.evidence.expected_usd(
-            price, size, region, self.modes, self.wait_usd_per_minute, self.default_seconds,
-            unmeasured_extra_s=self.unmeasured_extra_seconds.get(region, Decimal(0)),
-        )
+    def placement_estimate(self, price: Decimal, size: str, region: str) -> GatePlacementEstimate:
+        box, source = self.evidence.expected_box_time(
+            size, region, self.modes, self.default_seconds, self.unmeasured_extra_seconds.get(region, Decimal(0)))
+        compute = price * box / 3600
         transfer = self.region_transfer_usd.get(region, self.remote_transfer_usd) if region != self.home else Decimal(0)
-        wait = self.region_extra_seconds.get(region, Decimal(0)) * self.wait_usd_per_minute / 60
-        return box_and_refusals + transfer + wait
+        extra_seconds = self.region_extra_seconds.get(region, Decimal(0))
+        refusal_cost = self.evidence.refusal_wait_usd(size, region, self.wait_usd_per_minute)
+        wait = extra_seconds * self.wait_usd_per_minute / 60
+        measured = box + extra_seconds if source in (BoxTimeSource.OWN, BoxTimeSource.OTHER_REGIONS) else NoBoxTimeMeasurement()
+        return GatePlacementEstimate(compute + transfer, compute + refusal_cost + transfer + wait, measured)
+
+    def expected_usd(self, price: Decimal, size: str, region: str) -> Decimal:
+        return self.placement_estimate(price, size, region).order_cost_usd
 
     def estimate(self, price: Decimal, size: str, region: str) -> GateRunEstimate:
         seconds = self.evidence.median_box_seconds(size, region, self.modes)
@@ -572,7 +591,6 @@ def read_gate_pricing_inputs(directory: Path, now: int, values: conf.ConfigRead,
 @dataclass(frozen=True)
 class GateVariantEligibility:
     variants: tuple[GateLaunchVariant, ...]
-    prices: dict[GateLaunchVariant, Decimal]
     slow_box_seconds: dict[tuple[str, str], Decimal]
 
 
@@ -587,15 +605,21 @@ def slow_gate_types(
 
 
 def gate_variant_eligibility(
-    deployed: Sequence[GateLaunchVariant], directory: Path, evidence: RunEvidence, mode: str,
-    *, now: float, max_age: int, max_gate_minutes: int, live_prices: Sequence[ledger.RegionalSpotPrice] = (),
+    deployed: Sequence[GateLaunchVariant], evidence: RunEvidence, mode: str, max_gate_minutes: int,
 ) -> GateVariantEligibility:
-    """Filter deployed variants by median time and match prices by region, type, and zone."""
-    zone_prices = current_zone_prices(directory, now, max_age)
-    zone_prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
+    """Exclude variants whose median box time exceeds the limit."""
     slow = slow_gate_types(deployed, evidence, (mode,), max_gate_minutes)
     variants = tuple(variant for variant in deployed if (variant.instance_type, variant.region) not in slow)
-    return GateVariantEligibility(variants, deployed_gate_prices(variants, zone_prices), slow)
+    return GateVariantEligibility(variants, slow)
+
+
+def gate_variant_prices(
+    eligible: Sequence[GateLaunchVariant], directory: Path, now: float, max_age: int,
+    live_prices: Sequence[ledger.RegionalSpotPrice],
+) -> dict[GateLaunchVariant, Decimal]:
+    zone_prices = current_zone_prices(directory, now, max_age)
+    zone_prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
+    return deployed_gate_prices(eligible, zone_prices)
 
 
 def merge_gate_comparisons(directory: Path, now: int, values: conf.ConfigRead,
