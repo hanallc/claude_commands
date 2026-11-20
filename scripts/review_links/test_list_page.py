@@ -1326,6 +1326,9 @@ addEventListener('message',event=>{
 </script></body>''')
         page = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage("CASE_PATH" + list_page.PAGE_PATH))
         shell = console.render((page,), console.UnavailablePage()).decode()
+        news_path = f"/console/{console.NEWS_NAME}"
+        for route in (news_path, "/console/for-you.json"):
+            shell = shell.replace(route, "CASE_PATH" + route)
         probe = r'''<script>
 const params=new URLSearchParams(location.search),number=params.get('number'),scenario=params.get('case');
 const proof=scenario==='proof';
@@ -1522,9 +1525,18 @@ frame.addEventListener('load',async()=>{
                             _ = self.wfile.write(body)
 
                     def do_POST(self) -> None:
-                        if self.path == '/list-jump-result':
-                            self.result_rows.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                            self.result_event.set()
+                        if self.path == news_path:
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'application/json')
+                            self.end_headers()
+                            with suppress(BrokenPipeError):
+                                _ = self.wfile.write(b'{"new":[]}')
+                            return
+                        if self.path != '/list-jump-result':
+                            self.send_error(404)
+                            return
+                        self.result_rows.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                        self.result_event.set()
                         self.send_response(204)
                         self.end_headers()
 
@@ -6204,7 +6216,6 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the viewport layout check")
     def test_browser_sort_filters_hash_refresh_open_rows_and_phone_cards(self) -> None:
-        _ = self.fixture_items()
         self.browser()
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
@@ -6337,7 +6348,7 @@ window.fetch=async(_path,options={})=>{
  if(options.method==='POST'){
   const fields=new URLSearchParams(options.body);posts.push(fields);
   if(realFeedback){
-   const result=await nativeFetch('CASE_PATH/feedback',options);
+   const result=await nativeFetch('/feedback',options);
    if(loseResponse){loseResponse=false;throw new Error('fixture lost response');}
    return result;
   }
@@ -6353,7 +6364,7 @@ window.fetch=async(_path,options={})=>{
   return result;
  }
  reads.push(1);if(failRefresh) throw new Error('fixture refresh failed');
- if(realFeedback) return await nativeFetch('CASE_PATH/fresh');
+ if(realFeedback) return await nativeFetch('/fresh');
  return {ok:true,status:200,text:async()=>original};
 };
 addEventListener('error',event=>errors.push(event.message));
@@ -6743,27 +6754,29 @@ try{
   check(cell('106','Producer').display==='none','a phone card leaves out the keeper as producer');
  }
 }catch(error){failed.push(String(error));}
-await nativeFetch('CASE_PATH/results',{method:'POST',body:JSON.stringify([...failed,...errors])});
+await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...errors])});
 })();</script>'''
         for name, identity in (("OWNER", OWNER.id), ("DWIGHT", DWIGHT.id), ("MORTY", MORTY.id), ("OTHER", OTHER.id)):
             probe = probe.replace(name, json.dumps(identity))
         for width in (1440, 961, 390):
-            with self.subTest(width=width):
-                prefix = "/" + uuid4().hex
+            state = self.root / f"state-{width}"
+            with self.subTest(width=width), patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(state)}):
+                _ = self.fixture_items()
                 for identity in ("L105", "L106"):
                     _ = the_list.update(MORTY.id, identity,
                         {"latest_status": f"The fixture uses a width of {width} pixels."}, source="morty")
                 markup = list_page.render(self.root / "reviews").decode()
-                setup_for_width = setup.replace('CASE_PATH', prefix).replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
-                probe_for_width = probe.replace('CASE_PATH', prefix).replace('FIXTURE_WIDTH', str(width))
+                setup_for_width = setup.replace('MARKUP', json.dumps(markup).replace('</', '<\\/'))
+                probe_for_width = probe.replace('FIXTURE_WIDTH', str(width))
                 page = markup.replace('<head>', '<head>' + setup_for_width, 1).replace('</body>', probe_for_width + '</body>').encode()
                 root = self.root / "reviews"
                 results: list[list[str]] = []
                 complete = threading.Event()
-                host = (f'<iframe style="border:0;width:100vw;height:100vh" src="{prefix}/page"></iframe>'
-                        + f'<img hidden src="{prefix}/complete">').encode()
+                host = (b'<iframe style="border:0;width:100vw;height:100vh" src="/page"></iframe>'
+                        + b'<img hidden src="/complete">')
 
                 class Probe(BaseHTTPRequestHandler):
+                    timeout: ClassVar[float | None] = 40
                     result_rows: ClassVar[list[list[str]]] = results
                     result_event: ClassVar[threading.Event] = complete
                     probe_page: ClassVar[bytes] = page
@@ -6804,15 +6817,21 @@ await nativeFetch('CASE_PATH/results',{method:'POST',body:JSON.stringify([...fai
                     def log_message(self, format: str, *args: object) -> None:
                         pass
 
-                with self.probe_server(prefix, Probe) as server:
+                with (patch.object(change_page, "send_to_staff") as sends,
+                      ThreadingHTTPServer(("127.0.0.1", 0), Probe) as server):
+                    # Join the handlers before leaving this width's store.
+                    server.daemon_threads = False
+                    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+                    thread.start()
                     try:
-                        with patch.object(change_page, "send_to_staff") as sends:
-                            self.browser_results(f'http://127.0.0.1:{server.server_port}{prefix}/',
-                                                 width, 900, complete, firefox_only=True)
-                            self.assertEqual(results, [[]])
-                            sends.assert_called_once()
+                        self.browser_results(f'http://127.0.0.1:{server.server_port}/',
+                                             width, 900, complete, firefox_only=True)
+                        self.assertEqual(results, [[]])
+                        sends.assert_called_once()
                     finally:
                         complete.set()
+                        server.shutdown()
+                        thread.join(TEST_HANG_GUARD_SECS)
 
 
 if __name__ == '__main__':
