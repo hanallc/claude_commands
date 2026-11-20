@@ -1535,6 +1535,9 @@ It polls after every fence PUT attempt, including when S3 returns an error statu
 The sender retains the claim if the window ends before it confirms the fence, command termination, and lease release.
 The offload reports a loss if the transfer cannot fit, times out, or the guest cannot confirm its PUT.
 The offload requires an accepted result before it reports a build verdict.
+The offload publishes the result and saves its exit status before it attempts to report completion.
+If a record, admission report, or diagnostic fails, the offload keeps the published verdict and returns its exit status.
+An interrupt during completion reporting can change the exit status, so the caller rejects the result and repeats the run.
 
 ## Hana runtime per run
 
