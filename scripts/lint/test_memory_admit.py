@@ -2061,7 +2061,9 @@ class MemoryQueueFixture(unittest.TestCase):
             return {pid: gate.ProcessIdentity(1, start) for pid, start in self.processes.items()}
         _ = self.enterContext(patch.object(gate, "process_table", side_effect=table))
         def reading(pid: int, _start: str, _processes: dict[int, gate.ProcessIdentity],
-                    _proc: Path) -> admission_records.MeasuredMemory | admission_records.GoneMemory:
+                    _proc: Path, *, track_compilers: bool = False
+                    ) -> admission_records.MeasuredMemory | admission_records.GoneMemory:
+            _ = track_compilers
             # Newly admitted live processes have not allocated memory yet.
             result = self.readings.get(pid, admission_records.MeasuredMemory(0, anonymous=admission_records.AnonymousRunUse(0)))
             scope = self.root / f"fixture-anonymous-{pid}"
@@ -3860,6 +3862,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         scope = Path(sidecar.read_text())
         scope.mkdir(parents=True)
         _ = (scope / "cgroup.procs").write_text("100\n")
+        _ = (scope / "cgroup.events").write_text("populated 1\n")
         _ = (scope / "memory.current").write_text(str(3 * GIB))
         _ = (scope / "memory.stat").write_text(f"anon {2 * GIB}\nshmem 0\ninactive_file {GIB}\n")
         _ = (scope / "memory.swap.current").write_text(str(7 * GIB))
@@ -3881,6 +3884,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         scope = self.builds / "ending.scope"
         scope.mkdir(parents=True)
         _ = (scope / "cgroup.procs").write_text("101\n")
+        _ = (scope / "cgroup.events").write_text("populated 1\n")
         _ = (scope / "memory.stat").write_text("inactive_file 0\n")
         sidecar = self.root / "scope-path"
         _ = sidecar.write_text(str(scope))
@@ -4497,6 +4501,12 @@ class QueueApiTests(MemoryQueueFixture):
 
 class ProgressKeepAsideTests(unittest.TestCase):
     @staticmethod
+    def executable(proc: Path, pid: int, program: str = "verify") -> None:
+        link = proc / str(pid) / "exe"
+        link.unlink(missing_ok=True)
+        link.symlink_to(f"/fixture/bin/{program}")
+
+    @staticmethod
     def reservation(step: str = "build", *, identity: str = "step", need: int = 10 * GIB) -> admission_records.Reservation:
         return {**fixture_reservation(100, need), "step": step, "reservation_id": identity,
                 "build_run": LiveBuildRun(50, "50", 100)}
@@ -4614,7 +4624,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
         scope = Path("/fixture/builds.slice/test.scope")
         reading = admission_records.MeasuredMemory(use, anonymous=admission_records.AnonymousRunUse(use),
             anonymous_source=admission_records.ScopeSource(scope, frozenset({100})),
-            test_compilers="none",
+            compiler_evidence=admission_records.NoCompilerSeen(),
             peak_history=admission_records.PeakDecayed(peak, row["need"], 1, 181, False))
         base = replace(self.inputs((row,), (reading,)), now=182)
         (step,) = base.running
@@ -4648,6 +4658,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 f"peak_hold_seconds.merge-gate={hold}\ntest_phase_margin={margin}\n")
             with AdmissionFixture(root=root) as fixture:
                 request = fixture.request(step="merge-gate", need=46 * GIB // 10)
+                self.executable(fixture.proc.path, request.owner.pid)
                 sidecar = fixture.scope(request.owner, current=first_use, anonymous=first_use)
                 grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
                 fixture.scoped_peak(grant, grant.need)
@@ -4672,8 +4683,16 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 stat = fixture.proc.path / str(request.owner.pid) / "stat"
                 original = stat.read_text()
                 _ = stat.write_text(original.replace("(verify)", "(rustc)"))
+                self.executable(fixture.proc.path, request.owner.pid, "rustc")
                 self.assertEqual(need(), grant.need)
+                inputs = fixture.server.last_inputs
+                assert isinstance(inputs, admission_records.QueueInputs)
+                step, = (step for step in inputs.running if step.pid == request.owner.pid)
+                self.assertIn("full need: compiler running", gate.progress_text(step.measured))
+                self.assertEqual(memory_feed.need_notes((step,)),
+                    {"need_part": False, "need_reason": "full need: compiler running"})
                 _ = stat.write_text(original)
+                self.executable(fixture.proc.path, request.owner.pid)
 
                 _ = wave.write_text(f"{grant.need} {int(fixture.clock.now())}\n")
                 self.assertEqual(need(), grant.need)
@@ -4683,12 +4702,27 @@ class ProgressKeepAsideTests(unittest.TestCase):
     def test_gate_decay_uses_tree_memory_and_requires_complete_compiler_evidence(self) -> None:
         full = 46 * GIB // 10
         use = 3 * (GIB // 1024) // 10 * 1024
-        for name, scoped, compiler, expected in (
-            ("09:07 gate with empty sidecar", False, "verify", math.ceil(use * 1.2)),
-            ("unreadable scope member", True, "", full),
-            ("unreadable tree member", False, "", full),
-            ("standalone mold in scope", True, "mold", full),
-            ("standalone mold in tree", False, "mold", full),
+        reduced = math.ceil(use * 1.2)
+        for name, scoped, program, executable, expected in (
+            ("09:07 gate with empty sidecar", False, "verify", "verify", reduced),
+            ("unreadable scope member", True, "", "verify", full),
+            ("unreadable tree member", False, "", "verify", full),
+            ("standalone mold in scope", True, "mold", "verify", full),
+            ("standalone assembler", True, "as", "as", full),
+            ("target-prefixed linker", True, "x86_64-linux-gnu-ld", "x86_64-linux-gnu-ld", full),
+            ("WebAssembly linker", True, "wasm-ld", "wasm-ld", full),
+            ("Clang driver", False, "verify", "clang-cl", full),
+            ("Windows linker", False, "lld-link", "verify", full),
+            ("target prefix and version", False, "verify", "aarch64-unknown-linux-musl-clang-18.1", full),
+            ("standalone Cargo build script", True, "build-script-build", "build-script-build", full),
+            ("Cargo build script with a hash", True, "build_script_bu", "build_script_build-89c2e40f17be1d55", full),
+            ("standalone mold in tree", False, "mold", "verify", full),
+            ("version in comm", True, "clang-18", "verify", full),
+            ("version in executable", False, "verify", "clang-18", full),
+            ("gcc family", True, "gcc-14", "gcc-14", full),
+            ("rustc with a dotted version", False, "rustc-1.83", "rustc-1.83", full),
+            ("compiler family with a plus suffix", True, "cc1plus", "cc1plus", full),
+            ("name outside the tool families", True, "test-helper", "test-helper", reduced),
         ):
             with self.subTest(name=name), AdmissionFixture() as fixture:
                 _ = write_config_fixture(fixture.root / "build_admission.conf",
@@ -4697,9 +4731,11 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 request = fixture.request(step="merge-gate", need=full, owner=owner)
                 child = owner.pid + 1_000_000
                 write_process(fixture.proc.path, child, use, parent=owner.pid)
+                self.executable(fixture.proc.path, owner.pid)
+                self.executable(fixture.proc.path, child, executable)
                 stat = fixture.proc.path / str(child) / "stat"
-                if compiler:
-                    _ = stat.write_text(stat.read_text().replace("(verify)", f"({compiler})"))
+                if program:
+                    _ = stat.write_text(stat.read_text().replace("(verify)", f"({program})"))
                 sidecar = fixture.root / "program.cgroup"
                 if scoped:
                     sidecar = fixture.scope(owner, current=use, anonymous=use, members=(owner.pid, child))
@@ -4708,7 +4744,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
                 fixture.scoped_peak(grant, full)
                 _ = Path(grant.wave_path).write_text(f"{full} {int(fixture.clock.now())}\n")
-                if not compiler:
+                if not program:
                     stat.unlink()
                 fixture.clock.advance(181)
                 self.assertEqual(self.current_service_need(fixture), expected)
@@ -4716,6 +4752,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
     def test_a_live_owner_missing_from_the_process_scan_keeps_its_reservation(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request(step="merge-gate")
+            self.executable(fixture.proc.path, request.owner.pid)
             grant = only_admitted(fixture.server.handle_request(request))
             (fixture.proc.path / str(request.owner.pid) / "stat").unlink()
             self.assertEqual(fixture.proc.owner_start(request.owner.pid),
@@ -4724,6 +4761,30 @@ class ProgressKeepAsideTests(unittest.TestCase):
             self.assertIn(request.episode, fixture.server.reservations)
             self.assertEqual(self.current_service_need(fixture), grant.need)
 
+    def test_child_cgroup_members_keep_the_reservation_after_the_owner_exits(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="merge-gate")
+            proc = fixture.proc.path
+            child = request.owner.pid + 1_000_000
+            write_process(proc, child, GIB)
+            self.executable(proc, child)
+            sidecar = fixture.scope(request.owner, members=())
+            scope = Path(sidecar.read_text())
+            nested = scope / "child"
+            write_scope(nested, members=(child,), current=GIB, anonymous=GIB)
+            grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+            fixture.scoped_peak(grant, grant.need)
+            fixture.proc.kill(request.owner)
+            (proc / str(request.owner.pid) / "stat").unlink()
+
+            self.assertEqual(self.current_service_need(fixture), grant.need)
+            self.assertIn(request.episode, fixture.server.reservations)
+
+            _ = (nested / "cgroup.procs").write_text("")
+            _ = (scope / "cgroup.events").write_text("populated 0\n")
+            _ = fixture.run_pass()
+            self.assertNotIn(request.episode, fixture.server.reservations)
+
     def test_decay_peak_excludes_processes_assigned_to_a_child_reservation(self) -> None:
         with AdmissionFixture() as fixture:
             _ = write_config_fixture(fixture.root / "build_admission.conf",
@@ -4731,6 +4792,8 @@ class ProgressKeepAsideTests(unittest.TestCase):
             parent = fixture.proc.spawn(used=GIB)
             child = fixture.proc.spawn(used=2 * GIB)
             write_process(fixture.proc.path, child.pid, 2 * GIB, parent=parent.pid, start=child.start_time)
+            self.executable(fixture.proc.path, parent.pid)
+            self.executable(fixture.proc.path, child.pid)
             gate_request = fixture.request(step="merge-gate", owner=parent)
             grant = only_admitted(fixture.server.handle_request(gate_request))
             fixture.clock.advance(5)
@@ -4749,8 +4812,10 @@ class ProgressKeepAsideTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             _ = write_config_fixture(fixture.root / "build_admission.conf", "peak_hold_seconds.merge-gate=180\n")
             request = fixture.request(step="merge-gate", owner=fixture.proc.spawn(used=GIB))
+            self.executable(fixture.proc.path, request.owner.pid)
             child = request.owner.pid + 1_000_000
             write_process(fixture.proc.path, child, GIB, parent=request.owner.pid, start="10")
+            self.executable(fixture.proc.path, child)
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.scoped_peak(grant, grant.need)
             _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
@@ -4765,10 +4830,284 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 assert isinstance(step.measured, admission_records.MeasuredMemory)
                 self.assertEqual(step.measured.bytes, GIB)
 
+    def test_reused_scope_pid_cannot_hide_a_compiler(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = write_config_fixture(fixture.root / "build_admission.conf", "peak_hold_seconds.merge-gate=180\n")
+            request = fixture.request(step="merge-gate")
+            self.executable(fixture.proc.path, request.owner.pid)
+            child = request.owner.pid + 1_000_000
+            write_process(fixture.proc.path, child, GIB, start="10")
+            self.executable(fixture.proc.path, child)
+            sidecar = fixture.scope(request.owner, current=GIB, anonymous=GIB, members=(request.owner.pid, child))
+            grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+            fixture.scoped_peak(grant, grant.need)
+            _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+            fixture.clock.advance(181)
+            scanned = fixture.proc.processes()
+            write_process(fixture.proc.path, child, GIB, start="11")
+            stat = fixture.proc.path / str(child) / "stat"
+            _ = stat.write_text(stat.read_text().replace("(verify)", "(rustc)"))
+            with patch.object(fixture.proc, "processes", return_value=scanned):
+                self.assertEqual(self.current_service_need(fixture), grant.need)
+            self.assertEqual(self.current_service_need(fixture), grant.need)
+
+    def test_scope_read_keeps_the_full_need_after_exec_or_exit(self) -> None:
+        for change in ("exec", "exit"):
+            with self.subTest(change=change), AdmissionFixture() as fixture:
+                _ = write_config_fixture(fixture.root / "build_admission.conf",
+                    "peak_hold_seconds.merge-gate=180\ntest_phase_margin=1.2\n")
+                request = fixture.request(step="merge-gate")
+                proc = fixture.proc.path
+                child = request.owner.pid + 1_000_000
+                write_process(proc, child, GIB, start="10")
+                self.executable(proc, request.owner.pid)
+                self.executable(proc, child, "bash")
+                sidecar = fixture.scope(request.owner, current=GIB, anonymous=GIB, members=(request.owner.pid, child))
+                scope = Path(sidecar.read_text())
+                grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+                fixture.scoped_peak(grant, grant.need)
+                _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+                fixture.clock.advance(181)
+                read_scope = gate.slice_working_set
+                changed = False
+
+                def change_during_memory(path: Path) -> admission_records.MeasuredMemory:
+                    nonlocal changed
+                    reading = read_scope(path)
+                    if path == scope and not changed:
+                        changed = True
+                        if change == "exec":
+                            self.executable(proc, child, "rustc")
+                        else:
+                            (proc / str(child) / "stat").unlink()
+                            _ = (scope / "cgroup.procs").write_text(f"{request.owner.pid}\n")
+                    return reading
+
+                with patch.object(gate, "slice_working_set", side_effect=change_during_memory):
+                    self.assertEqual(self.current_service_need(fixture), grant.need)
+                self.assertTrue(changed)
+                expected = grant.need if change == "exec" else math.ceil(GIB * 1.2)
+                self.assertEqual(self.current_service_need(fixture), expected)
+
+    def test_a_new_tree_member_keeps_the_full_need(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = write_config_fixture(fixture.root / "build_admission.conf",
+                "peak_hold_seconds.merge-gate=180\ntest_phase_margin=1.2\n")
+            owner = fixture.proc.spawn(used=GIB)
+            proc = fixture.proc.path
+            request = fixture.request(step="merge-gate", owner=owner)
+            self.executable(proc, owner.pid)
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant, grant.need)
+            _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+            fixture.clock.advance(181)
+            self.assertEqual(self.current_service_need(fixture), math.ceil(GIB * 1.2))
+            child = owner.pid + 1_000_000
+            status = proc / str(owner.pid) / "status"
+            read_bytes = Path.read_bytes
+            started = False
+
+            def start_during_memory(path: Path) -> bytes:
+                nonlocal started
+                if path == status and not started:
+                    started = True
+                    write_process(proc, child, GIB, parent=owner.pid)
+                    self.executable(proc, child, "rustc")
+                return read_bytes(path)
+
+            with patch.object(Path, "read_bytes", start_during_memory):
+                self.assertEqual(self.current_service_need(fixture), grant.need)
+            self.assertTrue(started)
+
+    def test_a_new_sccache_job_keeps_the_full_need(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = write_config_fixture(fixture.root / "build_admission.conf",
+                "peak_hold_seconds.merge-gate=180\ntest_phase_margin=1.2\n")
+            request = fixture.request(step="merge-gate")
+            proc = fixture.proc.path
+            self.executable(proc, request.owner.pid)
+            sidecar = fixture.scope(request.owner, current=GIB, anonymous=GIB)
+            scope = Path(sidecar.read_text())
+            compiler_service = fixture.root / "builds.slice" / "sccache.service"
+            write_scope(compiler_service)
+            grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+            fixture.scoped_peak(grant, grant.need)
+            _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+            fixture.clock.advance(181)
+            self.assertEqual(self.current_service_need(fixture), math.ceil(GIB * 1.2))
+            child = request.owner.pid + 1_000_000
+            read_scope = gate.slice_working_set
+            started = False
+
+            def start_during_memory(path: Path) -> admission_records.MeasuredMemory:
+                nonlocal started
+                if path == scope and not started:
+                    started = True
+                    write_process(proc, child, GIB)
+                    self.executable(proc, child, "rustc")
+                    _ = (proc / str(child) / "environ").write_bytes(
+                        b"BUILDLOG_STEP_SCOPE=" + os.fsencode(scope) + b"\0")
+                    write_scope(compiler_service, members=(child,), current=GIB, anonymous=GIB)
+                return read_scope(path)
+
+            with patch.object(gate, "slice_working_set", side_effect=start_during_memory):
+                self.assertEqual(self.current_service_need(fixture), grant.need)
+            self.assertTrue(started)
+            write_scope(compiler_service)
+            self.assertEqual(self.current_service_need(fixture), math.ceil(GIB * 1.2))
+
+    def test_sccache_jobs_match_descendant_scopes(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = write_config_fixture(fixture.root / "build_admission.conf",
+                "peak_hold_seconds.merge-gate=180\ntest_phase_margin=1.2\n")
+            request = fixture.request(step="merge-gate")
+            proc = fixture.proc.path
+            self.executable(proc, request.owner.pid)
+            sidecar = fixture.scope(request.owner, current=GIB, anonymous=GIB)
+            scope = Path(sidecar.read_text())
+            descendant = scope / "child.scope"
+            write_scope(descendant)
+            compiler_service = fixture.root / "builds.slice" / "sccache.service"
+            daemon = request.owner.pid + 1_000_000
+            write_process(proc, daemon, GIB)
+            self.executable(proc, daemon, "sccache")
+            _ = (proc / str(daemon) / "environ").write_bytes(b"HOME=/fixture\0")
+            write_scope(compiler_service, members=(daemon,), current=GIB, anonymous=GIB)
+
+            with patch.object(fixture.readings, "compilers", side_effect=lambda: gate.sccache_memory(proc)):
+                grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+                fixture.scoped_peak(grant, grant.need)
+                _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+                fixture.clock.advance(181)
+                reduced = math.ceil(GIB * 1.2)
+                self.assertEqual(self.current_service_need(fixture), reduced)
+
+                compiler = daemon + 1
+                write_process(proc, compiler, GIB)
+                self.executable(proc, compiler, "rustc")
+                environment = proc / str(compiler) / "environ"
+                write_scope(compiler_service, members=(daemon, compiler), current=2 * GIB, anonymous=2 * GIB)
+                for name, job_scope, expected, evidence in (
+                    ("descendant", descendant, grant.need, admission_records.CompilerSeen),
+                    ("sibling with the same prefix", scope.with_name(scope.name + "-other"),
+                     reduced, admission_records.NoCompilerSeen),
+                ):
+                    with self.subTest(name=name):
+                        _ = environment.write_bytes(b"BUILDLOG_STEP_SCOPE=" + os.fsencode(job_scope) + b"\0")
+                        self.assertEqual(self.current_service_need(fixture), expected)
+                        inputs = fixture.server.last_inputs
+                        assert isinstance(inputs, admission_records.QueueInputs)
+                        step, = (step for step in inputs.running if step.pid == request.owner.pid)
+                        assert isinstance(step.measured, admission_records.MeasuredMemory)
+                        self.assertIsInstance(step.measured.compiler_evidence, evidence)
+
+    def test_tree_decay_uses_only_sccache_jobs_for_live_tree_cgroups(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = write_config_fixture(fixture.root / "build_admission.conf",
+                "peak_hold_seconds.merge-gate=180\ntest_phase_margin=1.2\n")
+            owner = fixture.proc.spawn(used=0)
+            request = fixture.request(step="merge-gate", owner=owner)
+            proc = fixture.proc.path
+            self.executable(proc, owner.pid, "cargo")
+            test_pid = owner.pid + 1_000_000
+            write_process(proc, test_pid, GIB, parent=owner.pid)
+            self.executable(proc, test_pid, "test-binary")
+            cgroup = "/fixture/builds.slice/gate.scope"
+            for pid in (owner.pid, test_pid):
+                _ = (proc / str(pid) / "cgroup").write_text(f"0::{cgroup}\n")
+            scope = Path("/sys/fs/cgroup" + cgroup)
+            compiler_service = fixture.root / "builds.slice" / "sccache.service"
+            write_scope(compiler_service)
+
+            with patch.object(fixture.readings, "compilers", side_effect=lambda: gate.sccache_memory(proc)):
+                grant = only_admitted(fixture.server.handle_request(request))
+                fixture.scoped_peak(grant, grant.need)
+                _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+                fixture.clock.advance(181)
+                reduced = math.ceil(GIB * 1.2)
+                with self.subTest(case="cargo and test binary without rustc"):
+                    self.assertEqual(self.current_service_need(fixture), reduced)
+
+                compiler = test_pid + 1
+                write_process(proc, compiler, GIB)
+                self.executable(proc, compiler, "rustc")
+                environment = proc / str(compiler) / "environ"
+                write_scope(compiler_service, members=(compiler,), current=GIB, anonymous=GIB)
+                for name, tag, expected in (
+                    ("unrelated", os.fsencode(scope.with_name("other.scope")), reduced),
+                    ("tree member cgroup", os.fsencode(scope), grant.need),
+                    ("descendant of tree member cgroup", os.fsencode(scope / "worker"), grant.need),
+                    ("ancestor with no tree member", os.fsencode(scope.parent), reduced),
+                    ("empty", b"", grant.need),
+                    ("unreadable", None, grant.need),
+                ):
+                    with self.subTest(tag=name):
+                        if tag is None:
+                            environment.unlink()
+                        else:
+                            _ = environment.write_bytes(b"BUILDLOG_STEP_SCOPE=" + tag + b"\0")
+                        self.assertEqual(self.current_service_need(fixture), expected)
+
+    def test_a_profile_keeps_the_full_need_until_a_post_decay_sample_arrives(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = write_config_fixture(fixture.root / "build_admission.conf",
+                "peak_hold_seconds.merge-gate=180\ntest_phase_margin=1.2\n")
+            request = fixture.request(step="merge-gate")
+            self.executable(fixture.proc.path, request.owner.pid)
+            sidecar = fixture.scope(request.owner, current=GIB, anonymous=GIB)
+            grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+            fixture.scoped_peak(grant, grant.need)
+            _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+            config = fixture.server.last_usable_configuration
+            assert isinstance(config, admission_records.MemoryConfig)
+            record = fixture.server.reservations[request.episode]
+            plan = service.SystemReadingPlan(config, (record,), (), False)
+            before_decay = service.read_system(plan, fixture.readings, fixture.proc, fixture.clock)
+            fixture.clock.advance(181)
+            with patch.object(progress.ProfileHistory, "matching", return_value=self.profile("suites:1", GIB // 2)), patch.object(
+                    progress, "read_counter", return_value=progress.ProgressCounter("suites:1", 80, 100)):
+                with patch.object(service, "read_system", return_value=before_decay):
+                    self.assertEqual(self.current_service_need(fixture), grant.need)
+                self.assertEqual(self.current_service_need(fixture), math.ceil(GIB * 1.2))
+
+    def test_first_peak_published_during_memory_read_keeps_the_full_need(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="merge-gate")
+            sidecar = fixture.scope(request.owner, current=GIB, anonymous=GIB)
+            grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+            peak = Path(grant.max_path)
+            wave = Path(grant.wave_path)
+            scope_stat = Path(sidecar.read_text()) / "memory.stat"
+            read_text = Path.read_text
+            published = False
+
+            def publish_first_peak(path: Path, *args: str, **kwargs: str) -> str:
+                nonlocal published
+                content = read_text(path, *args, **kwargs)
+                if path == scope_stat and not published:
+                    published = True
+                    fixture.scoped_peak(grant, grant.need)
+                    _ = wave.write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+                return content
+
+            self.assertFalse(peak.exists())
+            self.assertFalse(wave.exists())
+            with patch.object(Path, "read_text", publish_first_peak), patch.object(
+                    progress.ProfileHistory, "matching", return_value=self.profile("suites:1", GIB // 2)), patch.object(
+                    progress, "read_counter", return_value=progress.ProgressCounter("suites:1", 80, 100)):
+                self.assertEqual(self.current_service_need(fixture), grant.need)
+            self.assertTrue(published)
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, admission_records.QueueInputs)
+            (reading,) = (step.measured for step in inputs.running if gate.running_has_reservation(step))
+            assert isinstance(reading, admission_records.ProgressAdjustedMemory)
+            self.assertEqual(reading.peak_history, admission_records.PeakFileUnreadable(grant.need))
+
     def test_zero_is_a_complete_peak_after_decay(self) -> None:
         with AdmissionFixture() as fixture:
             _ = write_config_fixture(fixture.root / "build_admission.conf", "peak_hold_seconds.merge-gate=180\n")
             request = fixture.request(step="merge-gate", owner=fixture.proc.spawn(used=0))
+            self.executable(fixture.proc.path, request.owner.pid)
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.scoped_peak(grant, grant.need)
             _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
@@ -4793,6 +5132,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 _ = write_config_fixture(fixture.root / "build_admission.conf",
                     "peak_hold_seconds.merge-gate=180\npeak_hold_seconds.nextest=180\n")
                 request = fixture.request(step=step, need=8 * GIB)
+                self.executable(fixture.proc.path, request.owner.pid)
                 sidecar = fixture.scope(request.owner, current=GIB, anonymous=GIB)
                 grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
                 fixture.scoped_peak(grant, grant.need)
@@ -4820,7 +5160,9 @@ class ProgressKeepAsideTests(unittest.TestCase):
         reading = admission_records.MeasuredMemory(use.bytes, anonymous=use,
             anonymous_source=admission_records.ScopeSource(scope, frozenset({100})))
         for reason, history, compiling in (
-            ("compiler", admission_records.PeakDecayed(GIB, row["need"], 1, 181, False), (scope,)),
+            ("compiler running", admission_records.PeakDecayed(GIB, row["need"], 1, 181, False), (scope,)),
+            ("compiler running", admission_records.PeakDecayed(GIB, row["need"], 1, 181, False),
+             (scope / "child.scope",)),
             ("near-peak sample", admission_records.PeakSoFar(row["need"], 1.0, 182.0,
                 near_peak_is_fresh=True), ()),
         ):
@@ -4878,6 +5220,23 @@ class ProgressKeepAsideTests(unittest.TestCase):
         assert isinstance(room, admission_records.MemoryRoom)
         self.assertEqual((room.used, room.kept), (6 * GIB + GIB // 10, 10 * GIB - 6 * GIB - GIB // 10))
 
+    def test_descendant_compiler_job_counts_once_in_the_nearest_reserved_scope(self) -> None:
+        scope = Path("/cgroup/builds.slice/run-build.scope")
+        child_scope = scope / "child.scope"
+        parent = self.reservation(identity="parent")
+        child: admission_records.Reservation = {**self.reservation(identity="child"), "pid": 101}
+        use = admission_records.AnonymousRunUse
+        readings = (
+            admission_records.MeasuredMemory(3 * GIB, anonymous=use(3 * GIB),
+                anonymous_source=admission_records.ScopeSource(scope, frozenset({100, 101}))),
+            admission_records.MeasuredMemory(GIB, anonymous=use(GIB),
+                anonymous_source=admission_records.ScopeSource(child_scope, frozenset({101}))),
+        )
+        inputs = self.inputs((parent, child), readings)
+        job_uses = {child_scope / "job.scope": use(4 * GIB)}
+        attributed = gate.attributed_step_uses(inputs, compiler_uses=job_uses)
+        self.assertEqual(tuple(memory.use for _, _, memory in attributed), (use(2 * GIB), use(5 * GIB)))
+
     def test_sccache_reading_groups_its_compilers_by_step_scope_and_keeps_the_rest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4892,11 +5251,11 @@ class ProgressKeepAsideTests(unittest.TestCase):
                     (11, "rustc", 3 * 1024 * 1024, b"HOME=/h\0BUILDLOG_STEP_SCOPE=" + scope.encode() + b"\0"),
                     (12, "cc", 1024 * 1024, b"BUILDLOG_STEP_SCOPE=" + scope.encode() + b"\0"),
                     (13, "rustc", 2 * 1024 * 1024, b"BUILDLOG_STEP_SCOPE=/cgroup/run-other.scope\0")):
+                write_process(proc, pid, kib * 1024)
+                self.executable(proc, pid, program)
                 folder = proc / str(pid)
-                folder.mkdir(parents=True)
                 _ = (folder / "comm").write_text(program + "\n")
                 _ = (folder / "environ").write_bytes(environment)
-                _ = (folder / "status").write_text(f"VmRSS:\t{kib} kB\nRssAnon:\t{kib} kB\nRssShmem:\t0 kB\n")
             with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice")}):
                 reading, = gate.sccache_memory(proc)
             assert isinstance(reading, admission_records.CompilerServiceMemory)
@@ -4905,6 +5264,65 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 admission_records.CompilerJob(Path(scope), admission_records.AnonymousRunUse(4 * GIB)),
                 admission_records.CompilerJob(Path("/cgroup/run-other.scope"), admission_records.AnonymousRunUse(2 * GIB))))
             self.assertEqual(reading.bytes, 3 * GIB)
+
+    def test_reused_compiler_service_pid_marks_evidence_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = root / "builds.slice" / "sccache.service"
+            proc = root / "proc"
+            pid = 11
+            write_scope(scope, members=(pid,), current=GIB, anonymous=GIB)
+            write_process(proc, pid, GIB, start="10")
+            process = proc / str(pid)
+            _ = (process / "comm").write_text("verify\n")
+            _ = (process / "environ").write_bytes(b"HOME=/fixture\0")
+            self.executable(proc, pid)
+            named_step_scope = gate.named_step_scope
+
+            def replace_process(member: int, path: Path) -> Path | gate.NoStepScope:
+                result = named_step_scope(member, path)
+                write_process(proc, pid, GIB, start="11")
+                self.executable(proc, pid, "rustc")
+                return result
+
+            with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(scope.parent)}), patch.object(
+                    gate, "named_step_scope", side_effect=replace_process):
+                (reading,) = gate.sccache_memory(proc)
+            assert isinstance(reading, admission_records.CompilerServiceMemory)
+            self.assertIsInstance(reading.compiler_evidence, admission_records.CompilerEvidenceIncomplete)
+
+    def test_compiler_service_excludes_a_pid_reused_after_the_membership_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = root / "builds.slice" / "sccache.service"
+            proc = root / "proc"
+            pid = 11
+            write_scope(scope, members=(pid,), current=GIB, anonymous=GIB)
+            write_process(proc, pid, GIB, start="10")
+            self.executable(proc, pid, "rustc")
+            process = proc / str(pid)
+            _ = (process / "comm").write_text("rustc\n")
+            _ = (process / "environ").write_bytes(b"BUILDLOG_STEP_SCOPE=/fixture/build.scope\0")
+            read_text = Path.read_text
+            replaced = False
+
+            def reuse_after_membership(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                nonlocal replaced
+                content = read_text(path, encoding=encoding, errors=errors)
+                if path == scope / "cgroup.procs" and not replaced:
+                    replaced = True
+                    _ = path.write_text("")
+                    write_process(proc, pid, 2 * GIB, start="11")
+                return content
+
+            with patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(scope.parent)}), patch.object(
+                    Path, "read_text", reuse_after_membership):
+                (reading,) = gate.sccache_memory(proc)
+            assert isinstance(reading, admission_records.CompilerServiceMemory)
+            self.assertTrue(replaced)
+            self.assertIsInstance(reading.compiler_evidence, admission_records.CompilerEvidenceIncomplete)
+            self.assertEqual(reading.jobs, ())
+            self.assertEqual(reading.bytes, GIB)
 
     def test_shared_process_use_is_counted_once_before_distinct_step_profiles_are_grouped(self) -> None:
         rows = (self.reservation("build", identity="z-parent"), self.reservation("clippy", identity="a-child"))

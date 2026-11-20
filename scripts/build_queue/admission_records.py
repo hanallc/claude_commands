@@ -487,10 +487,36 @@ class ProcessAnonymousUse:
 
 
 @dataclass(frozen=True)
+class NoCompilerSeen:
+    """Both snapshots agree that no compiler is active."""
+
+
+@dataclass(frozen=True)
+class CompilerSeen:
+    """Both snapshots identify an active compiler."""
+
+
+@dataclass(frozen=True)
+class CompilerEvidenceIncomplete:
+    """The compiler evidence cannot support a reduction in need."""
+    reason: str
+
+
+CompilerEvidence = NoCompilerSeen | CompilerSeen | CompilerEvidenceIncomplete
+
+
+@dataclass(frozen=True)
+class CompilerEvidenceNotRecorded:
+    """This memory record has no compiler evidence."""
+
+
+@dataclass(frozen=True)
 class ScopeSource:
     """The memory reading comes from this scope and its process members."""
     directory: Path
     members: frozenset[int]
+    compiler_evidence: CompilerEvidence | CompilerEvidenceNotRecorded = field(
+        default_factory=CompilerEvidenceNotRecorded, kw_only=True, compare=False)
 
 
 @dataclass(frozen=True)
@@ -498,15 +524,16 @@ class ProcessSource:
     """The memory reading comes from these individual processes."""
     processes: tuple[ProcessAnonymousUse, ...]
     memory_read_incomplete: bool = field(default=False, kw_only=True)
+    compiler_evidence: CompilerEvidence | CompilerEvidenceNotRecorded = field(
+        default_factory=CompilerEvidenceNotRecorded, kw_only=True, compare=False)
 
 
 @dataclass(frozen=True)
 class NoSource:
     """The memory reading has no recorded source."""
 
-TestCompilers = Literal["unrecorded", "none", "running", "incomplete"]
 TestNeedReason = Literal["compiler", "compiler evidence unavailable", "near-peak sample",
-                         "peak evidence unavailable", "peak after decay"]
+                         "peak evidence unavailable", "post-decay sample unavailable", "peak after decay"]
 
 
 @dataclass(frozen=True)
@@ -534,7 +561,8 @@ class MeasuredMemory:
     # An existing peak file could not be read; its promise remains a floor.
     unknown_peak_promise: int = 0
     peak_history: PeakHistory = NoPeakRecorded()
-    test_compilers: TestCompilers = field(default="unrecorded", kw_only=True)
+    compiler_evidence: CompilerEvidence | CompilerEvidenceNotRecorded = field(
+        default_factory=CompilerEvidenceNotRecorded, kw_only=True)
 
 
 @dataclass(frozen=True)

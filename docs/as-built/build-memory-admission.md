@@ -1846,16 +1846,35 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 A second promise rule is measured and declined (showrunner, 2026-10-28: simple wins). The rule: a running build whose need is above a limit keeps its full promise; the running builds at or under it are promised the largest gap in full plus `max(0, 0.6 x need - anon)` each. The replay used 4 h of 5 s admission samples (2026-10-28 03:27-07:27Z, 240 waits, 1863 wait minutes), and "short" counts admitting ticks where the running builds' real growth after the tick passes `MemAvailable` minus the reserve. With a 6 GiB limit the rule saves 331 of 1863 minutes against 249 for the current rule, with the short rate at 0.8% against 0% (5 GiB: 326 min, 0.9%; 8 GiB: 501 min, 1.4%). The same rule limited by the waiting step's need never gets below 6.9% short. At about 4% of the wait for a second rule and a nonzero short rate, it is not built; a shortfall is the 2026-09-30 freeze. Do not measure it again unless the mix of steps changes.
 
 A reservation stays active while its owner or scope is live.
+The `populated` field in `cgroup.events` keeps the scope live while a child cgroup has members.
 A live owner missing from the process scan keeps its accepted need.
 For `merge-gate`, `targeted-test`, `nextest`, and `test`, a complete scope or process tree reading can reduce the need after `peak_hold`.
 The service assigns shared memory to one reservation before it measures the peak.
 The need uses the largest sample since decay, multiplied by `test_phase_margin` and capped at the accepted need.
+The accepted need applies until a complete post-decay sample arrives.
 A complete sample of zero counts toward the peak.
 The service keeps this peak in memory for the current decay. After a restart, the first sample starts the measurement again.
 A recorded near-peak sample retains the accepted need for `peak_hold`, including after a service restart.
 A compiler or linker in the scope or process tree restores the accepted need.
-The service checks each process start time after reading its memory.
-A changed start time or other incomplete compiler evidence retains the accepted need.
+Only a test step with a decayed peak checks for compilers before and after its memory read.
+Other steps use the current process table or scope membership for memory accounting.
+For each test step that can use decay, the reader checks the identity, size, and timestamps of `.max` and `.wave` around the memory read.
+A change to either file during the read makes the peak evidence incomplete.
+A matching progress profile can reduce the need when the peak files stay stable and no peak is recorded.
+Each compiler check captures the member set, process start times, executables, and relevant compiler service jobs.
+The reader matches build tool families by process name or executable name after removing the target prefix and numeric version.
+The reader also recognizes Cargo build scripts with hashes.
+Cargo can remain active while test binaries run and the need decreases.
+A tool with a name outside the supported patterns escapes detection by name.
+A new near-peak sample still restores the accepted need.
+An idle sccache daemon in the compiler service does not count as a compiler job.
+A scope reservation checks sccache jobs tagged with its scope or a descendant cgroup.
+A tree reservation checks sccache jobs tagged with a live tree member's cgroup or a descendant cgroup.
+A recognized compiler with an absent, empty, or unreadable tag keeps the accepted need.
+The closest reserved scope owns each job's memory use.
+Matching snapshots with a compiler keep the accepted need and report that a compiler is running.
+A failed read or changed snapshot keeps the accepted need and records the reason for incomplete evidence.
+The memory reader excludes processes whose start times no longer match.
 These conditions override the progress window and the frozen nextest test-phase need.
 The decay rule works without a progress counter or a profile.
 The freed room can admit another step before a second compile starts. `MemAvailable` and the PSI hold still guard this interval.

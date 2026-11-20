@@ -543,57 +543,27 @@ class SystemReadingPlan:
 
 
 @dataclass(frozen=True)
-class MissingSample:
-    """The sampler has not written this file."""
-
-
-@dataclass(frozen=True)
-class UnreadableSample:
-    """The sampler file could not be read."""
-
-
-@dataclass(frozen=True)
-class SampleFile:
-    text: str | MissingSample | UnreadableSample
-    modified_at: float | records.PeakTimeUnknown
-
-
-def sample_file(path: Path) -> SampleFile:
-    try:
-        text: str | MissingSample | UnreadableSample = path.read_text()
-    except FileNotFoundError:
-        text = MissingSample()
-    except (OSError, UnicodeError):
-        text = UnreadableSample()
-    try:
-        modified: float | records.PeakTimeUnknown = path.stat().st_mtime
-    except OSError:
-        modified = records.PeakTimeUnknown()
-    return SampleFile(text, modified)
-
-
-@dataclass(frozen=True)
 class ReservationEvidence:
     """Physical memory and sampler observations without a policy charge."""
     memory: records.StepMemory
-    peak: SampleFile
-    wave: SampleFile
+    peak_samples: gate.PeakSamples | gate.PeakSamplesChanged
     phase: test_phase.ObservedTestPhase | test_phase.UnobservedTestPhase
     scope: str
+    compiler_evidence: records.CompilerEvidence | records.CompilerEvidenceNotRecorded
 
 
 def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
                            lifetime: gate.StepLifetime, processes: dict[int, gate.ProcessIdentity],
-                           proc: Path) -> records.StepMemory:
+                           proc: Path, track_compilers: bool = False) -> records.StepMemory:
     _ = record
     if isinstance(lifetime, gate.EndedStep):
         return records.GoneMemory()
     if isinstance(lifetime, gate.PopulatedStepScope):
         try:
-            return gate.process_memory(lifetime, proc)
+            return gate.process_memory(lifetime, proc, track_compilers=track_compilers)
         except FileNotFoundError:
             pass
-    return gate.tree_memory(row["pid"], row["start_time"], processes, proc)
+    return gate.tree_memory(row["pid"], row["start_time"], processes, proc, track_compilers=track_compilers)
 
 
 def reservation_charge(evidence: ReservationEvidence, row: records.Reservation,
@@ -601,42 +571,11 @@ def reservation_charge(evidence: ReservationEvidence, row: records.Reservation,
     """Apply the current reservation and policy to unchanged physical evidence."""
     memory = gate.step_promise(row, evidence.memory)
     phase = gate.test_phase_history(row, memory, evidence.phase)
-    decaying_test = row["step"] in gate.DECAYING_TEST_STEPS
-    try:
-        if isinstance(evidence.peak.text, UnreadableSample):
-            raise ValueError("unreadable peak")
-        peak = 0 if isinstance(evidence.peak.text, MissingSample) else int(evidence.peak.text)
-        if peak < 0:
-            raise ValueError("negative peak")
-    except ValueError:
-        return (replace(memory, unknown_peak_promise=row["need"], peak_history=records.PeakFileUnreadable(row["need"]))
+    peak, history = gate.reservation_peak_history(row, evidence.peak_samples, now, policy)
+    fresh_peak = isinstance(history, records.PeakSoFar) and history.near_peak_is_fresh
+    if isinstance(history, records.PeakFileUnreadable) and peak == 0:
+        return (replace(memory, unknown_peak_promise=row["need"], peak_history=history)
                 if isinstance(memory, records.MeasuredMemory) else memory)
-    last_near_peak = now
-    peak_at = evidence.peak.modified_at if peak > 0 else records.PeakTimeUnknown()
-    peak_time: float | records.PeakTimeUnknown = records.PeakTimeUnknown()
-    old_sampler = False
-    if isinstance(evidence.wave.text, MissingSample) and peak > 0:
-        old_sampler = True
-        if isinstance(peak_at, float):
-            last_near_peak = peak_at
-            peak_time = peak_at
-    elif isinstance(evidence.wave.text, str):
-        try:
-            sampled, recorded = map(int, evidence.wave.text.split())
-            if sampled == peak and recorded >= 0:
-                last_near_peak = recorded
-                peak_time = recorded
-        except ValueError:
-            pass
-    hold = policy.peak_hold.seconds_for(row.get("step", ""))
-    fresh_peak = peak > 0 and not isinstance(peak_time, records.PeakTimeUnknown) and now - last_near_peak < hold
-    history: records.PeakHistory = (records.PeakSoFar(peak, peak_at, peak_time, old_sampler,
-        near_peak_is_fresh=decaying_test and fresh_peak) if peak > 0 else records.NoPeakRecorded())
-    if decaying_test and peak > 0 and isinstance(peak_time, records.PeakTimeUnknown):
-        history = records.PeakFileUnreadable(row["need"])
-    elif peak > 0 and not gate.release_build(row) and now - last_near_peak >= hold:
-        history = records.PeakDecayed(0, peak, last_near_peak, last_near_peak + hold, old_sampler)
-        peak = 0
     if isinstance(memory, records.MeasuredMemory):
         if isinstance(phase, records.TestPhaseStarted) and not fresh_peak and not (
                 isinstance(history, (records.PeakDecayed, records.PeakFileUnreadable))):
@@ -664,39 +603,20 @@ class SystemEvidence:
     host: records.HostMemory | records.ReadingUnavailable
     pressure: records.Pressure
     compilers: tuple[records.StepMemory, ...]
-    process_scan_incomplete: bool = field(default=False, kw_only=True)
 
     def build_run(self, pid: int) -> LiveBuildRun | NoLiveBuildRun:
         """Find one owner's build run from this reading's process table."""
         return self.activity.run(pid)
 
 
-def test_compilers(memory: records.MeasuredMemory, evidence: SystemEvidence) -> records.TestCompilers:
-    """Check every process in the step scope or process tree."""
-    source = memory.anonymous_source
-    if isinstance(source, records.ScopeSource):
-        members = source.members
-    elif isinstance(source, records.ProcessSource):
-        if evidence.process_scan_incomplete or source.memory_read_incomplete:
-            return "incomplete"
-        members = frozenset(process.pid for process in source.processes)
-    else:
-        return "incomplete"
-    if (not members or isinstance(memory.anonymous, records.RunUseUnavailable)
-            or any(isinstance(service, records.CompilerServiceMemory) and service.test_compilers == "incomplete"
-                   for service in evidence.compilers)
-            or any(pid not in evidence.processes for pid in members)):
-        return "incomplete"
-    return "running" if any(evidence.processes[pid].is_compiler for pid in members) else "none"
-
-
 def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: Clock, *,
                 reservation_reader: Callable[[ReservationRecord, records.Reservation, gate.StepLifetime,
-                    dict[int, gate.ProcessIdentity], Path], records.StepMemory] = raw_reservation_memory) -> SystemEvidence:
+                    dict[int, gate.ProcessIdentity], Path, bool], records.StepMemory] = raw_reservation_memory) -> SystemEvidence:
     """Read operating-system evidence without access to mutable service state."""
     started_monotonic = clock.monotonic()
     now = clock.now()
     processes = proc.processes()
+    compilers = tuple(readings.compilers())
     activity = ScopeActivityReader(processes, proc.path,
         tuple(LiveBuildRun(place.run.pid, place.run.start_time, place.since) for place in plan.runs))
     lifetimes: dict[str, gate.StepLifetime] = {}
@@ -706,21 +626,37 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
         live = proc.owner_start(record.owner.pid) == LiveOwnerIdentity(record.owner.start_time)
         lifetime = proc.lifetime(row, live)
         lifetimes[record.episode] = lifetime
-        memory = reservation_reader(record, row, lifetime, processes, proc.path)
+        path = Path(record.path)
+        before = gate.PeakSamples.read(path)
+        peak_samples: gate.PeakSamples | gate.PeakSamplesChanged = before
+        track_compilers = False
+        if row["step"] in gate.DECAYING_TEST_STEPS:
+            _, history = gate.reservation_peak_history(row, before, now, plan.config.policy)
+            track_compilers = gate.track_test_compilers(row, history)
+        memory = reservation_reader(record, row, lifetime, processes, proc.path, track_compilers)
+        if row["step"] in gate.DECAYING_TEST_STEPS:
+            peak_samples = before.after_memory_read(path)
         if isinstance(memory, records.GoneMemory) and live:
             memory = records.PromisedMemory(row["need"])
+        compilers_for_step: records.CompilerEvidence | records.CompilerEvidenceNotRecorded = records.CompilerEvidenceNotRecorded()
         if isinstance(memory, records.MeasuredMemory):
             memory = replace(memory, promise=records.NoPromise(), observed_peak=0,
                              unknown_peak_promise=0, peak_history=records.NoPeakRecorded())
+            if track_compilers:
+                source = memory.anonymous_source
+                if (isinstance(source, (records.ScopeSource, records.ProcessSource))
+                        and not isinstance(source.compiler_evidence, records.CompilerEvidenceNotRecorded)):
+                    compilers_for_step = source.compiler_evidence
+                else:
+                    compilers_for_step = records.CompilerEvidenceIncomplete("memory source has no compiler evidence")
         scope = ""
         if record.sidecar:
             try:
                 scope = Path(record.sidecar).read_text().strip()
             except OSError:
                 pass
-        reservations[record.episode] = ReservationEvidence(memory,
-            sample_file(Path(record.path).with_suffix(".max")),
-            sample_file(Path(record.path).with_suffix(".wave")), gate.observed_test_phase(row), scope)
+        reservations[record.episode] = ReservationEvidence(memory, peak_samples, gate.observed_test_phase(row),
+                                                           scope, compilers_for_step)
     # Capture every scope before the loop applies current reservation ownership.
     unowned = gate.unowned_slice_memory([], processes, proc.path,
         activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice)
@@ -770,8 +706,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     return SystemEvidence(now, started_monotonic, MappingProxyType(processes),
         MappingProxyType(lifetimes), MappingProxyType(reservations), activity,
         tuple(unowned), MappingProxyType(members), MappingProxyType(scope_process_memory), MappingProxyType(workers),
-        tuple(between), host, pressure, tuple(readings.compilers()),
-        process_scan_incomplete=isinstance(processes, gate.ProcessTable) and processes.incomplete)
+        tuple(between), host, pressure, compilers)
 
 
 @dataclass(frozen=True)
@@ -1930,7 +1865,8 @@ class AdmissionServer:
         plan = self._reading_plan(config)
         if isinstance(self.system_reader, NoSystemReader):
             def direct_memory(record: ReservationRecord, row: records.Reservation, lifetime: gate.StepLifetime,
-                              processes: dict[int, gate.ProcessIdentity], proc: Path) -> records.StepMemory:
+                              processes: dict[int, gate.ProcessIdentity], proc: Path,
+                              _track_compilers: bool) -> records.StepMemory:
                 return (records.GoneMemory() if isinstance(lifetime, gate.EndedStep) else
                     self.readings.reservation(Path(record.path), row, datetime.fromtimestamp(now, UTC),
                                               processes, proc, config.policy))
@@ -1963,8 +1899,8 @@ class AdmissionServer:
                 with retry_cleanup(Path(record.path)):
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
                 continue
-            if row["step"] in gate.DECAYING_TEST_STEPS and isinstance(memory, records.MeasuredMemory):
-                memory = replace(memory, test_compilers=test_compilers(memory, evidence))
+            if captured is not None and isinstance(memory, records.MeasuredMemory):
+                memory = replace(memory, compiler_evidence=captured.compiler_evidence)
             if record.episode.startswith("uid:") and isinstance(memory, records.MeasuredMemory):
                 if isinstance(memory.anonymous, records.AnonymousRunUse):
                     self._sample_runner(record, memory.anonymous.bytes, now)
@@ -2022,7 +1958,7 @@ class AdmissionServer:
                             read_at: float, margin: float) -> records.MeasuredMemory:
         """Keep the largest attributed anonymous memory sample within the current decay."""
         history = memory.peak_history
-        if (not isinstance(history, records.PeakDecayed) or memory.test_compilers == "incomplete"
+        if (not isinstance(history, records.PeakDecayed) or not isinstance(memory.compiler_evidence, records.NoCompilerSeen)
                 or not use.owns_source or not isinstance(use.use, records.AnonymousRunUse)
                 or read_at < history.decayed_at):
             return memory
