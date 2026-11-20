@@ -9,18 +9,20 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from typing import cast
 from unittest import mock
 
 from scripts.build_queue import execution_identity
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
-from scripts.build_queue import admission_protocol as wire, placement
+from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.build_queue.admission_test_support import caller_provider_controls
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_start_test_support import process_reader
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test import claim_state, offload
 
 from scripts.lib import process_start as process_identity
 
@@ -29,38 +31,132 @@ mac_test = eligibility_support.mac_test
 
 
 class VerifySshRetainedTests(VerifySshTargetsFixture):
+    def test_lost_authorization_releases_the_exact_settled_start(self) -> None:
+        self.check_lost_authorization(confirmed=True)
+
+    def test_lost_authorization_keeps_the_exact_unsettled_start(self) -> None:
+        self.check_lost_authorization(confirmed=False)
+
+    def check_lost_authorization(self, *, confirmed: bool) -> None:
+        self.configure("natedev,linux")
+        _ = self.hold_memory()
+        server = self.admission.server
+        send = server._send  # pyright: ignore[reportPrivateUsage]
+        authorizations: list[wire.FirstAuthorization] = []
+        consumed: list[bool] = []
+
+        def drop_first_authorization(connection: service.Connection, reply: wire.Reply) -> None:
+            if isinstance(reply, wire.FirstAuthorization):
+                authorizations.append(reply)
+                if len(authorizations) == 1:
+                    assignment = reply.assignment
+                    saved = server.assignments[execution_identity.attempt_key(assignment.episode, assignment.attempt)]
+                    consumed.append(isinstance(saved.permission, placement.PermissionConsumed))
+                    server._disconnect(connection)  # pyright: ignore[reportPrivateUsage]
+                    return
+            send(connection, reply)
+
+        arguments = ["test", "sample", "--no-cache"]
+        if not confirmed:
+            arguments.extend(("--target", "linux"))
+        mode = "start-fence-confirmed" if confirmed else "start-fence-unconfirmed"
+        with mock.patch.object(server, "_send", side_effect=drop_first_authorization):
+            process = self.start_verify(*arguments, extra={"TEST_SSH_MODES": json.dumps({"linux": mode})})
+            self.addCleanup(self.stop_verify, process)
+            events_path = self.runner_state / "ssh-events.jsonl"
+            self.wait_until(lambda: events_path.exists() and events_path.read_text().endswith("\n"),
+                            str(events_path), (process,), directory=self.runner_state)
+            first = self.ssh_events()[0]
+            expected_actions = ["cleanup", "release"] if confirmed else ["cleanup"]
+            self.assertEqual(first["actions"][-len(expected_actions):], expected_actions, first)
+            self.assertNotIn("run", first["actions"])
+            result = self.finish_verify(process)
+
+        lost = authorizations[0]
+        self.assertEqual(consumed, [True])
+        claim = lost.claim
+        self.assertEqual(first["adopted_claim_ids"], [claim.claim_id])
+        identity = claim_state.ClaimIdentity(claim.claim_id, claim.episode, claim.attempt)
+        state = self.target_state("linux")
+        journal = state / "pending-starts" / offload.pending_start_key(identity)
+        events = (self.runner_state / "queue-events.jsonl").read_text().splitlines()
+        requests = [wire.parse_request(json.dumps(cast(dict[str, object], json.loads(line))["request"]))
+                    for line in events]
+        report, = [request for request in requests if isinstance(request, wire.ExecutionReport)
+                   and request.assignment == lost.assignment]
+        self.assertEqual(report.claim, claim)
+        self.assertEqual(report.evidence, execution_identity.ExecutionNotStarted())
+        self.assertEqual(report.outcome, placement.PrelaunchRefused("state"))
+        self.assertEqual(self.local_runs(), [])
+        if confirmed:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIsInstance(report.path, placement.DispatchPathSettled)
+            self.assertNotIn(claim.claim_id, first["remaining_claim_ids"])
+            self.assertFalse(journal.exists())
+            self.assertFalse((self.runner_state / "provider-outcome-linux.json").exists())
+            _, successful = authorizations
+            self.assertEqual(successful.assignment.episode, lost.assignment.episode)
+            self.assertNotEqual(successful.claim, claim)
+            _, run = self.ssh_events()
+            self.assertIn("run", run["actions"])
+            self.assertEqual(run["result_type"], "PassedOnTarget")
+        else:
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIsInstance(report.path, placement.DispatchPathPending)
+            self.assertEqual(authorizations, [lost])
+            self.assertEqual(self.ssh_events(), [first])
+            held, = caller_provider_controls(self, self.admission).claims("linux")
+            self.assertEqual(claim_state.claim_identity(held.record), identity)
+            self.assertTrue(journal.exists())
+            fence = offload.start_fence_relative(identity, "linux", scope_key=held.path.stem)
+            self.assertTrue((self.home / fence.with_suffix(".lock")).exists())
+
     def test_verify_exit_before_first_memory_hook_fails(self) -> None:
         self.release_memory_after_hook()
-        with subprocess.Popen(["true"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
+        diagnostic_root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with mock.patch.object(self, "verify_diagnostic_root", return_value=diagnostic_root), \
+             subprocess.Popen(["printf", "partial\n"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
              mock.patch.object(self, "start_verify", return_value=process), \
              self.assertRaisesRegex(self.failureException, "verify exited"):
             _ = self.verify("test", "sample", "--no-cache")
+        evidence, = diagnostic_root.iterdir()
+        self.assertFalse(evidence.is_relative_to(self.root))
+        self.assertIn(f"PID {process.pid}", (evidence / "processes.txt").read_text())
+        self.assertEqual((evidence / "stdout").read_text(), "partial\n")
+
+    def verify_with_memory_hook(
+        self, event: support.CompletedMemoryHook, *, output_size: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        """Publish a complete hook event before the fixture can read it."""
+        self.release_memory_after_hook()
+        command = '''
+from pathlib import Path
+import sys
+
+from scripts.lib.atomic_file import write_text_atomic
+
+write_text_atomic(Path("memory-hook-1"), sys.argv[1])
+output_size = int(sys.argv[2])
+if output_size:
+    with Path("memory-hook-ack").open() as acknowledgment:
+        assert acknowledgment.read(len("continue")) == "continue"
+    sys.stdout.write("x" * output_size)
+'''
+        with subprocess.Popen([sys.executable, "-c", command, json.dumps(event), str(output_size)],
+                              cwd=self.runner_state, text=True,
+                              env={**self.environment, "PYTHONPATH": str(support.REPOSITORY)},
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
+             mock.patch.object(self, "start_verify", return_value=process):
+            return self.verify("test", "sample", "--no-cache")
 
     def test_verify_drains_output_after_memory_hook_settles(self) -> None:
-        self.release_memory_after_hook()
-        command = '''
-printf '%s\\n' '{"left": false, "clock": "", "attempts": 0}' > memory-hook-1
-head -c 8 memory-hook-ack > /dev/null
-exec "$1" -c 'import sys; sys.stdout.write("x" * (128 * 1024))'
-'''
-        with subprocess.Popen(["sh", "-c", command, "memory-hook-output", sys.executable],
-                              cwd=self.runner_state, text=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
-             mock.patch.object(self, "start_verify", return_value=process):
-            result = self.verify("test", "sample", "--no-cache")
+        output_size = 128 * 1024
+        result = self.verify_with_memory_hook({"left": False, "clock": "", "attempts": 0}, output_size=output_size)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "x" * (128 * 1024))
+        self.assertEqual(result.stdout, "x" * output_size)
 
     def test_verify_returns_when_settled_hook_skips_acknowledgment(self) -> None:
-        self.release_memory_after_hook()
-        command = '''
-printf '%s\\n' '{"left": true, "clock": "", "attempts": 0}' > memory-hook-1
-exit 0
-'''
-        with subprocess.Popen(["sh", "-c", command], cwd=self.runner_state, text=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process, \
-             mock.patch.object(self, "start_verify", return_value=process):
-            result = self.verify("test", "sample", "--no-cache")
+        result = self.verify_with_memory_hook({"left": True, "clock": "", "attempts": 0})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def retain_slots(self, old_capacity: int = 2) -> list[Path]:

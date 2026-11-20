@@ -115,6 +115,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 from contextlib import redirect_stdout
 from unittest import mock
@@ -140,6 +141,13 @@ reserved = bool(args.claim_owner_pid and any(claim.record["pid"] == args.claim_o
 same_path = False
 remote_output = ""
 remote_status = 0
+check_start_fence = mode in ("start-fence-confirmed", "start-fence-unconfirmed")
+
+def run_start_fence(command):
+    settled = real_run(["bash", "-c", command], capture_output=True,
+                       text=True, check=False, timeout=5)
+    assert settled.returncode == 0, settled.stderr
+    return settled.stdout
 
 def complete(arguments, attempt):
     global same_path
@@ -191,6 +199,12 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if mode == "after-probe":
         wire += "mac_cleanup=unconfirmed\n"
         (root / (request.target + ".marker")).touch()
+    if check_start_fence:
+        identity = controller.claim_identity
+        assert isinstance(identity, claim_state.ClaimIdentity)
+        prepare = offload.prepare_start_fence_command(identity, request.target, scope_key=controller.claim_scope_key)
+        assert prepare in arguments[-1]
+        run_start_fence(prepare)
     return offload.CommandOutput(0, wire, "")
 
 def copy_scripts(*arguments):
@@ -224,10 +238,7 @@ def stream(arguments):
         if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
             command = offload.start_fence_command(controller.claim_identity, request.target,
                 settle=True, scope_key=controller.claim_scope_key)
-            settled = real_run(["bash", "-c", command], capture_output=True,
-                               text=True, check=False, timeout=5)
-            assert settled.returncode == 0, settled.stderr
-            wire += settled.stdout
+            wire += run_start_fence(command)
 
     remote_output, remote_status = wire, status
 
@@ -248,8 +259,14 @@ def commands(arguments, **options):
         unresolved = mode in ("probe-refusal", "run-refusal", "after-probe")
         count = 2 if mode in ("probe-leftovers", "retained-leftovers") else 0
         fence = ""
-        if not unresolved and count == 0 and isinstance(controller.claim_identity, claim_state.ClaimIdentity):
-            fence = "dispatch_start_settled=" + offload.pending_start_key(controller.claim_identity) + "\n"
+        identity = controller.claim_identity
+        if check_start_fence and isinstance(identity, claim_state.ClaimIdentity):
+            command = offload.start_fence_command(identity, request.target, settle=True, scope_key=controller.claim_scope_key)
+            assert arguments[-1].startswith(command + " || exit 1\n")
+            if mode == "start-fence-confirmed":
+                fence = run_start_fence(command)
+        elif not unresolved and count == 0 and isinstance(identity, claim_state.ClaimIdentity):
+            fence = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"
         return subprocess.CompletedProcess(arguments, 3 if unresolved else 0,
             "" if unresolved else fence + "leftovers=" + str(count) + "\nrc=0\n", "")
     return real_run(arguments, **options)
@@ -266,9 +283,11 @@ with mock.patch.object(controller, "complete_claim", side_effect=complete), \
 
 configured_mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
 if not configured_mode.endswith("-once"):
+    cleanup_pending = controller.attempt_evidence.cleanup != "confirmed"
     reason = ("unreachable" if isinstance(result, offload.LostMacRun) else
-              "busy" if isinstance(result, offload.BusyMacDecline) and controller.attempt_evidence.cleanup != "confirmed" else
-              result.reason if isinstance(result, offload.DeclinedMacRun) else "")
+              "busy" if isinstance(result, offload.BusyMacDecline) and cleanup_pending else
+              result.reason if isinstance(result, offload.DeclinedMacRun)
+              and (cleanup_pending or mode in ("disk", "version-mismatch", "runtime-version-mismatch")) else "")
     outcome = root / ("provider-outcome-" + request.target + ".json")
     if reason:
         ready = outcome.with_suffix(".ready")
@@ -441,7 +460,7 @@ source() {
         acknowledgment = os.open(self.runner_state / "memory-hook-ack", os.O_RDWR)
         try:
             process = self.start_verify(*arguments, extra=extra)
-            try:
+            with self.keep_verify_failure(process):
                 sequence = 0
                 while True:
                     sequence += 1
@@ -454,7 +473,7 @@ source() {
                                              and saved.assignment.destination.provider != "local"
                                              for saved in self.admission.server.assignments.values())
                         if authorized and isinstance(self.memory_hook_observer, ReleaseMemoryAtWait):
-                            return self.finish_verify(process)
+                            break
                         self.wait_for_path(event_path, (process,))
                     event = cast(CompletedMemoryHook, json.loads(event_path.read_text()))
                     release = (True if isinstance(self.memory_hook_observer, ReleaseMemoryAtWait)
@@ -468,14 +487,7 @@ source() {
                     _ = os.write(acknowledgment, b"continue")
                     if settled:
                         break
-                output, errors = process.communicate()
-                return subprocess.CompletedProcess(process.args, process.wait(), output, errors)
-            except BaseException:
-                try:
-                    self.capture_queue_state()
-                finally:
-                    self.stop_verify(process)
-                raise
+            return self.finish_verify(process)
         finally:
             os.close(acknowledgment)
 

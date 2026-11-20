@@ -2513,6 +2513,31 @@ def observe_cleanup(evidence: AttemptEvidence, checked: LeftoverCheckResult) -> 
                                  if isinstance(checked, LeftoversRemain) else UnresolvedLeftoverCount())
 
 
+def authorize_ssh_start(controller: ProcessController, assignment: placement.PlacementAssignment) -> bool:
+    from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records
+
+    identity = controller.claim_identity
+    start = process_identity.process_start(os.getpid())
+    if not isinstance(identity, claim_state.ClaimIdentity) or not isinstance(start, process_identity.Started):
+        return False
+    reference = placement.ProviderClaimReference(assignment.destination.provider,
+        assignment.destination.target, assignment.destination.scope,
+        identity.claim_id, identity.episode, identity.attempt)
+    holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
+    while True:
+        try:
+            permission = admission_client.consume_permission(wire.ConsumePermission(
+                uuid.uuid4().hex, assignment, reference, holder))
+        except wire.AdmissionUnavailable:
+            return False
+        if isinstance(permission, wire.FirstAuthorization):
+            return True
+        if (not isinstance(permission.state, placement.CurrentAssignment)
+                or not isinstance(permission.permission, placement.PermissionAvailable)):
+            return False
+        time.sleep(records.read_memory_config().waiting_pass_seconds)
+
+
 def claimed_run(
     controller: ProcessController,
     config: OffloadConfig | hana_placement.HanaControlTransport,
@@ -2603,37 +2628,20 @@ def claimed_run(
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         copies.register_remote(request_mirror(config, request, repository))
         if isinstance(request.placement, AssignedOffloadRequest):
-            from scripts.build_queue import admission_client, admission_protocol as wire
-
             assignment = request.placement.assignment
             source = assignment.source_key
             if isinstance(source, execution_identity.SourceKeyKnown) and (
                     not isinstance(copied.tree_key, KnownTreeKey) or copied.tree_key.value != source.key):
                 release_allowed = True
                 return DeclinedMacRun("source_changed", elapsed_seconds(started), "the copied source differs from the assignment")
-            identity = controller.claim_identity
-            start = process_identity.process_start(os.getpid())
-            if not isinstance(identity, claim_state.ClaimIdentity) or not isinstance(start, process_identity.Started):
+            if not authorize_ssh_start(controller, assignment):
+                controller.pending = PendingStartOperation()
+                settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
+                release_allowed = isinstance(settlement, StartSettled)
+                evidence.execution = execution_identity.ExecutionNotStarted()
+                observe_cleanup(evidence, settlement.leftovers)
+                report_leftover_check(settlement.leftovers, request)
                 return declined("state", started)
-            reference = placement.ProviderClaimReference(assignment.destination.provider,
-                assignment.destination.target, assignment.destination.scope,
-                identity.claim_id, identity.episode, identity.attempt)
-            holder = placement.ClaimHolderIdentity(store.host_name(), os.getpid(), start.start)
-            while True:
-                try:
-                    permission = admission_client.consume_permission(wire.ConsumePermission(
-                        uuid.uuid4().hex, assignment, reference, holder))
-                except wire.AdmissionUnavailable:
-                    evidence.execution = execution_identity.ExecutionEvidenceUnavailable("authorization response unavailable", time.time())
-                    return declined("state", started)
-                if isinstance(permission, wire.FirstAuthorization):
-                    break
-                if (not isinstance(permission.state, placement.CurrentAssignment)
-                        or not isinstance(permission.permission, placement.PermissionAvailable)):
-                    return declined("state", started)
-                from scripts.build_queue import admission_records as records
-
-                time.sleep(records.read_memory_config().waiting_pass_seconds)
             evidence.launch_authorized = True
         release_allowed = False
         identity = controller.claim_identity

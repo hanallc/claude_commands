@@ -32,6 +32,7 @@ import time
 import unittest
 import contextlib
 from contextlib import contextmanager
+from collections import deque
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -41,7 +42,7 @@ from unittest import mock
 
 from scripts.build_hold import build_hold
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
-from scripts.lib import inotify
+from scripts.lib import conf, inotify
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -1451,25 +1452,58 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         return self.finish_verify(self.start_verify(*arguments, extra=extra))
 
     def finish_verify(self, process: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
-        """Stop owned processes before an exceptional exit reaches the next case."""
-        try:
+        with self.keep_verify_failure(process):
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-            return subprocess.CompletedProcess(process.args, process.wait(timeout=TEST_HANG_GUARD_SECS), output, errors)
-        except BaseException:
+            assert process.returncode is not None
+            return subprocess.CompletedProcess(process.args, process.returncode, output, errors)
+
+    def verify_diagnostic_root(self) -> Path:
+        """Use the system temporary root outside the test run's disposable folders."""
+        return Path(conf.read_or_repository("build_folders").text("roots.system"))
+
+    @contextmanager
+    def keep_verify_failure(self, process: subprocess.Popen[str]) -> Generator[None]:
+        """Save failure evidence before case teardown removes the private state."""
+        try:
+            yield
+        except BaseException as failure:
             try:
-                self.capture_queue_state()
-            finally:
-                self.stop_verify(process)
+                try:
+                    directory = Path(tempfile.mkdtemp(prefix="verify-failure-", dir=self.verify_diagnostic_root()))
+                    failure.add_note(f"{self.id()} failure evidence in {directory}")
+                    try:
+                        self.capture_verify_state(process, directory)
+                    except OSError as error:
+                        failure.add_note(f"Cannot save the Verify state ({error}).")
+                finally:
+                    output, errors = self.stop_verify(process)
+                _ = (directory / "stdout").write_text(output)
+                _ = (directory / "stderr").write_text(errors)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                failure.add_note(f"Cannot save the Verify output ({error}).")
             raise
 
-    def capture_queue_state(self) -> None:
-        """Keep the private queue state before process cleanup changes it."""
-        admission = caller_admission(self, self.root, self.environment)
-        with admission.loop_turn():
-            state = dict(requests=admission.server.placement_requests,
-                         assignments=admission.server.assignments,
-                         current=admission.server.current_assignments)
-            _ = (self.runner_state / "failed-queue-state.txt").write_text(repr(state))
+    def capture_verify_state(self, process: subprocess.Popen[str], directory: Path) -> None:
+        """Read process and queue state without waiting for the child or the queue."""
+        with (directory / "processes.txt").open("w") as output:
+            for pid in sorted(processes_carrying(self.child_marker()) | {process.pid}):
+                proc = Path("/proc") / str(pid)
+                _ = output.write(f"PID {pid}\n")
+                for name in ("cmdline", "wchan", "status"):
+                    with contextlib.suppress(OSError):
+                        value = (proc / name).read_text(errors="replace").replace("\0", " ").strip()
+                        _ = output.write(f"{name} {value}\n")
+                for descriptor in sorted((proc / "fd").glob("*")):
+                    with contextlib.suppress(OSError):
+                        _ = output.write(f"fd {descriptor.name} {descriptor.readlink()}\n")
+        messages = self.runner_state / "queue-events.jsonl"
+        if messages.exists():
+            with messages.open() as stream:
+                _ = (directory / messages.name).write_text("".join(deque(stream, maxlen=20)))
+        for name in ("state.json", "queue.json"):
+            source = Path(self.environment["BUILDLOG_DIR"]) / "admission" / name
+            with contextlib.suppress(FileNotFoundError):
+                _ = shutil.copyfile(source, directory / name)
 
     def start_verify(
         self, *arguments: str, extra: dict[str, str] | None = None
@@ -1616,10 +1650,10 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         """The environment entry every process this test starts inherits."""
         return f"TEST_RUNNER_STATE={self.runner_state}"
 
-    def stop_verify(self, process: subprocess.Popen[str]) -> None:
+    def stop_verify(self, process: subprocess.Popen[str]) -> tuple[str, str]:
         """Kill the call and every process under it, its steps' own groups and sessions too."""
         _ = reap(self.child_marker())
-        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        return process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def assert_nothing_outlives(self) -> None:
         # Runs after every other cleanup: a process a call left behind
