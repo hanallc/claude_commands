@@ -282,6 +282,13 @@ def instance_not_found(error: AwsUnavailable) -> bool:
     return code == 'InvalidInstanceID.NotFound'
 
 
+def _cleanup_warning(message: str, *, stderr: bool = True) -> None:
+    try:
+        print(message, file=sys.stderr if stderr else sys.stdout, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 def cleanup_folder(folder: Path, worker: GateWorker) -> bool:
     """Clean one gate folder or all module folders in a trial."""
     paths = [folder / 'request.json'] if (folder / 'request.json').exists() else sorted(folder.glob('*/request.json'))
@@ -291,26 +298,35 @@ def cleanup_folder(folder: Path, worker: GateWorker) -> bool:
 def cleanup_requests(paths: Sequence[Path], worker: GateWorker) -> bool:
     """Clean only the attempts in the selected request files."""
     attempts: list[GateCleanupAttempt] = []
-    complete = True
+    errors: list[Exception] = []
     for path in paths:
         try:
             attempt = ledger.text(read(path), 'attempt')
             reservation = next((row for row in worker.book.read_snapshot().gate_reservations if row.attempt == attempt), None)
             if reservation is not None:
                 launch_path = path.parent / 'launch.json'
-                attempts.append(GateCleanupAttempt(reservation, read(launch_path) if launch_path.exists() else {}, True))
+                try:
+                    launch = read(launch_path) if launch_path.exists() else {}
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    errors.append(error)
+                    attempts.append(GateCleanupAttempt(reservation, {}, False))
+                else:
+                    attempts.append(GateCleanupAttempt(reservation, launch, True))
         except (OSError, ValueError, KeyError, TypeError) as error:
-            print('gate cleanup: ' + str(error), file=sys.stderr)
-            complete = False
-    return cleanup_attempts(attempts, worker) and complete
+            errors.append(error)
+    complete = cleanup_attempts(attempts, worker)
+    for error in errors:
+        _cleanup_warning(f'gate cleanup: {error}')
+    return complete and not errors
 
 
 def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker) -> bool:
     """Request terminations before discovery and retain unconfirmed bookings."""
     complete = True
-    deadline = worker.clock() + settings().number('termination_timeout_s')
     boxes: list[GateTermination] = []
     uncertain: list[UncertainGateLaunch] = []
+    absent: list[str] = []
+    errors: list[Exception] = []
     for item in attempts:
         reservation, launch = item.reservation, item.launch
         if isinstance(reservation.state, (ledger.GateAbsent, ledger.GateTerminated)):
@@ -327,19 +343,25 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
                 uncertain.append(UncertainGateLaunch(reservation.attempt, (region,),
                     'Name=client-token,Values=' + token, reservation.expires))
             elif item.launch_record_checked:
-                worker.book.resolve_gate(reservation.attempt, ledger.GateAbsent(int(worker.clock())))
+                absent.append(reservation.attempt)
             else:
-                regions = (reservation.region,) if reservation.region else tuple(settings().words('regions'))
+                regions = (reservation.region,) if reservation.region else ()
                 uncertain.append(UncertainGateLaunch(reservation.attempt, regions,
                     'Name=tag:GateAttempt,Values=' + reservation.attempt, reservation.expires))
         except (ValueError, KeyError, TypeError) as error:
-            print('gate cleanup: ' + str(error), file=sys.stderr)
-            complete = False
-    boxes = worker.request_terminations(boxes, deadline)
+            errors.append(error)
+    ended = worker.request_terminations(boxes)
+    deadline = worker.clock()
+    if boxes or uncertain:
+        try:
+            deadline += settings().number('termination_timeout_s')
+        except (OSError, ValueError) as error:
+            errors.append(error)
+    located: list[tuple[str, str]] = []
     for launch in uncertain:
         try:
             found = False
-            for region in launch.regions:
+            for region in launch.regions or settings().words('regions'):
                 remaining = deadline - worker.clock()
                 if remaining <= 0:
                     raise AwsUnavailable('The gate cleanup deadline passed')
@@ -348,21 +370,32 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
                 instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
                 if instances:
                     discovered = [GateTermination(launch.attempt, ledger.text(row, 'InstanceId'), region) for row in instances]
-                    try:
-                        worker.book.gate_region(launch.attempt, region)
-                    finally:
-                        boxes.extend(worker.request_terminations(discovered, deadline))
+                    ended.update(worker.request_terminations(discovered))
+                    boxes.extend(discovered)
+                    located.append((launch.attempt, region))
                     found = True
                     break
             if not found:
                 if worker.clock() < launch.expires:
                     complete = False
                 else:
-                    worker.book.resolve_gate(launch.attempt, ledger.GateAbsent(int(worker.clock())))
+                    absent.append(launch.attempt)
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
-            print('gate cleanup: ' + str(error), file=sys.stderr)
-            complete = False
-    return worker.confirm_terminations(boxes, deadline) and complete
+            errors.append(error)
+    for attempt, region in located:
+        try:
+            worker.book.gate_region(attempt, region)
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+            errors.append(error)
+    for attempt in absent:
+        try:
+            worker.book.resolve_gate(attempt, ledger.GateAbsent(int(worker.clock())))
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+            errors.append(error)
+    confirmed = worker.confirm_terminations(worker.record_ends(boxes, ended), deadline)
+    for error in errors:
+        _cleanup_warning(f'gate cleanup: {error}')
+    return confirmed and complete and not errors
 
 
 @dataclass
@@ -466,64 +499,76 @@ class GateWorker:
 
     def terminate(self, attempt: str, instance: str, *,
                   result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED) -> None:
-        configuration = settings()
-        self._confirm_termination(instance, timeout_s=configuration.number('termination_timeout_s'),
-                                  poll_s=configuration.number('result_poll_s'))
+        self._confirm_termination(instance)
         ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
         self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance))
 
-    def _confirm_termination(self, instance: str, *, timeout_s: float, poll_s: float) -> None:
+    def _confirm_termination(self, instance: str, *, report_retries: bool = True) -> None:
         api = self.regional_api(self.box_region)
-        deadline = self.clock() + timeout_s
         requested = False
-        while True:
-            try:
-                if not requested:
-                    _ = api.call('terminate-instances', '--instance-ids', instance)
-                    requested = True
-                if api.observe(instance, int(self.clock())).state == 'terminated':
-                    break
-            except AwsUnavailable as error:
-                if instance_not_found(error):
-                    break
-                # A regional outage repeats the call until the deadline; any other error ends the try.
-                if not aws_down(str(error)):
-                    raise
-                print(f'Cloud gate termination waits on {self.box_region}: {error}', flush=True)
-            self.pause(poll_s)
-            if self.clock() >= deadline:
-                raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
+        deadline = float('inf')
+        poll_s = 0.0
+        first_outage: AwsUnavailable | Literal['no_outage'] = 'no_outage'
+        try:
+            while True:
+                try:
+                    if not requested:
+                        _ = api.call('terminate-instances', '--instance-ids', instance)
+                        requested = True
+                    if api.observe(instance, int(self.clock())).state == 'terminated':
+                        return
+                except AwsUnavailable as error:
+                    if instance_not_found(error):
+                        return
+                    if not aws_down(str(error)):
+                        raise
+                    if first_outage == 'no_outage':
+                        first_outage = error
+                    if report_retries:
+                        _cleanup_warning(f'Cloud gate termination waits on {self.box_region}: {error}', stderr=False)
+                if deadline == float('inf'):
+                    configuration = settings()
+                    deadline = self.clock() + configuration.number('termination_timeout_s')
+                    poll_s = configuration.number('result_poll_s')
+                self.pause(poll_s)
+                if self.clock() >= deadline:
+                    raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
+        except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
+            if isinstance(first_outage, AwsUnavailable) and first_outage is not error:
+                if report_retries:
+                    _cleanup_warning(f'Cloud gate could not confirm termination: {error}')
+                raise first_outage from error
+            raise
 
     def _recover_accepted_launch(self, attempt: str, instance: str, size: str, *,
-                                 termination_timeout_s: float, poll_s: float, lock_timeout_s: float,
-                                 accounting: ledger.GateLaunchAccounting) -> None:
+                                 lock_timeout_s: float, accounting: ledger.GateLaunchAccounting) -> None:
         outcome: ledger.GateRunning | ledger.GateTerminated = ledger.GateRunning(instance)
+        errors: list[tuple[str, Exception]] = []
         try:
-            self._confirm_termination(instance, timeout_s=termination_timeout_s, poll_s=poll_s)
+            self._confirm_termination(instance, report_retries=False)
             outcome = ledger.GateTerminated(int(self.clock()), instance)
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
-            print(f'Cloud gate could not confirm termination after a failed launch step: {error}',
-                  file=sys.stderr, flush=True)
+            errors.append(('Cloud gate could not confirm termination after a failed launch step', error))
         try:
             self.book.record_gate_launch_outcome(attempt, outcome, instance_type=size, lock_timeout_s=lock_timeout_s,
                                                 accounting=accounting)
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
-            print(f'Cloud gate did not record {instance} in the cost ledger: {error}',
-                  file=sys.stderr, flush=True)
+            errors.append((f'Cloud gate did not record {instance} in the cost ledger', error))
+        for message, error in errors:
+            _cleanup_warning(f'{message}: {error}')
 
-    def termination_call(self, region: str, operation: str, instances: Sequence[str], deadline: float) -> dict[str, object]:
-        remaining = deadline - self.clock()
-        if remaining <= 0:
-            raise AwsUnavailable('The trial cleanup deadline passed')
-        return self.regional_api(region).call(operation, '--instance-ids', *instances,
-            timeout_s=min(settings().number('api_timeout_s'), remaining))
-
-    def confirmed_ends(self, region: str, operation: Literal['terminate-instances', 'describe-instances'],
-                       instances: Sequence[str], deadline: float) -> set[str]:
+    def confirmed_ends(self, region: str, instances: Sequence[str], *,
+                       observation_deadline: float | Literal['send_termination']) -> set[str]:
+        api = self.regional_api(region)
         try:
-            reply = self.termination_call(region, operation, instances, deadline)
-            if operation == 'terminate-instances':
+            if observation_deadline == 'send_termination':
+                _ = api.call('terminate-instances', '--instance-ids', *instances)
                 return set()
+            remaining = observation_deadline - self.clock()
+            if remaining <= 0:
+                raise AwsUnavailable('The trial cleanup deadline passed')
+            reply = api.call('describe-instances', '--instance-ids', *instances,
+                             timeout_s=min(settings().number('api_timeout_s'), remaining))
             return {ledger.text(row, 'InstanceId') for group in ledger.rows(reply, 'Reservations')
                     for row in ledger.rows(group, 'Instances')
                     if ledger.text(ledger.mapping(row['State']), 'Name') == 'terminated'}
@@ -532,33 +577,34 @@ class GateWorker:
                 if len(instances) == 1:
                     return set(instances)
                 # A batch refusal does not identify the absent instances.
-                return {ended for instance in instances for ended in self.confirmed_ends(region, operation, (instance,), deadline)}
-            print('paired cleanup: ' + str(error), file=sys.stderr)
+                return {ended for instance in instances for ended in self.confirmed_ends(
+                    region, (instance,), observation_deadline=observation_deadline)}
+            _cleanup_warning(f'paired cleanup: {error}')
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-            print('paired cleanup: ' + str(error), file=sys.stderr)
+            _cleanup_warning(f'paired cleanup: {error}')
         return set()
 
-    def record_ends(self, boxes: Sequence[GateTermination], region: str, ended: set[str]) -> list[GateTermination]:
+    def record_ends(self, boxes: Sequence[GateTermination], ended: set[GateTermination]) -> list[GateTermination]:
         pending: list[GateTermination] = []
         for box in boxes:
-            if box.region == region and box.instance in ended:
+            if box in ended:
                 try:
                     self.book.resolve_gate(box.attempt, ledger.GateTerminated(int(self.clock()), box.instance))
                     continue
-                except (OSError, ValueError, KeyError, TypeError) as error:
-                    print('paired cleanup: ' + str(error), file=sys.stderr)
+                except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+                    _cleanup_warning(f'paired cleanup: {error}')
             pending.append(box)
         return pending
 
-    def request_terminations(self, boxes: Sequence[GateTermination], deadline: float) -> list[GateTermination]:
-        """Request termination and return boxes that still need confirmation."""
-        pending = list(boxes)
+    def request_terminations(self, boxes: Sequence[GateTermination]) -> set[GateTermination]:
+        """Request termination and return boxes that AWS reports as absent."""
+        ended: set[GateTermination] = set()
         for region in dict.fromkeys(box.region for box in boxes):
-            instances = [box.instance for box in boxes if box.region == region]
-            ended = self.confirmed_ends(region, 'terminate-instances', instances, deadline)
-            if ended:
-                pending = self.record_ends(pending, region, ended)
-        return pending
+            regional_boxes = [box for box in boxes if box.region == region]
+            instances = [box.instance for box in regional_boxes]
+            absent = self.confirmed_ends(region, instances, observation_deadline='send_termination')
+            ended.update(box for box in regional_boxes if box.instance in absent)
+        return ended
 
     def confirm_terminations(self, boxes: Sequence[GateTermination], deadline: float) -> bool:
         """Record confirmed terminations under one shared deadline."""
@@ -569,11 +615,16 @@ class GateWorker:
                 instances = [box.instance for box in pending if box.region == region]
                 if not instances or self.clock() >= deadline:
                     continue
-                ended = self.confirmed_ends(region, 'describe-instances', instances, deadline)
+                ended = self.confirmed_ends(region, instances, observation_deadline=deadline)
                 if ended:
-                    pending = self.record_ends(pending, region, ended)
+                    pending = self.record_ends(pending, {box for box in pending
+                                                         if box.region == region and box.instance in ended})
             if pending:
-                self.pause(max(0, min(settings().number('result_poll_s'), deadline - self.clock())))
+                try:
+                    self.pause(max(0, min(settings().number('result_poll_s'), deadline - self.clock())))
+                except (OSError, ValueError) as error:
+                    _cleanup_warning(f'paired cleanup: {error}')
+                    return False
         return not pending
 
     def cleanup_due(self, reservation: ledger.GateReservation) -> bool:
@@ -587,6 +638,7 @@ class GateWorker:
     def reconcile(self) -> None:
         """Clean expired or dead attempts while preserving live workers."""
         attempts: list[GateCleanupAttempt] = []
+        errors: list[Exception] = []
         for reservation in self.book.read_snapshot().gate_reservations:
             if isinstance(reservation.state, (ledger.GateAbsent, ledger.GateTerminated)) or not self.cleanup_due(reservation):
                 continue
@@ -596,9 +648,15 @@ class GateWorker:
                 folder = Path(reservation.owner.folder)
                 launch_path = folder / 'launch.json'
                 checked = (folder / 'request.json').exists()
-                launch = read(launch_path) if launch_path.exists() else {}
+                try:
+                    launch = read(launch_path) if launch_path.exists() else {}
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    checked = False
+                    errors.append(error)
             attempts.append(GateCleanupAttempt(reservation, launch, checked))
         _ = cleanup_attempts(attempts, self)
+        for error in errors:
+            _cleanup_warning(f'gate cleanup: {error}')
 
     def record_launch(self, request: dict[str, object], size: str, zone: str,
                       result: Literal['launched', 'refused', 'finished'], reason: str = '', *,
@@ -824,8 +882,6 @@ class GateWorker:
             self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
             configuration = settings()
             lock_timeout_s = configuration.number('launch_log_lock_timeout_s')
-            termination_timeout_s = configuration.number('termination_timeout_s')
-            poll_s = configuration.number('result_poll_s')
             accounting = ledger.GateLaunchAccounting.from_config(configuration)
             expired = self.clock() >= ledger.instant(request, 'expires')
             if expired:
@@ -898,8 +954,8 @@ class GateWorker:
                                        event_at=accepted_at)
                 self.book.refresh_gate_prices(lock_timeout_s=lock_timeout_s, accounting=accounting)
             except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
-                self._recover_accepted_launch(attempt, instance, size, termination_timeout_s=termination_timeout_s,
-                                              poll_s=poll_s, lock_timeout_s=lock_timeout_s, accounting=accounting)
+                self._recover_accepted_launch(attempt, instance, size, lock_timeout_s=lock_timeout_s,
+                                              accounting=accounting)
                 raise
             return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
@@ -955,6 +1011,7 @@ class GateWorker:
             log_key = prefix + 'gate.log'
             boot_error_key = prefix + 'boot-error.json'
             result_key = prefix + 'result.json'
+            work_failed = False
             try:
                 arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
                 self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
@@ -1057,18 +1114,31 @@ class GateWorker:
                     self.pause(settings().number('result_poll_s'))
                 if not row:
                     raise ValueError('The instance expired without a final result')
+            except BaseException:
+                work_failed = True
+                raise
             finally:
                 with cancellation.defer_cleanup_signals():
-                    self.terminate(attempt, instance, result_seen_at=result_seen_at)
-                    interruption_confirmed = bool(interruption_code)
+                    try:
+                        self.terminate(attempt, instance, result_seen_at=result_seen_at)
+                    except (OSError, ValueError, KeyError, TypeError, ArithmeticError,
+                            AwsUnavailable, subprocess.SubprocessError) as error:
+                        if not work_failed:
+                            raise
+                        _cleanup_warning(f'Cloud gate could not confirm termination: {error}')
+                    else:
+                        interruption_confirmed = bool(interruption_code)
             return {'status': 'complete', 'instance': instance, 'result_file': RESULT_FILE}
         except LaunchLogLockWaitExpired as error:
             return {'status': 'fallback', 'reason': str(error), 'error_code': error.code}
-        except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
-            launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
-            # Saved arguments mean AWS may have accepted the launch; a saved variant alone does not.
-            if 'arguments' not in launch:
-                self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError, AwsUnavailable, subprocess.SubprocessError) as error:
+            try:
+                launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
+                # A saved request can identify an accepted launch by its token.
+                if 'arguments' not in launch:
+                    self.book.resolve_gate(attempt, ledger.GateAbsent(int(self.clock())))
+            except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as state_error:
+                _cleanup_warning(f'Cloud gate could not record the attempt state: {state_error}')
             if row and request.get('task') != 'paired' and not gate_box.decode_run(row['gate']).passed:
                 return {'status': 'complete', 'result_file': RESULT_FILE}
             if interruption_confirmed:

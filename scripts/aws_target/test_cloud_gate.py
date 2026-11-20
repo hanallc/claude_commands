@@ -190,9 +190,29 @@ class FakeGateAws:
 
 
 class GateLaunchRecoveryTests(unittest.TestCase):
+    def test_termination_requests_the_box_before_reading_an_unusable_poll_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            path = folder / 'cloud_gate.conf'
+            write_gate_config(path)
+            override_fixture_settings(path, 'result_poll_s=unreadable')
+            configuration = conf.read(path)
+            book = ledger.CostLedger(folder)
+            fake = FakeGateAws()
+            fake.confirm_termination = False
+            worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=fake),
+                book, folder / 'aws_target.conf', folder / 'reservation')
+            with (mock.patch.object(cloud_gate, 'settings', return_value=configuration), redirect_stderr(StringIO()),
+                  self.assertRaisesRegex(conf.Unusable, 'result_poll_s')):
+                worker.terminate('fixture', 'i-fixture')
+            requests = [command for command in fake.commands if 'terminate-instances' in command]
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(fake.terminated_instances, {'i-fixture'})
+
     def test_identity_write_failure_requests_termination_before_recording_state(self) -> None:
-        for hold_ledger in (False, True):
-            with self.subTest(hold_ledger=hold_ledger), tempfile.TemporaryDirectory() as directory:
+        for hold_ledger, closed_stderr in ((True, False), (False, False), (False, True)):
+            with (self.subTest(hold_ledger=hold_ledger, closed_stderr=closed_stderr),
+                  tempfile.TemporaryDirectory() as directory):
                 folder = Path(directory)
                 write_gate_config(folder / 'cloud_gate.conf')
                 configuration = conf.read(folder / 'cloud_gate.conf')
@@ -231,6 +251,8 @@ class GateLaunchRecoveryTests(unittest.TestCase):
                     worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=transport),
                         book, folder / 'aws_target.conf', folder / 'reservation', clock=lambda: now)
                     errors = StringIO()
+                    if closed_stderr:
+                        errors.close()
                     with (mock.patch.object(cloud_gate, 'save', side_effect=save_launch),
                           mock.patch.object(cloud_gate, 'settings', return_value=configuration),
                           redirect_stderr(errors)):
@@ -249,6 +271,40 @@ class GateLaunchRecoveryTests(unittest.TestCase):
                 launch = cloud_gate.read(launch_path)
                 self.assertNotIn('instance', launch)
                 self.assertEqual(ledger.mapping(launch['arguments'])['ClientToken'], 'fixture-token')
+
+    def test_cleanup_requests_known_and_discovered_boxes_before_ledger_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            path = folder / 'cloud_gate.conf'
+            write_gate_config(path)
+            configuration = conf.read(path)
+            now = instant('2026-01-15T01:00:00+00:00')
+            book = ledger.CostLedger(folder)
+            fake = FakeGateAws()
+            known = ledger.GateReservation('known', now, now + 1200, Decimal('.8'), Decimal(0),
+                                          state=ledger.GateRunning('i-known'))
+            attempts = (
+                cloud_gate.GateCleanupAttempt(replace(known, attempt='absent', state=ledger.GateLaunchPending()), {}, True),
+                cloud_gate.GateCleanupAttempt(known, {}, True),
+                cloud_gate.GateCleanupAttempt(replace(known, attempt='discovered', state=ledger.GateLaunchPending()),
+                                              {'arguments': {'ClientToken': 'fixture-token'}}, True),
+            )
+            worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=fake),
+                book, folder / 'aws_target.conf', folder / 'reservation', clock=lambda: now)
+
+            def fail_write(*_arguments: object) -> None:
+                self.assertEqual(fake.terminated_instances, {'i-known', 'i-fixture'})
+                raise OSError('The fixture ledger is unavailable')
+
+            with (mock.patch.object(cloud_gate, 'settings', return_value=configuration),
+                  mock.patch.object(book, 'gate_region', side_effect=fail_write) as save_region,
+                  mock.patch.object(book, 'resolve_gate', side_effect=fail_write),
+                  mock.patch.object(worker, 'confirm_terminations', return_value=False),
+                  redirect_stderr(StringIO())):
+                self.assertFalse(cloud_gate.cleanup_attempts(attempts, worker))
+            save_region.assert_called_once_with('discovered', 'fixture-region')
+            operations = [command[command.index('--region') + 3] for command in fake.commands]
+            self.assertEqual(operations, ['terminate-instances', 'describe-instances', 'terminate-instances'])
 
 
 class CloudGateTests(CostFixture):
@@ -2014,9 +2070,11 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.fake.state = 'shutting-down'
         self.fake.state_reason = {'Code': 'Server.SpotInstanceShutdown'}
         self.fake.confirm_termination = False
-        outcome = self.execute()
+        with redirect_stderr(StringIO()) as errors:
+            outcome = self.execute()
         self.assertEqual(outcome['status'], 'fallback')
-        self.assertIn('Termination is unconfirmed', str(outcome['reason']))
+        self.assertIn('The instance stopped without a final result', str(outcome['reason']))
+        self.assertIn('Termination is unconfirmed', errors.getvalue())
         self.assertNotIsInstance(self.book.read_snapshot().gate_reservations[-1].state, ledger.GateTerminated)
 
     def test_a_spot_message_without_a_spot_code_does_not_request_a_retry(self) -> None:

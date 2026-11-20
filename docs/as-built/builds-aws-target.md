@@ -861,6 +861,9 @@ The `launch_log_lock_timeout_s` setting limits each launch log and cost ledger l
 If a wait expires, the worker requests termination for the instance.
 After the termination request, the worker tries to record the instance state in the cost ledger.
 If the recovery write fails, the worker reports the missing record. The saved token still permits discovery.
+The worker reads the retry settings when termination needs another attempt or confirmation poll.
+Cleanup sends requests for known instances before it searches for unconfirmed launches.
+Cleanup sends requests for discovered instances before it updates the ledger.
 For a launch log lock timeout, the worker reports `launch_log_lock_timeout` and states that the launch log entry is missing.
 The controller returns that reason without another append to the busy launch log.
 Recovery replays saved launch arguments in the saved region before it uses the current variants.
