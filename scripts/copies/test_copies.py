@@ -1449,12 +1449,29 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_clone_keeps_a_commit_that_exists_only_in_its_shared_source(self) -> None:
         source, commit = self.shared_source_commit()
-        checkout = copies.clone(source, task="gate:shared-source")
-        self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), commit)
-        self.assertEqual((checkout / "tracked.txt").read_text(), "shared source commit\n")
-        record = scratch.task_of(checkout)
-        assert isinstance(record, copy_record.Registered)
-        self.assertEqual(record.fields["source_commit"], commit)
+        template = self.base / "template"
+        hook = template / "hooks/pre-commit"
+        hook.parent.mkdir(parents=True)
+        _ = hook.write_text("#!/bin/sh\nexit 0\n")
+        hook.chmod(0o755)
+        (template / "info").mkdir()
+        _ = (template / "info/exclude").write_text("/custom-ignored\n")
+        configuration = self.base / "gitconfig"
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(configuration)}):
+            _ = self.git(source, "config", "--global", "init.templateDir", str(template))
+        for name, config in (("default", os.devnull), ("configured", str(configuration))):
+            with self.subTest(template=name), mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": config}):
+                checkout = copies.clone(source, task="gate:shared-source", word=name)
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), commit)
+                self.assertEqual((checkout / "tracked.txt").read_text(), "shared source commit\n")
+                record = scratch.task_of(checkout)
+                assert isinstance(record, copy_record.Registered)
+                self.assertEqual(record.fields["source_commit"], commit)
+                if name == "configured":
+                    installed = checkout / ".git/hooks/pre-commit"
+                    self.assertEqual(installed.read_bytes(), hook.read_bytes())
+                    self.assertTrue(os.access(installed, os.X_OK))
+                    self.assertEqual(self.git(checkout, "check-ignore", "custom-ignored"), "custom-ignored")
 
     def test_unshared_object_store_is_its_own_root(self) -> None:
         objects = self.source / ".git/objects"
@@ -1462,36 +1479,42 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertEqual(copies.root_object_stores(objects), (objects,))
 
     def test_clone_chain_borrows_only_roots_and_keeps_intermediate_commits(self) -> None:
-        source = self.source
-        commits = [self.head]
-        for name in ("first", "middle"):
-            checkout = self.base / name
-            _ = self.git(self.base, "clone", "--shared", "-q", str(source), str(checkout))
-            objects = checkout / ".git/objects"
-            relative = os.path.relpath(source / ".git/objects", objects)
-            _ = (objects / "info/alternates").write_text(relative + "\n")
-            _ = (checkout / f"{name}.txt").write_text(f"{name} commit\n")
-            _ = self.git(checkout, "add", f"{name}.txt")
-            _ = self.git(checkout, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-                         "commit", "-qm", f"{name} commit")
-            commits.append(self.git(checkout, "rev-parse", "HEAD"))
-            source = checkout
+        for depth in (2, 7):
+            with self.subTest(depth=depth):
+                chain = [self.source]
+                commits = [self.head]
+                names = ("first", *(f"store-{index}" for index in range(depth - 2)), "middle")
+                for name in names:
+                    checkout = self.base / name
+                    _ = self.git(self.base, "clone", "--shared", "-q", str(chain[-1]), str(checkout))
+                    alternate = checkout / ".git/objects/info/alternates"
+                    _ = alternate.write_text("".join(f"{ancestor / '.git/objects'}\n" for ancestor in chain))
+                    _ = (checkout / f"{name}.txt").write_text(f"{name} commit\n")
+                    _ = self.git(checkout, "add", f"{name}.txt")
+                    _ = self.git(checkout, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                                 "commit", "-qm", f"{name} commit")
+                    commits.append(self.git(checkout, "rev-parse", "HEAD"))
+                    chain.append(checkout)
+                for parent, checkout in zip(chain, chain[1:], strict=False):
+                    objects = checkout / ".git/objects"
+                    relative = os.path.relpath(parent / ".git/objects", objects)
+                    _ = (objects / "info/alternates").write_text(relative + "\n")
 
-        child = copies.clone(source, task="gate:child")
-        later = copies.clone(child, task="gate:later")
-        for checkout in (child, later):
-            alternate = checkout / ".git/objects/info/alternates"
-            self.assertEqual(alternate.read_text().splitlines(), [str(self.source / ".git/objects")])
-            self.assertEqual(self.git(checkout, "show", f"{commits[-1]}:middle.txt"), "middle commit")
+                child = copies.clone(chain[-1], task="gate:child", word=f"child-{depth}")
+                later = copies.clone(child, task="gate:later", word=f"later-{depth}")
+                for checkout in (child, later):
+                    alternate = checkout / ".git/objects/info/alternates"
+                    self.assertEqual(alternate.read_text().splitlines(), [str(self.source / ".git/objects")])
+                    self.assertEqual(self.git(checkout, "show", f"{commits[-1]}:middle.txt"), "middle commit")
 
-        shutil.rmtree(self.base / "middle")
-        shutil.rmtree(self.base / "first")
-        for checkout in (child, later):
-            self.assertEqual(self.git(checkout, "rev-list", "--objects", "--all", "--quiet"), "")
-            for commit in commits:
-                self.assertEqual(self.git(checkout, "cat-file", "-t", commit), "commit")
-            self.assertEqual(self.git(checkout, "show", "HEAD:first.txt"), "first commit")
-            self.assertEqual(self.git(checkout, "show", "HEAD:middle.txt"), "middle commit")
+                for checkout in reversed(chain[1:]):
+                    shutil.rmtree(checkout)
+                for checkout in (child, later):
+                    self.assertEqual(self.git(checkout, "rev-list", "--objects", "--all", "--quiet"), "")
+                    for commit in commits:
+                        self.assertEqual(self.git(checkout, "cat-file", "-t", commit), "commit")
+                    self.assertEqual(self.git(checkout, "show", "HEAD:first.txt"), "first commit")
+                    self.assertEqual(self.git(checkout, "show", "HEAD:middle.txt"), "middle commit")
 
     def test_worktree_snapshot_keeps_staged_blobs_without_an_intermediate_alternate(self) -> None:
         source, commit = self.shared_source_commit()
@@ -1509,12 +1532,19 @@ with patch.object(subprocess, 'run', pause_clone):
 
     def test_workspace_selects_a_detached_commit_that_exists_only_in_its_shared_source(self) -> None:
         source, commit = self.shared_source_commit()
-        with copies.workspace(self.owner_id, source, commit, name="detached", branch="worker") as tree:
-            self.assertEqual(self.git(tree, "rev-parse", "HEAD"), commit)
-            self.assertEqual((tree / "tracked.txt").read_text(), "shared source commit\n")
-            record = scratch.task_of(tree)
-            assert isinstance(record, copy_record.Registered)
-            self.assertEqual(record.fields["source_commit"], commit)
+        for name in ("detached", "reflog"):
+            with self.subTest(commit_source=name):
+                if name == "reflog":
+                    _ = self.git(source, "checkout", "-q", "--detach", self.head)
+                    self.assertNotEqual(self.git(source, "rev-parse", "HEAD"), commit)
+                    self.assertEqual(self.git(source, "for-each-ref", "--contains", commit), "")
+                    self.assertIn(commit, self.git(source, "reflog", "--format=%H").splitlines())
+                with copies.workspace(self.owner_id, source, commit, name=name, branch="worker") as tree:
+                    self.assertEqual(self.git(tree, "rev-parse", "HEAD"), commit)
+                    self.assertEqual((tree / "tracked.txt").read_text(), "shared source commit\n")
+                    record = scratch.task_of(tree)
+                    assert isinstance(record, copy_record.Registered)
+                    self.assertEqual(record.fields["source_commit"], commit)
 
     def test_clone_cli_with_one_until_value_ends_only_the_selected_clone(self) -> None:
         checkouts: list[Path] = []
@@ -2839,8 +2869,8 @@ with patch.object(subprocess, 'run', pause_clone):
         with copies.workspace(self.owner_id, self.source, self.head, name="parent", branch="worker") as parent:
             pass
         child = self.base / "adopted/borrower"
-        child.mkdir(parents=True)
-        copies.initialize_git(child, parent)
+        child.parent.mkdir()
+        _ = self.git(self.base, "clone", "--shared", "--no-checkout", str(parent), str(child))
         _ = self.git(child, "checkout", "-q", "-B", "borrower", self.head)
         with copies.workspace("other-unit", parent, self.head, name="borrower", branch="borrower", path=child):
             pass
@@ -2862,6 +2892,31 @@ with patch.object(subprocess, 'run', pause_clone):
         copies.remove_trees(self.owner_id)
         self.assertFalse(child.exists())
         self.assertFalse(parent.exists())
+
+        with self.subTest(borrowing="root"):
+            with copies.workspace("root-unit", self.source, self.head, name="root", branch="worker") as root:
+                _ = self.git(root, "repack", "-a", "-d")
+                (root / ".git/objects/info/alternates").unlink()
+            with copies.workspace(self.owner_id, root, self.head, name="middle", branch="worker") as middle:
+                pass
+            with copies.workspace("child-unit", middle, self.head, name="child", branch="worker") as child:
+                record = scratch.task_of(child)
+                assert isinstance(record, copy_record.Registered)
+                self.assertEqual(record.fields["borrows_from"], str(root / ".git"))
+            clone = copies.clone(middle, task="gate:root-dependency")
+            copies.remove_trees(self.owner_id)
+            self.assertFalse(middle.exists())
+            for checkout in (child, clone):
+                self.assertEqual(self.git(checkout, "show", "HEAD:tracked.txt"), "source HEAD")
+            with self.assertRaisesRegex(copies.CopyError, "borrowed"):
+                copies.remove_trees("root-unit")
+            copies.remove_trees("child-unit")
+            with self.assertRaisesRegex(copies.CopyError, "borrowed") as refusal:
+                copies.remove_trees("root-unit")
+            self.assertIn(str(clone), str(refusal.exception))
+            self.assertEqual(scratch.end("gate:root-dependency"), [clone])
+            copies.remove_trees("root-unit")
+            self.assertFalse(root.exists())
 
     def test_owner_removal_matches_transferred_names_without_constructing_unsafe_paths(self) -> None:
         for owner in ("Verify", "unit_name"):
@@ -3016,6 +3071,56 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertEqual(self.git(recovered, 'rev-parse', 'HEAD'), self.head)
             self.assertTrue(self.lease(recovered)['ready'])
         self.assertEqual(build_folders.build_folder_state(tree), 'free')
+
+    def test_interrupted_git_setup_recovers_on_next_use(self) -> None:
+        source, commit = self.shared_source_commit()
+        program = dedent("""
+            import os, sys
+            from pathlib import Path
+            from scripts.copies import copies
+
+            source, commit, stop = sys.argv[1:]
+            git = copies.git
+            write = copies.write_object_alternates
+            rename = Path.rename
+
+            def interrupt_git(repo, *arguments, **options):
+                result = git(repo, *arguments, **options)
+                if repo.name == copies.CLONE_STAGE and arguments[0] == stop:
+                    os._exit(19)
+                return result
+
+            def interrupt_write(objects, stores):
+                write(objects, stores)
+                if stop == "alternates":
+                    os._exit(19)
+
+            def interrupt_rename(path, destination):
+                result = rename(path, destination)
+                if path.parent.name == copies.CLONE_STAGE and stop == "rename":
+                    os._exit(19)
+                return result
+
+            copies.git = interrupt_git
+            copies.write_object_alternates = interrupt_write
+            Path.rename = interrupt_rename
+            with copies.workspace(copies.caller_owner(), source, commit, name=stop, branch="worker"):
+                pass
+            """)
+        for stop in ("init", "alternates", "fetch", "rename"):
+            with self.subTest(stop=stop):
+                interrupted = self.python_run(program, str(source), commit, stop)
+                self.assertEqual(interrupted.returncode, 19, interrupted.stderr)
+                path = copies.workspace_path(self.owner_id, source, stop)
+                self.assertTrue((path / copies.CLONE_STAGE).is_dir())
+                old_alternates = path / ".gate-clone-legacy00/template/objects/info/alternates"
+                old_alternates.parent.mkdir(parents=True)
+                _ = old_alternates.write_text(str(self.source / ".git/objects") + "\n")
+                with copies.workspace(self.owner_id, source, commit, name=stop, branch="worker") as tree:
+                    self.assertEqual(tree, path)
+                    self.assertEqual(self.git(tree, "rev-parse", "HEAD"), commit)
+                    self.assertEqual(self.git(tree, "status", "--porcelain"), "")
+                    self.assertEqual(list(tree.glob(".gate-clone*")), [])
 
     def test_interrupted_remove_finishes_even_after_record_is_deleted(self) -> None:
         with copies.workspace(self.owner_id, self.source, self.head, name='deleted-record', branch='deleted-record') as tree:

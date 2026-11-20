@@ -2277,11 +2277,12 @@ print(scratch.target('gate:proof', 'tree', False))
         borrower = source.parent / "borrower"
         borrower.mkdir()
         self.git(borrower, "init", "-q")
-        scratch.atomic_record(borrower / copy_record.RECORD,
-                              {"task": "gate:borrower", "borrows_from": str(source / ".git")})
-
-        self.assertEqual(scratch.record_lifetime(source, time.time()),
-                         scratch.Live(f"borrowed: {borrower} still uses its git objects"))
+        for stores in ((source / ".git",), (self.base / "other.git", source / ".git")):
+            with self.subTest(stores=stores):
+                scratch.atomic_record(borrower / copy_record.RECORD,
+                                      {"task": "gate:borrower", "borrows_from": "\n".join(map(str, stores))})
+                self.assertEqual(scratch.record_lifetime(source, time.time()),
+                                 scratch.Live(f"borrowed: {borrower} still uses its git objects"))
 
     def test_outside_checkout_does_not_inspect_the_copies_root(self) -> None:
         copies = self.base / "unrelated-copies"

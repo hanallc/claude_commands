@@ -1018,11 +1018,24 @@ def _unregistered_borrow_candidate(path: Path) -> UnregisteredBorrowCandidate:
     return UnregisteredBorrowCandidate.WORKTREE_SUBFOLDER
 
 
+def borrows_from(record: copy_record.Registered, path: Path) -> bool:
+    """Check every recorded store against the folder that removal would delete."""
+    borrowed = record.fields.get("borrows_from", "")
+    if not isinstance(borrowed, str):
+        raise ValueError("invalid borrows_from")
+    folder = path.resolve()
+    return any(Path(store).resolve().is_relative_to(folder) for store in borrowed.split("\n") if store)
+
+
 def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | Ended | Unknown:
     """Check the copy registry for borrowers of this folder's Git objects."""
     protection: Live | Ended | Unknown = Ended("no copy borrows from it")
     try:
-        for child in registered_copy_paths():
+        children = set(registered_copy_paths())
+        if (path / ".git/objects").is_dir():
+            children.update(folder.path for folder in folders(scratch_settings=scratch_settings)
+                            if (folder.path / ".git/objects/info/alternates").is_file())
+        for child in sorted(children):
             try:
                 mode = child.lstat().st_mode
             except FileNotFoundError:
@@ -1041,11 +1054,12 @@ def borrow_lifetime(path: Path, *, scratch_settings: conf.ConfigRead) -> Live | 
             if isinstance(other, copy_record.UnreadableRecord):
                 protection = Unknown(other.reason + "; cannot rule out borrowed objects")
                 break
-            borrowed = other.fields.get("borrows_from", "")
-            if not isinstance(borrowed, str):
-                protection = Unknown(f"repair record {child / copy_record.RECORD}: invalid borrows_from")
+            try:
+                borrowed = borrows_from(other, path)
+            except ValueError as error:
+                protection = Unknown(f"repair record {child / copy_record.RECORD}: {error}")
                 break
-            if borrowed and Path(borrowed).resolve() == (path / ".git").resolve():
+            if borrowed:
                 protection = Live(f"borrowed: {child} still uses its git objects")
                 break
     except OSError as error:

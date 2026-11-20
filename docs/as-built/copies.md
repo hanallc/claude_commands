@@ -54,13 +54,18 @@ Python callers pass slot lease descriptors to their build and test children.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the gate root.
 Its Git children inherit the destination lease and busy lock.
 New shared copies follow Git alternates to object stores that have no alternates of their own.
-Git fetches objects from the source that those root stores lack.
+Git initializes the copy in a private stage with the configured templates.
+The stage records only the root stores as alternates.
+The fetch gives upload-pack direct access to every store in the source chain.
+Git fetches objects that the root stores lack, including a requested commit that only the source reflog holds.
+The next use clears any unfinished stage before it prepares the checkout.
 Removing an intermediate copy leaves those objects available in the new copy.
 A clone of an active gate uses `--no-local` without sharing its object store.
 Worktree snapshots use a temporary object store while they read staged and working files.
 The new copy's alternates list does not include the worktree's intermediate store.
 Existing copies keep their alternates.
-Removal still checks for borrowers before it deletes a copy.
+Copy records name the stores that the copy uses.
+Removal checks those records before it deletes a store.
 The saved-work check trusts cached remote-tracking refs when they cover all local commits.
 Otherwise, removal runs `git ls-remote` in the clone once per named remote.
 Git uses the named remote's configured transport.

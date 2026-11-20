@@ -649,7 +649,7 @@ def refresh_remotes(tree: Path, source: Path, *, new_checkout: bool = False) -> 
         _ = git(tree, "update-ref", "--no-deref", "--stdin",
                 data="".join(f"delete {ref}\n" for ref in stale_heads).encode())
     if mappings:
-        _ = git(tree, "fetch", "-q", "--prune", "--", str(source), *mappings)
+        fetch_source(tree, source, *mappings, prune=True)
 
 
 def git_object_store(source: Path) -> Path:
@@ -658,10 +658,39 @@ def git_object_store(source: Path) -> Path:
     return Path(os.fsdecode(path.removesuffix(b"\n"))).resolve()
 
 
-def root_object_stores(source_objects: Path) -> tuple[Path, ...]:
-    """Find the stores that supply objects without borrowing from other stores."""
+def alternate_object_stores(objects: Path) -> tuple[Path, ...]:
+    """Read the direct alternates of one object store."""
+    alternates = objects / "info/alternates"
+    try:
+        descriptor = os.open(alternates, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return ()
+    with os.fdopen(descriptor, "rb") as source:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise CopyError(f"{alternates}: expected a regular file")
+        entries = source.read().split(b"\n")
+    stores: list[Path] = []
+    for entry in entries:
+        if not entry or entry.startswith(b"#"):
+            continue
+        if entry.startswith(b'"') and entry.endswith(b'"'):
+            entry, _ = escape_decode(entry[1:-1])
+        stores.append((objects / os.fsdecode(entry)).resolve())
+    return tuple(stores)
+
+
+@dataclass(frozen=True)
+class ObjectStoreChain:
+    """The root stores and all stores in dependency order."""
+
+    roots: tuple[Path, ...]
+    stores: tuple[Path, ...]
+
+
+def object_store_chain(source_objects: Path) -> ObjectStoreChain:
+    """List each store after the stores it borrows from."""
     roots: list[Path] = []
-    visited: set[Path] = set()
+    visited: dict[Path, None] = {}
     visiting: set[Path] = set()
 
     def visit(objects: Path) -> None:
@@ -673,31 +702,37 @@ def root_object_stores(source_objects: Path) -> tuple[Path, ...]:
         if not objects.is_dir():
             raise CopyError(f"{objects}: missing Git object store")
         visiting.add(objects)
-        alternates = objects / "info/alternates"
-        try:
-            descriptor = os.open(alternates, os.O_RDONLY | os.O_NONBLOCK)
-        except FileNotFoundError:
-            entries = []
-        else:
-            with os.fdopen(descriptor, "rb") as source:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise CopyError(f"{alternates}: expected a regular file")
-                entries = source.read().split(b"\n")
-        uses_alternate = False
-        for entry in entries:
-            if not entry or entry.startswith(b"#"):
-                continue
-            if entry.startswith(b'"') and entry.endswith(b'"'):
-                entry, _ = escape_decode(entry[1:-1])
-            uses_alternate = True
-            visit(objects / os.fsdecode(entry))
-        if not uses_alternate:
+        alternates = alternate_object_stores(objects)
+        for alternate in alternates:
+            visit(alternate)
+        if not alternates:
             roots.append(objects)
         visiting.remove(objects)
-        visited.add(objects)
+        visited[objects] = None
 
     visit(source_objects)
-    return tuple(roots)
+    return ObjectStoreChain(tuple(roots), tuple(visited))
+
+
+def root_object_stores(source_objects: Path) -> tuple[Path, ...]:
+    return object_store_chain(source_objects).roots
+
+
+def flattened_alternates(stores: Sequence[Path]) -> str:
+    """Quote each store for Git's alternate-directory list."""
+    return os.pathsep.join('"' + str(store).replace("\\", "\\\\").replace('"', '\\"') + '"'
+                           for store in stores)
+
+
+def fetch_source(tree: Path, source: Path, *refspecs: str, prune: bool = False) -> None:
+    """Fetch local objects, including commits that no source ref advertises."""
+    chain = object_store_chain(git_object_store(source))
+    upload_pack = ["git", "-c", "uploadpack.allowAnySHA1InWant=true", "upload-pack"]
+    if len(chain.stores) > 1:
+        # Give upload-pack the stores in root-first order. The receiver uses its own alternates.
+        upload_pack[:0] = ["env", "GIT_ALTERNATE_OBJECT_DIRECTORIES=" + flattened_alternates(chain.stores[:-1])]
+    options = ["--prune"] if prune else []
+    _ = git(tree, "fetch", "-q", *options, "--upload-pack", shlex.join(upload_pack), "--", str(source), *refspecs)
 
 
 def write_object_alternates(objects: Path, stores: Sequence[Path]) -> None:
@@ -710,28 +745,59 @@ def write_object_alternates(objects: Path, stores: Sequence[Path]) -> None:
     _ = (info / "alternates").write_bytes(b"\n".join(paths) + b"\n")
 
 
+def initialize_shared_git(stage: Path, source: Path, roots: tuple[Path, ...]) -> None:
+    """Create a copy with normal templates and direct access to its root stores."""
+    object_format = git(source, "rev-parse", "--show-object-format").decode().strip()
+    _ = git(stage, "init", "-q", f"--object-format={object_format}")
+    write_object_alternates(stage / ".git/objects", roots)
+    fetch_source(stage, source, "HEAD", "+refs/tags/*:refs/tags/*")
+    try:
+        branch = git(source, "symbolic-ref", "-q", "HEAD").decode().strip()
+    except GitExit as error:
+        if error.returncode != 1:
+            raise
+        _ = git(stage, "update-ref", "--no-deref", "HEAD", "FETCH_HEAD")
+    else:
+        _ = git(stage, "symbolic-ref", "HEAD", branch)
+        _ = git(stage, "update-ref", branch, "FETCH_HEAD")
+        name = branch.removeprefix("refs/heads/")
+        _ = git(stage, "config", f"branch.{name}.remote", "origin")
+        _ = git(stage, "config", f"branch.{name}.merge", branch)
+
+
 def initialize_git(tree: Path, source: Path) -> None:
     """Create private Git metadata while the caller holds the busy mark."""
     new_checkout = not (tree / ".git").exists()
-    if new_checkout:
-        # clone needs an empty destination; the tree already holds scratch's busy mark.
-        # Stage only Git metadata, so first creation never has an unlocked checkout.
-        with tempfile.TemporaryDirectory(dir=tree, prefix=CLONE_STAGE + "-") as directory:
-            stage = Path(directory)
-            clone_options = ["--no-local"]
-            if not any(active.tree == source for active in ACTIVE_GATES.get()):
-                source_objects = git_object_store(source)
-                roots = root_object_stores(source_objects)
-                if roots == (source_objects,):
-                    clone_options = ["--shared"]
-                else:
-                    # Give Git the root stores before it fetches the source refs.
-                    template = stage / "template"
-                    write_object_alternates(template / "objects", roots)
-                    clone_options.append(f"--template={template}")
-                    stage = stage / "checkout"
-            _ = git(source, "clone", *clone_options, "--no-checkout", "--quiet", "--", str(source), str(stage))
-            _ = (stage / ".git").rename(tree / ".git")
+    stage = tree / CLONE_STAGE
+    # Clear an interrupted stage while the busy mark protects the checkout.
+    for leftover in tree.glob(CLONE_STAGE + "*"):
+        if leftover.is_symlink() or not leftover.is_dir():
+            continue
+        if (leftover == stage or re.fullmatch(r"\.gate-clone-[a-z0-9_]{8}", leftover.name)
+                and ((leftover / "template/objects/info/alternates").is_file()
+                     or (leftover / ".git").is_dir() or not any(leftover.iterdir()))):
+            shutil.rmtree(leftover)
+    if not new_checkout:
+        prepare_git_metadata(tree, source, new_checkout=False)
+        return
+    stage.mkdir()
+    try:
+        if any(active.tree == source for active in ACTIVE_GATES.get()):
+            _ = git(source, "clone", "--no-local", "--no-checkout", "--quiet", "--", str(source), str(stage))
+        else:
+            source_objects = git_object_store(source)
+            roots = root_object_stores(source_objects)
+            if roots == (source_objects,):
+                _ = git(source, "clone", "--shared", "--no-checkout", "--quiet", "--", str(source), str(stage))
+            else:
+                initialize_shared_git(stage, source, roots)
+        prepare_git_metadata(stage, source, new_checkout=True)
+        _ = (stage / ".git").rename(tree / ".git")
+    finally:
+        shutil.rmtree(stage)
+
+
+def prepare_git_metadata(tree: Path, source: Path, *, new_checkout: bool) -> None:
     if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
         raise CopyError(f"{tree}: standing checkout must own its .git directory")
     actual = git(tree, "rev-parse", "--absolute-git-dir").decode().strip()
@@ -774,6 +840,8 @@ def register_scratch_clone(path: Path, source: CloneSourceCommit | CloneSource, 
     fields: dict[str, object] = {"test_hana_clone": True}
     if isinstance(source, CloneSourceCommit):
         fields.update(source_path=source.repository, source_commit=source.commit)
+    if (path / ".git").is_dir():
+        fields["borrows_from"] = borrowed_store_record(alternate_object_stores(git_object_store(path)))
     if isinstance(generated_from, CloneSourceCommit):
         fields["generated_source"] = True
     _ = scratch.update_record(path, lambda record: {
@@ -901,7 +969,7 @@ def merge_changes(tree: Path, source: Path, revision: str, *,
             commit = commit_at(tree, "FETCH_HEAD")
         else:
             commit = commit_at(source, revision)
-            _ = git(tree, "fetch", "-q", "--", str(source), commit)
+            fetch_source(tree, source, commit)
         _ = git(tree, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "--no-edit", "--no-verify", commit)
         if isinstance(committed_base, MergeEnvrcProof):
@@ -934,6 +1002,11 @@ def workspace_path(owner: str, repo: str | Path, name: str) -> Path:
     return copy_record.copies_root() / f"{repository_name(source)}-{owner}" / name
 
 
+def borrowed_store_record(stores: Sequence[Path]) -> str:
+    """Record each store and keep the existing Git directory form."""
+    return "\n".join(str(store.parent if store.name == "objects" else store) for store in stores)
+
+
 @contextmanager
 def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: str,
               task: str = "", path: Path | None = None, run_manifest: Path | None = None) -> Generator[Path]:
@@ -943,8 +1016,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
         if active.tree == source:
             source = active.source
             break
-    common, base = git(source, "rev-parse", "--path-format=absolute", "--git-common-dir", "--verify",
-                       "--end-of-options", f"{commit}^{{commit}}").decode().rstrip("\n").rsplit("\n", 1)
+    base = commit_at(source, commit)
     owner = checked_owner(owner)
     if path is None:
         _check_workspace_name(name)
@@ -976,11 +1048,16 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                     raise CopyError(f"{tree}: crate run link changed")
 
                 def register(copy_commit: str) -> None:
+                    if (tree / ".git").is_dir():
+                        stores = alternate_object_stores(git_object_store(tree))
+                    else:
+                        stores = root_object_stores(git_object_store(source))
+                    borrowed = borrowed_store_record(stores)
                     if legacy:
                         _ = scratch.hold(tree, task, LEGACY_WORKER_HOLD_REASON)
                         fields: dict[str, object] = dict(owner_unit=owner, source_path=str(source),
                             source_commit=base, copy_commit=copy_commit, target_mode="none",
-                            seed_source="", borrows_from=common, repository_identity=identity)
+                            seed_source="", borrows_from=borrowed, repository_identity=identity)
                         if manifest_path:
                             fields["crate_run"] = manifest_path
                         _ = scratch.update_record(tree, lambda _: scratch.fields_for_task(fields, task))
@@ -988,7 +1065,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                     else:
                         scratch.register_copy(tree, task=task, owner_unit=owner, source_path=str(source),
                                               source_commit=base, copy_commit=copy_commit, target_mode="none",
-                                              seed_source="", borrows_from=common, crate_run=manifest_path,
+                                              seed_source="", borrows_from=borrowed, crate_run=manifest_path,
                                               repository_identity=identity)
 
                 if isinstance(record, copy_record.Registered):
@@ -1029,6 +1106,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                     refresh_remotes(tree, source)
                 else:
                     initialize_git(tree, source)
+                    fetch_source(tree, source, base)
                     _ = git(tree, "checkout", "-q", "-B", branch, base)
                     source_settings = read_git_settings(source)
                     for key in ("user.name", "user.email"):
@@ -1201,13 +1279,13 @@ def worktree_objects(tree: Path, worktree: Path, base: str) -> Generator[None]:
     head = commit_at(worktree, "HEAD")
     if head != base:
         # The three-way apply can need objects from the worktree's HEAD.
-        _ = git(tree, "fetch", "-q", "--no-tags", "--", str(worktree), head)
+        fetch_source(tree, worktree, head)
     source_objects = git_object_store(worktree)
-    roots = root_object_stores(source_objects)
+    stores = object_store_chain(source_objects).stores
     with build_folders.tool_folder("copies-objects") as folder:
         objects = folder / "objects"
         # The temporary index can need staged blobs that no ref can supply.
-        write_object_alternates(objects, tuple(dict.fromkeys((*roots, source_objects))))
+        write_object_alternates(objects, stores)
         previous = os.environ.get("GIT_OBJECT_DIRECTORY")
         os.environ["GIT_OBJECT_DIRECTORY"] = str(objects)
         try:
@@ -1236,7 +1314,7 @@ def prepare_requested_source(tree: Path, source: Path, policy: SourcePolicy, mer
     else:
         _ = git(tree, "remote", "set-url", "origin", resolved_remote_url(source, origin))
     base = source_commit(source, policy)
-    _ = git(tree, "fetch", "-q", "--", str(source), base)
+    fetch_source(tree, source, base)
     _ = git(tree, "checkout", "--quiet", "--detach", base)
     committed_base = commit_at(tree, f"{base}^") if isinstance(policy, StagedSource) else base
     envrc: EnvrcReference | MergedEnvrcReference = EnvrcReference.CALLER_ANCHOR
@@ -1642,8 +1720,11 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
             raise CopyError(f"{tree}: borrowed objects form a cycle; repair the copy records")
         visiting.add(tree)
         for child, record in found:
-            borrowed = record.fields.get("borrows_from")
-            if isinstance(borrowed, str) and borrowed and Path(borrowed).resolve() == (tree / ".git").resolve():
+            try:
+                borrowed = child != tree and scratch.borrows_from(record, tree)
+            except ValueError as error:
+                raise CopyError(f"repair record {child / copy_record.RECORD}: {error}") from error
+            if borrowed:
                 visit(child)
         visiting.remove(tree)
         visited.add(tree)
