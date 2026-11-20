@@ -247,6 +247,20 @@ class AwsPageLaunchStateTests(PageCostFixture):
                                  'reason': 'AWS could not authenticate the launch credentials.',
                                  'first_at': self.now - 60, 'count': 1, 'latest_attempt_at': self.now - 60})
 
+    def test_publisher_resolves_one_file_for_spend_and_tables(self) -> None:
+        account = self.root / 'account' / 'aws_target.conf'
+        account.parent.mkdir()
+        _ = account.write_bytes(self.settings.read_bytes())
+        ledger_test_support.numeric_settings(account, {'daily_limit_usd': '7', 'run_cost_days': '11'})
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(now, (), 'fixture', builder_removed=True))
+        with mock.patch.object(aws_config, 'account_settings_path', return_value=account) as resolve:
+            page = aws_page.publish(self.state, now, self.root / 'page').read_text()
+        resolve.assert_called_once_with()
+        self.assertIn('of the $7.00 daily limit', page)
+        self.assertIn('11 days', page)
+
     def test_publisher_settings_have_fixed_fixture_values(self) -> None:
         settings = conf.read(self.settings)
         self.assertEqual((settings.whole('spend_pace_days'), settings.whole('run_cost_days'),
@@ -649,6 +663,54 @@ class AwsCombinedTableTests(PageCostFixture):
           "A small billed amount keeps its row even when the cell rounds to zero");
     east.click();
     check(sizes().includes("c7a.4xlarge"), "The row returns when its region is selected");
+""")
+
+    def test_refused_bill_notice_lists_only_estimates_shown_on_the_page(self) -> None:
+        now = ledger_test_support.instant('2026-01-15T12:00:00Z')
+        start = ledger_test_support.instant('2026-01-13T00:00:00Z')
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(start, (), 'fixture', builder_removed=True))
+        book.observe(ledger.InstanceObservation(start, 'terminated', 'fixture'))
+        charges = self.state / 'charges'
+        charges.mkdir()
+        bill = ledger.ChargeRead('2026-01-13', now, start, start + 86400, Decimal(4), Decimal(0), Decimal(0))
+        _ = (charges / '2026-01-13.json').write_text(json.dumps(ledger.charge_record(bill)))
+        _ = (charges / 'alias.json').write_text(json.dumps(ledger.charge_record(bill)))
+        self.run_browser_checks('', """
+    check(document.querySelector("#bill-refusals").hidden, "The valid bill still supplies the day");
+""")
+        mismatched = ledger.ChargeRead('2026-01-14', now, start + 86400, start + 2 * 86400,
+                                       Decimal(5), Decimal(0), Decimal(0))
+        mismatched_path = charges / '2026-01-15.json'
+        _ = mismatched_path.write_text(json.dumps(ledger.charge_record(mismatched)))
+        self.run_browser_checks('', """
+    const summary = document.querySelector("#bill-refusal-summary");
+    check(summary.textContent === "1 AWS bill record refused; those days show our estimate.", "One record");
+    check(document.querySelector("dl[role=tooltip] dt").textContent === "2026-01-14, 2026-01-15",
+          "The refusal lists both UTC dates");
+""")
+        mismatched_path.unlink()
+        _ = (charges / '2026-01-14.json').write_text('{broken')
+        self.run_browser_checks('', """
+    const summary = document.querySelector("#bill-refusal-summary");
+    check(summary.textContent === "1 AWS bill record refused; that day shows our estimate.", "Singular notice");
+    check(document.querySelector("dl[role=tooltip] dt").textContent === "2026-01-14", "Refused UTC day");
+""")
+        _ = (charges / '2026-01-15.json').write_text('{broken')
+        self.run_browser_checks('', """
+    const summary = document.querySelector("#bill-refusal-summary");
+    const tip = document.querySelector("#bill-refusal-tip");
+    check(summary.textContent === "2 AWS bill records refused; those days show our estimate.", "Plural notice");
+    check(!summary.parentElement.hidden && getComputedStyle(tip).display === "none", "Notice with closed tooltip");
+    summary.focus();
+    check(getComputedStyle(tip).display === "grid", "Focus opens the tooltip");
+    check([...tip.querySelectorAll("dt")].map(row => row.textContent).join() === "2026-01-14,2026-01-15",
+          "Only shown estimates appear");
+    check([...tip.querySelectorAll("dd")].every(row =>
+          row.textContent === "invalid bill format" && getComputedStyle(row).textAlign === "right"),
+          "The tooltip lists right-aligned reasons");
+    summary.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", bubbles: true}));
+    check(getComputedStyle(tip).display === "none", "Escape closes the tooltip");
 """)
 
     def test_launch_state_sits_above_spend_and_updates_after_a_good_launch(self) -> None:

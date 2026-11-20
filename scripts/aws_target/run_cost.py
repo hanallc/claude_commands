@@ -147,19 +147,28 @@ DayKey = tuple[str, str, str]
 BilledKey = tuple[str, str, str, str]
 
 
+class LegacyBillPolicy(Enum):
+    LEGACY = 'legacy'
+
+
+@dataclass(frozen=True)
+class ValidateBillsAt:
+    cutoff: int
+
+
 def billed_readings(book: ledger.CostLedger, start: datetime, end: datetime, *,
-                    bill_cutoff: int | None = None) -> list[ledger.ChargeRead]:
+                    bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY) -> list[ledger.ChargeRead]:
     """Read bill amounts for the UTC days in [start, end)."""
     readings = (tuple(reading for reading in book.read_bills() if ledger.is_billed_day(reading))
-                if bill_cutoff is None else book.validated_bills(bill_cutoff))
+                if bill_policy is LegacyBillPolicy.LEGACY else book.validated_bills(bill_policy.cutoff))
     first, following = start.date().isoformat(), end.date().isoformat()
     return [reading for reading in readings if first <= reading.day < following]
 
 
 def spot_bills(book: ledger.CostLedger, start: datetime, end: datetime, *,
-               bill_cutoff: int | None = None) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
+               bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
     """The billed Spot USD and box hours for each type, region and day in [start, end)."""
-    return bills_from_readings(billed_readings(book, start, end, bill_cutoff=bill_cutoff))
+    return bills_from_readings(billed_readings(book, start, end, bill_policy=bill_policy))
 
 
 def _spot_usage_key(usage_type: str) -> tuple[str, str] | None:
@@ -186,7 +195,7 @@ def hana_billed_hours(directory: Path, day: date) -> Decimal | None:
     try:
         record = ledger.read_saved_bill(path, int(time.time()))
         bill = record.pricing_read
-        if (record.usable_bill is ledger.BillRecordRejection.DUPLICATE_FIELDS
+        if (record.validation_result is ledger.BillRecordRejection.DUPLICATE_FIELDS
                 or not ledger.matches_utc_charge_day(path.name, bill, day)):
             return None
     except (OSError, ValueError, ArithmeticError):
@@ -302,11 +311,11 @@ def _box_hours(snapshot: ledger.LedgerEvidence, start: datetime, end: datetime, 
 
 
 def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
-                     scope: SpotHoursScope, max_ratio: Decimal, *, bill_cutoff: int | None = None) -> dict[DayKey, HoursCheck]:
+                     scope: SpotHoursScope, max_ratio: Decimal, *, bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY) -> dict[DayKey, HoursCheck]:
     """Check each type in scope by region and UTC day in the window.
 
     A bill without Spot usage for a type counts as zero hours."""
-    readings = billed_readings(book, start, end, bill_cutoff=bill_cutoff)
+    readings = billed_readings(book, start, end, bill_policy=bill_policy)
     read_days = {reading.day for reading in readings}
     bills = bills_from_readings(readings)
     snapshot = book.read_snapshot()
@@ -332,11 +341,11 @@ def day_hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, ho
 
 
 def hours_checks(book: ledger.CostLedger, start: datetime, end: datetime, home: str, builder: str,
-                 scope: SpotHoursScope, max_ratio: Decimal, *, bill_cutoff: int | None = None) -> dict[tuple[str, str], HoursCheck]:
+                 scope: SpotHoursScope, max_ratio: Decimal, *, bill_policy: LegacyBillPolicy | ValidateBillsAt = LegacyBillPolicy.LEGACY) -> dict[tuple[str, str], HoursCheck]:
     """The hours check of each type in sizes and region, summed over the days in [start, end) with a bill."""
     billed: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
     unbilled: dict[tuple[str, str], list[HoursCheck]] = defaultdict(list)
-    daily = day_hours_checks(book, start, end, home, builder, scope, max_ratio, bill_cutoff=bill_cutoff)
+    daily = day_hours_checks(book, start, end, home, builder, scope, max_ratio, bill_policy=bill_policy)
     for (size, region, _day), check in daily.items():
         (unbilled if check.billed_hours is None else billed)[size, region].append(check)
     checks: dict[tuple[str, str], HoursCheck] = {}

@@ -99,7 +99,7 @@ REFERENCE: dict[str, SpendReference] = {
     '85 dispatched': (('2', '4'), ('1', '3'), ('1', '3')),
     '85 expired': (('2', '4'), ('5', '7'), ('5', '7')),
     '86': (('2', '4'), ('2', '4'), ('2', '4')),
-    '86 zero marker': (('2', '6'), ('0', '4'), ('2', '6')),
+    '86 zero marker': (('0', '4'), ('0', '4'), ('2', '6')),
     '87': (('11', '12'), ('11', '12'), ('11', '12')),
     '87 tax carry': (('1', '12'), ('1', '12'), ('1', '12')),
     '88 zero': (('3', '—'), ('3', '3'), ('3', '3')),
@@ -755,7 +755,10 @@ class AccountSpendParityTests(SpendReferenceFixture):
         other = self.root / 'report-settings.conf'
         _ = other.write_text(self.original_settings)
         self.record('66')
-        self.assertEqual(spend.read_spend(other, self.book.directory, self.now, utc_day(self.now)), self.page())
+        report = spend.read_spend(other, self.book.directory, self.now, utc_day(self.now))
+        assert isinstance(report, spend.Spend)
+        day, = (row for row in report.days if row.day == utc_day(self.now))
+        self.assertEqual(day.usd, Decimal(1))
 
         jan15 = JAN1 + 14 * DAY
         self.scene('67', now=jan15 + DAY + 12 * HOUR)

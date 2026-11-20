@@ -21,7 +21,9 @@ from pathlib import Path
 from statistics import median
 from typing import Literal, NotRequired, TypedDict
 
-from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
+from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, measurement, quota_requests, run_cost, spend as aws_spend, spot_table
+from scripts.build_queue import memory_files
+from scripts.disks.disks_page import shared_step_tip
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
@@ -87,12 +89,18 @@ class SpendTile(TypedDict):
     note: str
 
 
+class RefusedBillData(TypedDict):
+    days: list[str]
+    reason: str
+
+
 class SpendData(TypedDict):
     # Empty when the spend is available.
     unavailable: str
     # Today, yesterday and the month to date, in that order.
     tiles: list[SpendTile]
     forecast: str
+    refused_bills: list[RefusedBillData]
 
 
 class NormalLaunchRefusal(StrEnum):
@@ -347,19 +355,28 @@ def day_tile(label: str, day: str, spend: aws_spend.Spend, limit: bool) -> Spend
 def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: int, pace_days: int) -> SpendData:
     """Today, yesterday and the month to date, as the buildlog report shows them."""
     if isinstance(spend, aws_config.MeasurementUnavailable):
-        return {'unavailable': f'AWS spend unavailable: {spend.reason}.', 'tiles': [], 'forecast': ''}
+        return {'unavailable': f'AWS spend unavailable: {spend.reason}.', 'tiles': [],
+                'forecast': '', 'refused_bills': []}
     today = datetime.fromtimestamp(now, UTC).date()
+    yesterday = today - timedelta(days=1)
     tiles = [day_tile('Today', today.isoformat(), spend, True),
-             day_tile('Yesterday', (today - timedelta(days=1)).isoformat(), spend, True)]
+             day_tile('Yesterday', yesterday.isoformat(), spend, True)]
     month = aws_spend.month_spend(spend.days, today, pace_days)
+    shown_estimates = {row.day for row in spend.days if row.source != 'AWS bill' and (
+        row.day in (today.isoformat(), yesterday.isoformat())
+        or (month is not None and row.day.startswith(f'{today:%Y-%m}')))}
+    refused: list[RefusedBillData] = [
+        {'days': labels, 'reason': record.reason.value}
+        for record in spend.refused_bills
+        if (labels := [day.isoformat() for day in record.days if day.isoformat() in shown_estimates])]
     if month is None:
         tiles.append({'label': 'Month to date', 'usd': '—', 'note': f'UTC {today:%Y-%m}: no billed day yet'})
-        return {'unavailable': '', 'tiles': tiles, 'forecast': ''}
+        return {'unavailable': '', 'tiles': tiles, 'forecast': '', 'refused_bills': refused}
     tiles.append({'label': 'Month to date', 'usd': f'${month.to_date:.2f}',
                   'note': f'UTC {today:%Y-%m}, of the ${spend.monthly_limit:.2f} monthly limit.'})
     forecast = (f'Month forecast: ${month.forecast:.2f} at ${month.pace:.2f} a day, the average of the last '
                 + f'{month.billed_days} billed days. 32-CPU gate compute is {month.gate_share:.0%} of the spend on those days.')
-    return {'unavailable': '', 'tiles': tiles, 'forecast': forecast}
+    return {'unavailable': '', 'tiles': tiles, 'forecast': forecast, 'refused_bills': refused}
 
 
 def launch_state(records: Sequence[dict[str, object]], gate_switch: cloud_gate.CloudGateSetting) -> LaunchState:
@@ -565,14 +582,23 @@ def settled_amount_notes(watched: Sequence[ledger.WatchedChargeDay]) -> tuple[st
 def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | None = None) -> Path:
     """Write the page with the tables of the local snapshot and run ledger."""
     started = time.perf_counter()
-    configuration = conf.read(settings_path) if settings_path else conf.read_or_repository('aws_target')
+    configuration = conf.read(settings_path if settings_path is not None else aws_config.account_settings_path())
     today = datetime.fromtimestamp(now, UTC).date().isoformat()
-    read = aws_spend.read_spend(settings_path or conf.path('aws_target'), directory, now, today)
-    spend = spend_data(read, now, configuration.whole('spend_pace_days'))
+    book = ledger.CostLedger(directory)
+    watched: tuple[ledger.WatchedChargeDay, ...] = ()
     try:
-        watched = ledger.CostLedger(directory).read_charge_watch(aws_config.read_settings(configuration), now)
-    except (OSError, ValueError):
-        watched = ()
+        inputs = measurement.read_inputs(configuration, directory)
+        snapshot = measurement.read_measurement(configuration, directory, now, inputs=inputs)
+        read = aws_spend.spend_from(inputs, snapshot, book, now, today, book.refused_bill_records(now))
+    except (OSError, ValueError, ArithmeticError) as error:
+        read = aws_config.MeasurementUnavailable(str(error))
+    else:
+        if isinstance(inputs.settings, aws_config.SpendingSettings):
+            try:
+                watched = book.read_charge_watch(inputs.settings, now)
+            except (OSError, ValueError):
+                pass
+    spend = spend_data(read, now, configuration.whole('spend_pace_days'))
     try:
         placement = ledger.read_spot_placement_scores(directory)
     except (OSError, ValueError, KeyError) as error:
@@ -580,17 +606,19 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
         placement = ()
     values = cloud_gate.settings()
     gate_pricing = run_cost.read_gate_pricing_inputs(directory, now, values, configuration)
-    tables = spot_table.spot_tables(directory, now, settings_path=settings_path, gate_pricing=gate_pricing)
-    data = page_data(tables, spend, now, placement, launch_records=ledger.CostLedger(directory).launches(),
+    tables = spot_table.spot_tables_from(directory, now, values, configuration, gate_pricing=gate_pricing)
+    data = page_data(tables, spend, now, placement, launch_records=book.launches(),
                      settled_notes=settled_amount_notes(watched), gate_switch=cloud_gate.launch_switch(values))
     comparisons = run_cost.merge_gate_comparisons(directory, now, values, configuration, gate_pricing=gate_pricing)
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
     gate_time_data = {'table': gate_time_price, 'regions': regions}
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
-    # A '</' in a cell must not end the script element.
+    tip = shared_step_tip(memory_files.PAGE_SOURCE.read_text(encoding='utf-8'))
     data['render_seconds'] = time.perf_counter() - started
+    # Escape closing tags inside JSON values.
     page = (page_frame.template(source, 'AWS', 'aws')
+            .replace('__STEP_TIP_STYLE__', tip.style, 1)
             .replace('__AWS_QUOTA_HELP__', quota_help(), 1)
             .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/'))
             .replace('__AWS_GATE_TIME_DATA__', json.dumps(gate_time_data).replace('</', '<\\/')))
@@ -604,7 +632,7 @@ def publish_configured() -> int:
     """Publish the page from the AWS target state folder; the hourly job calls this."""
     from scripts.build_targets.target_config import ssh_target_state_directory
 
-    _ = publish(ssh_target_state_directory('aws'), int(time.time()), output_folder(), settings_path=conf.path('aws_target'))
+    _ = publish(ssh_target_state_directory('aws'), int(time.time()), output_folder())
     return 0
 
 

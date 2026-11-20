@@ -603,7 +603,7 @@ region_transfer_usd={"us-west-1":0.00015}
                 runs = run_cost.gate_runs(book, start, end, region).runs
                 self.assertEqual([(run.instance_type, run.box_s) for run in runs], [(size, Decimal(360))])
                 self.assertEqual(sum(day.runs for day in book.spend_days(aws_config.read_settings(self.settings), now)), 1)
-                report = aws_report.gate_type_report(self.state, end.date().isoformat(), 1)
+                report = aws_report.gate_type_report(self.state, end.date().isoformat(), 1, home=conf.read(self.settings).text('region'))
                 self.assertTrue(any(line.startswith(f'| {size} |') for line in report.tables))
                 page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
                 payload = page.read_text().split('<script id="aws-prices-data" type="application/json">', 1)[1]
@@ -773,7 +773,7 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual([tile['usd'] for tile in no_bill['tiles']], ['$2.00', '—', '—'])
         self.assertEqual(no_bill['forecast'], '')
         gone = aws_page.spend_data(aws_config.MeasurementUnavailable('ledger unreadable'), now, 2)
-        self.assertEqual(gone, {'unavailable': 'AWS spend unavailable: ledger unreadable.', 'tiles': [], 'forecast': ''})
+        self.assertEqual(gone, {'unavailable': 'AWS spend unavailable: ledger unreadable.', 'tiles': [], 'forecast': '', 'refused_bills': []})
 
     def test_page_data_cannot_end_its_script_element(self) -> None:
         folder = self.root / 'page'
@@ -782,7 +782,7 @@ region_transfer_usd={"us-west-1":0.00015}
         standard, *other_prices = tables.prices
         first, *other_rows = standard.rows
         prices = (replace(standard, rows=((first[0], cell, *first[2:]), *other_rows)), *other_prices)
-        with mock.patch.object(spot_table, 'spot_tables', return_value=replace(tables, prices=prices)):
+        with mock.patch.object(spot_table, 'spot_tables_from', return_value=replace(tables, prices=prices)):
             source = aws_page.publish(self.state, int(self.clock.now), folder).read_text()
         payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
         self.assertEqual(cast(aws_page.PageData, json.loads(payload))['prices'][0]['rows'][0][1], cell)

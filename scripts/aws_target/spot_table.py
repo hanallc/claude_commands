@@ -147,6 +147,12 @@ def spot_tables(directory: Path, now: int, *, settings_path: Path | None = None,
     """Read prices, quotas, run costs, billed hours, and the reason for each unavailable value."""
     values = conf.read_or_repository('cloud_gate')
     configuration = conf.read(settings_path) if settings_path else conf.read_or_repository('aws_target')
+    return spot_tables_from(directory, now, values, configuration, gate_pricing=gate_pricing)
+
+
+def spot_tables_from(directory: Path, now: int, values: conf.ConfigRead, configuration: conf.ConfigRead, *,
+                     gate_pricing: run_cost.GatePricingInputs | None = None) -> SpotTables:
+    """Build the tables from the settings for this publication."""
     regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
     gate_types = values.words('instance_types')
     standard = tuple(dict.fromkeys((*gate_types, *values.words('price_compare_instance_types'))))
@@ -232,7 +238,7 @@ def run_costs(directory: Path, now: int, sizes: tuple[str, ...], regions: tuple[
     start = end - timedelta(days=days)
     book = ledger.CostLedger(directory)
     history = run_cost.read_gate_run_history(book, start, end, home)
-    bills = run_cost.spot_bills(book, start, end, bill_cutoff=now)
+    bills = run_cost.spot_bills(book, start, end, bill_policy=run_cost.ValidateBillsAt(now))
     paid_hourly = run_cost.paid_per_hour(bills)
     allocations = run_cost.billed_allocations(bills, history.runs)
     gate_minimum: dict[tuple[str, str], Decimal] = {}
@@ -327,7 +333,7 @@ def billed_hours(directory: Path, now: int, regions: tuple[str, ...], scope: run
     end = datetime.fromtimestamp(now, UTC)
     try:
         checks = run_cost.hours_checks(ledger.CostLedger(directory), end - timedelta(days=days), end, home, builder, scope,
-                                       max_ratio, bill_cutoff=now)
+                                       max_ratio, bill_policy=run_cost.ValidateBillsAt(now))
     except ledger.LedgerUnavailable:
         return BilledHoursTable(title, ('type', *regions), frozenset(), (), 'columns',
                                 active_regions_by_size={}, note='No billed hours: the cost ledger is not readable.', reserved_by_region={})
