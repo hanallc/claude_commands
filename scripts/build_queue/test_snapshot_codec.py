@@ -115,6 +115,13 @@ class SnapshotCodecTests(unittest.TestCase):
             expected = replace(slot, slot=retained) if isinstance(slot, records.ContinuationSlot) else retained
             self.assertEqual(parsed, replace(inputs, slots=(expected,)))
 
+            identity_fields = cast(dict[str, object], older["identity"])
+            for name in ("name", "source", "staff_id"):
+                with self.subTest(slot=type(slot).__name__, missing=name):
+                    older["identity"] = {key: value for key, value in identity_fields.items() if key != name}
+                    with self.assertRaises(codec.SnapshotParseError):
+                        _ = codec.parse_snapshot_value(raw, records.QueueInputs)
+
     def test_older_services_read_direct_requests_with_a_local_reason(self) -> None:
         reason = "it edits the merged checkout on natedev with mend and fmt, and the push goes from there"
         for revision in (CI_CLIENT, "1be2f8932"):
@@ -424,8 +431,45 @@ class SnapshotCodecTests(unittest.TestCase):
         schema = list[int | str | float]
         self.assertEqual(codec.parse_snapshot_value([1, "sample", 2.5], schema), [1, "sample", 2.5])
         for value in (True, float("nan"), float("inf"), None):
-            with self.subTest(value=value), self.assertRaises(ValueError):
+            with self.subTest(value=value), self.assertRaises(codec.SnapshotParseError):
                 _ = codec.parse_snapshot_value([value], schema)
+
+    def test_numeric_fields_reject_integers_outside_the_finite_range(self) -> None:
+        huge = int("9" * 400)
+        for schema in (int, float, int | str, str | float):
+            for value in (huge, -huge):
+                with self.subTest(schema=schema, sign=value > 0), self.assertRaises(codec.SnapshotParseError):
+                    _ = codec.parse_snapshot_value(value, schema)
+        for schema in (list[int], list[int | str], tuple[int, ...], frozenset[int]):
+            with self.subTest(schema=schema), self.assertRaises(codec.SnapshotParseError):
+                _ = codec.parse_snapshot_value([huge], schema)
+        for value in (codec.MIN_SNAPSHOT_INTEGER, codec.MAX_SNAPSHOT_INTEGER):
+            self.assertEqual(codec.parse_snapshot_value(value, int), value)
+            self.assertEqual(codec.parse_snapshot_value(value, float), value)
+
+    def test_malformed_fields_raise_the_snapshot_parse_error(self) -> None:
+        cases: tuple[tuple[object, object], ...] = (
+            (str, 1),
+            (bool, 1),
+            (float, float("inf")),
+            (Literal[1], True),
+            (type(None), ""),
+            (Path, "directory\0"),
+            (list[str], {"count": 1}),
+            (tuple[int, str], [1]),
+            (frozenset[object], [[1]]),
+            (dict[str, int], [1]),
+            (dict[int, str], {"one": "value"}),
+            (dict[str, int], {"count": False}),
+            (Reading, {"state": "ready"}),
+            (Reading, {"state": "ready", "value": {"kind": "Ready", "count": 1}, "detail": None}),
+            (Ready, {"kind": "Unavailable", "count": 1}),
+            (Ready, {"kind": "Ready"}),
+            (records.RequestedTestWidth, {"kind": "RequestedTestWidth", "threads": 0}),
+        )
+        for schema, value in cases:
+            with self.subTest(schema=schema, value=value), self.assertRaises(codec.SnapshotParseError):
+                _ = codec.parse_snapshot_value(value, schema)
 
 
 if __name__ == "__main__":

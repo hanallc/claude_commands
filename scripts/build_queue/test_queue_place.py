@@ -28,7 +28,7 @@ from scripts.build_queue.queue_fixture import write_process
 from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
-from scripts.build_queue import admission_records as records, step_estimator
+from scripts.build_queue import admission_records as records, snapshot_codec, step_estimator
 from scripts.lint import memory_admit as gate
 
 from scripts.buildlog import store
@@ -1338,6 +1338,12 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                                 pass
 
     def test_truncated_program_record_keeps_its_folder_and_allows_admission(self) -> None:
+        self.assert_damaged_program_record_keeps_folder(truncated=True)
+
+    def test_program_record_with_a_400_digit_pid_keeps_its_folder_and_allows_admission(self) -> None:
+        self.assert_damaged_program_record_keeps_folder(truncated=False)
+
+    def assert_damaged_program_record_keeps_folder(self, *, truncated: bool) -> None:
         with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {"TMPDIR": str(fixture.root)}):
             holder = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True, timeout=3)
             owner = wire.Owner(int(holder.stdout), "1")
@@ -1350,7 +1356,13 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             directory = queue.program_starts()
             directory.mkdir(parents=True, exist_ok=True)
             damaged = directory / "damaged.json"
-            text = wire.encode_record(queue.ProgramStart(owner, owner, "", sidecar=str(sidecar)))[:-1]
+            text = wire.encode_record(queue.ProgramStart(owner, owner, "", sidecar=str(sidecar)))
+            if truncated:
+                text = text[:-1]
+            else:
+                fields = cast(dict[str, object], json.loads(text))
+                cast(dict[str, object], fields["holder"])["pid"] = int("9" * 400)
+                text = json.dumps(fields)
             _ = damaged.write_text(text)
             recoverable = directory / "recoverable.json"
             empty_scope = fixture.root / "empty-scope"
@@ -1368,6 +1380,33 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertTrue(sidecar.is_file())
             self.assertEqual(sidecar.with_name(build_folders.RECOVERY_MARKER).readlink(), damaged.absolute())
             fixture.assert_cleaned(self)
+
+    def test_each_malformed_program_record_field_raises_the_snapshot_parse_error(self) -> None:
+        owner = {"kind": "Owner", "pid": 42, "start_time": "100"}
+        valid = {"kind": "ProgramStart", "holder": owner, "program": owner, "scope": "", "ready": False,
+                 "sidecar": ""}
+        cases: tuple[tuple[str, object], ...] = (
+            ("kind", "Owner"),
+            ("holder", None),
+            ("holder", {**owner, "kind": "Other"}),
+            ("holder", {**owner, "pid": 2 ** 31}),
+            ("holder", {**owner, "start_time": None}),
+            ("program", []),
+            ("program", {**owner, "pid": int("9" * 400)}),
+            ("program", {**owner, "start_time": ""}),
+            ("scope", []),
+            ("scope", "\0"),
+            ("ready", 1),
+            ("sidecar", 1),
+            ("sidecar", "\ud800"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            record = Path(temporary) / "program.json"
+            for name, value in cases:
+                with self.subTest(name=name, value=value):
+                    _ = record.write_text(json.dumps({**valid, name: value}))
+                    with self.assertRaises(snapshot_codec.SnapshotParseError):
+                        _ = queue.read_program_start(record)
 
     def test_allocation_keeps_a_dead_holders_folder_until_the_scope_is_empty(self) -> None:
         self.assert_pending_scope_keeps_folder(legacy=False)

@@ -9,11 +9,18 @@ from enum import Enum, auto
 from functools import lru_cache
 import math
 from pathlib import Path
+from sys import float_info
 from types import UnionType
 from typing import Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
 
 # Literal unions use typing.Union on Python 3.13.
 LITERAL_UNION_ORIGIN = get_origin(Literal[0] | Literal[1])
+MAX_SNAPSHOT_INTEGER = int(float_info.max)
+MIN_SNAPSHOT_INTEGER = -MAX_SNAPSHOT_INTEGER
+
+
+class SnapshotParseError(ValueError):
+    """The wire value does not match its snapshot schema."""
 
 
 class SnapshotReadPolicy(Enum):
@@ -99,11 +106,12 @@ def ended_step_facts(value: object) -> object:
     identity = cast(dict[str, object], value)
     if identity.get("kind") != "EndedStepIdentity":
         return identity
-    name, source = identity["name"], identity["source"]
+    name = parse_scalar(identity.get("name"), str)
+    source = parse_scalar(identity.get("source"), str)
     absent = {"kind": "EndedStepFactNotRecorded"}
     return {"kind": "EndedStepFacts", "step": name if source in ("step", "script") else absent,
             "package": {"kind": "PackageNotRecorded"}, "project": name if source == "repository" else absent,
-            "folder": absent, "staff_id": identity["staff_id"]}
+            "folder": absent, "staff_id": identity.get("staff_id")}
 
 
 def remote_memory_row(value: object) -> bool:
@@ -212,7 +220,7 @@ EXACT_SCALARS: tuple[object, ...] = (str, int, bool)
 
 @lru_cache(maxsize=None)
 def exact_scalars(schema: object) -> frozenset[object]:
-    """Name the scalar types that a schema takes unchanged by exact type; a float still needs its finite check."""
+    """Name the scalar types that can use the direct check."""
     if schema in EXACT_SCALARS:
         return frozenset({schema})
     origin = get_origin(schema)
@@ -223,79 +231,94 @@ def exact_scalars(schema: object) -> frozenset[object]:
 
 
 def parse_scalar(value: object, schema: type) -> object:
-    """Accept a value of the scalar type, or an int for a float; refuse a value that is not finite."""
-    valid = type(value) is schema or schema is float and type(value) is int
-    if not valid or isinstance(value, (int, float)) and not math.isfinite(value):
-        raise ValueError("invalid snapshot scalar")
+    """Check the scalar type and numeric range."""
+    if type(value) is int:
+        if schema not in (int, float) or not MIN_SNAPSHOT_INTEGER <= value <= MAX_SNAPSHOT_INTEGER:
+            raise SnapshotParseError("invalid snapshot integer")
+    elif type(value) is not schema or isinstance(value, float) and not math.isfinite(value):
+        raise SnapshotParseError("invalid snapshot scalar")
     return value
 
 
 def parse_snapshot_value(value: object, schema: object) -> object:
-    """Validate the wire shape against the same domain fields that the writer serializes."""
+    """Validate the wire value and report malformed fields as SnapshotParseError."""
+    try:
+        return _parse_snapshot_value(value, schema)
+    except SnapshotParseError:
+        raise
+    except (ArithmeticError, KeyError, TypeError, ValueError, RecursionError) as error:
+        raise SnapshotParseError(str(error)) from error
+
+
+def _parse_snapshot_value(value: object, schema: object) -> object:
     if schema is str or schema is int or schema is float or schema is bool:
         # Profile records hold millions of scalars; this check comes before the typing lookups.
         return parse_scalar(value, schema)
     if isinstance(schema, NewType):
-        return parse_snapshot_value(value, schema.__supertype__)
+        return _parse_snapshot_value(value, schema.__supertype__)
     origin, args = get_origin(schema), cast(tuple[object, ...], get_args(schema))
     if schema is object:
         return value
     if origin is NotRequired:
-        return parse_snapshot_value(value, args[0])
+        return _parse_snapshot_value(value, args[0])
     if origin is UnionType or origin is LITERAL_UNION_ORIGIN:
-        if type(value) in exact_scalars(schema):
-            return value
+        if (kind := type(value)) in exact_scalars(schema):
+            return parse_scalar(value, kind)
         for variant in args:
             try:
-                return parse_snapshot_value(value, variant)
+                return _parse_snapshot_value(value, variant)
             except (ValueError, TypeError, KeyError):
                 continue
-        raise ValueError("invalid snapshot variant")
+        raise SnapshotParseError("invalid snapshot variant")
     if origin is Literal:
-        if value not in args:
-            raise ValueError("invalid snapshot literal")
+        if not any(type(value) is type(member) and value == member for member in args):
+            raise SnapshotParseError("invalid snapshot literal")
         return value
     if schema is type(None):
         if value is not None:
-            raise ValueError("invalid snapshot null")
+            raise SnapshotParseError("invalid snapshot null")
         return None
     if schema is Path:
-        return Path(cast(str, parse_snapshot_value(value, str)))
+        path = cast(str, parse_scalar(value, str))
+        if "\0" in path:
+            raise SnapshotParseError("invalid snapshot path")
+        return Path(path)
     if origin in (list, tuple, frozenset, Sequence):
         if not isinstance(value, list):
-            raise ValueError("invalid snapshot sequence")
+            raise SnapshotParseError("invalid snapshot sequence")
         items = cast(list[object], value)
         if origin in (list, frozenset, Sequence) or len(args) == 2 and args[1] is Ellipsis:
             exact = exact_scalars(args[0])
-            parsed = [item if type(item) in exact else parse_snapshot_value(item, args[0]) for item in items]
+            parsed = [parse_scalar(item, kind) if (kind := type(item)) in exact
+                      else _parse_snapshot_value(item, args[0]) for item in items]
         else:
             if len(items) != len(args):
-                raise ValueError("invalid snapshot tuple")
-            parsed = [parse_snapshot_value(item, kind) for item, kind in zip(items, args, strict=True)]
+                raise SnapshotParseError("invalid snapshot tuple")
+            parsed = [_parse_snapshot_value(item, kind) for item, kind in zip(items, args, strict=True)]
         return parsed if origin in (list, Sequence) else frozenset(parsed) if origin is frozenset else tuple(parsed)
     if origin in (dict, Mapping):
         if not isinstance(value, dict):
-            raise ValueError("invalid snapshot mapping")
-        return {parse_snapshot_value(key, args[0]): parse_snapshot_value(item, args[1])
+            raise SnapshotParseError("invalid snapshot mapping")
+        return {_parse_snapshot_value(key, args[0]): _parse_snapshot_value(item, args[1])
                 for key, item in cast(dict[str, object], value).items()}
     if not isinstance(schema, type) or not isinstance(value, dict):
-        raise ValueError("invalid snapshot record")
+        raise SnapshotParseError("invalid snapshot record")
     record = cast(dict[str, object], value)
     annotations = snapshot_fields(schema)
     if is_typeddict(schema):
         if any(name not in record and get_origin(kind) is not NotRequired for name, kind in annotations.items()):
-            raise ValueError("missing snapshot row field")
-        return {name: parse_snapshot_value(item, annotations[name]) for name, item in record.items()
+            raise SnapshotParseError("missing snapshot row field")
+        return {name: _parse_snapshot_value(item, annotations[name]) for name, item in record.items()
                 if name in annotations}
     if not is_dataclass(schema) or record.get("kind") != schema.__name__:
-        raise ValueError("invalid snapshot record tag")
+        raise SnapshotParseError("invalid snapshot record tag")
     record = current_wait_shape(wire_record(schema, record, writing=False))
     if schema.__name__ == "MemoryPressure" and record.get("condition") == "swap":
         record = {**record, "condition": "some"}
     if any(member.name not in record and member.default is MISSING and member.default_factory is MISSING
            for member in fields(schema)):
-        raise ValueError("invalid snapshot record fields")
+        raise SnapshotParseError("invalid snapshot record fields")
     unused = (acquisition_unused_fields(schema)
               if _READ_POLICY.get() is SnapshotReadPolicy.ACQUISITION_FIELDS else frozenset[str]())
-    return cast(Callable[..., object], schema)(**{name: parse_snapshot_value(record[name], kind)
+    return cast(Callable[..., object], schema)(**{name: _parse_snapshot_value(record[name], kind)
                                                 for name, kind in annotations.items() if name in record and name not in unused})

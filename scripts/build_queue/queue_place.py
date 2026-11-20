@@ -26,7 +26,7 @@ from typing import BinaryIO, TypedDict, Unpack
 
 from scripts.lib import build_folders, atomic_file, conf
 from scripts.lib.build_folders import program_starts as program_starts
-from scripts.build_queue import admission_records
+from scripts.build_queue import admission_records, snapshot_codec
 from scripts.build_queue import step_estimator
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
@@ -205,12 +205,28 @@ class ProgramStart:
     ready: bool = True
     sidecar: str = ""
 
+    def __post_init__(self) -> None:
+        for owner in (self.holder, self.program):
+            if not 0 < owner.pid < 2 ** 31 or not owner.start_time:
+                raise snapshot_codec.SnapshotParseError("invalid program process identity")
+        for path in (self.scope, self.sidecar):
+            if "\0" in path:
+                raise snapshot_codec.SnapshotParseError("invalid program path")
+            try:
+                _ = os.fsencode(path)
+            except UnicodeError as error:
+                raise snapshot_codec.SnapshotParseError("invalid program path") from error
+
 
 def read_program_start(record: Path) -> ProgramStart | None:
     try:
         return wire.parse_record(record.read_text(), ProgramStart)
     except FileNotFoundError:
         return None
+    except snapshot_codec.SnapshotParseError:
+        raise
+    except (ValueError, RecursionError) as error:
+        raise snapshot_codec.SnapshotParseError(str(error)) from error
 
 
 def _recorded_sidecar(path: Path) -> str:
@@ -334,7 +350,7 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
                 if published is not None and published.scope:
                     stop_scope(Path(published.scope), deadline, configuration.program_sample_seconds)
             path.unlink(missing_ok=True)
-        except (CleanupUnresolved, OSError, ValueError, RecursionError) as error:
+        except (CleanupUnresolved, OSError, snapshot_codec.SnapshotParseError) as error:
             name = record.sidecar if record is not None else _recorded_sidecar(path)
             if name:
                 sidecar = Path(name)
@@ -369,7 +385,13 @@ def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequenc
 def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
     """Stop scope members until the scope is empty."""
     kill_at = (time.monotonic() + deadline) / 2
-    while members := memory_admit.scope_members(scope):
+    while True:
+        try:
+            members = memory_admit.scope_members(scope)
+        except ValueError as error:
+            raise CleanupUnresolved(f"could not read the members of {scope}: {error}") from error
+        if not members:
+            return
         now = time.monotonic()
         if now >= deadline:
             raise CleanupUnresolved(f"scope {scope} still has live processes")
