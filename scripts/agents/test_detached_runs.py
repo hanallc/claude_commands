@@ -682,6 +682,7 @@ class DetachedRunsTests(unittest.TestCase):
 
         with self.subTest(held_record_lock=True):
             path = self.finished_run("locked")
+            self.save_pass_receipt("locked")
             pending_stop = path.with_suffix(detached_runs.PENDING_STOP_SUFFIX)
             pending_stop.touch()
             lock_inode = path.with_suffix(".record.lock").stat().st_ino
@@ -3585,14 +3586,24 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
     def test_stop_and_phase_finish_keep_the_pass_outcome_and_status_together(self) -> None:
         row = self.fixture.worker("impl", family="codex")
-        self.fixture.world.add(row, "w1:p1", family="codex")
-        self.fixture.world.locations["w1:p1"]["agent_status"] = "working"
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        self.fixture.world.locations[pane]["agent_status"] = "working"
+        agent = test_worker.DispatchAgent(self.fixture)
         commit = progress_history.stop_dispatch
         state_path = self.run_dir / unit_runs.STATE_FILE
-        for phase_first in (True, False):
-            with self.subTest(phase_first=phase_first):
-                dispatch, _ = self.begin_pane_pass(row)
+        cases = ((True, False, ""), (False, False, ""), (True, True, ""),
+                 (True, False, "before delivery"), (True, False, "before reap"))
+        for phase_first, retry, done_at in cases:
+            with self.subTest(phase_first=phase_first, retry=retry, done_at=done_at):
+                self.inputs.clear()
+                self.notices.clear()
+                dispatch, reply = self.begin_pane_pass(row)
                 stopped = self.create_stopped_run(row, dispatch)
+                done = f"The check ended.\nDONE {dispatch}"
+                if done_at:
+                    delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+                    agent.append(pane, "user", delivery.line)
                 writes: list[tuple[object, progress_history.HookCompletion | progress_history.NoHookCompletion]] = []
 
                 def observe_write(path: Path, contents: str) -> None:
@@ -3617,21 +3628,63 @@ class PaneRunDeliveryTests(unittest.TestCase):
                                       ) -> progress_history.StoppedPassNotice | progress_history.StopDispatchRefused:
                     if phase_first:
                         finish_phase()
+                    if done_at == "before delivery":
+                        agent.append(pane, "assistant", done)
                     with patch.object(progress_history, "write_text_atomic", side_effect=observe_write):
                         return commit(run, slot, instance_id, owner, director, run_id=run_id, reason=reason)
 
                 with (patch.object(detached_runs, "_group_is_live", return_value=False),
                       patch.object(progress_history, "stop_dispatch", side_effect=race_phase_finish),
                       contextlib.redirect_stderr(io.StringIO())):
-                    self.assertEqual(detached_runs.main(["deliver", str(stopped)]), 0)
+                    if retry:
+                        with patch.object(send, "_send", return_value=send.Result("failed", "Director unavailable.")):
+                            self.assertEqual(detached_runs.main(["deliver", str(stopped)]), 1)
+                        self.assertTrue(worker_lifecycle.read_json_object(stopped)["completion_pending"])
+                    if done_at == "before reap":
+                        with (patch.object(detached_runs, "_clear_completion_pending",
+                                           side_effect=SystemExit("interrupted after result delivery")),
+                              self.assertRaisesRegex(SystemExit, "interrupted after result delivery")):
+                            _ = detached_runs.main(["deliver", str(stopped)])
+                        saved = worker_lifecycle.read_json_object(stopped)
+                        self.assertTrue(saved["completion_pending"])
+                        self.assertTrue(str(saved["delivery"]).startswith(detached_runs.INTERRUPTED_PASS_DELIVERY))
+                        agent.append(pane, "assistant", done)
+                        self.fixture.world.locations[pane]["agent_status"] = "done"
+                        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                    else:
+                        self.assertEqual(detached_runs.main(["deliver", str(stopped)]), 0)
+                        if phase_first:
+                            self.assertEqual(detached_runs.main(["deliver", str(stopped)]), 0)
+                self.assertEqual(self.inputs, [])
                 if not phase_first:
                     finish_phase()
                 passed = worker_panes.worker_pass(row, self.run_dir)
                 self.assertEqual(passed.get("status"), "interrupted" if phase_first else "canceled")
                 completion = progress_history.hook_completion(passed)
                 if phase_first:
-                    self.assertIs(completion, progress_history.NoHookCompletion.UNRECORDED)
                     self.assertEqual(writes, [])
+                    saved = worker_lifecycle.read_json_object(stopped)
+                    self.assertFalse(saved["completion_pending"])
+                    if done_at == "before delivery":
+                        self.assertIs(completion, progress_history.NoHookCompletion.UNRECORDED)
+                        self.assertEqual(saved["delivery"], detached_runs.COVERED_BY_DONE)
+                        self.assertEqual(self.notices, [])
+                        continue
+                    if done_at == "before reap":
+                        self.assertIsInstance(completion, progress_history.HookCompletion)
+                        assert isinstance(completion, progress_history.HookCompletion)
+                        self.assertEqual(completion.outcome, turn_end.TurnOutcome.LATE_DONE)
+                        late = reply.with_name(f"reply_late_{dispatch}.txt")
+                        self.assertEqual(late.read_text().rstrip(), done)
+                        self.assertEqual(len(self.notices), 2)
+                        self.assertIn("phase 40: late DONE", self.notices[1][1])
+                    else:
+                        self.assertIs(completion, progress_history.NoHookCompletion.UNRECORDED)
+                        self.assertEqual(len(self.notices), 1)
+                    target, message = self.notices[0]
+                    self.assertEqual(target, f"session:{self.fixture.parent.current_session}")
+                    self.assertIn(f"Detached run: {stopped.stem}", message)
+                    self.assertIn("Private stop.", message)
                 else:
                     assert isinstance(completion, progress_history.HookCompletion)
                     self.assertEqual(completion.outcome, "stopped")

@@ -130,7 +130,7 @@ class TurnEndTests(unittest.TestCase):
             with self.subTest(family=family, close=close, transcript=transcript):
                 _ = write_registry(self.case.fixture.root / "conf/models.conf", {"assignments": {"direct": family}})
                 name = "impl-" + family + "-" + close + "-" + transcript.replace(" ", "-")
-                self.case.agent.finish_after = int(transcript != "current")
+                self.case.agent.finish_after = int(transcript != "current" or close == "scratch")
                 self.assertIs(self.case.dispatch(name), worker.DispatchSubmission.SUBMITTED)
                 pane = self.case.agent.submitted[-1][0]
                 row = self.case.agent.row(pane)
@@ -154,8 +154,10 @@ class TurnEndTests(unittest.TestCase):
                             "label": "private verification", "log": str(log), "session_dir": str(self.case.run_dir),
                             "director_dir": str(self.case.run_dir), "done_message_file": "",
                         }
+                        record["finished_at"] = datetime.now().astimezone().isoformat(timespec="microseconds")
                         atomic_file.write_text_atomic(log.with_suffix(".json"), json.dumps(record))
                         atomic_file.write_text_atomic(log, "output")
+                    self.case.agent.complete(pane)
                 active = progress_history.active_dispatch(row.id, self.case.run_dir)
                 self.assertIsInstance(active, progress_history.ActiveDispatch)
                 assert isinstance(active, progress_history.ActiveDispatch)

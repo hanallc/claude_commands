@@ -562,6 +562,7 @@ def _retired_worker_result(record: RunRecord) -> bool:
 SUPERSEDED_ORPHAN_DELIVERY = "nothing delivered: the supervisor is gone and a newer run of the same command answers"
 OTHER_PASS_DELIVERY = "nothing delivered: the result belongs to a different pane pass"
 COVERED_BY_DONE = "finished: the pass DONE covers the result"
+INTERRUPTED_PASS_DELIVERY = "interrupted pass result: "
 
 
 @dataclass
@@ -1421,6 +1422,12 @@ class WorkerResultInput(Enum):
     TURN_ENDED = "wait for the pane to become idle after the turn ends"
 
 
+class WorkerResultTarget(Enum):
+    PANE = "the worker pane can receive the result"
+    PARKED = "the worker must resume before delivery"
+    DIRECTOR = "the phase interrupted the owning pass"
+
+
 class ParkedWorkerDelivery(Enum):
     DEFER = "leave pane restore to the worker event"
 
@@ -1510,9 +1517,10 @@ def deliver(record: RunRecord, result: CommandResult, *,
         worker = member
         unconfirmed = saved.startswith(UNCONFIRMED_WORKER_RESULT)
 
-        def check_pass() -> bool:
-            if record.get("pane_dispatch_id") == "":
-                return False
+        def check_pass() -> WorkerResultTarget:
+            linked = record.get("pane_dispatch_id")
+            if linked == "":
+                return WorkerResultTarget.PANE
             from scripts.direct import progress_history, recorder_state
             from scripts.herdr import worker_panes
 
@@ -1523,7 +1531,7 @@ def deliver(record: RunRecord, result: CommandResult, *,
                 if result_is_from_another_pass(record, instance):
                     raise _WorkerPassDeliveryBlocked(OTHER_PASS_DELIVERY)
                 if run != Path(record["session_dir"]):
-                    return False
+                    return WorkerResultTarget.PANE
                 read_coverage = cast(Callable[[staff.StaffRow, dict[str, object], RunRecord],
                     ResultDoneCoverage | ResultTranscriptUnknown],
                     import_module("scripts.production.worker").result_done_coverage)
@@ -1536,23 +1544,29 @@ def deliver(record: RunRecord, result: CommandResult, *,
                     DEFERRED_WORKER_RESULT + f"worker transcript is unavailable: {coverage.reason}")
             if coverage == ResultDoneCoverage.COVERED:
                 raise _WorkerPassDeliveryBlocked(COVERED_BY_DONE)
+            if (_cancels_pass(record) and isinstance(linked, str) and linked == instance
+                    and passed.get("status") == "interrupted"):
+                return WorkerResultTarget.DIRECTOR
             parked = progress_history.parked_worker_pass(passed)
             if parked and isinstance(resume_parked, ParkedWorkerDelivery):
                 raise _WorkerPassDeliveryBlocked(DEFERRED_WORKER_RESULT + "the worker is parked")
-            return parked
+            return WorkerResultTarget.PARKED if parked else WorkerResultTarget.PANE
 
         def before_input() -> None:
-            _ = check_pass()
+            if check_pass() is WorkerResultTarget.DIRECTOR:
+                raise _WorkerPassDeliveryBlocked(DEFERRED_WORKER_RESULT + WorkerResultTarget.DIRECTOR.value)
             _ = _save_delivery(path, WORKER_INPUT_CHECKPOINT)
 
         receipt = send.WorkerResultReceipt(marker, wait_for_idle=worker_input == WorkerResultInput.TURN_ENDED,
             worker_only=self_stop, before_input=before_input)
         try:
-            parked = check_pass()
+            target = check_pass()
             # A stopped launcher can leave its checkpoint before it submits input.
             if unconfirmed and (saved != WORKER_INPUT_CHECKPOINT or reason):
                 return saved
-            if parked and not isinstance(resume_parked, ParkedWorkerDelivery):
+            if target is WorkerResultTarget.DIRECTOR:
+                reason = target.value
+            if target is WorkerResultTarget.PARKED and not isinstance(resume_parked, ParkedWorkerDelivery):
                 if not resume_parked():
                     return _save_delivery(path, DEFERRED_WORKER_RESULT + "the parked worker could not resume")
                 membership = staff.local_snapshot()
@@ -1578,6 +1592,8 @@ def deliver(record: RunRecord, result: CommandResult, *,
             raise RunDeliveryFailed(f"{delivery.outcome}: {delivery.detail}")
         else:
             saved_delivery = f"{delivery.outcome}: {delivery.detail}"
+            if target is WorkerResultTarget.DIRECTOR:
+                saved_delivery = INTERRUPTED_PASS_DELIVERY + saved_delivery
         return _save_delivery(path, saved_delivery)
 
 
