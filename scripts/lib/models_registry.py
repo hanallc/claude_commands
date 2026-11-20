@@ -9,6 +9,7 @@ import argparse
 import fcntl
 import json
 import os
+import platform
 import shlex
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from scripts.lib.operation_environment import OPERATION_ENVIRONMENT as OPERATION
 from scripts.lib.operation_environment import agent_environment as agent_environment
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import land_queue
 
 DEFAULT_PATH = Path("~/.claude/config/models.conf").expanduser()
 REGISTRY_PATH = "config/models.conf"
@@ -410,8 +412,46 @@ def _on_main(target: SharedRegistry) -> bool:
     return _git(target.repository, "symbolic-ref", "--short", "HEAD") == "main"
 
 
-def publish_pending(registry: Path) -> bool:
-    """Publish rows that main does not have yet; return False at once when main is busy."""
+def _forward_main_rows(target: SharedRegistry, path: Path, description: str, *, additive_catalog: bool) -> None:
+    """Send the Mac's live rows to the natedev publisher."""
+    before = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
+    after = registry_text(path)
+    if not registry_rows.changes(before, after):
+        return
+    arguments = ["receive", "--description", description, "--rows", json.dumps([before, after])]
+    if additive_catalog:
+        arguments.append("--additive-catalog")
+    command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/models_registry.py" '
+               + shlex.join(arguments))
+    done = main_publish.ssh(command, ssh_program=os.environ.get("ZONE_SSH") or "ssh", host="natedev")
+    if isinstance(done, str) or done.returncode:
+        raise OSError(done if isinstance(done, str) else main_publish.first_line(done))
+    if done.stderr:
+        print(done.stderr, end="", file=sys.stderr)
+
+
+def _publish_in_gap(target: SharedRegistry, path: Path, description: str, replay: waiting_rows.RegistryReplay,
+                    *, wait: bool, gap: land_queue.SettingsGap | main_push_lock.CheckLandLine,
+                    additive_catalog: bool = False) -> bool:
+    on_main = _on_main(target)
+    if on_main and platform.system() == "Darwin":
+        _forward_main_rows(target, path, description, additive_catalog=additive_catalog)
+        return False
+    with ExitStack() as locks:
+        if on_main:
+            admission = locks.enter_context(main_push_lock.settings_push(target.repository, wait=wait, gap=gap))
+            if isinstance(admission, land_queue.SettingsWaiting):
+                print(admission.report(), file=sys.stderr)
+            if not isinstance(admission, main_push_lock.MainPushReady):
+                return False
+        lock = locks.enter_context(_publish_lock_path(target, path).open("a"))
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _publish(target.repository, path, description, replay)
+
+
+def publish_pending(registry: Path, *, gap: land_queue.SettingsGap | main_push_lock.CheckLandLine =
+                    main_push_lock.CHECK_LAND_LINE) -> bool:
+    """Publish waiting rows in a gap. Return False when publication waits."""
     path = registry.resolve()
     target = _publish_repository(path)
     if (not isinstance(target, SharedRegistry) or path != DEFAULT_PATH.resolve()
@@ -420,15 +460,8 @@ def publish_pending(registry: Path) -> bool:
     head = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
     if not waiting_rows.move_marker(target.repository).exists() and not registry_rows.changes(head, registry_text(path)):
         return False
-    with ExitStack() as locks:
-        if _on_main(target):
-            try:
-                locks.enter_context(main_push_lock.main_push_lock(target.repository, wait=False))
-            except BlockingIOError:
-                return False
-        lock = locks.enter_context(_publish_lock_path(target, path).open("a"))
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        return _publish(target.repository, path, "rows written while main was busy", registry_rows.replay_pending)
+    return _publish_in_gap(target, path, "rows written while main was busy", registry_rows.replay_pending,
+                           wait=isinstance(gap, land_queue.SettingsGap), gap=gap)
 
 
 def store_registry(registry: Path, before: str, after: str, description: str, *,
@@ -456,12 +489,8 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     if (isinstance(target, SharedRegistry) and path == DEFAULT_PATH.resolve()
             and os.environ.get("MODELS_CONFIG_PUBLISH") not in ("0", "later")):
         try:
-            with ExitStack() as locks:
-                if _on_main(target):
-                    locks.enter_context(main_push_lock.main_push_lock(target.repository))
-                lock = locks.enter_context(lock_path.open("a"))
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                _ = _publish(target.repository, path, description, replay)
+            _ = _publish_in_gap(target, path, description, replay, wait=True, gap=main_push_lock.CHECK_LAND_LINE,
+                                additive_catalog=additive_catalog)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise OSError(f"the rows are live; main does not have them yet: {' '.join(str(error).split())}; "
                           + "the notes timer tries again") from error
@@ -520,6 +549,7 @@ class Arguments(argparse.Namespace):
     after: Path = Path()
     description: str = "update registry"
     additive_catalog: bool = False
+    rows: str = ""
     launch: bool = False
     edit: bool = False
 
@@ -530,13 +560,14 @@ class Arguments(argparse.Namespace):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("command", choices=("store", "catalog", "shell"))
+    _ = parser.add_argument("command", choices=("store", "catalog", "shell", "receive"))
     _ = parser.add_argument("--launch", action="store_true")
     _ = parser.add_argument("--edit", action="store_true")
     _ = parser.add_argument("--registry", type=Path)
     _ = parser.add_argument("--before", type=Path, default=Path("/dev/stdin"))
     _ = parser.add_argument("--after", type=Path, default=Path())
     _ = parser.add_argument("--description", default="update registry")
+    _ = parser.add_argument("--rows", default="")
     _ = parser.add_argument("--additive-catalog", action="store_true")
     arguments = parser.parse_args(namespace=Arguments())
     try:
@@ -552,6 +583,11 @@ def main() -> int:
             print(configuration_shell(configuration), end="")
             return 0
         conf_reads.record("models")
+        if arguments.command == "receive":
+            before, after = cast(tuple[str, str], json.loads(arguments.rows))
+            _ = store_registry(arguments.registry, before, after, arguments.description,
+                               additive_catalog=arguments.additive_catalog)
+            return 0
         before = arguments.before.read_text(encoding="utf-8")
         after = arguments.after.read_text(encoding="utf-8")
         if arguments.command == "catalog":

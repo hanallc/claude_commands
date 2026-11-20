@@ -16,18 +16,37 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Sequence
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
+from importlib import import_module
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import land_runs, waits_on
+from scripts.production import land_runs
 
 HASH = re.compile(r"[0-9a-f]{7,40}")
+SETTINGS_LABEL = "settings publish"
+SETTINGS_WAIT_NOTICE = "main: waits for the land that runs now"
+
+
+class SettingsGap(NamedTuple):
+    """The line lock protects this publication until the gap ends."""
+
+
+class SettingsWaiting(NamedTuple):
+    """A running land has the line. One item holds the next gap."""
+
+    def report(self) -> str:
+        return SETTINGS_WAIT_NOTICE
+
+
+class NoQueuedSettings(NamedTuple):
+    """A different runner already removed the settings item."""
 
 
 class LineItem(TypedDict):
@@ -124,15 +143,60 @@ def read_items() -> list[LineItem] | NoLine:
 
 
 @contextmanager
-def edited() -> Generator[list[LineItem]]:
-    """Hold the line lock, yield the items to change, and write them when the block ends."""
+def line_lock() -> Generator[None]:
     path = line_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock.exclusive(path.with_name(path.name + ".lock")):
+        yield
+
+
+@contextmanager
+def landing(commits: Sequence[str], owners: Sequence[str]) -> Generator[None]:
+    """Register a land between settings pushes and release the line lock."""
+    with ExitStack() as record:
+        with line_lock():
+            record.enter_context(land_runs.landing(commits, owners))
+        yield
+
+
+def write_items(items: list[LineItem]) -> None:
+    write_text_atomic(line_path(), json.dumps(items, indent=1) + "\n")
+
+
+@contextmanager
+def edited() -> Generator[list[LineItem]]:
+    """Hold the line lock through the edit."""
+    with line_lock():
         read = read_items()
         items = [] if isinstance(read, NoLine) else read
         yield items
-        write_text_atomic(path, json.dumps(items, indent=1) + "\n")
+        write_items(items)
+
+
+def _settings_item(item: LineItem) -> bool:
+    return item["label"] == SETTINGS_LABEL and not item["batch"] and not item["commits"]
+
+
+@contextmanager
+def settings_gap(*, queued: bool = False) -> Generator[SettingsGap | SettingsWaiting | NoQueuedSettings]:
+    """Protect an immediate push or reserve the next gap for all waiting changes."""
+    with line_lock():
+        found = read_items()
+        items = [] if isinstance(found, NoLine) else found
+        scheduled = next((item for item in items if _settings_item(item)), None)
+        if queued and scheduled is None:
+            yield NoQueuedSettings()
+        elif land_runs.running_lands():
+            if scheduled is None:
+                items.insert(0, {"label": SETTINGS_LABEL, "batch": "", "commits": [],
+                                 "added": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+                write_items(items)
+            yield SettingsWaiting()
+        else:
+            yield SettingsGap()
+            if queued and scheduled is not None:
+                items.remove(scheduled)
+                write_items(items)
 
 
 def batch_commits(batch: str) -> tuple[BatchCommit, ...]:
@@ -176,12 +240,15 @@ def place_of(line: dict[str, Place], commit: str) -> Place | None:
 
 def land_view(repo: Path) -> LandView:
     """Read the lands; one git call for each listed commit finds the commits it carries."""
+    # Load the board reader here. Publication only needs the line.
+    carried = cast(Callable[[Path, str], list[str]],
+                   import_module("scripts.production.waits_on").carried)
     running, line = land_runs.running_lands(), places()
-    carried_running = frozenset(commit for listed in running for commit in waits_on.carried(repo, listed))
+    carried_running = frozenset(commit for listed in running for commit in carried(repo, listed))
     carried_line: dict[str, Place] = {}
     if not isinstance(line, NoLine):
         for listed, place in sorted(line.items(), key=lambda entry: entry[1].number):
-            for commit in waits_on.carried(repo, listed):
+            for commit in carried(repo, listed):
                 _ = carried_line.setdefault(commit, place)
     return LandView(running, line, land_runs.last_results(), carried_running, carried_line)
 
@@ -215,6 +282,10 @@ def position(items: list[LineItem], label: str) -> int:
 
 def insert(items: list[LineItem], item: LineItem, *, first: bool, before: str | None) -> None:
     index = 0 if first else position(items, before) if before is not None else len(items)
+    if _settings_item(item):
+        index = 0
+    elif items and _settings_item(items[0]):
+        index = max(index, 1)
     items.insert(index, item)
 
 
@@ -259,17 +330,31 @@ def remove(label: str) -> None:
         _ = items.pop(position(items, label))
 
 
+def _take_land_item(items: list[LineItem]) -> str:
+    if not items or _settings_item(items[0]):
+        return ""
+    label, batch = items[0]["label"], items[0]["batch"]
+    check_label(label)
+    check_batch_path(batch)
+    _ = items.pop(0)
+    return f"{label} {batch}" if batch else label
+
+
 def take_next() -> str:
-    """Check the first item before removal and format its label and batch path."""
+    """Publish the waiting settings before the next land."""
     with edited() as items:
-        if not items:
-            return ""
-        item = items[0]
-        label, batch = item["label"], item["batch"]
-        check_label(label)
-        check_batch_path(batch)
-        _ = items.pop(0)
-        return f"{label} {batch}" if batch else label
+        if not items or not _settings_item(items[0]):
+            return _take_land_item(items)
+    script = Path(__file__).resolve().parents[1] / "lib/live_settings.py"
+    result = subprocess.run([sys.executable, str(script), "publish-queued"],
+                            capture_output=True, text=True, check=False)
+    for output in (result.stderr, result.stdout):
+        if output:
+            print(output, end="", file=sys.stderr)
+    if result.returncode:
+        raise Refusal(f"settings publication stopped with exit {result.returncode}")
+    with edited() as items:
+        return _take_land_item(items)
 
 
 def listing() -> str:
@@ -278,6 +363,9 @@ def listing() -> str:
         return "the land line is empty"
     rows: list[str] = []
     for number, item in enumerate(items, 1):
+        if _settings_item(item):
+            rows.append(f"{number}. {SETTINGS_LABEL}: waiting changes")
+            continue
         named = [f"{entry.unit} {entry.phase} {entry.commit[:9]}" for entry in batch_commits(item["batch"])]
         named += [commit[:9] for commit in item["commits"]]
         rows.append(f"{number}. {item['label']}: {', '.join(named) or 'no commit'}")

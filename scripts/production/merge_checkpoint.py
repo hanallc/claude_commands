@@ -31,7 +31,7 @@ from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
 from scripts.lib import build_folders
-from scripts.production import change_review, checkpoint_gate, land_runs
+from scripts.production import change_review, checkpoint_gate, land_queue, land_runs
 from scripts.worktree import worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
@@ -1034,7 +1034,7 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
             if unpushed:
                 return PromotionOriginPushed(tip)
             return PromotionAlreadyAtTip(tip)
-        if conflict := merge_gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
+        if conflict := merge_gate.promotion_edit_conflict(checkout, tip, *waiting_rows.waiting_paths(checkout)):
             raise checkpoint_gate.Stop("promote", "failed", conflict,
                        "clear the listed checkout paths and rerun this checkpoint")
         if refusal := merge_gate.live_state_refusal(checkout, tip):
@@ -2161,7 +2161,7 @@ def main() -> int:
             requests = batch_requests(batch, cast(str, args.production))
             production = requests[0].production
             owners = [f"{item.unit.name} {item.phase}" for item in requests]
-            with merge_lock(production.checkout, production.name), land_runs.landing([item.commit for item in requests], owners):
+            with merge_lock(production.checkout, production.name), land_queue.landing([item.commit for item in requests], owners):
                 return run_batch(requests)
         except (Refusal, staff.StaffRefused, OSError, ValueError, checkpoint_gate.Stop) as error:
             checkpoint_gate.report("input", "failed", str(error))
@@ -2197,7 +2197,7 @@ def main() -> int:
     try:
         request = request_from(args)
         owners = [f"{request.unit.name} {request.phase}"]
-        with merge_lock(request.production.checkout, request.production.name), land_runs.landing([request.commit], owners):
+        with merge_lock(request.production.checkout, request.production.name), land_queue.landing([request.commit], owners):
             return run(request)
     except staff.StaffUnreadable as error:
         checkpoint_gate.report("change review", "failed", f"{error}: the staff record is read before the push")

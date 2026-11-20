@@ -68,7 +68,8 @@ A Claude launch turns that word into the newest model of the family; see [Claude
 It first writes the changed rows live: it replays them against the latest text under an exclusive writer lock.
 It preserves unrelated edits, file mode, comments, and spacing.
 The live write never waits for the main push lock, so the new value is in effect at once.
-Publication follows the write. A failed publication keeps the rows live and fails with `the rows are live; main does not have them yet`, as `/tune` exits 2 after its live write.
+Publication follows the live write. During a land, the publisher reserves the next gap.
+A failed publication keeps the rows live and reports `the rows are live; main does not have them yet`.
 The notes timer then publishes them through `publish_pending`.
 It returns the live text after publication. The `store` command builds `configuration_shell` from that text without a second read.
 
@@ -79,7 +80,7 @@ The shared writer fetches origin and checks fast-forward safety with a temporary
 `models_registry._fetch(repo, branch)` fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` and reads that ref, never `FETCH_HEAD`.
 Every fetch in the checkout writes `FETCH_HEAD`, so another fetch between the fetch and the read cannot change the target.
 With `fetch.prune=true`, this one-ref refspec prunes no other `origin/*` ref.
-Main publication takes the [shared main push lock](repair-rounds.md#shared-main-push-lock), after the live write, before the registry writer lock.
+Main publication takes the land line lock, then the shared main push lock, then the registry writer lock.
 The hold covers fetch, row replay, commit, push retries, and local reconciliation.
 Other target branches retain only the registry writer lock.
 An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
@@ -97,7 +98,7 @@ It never waits for main, so a landing that holds main never delays the caller.
 The quota alert's `edit_registry` uses this mode for its role routing.
 `sync_codex_catalog.sh` uses it on Linux; the Mac runs no notes timer and publishes its catalog rows in place.
 `publish_pending(registry)` commits and pushes the rows that HEAD does not have.
-It returns `False` at once when another process holds the main push lock.
+It returns `False` when another process holds the main push lock or a land runs.
 Each quota part of the notes timer calls it through `live_settings.publish_waiting()`.
 Exhaustion reports that the file is edited but not shared.
 Local integration uses fast-forward only.

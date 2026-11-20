@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 import json
 import os
@@ -17,9 +17,10 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import cast
+from typing import NamedTuple, cast
 
 from scripts.lib import conf
+from scripts.production import land_queue
 
 
 _HELD_LOCKS: set[str] = set()
@@ -104,6 +105,40 @@ def main_push_lock(checkout: Path, holder: str = "", *, wait: bool = True) -> Ge
             finally:
                 _HELD_LOCKS.remove(path)
                 fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+class MainPushReady(NamedTuple):
+    """The settings publisher holds the line and main push locks."""
+
+
+class MainPushBusy(NamedTuple):
+    """Another process holds the main push lock."""
+
+
+class CheckLandLine(NamedTuple):
+    """The publisher still needs a gap in the line."""
+
+
+CHECK_LAND_LINE = CheckLandLine()
+
+
+@contextmanager
+def settings_push(checkout: Path, *, wait: bool,
+                  gap: land_queue.SettingsGap | CheckLandLine = CHECK_LAND_LINE) -> Generator[
+                      MainPushReady | MainPushBusy | land_queue.SettingsWaiting | land_queue.NoQueuedSettings]:
+    """Get a publication gap and hold main while the caller publishes settings."""
+    # Lock order: land line, main push, settings journal.
+    with ExitStack() as locks:
+        admission = locks.enter_context(land_queue.settings_gap()) if isinstance(gap, CheckLandLine) else gap
+        if not isinstance(admission, land_queue.SettingsGap):
+            yield admission
+            return
+        try:
+            locks.enter_context(main_push_lock(checkout, wait=wait))
+        except BlockingIOError:
+            yield MainPushBusy()
+        else:
+            yield MainPushReady()
 
 
 class LockCommand(argparse.Namespace):

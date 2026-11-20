@@ -700,9 +700,20 @@ Git, executable stand-ins, and selected unit and child-handoff cases retain real
 
 ### Land line
 
-`land_queue.py` keeps the order in which the land runner takes items: `add`, `move`, `remove`, `list`, `next`.
-The runner takes each item with `next` under the line lock, so an item lands once and an edit never loses an item.
-The units board reads the line to show `<Nth> in line` for a checkpoint that waits to land.
+`land_queue.py` manages the land line through `add`, `move`, `remove`, `list`, and `next`.
+The runner takes each land item under the line lock.
+The units board shows `<Nth> in line` for each checkpoint that waits.
+
+A shared settings change takes effect before publication.
+When a land runs, the publisher places one `settings publish` item at the front of the line.
+`next` publishes the waiting changes, removes the settings item, and returns the next land item.
+A failed publication leaves the changes for the notes timer to retry.
+When no land runs, a settings push can use the gap immediately.
+
+For an approved edit to the live `settings.json` on natedev, use
+`~/.claude/scripts/lib/py ~/.claude/scripts/lib/live_settings.py publish-json --message "<approved reason>"`.
+The command records the shared edits and sends them to the Mac before it requests publication.
+The Git filter keeps machine settings local.
 
 ### Queued checkpoint batches
 

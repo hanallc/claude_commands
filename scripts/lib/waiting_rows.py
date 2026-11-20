@@ -24,8 +24,9 @@ from scripts.lib import build_folders, conf, conf_reads, git_index, registry_row
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.transcripts import config_dirs
 
-WAITING_PATHS = ":(glob)config/*.conf"
+WAITING_CONFIG = ":(glob)config/*.conf"
 REGISTRY_PATH = "config/models.conf"
+SETTINGS_JSON = "settings.json"
 ORDER_PATH = "config/settings-orders.json"
 RegistryReplay = Callable[[str, str, str], str]
 
@@ -128,11 +129,31 @@ class AcceptedSaveRecord(TypedDict):
     legacy_base: NotRequired[str | None]
 
 
+class SettingsJsonEdits(TypedDict):
+    """The shared keys that one Save sets or removes."""
+
+    values: dict[str, object]
+    removed: list[str]
+
+
+class SettingsJsonSave(TypedDict):
+    order: int
+    message: str
+    edits: SettingsJsonEdits
+
+
+@dataclass(frozen=True)
+class NoSettingsJsonSave:
+    """No shared settings.json changes wait for publication."""
+
+
 class SettingsJournalRecord(TypedDict):
     last_order: int
     accepted: NotRequired[dict[str, dict[str, AcceptedSaveRecord]]]
     register: NotRequired[dict[str, dict[str, AcceptedSaveRecord]]]
     changes: list[WaitingChangeRecord]
+    settings_json: NotRequired[SettingsJsonSave]
+    settings_json_order: NotRequired[int]
 
 
 @dataclass
@@ -144,10 +165,16 @@ class LockedJournal:
     accepted: dict[str, dict[str, AcceptedOrder]]
     changes: list[WaitingChange]
     migrating: bool = False
+    settings_json: SettingsJsonSave | NoSettingsJsonSave = NoSettingsJsonSave()
+    settings_json_order: int = 0
 
     def save(self) -> None:
-        record = {"last_order": self.last_order, "register": self.accepted,
-                  "changes": self.changes}
+        record: dict[str, object] = {"last_order": self.last_order, "register": self.accepted,
+                                     "changes": self.changes}
+        if not isinstance(self.settings_json, NoSettingsJsonSave):
+            record["settings_json"] = self.settings_json
+        if self.settings_json_order:
+            record["settings_json_order"] = self.settings_json_order
         write_text_atomic(self.path, json.dumps(record, default=asdict, indent=2) + "\n", new_file_mode=0o600)
         self.migrating = False
 
@@ -224,7 +251,9 @@ def _read_journal(path: Path) -> LockedJournal:
         accepted = {stem: {key: AcceptedSave(row["order"], value, row.get("legacy_base"))
                            if (value := row.get("value")) is not None else AcceptedOrder(row["order"])
                            for key, row in keys.items()} for stem, keys in register.items()}
-        return LockedJournal(path, record["last_order"], accepted, changes, migrating="register" not in record)
+        return LockedJournal(path, record["last_order"], accepted, changes, migrating="register" not in record,
+                             settings_json=record.get("settings_json", NoSettingsJsonSave()),
+                             settings_json_order=record.get("settings_json_order", 0))
     except FileNotFoundError:
         return LockedJournal(path, 0, {}, [])
     except (ValueError, TypeError, KeyError) as error:
@@ -275,10 +304,17 @@ def show(checkout: Path, commit: str, path: str) -> str:
     return git(checkout, "show", f"{commit}:{path}")
 
 
+def waiting_paths(checkout: Path) -> tuple[str, ...]:
+    """Include settings.json only for the live configuration checkout."""
+    if (checkout / "config").resolve() == conf.directory().resolve():
+        return WAITING_CONFIG, SETTINGS_JSON
+    return (WAITING_CONFIG,)
+
+
 def waiting_files(checkout: Path) -> list[str]:
     """Tracked configuration files with a staged or unstaged change."""
-    live = git(checkout, "diff", "--name-only", "-z", "HEAD", "--", WAITING_PATHS)
-    staged = git(checkout, "diff", "--cached", "--name-only", "-z", "HEAD", "--", WAITING_PATHS)
+    live = git(checkout, "diff", "--name-only", "-z", "HEAD", "--", WAITING_CONFIG)
+    staged = git(checkout, "diff", "--cached", "--name-only", "-z", "HEAD", "--", WAITING_CONFIG)
     return list(dict.fromkeys(path for path in (live + staged).split("\0") if path))
 
 
@@ -315,6 +351,43 @@ def tree_text(checkout: Path, commit: str, path: str) -> str | None:
     return show(checkout, commit, path) if git(checkout, "ls-tree", commit, "--", path) else None
 
 
+def _settings_object(text: str) -> dict[str, object]:
+    values = cast(object, json.loads(text))
+    if not isinstance(values, dict):
+        raise ValueError(f"{SETTINGS_JSON}: expected a JSON object")
+    return cast(dict[str, object], values)
+
+
+def settings_json_edits(before: str, after: str) -> SettingsJsonEdits:
+    old, new = _settings_object(before), _settings_object(after)
+    return {"values": {key: value for key, value in new.items()
+                       if key not in old or json.dumps(old[key], sort_keys=True) != json.dumps(value, sort_keys=True)},
+            "removed": [key for key in old if key not in new]}
+
+
+def apply_settings_json_edits(text: str, edits: SettingsJsonEdits) -> str:
+    if not edits["values"] and not edits["removed"]:
+        return text
+    settings = _settings_object(text)
+    for key in edits["removed"]:
+        _ = settings.pop(key, None)
+    settings.update(edits["values"])
+    return json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
+
+
+def clean_settings_json(checkout: Path) -> str:
+    """Read the shared values through the checkout's Git filter."""
+    snapshot = (checkout / SETTINGS_JSON).read_text(encoding="utf-8")
+    blob = git(checkout, "hash-object", "-w", f"--path={SETTINGS_JSON}", "--stdin", input_text=snapshot).strip()
+    return git(checkout, "cat-file", "blob", blob)
+
+
+def smudge_settings_json(checkout: Path, shared: str) -> str:
+    """Restore machine settings through the checkout's Git filter."""
+    blob = git(checkout, "hash-object", "-w", "--stdin", input_text=shared).strip()
+    return git(checkout, "cat-file", "--filters", f"--path={SETTINGS_JSON}", blob)
+
+
 def tree_value(checkout: Path, commit: str, stem: str, key: str) -> str | None:
     setting = conf.settings(tree_text(checkout, commit, f"config/{stem}.conf") or "").get(key)
     return setting.value if setting else None
@@ -346,7 +419,7 @@ def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
          replace_registry: bool, replay_registry: RegistryReplay) -> MovePlan:
     """Plan writes for paths that Git must leave in place."""
     target = move.tip
-    changed = changed_paths(checkout, move.head, target, WAITING_PATHS)
+    changed = changed_paths(checkout, move.head, target, *waiting_paths(checkout))
     managed = pending_files(checkout, pending)
     orders = published_orders(checkout, target)
     plan = MovePlan(source=move.head, target=target, before={}, after={})
@@ -367,7 +440,26 @@ def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
             plan["after"][path] = incoming if replace_registry else replay_registry(head or "", local or "", incoming)
         else:
             plan["after"][path] = replay_settings(path, head or "", local or "", incoming, saves, settled)
+    if SETTINGS_JSON in changed:
+        _hold_settings_json(checkout, plan)
     return plan
+
+
+def _hold_settings_json(checkout: Path, plan: MovePlan) -> None:
+    local = live_text(checkout / SETTINGS_JSON)
+    if local is None:
+        return
+    head = tree_text(checkout, plan["source"], SETTINGS_JSON)
+    incoming = tree_text(checkout, plan["target"], SETTINGS_JSON)
+    edits = settings_json_edits(head or "{}\n", clean_settings_json(checkout))
+    if not edits["values"] and not edits["removed"]:
+        return
+    plan["before"][SETTINGS_JSON] = local
+    if incoming is None:
+        plan["after"][SETTINGS_JSON] = local
+    else:
+        merged = apply_settings_json_edits(incoming, edits)
+        plan["after"][SETTINGS_JSON] = smudge_settings_json(checkout, merged)
 
 
 def replay_settings(path: str, head: str, local: str, target: str | None,
@@ -655,7 +747,7 @@ def check_move(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
         environment = {**os.environ, "GIT_INDEX_FILE": str(trial)}
         git_index.private_copy(index, trial)
         index_before = git(checkout, "write-tree", environment=environment).strip()
-        staged = changed_paths(checkout, move.head, index_before, WAITING_PATHS)
+        staged = changed_paths(checkout, move.head, index_before, *waiting_paths(checkout))
         plan = hold(checkout, move, pending, replace_registry=replace_registry, replay_registry=replay_registry)
         target_entries = {path: index_entry(checkout, move.tip, path) for path in plan["after"]}
         merged_entries: dict[str, str] = {}

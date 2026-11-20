@@ -6,6 +6,7 @@ from scripts.production import checkpoint_gate
 
 import argparse
 import fcntl
+import json
 from collections.abc import Generator
 from contextlib import contextmanager, redirect_stdout
 from datetime import datetime, tzinfo
@@ -20,17 +21,17 @@ import time
 import unittest
 from unittest import mock
 from pathlib import Path, PurePosixPath
-from typing import final
+from typing import cast, final
 from scripts.production.cli_fixture import production_paths
 from scripts.agents import pane_record
 from zoneinfo import ZoneInfo
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib import land_main, main_publish
+from scripts.lib import land_main, live_settings, main_publish
 from scripts.message import sessions
 
 from scripts.production.merge_checkpoint import promote, request_from
-from scripts.production import merge_checkpoint
+from scripts.production import land_runs, merge_checkpoint
 from scripts.production import change_review
 from scripts.production.production_doc import Production, ProductionDocument
 
@@ -52,6 +53,65 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def assert_promotion_keeps_waiting_setting(self, *, json_file: bool, same_file: bool) -> None:
+        if json_file:
+            path = "settings.json"
+            baseline = json.dumps({"autoCompactWindow": 283800, "published": 1}) + "\n"
+            live = json.dumps({"autoCompactWindow": 308800, "published": 1}) + "\n"
+            incoming = json.dumps({"autoCompactWindow": 333800, "published": 2}) + "\n"
+            expected = {"autoCompactWindow": 308800, "published": 2 if same_file else 1}
+        else:
+            path = "config/example.conf"
+            baseline = "# whole: 1..10\namount=2\npublished=1\n"
+            live = "# whole: 1..10\namount=3\npublished=1\n"
+            incoming = "# whole: 1..10\namount=4\npublished=2\n"
+            expected = {"amount": 3, "published": 2 if same_file else 1}
+        self.write(self.promote, path, baseline)
+        _ = self.git("add", path, cwd=self.promote)
+        _ = self.git("commit", "-m", "add the setting", cwd=self.promote)
+        _ = self.git("push", "origin", "main", cwd=self.promote)
+        _ = self.git("merge", "--ff-only", "main", cwd=self.checkout)
+        target_path = path if same_file else "README.md"
+        self.write(self.checkout, target_path, incoming if same_file else "advance an unrelated file\n")
+        _ = self.git("add", target_path, cwd=self.checkout)
+        _ = self.git("commit", "-m", "advance production", cwd=self.checkout)
+        _ = self.git("push", "origin", "production", cwd=self.checkout)
+        tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+        environment = {**self.env, "CONF_DIR": str(self.promote / "config"), "ZONE_SSH": str(self.bin / "ssh"),
+                       "XDG_STATE_HOME": str(self.root / "publication-state"),
+                       "MERGE_GATE_STATE_DIR": str(self.root / "land-state")}
+        with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(StringIO()):
+            if json_file:
+                self.write(self.promote, path, live)
+                with land_runs.landing([tip]):
+                    self.assertEqual(live_settings.main(["publish-json", "--message", "Approved window"]), 0)
+            else:
+                _ = live_settings.stage_save(live_settings.WaitingChange(
+                    "example", "amount", "3", "tune(example): approved value"))
+            self.assertEqual((self.promote / path).read_text(), live)
+            self.assertEqual(merge_checkpoint.promote_local_checkout(self.promote, "production", tip),
+                             merge_checkpoint.PromotionAdvanced(tip))
+        text = (self.promote / path).read_text()
+        if json_file:
+            self.assertEqual(cast(object, json.loads(text)), expected)
+        else:
+            for key, value in expected.items():
+                self.assertIn(f"{key}={value}\n", text)
+        self.assertEqual(self.git("show", f"main:{path}", cwd=self.origin),
+                         (incoming if same_file else baseline).strip())
+
+    def test_promotion_keeps_waiting_conf_when_the_land_changes_that_file(self) -> None:
+        self.assert_promotion_keeps_waiting_setting(json_file=False, same_file=True)
+
+    def test_promotion_keeps_waiting_conf_when_the_land_changes_another_file(self) -> None:
+        self.assert_promotion_keeps_waiting_setting(json_file=False, same_file=False)
+
+    def test_promotion_keeps_waiting_json_when_the_land_changes_that_file(self) -> None:
+        self.assert_promotion_keeps_waiting_setting(json_file=True, same_file=True)
+
+    def test_promotion_keeps_waiting_json_when_the_land_changes_another_file(self) -> None:
+        self.assert_promotion_keeps_waiting_setting(json_file=True, same_file=False)
+
     def test_hook_failure_warns_without_stopping_either_promotion_path(self) -> None:
         for advances in (False, True):
             with self.subTest(advances=advances):
@@ -643,6 +703,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
         attempted = self.root / "fast-push-contended"
         child_script = '''import fcntl
+import json
 from pathlib import Path
 import subprocess
 import sys

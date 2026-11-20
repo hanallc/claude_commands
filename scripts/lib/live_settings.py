@@ -7,9 +7,9 @@ except FileNotFoundError:
     pass
 
 from collections.abc import Callable
-from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from enum import StrEnum
+import argparse
 import json
 import os
 import platform
@@ -18,14 +18,17 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from typing import NamedTuple, cast
 
 from scripts.lib import conf, mac_wake, main_publish, main_push_lock, models_registry
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import land_queue
 from scripts.lib.waiting_rows import (
-    ORDER_PATH, AcceptedSave, LockedJournal, SaveOrders, WaitingChange as WaitingChange,
+    ORDER_PATH, SETTINGS_JSON, AcceptedSave, LockedJournal, NoSettingsJsonSave, SaveOrders, SettingsJsonEdits, SettingsJsonSave,
+    WaitingChange as WaitingChange, apply_settings_json_edits, clean_settings_json, settings_json_edits, smudge_settings_json,
     append_setting, apply_move, check_move, git,
     journal_path as journal_path, locked_journal, model_color_host, model_color_key, model_color_value, move_target,
-    published_orders, replace_value, show, tree_value,
+    published_orders, replace_value, tree_text, tree_value,
 )
 
 SAVE_ORDER_ENV = "LIVE_SETTINGS_SAVE_ORDER"
@@ -107,27 +110,32 @@ def stage_save(change: WaitingChange, *, describe: Callable[[str], str] | None =
         return StagedSave(_write_setting(stem, key, value, setting), order)
 
 
-def _commit_row(checkout: Path, relative: str, change: WaitingChange, orders: SaveOrders, pending: LockedJournal) -> None:
-    """Commit only this row onto HEAD; other waiting rows stay live and uncommitted."""
-    entry = git(checkout, "ls-tree", "HEAD", "--", relative)
-    head = show(checkout, "HEAD", relative) if entry else ""
-    setting = conf.settings(head).get(change.key)
-    text = (replace_value(head, setting.line, change.value) if setting
-            else append_setting(head, change.key, change.value))
-    mode = entry.split()[0] if entry else "100644"
-    orders.setdefault(change.stem, {})[change.key] = change.save_order
+def _commit_settings(checkout: Path, files: dict[str, str], message: str, pending: LockedJournal) -> None:
+    """Commit only these files while the other live values stay in place."""
     parent = git(checkout, "rev-parse", "HEAD").strip()
     with tempfile.TemporaryDirectory(prefix="live-settings-index-") as directory:
         environment = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index")}
         _ = git(checkout, "read-tree", parent, environment=environment)
-        for path, permissions, contents in (
-                (relative, mode, text), (ORDER_PATH, "100644", json.dumps(orders, indent=2, sort_keys=True) + "\n")):
+        for path, contents in files.items():
+            entry = git(checkout, "ls-tree", parent, "--", path)
+            mode = entry.split()[0] if entry else "100644"
             blob = git(checkout, "hash-object", "-w", "--stdin", input_text=contents).strip()
-            _ = git(checkout, "update-index", "--add", "--cacheinfo", f"{permissions},{blob},{path}", environment=environment)
+            _ = git(checkout, "update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}", environment=environment)
         tree = git(checkout, "write-tree", environment=environment).strip()
-    commit = git(checkout, "commit-tree", tree, "-p", parent, input_text=change.message).strip()
+    commit = git(checkout, "commit-tree", tree, "-p", parent, input_text=message).strip()
     move = move_target(checkout, commit, pending, fast_forward=True)
     apply_move(checkout, check_move(checkout, move, pending), pending)
+
+
+def _commit_row(checkout: Path, relative: str, change: WaitingChange, orders: SaveOrders, pending: LockedJournal) -> None:
+    """Commit one waiting configuration row onto HEAD."""
+    head = tree_text(checkout, "HEAD", relative) or ""
+    setting = conf.settings(head).get(change.key)
+    text = (replace_value(head, setting.line, change.value) if setting
+            else append_setting(head, change.key, change.value))
+    orders.setdefault(change.stem, {})[change.key] = change.save_order
+    _commit_settings(checkout, {relative: text, ORDER_PATH: json.dumps(orders, indent=2, sort_keys=True) + "\n"},
+                     change.message, pending)
 
 
 def _publish_rows(checkout: Path, pending: LockedJournal, changes: list[WaitingChange]) -> list[str]:
@@ -144,47 +152,122 @@ def _publish_rows(checkout: Path, pending: LockedJournal, changes: list[WaitingC
     return lines
 
 
+class PublishedSettings(NamedTuple):
+    checkout: Path
+    label: str
+    lines: list[str]
+
+    def with_mac_pull(self) -> list[str]:
+        return [*self.lines, pull_mac(self.checkout, self.label)]
+
+
+def _publish_main(checkout: Path) -> PublishedSettings:
+    """Move the waiting Saves to main and return the label for the Mac pull."""
+    main_publish.ready(checkout, fetch_limit=main_publish.CommandTimeLimit(_seconds("fetch_seconds")))
+    with locked_journal(journal_path()) as pending:
+        pending.restore(checkout, "HEAD")
+        changes = list(pending.changes)
+        lines = _publish_rows(checkout, pending, changes)
+        settings_json = pending.settings_json
+        if not isinstance(settings_json, NoSettingsJsonSave):
+            head = tree_text(checkout, "HEAD", SETTINGS_JSON) or "{}\n"
+            settings = apply_settings_json_edits(head, settings_json["edits"])
+            if settings_json_edits(head, settings) != {"values": {}, "removed": []}:
+                _commit_settings(checkout, {SETTINGS_JSON: settings}, settings_json["message"], pending)
+    pushed, detail = main_publish.push(checkout, time_limit=main_publish.CommandTimeLimit(_seconds("push_seconds")))
+    if not pushed:
+        raise main_publish.Refusal(f"main: {detail}")
+    lines.append(f"main: {detail}")
+    with locked_journal(journal_path()) as pending:
+        retained = [change for change in pending.changes if change not in changes]
+        finished_json = not isinstance(settings_json, NoSettingsJsonSave) and settings_json == pending.settings_json
+        if finished_json:
+            pending.settings_json = NoSettingsJsonSave()
+        if retained != pending.changes or finished_json:
+            pending.changes = retained
+            pending.save()
+    names = [f"{change.stem}.{change.key}" for change in changes]
+    if not isinstance(settings_json, NoSettingsJsonSave):
+        names.append(SETTINGS_JSON)
+    label = " ".join(names) or "main"
+    return PublishedSettings(checkout, label, lines)
+
+
+def _publish(checkout: Path, *, wait: bool, gap: land_queue.SettingsGap | main_push_lock.CheckLandLine
+             ) -> PublishedSettings | land_queue.SettingsWaiting | main_push_lock.MainPushBusy:
+    with main_push_lock.settings_push(checkout, wait=wait, gap=gap) as admission:
+        if isinstance(admission, main_push_lock.MainPushReady):
+            return _publish_main(checkout)
+        if isinstance(admission, land_queue.SettingsWaiting):
+            return admission
+        return main_push_lock.MainPushBusy()
+
+
 def publish(checkout: Path, *, wait: bool) -> list[str] | None:
-    """Publish waiting changes and request a Mac pull. Return None if the lock is busy and wait is False."""
-    with ExitStack() as locks:
-        try:
-            locks.enter_context(main_push_lock.main_push_lock(checkout, wait=wait))
-        except BlockingIOError:
-            return None
-        main_publish.ready(checkout, fetch_limit=main_publish.CommandTimeLimit(_seconds("fetch_seconds")))
-        with locked_journal(journal_path()) as pending:
-            pending.restore(checkout, "HEAD")
-            changes = list(pending.changes)
-            lines = _publish_rows(checkout, pending, changes)
-        pushed, detail = main_publish.push(checkout, time_limit=main_publish.CommandTimeLimit(_seconds("push_seconds")))
-        if not pushed:
-            raise main_publish.Refusal(f"main: {detail}")
-        lines.append(f"main: {detail}")
-        with locked_journal(journal_path()) as pending:
-            retained = [change for change in pending.changes if change not in changes]
-            if retained != pending.changes:
-                pending.changes = retained
-                pending.save()
-    label = " ".join(f"{change.stem}.{change.key}" for change in changes) or "main"
-    return [*lines, pull_mac(checkout, label)]
+    """Publish now in a gap or report the wait."""
+    published = _publish(checkout, wait=wait, gap=main_push_lock.CHECK_LAND_LINE)
+    if isinstance(published, PublishedSettings):
+        return published.with_mac_pull()
+    if isinstance(published, land_queue.SettingsWaiting):
+        return [published.report()]
+    return None
 
 
-def publish_waiting() -> list[str]:
-    """Publish waiting /tune changes and registry rows when main is free; never wait for main."""
-    lines: list[str] = []
+def _waiting_checkout() -> Path | None:
+    with locked_journal(journal_path()) as pending:
+        first = next((change for change in pending.changes if change.publish_on_main), None)
+        has_settings_json = not isinstance(pending.settings_json, NoSettingsJsonSave)
+    if first is not None:
+        return main_publish.checkout_of(conf.path(first.stem).resolve())
+    if has_settings_json:
+        return _settings_checkout()
+    return None
+
+
+def _publish_registry(lines: list[str], *, gap: land_queue.SettingsGap | main_push_lock.CheckLandLine) -> None:
     try:
-        with locked_journal(journal_path()) as pending:
-            first = next((change for change in pending.changes if change.publish_on_main), None)
-        if first is not None:
-            lines += publish(main_publish.checkout_of(conf.path(first.stem).resolve()), wait=False) or []
-    except (OSError, main_publish.Refusal, conf.Unusable) as error:
-        lines.append(f"settings not on main yet: {' '.join(str(error).split())}")
-    try:
-        if models_registry.publish_pending(models_registry.registry_path()):
+        if models_registry.publish_pending(models_registry.registry_path(), gap=gap):
             lines.append("registry rows published")
     except OSError as error:
         lines.append(f"registry rows not on main yet: {' '.join(str(error).split())}")
+
+
+def _publish_waiting_settings(lines: list[str], *, gap: land_queue.SettingsGap | main_push_lock.CheckLandLine
+                              ) -> PublishedSettings | None:
+    try:
+        if (checkout := _waiting_checkout()) is not None:
+            published = _publish(checkout, wait=isinstance(gap, land_queue.SettingsGap), gap=gap)
+            if isinstance(published, PublishedSettings):
+                return published
+            if isinstance(published, land_queue.SettingsWaiting):
+                lines.append(published.report())
+    except (OSError, main_publish.Refusal, conf.Unusable) as error:
+        lines.append(f"settings not on main yet: {' '.join(str(error).split())}")
+    return None
+
+
+def publish_waiting() -> list[str]:
+    """Use the next gap for waiting settings and registry rows."""
+    gap = main_push_lock.CHECK_LAND_LINE
+    lines: list[str] = []
+    if (published := _publish_waiting_settings(lines, gap=gap)) is not None:
+        lines.extend(published.with_mac_pull())
+    _publish_registry(lines, gap=gap)
     return lines
+
+
+def publish_queued() -> list[str]:
+    """Use the queued gap before the runner starts another land."""
+    lines: list[str] = []
+    with land_queue.settings_gap(queued=True) as gap:
+        if not isinstance(gap, land_queue.SettingsGap):
+            return lines
+        published = _publish_waiting_settings(lines, gap=gap)
+        _publish_registry(lines, gap=gap)
+    if published is None:
+        return lines
+    mac = _queue_mac_pull(published.checkout, published.label, "settings published")
+    return [*published.lines, *lines, mac]
 
 
 def pull_mac(checkout: Path, label: str) -> str:
@@ -193,10 +276,14 @@ def pull_mac(checkout: Path, label: str) -> str:
     if isinstance(outcome, main_publish.MacPulled):
         main_publish.clear_pull_only()
         return "mac: pulled"
-    main_publish.queue_pull_only(label, outcome.reason,
+    return _queue_mac_pull(checkout, label, outcome.reason)
+
+
+def _queue_mac_pull(checkout: Path, label: str, reason: str) -> str:
+    main_publish.queue_pull_only(label, reason,
                                  pulls=(main_publish.MacCheckoutPull(PurePosixPath("~/.claude"), checkout),))
     _ = mac_wake.start()
-    return f"mac: queued ({outcome.reason}); it goes out as soon as the Mac answers"
+    return f"mac: queued ({reason}); it goes out as soon as the Mac answers"
 
 
 class MacWriteSuperseded(StrEnum):
@@ -220,6 +307,89 @@ def write_mac(stem: str, key: str, value: str, *, order: int) -> str | MacWriteS
     return f"mac: live now: {key}={value}"
 
 
+def _settings_checkout() -> Path:
+    return main_publish.checkout_of(conf.directory().parent / SETTINGS_JSON)
+
+
+def _accept_settings_json(checkout: Path, order: int, edits: SettingsJsonEdits) -> None:
+    with locked_journal(journal_path()) as pending:
+        if order <= pending.settings_json_order:
+            return
+        shared = apply_settings_json_edits(clean_settings_json(checkout), edits)
+        write_text_atomic(checkout / SETTINGS_JSON, smudge_settings_json(checkout, shared))
+        pending.settings_json_order = order
+        pending.save()
+
+
+def _write_settings_json_mac(saved: SettingsJsonSave) -> str:
+    command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/live_settings.py" '
+               + shlex.join(["apply-json", str(saved["order"]), json.dumps(saved["edits"])]))
+    done = main_publish.ssh(command, ssh_program=os.environ.get("ZONE_SSH") or "ssh",
+                            time_limit=main_publish.CommandTimeLimit(_seconds("mac_write_seconds")))
+    if isinstance(done, str) or done.returncode:
+        reason = done if isinstance(done, str) else main_publish.first_line(done)
+        return f"mac: not live yet ({reason}); the Mac pull brings it"
+    return f"mac: live now: {SETTINGS_JSON}"
+
+
+def _stage_settings_json(checkout: Path, message: str, forwarded: str) -> SettingsJsonSave | NoSettingsJsonSave:
+    with locked_journal(journal_path()) as pending:
+        pending.restore(checkout, "HEAD")
+        head = tree_text(checkout, "HEAD", SETTINGS_JSON) or "{}\n"
+        shared = clean_settings_json(checkout)
+        if forwarded:
+            shared = apply_settings_json_edits(shared, cast(SettingsJsonEdits, json.loads(forwarded)))
+            write_text_atomic(checkout / SETTINGS_JSON, smudge_settings_json(checkout, shared))
+        edits = settings_json_edits(head, shared)
+        if not edits["values"] and not edits["removed"]:
+            return pending.settings_json
+        pending.last_order += 1
+        pending.settings_json = {"order": pending.last_order, "message": f"tune({SETTINGS_JSON}): {message}",
+                                 "edits": edits}
+        pending.save()
+        return pending.settings_json
+
+
+def _forward_settings_json(checkout: Path, message: str) -> int:
+    with locked_journal(journal_path()) as pending:
+        pending.restore(checkout, "HEAD")
+        head = tree_text(checkout, "HEAD", SETTINGS_JSON) or "{}\n"
+        edits = settings_json_edits(head, clean_settings_json(checkout))
+    command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/live_settings.py" '
+               + shlex.join(["publish-json", "--message", message, "--forwarded", json.dumps(edits)]))
+    done = main_publish.ssh(command, ssh_program=os.environ.get("ZONE_SSH") or "ssh", host="natedev",
+                            time_limit=main_publish.CommandTimeLimit(_seconds("mac_write_seconds")))
+    if isinstance(done, str):
+        raise OSError(f"natedev: {done}")
+    print(done.stdout, end="")
+    print(done.stderr, end="", file=sys.stderr)
+    return done.returncode
+
+
+class PublishSettingsJsonArgs(argparse.Namespace):
+    message: str = ""
+    forwarded: str = ""
+
+
+def _publish_settings_json(arguments: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="live_settings.py publish-json")
+    _ = parser.add_argument("--message", required=True)
+    _ = parser.add_argument("--forwarded", default="", help=argparse.SUPPRESS)
+    args = parser.parse_args(arguments, namespace=PublishSettingsJsonArgs())
+    checkout = _settings_checkout()
+    if platform.system() == "Darwin":
+        return _forward_settings_json(checkout, args.message)
+    saved = _stage_settings_json(checkout, args.message, args.forwarded)
+    if isinstance(saved, NoSettingsJsonSave):
+        print(f"main: {SETTINGS_JSON} has no shared changes")
+        return 0
+    print(f"live now: {SETTINGS_JSON}")
+    print(_write_settings_json_mac(saved))
+    for line in publish(checkout, wait=True) or []:
+        print(line)
+    return 0
+
+
 def start_readers(stem: str) -> list[str]:
     """Run each notes part that reads this file now, in its own session; do not wait for it."""
     pairs = (pair.partition(":") for pair in conf.read_or_repository("live_settings").words("readers"))
@@ -239,6 +409,22 @@ def _seconds(key: str) -> int:
 
 def main(arguments: list[str] | None = None) -> int:
     argv = sys.argv[1:] if arguments is None else arguments
+    try:
+        match argv:
+            case ["publish-queued"]:
+                for line in publish_queued():
+                    print(line)
+                return 0
+            case ["publish-json", *options]:
+                return _publish_settings_json(options)
+            case ["apply-json", order, text]:
+                _accept_settings_json(_settings_checkout(), int(order), cast(SettingsJsonEdits, json.loads(text)))
+                return 0
+            case _:
+                pass
+    except (OSError, ValueError, main_publish.Refusal) as error:
+        print(f"live_settings: {error}", file=sys.stderr)
+        return 1
     accepted = argv[:1] == ["--accepted-model-color"]
     if accepted:
         argv = argv[1:]

@@ -17,6 +17,7 @@ import sys
 from scripts.lib import conf, live_settings, main_publish
 from scripts.lib.conf import Unusable
 from scripts.build_hold.override_guard import refuse_overrides
+from scripts.production.land_queue import SETTINGS_WAIT_NOTICE
 
 SUBJECT = "tune("
 FORWARD_LIMIT = main_publish.CommandTimeLimit(55)
@@ -78,7 +79,7 @@ def change(args: RequestedValueChange) -> int:
               file=sys.stderr)
         return 2
     for line in lines:
-        if isinstance(saved, live_settings.StagedSave) or line.startswith("mac: queued"):
+        if isinstance(saved, live_settings.StagedSave) or line == SETTINGS_WAIT_NOTICE or line.startswith("mac: queued"):
             print(line)
     return 0
 

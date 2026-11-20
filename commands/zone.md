@@ -21,9 +21,9 @@ This command shows it or changes it, on both machines.
    the city of one (`Curacao`, `New York`), or a label only one zone uses. Then it:
    - writes the zone live in `config/user_zone.conf` on natedev and on the Mac, at once;
    - tells every session on both machines with `broadcast.py --all`;
-   - commits that file on `~/.claude` main, pushes it and pulls the Mac's `~/.claude`;
+   - commits and pushes the file in a gap between lands, then updates the Mac checkout;
    - prints the new zone and the time now.
-   The write comes first, so the new zone is in effect before main has it.
+   If a land runs, the zone stays live and publication waits for the next gap.
 3. Exit 2 with a `zone:` line before any `live now` line means nothing changed. Read the message:
    - **No zone has that name** (a city such as `Seattle`): find the IANA zone
      of the place (`America/Los_Angeles`) and run step 2 again with it.
@@ -37,7 +37,7 @@ This command shows it or changes it, on both machines.
 5. Exit 1 means the zone changed, but some deliveries failed. Report the lines
    that say so.
 6. Report in one or two lines: the new zone with its label, the time now, and
-   whether the Mac has it now or waits. Write that time in the new zone.
+   whether the Mac or main waits. Write that time in the new zone.
 
 When the Mac write fails, the Mac pull brings the zone, and the sessions'
 message goes out at the next bare `/zone` or the next promotion's Mac pull.

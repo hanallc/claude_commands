@@ -11,20 +11,19 @@ user in one line, then runs this command only on the user's go. Moving a value
 from code to config with the same value needs no go and does not use `/tune`.
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/tune.py" <file> <key> <value> --why "<one line>" --user-words "<the user's own approval words>"`.
-Pass arguments as separate, quoted shell arguments. On the Mac the script
-forwards them to natedev. It checks the key and limits, then writes the value
-live on natedev and on the Mac at once. It starts each reader that
-`config/live_settings.conf` names for the file. Then it commits only that row on
-main, pushes, and pulls the Mac. Git fetch, Git push, the Mac write and the Mac
-pull have time limits. A stalled or asleep Mac keeps a queued pull. A watcher
-on natedev sends it as soon as the Mac answers. Run no test or gate. Add no approval step after
-the user's go.
+Pass separate, quoted arguments. On the Mac, the script forwards them to natedev.
+The script checks the limits, writes the live value on both machines, and starts the configured readers.
+It commits the row and pushes main when no land runs.
+During a land, it reserves the next gap and returns.
+If the Mac is offline, the watcher sends the pull when the Mac answers.
+Run no test or gate. Add no approval step.
 
 If `<key>.<host>` also exists, the script refuses `<key>` and names both lines.
 Name the exact key, such as `sweep_free_floor_gib.mac`, to change that line.
 
-Report the script's result. Exit 2 means a refusal, or a value that is live but
-not on main yet: the notes timer commits it when main is free. Exit 1 means the
-Mac forwarding failed. `already <key>=<value>` means the value needs no edit.
-The script still completes publication and retries the Mac pull.
-Exit 0 requires main on origin and a completed or queued Mac pull.
+Report the script's result. Exit 0 can mean that main waits for the current land.
+Exit 2 means a refusal or a publication failure. The notes timer retries publication failures.
+Exit 1 means the Mac forwarding failed. An unchanged value can retry publication or a Mac pull.
+
+For an approved shared `settings.json` edit, apply it on natedev and run
+`"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/live_settings.py" publish-json --message "<approved reason>"`.
