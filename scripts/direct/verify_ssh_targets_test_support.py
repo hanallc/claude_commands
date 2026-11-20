@@ -419,7 +419,8 @@ source() {
         return sorted(rows, key=lambda row: cast(str, row["at"]))
 
     def enable_mac(self) -> None:
-        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=on\n")        _ = write_config_fixture(self.root / "mac_test.conf", "linux_only.hana=\nlinux_only.case=\n")
+        _ = write_config_fixture(self.root / "build_targets.conf", "enabled.mac=on\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "linux_only.hana=\nlinux_only.case=\n")
 
     def release_memory_after_hook(self, observe: Callable[[CompletedMemoryHook], bool] | ReleaseMemoryAtWait = RELEASE_MEMORY_AT_WAIT,
                                   *, after_attempts: int = 0) -> None:
