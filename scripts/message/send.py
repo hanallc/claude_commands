@@ -5390,8 +5390,10 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                     return Result("failed", f"{relayed_result.detail}; {dead_socket_reason(message.to)}")
                 if transport_message.review_batch:
                     queue_recipient = conversation_recipient(queue_recipient)
-                enqueue(replace(delivery_message, key=None if transport_message.review_batch else delivery_message.key),
-                        relayed_result.detail, started, order=order, membership=membership, mailbox=queue_recipient)
+                queued_message = replace(delivery_message, to=stable_mailbox_key(queue_recipient),
+                                         key=None if transport_message.review_batch else delivery_message.key)
+                enqueue(queued_message, relayed_result.detail, started, order=order,
+                        membership=membership, mailbox=queue_recipient)
                 return relayed_result
 
             def relay_with_claim(attempt: Message, timeout: float, entry_id: str) -> Result:
