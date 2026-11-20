@@ -1693,6 +1693,9 @@ The route accepts check and lint judgments for the normalized Hana repository.
 These judgments run direct `cargo check` or `cargo clippy` commands.
 The command policy rejects repairs, builds, nextest, final steps, path overrides, and unknown wrappers.
 `enabled.hana-aws=on` in `build_targets.conf` permits new placed work.
+With the switch off, the controller renews the permit for an active claim while spending permits it.
+The controller orders a stop on the next tick after the claim ends.
+The daily, monthly, and reserve limits still apply to each renewal.
 Manual Hana AWS resource commands and status reports continue independently of the switch.
 The queue checks the Hana image and capacity before it assigns work.
 A pinned request uses only its requested target.

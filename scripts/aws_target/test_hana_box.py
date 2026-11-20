@@ -1015,6 +1015,50 @@ class HanaBoxTests(CostFixture):
         self.assertEqual(self.record()['observed_at'], observed_at)
         self.assertEqual(ledger.rows(self.record(), 'claims')[0], claim)
 
+    def test_switch_off_renews_the_active_claim_then_stops_after_release(self) -> None:
+        self.ready()
+        old_generation = self.generation()
+        old_permit = ledger.mapping(self.record()['delivered'])
+        expiry = ledger.instant(old_permit, 'expires')
+        settings = hana_box.read_settings(conf.read(self.workload_path))
+        self.clock.now = expiry - (2 * settings.controller_tick_timeout_s + 3 * settings.tick_interval_s)
+        set_hana_switch(self.root, 'off')
+
+        self.assertEqual(self.controller.request('execution-two'), hana_box.ClaimRefused('Hana is disabled'))
+        self.assertEqual(self.tick(), hana_box.Lifecycle.READY)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.READY)
+        delivery = ledger.mapping(self.record()['delivered'])
+        self.assertEqual(delivery['execution'], 'execution-one')
+        self.assertGreater(ledger.instant(delivery, 'expires'), expiry)
+        self.assertGreater(ledger.instant(delivery, 'generation'), old_generation)
+        self.assertEqual(self.provider.published[-1].expected_generation, old_generation)
+        self.assertFalse(any(call.action == hana_box.Action.STOP for call in self.provider.calls))
+
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(ledger.mapping(self.record()['operation'])['action'], hana_box.Action.STOP.value)
+
+    def test_switch_off_refuses_to_start_a_pending_claim(self) -> None:
+        self.assertIsInstance(self.controller.request('execution-one'), hana_box.ClaimCommitted)
+        set_hana_switch(self.root, 'off')
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual([call.action for call in self.provider.calls], [hana_box.Action.OBSERVE])
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
+
+    def test_spending_refusal_stops_an_active_claim_when_the_switch_is_off(self) -> None:
+        self.ready()
+        expiry = ledger.instant(ledger.mapping(self.record()['delivered']), 'expires')
+        settings = hana_box.read_settings(conf.read(self.workload_path))
+        self.clock.now = expiry - (2 * settings.controller_tick_timeout_s + 3 * settings.tick_interval_s)
+        set_hana_switch(self.root, 'off')
+        self.costs({'daily_limit_usd': '0.01', 'limit_reserve_usd': '0'})
+        publications = list(self.provider.published)
+
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.record()['reason'], 'daily_limit')
+        self.assertEqual(ledger.mapping(self.record()['operation'])['action'], hana_box.Action.STOP.value)
+        self.assertEqual(self.provider.published, publications)
+
     def test_refresh_failure_does_not_stop_lifecycle_recovery(self) -> None:
         _ = self.controller.request('execution-one')
         events: list[str] = []

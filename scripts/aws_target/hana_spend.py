@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum, auto
 from pathlib import Path
 from threading import Lock
 import time
@@ -93,6 +94,11 @@ class PermitIssued:
 @dataclass(frozen=True)
 class PermitRefused:
     reason: str
+
+
+class PermitUse(Enum):
+    NEW_WORK = auto()
+    ACTIVE_CLAIM = auto()
 
 
 @dataclass(frozen=True)
@@ -308,9 +314,10 @@ class HanaSpending[Settings: StartPermitSettings]:
             storage.append(ledger.HanaStorageExposure(now, self.settings.storage_usd_per_month))
         return replace(state, hana_compute=[*compute, proposed], hana_storage=storage), proposed
 
-    def check_start(self, now: int, generation: int) -> StartReserved | PermitRefused:
+    def check_start(self, now: int, generation: int, *, use: PermitUse = PermitUse.NEW_WORK
+                    ) -> StartReserved | PermitRefused:
         """Recheck an existing reservation before a start or permit mutation."""
-        if not self.settings.enabled:
+        if not self.settings.enabled and use is PermitUse.NEW_WORK:
             return PermitRefused('Hana is disabled')
         with self.book.transaction() as state:
             for row in state.hana_compute:
@@ -319,30 +326,35 @@ class HanaSpending[Settings: StartPermitSettings]:
                     return decision if isinstance(decision, PermitRefused) else StartReserved(row)
             return PermitRefused('The start reservation is expired or its generation is old')
 
-    def bind_start(self, now: int, generation: int, boot_id: str) -> PermitIssued | PermitRefused:
+    def bind_start(self, now: int, generation: int, boot_id: str, *, use: PermitUse = PermitUse.NEW_WORK
+                   ) -> PermitIssued | PermitRefused:
         """Authorize an existing reservation after the controller verifies its boot identity."""
         if not boot_id.strip():
             return PermitRefused('The guest boot identity is missing')
-        result = self.check_start(now, generation)
+        result = self.check_start(now, generation, use=use)
         if isinstance(result, PermitRefused):
             return result
         row = result.exposure
         return PermitIssued(hana_guest.WorkPermit(float(row.expires), str(generation), boot_id), row)
 
-    def issue(self, now: int, expires: int, boot_id: str, *, expected_generation: int = 0) -> PermitIssued | PermitRefused:
+    def issue(self, now: int, expires: int, boot_id: str, *, expected_generation: int = 0,
+              use: PermitUse = PermitUse.NEW_WORK) -> PermitIssued | PermitRefused:
         """Reserve a start or renewal before returning its increasing generation."""
         if not boot_id.strip():
             return PermitRefused('The guest boot identity is missing')
-        result = self._reserve_compute(now, expires, expected_generation=expected_generation)
+        result = self._reserve_compute(now, expires, expected_generation=expected_generation, use=use)
         if isinstance(result, PermitRefused):
             return result
         return PermitIssued(hana_guest.WorkPermit(float(expires), str(result.exposure.generation), boot_id), result.exposure)
 
     def _reserve_compute(self, now: int, expires: int, *, expected_generation: int, approved_setup: bool = False,
+                         use: PermitUse = PermitUse.NEW_WORK,
                          before_commit: Callable[[ledger.HanaComputeExposure], None] | None = None
                          ) -> StartReserved | PermitRefused:
-        if not self.settings.enabled and not approved_setup:
+        if not self.settings.enabled and not approved_setup and use is PermitUse.NEW_WORK:
             return PermitRefused('Hana is disabled')
+        if use is PermitUse.ACTIVE_CLAIM and expected_generation <= 0:
+            return PermitRefused('An active claim renewal requires its permit generation')
         if type(now) is not int or type(expires) is not int or now < 0 or not 0 < expires - now <= self.settings.permit_max_seconds:
             return PermitRefused('The permit deadline is outside its renewal window')
         with self.book.transaction() as state:

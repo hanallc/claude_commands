@@ -541,11 +541,12 @@ with hana_command_lock(directory) as access:
         check_start = hana_spend.HanaSpending[hana_spend.PermitSettings].check_start
         checked: list[hana_spend.StartReserved | hana_spend.PermitRefused] = []
 
-        def check(spending: hana_spend.HanaSpending[hana_spend.PermitSettings], now: int, generation: int
+        def check(spending: hana_spend.HanaSpending[hana_spend.PermitSettings], now: int, generation: int, *,
+                  use: hana_spend.PermitUse
                   ) -> hana_spend.StartReserved | hana_spend.PermitRefused:
             self.assertEqual(spending.book.read_snapshot().hana_compute[0].generation, generation)
             self.costs({'daily_limit_usd': '0.01', 'limit_reserve_usd': '0'})
-            result = check_start(spending, now, generation)
+            result = check_start(spending, now, generation, use=use)
             checked.append(result)
             return result
 
