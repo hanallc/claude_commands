@@ -23,7 +23,9 @@ from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_browser, change_page, console, for_you, investigations_page, page_frame, review_link
+from scripts.review_links import (
+    change_browser, change_page, console, for_you, investigations_page, page_frame, record_table, review_link,
+)
 
 
 class ConsoleMarkup(HTMLParser):
@@ -106,7 +108,6 @@ class ConsoleTests(unittest.TestCase):
         retry = conf.read("review_links").number("frame_retry_seconds")
         self.assertIn(f'data-frame-retry-seconds="{retry}"', source)
         self.assertIn("try { loaded = frame.contentWindow.location.origin === location.origin; } catch (_) {}", source)
-        self.assertIn("setTimeout(() => { frame.src = place; }, Number(shell.dataset.frameRetrySeconds) * 1000);", source)
         self.assertIn('<a class="rebuild-link" id="rebuild-link" href="?page=rebuilds" data-page="rebuilds"', source)
         self.assertIn("const pages = [...entries, rebuildLink];", source)
         self.assertIn("if (shown) shown.replaceWith(shown.ownerDocument.importNode(parsed, true));", source)
@@ -420,6 +421,13 @@ try{
  check(reads===queued+2 && trigger.dataset.state==='quiet','completion queues one read after a read in progress');
  mode='good';dispatchEvent(new Event('focus'));await flush();
  const collapsed=shell.classList.contains('collapsed');
+ const escapeInFrame=()=>new frame.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true});
+ const frameSearch=frame.contentDocument.querySelector('[data-filter-words]');
+ frameSearch.value='auto';
+ frameSearch.focus();
+ frameSearch.dispatchEvent(escapeInFrame());
+ check(!panel.hidden && frameSearch.value==='' && frame.contentDocument.activeElement===frameSearch,
+  'Escape clears the List filter and keeps For you open.');
  const frameButton=frame.contentDocument.querySelector('button');
  frameButton.focus();
  check(document.activeElement===frame && frame.contentDocument.activeElement===frameButton,'focus enters the page frame');
@@ -509,12 +517,35 @@ try{
   layout.dispatchEvent(new fixture.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
   check(box.hidden && layout.activeElement===mobile,'Escape restores focus to the visible button after resizing');
   fixture.remove();
+
+  const listLoaded=()=>new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const loaded=listLoaded();
+  frame.src='/page?filter=mine&restart=1#q=auto';
+  await loaded;
+  const list=frame.contentWindow;
+  const cleared=new Promise(resolve=>list.addEventListener('hashchange',resolve,{once:true}));
+  list.location.hash='q=';
+  await cleared;
+  const saved=new URL(location.href).searchParams.get('at.list');
+  check(saved==='/page?filter=mine&restart=1#q=','The console saves the cleared List address.');
+  const failedLoad=listLoaded();
+  frame.src='data:text/html,Unavailable';
+  await failedLoad;
+  await listLoaded();
+  check(list.location.pathname+list.location.search+list.location.hash===saved,
+   'The frame retry opens the last saved List address with the words cleared.');
  }
 }catch(error){failures.push(String(error));}
 await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
     layout = source.replace('</head>', setup + '</head>')
     page = layout.replace('</body>', probe + '<img hidden src="/complete"></body>').encode()
+    list_fixture = (
+        '<!doctype html><title>List fixture</title><button>Fixture control</button>'
+        + record_table.words_box('list-search', 'Filter by words')
+        + '<script>' + record_table.SCRIPT
+        + "filterControl.bind(document.querySelector('[data-filter-words]'),()=>{});</script>"
+    ).encode()
     results: list[list[str]] = []
     complete = threading.Event()
 
@@ -529,6 +560,8 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 _ = self.wfile.write(layout.encode())
             elif self.path.startswith('/?'):
                 _ = self.wfile.write(page)
+            elif self.path.startswith('/page?'):
+                _ = self.wfile.write(list_fixture)
             else:
                 _ = self.wfile.write(b'<!doctype html><title>Fixture</title><button>Fixture control</button>')
 

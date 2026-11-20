@@ -684,7 +684,10 @@ Ending an active unbound design records `finish-run --status completed` under th
 A phase-bound design uses the unit run and records no separate design phase.
 The one-shot managed review closes its phase and run in `assign.py` after worker cleanup.
 `worker.dispatch` owns successful pass completion; `assign.py` records pass failure only.
-Detached command results use `detached_runs.deliver` and `send.deliver_worker_text`.
+Detached worker results use `detached_runs.deliver` and `send.deliver_worker_text`.
+A unit director or showrunner gives `detached_runs.py start` its own folder with `--session-dir`.
+The run record saves the caller's staff ID. The supervisor starts in a separate process session.
+`send.py` uses the saved staff ID to deliver the result to the current session or queue it during a move.
 After the command ends, the supervisor starts `detached_runs.py deliver <record>` in a new Python process.
 This process imports the current delivery code and saves the delivery outcome in the run record.
 The supervisor waits for this process before it marks the run finished.
