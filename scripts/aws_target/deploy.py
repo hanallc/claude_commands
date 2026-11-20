@@ -3412,6 +3412,7 @@ class DeploymentArguments(argparse.Namespace):
         self.output: Path = Path.home() / '.local/state/aws-build/deployment'
         self.approve_resources: bool = False
         self.approve_destroy: bool = False
+        self.approve_release: bool = False
         self.plan: bool = False
         self.check: bool = False
         self.trial_action: str | None = None
@@ -3451,7 +3452,7 @@ def main() -> int:
         with step('aws-trial', 'running the trial', settings_path):
             return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
     parser = argparse.ArgumentParser(description=__doc__, epilog=aws_test_identity.CONSOLE_SETUP)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply', 'plan-identity', 'test-identity'),
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'hana-release-unknown-stop', 'apply', 'plan-identity', 'test-identity'),
                             help='Use quota-status to read Spot quotas with the plan key. Use quota-request to request increases with the admin key.')
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
@@ -3462,6 +3463,7 @@ def main() -> int:
     _ = parser.add_argument('--output', type=Path)
     _ = parser.add_argument('--approve-resources', action='store_true')
     _ = parser.add_argument('--approve-destroy', action='store_true')
+    _ = parser.add_argument('--approve-release', action='store_true', help='Save an approved release of a Hana unknown stop.')
     _ = parser.add_argument('--plan', action='store_true', help='Check setup with the AWS plan identity.')
     _ = parser.add_argument('--check', action='store_true', help='Verify the saved plan or test identity without a prompt.')
     args = parser.parse_args(namespace=DeploymentArguments())
@@ -3475,6 +3477,17 @@ def main() -> int:
         return plan_identity.command_check(args.settings)
     if args.plan:
         return run_setup_plan(args)
+    if args.command == 'hana-release-unknown-stop':
+        try:
+            release = hana_box.release_unknown_stop(args.directory, approve_release=args.approve_release)
+        except hana_box.UnknownStopReleaseRefused as error:
+            print(f'hana-release-unknown-stop: {error}', file=sys.stderr)
+            return 1
+        except (OSError, KeyError, TypeError, ValueError):
+            print('hana-release-unknown-stop: Could not read or save the local Hana state.', file=sys.stderr)
+            return 1
+        print(f'hana-release-unknown-stop: {release}')
+        return 0
     deploy = Deployment(args.settings, args.directory, args.output)
     try:
         if args.workload == 'plan-identity' and args.command != 'down':

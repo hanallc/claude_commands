@@ -190,7 +190,13 @@ A composer with a draft waits until the deadline without changes to the draft.
 Pane reports keep failed pane lists, unassigned panes, and unreadable registry evidence. A proved owner establishes presence even when other observations fail. A lookup requires complete relevant evidence to report absence.
 
 An observed empty pane requires one foreground shell with the same PID as the pane shell and the foreground process group.
-An empty pane adds no failure to a conversation search. Demotion can resume the conversation after a complete search proves absence.
+The unit lookup checks the ancestry and controlling terminal of each other holder.
+It ignores a holder outside the pane shell's process tree if the holder has a different controlling terminal or no controlling terminal.
+A shell descendant or a holder on the pane terminal keeps the pane owner unknown.
+Unknown ancestry or terminal evidence also keeps the pane owner unknown.
+On Linux, a changed or unreadable process start time makes its ancestry and terminal unknown.
+An empty pane adds no failure to a conversation search.
+A complete search can prove absence and let a resume use the empty pane.
 
 The unit lookup requires a recorded process start and a matching native conversation for every Claude owner.
 For a pane, the lookup also requires proof of the foreground PID.

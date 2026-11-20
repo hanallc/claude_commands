@@ -431,6 +431,7 @@ class FooterCountsTests(unittest.TestCase):
         broken = replace(snapshot, rows=tuple(replace(row, parent=None) if row.id == one.id else row
                                                for row in snapshot.rows))
         with (mock.patch.object(staff, "snapshot", return_value=broken), production_staff_record(),
+              mock.patch.object(staff, "authority_snapshot", lambda: broken),
               mock.patch.object(unrouted_alert, "send_message") as send, contextlib.redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(footer_counts.changes(doc), 0)
             self.assertEqual(footer_counts.unrouted_changes(doc), 2)

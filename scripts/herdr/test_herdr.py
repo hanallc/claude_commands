@@ -8,7 +8,7 @@ from importlib import import_module
 import io
 import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 import os
 import select
@@ -1653,6 +1653,109 @@ class PromptSubmissionTests(unittest.TestCase):
                     self.assertIsInstance(self.submit(timeout_ms=1000), herdr.PromptSubmitted)
                 self.assertEqual(len(self.typed), 1)
                 self.assertEqual(self.elapsed, 0)
+
+    def test_opening_prompt_checks_the_foreground_group_leader_and_recipient(self) -> None:
+        leader, agent = 23457, 23456
+        script = Path(herdr.__file__).resolve().parents[1] / "lib/relaunch.py"
+        other_script = self.root / "other/scripts/lib/relaunch.py"
+        other_script.parent.mkdir(parents=True)
+        other_script.touch()
+        proc = self.root / "proc"
+        child_process = proc / str(agent)
+        child_process.mkdir(parents=True)
+        parent_process = proc / str(leader)
+        parent_process.mkdir()
+        parent_exe = parent_process / "exe"
+        parent_cmdline = parent_process / "cmdline"
+        parent_stat = parent_process / "stat"
+        read_bytes = Path.read_bytes
+        self.submit_on_enter = 1
+
+        def stat_line(pid: int, program: str, parent: int, start: int) -> str:
+            return f"{pid} ({program}) S {parent} {leader} 23455 0 {leader} " + "0 " * 13 + f"{start}\n"
+
+        for label, program, script_path, command, parent, recipient, accepted in (
+            ("approved script", "python3", script, "run", leader, agent, True),
+            ("other script", "python3", other_script, "run", leader, agent, False),
+            ("parent generation changes", "python3", script, "run", leader, agent, False),
+            ("child generation changes", "python3", script, "run", leader, agent, False),
+            ("direct parent changes", "python3", script, "run", leader, agent, False),
+            ("parent execs", "python3", script, "run", leader, agent, False),
+            ("other program", "editor", script, "run", leader, agent, False),
+            ("other command", "python3", script, "help", leader, agent, False),
+            ("other parent", "python3", script, "run", 23458, agent, False),
+            ("leader as recipient", "python3", script, "run", leader, leader, False),
+        ):
+            with self.subTest(label=label):
+                self.elapsed = 0
+                self.typed.clear()
+                self.enters.clear()
+                _ = self.path.write_bytes(b"")
+                child_stat = child_process / "stat"
+                initial_child_stat = stat_line(agent, "claude", parent, 200)
+                _ = child_stat.write_text(initial_child_stat)
+                _ = parent_stat.write_text(stat_line(leader, program, 23455, 100))
+                parent_exe.unlink(missing_ok=True)
+                parent_exe.symlink_to(self.root / "bin" / program)
+                _ = parent_cmdline.write_bytes(os.fsencode(f"{program}\0{script_path}\0{command}\0"))
+                command_reads = 0
+
+                def read_command(path: Path) -> bytes:
+                    nonlocal command_reads
+                    raw = read_bytes(path)
+                    if path != parent_cmdline:
+                        return raw
+                    command_reads += 1
+                    if label == "parent generation changes":
+                        _ = parent_stat.write_text(stat_line(leader, program, 23455, 100 + command_reads))
+                    if label == "child generation changes":
+                        _ = child_stat.write_text(stat_line(agent, "claude", parent, 200 + command_reads))
+                    if label == "direct parent changes":
+                        _ = child_stat.write_text(stat_line(agent, "claude", 23458, 200))
+                    if label == "parent execs" and command_reads % 2 == 0:
+                        return raw + b"changed-argument\0"
+                    return raw
+
+                # The pane report still shows the original supervisor command.
+                info = {"process_info": {"shell_pid": 23455, "foreground_process_group_id": leader,
+                    "foreground_processes": [{"pid": leader, "name": "python3", "argv": ["python3", str(script), "run"]},
+                                             {"pid": agent, "argv": ["claude"]}]}}
+                with (patch.dict(os.environ, {"HERDR_PLATFORM": "linux"}),
+                      patch.object(herdr, "proc_root", return_value=proc),
+                      patch.object(Path, "read_bytes", read_command),
+                      patch.object(self.client, "result", return_value=info),
+                      patch.object(herdr, "prompt_recipient_process",
+                                   return_value=herdr.PromptRecipientProcess(recipient, "fixture-prompt-recipient")),
+                      redirect_stderr(io.StringIO())):
+                    outcome = self.submit(timeout_ms=6000 if accepted else 1000)
+                if accepted:
+                    self.assertEqual(command_reads, 4)
+                    self.assertIsInstance(outcome, herdr.PromptSubmitted)
+                    self.assertEqual(len(self.typed), 1)
+                    self.assertEqual(self.enters, [("destination:p1", ("Enter",))])
+                else:
+                    self.assertEqual(outcome, herdr.PromptNotSubmitted(
+                        "prompt target is unknown; session retained", self.screen, state="not_sent"))
+                    self.assertEqual((self.typed, self.enters), ([], []))
+
+    def test_opening_prompt_reports_each_retained_reason_once_across_polls(self) -> None:
+        def retained_process_info(*_arguments: str) -> dict[str, object]:
+            foreground = [] if self.elapsed < 0.3 else [{"pid": 23456, "name": "claude"}]
+            return {"process_info": {"shell_pid": 23455, "foreground_process_group_id": 23456,
+                                     "foreground_processes": foreground}}
+
+        with (patch.object(self.client, "result", side_effect=retained_process_info) as result,
+              redirect_stderr(io.StringIO()) as errors):
+            outcome = self.submit(timeout_ms=10_000)
+
+        self.assertGreater(result.call_count, 8)
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "herdr agents:destination:p1: native session is unknown; target retained",
+            "herdr agents:destination:p1: target evidence is unknown: agent argv is unavailable; target retained",
+        ])
+        self.assertEqual(outcome, herdr.PromptNotSubmitted(
+            "prompt target is unknown; session retained", self.screen, state="not_sent"))
+        self.assertEqual((self.typed, self.enters), ([], []))
 
     def test_opening_prompt_requires_a_fresh_empty_composer(self) -> None:
         empty = self.screen
@@ -4412,14 +4515,19 @@ class HerdrTests(unittest.TestCase):
     def darwin_sockets(self, text: str) -> None:
         self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"], text)
 
-    def darwin_process_table(self, text: str) -> None:
+    def darwin_process_table(self, text: str, *, terminals: Mapping[int, str] | None = None) -> None:
         executables: list[str] = []
+        terminals_and_executables: list[str] = []
         commands: list[str] = []
         for line in text.splitlines():
             pid, parent, uid, command = line.split(maxsplit=3)
             executables.append(f"{pid} {parent} {uid} {command.split()[0]}")
+            terminal = "??" if terminals is None else terminals.get(int(pid), "??")
+            terminals_and_executables.append(f"{pid} {parent} {uid} {terminal} {command.split()[0]}")
             commands.append(f"{pid} {command}")
         self.configure(["-U", str(os.getuid()), "-o", "pid=,ppid=,uid=,comm="], "\n".join(executables))
+        self.configure(["-U", str(os.getuid()), "-o", "pid=,ppid=,uid=,tdev=,comm="],
+                       "\n".join(terminals_and_executables))
         self.configure(["-U", str(os.getuid()), "-o", "pid=,command="], "\n".join(commands))
 
     def darwin_startup_table(self, text: str, *, started: str = "Tue Nov  3 08:00:00 2026") -> None:
@@ -5034,7 +5142,9 @@ class HerdrTests(unittest.TestCase):
         self.darwin_process_table(
             f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n" +
             f"73 71 {uid + 1} claude\n74 71 {uid} claude HERDR_PANE_ID=forged\n" +
-            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated 'outside-herdr\n")
+            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated 'outside-herdr\n" +
+            f"78 1 {uid} holder\n79 1 {uid} holder\n",
+            terminals={71: "16/0", 72: "16/0", 78: "16/0", 79: "unreadable"})
         self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
         self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": [{'pane_id': 'w1:p1', 'workspace_id': 'w1'}, {'pane_id': 'w1:p2', 'workspace_id': 'w1'}]}}))
         self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 CODEX_THREAD_ID=unit")
@@ -5053,6 +5163,13 @@ class HerdrTests(unittest.TestCase):
             herdr.HerdrProcess(76, herdr.HerdrPlace("writing", "w1:p2"), {}, "claude",
                                herdr.UnreadableCwd("process 76 cwd: stderr: gone"))])
         self.assertEqual([command for command in self.commands() if "cwd" in command], [cwd_command])
+        ancestry = next(row.ancestry for row in rows if row.pid == 72)
+        self.assertEqual(ancestry.relative_to_shell(72, 71), herdr.PaneShellAncestry.DESCENDANT)
+        self.assertEqual(ancestry.relative_to_shell(77, 71), herdr.PaneShellAncestry.OUTSIDE)
+        self.assertEqual(ancestry.relative_to_shell(73, 71), herdr.PaneShellAncestry.UNKNOWN)
+        self.assertTrue(ancestry.is_detached_from_shell(77, 71))
+        self.assertFalse(ancestry.is_detached_from_shell(78, 71))
+        self.assertFalse(ancestry.is_detached_from_shell(79, 71))
         self.configure(cwd_command, "p72\nfcwd\nn/second folder\np71\nfcwd\nn/first folder\np76\nfcwd\nn/third folder\n")
         self.assertEqual({row.pid: row.working_directory for row in herdr.herdr_processes()},
                          {71: "/first folder", 72: "/second folder", 76: "/third folder"})
@@ -8041,6 +8158,56 @@ class RowTabTests(StaffTestCase):
         for text in ("p2", "t1", "private process facts are unavailable"):
             self.assertIn(text, errors.getvalue())
 
+    def test_layout_scan_reports_missing_claude_arguments_only_after_start(self) -> None:
+        configuration = self.root / "configuration"
+        _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\n")
+        proc = self.root / "proc"
+        uptime = proc / "uptime"
+        ticks = os.sysconf("SC_CLK_TCK")
+        process = proc / "991000"
+        process.mkdir()
+        # The relaunch supervisor leads the foreground group.
+        _ = (process / "stat").write_text("991000 (claude) S 990500 990500 990000 0 990500 "
+                                          + "0 " * 13 + str(100 * ticks))
+        pane: dict[str, object] = dict(self.client.tabs[0])
+        record = staff.snapshot()
+        result = self.client.result
+
+        def supervised(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            payload = result(*arguments, deadline=deadline)
+            if arguments[:2] == ("pane", "process-info"):
+                herdr.json_object(payload["process_info"], "test process info")["foreground_process_group_id"] = 990500
+            return payload
+
+        for arguments_arrive in (True, False):
+            with (self.subTest(arguments_arrive=arguments_arrive),
+                  patch.dict(os.environ, config_environment(configuration)),
+                  patch.object(self.client, "result", side_effect=supervised),
+                  herdr.pane_evidence_run(), redirect_stderr(io.StringIO()) as errors):
+                self.client.missing_argv = {"p0"}
+                _ = uptime.write_text("101.0 0.0\n")
+                starting = self.client.scan_row_panes(record, [pane])
+                self.assertEqual(starting.found, {})
+                self.assertEqual(starting.unknown, [herdr.UnknownPane("p0", "t0", "starting")])
+                self.assertEqual(errors.getvalue(), "")
+
+                if arguments_arrive:
+                    self.client.missing_argv.clear()
+                else:
+                    _ = uptime.write_text("120.0 0.0\n")
+                observed = self.client.scan_row_panes(record, [pane])
+                self.assertEqual(self.client.scan_row_panes(record, [pane]), observed)
+                if arguments_arrive:
+                    self.assertEqual(observed.found, {self.rows["unit"].id: [pane]})
+                    self.assertEqual(observed.unknown, [])
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertEqual(observed.found, {})
+                    self.assertEqual(observed.unknown, [
+                        herdr.UnknownPane("p0", "t0", "agent argv is unavailable")])
+                    self.assertEqual(errors.getvalue(),
+                        "herdr fixture:p0 tab t0: pane evidence is unknown: agent argv is unavailable; row placement retained\n")
+
     def test_transfer_continues_for_a_proved_tab_and_keeps_an_unknown_tab(self) -> None:
         unknown = dict(self.client.tabs[2])
         self.client.unknown.add(unknown["pane_id"])
@@ -9034,17 +9201,17 @@ class PaneSessionsTests(unittest.TestCase):
     LIVE: dict[str, object] = {"pid": 101, "name": "claude", "argv": ["claude", "--resume", "recorded-id"]}
     EXITED: dict[str, object] = {"pid": 102, "name": "claude"}
 
-    def sessions(self, *processes: dict[str, object]) -> frozenset[str]:
+    def session(self, *processes: dict[str, object]) -> herdr.ClaudePaneSession:
         observed = herdr.NativeAgentProcess(herdr.EnvironmentThread("recorded-id"), "fixture-start", {})
         with patch.object(herdr, "native_process", return_value=observed):
-            sessions = herdr._pane_sessions({"foreground_processes": list(processes)}, {"pane_id": "w1:p1"})  # pyright: ignore[reportPrivateUsage]
-        assert isinstance(sessions, frozenset)
-        return sessions
+            session = herdr._pane_session({"foreground_processes": list(processes)}, {"pane_id": "w1:p1"})  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(session, herdr.ClaudePaneSession)
+        return session
 
     def test_an_exited_agent_child_beside_the_live_agent_is_ignored(self) -> None:
-        self.assertEqual(self.sessions(self.LIVE, self.EXITED), {"recorded-id"})
-        self.assertEqual(self.sessions(self.EXITED, self.LIVE), {"recorded-id"})
+        self.assertEqual(self.session(self.LIVE, self.EXITED), herdr.ClaudePaneSession("recorded-id", 101))
+        self.assertEqual(self.session(self.EXITED, self.LIVE), herdr.ClaudePaneSession("recorded-id", 101))
 
     def test_an_agent_without_an_argv_and_no_live_agent_is_unknown(self) -> None:
         with self.assertRaisesRegex(herdr_types.HerdrFailure, "agent argv is unavailable"):
-            _ = self.sessions(self.EXITED)
+            _ = self.session(self.EXITED)
