@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
-import time
 import subprocess
+import time
 from pathlib import Path
-from typing import Literal, NamedTuple, TypedDict
+from typing import Literal, NamedTuple, TypedDict, cast
 
 from scripts.buildlog import store
 from scripts.buildlog import cgroup_capture, filesystem
@@ -16,6 +17,7 @@ from scripts.buildlog.cgroup_capture import (Unmeasured as Unmeasured, StallTota
                             PartialStallTotals as PartialStallTotals, read_pressure as read_pressure,
                             parse_pressure as parse_pressure)
 
+PROC = Path("/proc")
 MEMINFO = Path("/proc/meminfo")
 PRESSURE = Path("/proc/pressure/memory")
 CPU_PRESSURE = Path("/proc/pressure/cpu")
@@ -113,6 +115,99 @@ def sccache_in_service(builds: Path) -> int | Unmeasured:
         return int(bool((builds / "sccache.service/cgroup.procs").read_text().strip()))
     except OSError:
         return 0
+
+
+class SccacheStats(TypedDict):
+    rust_compile_requests: int
+    rust_hits: int
+    rust_misses: int
+    rust_hit_rate: float | None
+    cache_size: int | None
+    max_cache_size: int | None
+
+
+class SccacheSample(SccacheStats):
+    kind: Literal["sccache_sample"]
+    host: str
+    at: str
+    boot_id: str
+    server_started_us: int
+
+
+def sccache_object(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("Expected an sccache JSON object.")
+    return cast(dict[str, object], value)
+
+
+def sccache_counter(value: object) -> int:
+    if type(value) is not int or not 0 <= value < 2**63:
+        raise ValueError("Expected a nonnegative SQLite integer.")
+    return value
+
+
+def rust_cache_count(stats: dict[str, object], key: str) -> int:
+    counts = sccache_object(sccache_object(stats[key])["counts"])
+    return sccache_counter(counts.get("Rust", 0))
+
+
+def parse_sccache_stats(text: str) -> SccacheStats:
+    result = sccache_object(cast(object, json.loads(text)))
+    stats = sccache_object(result["stats"])
+    hits = rust_cache_count(stats, "cache_hits")
+    misses = rust_cache_count(stats, "cache_misses")
+    requests = sccache_counter(hits + misses)
+    size, maximum = result["cache_size"], result["max_cache_size"]
+    return {"rust_compile_requests": requests, "rust_hits": hits, "rust_misses": misses,
+            "rust_hit_rate": hits / requests if requests else None,
+            "cache_size": sccache_counter(size) if size is not None else None,
+            "max_cache_size": sccache_counter(maximum) if maximum is not None else None}
+
+
+def sccache_service() -> tuple[int, int]:
+    command = ["systemctl", "--user", "show", "sccache.service",
+               "--property=ActiveState", "--property=ExecMainStartTimestampMonotonic", "--property=MainPID"]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=2, check=True)
+    values = {key: value for key, _, value in (line.partition("=") for line in result.stdout.splitlines())}
+    pid = int(values["MainPID"])
+    start = sccache_counter(int(values["ExecMainStartTimestampMonotonic"]))
+    if values["ActiveState"] != "active" or pid <= 0 or start == 0:
+        raise ValueError("The sccache service is inactive.")
+    return pid, start
+
+
+def sccache_sample() -> int:
+    """Record one hourly reading from the active server."""
+    try:
+        boot_id = parse_boot_id(BOOT_ID.read_text())
+        pid, start = sccache_service()
+        server = PROC / str(pid)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("SCCACHE_")}
+        for item in (server / "environ").read_bytes().split(b"\0"):
+            name, separator, value = item.partition(b"=")
+            if separator and name.startswith(b"SCCACHE_"):
+                environment[os.fsdecode(name)] = os.fsdecode(value)
+        # The server start flag conflicts with --show-stats.
+        _ = environment.pop("SCCACHE_START_SERVER", None)
+        environment.update(SCCACHE_LOG="sccache::commands=debug", RUST_LOG_STYLE="never")
+        at = time.time()
+        result = subprocess.run(["sccache", "--show-stats", "--stats-format", "json"],
+                                capture_output=True, text=True, timeout=2, check=True,
+                                cwd=server / "cwd", env=environment)
+        # sccache v0.15 prints default counters when the connection fails.
+        # Only the server request path logs this message.
+        if not any(line.endswith(" DEBUG sccache::commands] request_stats") for line in result.stderr.splitlines()):
+            return 0
+        stats = parse_sccache_stats(result.stdout)
+        if sccache_service() != (pid, start):
+            return 0
+    except (OSError, ValueError, KeyError, RecursionError, subprocess.SubprocessError):
+        return 0
+    host = store.host_name()
+    record: SccacheSample = {**stats, "kind": "sccache_sample", "host": host, "at": store.utc_iso(at),
+                             "boot_id": boot_id, "server_started_us": start}
+    store.append_line(store.sample_file(host, at), record)
+    return 0
 
 
 class PoolTokensMeasured(TypedDict):

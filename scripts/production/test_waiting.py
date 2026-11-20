@@ -105,7 +105,7 @@ def setUpModule() -> None:
 class LiteralScratchCommandTests(unittest.TestCase):
     def test_only_literal_command_words_can_use_admission_before_the_slot(self) -> None:
         literal = ('bash verify.sh check sample', 'bash "verify.sh" check "sample package"',
-                   "python3 targeted_test.py --type-dirs scripts/production")
+                   "python3 targeted_test.py --repo scripts/production")
         shell = ('bash verify.sh check "$PKG"', 'bash verify.sh check ${PKG}',
                  'bash verify.sh check $(printf sample)', 'bash verify.sh check `printf sample`',
                  'bash verify.sh check sample*', 'bash verify.sh check sample?',
@@ -211,7 +211,7 @@ class WaitingTests(unittest.TestCase):
         # as its name. Tests that call the tool in this process read the same stand-ins.
         (self.root / "sessions").mkdir()
         self.write(self.root / "showrunners.json", json.dumps({
-            "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "natedev",
+            "threshold_percent": 2, "stall_minutes": 5, "faults_to": "natedev",
             "always": []}))
         self.write(self.root / "herdr-responses.json", json.dumps({
             "default": CommandResponse(stdout="", code=1),

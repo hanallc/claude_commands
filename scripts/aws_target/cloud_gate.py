@@ -10,8 +10,9 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from hashlib import sha256
 import json
 import os
@@ -19,7 +20,6 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
-from statistics import median
 import sys
 import tempfile
 import time
@@ -30,13 +30,14 @@ from scripts.aws_target import admin_secrets, gate_box, ledger, run_cost, s3_pre
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, fetch_account_charges
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
-from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
+from scripts.aws_target.run_cost import GateLaunchVariant as GateLaunchVariant
+from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place, snapshot_codec
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
 from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf, git_index
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.process_start import process_start, Started, Unreadable
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
@@ -58,19 +59,12 @@ class CloudAttempt:
     mode: gate.SuiteMode
     identifier: str = ''
     interruptions: int = 0
+    gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
 
 
 @dataclass(frozen=True)
 class CloudCompleted:
     run: gate.GateRun
-
-
-@dataclass(frozen=True)
-class GateLaunchVariant:
-    region: str
-    instance_type: str
-    subnet_id: str
-    zone: str
 
 
 @dataclass(frozen=True)
@@ -86,8 +80,47 @@ SPOT_INTERRUPTION_CODES = frozenset(('Server.SpotInstanceTermination', 'Server.S
 RESULT_FILE = 'remote-result.json'
 
 
+class LogUploadFailed(ValueError):
+    """The box published a result after its final log upload failed."""
+
+
+class RetryableCloudFailure(StrEnum):
+    SPOT = 'interrupted'
+    BOX = 'box-failed'
+    NONE = 'no retry'
+
+
+def retryable_cloud_failure(outcome: dict[str, object]) -> RetryableCloudFailure:
+    status = outcome.get('status')
+    if status == RetryableCloudFailure.SPOT and outcome.get('interruption_code') in SPOT_INTERRUPTION_CODES:
+        return RetryableCloudFailure.SPOT
+    if status == RetryableCloudFailure.BOX:
+        return RetryableCloudFailure.BOX
+    return RetryableCloudFailure.NONE
+
+
+class CloudGateSwitch(StrEnum):
+    ON = 'on'
+    OFF = 'off'
+
+
+@dataclass(frozen=True)
+class InvalidCloudGateSwitch:
+    reason: str
+
+
+type CloudGateSetting = CloudGateSwitch | InvalidCloudGateSwitch
+
+
 def settings() -> conf.ConfigRead:
     return conf.read_or_repository('cloud_gate')
+
+
+def launch_switch(configuration: conf.ConfigRead) -> CloudGateSetting:
+    try:
+        return configuration.value('enabled', CloudGateSwitch, recover_invalid=False)
+    except conf.Unusable as error:
+        return InvalidCloudGateSwitch(str(error))
 
 
 def read(path: Path) -> dict[str, object]:
@@ -98,10 +131,19 @@ def save(path: Path, row: dict[str, object]) -> None:
     write_text_atomic(path, json.dumps(row, sort_keys=True) + '\n')
 
 
-def append_launch(directory: Path, row: dict[str, object]) -> None:
-    """Append one event with the existing launch record lock and format."""
+def _saved_gate_job(record: dict[str, object]) -> StepJob | GateJobNotRecorded:
+    """Read the saved job for an attempt."""
+    try:
+        return cast(StepJob | GateJobNotRecorded,
+            snapshot_codec.parse_snapshot_value(record.get('gate_job'), StepJob | GateJobNotRecorded))
+    except (ValueError, OverflowError):
+        return GATE_JOB_NOT_RECORDED
+
+
+def append_launch(directory: Path, row: dict[str, object], *, gate_job: StepJob | GateJobNotRecorded) -> None:
+    """Append one launch event with the queue's job record."""
     with store.locked_append(directory / 'cloud-gate-launches.jsonl') as handle:
-        store.append_locked(handle, row)
+        store.append_locked(handle, {**row, 'gate_job': snapshot_codec.snapshot_value(gate_job)})
 
 
 def capacity_error(reason: str) -> bool:
@@ -114,6 +156,24 @@ def aws_down(reason: str) -> bool:
     return any(code in reason for code in ('Could not connect to the endpoint', 'EndpointConnectionError',
                                            'ServiceUnavailable', 'InternalError', 'RequestTimeout', 'Connection timed out',
                                            'InternalFailure', 'ServerInternal', '(Unavailable)'))
+
+
+class _PollOutage:
+    def __init__(self) -> None:
+        self._started_at: float = float('inf')
+
+    def reset(self) -> None:
+        self._started_at = float('inf')
+
+    def retry_after_failure(self, error: AwsUnavailable, now: float) -> bool:
+        if not aws_down(str(error)):
+            return False
+        if self._started_at == float('inf'):
+            self._started_at = now
+        if now - self._started_at >= settings().number('observe_outage_s'):
+            return False
+        print(f'Cloud gate poll skipped: {error}', flush=True)
+        return True
 
 
 def not_sent(reason: str) -> bool:
@@ -299,6 +359,7 @@ class CloudReservation:
 
 @contextmanager
 def cloud_reservation(repo: Path, sidecar: Path, work: gate.SuiteMode | StepJob, *,
+                      gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
                       group: CloudGroup | NoCloudGroup = NO_CLOUD_GROUP) -> Generator[CloudReservation]:
     """Keep the route's cloud slot until its result or fallback returns."""
     pid = os.getpid()
@@ -307,7 +368,7 @@ def cloud_reservation(repo: Path, sidecar: Path, work: gate.SuiteMode | StepJob,
         raise GateRefused('The cloud route has no live process identity')
     owner, episode, since = wire.Owner(pid, start), uuid4().hex, time.time()
     step = work.step if isinstance(work, StepJob) else work.value
-    job = work if isinstance(work, StepJob) else GATE_JOB_NOT_RECORDED
+    job = work if isinstance(work, StepJob) else gate_job
     profile = admission_records.ProgramProfile(step, str(Path(__file__).resolve().parents[2]), str(repo.resolve()),
         admission_records.HistoryPeakSizing(0, admission_records.FirstProgramPeak(0), 0.0))
     def refresh() -> wire.AdmitRequest:
@@ -515,7 +576,7 @@ class GateWorker:
             row['gate_s'] = gate_s
         else:
             row.update({'availability_zone': zone, 'error_code': error_code, 'reason': reason})
-        append_launch(self.book.directory, row)
+        append_launch(self.book.directory, row, gate_job=_saved_gate_job(request))
         if result == 'refused':
             if error_code in run_cost.QUOTA_REFUSALS:
                 pool = ledger.SpotQuotaPool(self.box_region, ledger.spot_quota_class(size))
@@ -581,35 +642,17 @@ class GateWorker:
         now = self.clock()
         max_age = policy.whole('price_max_age_seconds')
         cooldown = values.whole('capacity_cooldown_seconds')
-        days = policy.whole('run_cost_days')
-        try:
-            history = ledger.recent_gate_launches(self.book.directory, now - max(max_age, cooldown, days * 86400))
-        except OSError:
-            history = ()
-        recent = [row for row in history if float(str(row['time'])) <= now]
-        refused = [row for row in recent if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
+        history = run_cost.read_placement_run_history(self.book.directory, now, values, policy, self.api.region)
+        refused = [row for row in history.launch_rows
+                   if row.get('result') == 'refused' and float(str(row['time'])) >= now - cooldown]
         zones = {(str(row.get('region', '')), str(row.get('instance_type', '')), str(row.get('availability_zone', '')))
                  for row in refused if row.get('error_code') in run_cost.ZONE_REFUSALS}
-        try:
-            prices = {(row.region, row.instance_type, row.zone): row.usd_per_hour
-                      for row in sorted(ledger.read_spot_prices(self.book.directory), key=lambda row: row.read_at)
-                      if 0 <= now - row.read_at <= max_age}
-        except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
-            prices = {}
-        prices.update({(row.region, row.instance_type, row.zone): row.usd_per_hour for row in live_prices})
-        moment = datetime.fromtimestamp(now, UTC)
-        evidence = run_cost.run_evidence(recent, moment - timedelta(days=days), moment, self.api.region)
         cap = values.whole('max_gate_minutes')
-        def median_box_s(variant: GateLaunchVariant) -> Decimal | None:
-            # A type with no measured runs has no median; the lifetime_minutes default is not a measurement.
-            seconds, _source = evidence.box_seconds(variant.instance_type, variant.region, (mode,))
-            return Decimal(median(seconds)) if seconds else None
-        slow = {(variant.instance_type, variant.region): box for variant in variants
-                if (box := median_box_s(variant)) is not None and box > cap * 60}
-        for (size, region), box in sorted(slow.items()):
+        eligibility = run_cost.gate_variant_eligibility(variants, self.book.directory, history.evidence, mode,
+            now=now, max_age=max_age, max_gate_minutes=cap, live_prices=live_prices)
+        for (size, region), box in sorted(eligibility.slow_box_seconds.items()):
             print(f'Cloud gate skips {size} in {region}: its median gate time {run_cost.median_run_time([box])} '
                   + f'is above max_gate_minutes={cap}.', flush=True)
-        variants = [variant for variant in variants if (variant.instance_type, variant.region) not in slow]
         try:
             quotas = {row.region: row for row in ledger.read_spot_quotas(self.book.directory) if 0 <= now - row.read_at <= max_age}
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
@@ -628,25 +671,15 @@ class GateWorker:
             key = (variant.region, variant.instance_type, variant.zone)
             full = isinstance(limit, Decimal) and live.get(pool, 0) + ledger.gate_vcpus(variant.instance_type) > limit
             return pool in marked, full, key in zones
-        if not any((row.region, row.instance_type, row.zone) in prices for row in variants):
-            return sorted(variants, key=capacity_order)
-        default_seconds = Decimal(values.whole('lifetime_minutes') * 60)
-        transfer = conf.decimal(values.text('remote_region_transfer_usd'))
-        transfers = run_cost.region_numbers(values, 'region_transfer_usd')
-        wait_cost = conf.decimal(values.text('gate_wait_usd_per_minute'))
-        extra_seconds = run_cost.region_numbers(values, 'region_extra_gate_seconds')
-        unmeasured = run_cost.region_numbers(values, 'unmeasured_region_extra_seconds')
+        if not eligibility.prices:
+            return sorted(eligibility.variants, key=capacity_order)
+        pricing = run_cost.GateRunPricing.from_config(values, history.evidence, self.api.region, (mode,))
         def order(item: tuple[int, GateLaunchVariant]) -> tuple[tuple[bool, bool, bool], bool, Decimal, int, int]:
             position, variant = item
-            key = (variant.region, variant.instance_type, variant.zone)
-            # The expected USD of one run: box time by type and region, plus the wait for expected refusals.
-            cost = (evidence.expected_usd(prices[key], variant.instance_type, variant.region, (mode,), wait_cost,
-                                         default_seconds, unmeasured_extra_s=unmeasured.get(variant.region, Decimal(0)))
-                    + (transfers.get(variant.region, transfer) if variant.region != self.api.region else Decimal(0))
-                    + extra_seconds.get(variant.region, Decimal(0)) * wait_cost / 60
-                    if key in prices else Decimal(0))
-            return capacity_order(variant), key not in prices, cost, type_rank(variant), position
-        return [variant for _, variant in sorted(enumerate(variants), key=order)]
+            price = eligibility.prices.get(variant)
+            cost = pricing.expected_usd(price, variant.instance_type, variant.region) if price is not None else Decimal(0)
+            return capacity_order(variant), price is None, cost, type_rank(variant), position
+        return [variant for _, variant in sorted(enumerate(eligibility.variants), key=order)]
 
     def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:
         path = folder / 'launch.json'
@@ -656,18 +689,15 @@ class GateWorker:
             self.box_zone = str(launch.get('zone', ''))
             return ledger.text(launch, 'instance')
         sizes = settings().words('instance_types')
+        deployed = run_cost.deployed_gate_variants(deployment, sizes)
         if 'instance_types' in deployment:
-            # The stack policy allows only the types of the last deploy.py up.
-            deployed = cast(list[str], deployment['instance_types'])
-            missing = [size for size in sizes if size not in deployed]
-            if missing:
-                print(f'Cloud gate skips {" ".join(missing)}: the stack does not allow it. Run deploy.py up.', flush=True)
-            sizes = [size for size in sizes if size in deployed]
-            if not sizes and not path.exists():
+            if deployed.unsupported_types:
+                print(f'Cloud gate skips {" ".join(deployed.unsupported_types)}: the stack does not allow it. Run deploy.py up.',
+                      flush=True)
+            if len(deployed.unsupported_types) == len(sizes) and not path.exists():
                 self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
                 return LocalFallback('The stack allows no configured gate type; run deploy.py up')
-        variants = [GateLaunchVariant(ledger.text(regional, 'region'), size, ledger.text(row, 'id'), ledger.text(row, 'zone'))
-                    for regional in ledger.rows(deployment, 'regions') for size in sizes for row in ledger.rows(regional, 'subnets')]
+        variants: Sequence[GateLaunchVariant] = deployed.variants
         if not path.exists():
             if 'retry_launch' in request:
                 launch = ledger.mapping(request['retry_launch'])
@@ -821,6 +851,12 @@ class GateWorker:
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
         return LocalFallback('Spot capacity is unavailable in every configured region')
 
+    def artifact_etags(self, bucket: str, prefix: str) -> dict[str, str]:
+        listing = self.api.call('list-objects-v2', '--bucket', bucket, '--prefix', prefix,
+                                '--no-paginate', service='s3api')
+        return {ledger.text(row, 'Key'): ledger.text(row, 'ETag')
+                for row in ledger.rows({'Contents': listing.get('Contents', [])}, 'Contents')}
+
     def execute(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
         attempt = ledger.text(request, 'attempt')
         row: dict[str, object] = {}
@@ -861,7 +897,10 @@ class GateWorker:
             if isinstance(launched, LocalFallback):
                 return {'status': 'fallback', 'reason': launched.reason}
             instance = launched
-            prefix = 'artifacts/' + attempt
+            prefix = 'artifacts/' + attempt + '/'
+            log_key = prefix + 'gate.log'
+            boot_error_key = prefix + 'boot-error.json'
+            result_key = prefix + 'result.json'
             try:
                 arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
                 self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
@@ -872,23 +911,58 @@ class GateWorker:
                     print(f'Gate time limit disabled: no passing history for {self.size_vcpus} vCPUs', flush=True)
                 began = 0.0
                 deadline = float('inf')
-                outage_since: float | None = None
+                ec2_outage = _PollOutage()
+                s3_outage = _PollOutage()
+                bucket = ledger.text(deployment, 'bucket')
+                downloaded_log_etag = ''
+                instance_check_s = settings().whole('instance_check_s')
+                next_instance_check = time.monotonic()
                 while self.clock() < ledger.instant(request, 'expires'):
+                    now = time.monotonic()
+                    deadline_reached = now >= deadline
+                    stop_reason = ''
+                    stop_code = ''
+                    ec2_error: AwsUnavailable | None = None
+                    if deadline_reached or now >= next_instance_check:
+                        next_instance_check = now + instance_check_s
+                        try:
+                            regional_api = self.regional_api(self.box_region)
+                            state = regional_api.observe(instance, int(self.clock())).state
+                            if state not in ('pending', 'running'):
+                                reply = regional_api.call('describe-instances', '--instance-ids', instance)
+                                stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
+                                reason = ledger.mapping(stopped.get('StateReason', {}))
+                                stop_code = str(reason.get('Code', ''))
+                                detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
+                                stop_reason = 'The instance stopped without a final result' + (f' ({detail})' if detail else '')
+                            ec2_outage.reset()
+                        except subprocess.TimeoutExpired:
+                            pass
+                        except AwsUnavailable as error:
+                            if not ec2_outage.retry_after_failure(error, self.clock()):
+                                ec2_error = error
                     try:
-                        bucket = ledger.text(deployment, 'bucket')
-                        if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                            self.publish_log(folder)
-                            if not began and 'Runner: ' in (folder / 'gate.log').read_text():
-                                began = time.monotonic()
-                                deadline = began + limit if limit else float('inf')
-                        if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
-                            raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
-                        if self.download(bucket, prefix + '/result.json', folder / RESULT_FILE):
+                        etags = self.artifact_etags(bucket, prefix)
+                        log_etag = etags.get(log_key, '')
+                        log_changed = bool(log_etag and log_etag != downloaded_log_etag)
+                        if boot_error_key in etags and self.download(bucket, boot_error_key, folder / 'boot-error.json'):
+                            reason = ledger.text(read(folder / 'boot-error.json'), 'error')
+                            if log_changed:
+                                try:
+                                    if self.download(bucket, log_key, folder / 'gate.log'):
+                                        self.publish_log(folder)
+                                except subprocess.TimeoutExpired:
+                                    pass
+                            return {'status': RetryableCloudFailure.BOX.value, 'reason': reason}
+                        if result_key in etags and self.download(bucket, result_key, folder / RESULT_FILE):
                             received_at = int(self.clock())
-                            if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                                raise ValueError('The final log is absent')
                             result = read(folder / RESULT_FILE)
-                            validate_result(result, request, instance=instance)
+                            try:
+                                validate_result(result, request, instance=instance)
+                            except LogUploadFailed as error:
+                                return {'status': RetryableCloudFailure.BOX.value, 'reason': str(error)}
+                            if not self.download(bucket, log_key, folder / 'gate.log'):
+                                raise ValueError('The final log is absent')
                             if request.get('task') == 'paired' and any(
                                     sample['instance_type'] != arguments['InstanceType'] for sample in ledger.rows(result, 'runs')):
                                 raise ValueError('The sample instance type differs from the launch')
@@ -901,28 +975,25 @@ class GateWorker:
                             row = result
                             self.publish_log(folder)
                             break
-                        state = self.regional_api(self.box_region).observe(instance, int(self.clock())).state
-                        if state not in ('pending', 'running'):
-                            reply = self.regional_api(self.box_region).call('describe-instances', '--instance-ids', instance)
-                            stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
-                            reason = ledger.mapping(stopped.get('StateReason', {}))
-                            code = str(reason.get('Code', ''))
-                            if code in SPOT_INTERRUPTION_CODES:
-                                interruption_code = code
-                            detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
-                            raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
-                        outage_since = None
+                        if result_key not in etags and log_changed and self.download(bucket, log_key, folder / 'gate.log'):
+                            downloaded_log_etag = log_etag
+                            self.publish_log(folder)
+                            if not began and 'Runner: ' in (folder / 'gate.log').read_text():
+                                began = time.monotonic()
+                                deadline = began + limit if limit else float('inf')
+                        s3_outage.reset()
                     except subprocess.TimeoutExpired:
                         pass
                     except AwsUnavailable as error:
-                        # The box keeps running through a short AWS outage; a long one ends the cloud try.
-                        if not aws_down(str(error)):
+                        if not s3_outage.retry_after_failure(error, self.clock()):
                             raise
-                        outage_since = self.clock() if outage_since is None else outage_since
-                        if self.clock() - outage_since >= settings().number('observe_outage_s'):
-                            raise
-                        print(f'Cloud gate poll skipped: {error}', flush=True)
-                    if time.monotonic() >= deadline:
+                    if ec2_error is not None:
+                        raise ec2_error
+                    if stop_reason:
+                        if stop_code in SPOT_INTERRUPTION_CODES:
+                            interruption_code = stop_code
+                        raise ValueError(stop_reason)
+                    if deadline_reached:
                         text = (folder / 'gate.log').read_text() if (folder / 'gate.log').exists() else ''
                         row = time_limit_result(request, text, time.monotonic() - began, limit, self.size_vcpus)
                         save(folder / RESULT_FILE, row)
@@ -995,20 +1066,31 @@ def _outcome_imported(folder: Path) -> bool:
         return False
 
 
-def validate_result(row: dict[str, object], request: dict[str, object], *, instance: str = '') -> None:
-    if request.get('task') == 'paired':
-        gate_box.validate_paired_result(row, request, instance)
-        return
+def decode_requested_run(row: dict[str, object], request: dict[str, object]) -> gate.GateRun:
+    """Decode a result for the requested attempt and source tree."""
     for key in ('attempt', 'commit', 'tree'):
         if row.get(key) != request[key]:
             raise ValueError('The result differs from the current ' + key)
-    run = gate_box.decode_run(row['gate'])
-    if row.get('log_error') or row.get('verdict') != ('pass' if run.passed else 'fail'):
-        raise ValueError('The result has no complete verdict and log')
+    if row.get('log_error'):
+        raise LogUploadFailed('The final log upload failed')
+    return gate_box.decode_run(row['gate'])
+
+
+def validate_run_modules(run: gate.GateRun, request: dict[str, object]) -> None:
     modules = ['scripts/' + job.suite + '/' + job.module for job in run.jobs]
     if (any(job.kind is not gate.GateJobKind.TEST_MODULE for job in run.jobs)
             or len(modules) != len(set(modules)) or set(modules) != set(cast(list[str], request['modules']))):
         raise ValueError('The result has a different module list')
+
+
+def validate_result(row: dict[str, object], request: dict[str, object], *, instance: str = '') -> None:
+    if request.get('task') == 'paired':
+        gate_box.validate_paired_result(row, request, instance)
+        return
+    run = decode_requested_run(row, request)
+    if row.get('verdict') != ('pass' if run.passed else 'fail'):
+        raise ValueError('The result has no complete verdict and log')
+    validate_run_modules(run, request)
     host = ledger.text(row, 'host')
     if not host or Path(host).name != host or host in ('.', '..'):
         raise ValueError('Invalid remote host')
@@ -1089,8 +1171,24 @@ def working_tree(repo: Path) -> tuple[str, set[str]]:
         return tree.stdout.strip(), dirty
 
 
-def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
-            selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> dict[str, object]:
+def create_source_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, exclude: str = '') -> None:
+    """Write one bundle for the requested tips and an optional common base."""
+    refs: list[str] = []
+    try:
+        for index, commit in enumerate(dict.fromkeys(commits)):
+            suffix = f'-{index}' if index else ''
+            ref = f'refs/cloud-gates/{bundle.parent.name}{suffix}'
+            refs.append(ref)
+            _ = gate.checked_git(repo, 'update-ref', ref, commit)
+        prerequisite = ('^' + exclude,) if exclude else ()
+        _ = gate.checked_git(repo, 'bundle', 'create', str(bundle), *refs, *prerequisite)
+    finally:
+        for ref in refs:
+            _ = gate.checked_git(repo, 'update-ref', '-d', ref)
+
+
+def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
+                    selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> dict[str, object]:
     head = gate.checked_git(repo, 'rev-parse', 'HEAD')
     tree, dirty = working_tree(repo)
     if isinstance(selected, gate.TreeSelection) and tree != selected.tree:
@@ -1108,30 +1206,36 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
     if urlsplit(origin).password or urlsplit(origin).query or ('://' in origin and urlsplit(origin).username):
         raise GateRefused('The origin URL must contain no credential')
     folder.mkdir(parents=True, exist_ok=True)
-    source_key = ''
-    if int(gate.checked_git(repo, 'rev-list', '--count', commit, '--not', 'refs/remotes/origin/main')):
-        ref = 'refs/cloud-gates/' + folder.name
-        _ = gate.checked_git(repo, 'update-ref', ref, commit)
-        try:
-            _ = gate.checked_git(repo, 'bundle', 'create', str(folder / 'source.bundle'), ref, '--not', 'refs/remotes/origin/main')
-        finally:
-            _ = gate.checked_git(repo, 'update-ref', '-d', ref)
-        digest = sha256((folder / 'source.bundle').read_bytes()).hexdigest()
-        source_key = 'source/' + digest + '.bundle'
     request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'head': head, 'tree': tree, 'dirty_paths': sorted(dirty), 'origin': origin,
         'origin_main': origin_main, 'clone_url': settings().text('clone_url'),
-        'mode': mode.value, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': source_key,
+        'mode': mode.value, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': '',
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
         'module_time_limit_s': min(limit, settings().number('module_time_limit_s'))}
+    return request
+
+
+def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
+            selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
+            gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> dict[str, object]:
+    request = prepare_request(repo, folder, mode, limit, selected=selected)
+    commit, base = (ledger.text(request, key) for key in ('commit', 'origin_main'))
+    if int(gate.checked_git(repo, 'rev-list', '--count', commit, '--not', base)):
+        bundle = folder / 'source.bundle'
+        create_source_bundle(repo, bundle, (commit,), exclude=base)
+        digest = sha256(bundle.read_bytes()).hexdigest()
+        request['source_key'] = 'source/' + digest + '.bundle'
+    if isinstance(gate_job, StepJob):
+        request['gate_job'] = snapshot_codec.snapshot_value(gate_job)
     save(folder / 'request.json', request)
     return request
 
 
 def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
         selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
+        gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED,
         service: Callable[[Sequence[str]], int] = lambda command: subprocess.call(command)) -> LocalFallback | CloudCompleted:
     # Record the final fallback here so worker replies and service errors produce one row.
-    attempt = CloudAttempt(target_config.ssh_target_state_directory('aws'), mode)
+    attempt = CloudAttempt(target_config.ssh_target_state_directory('aws'), mode, gate_job=gate_job)
     try:
         outcome = run_cloud(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                             selected=selected, service=service, attempt=attempt)
@@ -1144,7 +1248,8 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         try:
             append_launch(attempt.directory, {'time': time.time(), 'attempt': attempt.identifier,
                 'instance_type': '', 'vcpus': 0, 'result': 'fallback', 'mode': attempt.mode.value, 'region': '',
-                'availability_zone': '', 'error_code': launch_error_code(outcome.reason), 'reason': outcome.reason})
+                'availability_zone': '', 'error_code': launch_error_code(outcome.reason), 'reason': outcome.reason},
+                gate_job=attempt.gate_job)
         except OSError as error:
             detail = ' '.join(str(error).split())
             print('Cloud gate fallback row was not written: ' + detail, file=sys.stderr, flush=True)
@@ -1154,8 +1259,14 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
 def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
+    switch = launch_switch(settings())
+    if isinstance(switch, InvalidCloudGateSwitch):
+        return LocalFallback(switch.reason)
+    if switch is CloudGateSwitch.OFF:
+        return LocalFallback('cloud gates are off (cloud_gate.conf enabled=off)')
     directory = attempt.directory
     split = isinstance(selected, AssignedModules)
+    command_job = attempt.gate_job
     deployment_path = directory / 'gate-deployment.json'
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
@@ -1185,7 +1296,8 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                 pass
             else:
                 attempt.identifier = folder.name
-                with cloud_reservation(repo, folder / 'reservation.cgroup', mode) as reservation:
+                attempt.gate_job = _saved_gate_job(previous)
+                with cloud_reservation(repo, folder / 'reservation.cgroup', mode, gate_job=command_job) as reservation:
                     outcome = _complete_outcome(repo, folder, request, row)
                     reservation.status = int(isinstance(outcome, CloudCompleted) and not outcome.run.passed)
                     return outcome
@@ -1198,44 +1310,62 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if not regional.get('image') or not regional.get('template'):
             return LocalFallback('image or stack is absent')
         retrying = same_request and saved_result.get('status') not in ('complete', 'fallback') and (
-            bool(previous.get('retry_launch')) or saved_result.get('status') == 'interrupted'
-            and saved_result.get('interruption_code') in SPOT_INTERRUPTION_CODES)
+            bool(previous.get('retry_launch')) or retryable_cloud_failure(saved_result) is not RetryableCloudFailure.NONE)
         book = ledger.CostLedger(directory)
         ended = book.path.exists() and any(
             row.attempt == folder.name and isinstance(row.state, (ledger.GateAbsent, ledger.GateTerminated))
             for row in book.read_snapshot().gate_reservations)
         if not retrying and (ended or result_path.exists() and saved_result.get('status') != 'pending'):
             folder = root / uuid4().hex
+        elif same_request:
+            attempt.gate_job = _saved_gate_job(previous)
         attempt.identifier = folder.name
         folder.mkdir(parents=True, exist_ok=True)
         sidecar = folder / 'reservation.cgroup'
         retry_launch = ledger.mapping(previous.get('retry_launch', {})) if retrying else {}
         attempt.interruptions = int(str(previous.get('spot_interruptions', 0))) if retrying else 0
         counted_interruption = str(previous.get('counted_interruption', '')) if retrying else ''
-        retry_limit = settings().whole('spot_interruption_retries')
+        box_failures = int(str(previous.get('box_failures', 0))) if retrying else 0
+        counted_box_failure = str(previous.get('counted_box_failure', '')) if retrying else ''
+        last_box_failure = str(previous.get('last_box_failure', '')) if retrying else ''
+        values = settings()
+        retry_limit = values.whole('spot_interruption_retries')
+        box_retry_limit = values.whole('box_failure_retries')
         if retrying:
             retry_limit = min(retry_limit, int(str(previous.get('spot_retry_limit', retry_limit))))
-        with cloud_reservation(repo, sidecar, mode) as reservation:
+            box_retry_limit = min(box_retry_limit, int(str(previous.get('box_retry_limit', box_retry_limit))))
+        with cloud_reservation(repo, sidecar, mode, gate_job=command_job) as reservation:
             while True:
                 state: dict[str, object] = {'attempt': folder.name, **identity,
+                    'gate_job': snapshot_codec.snapshot_value(attempt.gate_job),
                     'spot_interruptions': attempt.interruptions, 'counted_interruption': counted_interruption,
-                    'retry_launch': retry_launch, 'spot_retry_limit': retry_limit}
+                    'retry_launch': retry_launch, 'spot_retry_limit': retry_limit,
+                    'box_failures': box_failures, 'counted_box_failure': counted_box_failure,
+                    'box_retry_limit': box_retry_limit, 'last_box_failure': last_box_failure}
                 save(current, state)
                 result_path = folder / 'outcome.json'
                 result = read(result_path) if result_path.exists() else {}
-                if result.get('status') == 'interrupted' and result.get('interruption_code') in SPOT_INTERRUPTION_CODES:
+                failure = retryable_cloud_failure(result)
+                if failure is not RetryableCloudFailure.NONE:
                     outcome = LocalFallback(ledger.text(result, 'reason'))
                 else:
-                    if attempt.interruptions > retry_limit and not (folder / 'launch.json').exists():
-                        reservation.status = 0
-                        return LocalFallback('The Spot interruption retry limit is reached')
+                    if not (folder / 'launch.json').exists():
+                        if attempt.interruptions > retry_limit:
+                            reservation.status = 0
+                            return LocalFallback('The Spot interruption retry limit is reached')
+                        if box_failures > box_retry_limit:
+                            reservation.status = 0
+                            return LocalFallback(f'The box failure retry limit is reached: {last_box_failure}')
                     command = service_command('scripts.aws_target.cloud_gate',
                         ['--worker', str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
                          '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
                     request = (read(folder / 'request.json') if (folder / 'request.json').exists()
-                               else prepare(repo, folder, mode, module_time_limit_s, selected=selected))
+                               else prepare(repo, folder, mode, module_time_limit_s,
+                                            selected=selected, gate_job=attempt.gate_job))
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
                         raise GateRefused('The checkout changed between cloud attempts')
+                    if _saved_gate_job(request) != attempt.gate_job:
+                        request['gate_job'] = state['gate_job']
                     request['full'] = full
                     request['split'] = split
                     if retry_launch:
@@ -1244,27 +1374,41 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     save(folder / 'deployment.json', deployment)
                     outcome = run_service(repo, folder, request, command, service)
                     result = read(result_path) if result_path.exists() else {}
+                    failure = retryable_cloud_failure(result)
                 if isinstance(outcome, CloudCompleted):
                     reservation.status = int(not outcome.run.passed)
                     return outcome
                 reservation.status = 0
-                if result.get('status') != 'interrupted' or result.get('interruption_code') not in SPOT_INTERRUPTION_CODES:
+                if failure is RetryableCloudFailure.NONE:
                     return outcome
-                if counted_interruption != folder.name:
-                    attempt.interruptions += 1
-                    counted_interruption = folder.name
+                if failure is RetryableCloudFailure.SPOT:
+                    if counted_interruption != folder.name:
+                        attempt.interruptions += 1
+                        counted_interruption = folder.name
+                else:
+                    last_box_failure = outcome.reason
+                    if counted_box_failure != folder.name:
+                        box_failures += 1
+                        counted_box_failure = folder.name
                 launch = read(folder / 'launch.json')
                 next_variant = ledger.instant(launch, 'variant') + 1
                 retry_launch = {key: launch[key] for key in ('variants', 'spot_price_reads') if key in launch}
                 retry_launch['variant'] = next_variant
                 save(current, {**state, 'spot_interruptions': attempt.interruptions,
-                               'counted_interruption': counted_interruption, 'retry_launch': retry_launch})
+                               'counted_interruption': counted_interruption, 'retry_launch': retry_launch,
+                               'box_failures': box_failures, 'counted_box_failure': counted_box_failure,
+                               'last_box_failure': last_box_failure})
                 if attempt.interruptions > retry_limit:
                     return LocalFallback('The Spot interruption retry limit is reached')
+                if box_failures > box_retry_limit:
+                    return LocalFallback(f'The box failure retry limit is reached: {last_box_failure}')
                 if next_variant >= len(ledger.rows(launch, 'variants')):
+                    if failure is RetryableCloudFailure.BOX:
+                        return LocalFallback(f'Box failure: {last_box_failure}. No cloud capacity choice remains')
                     return LocalFallback('No cloud capacity choice remains')
                 folder = root / uuid4().hex
                 attempt.identifier = folder.name
+                attempt.gate_job = command_job
                 folder.mkdir()
 
 
@@ -1353,9 +1497,11 @@ def main() -> int:
 
 
 def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: float,
-          selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> gate.GateRun | str:
+          selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES,
+          gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED) -> gate.GateRun | str:
     """Return a completed gate or the reason for local fallback."""
-    outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected)
+    outcome = run(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                  selected=selected, gate_job=gate_job)
     return outcome.reason if isinstance(outcome, LocalFallback) else outcome.run
 
 

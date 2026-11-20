@@ -190,11 +190,13 @@ from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 from scripts.lib import build_folders, conf
 from scripts.lib.cargo_target_config import (
+    NoCargoManifest,
     cargo_build_folder,
     cargo_folder_settings,
     cargo_home_folder,
 )
 from scripts.lib.process_failure import failure_detail
+from scripts.lib.process_start import ProcessStart, Started, proc_table_start, process_start
 from scripts.lib.user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
@@ -252,6 +254,7 @@ DEP_INFO_SUFFIX = ".d"
 # A dep-info file's first line starts with the output it describes.
 # target/debug, target/<triple>/debug, target/<custom>/<triple>/debug.
 FLOOR_KEY = "sweep_free_floor_gib"
+BUILD_FLOOR_KEY = "sweep_build_floor_gib"
 RECENT_KEY = "recent_minutes"
 FLOOR_LOCK_ALERT_KEY = "floor_lock_alert_minutes"
 FLOOR_ONLY_FLAG = "--floor-only"
@@ -1242,11 +1245,17 @@ def held_cargo_lock_files(*, lint_settings: conf.ConfigRead | UseConfiguredValue
 
 
 @dataclass(frozen=True)
+class UnobservedHolderStart:
+    """The target record does not contain a process start identity."""
+
+
+@dataclass(frozen=True)
 class TargetUse:
     """A live process using a target directory, and how."""
 
     pid: int
     how: str
+    start: ProcessStart | UnobservedHolderStart = field(default=UnobservedHolderStart(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -1293,6 +1302,7 @@ class FloorHolder:
     pid: int | None
     how: str
     session: str | None
+    start: ProcessStart | UnobservedHolderStart = field(default=UnobservedHolderStart(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -1308,10 +1318,11 @@ class OutsideTargets:
 class TargetOwnerIndex(Sequence[str]):
     """One pass's resolved targets and memo of the deepest owner of each path."""
 
-    def __init__(self, targets: Sequence[str]) -> None:
+    def __init__(self, targets: Sequence[str], *, identify_holders: bool = False) -> None:
         self.targets: tuple[str, ...] = tuple(targets)
         self.checked_targets: tuple[str, ...] = self.targets
         self.rechecking: bool = False
+        self.identify_holders: bool = identify_holders
         self.by_path: dict[str, TargetOwner] = {
             os.path.realpath(target): TargetOwner(target) for target in targets
         }
@@ -1387,14 +1398,18 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
                      if owner.target in checked) if restricted else ()
     exact_roots = tuple(prefix[:-1] for prefix in prefixes)
     encoded_prefixes = tuple(os.fsencode(prefix) for prefix in prefixes)
+    proc_root = Path(proc)
 
     try:
         names = [name for name in os.listdir(proc) if name.isdigit()]
     except OSError:
         return found
+
     for name in names:
         if len(found) == len(checked):
             break
+        pid = int(name)
+        start = proc_table_start(pid, proc_root) if owners.identify_holders else UnobservedHolderStart()
         base = os.path.join(proc, name)
         try:
             exe = os.readlink(os.path.join(base, "exe"))
@@ -1405,7 +1420,6 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
                 argv = [arg.decode(errors="replace") for arg in handle.read().split(b"\0") if arg]
         except OSError:
             continue
-        pid = int(name)
         for path, how in ((exe, "runs"), (cwd, "works in")):
             if path.endswith(DELETED_SUFFIX) and how == "runs":
                 continue
@@ -1413,22 +1427,22 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
                 continue
             owner = owners.process_owner(path)
             if isinstance(owner, TargetOwner) and owner.target in checked:
-                _ = found.setdefault(owner.target, TargetUse(pid, f"{how} {path}"))
+                _ = found.setdefault(owner.target, TargetUse(pid, f"{how} {path}", start))
         matching_maps = not restricted or any(prefix in maps for prefix in encoded_prefixes)
         for path in mapped_files(maps) if matching_maps else ():
             if path.endswith(DELETED_SUFFIX):
                 continue
             owner = owners.process_owner(path)
             if isinstance(owner, TargetOwner) and owner.target in checked:
-                _ = found.setdefault(owner.target, TargetUse(pid, f"maps {path}"))
+                _ = found.setdefault(owner.target, TargetUse(pid, f"maps {path}", start))
         command = os.path.basename(argv[0]) if argv else ""
         verify = command == "verify.sh" or (command in ("bash", "sh", "zsh", "dash") and os.path.basename(
             next((argument for argument in argv[1:] if not argument.startswith("-")), "")) == "verify.sh")
         if verify or NEXTEST_ARG in argv[1:2] or command == f"cargo-{NEXTEST_ARG}":
             runner = "verify.sh" if verify else "cargo-nextest"
-            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners):
+            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners, verify_runner=verify):
                 if target in checked:
-                    _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}"))
+                    _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}", start))
     return {target: found[target] for target in owners if target in found}
 
 
@@ -1631,21 +1645,27 @@ def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | No
     """Each busy target, largest first, with the pid that holds it and that pid's session when known."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
-    uses: list[tuple[str, int | None, str]] = []
+    holders: list[FloorHolder] = []
     for root, use in busy.items():
         if isinstance(use, (BuildHoldTarget, NoRecordedEvidence)):
             continue
         if isinstance(use, LockHeld):
-            uses.append((root, lock_holder(use.lock, locks, lint_settings=lint_settings), f"holds the cargo lock {use.lock}"))
+            pid = lock_holder(use.lock, locks, lint_settings=lint_settings)
+            start = process_start(pid) if pid is not None else UnobservedHolderStart()
+            if isinstance(start, Started) and lock_holder(use.lock, locks, lint_settings=lint_settings) != pid:
+                start = UnobservedHolderStart()
+            how = f"holds the cargo lock {use.lock}"
         else:
-            uses.append((root, use.pid, use.how))
-    sessions = holder_sessions([pid for _, pid, _ in uses if pid is not None])
-    holders = [FloorHolder(root, sizes.get(root, 0), pid, how, sessions.get(pid) if pid is not None else None)
-               for root, pid, how in uses]
+            pid, start, how = use.pid, use.start, use.how
+        holders.append(FloorHolder(root, sizes.get(root, 0), pid, how, None, start))
+    sessions = holder_sessions([holder.pid for holder in holders if holder.pid is not None])
+    holders = [replace(holder, session=sessions.get(holder.pid)) if holder.pid is not None else holder
+               for holder in holders]
     return sorted(holders, key=lambda holder: (-holder.bytes, holder.path))
 
 
-def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str]) -> list[str]:
+def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str], *,
+                      verify_runner: bool) -> list[str]:
     """Resolve Cargo's artifact and intermediate folders through one busy check."""
     try:
         with open(environ, "rb") as handle:
@@ -1658,6 +1678,8 @@ def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence
     try:
         chosen = {cargo_build_folder(setting, argv, cwd, cargo_home) if key == "build-dir"
                   else os.path.realpath(setting.base / setting.value) for key, setting in settings.items()}
+    except NoCargoManifest:
+        return [] if verify_runner else list(targets)
     except (OSError, ValueError):
         return list(targets)
     owners = targets if isinstance(targets, TargetOwnerIndex) else TargetOwnerIndex(targets)
@@ -2168,10 +2190,11 @@ def trim_row_recorded(take: TrimTake) -> bool:
 
 @contextmanager
 def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], scan: Scan,
-                     dry_run: bool, owners: TargetOwnerIndex) -> Generator[None]:
-    """One write-ahead deletion and publication path for budget and floor takes."""
+                     dry_run: bool, owners: TargetOwnerIndex, *,
+                     lint_settings: conf.ConfigRead, proc: str) -> Generator[dict[str, TargetUse | BuildHoldTarget]]:
+    """Keep the trim locked and report any users that block its recovery."""
     if dry_run:
-        yield
+        yield {}
         return
     target = os.path.abspath(target)
     path = trim_intent_path(target)
@@ -2187,6 +2210,10 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
         if path.exists():
             unfinished = load_trim_for_recovery(path)
             if not isinstance(unfinished, DamagedTrimIntentSetAside):
+                uses = trim_output_uses(unfinished, lint_settings=lint_settings, proc=proc)
+                if uses:
+                    yield uses
+                    return
                 _ = unfinished.recover()
                 recovered = unfinished.publish()
                 if not recovered:
@@ -2196,7 +2223,7 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
         active.update({whole.target: take for whole in whole_targets})
         token = TRIM_TAKES.set(active)
         try:
-            yield
+            yield {}
             # A failed append keeps its completed intent for the next invocation.
             if recovered and path.exists() and not take.publish():
                 return
@@ -2218,6 +2245,15 @@ def trim_inside(take: TrimTake, roots: Sequence[str]) -> bool:
                for output in take.output_roots or (take.target,))
 
 
+def trim_output_uses(take: TrimTake, *, lint_settings: conf.ConfigRead,
+                     proc: str) -> dict[str, TargetUse | BuildHoldTarget]:
+    roots = take.output_roots
+    if len(roots) <= 1:
+        return {}
+    holds = build_hold_targets(roots, {}, lint_settings=lint_settings, proc=proc)
+    return dict(holds) if holds else dict(process_uses(TargetOwnerIndex(roots), proc))
+
+
 def saved_trim_outside(roots: Sequence[str]) -> str | None:
     """The first root whose own saved trim has output outside roots; recoverable_trim would finish it."""
     for root in roots:
@@ -2234,6 +2270,7 @@ def saved_trim_outside(roots: Sequence[str]) -> str | None:
 def recover_pending_trims(locked_targets: Sequence[str] = (), *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scope: TrimRecovery = TrimRecovery.EVERY_SAVED_TRIM,
+    proc: str = PROC_DIR,
 ) -> None:
     """Publish unfinished takes even when the rerun has no output or shortfall left.
 
@@ -2257,10 +2294,9 @@ def recover_pending_trims(locked_targets: Sequence[str] = (), *,
                     roots = take.output_roots or (take.target,)
                     if scope is TrimRecovery.INSIDE_SWEPT_ROOTS and not trim_inside(take, locked_targets):
                         continue
+                    if trim_output_uses(take, lint_settings=lint_settings, proc=proc):
+                        continue
                     if len(roots) > 1:
-                        owners = TargetOwnerIndex(roots)
-                        if build_hold_targets(roots, {}, lint_settings=lint_settings) or process_uses(owners):
-                            continue
                         acquired = True
                         for root in sorted(roots):
                             if root not in locked_targets and not guards.enter_context(scratch.removal_lock(Path(root))):
@@ -2606,9 +2642,14 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
     return combined
 
 
+class WorkspaceSweepSkip(Enum):
+    BUSY_TRIM = "a saved trim has active output"
+
+
 def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run: bool,
           recent_minutes: float, *, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-          trim_recovery: TrimRecovery = TrimRecovery.EVERY_SAVED_TRIM) -> int:
+          trim_recovery: TrimRecovery = TrimRecovery.EVERY_SAVED_TRIM,
+          proc: str = PROC_DIR) -> int | WorkspaceSweepSkip:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     if trim_recovery is TrimRecovery.INSIDE_SWEPT_ROOTS:
@@ -2618,7 +2659,7 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
             print(f"lint sweep: {outside} has a saved trim with output outside it; skipped")
             return 0
     if not dry_run:
-        recover_pending_trims(roots, lint_settings=lint_settings, scope=trim_recovery)
+        recover_pending_trims(roots, lint_settings=lint_settings, scope=trim_recovery, proc=proc)
     scan = scan_roots(roots, trees, lint_settings=lint_settings)
     total = sum(scan.blocks.values())
     label = ", ".join(roots)
@@ -2628,7 +2669,11 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
     owners = TargetOwnerIndex(roots)
     with ExitStack() as takes:
         for root in roots:
-            takes.enter_context(recoverable_trim(root, "budget take", scan, dry_run, owners))
+            uses = takes.enter_context(recoverable_trim(root, "budget take", scan, dry_run, owners,
+                                                       lint_settings=lint_settings, proc=proc))
+            if uses:
+                print(f"lint sweep: saved trim for {root} has active output; skipped")
+                return WorkspaceSweepSkip.BUSY_TRIM
         left, failures = shrink(
             scan, total, budget, dry_run,
             lambda group: (float(group.last_used > now - recent_minutes * 60), *unit_age(group, now)),
@@ -2857,7 +2902,7 @@ def shrink_floor(
         paired_roots = OUTPUT_ROOTS.get().roots_for(root)
         if any(paired in busy for paired in paired_roots):
             continue
-        current_holds = (build_hold_targets(paired_roots, trees, lint_settings=lint_settings)
+        current_holds = (build_hold_targets(paired_roots, trees, lint_settings=lint_settings, proc=PROC_DIR)
                          if not isinstance(policy, MacFloor) else {})
         current_uses: dict[str, TargetUse | LockHeld] = {}
         if isinstance(policy, MacFloor):
@@ -2928,7 +2973,11 @@ def shrink_floor(
                         locks.held.append(held)
                     if blocked:
                         continue
-                with recoverable_trim(root, "floor take", scan, dry_run, owners):
+                with recoverable_trim(root, "floor take", scan, dry_run, owners,
+                                      lint_settings=lint_settings, proc=PROC_DIR) as uses:
+                    if uses:
+                        busy.update(uses)
+                        continue
                     for group in candidates:
                         if left <= budget:
                             break
@@ -2998,12 +3047,17 @@ def free_bytes(path: str) -> int:
     return stat.f_bavail * stat.f_frsize
 
 
+def floor_setting_key(keys: Collection[str], base: str, host: str) -> str:
+    override_key = f"{base}.{host}"
+    return override_key if override_key in keys else base
+
+
 def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | None]:
     """The free-space floor and the key it came from: (None, None) when none is
     set, (None, key) when its value is malformed."""
-    for key in (f"{FLOOR_KEY}.{host}", FLOOR_KEY):
-        if values.get(key):
-            return size_bytes(values[key], GIB), key
+    key = floor_setting_key({key for key, value in values.items() if value}, FLOOR_KEY, host)
+    if value := values.get(key):
+        return size_bytes(value, GIB), key
     return None, None
 
 
@@ -3501,18 +3555,36 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
     return fit_alert_text(render, lint_settings=lint_settings)
 
 
-def holder_message_text(holder: FloorHolder, free: int, floor: int, *,
+def holder_message_text(holders: Sequence[FloorHolder], free: int, floor: int, removed: int, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str:
-    """The message to the session whose process holds a target the floor needs."""
+    """Describe the targets one process holds, largest first."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     path_limit = int(lint_settings.words("sweep_message_path_widths")[0])
-    return "\n".join([
-        f"natedev has {gib(free)} free, and builds need {gib(floor)} free. The disk floor sweep removed all idle build output.",
-        f"{holder_text(holder, path_limit)}. This process is in your session, so the sweep cannot remove that output.",
-        "When the process ends, the next sweep removes the output. If the process is stale, stop it.",
-    ])
+    limit = lint_settings.whole("sweep_message_limit")
+    cleanup = ("The disk floor sweep removed all idle build output." if removed > 0
+               else "The disk floor sweep found no idle build output to remove.")
+    count = len(holders)
+    size = gib(sum(holder.bytes for holder in holders))
+    pid = holders[0].pid if holders else None
+    process = f"Pid {pid}" if pid is not None else "A process"
+    header = [
+        cleanup,
+        f"natedev has {gib(free)} free, and builds need {gib(floor)} free.",
+        f"{process} in your session holds {count} {'target' if count == 1 else 'targets'} ({size}).",
+    ]
+    footer = "When the process ends, the next sweep removes the output. If the process is stale, stop it."
+    remaining = limit - len("\n".join([*header, footer]))
+    lines: list[str] = []
+    for holder in sorted(holders, key=lambda item: (-item.bytes, item.path)):
+        line = f"- {holder_text(holder, path_limit)}"
+        if len(line) + 1 > remaining:
+            line = f"- {alert_path(holder.path, path_limit)} ({gib(holder.bytes)})"
+        if len(line) + 1 <= remaining:
+            lines.append(line)
+            remaining -= len(line) + 1
+    return "\n".join([*header, *lines, footer])
 
 
 def leaf_directories(measurement: AvailableDiskMeasurement) -> list[OutsideCacheDirectory]:
@@ -3737,6 +3809,28 @@ def send_holder_message(session: str, message: str, *,
                     timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
 
 
+def send_floor_holder_messages(holders: Sequence[FloorHolder], free: int, floor: int, removed: int, *,
+                               lint_settings: conf.ConfigRead) -> frozenset[str]:
+    """Tell each live holder's session once and return the paths it accepted."""
+    groups: dict[tuple[str, int, str], list[FloorHolder]] = {}
+    for holder in holders:
+        if holder.session is not None and holder.pid is not None and isinstance(holder.start, Started):
+            groups.setdefault((holder.session, holder.pid, holder.start.start), []).append(holder)
+    told: set[str] = set()
+    repeat_minutes = lint_settings.number("sweep_alert_interval_seconds") / 60
+    limit = lint_settings.whole("sweep_message_limit")
+    for (session, pid, start), group in groups.items():
+        paths = sorted({holder.path for holder in group})
+        digest = hashlib.sha256(json.dumps(paths).encode()).hexdigest()
+        key = CrossingSendKey(f"floor-holder:{pid}:{start}:{digest}", repeat_minutes)
+        message = holder_message_text(group, free, floor, removed, lint_settings=lint_settings)
+        if len(message) > limit or process_start(pid) != Started(start):
+            continue
+        if send_holder_message(session, message, repeat=key, lint_settings=lint_settings).accepted:
+            told.update(paths)
+    return frozenset(told)
+
+
 def disk_floor_channels() -> FloorAlertChannels:
     """Keep phone delivery disabled until the user records a current approval."""
     if TYPE_CHECKING:
@@ -3823,6 +3917,7 @@ class BuildHoldTarget:
 
 def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]], *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    proc: str = PROC_DIR,
 ) -> dict[str, BuildHoldTarget]:
     """Protect session workspaces and recently written build trees without reading build output."""
     from scripts.build_hold import build_hold
@@ -3843,7 +3938,7 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
             if record["sessionId"] != holder.key:
                 continue
             try:
-                folder = Path(os.readlink(Path(PROC_DIR) / str(record["pid"]) / "cwd")).resolve(strict=True)
+                folder = Path(os.readlink(Path(proc) / str(record["pid"]) / "cwd")).resolve(strict=True)
             except OSError:
                 continue
             if folder.is_dir():
@@ -4144,9 +4239,16 @@ def output_device(path: str) -> int:
 
 
 def filesystem_floors(floor: int, targets: Sequence[str], *, lint_settings: conf.ConfigRead) -> list[FilesystemFloor]:
-    origin = lint_settings.origin("sweep_free_floor_percent", float)
-    if not isinstance(origin, conf.UsableLiveValue) or not math.isfinite(origin.value) or not 0 <= origin.value <= 100:
-        raise conf.Unusable("lint.conf: sweep_free_floor_percent must be a live number from 0 to 100")
+    settings = lint_settings.settings
+    live_keys = settings.keys() if isinstance(settings, dict) else ()
+    build_key = floor_setting_key(live_keys, BUILD_FLOOR_KEY, socket.gethostname())
+    fixed_floor = build_key in live_keys
+    key = build_key if fixed_floor else "sweep_free_floor_percent"
+    origin = lint_settings.origin(key, float)
+    upper = sys.float_info.max / GIB if fixed_floor else 100
+    if not isinstance(origin, conf.UsableLiveValue) or not 0 <= origin.value <= upper:
+        requirement = "a live non-negative number of GiB" if fixed_floor else "a live number from 0 to 100"
+        raise conf.Unusable(f"lint.conf: {key} must be {requirement}")
     home = os.path.expanduser("~")
     root_device = output_device(home)
     devices: dict[int, list[str]] = {root_device: []}
@@ -4168,6 +4270,8 @@ def filesystem_floors(floor: int, targets: Sequence[str], *, lint_settings: conf
         probe = probes[device]
         if device == root_device:
             threshold = floor
+        elif fixed_floor:
+            threshold = int(origin.value * GIB)
         else:
             usage = os.statvfs(probe)
             threshold = int(usage.f_blocks * usage.f_frsize * origin.value / 100)
@@ -4478,7 +4582,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         filesystem = FLOOR_FILESYSTEM.get()
         lock = lock or str(floor_record_path().with_suffix(".lock"))
         if not dry_run and isinstance(policy, NatedevFloor):
-            recover_pending_trims(lint_settings=lint_settings)
+            recover_pending_trims(lint_settings=lint_settings, proc=PROC_DIR)
         home = filesystem.probe_path if isinstance(filesystem, FilesystemFloor) else os.path.expanduser("~")
         free = free_bytes(home)
         if free >= floor:
@@ -4526,8 +4630,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         if isinstance(policy, MacFloor):
             targets = [target for target in targets if policy.allows(target)]
         target_search = SearchedFloorTargets(targets)
-        owners = TargetOwnerIndex(targets)
-        hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings)
+        owners = TargetOwnerIndex(targets, identify_holders=isinstance(policy, NatedevFloor) and not dry_run)
+        hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings, proc=PROC_DIR)
                         if isinstance(policy, NatedevFloor) else {})
         uses: dict[str, TargetUse | LockHeld] = dict(policy.uses(targets) if isinstance(policy, MacFloor) else process_uses(owners))
         if isinstance(policy, NatedevFloor):
@@ -4734,8 +4838,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         holders = floor_holders(busy, busy_bytes, lint_settings=lint_settings)
                         holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
                                        for root, use in busy.items() if isinstance(use, BuildHoldTarget))
-                        told = frozenset(holder.path for holder in holders if holder.session is not None
-                                         and send_holder_message(holder.session, holder_message_text(holder, after_free, floor, lint_settings=lint_settings), lint_settings=lint_settings).accepted)
+                        told = send_floor_holder_messages(holders, after_free, floor, removed, lint_settings=lint_settings)
                         measurement = (read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
                                        or filesystem.root_device else UnavailableDiskMeasurement("missing"))
                         message = floor_out_of_reach_text(now, removed, after_free, floor, holders, told,
@@ -5217,7 +5320,8 @@ def assess_scope(run: Callable[[], tmp_sweep.SweepAssessment],
 
 def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_run: bool,
                     recent_minutes: float, *,
-                    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> int:
+                    lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                    proc: str = PROC_DIR) -> int:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     # Read the working folder once: a gate can remove its checkout while this sweep runs in it.
@@ -5243,7 +5347,7 @@ def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_
             # A named target folder finishes only its own saved trims.
             recovery = TrimRecovery.EVERY_SAVED_TRIM if target_dir is None else TrimRecovery.INSIDE_SWEPT_ROOTS
             return _sweep_workspace(roots, budget_config, dry_run, recent_minutes, repo, lint_settings=lint_settings,
-                                    trim_recovery=recovery)
+                                    trim_recovery=recovery, proc=proc)
         scope = WorkspaceFailureScope(tuple(sorted(roots)))
         if target_dir is not None:
             # A named target folder belongs to a CI runner: a failure prints to its job log, with no notice.
@@ -5255,7 +5359,7 @@ def sweep_workspace(target_dir: str | None, budget_config: conf.ConfigRead, dry_
 
 def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: bool,
                     recent_minutes: float, repo: str | None, *,
-                    lint_settings: conf.ConfigRead, trim_recovery: TrimRecovery) -> tmp_sweep.SweepAssessment:
+                    lint_settings: conf.ConfigRead, trim_recovery: TrimRecovery, proc: str) -> tmp_sweep.SweepAssessment:
     """Sweep the resolved output roots to their budget."""
     from scripts.lint import tmp_sweep
 
@@ -5270,7 +5374,7 @@ def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: 
     if doc_budget is None:
         print(f"lint sweep: {DOC_INDEX_ENV} must be a non-negative number of MiB", file=sys.stderr)
         return tmp_sweep.CompletedSweepAssessment(2)
-    uses = process_uses(roots)
+    uses = process_uses(roots, proc)
     if uses:
         root, use = next(iter(uses.items()))
         print(f"lint sweep: pid {use.pid} {use.how}; {root} skipped")
@@ -5283,9 +5387,13 @@ def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: 
         return tmp_sweep.SkippedSweepAssessment()
     try:
         doc_status = prune_doc_index(roots, doc_budget, dry_run, lint_settings=lint_settings)
-        return tmp_sweep.CompletedSweepAssessment(
-            sweep(roots, trees, budget, source, dry_run, recent_minutes, lint_settings=lint_settings,
-                  trim_recovery=trim_recovery) or doc_status)
+        status = sweep(roots, trees, budget, source, dry_run, recent_minutes,
+                       lint_settings=lint_settings, trim_recovery=trim_recovery, proc=proc)
+        if status is WorkspaceSweepSkip.BUSY_TRIM:
+            if doc_status:
+                return tmp_sweep.CompletedSweepAssessment(doc_status)
+            return tmp_sweep.SkippedSweepAssessment()
+        return tmp_sweep.CompletedSweepAssessment(status or doc_status)
     finally:
         release(locks.held)
 

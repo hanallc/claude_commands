@@ -38,6 +38,7 @@ from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.lib import build_folders, conf, copy_record
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.process_start import Gone, ProcessStart, Started, proc_table_start
 from scripts.mac_test import floor_claims
 from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -245,6 +246,7 @@ def run_sweep(target: Target, budget: int, dry_run: bool) -> tuple[int, str]:
     output = io.StringIO()
     with redirect_stdout(output):
         status = sweep.sweep([str(target.root)], sweep.build_trees(str(target.root)), budget, "test", dry_run, recent_minutes=60)
+    assert isinstance(status, int)
     return status, output.getvalue()
 
 
@@ -1049,6 +1051,21 @@ class ProcessUseTests(SweepCase):
                      argv=("/nix/store/x-cargo-nextest/bin/cargo-nextest", "nextest", "run"))
         self.assertEqual(self.uses(), {str(self.hana): f"runs cargo-nextest in {self.workspace / 'crates' / 'app'}"})
 
+        python_project = self.base / "python"
+        python_project.mkdir()
+        cargo_home = self.base / "cargo-home"
+        cargo_home.mkdir()
+        _ = (cargo_home / "config.toml").write_text('[build]\nbuild-dir = "{workspace-root}/target"\n')
+        environ_with_template = (f"CARGO_HOME={cargo_home}",)
+        broken_workspace = self.base / "broken"
+        broken_workspace.mkdir()
+        _ = (broken_workspace / "Cargo.toml").write_text("[workspace\n")
+        unreadable_workspace = self.base / "unreadable"
+        unreadable_workspace.mkdir()
+        (unreadable_workspace / "Cargo.toml").symlink_to(unreadable_workspace / "missing")
+        fifo_cwd = self.workspace / "fifo"
+        fifo_cwd.mkdir()
+
         cases = (
             (("bash", "/x/verify.sh", "build", "hana"), self.workspace / "crates" / "app", (), (self.hana,)),
             (("/x/verify.sh", "build", "hana"), self.workspace, (), (self.hana,)),
@@ -1059,12 +1076,26 @@ class ProcessUseTests(SweepCase):
             (("bash", "/x/other.sh"), self.workspace, (), ()),
             (("bash", "/x/verify.sh", "build"), self.workspace, (f"CARGO_TARGET_DIR={self.other}",), (self.other,)),
             (("bash", "/x/verify.sh", "build"), self.other.parent, (), (self.other,)),
+            (("bash", "/x/verify.sh", "build"), python_project, environ_with_template, ()),
+            (("bash", "/x/verify.sh", "build", "--manifest-path", "missing/Cargo.toml"),
+             python_project, environ_with_template, (self.hana, self.other)),
+            (("bash", "/x/verify.sh", "build"), broken_workspace, environ_with_template, (self.hana, self.other)),
+            (("bash", "/x/verify.sh", "build"), unreadable_workspace, environ_with_template, (self.hana, self.other)),
+            (("cargo-nextest", "nextest", "run"), python_project, environ_with_template, (self.hana, self.other)),
+            (("cargo-nextest", "nextest", "run"), python_project, (f"CARGO_TARGET_DIR={self.other}",), (self.other,)),
+            (("bash", "/x/verify.sh", "build"), fifo_cwd, environ_with_template, (self.hana,)),
         )
         for argv, cwd, environ, targets in cases:
             with self.subTest(argv=argv, cwd=cwd, environ=environ):
+                if cwd == fifo_cwd:
+                    if not hasattr(os, "mkfifo"):
+                        self.skipTest("A FIFO requires os.mkfifo")
+                    _ = (self.workspace / "Cargo.toml").write_text("[workspace]\n")
+                    os.mkfifo(cwd / "Cargo.toml")
                 shutil.rmtree(self.proc)
                 fake_process(self.proc, 10, cwd=str(cwd), argv=argv, environ=environ)
-                self.assertEqual(self.uses(), {str(target): f"runs verify.sh in {cwd}" for target in targets})
+                runner = "cargo-nextest" if argv[0] == "cargo-nextest" else "verify.sh"
+                self.assertEqual(self.uses(), {str(target): f"runs {runner} in {cwd}" for target in targets})
 
     def test_a_nextest_run_uses_the_target_its_flag_or_environment_names(self) -> None:
         for argv, environ in ((("cargo", "nextest", "run", "--target-dir", str(self.other)), ()),
@@ -1074,6 +1105,22 @@ class ProcessUseTests(SweepCase):
                 fake_process(self.proc, 10, exe="/usr/bin/cargo", cwd=str(self.workspace), argv=argv, environ=environ)
                 self.assertEqual(self.uses(), {str(self.other): f"runs cargo-nextest in {self.workspace}"})
                 shutil.rmtree(self.proc)
+
+    def test_verify_keeps_all_outputs_when_a_template_needs_a_missing_manifest(self) -> None:
+        cargo_home = self.base / "cargo-home"
+        cargo_home.mkdir()
+        _ = (cargo_home / "config.toml").write_text('[build]\nbuild-dir = "{workspace-root}/build"\n')
+        argv = ("bash", "/x/verify.sh", "test", "--manifest-path", "missing/Cargo.toml")
+        environment = (f"CARGO_HOME={cargo_home}",)
+        reason = f"runs verify.sh in {self.workspace}"
+
+        fake_process(self.proc, 10, cwd=str(self.workspace), argv=argv, environ=environment)
+        self.assertEqual(self.uses(), {str(self.hana): reason, str(self.other): reason})
+
+        shutil.rmtree(self.proc)
+        fake_process(self.proc, 10, cwd=str(self.workspace), argv=argv,
+                     environ=(*environment, f"CARGO_TARGET_DIR={self.other}"))
+        self.assertEqual(self.uses(), {str(self.hana): reason, str(self.other): reason})
 
     def test_nextest_shared_reader_keeps_legacy_override_and_invalid_config_behavior(self) -> None:
         config = self.workspace / ".cargo"
@@ -1678,7 +1725,7 @@ class FloorTests(SweepCase):
         self.assertIn(f"{protected}: holds 0.0 GiB.", protected_lines)
         self.assertIn("These target dirs are in use", in_use_lines)
         self.assertNotIn(protected, in_use_lines)
-        holder_messages = [sweep.holder_message_text(holder, 0, 10 * GIB) for holder in holders]
+        holder_messages = [sweep.holder_message_text([holder], 0, 10 * GIB, 0) for holder in holders]
         self.assertEqual(len(holder_messages), 1)
         self.assertTrue(all(protected not in text for text in holder_messages))
         self.assertTrue(protected_file.exists())
@@ -1917,14 +1964,15 @@ class FloorTests(SweepCase):
         proc = base / "proc"
         (proc / "4242").mkdir(parents=True)
         (proc / "4242" / "cwd").symlink_to(mapping.workspace_root, target_is_directory=True)
-        with (mock.patch.object(sessions, "live_sessions", return_value=[record]),
-              mock.patch.object(sweep, "PROC_DIR", str(proc))):
-            held = sweep.build_hold_targets([str(mapping.target_directory), str(mapping.build_directory)], {})
+        with mock.patch.object(sessions, "live_sessions", return_value=[record]):
+            held = sweep.build_hold_targets([str(mapping.target_directory), str(mapping.build_directory)], {},
+                                            proc=str(proc))
         self.assertEqual(set(held), {str(mapping.target_directory), str(mapping.build_directory)})
         self.assertTrue(own.exists())
         self.assertTrue(copy.exists())
 
     def test_interrupted_pair_keeps_pending_artifact_paths(self) -> None:
+        process_uses = sweep.process_uses
         base = self.base()
         mapping, own, copy = self.paired_output(base)
         roots = [str(mapping.build_directory), str(mapping.target_directory)]
@@ -1942,16 +1990,22 @@ class FloorTests(SweepCase):
         with (mock.patch.object(sweep, "remove_entry", side_effect=stop_at_artifact),
               self.assertRaises(KeyboardInterrupt)):
             with sweep.recoverable_trim(str(mapping.build_directory), "floor take", scan, False,
-                                        sweep.TargetOwnerIndex(roots)):
+                                        sweep.TargetOwnerIndex(roots), lint_settings=conf.read("lint"),
+                                        proc=str(base / "proc")):
                 _ = sweep.reclaim(group, scan, dict(scan.links), False)
         self.assertTrue(stopped)
         self.assertFalse(own.exists())
         self.assertTrue(copy.exists())
         intent = sweep.read_trim_intent(sweep.trim_intent_path(str(mapping.build_directory)))
         self.assertIn(str(copy), intent.group_paths)
-        with mock.patch.object(sweep, "process_uses", return_value={}):
-            sweep.recover_pending_trims()
-            sweep.recover_pending_trims()
+        proc = base / "proc"
+        fake_process(proc, 10, cwd=str(mapping.target_directory))
+        with mock.patch.object(sweep, "process_uses", wraps=process_uses):
+            sweep.recover_pending_trims(proc=str(proc))
+            self.assertTrue(copy.exists())
+            shutil.rmtree(proc / "10")
+            sweep.recover_pending_trims(proc=str(proc))
+            sweep.recover_pending_trims(proc=str(proc))
         self.assertFalse(copy.exists())
         row, = self.trim_rows()
         self.assertEqual(row["cause"], "floor take")
@@ -1965,6 +2019,52 @@ class FloorTests(SweepCase):
         sweep.trim_intent_path(take.target).parent.mkdir(parents=True, exist_ok=True)
         take.prepare(group)
         return take
+
+    def test_workspace_leaves_a_saved_pair_pending_when_a_process_starts_after_the_first_scan(self) -> None:
+        process_uses = sweep.process_uses
+        base = self.base()
+        mapping, own, artifact = self.paired_output(base)
+        take = self.prepare_pair_take(mapping)
+        intent = sweep.trim_intent_path(take.target)
+        pending = intent.read_bytes()
+        roots = [str(mapping.build_directory), str(mapping.target_directory)]
+        scope = sweep.WorkspaceFailureScope(tuple(sorted(roots)))
+        settings = conf.read("lint")
+        with mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT):
+            sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1), lint_settings=settings, scope=scope)
+        record = base / scope.record_name
+        reported = record.read_bytes()
+        for doc_status in (0, 1):
+            with self.subTest(doc_status=doc_status):
+                proc = base / f"proc-{doc_status}"
+                proc.mkdir()
+                scans = 0
+
+                def scan_processes(targets: Sequence[str], table: str) -> dict[str, sweep.TargetUse]:
+                    nonlocal scans
+                    self.assertEqual(table, str(proc))
+                    scans += 1
+                    if scans == 2:
+                        fake_process(proc, 10, cwd=str(mapping.target_directory))
+                    return process_uses(targets, table)
+
+                output = io.StringIO()
+                with (mock.patch.object(sweep, "cargo_roots", return_value=roots),
+                      mock.patch.object(sweep, "process_uses", side_effect=scan_processes),
+                      mock.patch.object(sweep, "prune_doc_index", return_value=doc_status),
+                      mock.patch.object(sweep, "remove_entry", wraps=sweep.remove_entry) as remove,
+                      mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "0"}),
+                      redirect_stdout(output)):
+                    status = sweep.sweep_workspace(None, settings, False, 60, proc=str(proc))
+                self.assertEqual(status, doc_status)
+                self.assertEqual(scans, 3)
+                self.assertIn("has active output; skipped", output.getvalue())
+                remove.assert_not_called()
+                self.assertTrue(own.exists())
+                self.assertTrue(artifact.exists())
+                self.assertEqual(intent.read_bytes(), pending)
+                self.assertEqual(record.read_bytes(), reported)
+                self.assertEqual(self.trim_rows(), [])
 
     def test_changed_pair_entries_clear_the_old_intent_and_allow_a_new_take(self) -> None:
         base = self.base()
@@ -2044,36 +2144,55 @@ class FloorTests(SweepCase):
             floors = sweep.filesystem_floors(10 * GIB, [str(target)], lint_settings=conf.read("lint"))
         self.assertTrue(all(str(target) not in floor.targets for floor in floors))
 
-    def test_secondary_floor_uses_configured_percent_and_groups_each_device(self) -> None:
-        base = self.base()
-        first = base / "first"
-        second = base / "second"
-        first.mkdir()
-        second.mkdir()
-        _ = write_config_fixture(conf.path("lint"), "sweep_free_floor_percent=25\n")
+    def test_secondary_floor_uses_configured_floor_and_groups_each_device(self) -> None:
         usage = os.statvfs_result((4096, 4096, 1000, 500, 500, 0, 0, 0, 0, 255))
-        def device(path: str) -> int:
-            return 2 if path == str(second) else 1
-        with (mock.patch.object(sweep, "output_device", side_effect=device),
-              mock.patch.object(os, "statvfs", return_value=usage)):
-            floors = sweep.filesystem_floors(12345, [str(first), str(second)], lint_settings=conf.read("lint"))
-        self.assertEqual([(item.device, item.floor_bytes, item.targets) for item in floors],
-                         [(1, 12345, (str(first),)), (2, 1000 * 4096 // 4, (str(second),))])
-        self.assertEqual([item.root_device for item in floors], [True, False])
-
-    def test_missing_or_bad_floor_percent_refuses_once(self) -> None:
-        for value in ("", "bad", "-1", "101"):
-            with self.subTest(value=value):
+        plain_floor = "# range: 0..\nsweep_build_floor_gib=40.5\n"
+        host_floor = "# range: 0..\nsweep_build_floor_gib.testhost=55\n"
+        natedev_floor = "# range: 0..\nsweep_build_floor_gib.natedev=733.29\n"
+        for host, overrides, expected in (("testhost", "", 1000 * 4096 // 4),
+                                          ("testhost", plain_floor, int(40.5 * GIB)),
+                                          ("testhost", plain_floor + host_floor, 55 * GIB),
+                                          ("natedev", natedev_floor, int(733.29 * GIB))):
+            with self.subTest(host=host, overrides=overrides):
                 base = self.base()
-                _ = write_config_fixture(conf.path("lint"), f"sweep_free_floor_percent={value}\n")
+                first = base / "first"
+                second = base / "second"
+                first.mkdir()
+                second.mkdir()
+                _ = write_config_fixture(conf.path("lint"), "sweep_free_floor_percent=25\n" + overrides)
+
+                def device(path: str) -> int:
+                    return 2 if path == str(second) else 1
+
+                with (mock.patch.object(socket, "gethostname", return_value=host),
+                      mock.patch.object(sweep, "output_device", side_effect=device),
+                      mock.patch.object(os, "statvfs", return_value=usage)):
+                    floors = sweep.filesystem_floors(12345, [str(first), str(second)], lint_settings=conf.read("lint"))
+                self.assertEqual([(item.device, item.floor_bytes, item.targets) for item in floors],
+                                 [(1, 12345, (str(first),)), (2, expected, (str(second),))])
+                self.assertEqual([item.root_device for item in floors], [True, False])
+
+    def test_missing_or_bad_secondary_floor_refuses_once(self) -> None:
+        cases = (
+            ("sweep_free_floor_percent", "", ""),
+            ("sweep_free_floor_percent", "bad", ""),
+            ("sweep_free_floor_percent", "-1", ""),
+            ("sweep_free_floor_percent", "101", ""),
+            ("sweep_build_floor_gib", "-1", "# range: 0..\n"),
+            ("sweep_build_floor_gib.testhost", "bad", "# range: 0..\nsweep_build_floor_gib=40\n# range: 0..\n"),
+        )
+        for key, value, prefix in cases:
+            with self.subTest(key=key, value=value):
+                base = self.base()
+                _ = write_config_fixture(conf.path("lint"), f"{prefix}{key}={value}\n")
                 errors = io.StringIO()
-                with (redirect_stderr(errors),
+                with (mock.patch.object(socket, "gethostname", return_value="testhost"), redirect_stderr(errors),
                       mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send):
                     self.assertEqual(self.hold(base, 10 * GIB, [10 * GIB], recorded=True)[0], 2)
                 send.assert_called()
                 cast(mock.Mock, sweep.send_phone_push).assert_not_called()
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
-                self.assertIn("sweep_free_floor_percent", errors.getvalue())
+                self.assertIn(key, errors.getvalue())
 
     def test_busy_floor_lock_does_not_stop_another_filesystem(self) -> None:
         base = self.base()
@@ -2659,7 +2778,7 @@ class FloorTests(SweepCase):
         proc = base / "proc"
         fake_process(proc, 42, exe="/usr/bin/cargo-nextest", cwd=str(workspace),
                      argv=("cargo-nextest", "nextest", "run"), environ=environment)
-        def private_uses(targets: list[str]) -> dict[str, sweep.TargetUse]:
+        def private_uses(targets: Sequence[str], _proc: str = sweep.PROC_DIR) -> dict[str, sweep.TargetUse]:
             return process_uses(targets, str(proc))
 
         _ = self.enterContext(mock.patch.object(sweep, "process_uses", side_effect=private_uses))
@@ -4105,7 +4224,7 @@ class FloorTests(SweepCase):
                 remote = command[host_position + 1:]
                 command = shlex.split(remote[0]) if len(remote) == 1 else remote
             recipient = command[command.index("--to") + 1]
-            self.assertIn(recipient, ("natedev", "user"))
+            self.assertIn(recipient, ("natedev", "user", *replies))
             delivery.commands.append(list(command))
             if "retire" in command:
                 delivery.retire_hosts.append(retire_host)
@@ -5247,7 +5366,7 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
 
     def test_above_cleanup_floor_rearms_the_phone_crossing(self) -> None:
         with self.crossing_delivery({}) as delivery:
-            _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_minutes=0\n")
+            _ = write_config_fixture(conf.path("lint"), "sweep_phone_rearm_minutes=0\nsweep_phone_rearm_gib=5\n")
             base = delivery.base
             send = cast(mock.Mock, sweep.send_floor_alert)
             for free in (140, 320, 140):
@@ -5864,15 +5983,92 @@ raise SystemExit(int(os.environ[variable]))
         self.assertIn("No earlier floor sweep", message)
         self.assertNotIn("fall beyond cache growth", message)
 
-    def test_holder_message_uses_the_first_configured_path_width(self) -> None:
+    def test_holder_message_uses_the_first_configured_path_width_and_reports_removal(self) -> None:
         _ = write_config_fixture(conf.path("lint"),
                                  "sweep_message_path_widths=24 16\n")
         holder = sweep.FloorHolder("/phase46/" + "a" * 70 + "/target", 2 * GIB, 46,
                                    "maps build output", "phase46")
 
-        message = sweep.holder_message_text(holder, GIB, 3 * GIB)
+        for removed, first_line in (
+            (0, "The disk floor sweep found no idle build output to remove."),
+            (GIB, "The disk floor sweep removed all idle build output."),
+        ):
+            with self.subTest(removed=removed):
+                message = sweep.holder_message_text([holder], GIB, 3 * GIB, removed)
+                self.assertEqual(message.splitlines()[0], first_line)
+                self.assertIn("/phase46/aaaaaaa…/target (2.0 GiB)", message)
 
-        self.assertIn("/phase46/aaaaaaa…/target (2.0 GiB)", message)
+    def test_holder_messages_group_targets_and_reuse_delivery_keys(self) -> None:
+        start = Started("123")
+        holders = [sweep.FloorHolder(f"/cache/target-{size}", size * GIB, 46,
+                                     "maps build output", "session-one", start)
+                   for size in range(1, 9)]
+        holders.append(sweep.FloorHolder("/other/target", GIB, 47, "runs a test", "session-two", start))
+        with (self.crossing_delivery({"session-one": [], "session-two": []}) as delivery,
+              mock.patch.object(sweep, "process_start", return_value=start)):
+            _ = write_config_fixture(conf.path("lint"), "sweep_message_limit=365\nsweep_alert_interval_seconds=150\n")
+            settings = conf.read("lint")
+            for order in (holders, list(reversed(holders))):
+                told = sweep.send_floor_holder_messages(order, GIB, 3 * GIB, 0, lint_settings=settings)
+                self.assertEqual(told, frozenset(holder.path for holder in holders))
+
+        self.assertCountEqual([attempt.recipient for attempt in delivery if attempt.accepted],
+                              ["session-one", "session-two"])
+        for recipient in ("session-one", "session-two"):
+            first, repeat = [attempt for attempt in delivery if attempt.recipient == recipient]
+            self.assertTrue(first.key)
+            self.assertEqual(first.key, repeat.key)
+            self.assertFalse(repeat.accepted)
+            self.assertEqual(first.command[first.command.index("--repeat-minutes") + 1], "2.5")
+            self.assertLessEqual(len(first.text), 365)
+        message = delivery[0].text
+        self.assertIn("holds 8 targets (36.0 GiB)", message)
+        self.assertLess(message.index("/cache/target-8"), message.index("/cache/target-7"))
+        self.assertNotIn("/cache/target-1", message)
+
+    def test_floor_pass_checks_the_original_process_start_before_sending(self) -> None:
+        read_uses = sweep.process_uses
+        cases = (
+            (b"test process", Gone()),
+            (b"test process", Started("456")),
+            (b"test \xff process", Started("123")),
+        )
+        for name, after_scan in cases:
+            with self.subTest(name=name, after_scan=type(after_scan).__name__):
+                base = self.base()
+                tree, payload = cargo_target(base, "busy", DEMO, time.time())
+                proc = base / "proc"
+                fake_process(proc, 46, exe=str(payload))
+                _ = (proc / "46" / "stat").write_bytes(b"46 (" + name + b") S " + b"0 " * 18 + b"123 0\n")
+
+                def read_start(pid: int) -> ProcessStart:
+                    self.assertEqual(pid, 46)
+                    self.assertTrue(cast(mock.Mock, sweep.scan_floor_roots).called)
+                    return after_scan
+
+                def fixture_uses(roots: Sequence[str]) -> dict[str, sweep.TargetUse]:
+                    uses = read_uses(roots, str(proc))
+                    self.assertEqual(uses[str(tree.parent)].start, Started("123"))
+                    return uses
+
+                with (mock.patch.object(sweep, "process_uses", side_effect=fixture_uses),
+                      mock.patch.object(sweep, "proc_table_start", wraps=proc_table_start) as table_start,
+                      mock.patch.object(sweep, "process_start", side_effect=read_start) as starts,
+                      mock.patch.object(sweep, "holder_sessions", return_value={46: "hana-unit"}),
+                      mock.patch.object(sweep, "send_holder_message",
+                                        return_value=sweep.FloorChannelOutcome.DELIVERED) as tell,
+                      mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as summary):
+                    self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB], recorded=True)[0], 0)
+                table_start.assert_called_once_with(46, proc)
+                starts.assert_called_once_with(46)
+                message = cast(str, summary.call_args.args[0])
+                if after_scan == Started("123"):
+                    tell.assert_called_once()
+                    self.assertEqual(tell.call_args.args[0], "hana-unit")
+                    self.assertIn("session hana-unit was told", message)
+                else:
+                    tell.assert_not_called()
+                    self.assertIn("the message to session hana-unit failed", message)
 
     def test_free_space_rise_uses_rising_wording(self) -> None:
         now = time.time()
@@ -5987,7 +6183,8 @@ raise SystemExit(int(os.environ[variable]))
                     self.assertEqual(tell.call_args.args[0], "hana-unit")
                     told = cast(str, tell.call_args.args[1])
                     self.assertIn(f"{busy_tree.parent} (", told)
-                    self.assertIn(f"pid {os.getpid()} holds the cargo lock {lock_path}. This process is in your session", told)
+                    self.assertIn(f"pid {os.getpid()} holds the cargo lock {lock_path}", told)
+                    self.assertIn(f"Pid {os.getpid()} in your session holds 1 target", told)
                     self.assertIn("If the process is stale, stop it.", told)
                     message = cast(str, send.call_args.args[0])
                     if delivered:
@@ -6652,7 +6849,7 @@ raise SystemExit(int(os.environ[variable]))
         proc.mkdir()
         (proc / str(test.pid)).symlink_to(Path("/proc") / str(test.pid), target_is_directory=True)
 
-        def own_process_uses(targets: list[str]) -> dict[str, sweep.TargetUse]:
+        def own_process_uses(targets: Sequence[str], _proc: str = sweep.PROC_DIR) -> dict[str, sweep.TargetUse]:
             return process_uses(targets, str(proc))
 
         with mock.patch.object(sweep, "process_uses", side_effect=own_process_uses):
@@ -7337,7 +7534,7 @@ class MacFloorTests(SweepCase):
 
     def test_mac_missing_or_lower_floor_refuses_with_one_line(self) -> None:
         config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
-        _ = write_config_fixture(config, "sweep_floor_gib=150\n")
+        _ = write_config_fixture(config, "free_floor_gib=100\nsweep_floor_gib=150\n")
         original = config.read_text()
         for changed in (original.replace("sweep_floor_gib=150", "sweep_floor_gib=99"),
                         original.replace("sweep_floor_gib=150", "")):
@@ -7354,7 +7551,7 @@ class MacFloorTests(SweepCase):
         config = Path(os.environ["CONF_DIR"]) / "mac_test.conf"
         _ = write_config_fixture(conf.path("build_targets"), "platform.mac=macos\n")
         _ = write_config_fixture(config,
-            "sweep_floor_gib=101\nmirror_root=~/.local/state/mac-test/test-mirror\n"
+            "free_floor_gib=100\nsweep_floor_gib=101\nmirror_root=~/.local/state/mac-test/test-mirror\n"
             + "sweep_floor_roots=/tmp ~/rust ~/.local/state/mac-test/test-mirror\n")
         claims = floor_claims.ClaimSnapshot(frozenset())
         with (mock.patch.object(floor_claims, "read_claims", return_value=claims),
@@ -7447,13 +7644,12 @@ class HolderSessionTests(unittest.TestCase):
         with (mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(holders),
                                           tmp_sweep.STATE_ENV: str(base / "state")}),
               mock.patch.object(sessions, "live_sessions", return_value=[record]),
-              mock.patch.object(process_table, "snapshot", return_value=table),
-              mock.patch.object(sweep, "PROC_DIR", str(proc))):
+              mock.patch.object(process_table, "snapshot", return_value=table)):
             original_path = list(sys.path)
             for attempt in range(2):
                 with (self.subTest(query="build_hold_targets", attempt=attempt),
                       mock.patch.object(sys, "path", list(original_path))):
-                    self.assertEqual(sweep.build_hold_targets([str(tree.parent)], {}),
+                    self.assertEqual(sweep.build_hold_targets([str(tree.parent)], {}, proc=str(proc)),
                                      {str(tree.parent): sweep.BuildHoldTarget("hana-unit")})
                     self.assertEqual(sys.path, original_path)
                 with (self.subTest(query="holder_sessions", attempt=attempt),

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from functools import cached_property
+from dataclasses import replace
 from contextlib import closing
 import gzip
 import io
@@ -13,6 +14,7 @@ import re
 import select
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,9 +30,11 @@ from typing import BinaryIO, ClassVar, cast, override
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.shell_test_support import shell_function, shell_functions
 
+from scripts.aws_target import hana_result
+from scripts.aws_target.test_hana_result import command_result
 from scripts.buildlog import record as recorder
 from scripts.buildlog import step_context
-from scripts.buildlog import index
+from scripts.buildlog import index, parse
 from scripts.buildlog import report, sample
 from scripts.buildlog import store
 from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
@@ -38,7 +42,7 @@ from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_count
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_queue import admission_records, step_estimator
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
-from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
 from scripts.lint.build_shape import build_shape
@@ -236,6 +240,63 @@ class RecordTests(unittest.TestCase):
         for path in sorted(self.root.glob("*/*.jsonl")):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
+
+    def test_local_and_hana_nextest_steps_classify_fast_passes_without_timing_rows(self) -> None:
+        config = Path(os.environ["CONF_DIR"])
+        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        output = ("PASS [ 0.010s] hana::bin/hana tests::fast\n"
+                  + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
+        handoff = self.base / "nextest.log"
+        _ = handoff.write_text(output)
+        local = self.step(0, "0", str(handoff), "", NEXTEST)
+        value = replace(command_result(), argv=tuple(NEXTEST), stdout=b"output with no newline", stderr=output.encode())
+        link = hana_result.LogicalStepLink(CALL_ID, value.key.episode)
+        context = recorder.HanaStepContext("hana", "nextest", "fixture-repository", str(self.repo), "")
+        self.assertTrue(recorder.publish_hana_result(hana_result.AcceptedHanaResult(value), link, context).added)
+        remote, = [row for row in self.records() if row.get("attempt_role") == "remote"]
+
+        with closing(sqlite3.connect(":memory:")) as database:
+            index.create_schema(database)
+            for row in (local, remote):
+                with self.subTest(host=row["host"]):
+                    self.assertEqual(row["observed_tests"], {
+                        "by_binary": {"hana::bin/hana": ["tests::fast"]}, "complete": True,
+                    })
+                    self.assertEqual(row["tests"], [])
+                    index.add_step(database, row, "record.jsonl")
+                    proof = {("hana::bin/hana", "tests::fast"): index.NextestGpuClass.NO_GPU}
+                    self.assertEqual(index.nextest_gpu_class(database, str(row["id"]), proof),
+                                     index.NextestGpuClass.NO_GPU)
+            self.assertEqual(database.execute("SELECT test FROM tests").fetchall(), [])
+
+    def test_nextest_output_without_trusted_statuses_cannot_supply_gpu_proof(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        output = ("PASS [ 0.010s] hana tests::forged\n"
+                  + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
+        for options, environment in ((["--no-capture"], {}), (["--", "--nocapture"], {}),
+                                     (["--status-level", "none"], {}), (["--status-level=slow"], {}),
+                                     (["--show-progress=only"], {}), ([], {"NEXTEST_STATUS_LEVEL": "retry"})):
+            with self.subTest(options=options, environment=environment):
+                handoff = self.base / "nextest.log"
+                _ = handoff.write_text(output)
+                row = self.step(0, "0", str(handoff), "", [*NEXTEST, *options], environment)
+                self.assertEqual(row["observed_tests"], {"by_binary": {}, "complete": False})
+                with closing(sqlite3.connect(":memory:")) as database:
+                    index.create_schema(database)
+                    index.add_step(database, row, "record.jsonl")
+                    proof = {("hana", "tests::forged"): index.NextestGpuClass.GPU}
+                    self.assertEqual(index.nextest_gpu_class(database, str(row["id"]), proof),
+                                     index.NextestGpuClass.UNKNOWN)
+
+    def test_hana_parse_failure_still_publishes_the_step_result(self) -> None:
+        value = command_result(status=101)
+        link = hana_result.LogicalStepLink(CALL_ID, value.key.episode)
+        context = recorder.HanaStepContext("hana", "nextest", "fixture-repository", str(self.repo), "")
+        with mock.patch.object(parse, "log_facts", side_effect=ValueError("invalid capture")):
+            self.assertTrue(recorder.publish_hana_result(hana_result.AcceptedHanaResult(value), link, context).added)
+        row, = self.records()
+        self.assertEqual(row["status"], 101)
+        self.assertNotIn("observed_tests", row)
 
     def test_reserved_test_phase_row_keeps_the_sampler_reservation_with_or_without_charge(self) -> None:
         reservation = "sampled-reservation"

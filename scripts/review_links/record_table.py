@@ -51,7 +51,8 @@ def words_box(element_id: str, placeholder: str) -> str:
     identity = html.escape(element_id, quote=True)
     words = html.escape(placeholder, quote=True)
     return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words'
-            + f' aria-label="{words}" placeholder="{words}"></div>')
+            + f' autocomplete="off" aria-label="{words}" placeholder="{words}">'
+            + f'<button type="button" id="{identity}-clear" data-clear-filter-words aria-label="Clear filter">×</button></div>')
 
 
 CLOCK = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
@@ -89,13 +90,20 @@ main{font-size:15px;line-height:1.5}
 background:var(--card);color:var(--ink);border-radius:8px;max-width:100%;min-width:0}
 .list-filters input{width:260px}
 .list-search-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
-.record-filter-words{display:flex;justify-content:flex-end;margin-bottom:10px}
-.record-filter-words input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
-background:var(--card);color:var(--ink);width:300px;max-width:100%;min-width:0;box-sizing:border-box}
+.record-filter-words{position:relative;width:300px;max-width:100%;margin:0 0 10px auto}
+.record-filter-words input{font:inherit;min-height:44px;padding:7px 10px;border:1px solid var(--line);
+border-radius:8px;background:var(--card);color:var(--ink);width:100%;min-width:0;box-sizing:border-box}
+.record-filter-words input:not(:placeholder-shown){padding-inline-end:44px;border-color:var(--filter-selected-bg)}
+.record-filter-words input::-webkit-search-cancel-button{appearance:none}
+.record-filter-words input:placeholder-shown+[data-clear-filter-words]{display:none}
+@media(max-width:340px){.record-filter-words input::placeholder{font-size:14px}}
+[data-clear-filter-words]{position:absolute;inset-block:0;inset-inline-end:0;width:44px;margin:0;padding:0;
+border:0;border-radius:8px;background:none;color:var(--ink-2);font-size:22px;cursor:pointer}
+[data-clear-filter-words]:hover{color:var(--ink)}
 .record-filter-row{display:grid;grid-template-columns:5rem minmax(0,1fr);align-items:baseline;gap:8px;margin-bottom:8px}
 .record-filter-row>span{color:var(--ink-2);font-size:13px}
 .record-filter-row>div{display:flex;flex-wrap:wrap;gap:6px}
-[data-filter-row] button,.list-expansion button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
+[data-filter-row] button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
 color:var(--ink);border:1px solid var(--line);border-radius:999px;background:var(--card);padding:4px 10px;margin:0}
 [data-filter-row] button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
 color:var(--filter-selected-ink)}
@@ -206,6 +214,12 @@ border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--
 
 
 SCRIPT = r'''const filterControl={
+ wordValues:new WeakMap(),
+ getWords(control){return this.wordValues.get(control) ?? '';},
+ setWords(control,value){
+  this.wordValues.set(control,value);
+  if(control.value!==value) control.value=value;
+ },
  buttons(row){return [...row.querySelectorAll('[data-filter-value]')];},
  setCounts(row,counts){
   for(const button of this.buttons(row)){
@@ -232,9 +246,22 @@ SCRIPT = r'''const filterControl={
   const emit=value=>control.dispatchEvent(new CustomEvent('filterchange',{bubbles:true,detail:value}));
   if(control.hasAttribute('data-filter-words')){
    let timer;
-   control.addEventListener('input',()=>{
+   const clear=()=>{
     clearTimeout(timer);
-    timer=setTimeout(()=>{if(control.isConnected) emit(control.value);},120);
+    this.setWords(control,'');
+    control.focus({preventScroll:true});
+    emit('');
+   };
+   control.addEventListener('input',()=>{
+    this.setWords(control,control.value);
+    clearTimeout(timer);
+    timer=setTimeout(()=>{if(control.isConnected) emit(this.getWords(control));},120);
+   });
+   control.parentElement.querySelector('[data-clear-filter-words]').addEventListener('click',clear);
+   control.addEventListener('keydown',event=>{
+    if(event.key!=='Escape' || event.defaultPrevented || event.isComposing || !control.value) return;
+    event.preventDefault();
+    clear();
    });
   }else{
    for(const button of this.buttons(control))
@@ -242,11 +269,33 @@ SCRIPT = r'''const filterControl={
   }
  }
 };
+function recordPlaceParams(){
+ const params=new URLSearchParams(location.search);
+ const fragment=new URLSearchParams(location.hash.slice(1));
+ for(const key of new Set(fragment.keys())) params.delete(key);
+ for(const [key,value] of fragment) params.append(key,value);
+ return params;
+}
+function recordItemLink(params,resolve){
+ const item=params.get('jump') || params.get('item'),saved=history.state?.recordTable;
+ return item && (!saved || saved.pendingItem) ? resolve(item) : item;
+}
+function resolveShownRecordId(index,value){
+ if(!value || index.has(value)) return value;
+ const shown=value.toLowerCase();
+ let key=null;
+ for(const entry of index.values()){
+  if(entry.id.toLowerCase()!==shown) continue;
+  if(key!==null) return value;
+  key=entry.key;
+ }
+ return key ?? value;
+}
 function createRecordTable(options){
 const contentProxy=()=>options.content();
 const defaultShow=options.defaultShow ?? 'open';
 let content=contentProxy(),owner='',show=defaultShow,query='',sort='',direction='asc',type='',sourceOwner='',keys=new Set();
-let linkedItem='',revealedLinkedItem='';
+let linkedItem='',revealedLinkedItem='',pendingItem=false;
 let placeHash=location.hash;
 let highlightedRow,highlightTimer;
 const opened=new Set(),filterNames=options.filters || [],filters={};
@@ -351,6 +400,8 @@ if(options.mount){
 const sortValues=data=>options.sortValues?.(data) ?? JSON.parse(data.sortValues);
 const words=()=>content.querySelector('[data-filter-words]') ?? content.querySelector('#list-search');
 const sharedWords=()=>words().hasAttribute?.('data-filter-words');
+const currentWords=()=>sharedWords() ? filterControl.getWords(words()) : words().value;
+if(sharedWords()) addEventListener('pageshow',()=>setTimeout(()=>filterControl.setWords(words(),currentWords()),0));
 const chipRow=name=>content.querySelector('[data-filter-row="'+name+'"]');
 const staffChipPrefix='staff:';
 const isStaffChipFilter=name=>options.staffChipFilters?.includes(name);
@@ -385,13 +436,12 @@ function filterSelection(name){
  };
 }
 function placeParams(){
- const params=new URLSearchParams(location.search);
- const fragment=new URLSearchParams(location.hash.slice(1));
- for(const key of new Set(fragment.keys())) params.delete(key);
- for(const [key,value] of fragment) params.append(key,value);
+ const params=recordPlaceParams();
  options.place?.(params);
  return params;
 }
+const resolveItem=value=>options.resolveItem?.(value) ?? value;
+const itemLinkKey=()=>recordItemLink(placeParams(),resolveItem);
 function place(){return readPlace(placeParams());}
 function itemWithKey(key){
  if(options.hasKey && !options.hasKey(key)) return;
@@ -411,27 +461,34 @@ function readPlace(params,followingItemLink=false){
  const item=params.get('item');if(item && !followingItemLink){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
-   owner='';show=options.requiredShow?.(itemWithKey(item)?.dataset) ?? 'all';
+   owner='';show='all';
    query='';type='';for(const name of filterNames) filters[name]='';}
-  if(options.single) opened.clear();opened.add(item);revealKey=item;
+  if(options.hasKey?.(item) ?? itemWithKey(item)){openCard(item);revealKey=item;}
  }
  const saved=followingItemLink ? null : history.state?.recordTable;
- linkedItem=options.missingItem ? saved?.linkedItem ?? (
-  !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
- const reveal=options.revealLinked && params.get('reveal')==='1';
- revealedLinkedItem=reveal || saved?.revealedLinkedItem===linkedItem ? linkedItem : '';
  if(saved && (!options.mount || saved.top!==undefined)){
   opened.clear();
-  saved.opened.forEach(key=>opened.add(key));
+  const key=saved.opened.includes(item) ? item : saved.opened[0];
+  if(key) openCard(key);
  }
+ linkedItem=options.missingItem ? saved?.linkedItem ?? (
+  !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
+ pendingItem=Boolean(options.resolveItem && linkedItem && saved?.pendingItem);
+ const reveal=options.revealLinked && params.get('reveal')==='1';
+ revealedLinkedItem=reveal || saved?.revealedLinkedItem===linkedItem ? linkedItem : '';
  owner=options.resolveOwner?.(owner) ?? owner;
- if(sharedWords()) words().value=query;
+ if(sharedWords()) filterControl.setWords(words(),query);
  return saved?.top;
 }
 function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}){
  if(unappliedOnly && location.hash===placeHash) return false;
  const params=placeParams();
- const jumpKey=params.get('jump'),key=jumpKey || params.get('item');
+ let unresolved=false;
+ const key=recordItemLink(params,value=>{
+  const resolved=resolveItem(value);
+  unresolved=Boolean(options.resolveItem && !options.hasKey?.(resolved));
+  return resolved;
+ });
  if(!key) return false;
  const motion=rowMotion.size ? motionsByKey().get(key) : undefined;
  if(motion){
@@ -448,7 +505,14 @@ function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}
   if(!params.has('key')) keys.forEach(key=>params.append('key',key));
  }
  readPlace(params,true);
- jump(key,{pushPlace:false,focusTarget:Boolean(jumpKey),keepMatchingFilters:true});
+ jump(key,{pushPlace:false,focusTarget:Boolean(params.get('jump')),keepMatchingFilters:true,unresolved});
+ return true;
+}
+function retryItemLink(){
+ if(!pendingItem || !linkedItem || location.hash!==placeHash) return false;
+ const key=resolveItem(linkedItem);
+ if(!options.hasKey?.(key)) return false;
+ jump(key,{pushPlace:false,focusTarget:false,keepMatchingFilters:true});
  return true;
 }
 function compare(a,b){
@@ -490,10 +554,11 @@ function animateRow(table,item,showRow,previousItem=item){
  copyTable.append(columns.cloneNode(true),copy);clip.append(copyTable);cell.append(clip);
  item.after(spacer);
  if(showRow) item.classList.add('record-motion-source');
+ const duration=Number(showRow ? content.dataset.cardFadeInMs : content.dataset.cardFadeOutMs);
  const animation=clip.animate([
   {height:(heightBefore ?? (showRow ? 0 : height))+'px',opacity:opacityBefore},
   {height:(showRow ? height : 0)+'px',opacity:Number(showRow)},
- ],{duration:200,easing:'ease-in-out',fill:'both'});
+ ],{duration,easing:'ease-in-out',fill:'both'});
  const finished=animation.finished.then(()=>{
   if(rowMotion.get(item)?.animation!==animation) return;
   stopMotion(item);
@@ -533,24 +598,27 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
 }
 function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
 function canRevealLinked(item,selection){
- const required=options.requiredShow?.(item.dataset);
- if(required && required!==selection.show) return false;
  return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
 }
-function matches(item,selection,counts){
+function matches(item,selection,counts,allowExpanded=false){
  if(!isSelected(item)) return false;
  if(!options.filterValues) return options.visible(item.dataset,selection);
- const values=options.filterValues(item.dataset,selection.query,selection);
+ const data=item.dataset;
+ const activeValues=options.filterValues(data,selection.query,selection);
+ const expanded=!activeValues && allowExpanded && opened.has(data.key) && options.expandedSelection?.(data,selection);
+ const values=activeValues || (expanded && options.filterValues(data,expanded.query,expanded));
  if(!values) return false;
  const selected={show:selection.show,owner:selection.owner,...selection.filters};
- const required=options.requiredShow?.(item.dataset);
  const excluded=Object.entries(values).filter(([name,choices])=>
-  filterChipValue(name,selected[name])==='all' ? name==='show' && required : !choices.includes(selected[name]));
+  filterChipValue(name,selected[name])!=='all' && !choices.includes(selected[name]));
  // A record counts for a row when it matches every other row.
  if(counts && excluded.length<2){
   for(const [name,choices] of Object.entries(values)){
-   if(excluded.length && excluded[0][0]!==name) continue;
-   for(const value of [...(name==='show' && required ? [] : ['all']),...choices.map(choice=>filterChipValue(name,choice))])
+   // A change to Show ends the exception for an open read row.
+   const sameShow=expanded && name==='show';
+   if(excluded.length && (excluded[0][0]!==name || sameShow)) continue;
+   const chipValues=sameShow ? [selection.show] : ['all',...choices.map(choice=>filterChipValue(name,choice))];
+   for(const value of chipValues)
     counts[name][value]=(counts[name][value] ?? 0)+1;
   }
  }
@@ -563,7 +631,7 @@ function apply(write=true,layout={}){
  options.beforeApply?.();
  applyRows(write,layout);
 }
-function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false,top}={}){
+function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=false,pushPlace=false,top}={}){
  const previousReveal=revealedLinkedItem;
  const motion=animate && !matchMedia('(prefers-reduced-motion: reduce)').matches;
  if(!motion) for(const item of rowMotion.keys()) stopMotion(item);
@@ -583,7 +651,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  const previousOwner=owner,previousShow=show,previousFilters={...filters};
  owner=options.resolveOwner?.(owner) ?? owner;
  const search=query.trim().toLowerCase();
- owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
+ if(normalizeOwner) owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
  owner=filterSelection('owner').set(owner);
  if(previousOwner && !owner) sourceOwner='';
  show=filterSelection('show').set(show);
@@ -600,10 +668,10 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   const transition=windowMotions ? windowMotions.get(item.dataset.key) : rowMotion.get(item);
   return (transition?.sortValues ?? sortValues(item.dataset))[column];
  };
- const items=[...rows,...departingRows].sort((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
-  (compare(sortValue(a),sortValue(b)) ||
-   Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
- const table=content.querySelector('table');let count=0,expandedOutsideFilter=false;
+ const compareOrder=(a,b)=>compare(Number(a.dataset.order),Number(b.dataset.order));
+ const items=[...rows,...departingRows].sort((a,b)=>column<0 ? compareOrder(a,b) :
+  (compare(sortValue(a),sortValue(b)) || compareOrder(a,b))*(direction==='desc' ? -1 : 1));
+ const table=content.querySelector('table');let count=0;
  if(options.mount){
   const visibleKeys=new Set(rows.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
   count=visibleKeys.size;
@@ -644,13 +712,10 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   if(linkedSection) linkedSection.hidden=!linked && !leavingLinked;
   items.forEach(item=>{
    const expanded=opened.has(item.dataset.key);
-   const matched=matches(item,active,counts);
-   const selection=expanded && !matched && item!==linked && options.expandedSelection?.(item.dataset,active);
-   const keepExpanded=selection && matches(item,selection);
-   const showRow=matched || item===linked || keepExpanded,wasShown=!item.hidden;
+   const matched=matches(item,active,counts,item!==linked);
+   const showRow=matched || item===linked,wasShown=!item.hidden;
    if(motion && wasShown && !showRow) animateRow(item.parentElement,item,false);
    item.hidden=!showRow;if(matched) count++;
-   if(keepExpanded) expandedOutsideFilter=true;
    const expansionChanged=setExpanded(item,expanded);
    const transition=rowMotion.get(item);
    if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(item.parentElement,item,true);
@@ -673,7 +738,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
   notice.hidden=!missing.length;
  }
- empty.hidden=count>0 || expandedOutsideFilter || missing.length>0;
+ empty.hidden=count>0 || missing.length>0;
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
   const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
@@ -693,6 +758,9 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
    filterNames.some(name=>filters[name]!==previousFilters[name])))
   writePlace(pushPlace,top);
 }
+function placeState(top){
+ return {recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top,...(linkedItem && pendingItem ? {pendingItem:true} : {})}};
+}
 function writePlace(push=false,top){
  const place=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
   ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]]))});
@@ -701,7 +769,7 @@ function writePlace(push=false,top){
  if(options.persistLinkedTarget && linkedItem) place.set('linked','1');
  if(linkedItem && revealedLinkedItem===linkedItem) place.set('reveal','1');
  keys.forEach(key=>place.append('key',key));
- const hash='#'+place,state={recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top}};
+ const hash='#'+place,state=placeState(top);
  if(push && hash!==location.hash) history.pushState(state,'',location.pathname+hash);
  else history.replaceState(state,'',location.pathname+hash);
  placeHash=location.hash;
@@ -711,39 +779,39 @@ function restorePlace(event){
  // A changed fragment sends hashchange after popstate.
  if(event?.type==='popstate' && location.hash!==placeHash) return;
  const top=place();
- apply(false,{top});
+ if(retryItemLink()) return;
+ apply(false,{top,normalizeOwner:!history.state?.recordTable});
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
 }
 function saveDeparturePlace(){
- if(sharedWords() && query!==words().value){
-  query=words().value;
+ if(sharedWords() && query!==currentWords()){
+  query=currentWords();
   writePlace(false,scrollY);
- }else history.replaceState({recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top:scrollY}},'');
+ }else history.replaceState(placeState(scrollY),'');
 }
-function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}){
+function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false,unresolved=false}={}){
  if(pushPlace) saveDeparturePlace();
  const target=itemWithKey(key);
  linkedItem=options.missingItem ? key : '';
+ pendingItem=unresolved;
  if(target){
   if(keys.size) keys.add(key);
-  if(options.single) opened.clear();
-  opened.add(key);
+  openCard(key);
   const selection=currentSelection();
-  if(!canRevealLinked(target,selection) && !matches(target,selection)){
-   const targetShow=options.requiredShow?.(target.dataset) ?? 'all';
-   const unfiltered=currentSelection({owner:'',show:targetShow,query:'',type:'',sourceOwner:'',filters:{}});
+  if(!preserveFilters && !canRevealLinked(target,selection) && !matches(target,selection)){
+   const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
    if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
    if(!keepMatchingFilters || sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
-   if(!keepMatchingFilters || show!==targetShow && !matches(target,{...unfiltered,show})) show=targetShow;
+   if(!keepMatchingFilters || show!=='all' && !matches(target,{...unfiltered,show})) show='all';
    if(query && !matches(target,{...unfiltered,query:query.trim().toLowerCase()})) query='';
    if(type && !matches(target,{...unfiltered,type})) type='';
    for(const name of filterNames)
     if(filters[name] && !matches(target,{...unfiltered,filters:{[name]:filters[name]}})) filters[name]='';
-   if(sharedWords()) words().value=query;
+   if(sharedWords()) filterControl.setWords(words(),query);
   }
  }
  if(options.mount && target) revealKey=key;
- apply(true,{pushPlace});
+ apply(true,{pushPlace,normalizeOwner:!preserveFilters});
  const mountedTarget=options.mount ? mounted.get(key) : target;
  if(!mountedTarget){
   content.querySelector('[data-missing-item]')?.scrollIntoView({block:'nearest',behavior:'instant'});
@@ -763,23 +831,24 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
  options.itemOpened?.(mountedTarget);
 }
-function setRowsExpanded(items,expanded){
- for(const item of items){
-  const key=item.dataset.key;
-  if(opened.has(key)===expanded) continue;
-  if(!expanded && key===linkedItem) linkedItem='';
-  if(expanded){
-   if(options.single) opened.clear();
-   opened.add(key);
-  }else opened.delete(key);
-  measured.delete(key);
- }
- apply(true,{animate:true});
+function openCard(key){
+ for(const previous of opened) measured.delete(previous);
+ opened.clear();
+ opened.add(key);
+ measured.delete(key);
+ if(linkedItem!==key){linkedItem='';revealedLinkedItem='';}
+}
+function closeCard(key,write=true){
+ const wasOpen=opened.delete(key);
+ if(linkedItem===key){linkedItem='';revealedLinkedItem='';}
+ else if(!wasOpen) return;
+ measured.delete(key);
+ if(write && location.hash===placeHash) writePlace();
 }
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
- const changePlace=()=>apply(true,{dismissMissingItem:true});
- const changeFilter=()=>{if(sharedWords()) query=words().value;changePlace();};
+ const changePlace=(normalizeOwner=false)=>apply(true,{dismissMissingItem:true,normalizeOwner});
+ const changeFilter=()=>{if(sharedWords()) query=currentWords();changePlace(true);};
  content.querySelector('[data-clear-linked-reviews]')?.addEventListener('click',()=>{
   keys.clear();changeFilter();words().focus({preventScroll:true});
  });
@@ -804,28 +873,22 @@ function bind(){
  content.addEventListener('click',event=>{
   const item=event.target.closest('.list-row')?.closest('[data-list-item]');if(!item) return;
   if(event.target.closest('a') || (event.target.closest('button') && !event.target.closest('.list-toggle'))) return;
-  const expanded=!opened.has(item.dataset.key);
-  setRowsExpanded([item],expanded);
+  const key=item.dataset.key,expanded=!opened.has(key);
+  if(expanded) openCard(key);else closeCard(key,false);
+  apply(true,{animate:true});
   if(expanded && !item.hidden) options.itemOpened?.(item);
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
-  type=button.dataset.typeChip;changePlace();
+  type=button.dataset.typeChip;changeFilter();
  }));
 }
-return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDeparturePlace,get linkedItem(){return linkedItem;},
- setShownExpanded(expanded){
-  const currentQuery=words().value;
-  if(query!==currentQuery){
-   query=currentQuery;
-   apply(false,{dismissMissingItem:true});
-  }
-  setRowsExpanded(content.querySelector('table').querySelectorAll('[data-list-item]:not([hidden])'),expanded);
- },
- closeCard(key){
-  const wasOpen=opened.delete(key);
-  if(linkedItem===key){linkedItem='';revealedLinkedItem='';}
-  else if(!wasOpen) return;
-  if(location.hash===placeHash) writePlace();
+return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
+ revealMatchingItem(key){
+  const target=itemWithKey(key);
+  const selection=currentSelection({query:currentWords().trim().toLowerCase()});
+  if(!target || !matches(target,selection)) return false;
+  jump(key,{preserveFilters:true});
+  return true;
  },
  releaseLink(key){
   if(linkedItem!==key) return;
@@ -850,15 +913,16 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  showActionResult,
  actionNotice(item){return actionNotices.get(item.dataset.key)?.message ?? '';},
  applyAction(){apply(false,{animate:true});},
+ rowFading(key){return [...rowMotion.keys()].some(item=>item.dataset.key===key);},
  async rowSettled(item){while(rowMotion.has(item)) await rowMotion.get(item).finished;},
  get hasActiveRowAnimations(){return rowMotion.size>0;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(draw=true){
-  const previous=words(),previousQuery=query;
+  const previous=currentWords(),previousQuery=query;
   for(const gap of windowGaps.splice(0)) gap.remove();
   for(const node of mounted.values()){resize?.unobserve(node);options.unmount?.(node);node.remove();}
   mounted.clear();measured.clear();content=contentProxy();
-  if(sharedWords()){query=previous.value;words().value=query;}
+  if(sharedWords()){query=previous;filterControl.setWords(words(),query);}
   bind();if(draw) applyRows(query!==previousQuery);
  }};
 }
@@ -911,7 +975,15 @@ function closeDateTimePicker(menu,focus){
  const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
  if(focus) toggle.focus();
 }
-function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=()=>{},retryTime=()=>NaN}){
+function pickerSummary(zone){
+ const date=new Intl.DateTimeFormat('en-GB',{timeZone:zone,weekday:'short',day:'numeric',month:'short'});
+ return at=>{
+  const {hour,minute}=zoneParts(zone,at);
+  return date.format(at)+' '+dateTimeClock(hour*60+minute);
+ };
+}
+function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummary=pickerSummary(zone),
+ prepareMenu=()=>{},retryTime=()=>NaN}){
  const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
  const custom=menu.querySelector('[data-later-custom]'),chooseItem=menu.querySelector('[data-later-choose]');
  const items=()=>[...menu.querySelectorAll('[role=menuitem]:not([hidden])')];
@@ -930,7 +1002,6 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
  const dayText=date=>date.toISOString().slice(0,10);
  const monthText=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',year:'numeric'});
  const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
- const summary=new Intl.DateTimeFormat('en-GB',{timeZone:zone,weekday:'short',day:'numeric',month:'short'});
  let selected=new Date(),display=new Date();
  const today=()=>{const now=zoneParts(zone,Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
  const update=(normalize=false)=>{
@@ -942,9 +1013,8 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
   field.dispatchEvent(new Event('input',{bubbles:true}));
   const retry=retryTime();
   const at=Number.isFinite(retry) ? retry : valid ? dateTimeEpoch(zone,selected,minutes) : NaN;
-  const resolved=Number.isFinite(at) ? zoneParts(zone,at) : null;
-  custom.querySelector('[data-later-summary]').textContent=resolved ? summaryPrefix+summary.format(at)+' '+
-   dateTimeClock(resolved.hour*60+resolved.minute) : 'Choose a time';
+  custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at)
+   ? summaryPrefix+formatSummary(at) : 'Choose a time';
   save.disabled=!Number.isFinite(retry) && !(at>Date.now());
  };
  const draw=()=>{

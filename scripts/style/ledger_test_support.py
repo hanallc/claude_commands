@@ -80,6 +80,21 @@ def ticket_owner_id(reference: str) -> str:
     return reference
 
 
+def add_saved_reservation_path(ledger: style_ledger.Ledger, ticket: str, path: str,
+                               role: style_ledger.ReservationRole) -> None:
+    """Add an overlap to a saved plan to test later checks."""
+    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+        _ = connection.execute("UPDATE ticket_reservations SET plan=json_insert(plan,'$.paths[#]',json(?)) WHERE ticket=?",
+                               (json.dumps([path, role]), ticket))
+
+
+@contextmanager
+def legacy_overlapping_tickets() -> Generator[None]:
+    """Seed ticket combinations that an earlier ledger allowed."""
+    with mock.patch.object(style_ledger.Ledger, "_check_reservation_overlap"):
+        yield
+
+
 @contextmanager
 def style_staff_fixture(root: Path, repo: Path,
                         assignments: tuple[StyleUnitAssignment, ...] = DEFAULT_STYLE_ASSIGNMENTS) -> Generator[None]:
@@ -990,7 +1005,8 @@ class LedgerTestCase(unittest.TestCase):
         for source in (kept, path):
             self.record(rule, source, self.initial_tip, ticket="1")
         ledger.ticket_add("8001", ticket_owner_id("other-names"), "read", "names", "crates/alpha", [path], [rule])
-        ledger.ticket_assign("8001", "main")
+        with legacy_overlapping_tickets():
+            ledger.ticket_assign("8001", "main")
         _ = ledger.ticket_base("8001")
         original = (self.repo / path).read_text()
         (self.repo / path).unlink()
@@ -1039,7 +1055,8 @@ class LedgerTestCase(unittest.TestCase):
                 "SELECT state,reservation_session_dir,reservation_phase FROM tickets WHERE id=?", (ticket,)).fetchone())
 
     def yield_proposal(self, kept: tuple[str, str, str, str], freed: tuple[str, str, str, str],
-                       files: dict[str, str] | None = None) -> tuple[str, str, Path]:
+                       files: dict[str, str] | None = None, *,
+                       companions: tuple[tuple[str, str, str, str], ...] = ()) -> tuple[str, str, Path]:
         """Add an assigned proposal ticket 7001 with one finding at each (path, kind, before, after), at a tip
         that adds files; return the kept finding, the finding to yield and the decision."""
         rule = self.rule("decision")
@@ -1049,12 +1066,13 @@ class LedgerTestCase(unittest.TestCase):
         ledger = self.ledger()
         issue = self.root / "issues/decision.md"
         identities: list[str] = []
-        for line, (path, kind, before, after) in enumerate((kept, freed), 1):
+        for line, (path, kind, before, after) in enumerate((kept, freed, *companions), 1):
             finding = ledger.hold(rule, path, line, "change", cast(style_ledger.FindingKind, kind), before, after,
                                   self.blob(rule), "outside")
             ledger.file_held(finding.finding_id, issue)
             identities.append(finding.finding_id)
-        ledger.ticket_add("7001", ticket_owner_id("proposal"), "proposal", "names", "crates/alpha", sorted({kept[0], freed[0]}),
+        paths = sorted({path for path, _, _, _ in (kept, freed, *companions)})
+        ledger.ticket_add("7001", ticket_owner_id("proposal"), "proposal", "names", "crates/alpha", paths,
                           [rule], proposal=str(issue), finding_ids=tuple(identities))
         ledger.ticket_assign("7001", "main")
         return identities[0], identities[1], issue

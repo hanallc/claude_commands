@@ -187,29 +187,37 @@ def _restart(label: str, identity: str, source: str) -> str:
         member = record.by_member_reference(identity) or record.by_member_reference(source) or record.by_path(identity)
         if member is None:
             return f"{identity}: unknown staff member"
-        identity = member.current_session
-        parent = record.parent_of(member)
-        if member.kind == "unit" and parent is not None:
-            match live_units.listing_in(parent.name, _fresh_units()).checked_unit(member.name):
-                case unit_lookup.UnknownUnit(reason=reason):
-                    return reason
-                case unit_lookup.ProvedLiveUnit():
-                    return ""
-                case unit_lookup.ProvedAbsentUnit():
-                    pass
-        live = sessions.session_liveness(identity)
-        if isinstance(live, sessions.SessionLivenessUnknown):
-            return live.reason
-        if isinstance(live, sessions.LiveSessionProcess):
-            return ""  # Another recovery already brought this conversation back.
-        resume = cast(ResumeUnit, import_module("scripts.agents.stop_resume").resume)
-        result = resume(identity, why="unit watchdog recovery", to=label)
+        if not isinstance(staff.row_activity(member.id), staff.RowAvailable):
+            return "account move in progress"
+        with staff.slot_operation(member.id, member.name):
+            record = staff.snapshot()
+            current = record.by_id(member.id)
+            if current is None:
+                return "staff member no longer exists"
+            member = current
+            identity = member.current_session
+            parent = record.parent_of(member)
+            if member.kind == "unit" and parent is not None:
+                match live_units.listing_in(parent.name, _fresh_units()).checked_unit(member.name):
+                    case unit_lookup.ProvedAbsentUnit() | unit_lookup.NonAgentPaneHolders():
+                        pass
+                    case unit_lookup.UnknownUnit(reason=reason):
+                        return reason
+                    case unit_lookup.ProvedLiveUnit():
+                        return ""
+            live = sessions.session_liveness(identity)
+            if isinstance(live, sessions.SessionLivenessUnknown):
+                return live.reason
+            if isinstance(live, sessions.LiveSessionProcess):
+                return ""  # Another recovery already brought this conversation back.
+            resume = cast(ResumeUnit, import_module("scripts.agents.stop_resume").resume)
+            result = resume(identity, why="unit watchdog recovery", to=label)
         if isinstance(result, stop_results.ClaudeUp):
             return ""
         return (result.reason
                 if isinstance(result, stop_results.ResumeFailed)
                 else f"{identity}: no pane launch")
-    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
+    except (OSError, ValueError, staff.StaffRefused, herdr_types.HerdrFailure) as error:
         return str(error)
 
 
@@ -264,7 +272,7 @@ def _live_account(production_name: str, unit: str) -> str:
             return accounts.claude_config_label(identity.path)
         case unit_lookup.ProvedLiveUnit():
             raise OSError("the live owner is not Claude")
-        case unit_lookup.ProvedAbsentUnit():
+        case unit_lookup.ProvedAbsentUnit() | unit_lookup.NonAgentPaneHolders():
             return ""
         case unit_lookup.UnknownUnit(reason=reason):
             raise OSError(reason)
@@ -332,10 +340,13 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                         source = sources.get((runner["name"], unit))
                         if source is None:
                             continue
+                        if isinstance(source, RecoverySource) and not isinstance(
+                                staff.row_activity(source.identity), staff.RowAvailable):
+                            continue
                         owner = found.owner
                         if not isinstance(owner, unit_lookup.ProvedLiveUnit):
                             owner = fresh_production().checked_unit(unit)
-                        if isinstance(owner, unit_lookup.UnknownUnit):
+                        if isinstance(owner, unit_lookup.UnknownUnit) and not isinstance(owner, unit_lookup.NonAgentPaneHolders):
                             raise OSError(owner.reason)
                         if isinstance(source, NoRecovery):
                             if not dry_run:
@@ -351,7 +362,7 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                                 claude = live
                             case unit_lookup.ProvedLiveUnit():
                                 raise OSError("the live owner is not Claude")
-                            case unit_lookup.ProvedAbsentUnit():
+                            case unit_lookup.ProvedAbsentUnit() | unit_lookup.NonAgentPaneHolders():
                                 claude = unit_lookup.ClaudeNotRunning()
                         if isinstance(claude, unit_lookup.LiveClaude):
                             outage = state.get(claude.session_id)

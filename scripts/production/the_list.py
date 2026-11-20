@@ -14,10 +14,10 @@ import re
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
-from scripts.lib.user_zone import user_zone
+from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.production import change_review, delivery_state, record_store, staff
 from scripts.review_links import change_page, page_question, question_record
@@ -82,6 +82,8 @@ Parking = Timestamp | ParkUntilDelivered
 class EtaStatus(StrEnum):
     NOT_ASKED = "Not asked"
     PENDING = "Pending"
+    NO_TIME_YET = "No time yet"
+    WAITING_FOR_NATE = "Waiting for nate"
     PAUSED = "Paused"
     DELIVERED = "Delivered"
 
@@ -109,7 +111,7 @@ class UnassignedOwner(StrEnum):
 
 ItemOwner = staff.StaffId | UnassignedOwner
 NextCheck = Timestamp | CheckCondition
-Eta = datetime | EtaRange | EtaStatus | EtaDescription
+Eta = datetime | date | EtaRange | EtaStatus | EtaDescription
 
 
 @dataclass(frozen=True)
@@ -248,6 +250,13 @@ class ListItem:
     @property
     def id(self) -> str:
         return f"L{self.number}"
+
+    @property
+    def latest_status_time(self) -> Timestamp:
+        for entry in reversed(self.log):
+            if isinstance(entry.what, FieldChange) and "latest_status" in entry.what.fields:
+                return entry.time
+        return NoTimestamp.UNSET
 
 
 class AllItems(StrEnum):
@@ -444,6 +453,11 @@ def parking_date(moment: datetime, zone: tzinfo) -> str:
     return moment.astimezone(zone).date().isoformat()
 
 
+def list_time(moment: datetime, today: datetime) -> str:
+    local = moment.astimezone(today.tzinfo)
+    return local.strftime("%H:%M %Z" if local.date() == today.date() else "%Y-%m-%d %H:%M %Z")
+
+
 def _time_text(value: Timestamp) -> str:
     return value.isoformat() if isinstance(value, datetime) else ""
 
@@ -477,12 +491,58 @@ def eta_value(text: str) -> Eta:
     return EtaRange(earliest, latest)
 
 
+_ETA_INPUT_STATUSES = (EtaStatus.NO_TIME_YET, EtaStatus.WAITING_FOR_NATE, EtaStatus.PAUSED, EtaStatus.DELIVERED)
+_ETA_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_ETA_DATE = re.compile(r"([A-Z][a-z]{2}) ([0-9]{1,2})(?: ([01][0-9]|2[0-3]):([0-5][0-9]) (\S+))?")
+_ETA_INPUT_ERROR = ("Use --eta with Mon D, Mon D HH:MM ZONE, No time yet, Waiting for nate, Paused, or Delivered. "
+                    + "For other details, put the reason in --latest-status.")
+
+
+def _cli_eta(text: str) -> datetime | date | EtaStatus:
+    if text in _ETA_INPUT_STATUSES:
+        return EtaStatus(text)
+    match = _ETA_DATE.fullmatch(text)
+    if match is None or match[1] not in _ETA_MONTHS:
+        raise ListError(_ETA_INPUT_ERROR)
+    month, day = _ETA_MONTHS.index(match[1]) + 1, int(match[2])
+    zone = user_zone()
+    today = now().astimezone(zone).date()
+    dates: list[date] = []
+    # Four years on each side also cover the nearest leap day.
+    for year in range(max(date.min.year, today.year - 4), min(date.max.year, today.year + 4) + 1):
+        try:
+            dates.append(date(year, month, day))
+        except ValueError:
+            continue
+    if not dates:
+        raise ListError(_ETA_INPUT_ERROR)
+    nearest = min(dates, key=lambda candidate: abs(candidate - today))
+    if match[5] is None:
+        return nearest
+    moment = datetime(nearest.year, month, day, int(match[3]), int(match[4]), tzinfo=zone)
+    for fold in (0, 1):
+        local = moment.replace(fold=fold)
+        if local.astimezone(UTC).astimezone(zone) == local and zone_label(local) == match[5]:
+            return local
+    raise ListError(_ETA_INPUT_ERROR)
+
+
 def eta_text(value: Eta) -> str:
-    if isinstance(value, datetime):
+    if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, EtaRange):
         return f"{value.earliest.isoformat()}/{value.latest.isoformat()}"
     return value.text if isinstance(value, EtaDescription) else value.value
+
+
+def eta_due(eta: Eta) -> datetime | None:
+    if isinstance(eta, datetime):
+        return eta
+    if isinstance(eta, date) and eta < date.max:
+        return datetime.combine(eta + timedelta(days=1), time.min, tzinfo=user_zone())
+    if isinstance(eta, EtaRange):
+        return eta.latest
+    return None
 
 
 def _eta_kind(eta: Eta) -> Literal["text", "time or status"]:
@@ -494,6 +554,8 @@ def _read_eta(text: str, kind: str) -> Eta:
         _line(text, "ETA")
         return EtaDescription(text)
     if kind == "time or status":
+        if len(text) == 10 and ISO_TIME.fullmatch(text):
+            return date.fromisoformat(text)
         eta = eta_value(text)
         if not isinstance(eta, EtaDescription):
             return eta
@@ -508,6 +570,29 @@ def _line(value: str, name: str) -> None:
 def _log_line(value: str, name: str) -> None:
     if not value.strip() or "\n" in value or "\r" in value:
         raise ListError(f"{name} must have one nonempty line")
+
+
+_SOURCE_CLOCK = re.compile(r"(?:^|(?<=[\s,]))(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:[.,]\d+)?)?"
+                           + r"(?: [A-Z]{2,6}|Z| ?[+-]\d{2}(?::?\d{2})?)?$")
+
+
+def source_without_clock(source: str) -> str:
+    """Remove a hand-written clock time from the end of a log source."""
+    text = source.rstrip()
+    for boundary in re.finditer(r"^|[ \t,]", text):
+        start = boundary.end()
+        suffix = text[start:]
+        try:
+            _ = datetime.fromisoformat(suffix)
+        except ValueError:
+            continue
+        try:
+            _ = date.fromisoformat(suffix)
+        except ValueError:
+            return text[:start].rstrip(" ,\t")
+
+    clock = _SOURCE_CLOCK.search(text)
+    return text[:clock.start()].rstrip(" ,\t") if clock else source
 
 
 def _staff_id(value: str, name: str) -> None:
@@ -1114,9 +1199,32 @@ def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
             _save(store, item)
 
 
+class _CreationDefaults(TypedDict):
+    unit: str
+    state: ItemState
+    next_check: NextCheck
+    eta: Eta
+    parked_until: Parking
+    blocked_by: tuple[ItemDependency, ...]
+    related_to: tuple[int, ...]
+    requested_by: RequestedBy
+    closing_words: str
+    next_step: str
+    latest_status: str
+    evidence: str
+    done_when: str
+
+
+_CREATION_DEFAULTS: _CreationDefaults = {
+    "unit": "", "state": ItemState.NEW, "next_check": NoTimestamp.UNSET, "eta": EtaStatus.NOT_ASKED,
+    "parked_until": NoTimestamp.UNSET, "blocked_by": (), "related_to": (), "requested_by": RequestedBy.NATE,
+    "closing_words": "", "next_step": "", "latest_status": "", "evidence": "", "done_when": "",
+}
+
+
 def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         changes: ItemChanges,
-        number: int | NextNumber = NextNumber.AVAILABLE, requested_by: RequestedBy = RequestedBy.NATE,
+        number: int | NextNumber = NextNumber.AVAILABLE, requested_by: RequestedBy = _CREATION_DEFAULTS["requested_by"],
         ) -> ListItem:
     """Create an item without reusing an existing record number."""
     store = _store(keeper)
@@ -1126,14 +1234,16 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         if store.path(identity).exists():
             raise ListError(f"{identity}: the item already exists")
         moment = now()
-        item = ListItem(chosen, title, owner, keeper, "", ItemState.NEW, NoTimestamp.UNSET, EtaStatus.NOT_ASKED,
-                        moment, NoTimestamp.UNSET, (), (), requested_by, moment, moment, NoTimestamp.UNSET, "",
-                        "", "", "", "", ())
+        defaults = _CREATION_DEFAULTS.copy()
+        defaults["requested_by"] = requested_by
+        item = ListItem(chosen, title, owner, keeper, unread_since=moment, opened=moment, updated=moment,
+                        closed=NoTimestamp.UNSET, log=(), **defaults)
         if changes:
             item = replace(item, **changes)
         initial: LogFields = {"title": item.title, "owner": item.owner, "producer": item.producer,
                                 "state": item.state, "eta": item.eta,
-                                "next_step": item.next_step, "latest_status": item.latest_status, **changes}
+                                "next_step": item.next_step, "latest_status": item.latest_status,
+                                "requested_by": item.requested_by, **changes}
         item = replace(item, log=(ItemChange(moment, FieldChange("Added", initial), source),))
         _validate(item)
         _check_links(lambda number: load(keeper, f"L{number}"), item.number, changes)
@@ -1143,7 +1253,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
 
 
 def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, datetime], ListItem],
-            what: ListEvent, source: str, *, unread: bool = True,
+            what: ListEvent | Callable[[ListItem], ListEvent], source: str, *, unread: bool = True,
             page_action: PageItemNotice | PageRequest | NoPageRequest = NoPageRequest.ABSENT,
             assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
     store = _store(keeper)
@@ -1168,10 +1278,11 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         changed = edit(item, moment)
         entries: list[ItemChange] = []
         if changed != item:
-            entries.append(ItemChange(moment, what, source))
+            event = what(changed) if callable(what) else what
+            entries.append(ItemChange(moment, event, source))
             changed = replace(changed, updated=moment, unread_since=moment if unread else NoTimestamp.UNSET)
-            if (isinstance(what, FieldChange) and what.action == "Updated"
-                    and what.fields.get("state") == ItemState.DELIVERED
+            if (isinstance(event, FieldChange) and event.action == "Updated"
+                    and event.fields.get("state") == ItemState.DELIVERED
                     and changed.parked_until is ParkUntilDelivered.DELIVERED):
                 changed = replace(changed, parked_until=NoTimestamp.UNSET)
                 entries.append(ItemChange(moment, UnparkedForDelivery(ItemDelivered.RECORDED), source))
@@ -1267,17 +1378,86 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
     return _update(keeper, identity, changes, source=source).item
 
 
-def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str,
-            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
+_PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check", "evidence", "add_evidence")
+_PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
+
+
+def _check_producer_update_fields(fields: Iterable[str]) -> None:
+    refused = sorted("--" + field.replace("_", "-") for field in set(fields).difference(_PRODUCER_UPDATE_FIELDS))
+    if refused:
+        raise ListError(f"producers can update only {', '.join(_PRODUCER_UPDATE_OPTIONS)}. "
+                        + f"Refused options: {', '.join(refused)}")
+
+
+def _append_evidence(evidence: str, line: str) -> str:
+    separator = "\n" if evidence and not evidence.endswith("\n") else ""
+    return evidence + separator + line
+
+
+def log_field_changes(item: ListItem) -> Generator[dict[str, object]]:
+    """Replay the saved fields and yield the fields to show for each log entry."""
+    previous: dict[str, object] = {}
+    for entry in item.log:
+        event = entry.what
+        shown: dict[str, object] = {}
+        if isinstance(event, FieldChange):
+            fields: dict[str, object] = dict(event.fields)
+            if event.action == "Added":
+                previous = dict(_CREATION_DEFAULTS)
+                _ = previous.pop("requested_by")
+            if event.action == "Closed":
+                previous["state"] = ItemState.CLOSED
+            shown = fields
+            if event.action == "Updated":
+                shown = {field: value for field, value in fields.items()
+                         if field not in previous or previous[field] != value}
+                evidence, old_evidence = shown.get("evidence"), previous.get("evidence")
+                if isinstance(evidence, str):
+                    old_lines: set[str] = set(old_evidence.splitlines()) if isinstance(old_evidence, str) else set()
+                    new_lines = [line for line in evidence.splitlines() if line not in old_lines]
+                    if new_lines:
+                        shown["evidence"] = "\n".join(new_lines) or "\n"
+                    elif evidence or not old_evidence:
+                        del shown["evidence"]
+            previous.update(fields)
+        elif isinstance(event, Reopened) or event == "Reopened":
+            previous.update(state=ItemState.NEW, closing_words="", parked_until=NoTimestamp.UNSET)
+        elif isinstance(event, Unparked):
+            previous["parked_until"] = NoTimestamp.UNSET
+            if isinstance(event, UnparkedForDelivery):
+                previous["state"] = ItemState.DELIVERED
+        yield shown
+
+
+def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str, add_evidence: str = "",
+            assigned_to: staff.StaffRow | AllItems = AllItems.INCLUDED) -> ListEdit:
+    scope: staff.StaffId | AllItems = AllItems.INCLUDED
+    if assigned_to is not AllItems.INCLUDED:
+        _check_producer_update_fields(changes)
+        if assigned_to.kind != "producer":
+            raise ListError("the assigned producer has no producer staff row")
+        if isinstance(assigned_to.retirement, staff.RetiredProducer):
+            raise ListError(f"{assigned_to.name}: retired producer. Choose an active producer.")
+        source = assigned_to.name
+        scope = assigned_to.id
+
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         if changes.get("state") == ItemState.CLOSED:
             raise ListError("use close to record closing words and a time")
         changed = replace(item, **changes)
+        if add_evidence:
+            changed = replace(changed, evidence=_append_evidence(changed.evidence, add_evidence))
         _validate(changed)
         _check_links(lambda number: load(keeper, f"L{number}"), changed.number, changes)
         return changed
-    return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source, assigned_to=assigned_to)
+
+    def event(changed: ListItem) -> FieldChange:
+        fields: LogFields = {**changes}
+        if add_evidence:
+            fields["evidence"] = changed.evidence
+        return FieldChange("Updated", fields)
+    return _change(keeper, identity, edit, event, source, assigned_to=scope)
 
 
 def move_open_producer(keeper: staff.StaffId, identity: str, previous: staff.StaffId,
@@ -1672,7 +1852,9 @@ def _claim_question(questions: _ListQuestionStore, item: ListItem, words: str,
 
 
 def _list_question_target(keeper: staff.StaffId, item: ListItem) -> change_page.QuestionDeliveryTarget:
-    return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title, keeper)
+    owner = None if isinstance(item.owner, UnassignedOwner) else item.owner
+    return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title,
+                                           keeper, alert_owner=owner)
 
 
 def resend_question(keeper: staff.StaffId, identity: str, question_id: str,
@@ -1763,6 +1945,7 @@ def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked
 def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, include_parked: bool,
                   show_latest_status: bool = False) -> str:
     moment = now()
+    today = moment.astimezone(user_zone()) if show_latest_status else moment
     visible = [item for item in items if include_parked or not parking_active(item.parked_until, moment)]
     visible.sort(key=order)
     columns = ("#", "Owner", "Producer", "Item", "State", "Next step", "ETA", "Update")
@@ -1785,7 +1968,11 @@ def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, inc
                  producer.name if producer is not None else item.producer, item.title, state,
                  item.next_step, eta_text(item.eta), "●" if isinstance(item.unread_since, datetime) else "—")
         if show_latest_status:
-            cells += (item.latest_status,)
+            status = item.latest_status
+            status_time = item.latest_status_time
+            if status and isinstance(status_time, datetime):
+                status += " · " + list_time(status_time, today)
+            cells += (status,)
         lines.append("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
     return "\n".join(lines)
 
@@ -1825,7 +2012,7 @@ def _cli_changes(args: argparse.Namespace, members: staff.StaffSnapshot) -> Item
     if isinstance(next_check, str):
         changes["next_check"] = next_check_value(next_check)
     if isinstance(eta, str):
-        changes["eta"] = eta_value(eta)
+        changes["eta"] = _cli_eta(eta)
     if isinstance(requested, str):
         changes["requested_by"] = RequestedBy(requested)
     blocked_by, related_to = options.get("blocked_by"), options.get("related_to")
@@ -1844,8 +2031,7 @@ def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
     command = session_send.send_argv("--to", recipient.id, "--recipient-kind", recipient.kind,
                                      "--from", "morty", "--text", text)
     result = subprocess.run(command, capture_output=True, text=True, check=False)
-    outcome = send_result.send_outcome(result.returncode, result.stdout)
-    if isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in ("sent", "skipped"):
+    if send_result.delivered_or_kept(result.returncode, result.stdout, accept_skipped=True):
         return
     raise ListError((result.stderr or result.stdout).strip() or "message delivery failed")
 
@@ -1862,10 +2048,11 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
     showrunner = f"Its showrunner is {owner.name}." if owner is not None else "The item has no assigned showrunner."
     item_text = f"item {item.number}: {item.title}"
     launcher = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
+    update_options = ", ".join(f"`{option}`" for option in _PRODUCER_UPDATE_OPTIONS)
     notices = (
         ("producer", item.producer, producer, f"You are the producer of {item_text}. {showrunner}\n"
          + f"Run `{launcher} list --all --latest-status` to read it. "
-         + f"Run `{launcher} update --id {item.id}` with `--latest-status`, `--next-step`, or `--eta` to update it."),
+         + f"Run `{launcher} update --id {item.id}` to update it. Use any of {update_options}."),
         ("showrunner", item.owner, owner, f"The saved assignment for {item_text} needs a new producer."
          if producer is None else f"{producer.name} is the producer of {item_text}. "
          + f"Send design questions on this item to {producer.name}."),
@@ -1908,7 +2095,7 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--title", required=name == "add")
             _ = command.add_argument("--owner", required=name == "add")
             _ = command.add_argument("--producer")
-            for key in ("unit", "next-check", "eta", "next-step", "latest-status", "evidence", "done-when"):
+            for key in ("unit", "next-check", "eta", "next-step", "latest-status", "evidence", "add-evidence", "done-when"):
                 _ = command.add_argument("--" + key)
             _ = command.add_argument("--state", choices=[state.value for state in ItemState if state != ItemState.CLOSED])
             _ = command.add_argument("--requested-by", choices=list(RequestedBy))
@@ -1929,6 +2116,12 @@ def main(argv: list[str] | None = None) -> int:
     if name in ("link", "unlink") and not cast(list[ReviewByShownId | ReviewByKey], args.reviews):
         parser.error("use --review or --review-key")
     try:
+        source = cast(str | None, getattr(args, "source", None))
+        if source is not None and source_without_clock(source) != source:
+            raise ListError("Omit the clock time from --source because the tool adds the time.")
+        add_evidence = cast(str | None, getattr(args, "add_evidence", None))
+        if add_evidence is not None:
+            _line(add_evidence, "evidence to add")
         record = staff.snapshot()
         caller = record.by_current_session(staff.caller_identity())
         if caller is None:
@@ -1957,18 +2150,14 @@ def main(argv: list[str] | None = None) -> int:
                 identity = f"L{identity}"
             if assigned_to is not AllItems.INCLUDED:
                 options = cast(dict[str, object], vars(args))
-                allowed = {"command", "id", "source", "latest_status", "next_step", "eta"}
-                refused = sorted(f"--{key.replace('_', '-')}" for key, value in options.items()
-                                 if value is not None and key not in allowed)
-                if refused:
-                    raise ListError("producers can update only --latest-status, --next-step, and --eta. "
-                                    + f"Refused options: {', '.join(refused)}")
-                _ = _update(keeper, identity, _cli_changes(args, record), source=caller.name, assigned_to=assigned_to)
+                _check_producer_update_fields(key for key, value in options.items()
+                                              if value is not None and key not in {"command", "id", "source"})
+                _ = _update(keeper, identity, _cli_changes(args, record), source=source or "",
+                            add_evidence=add_evidence or "", assigned_to=caller)
                 return 0
-            source = cast(str | None, args.source)
             if source is None:
                 parser.error("update requires --source for morty")
-            changed = _update(keeper, identity, _cli_changes(args, record), source=source)
+            changed = _update(keeper, identity, _cli_changes(args, record), source=source, add_evidence=add_evidence or "")
             if isinstance(changed, UnchangedEdit):
                 return 0
             return _notify_producer_assignment(changed.item, changed.before.producer, keeper)
@@ -1981,7 +2170,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ListError(result.reason)
             print(f"answered {identity} {question}")
             return 0
-        source = cast(str, args.source)
+        assert source is not None
         if name == "clean-evidence":
             changed, unchanged = clean_evidence(keeper, source=source)
             print(f"{changed} changed; {unchanged} unchanged")
@@ -2014,6 +2203,8 @@ def main(argv: list[str] | None = None) -> int:
             _ = edit_reviews(keeper, identity, resolved, source=source)
         elif name == "add":
             changes = _cli_changes(args, record)
+            if add_evidence is not None:
+                changes["evidence"] = _append_evidence(changes.get("evidence", ""), add_evidence)
             number = cast(dict[str, object], vars(args)).get("number")
             owner = changes.get("owner")
             if owner is None:

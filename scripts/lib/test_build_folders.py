@@ -1003,6 +1003,28 @@ print('signals')
         self.assertFalse(path.exists())
         self.assertFalse(path.with_name(path.name + ".lock").exists())
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+        with self.subTest(request="persistent unique"):
+            config = self.root / "persistent-config"
+            config.mkdir()
+            _ = (config / "build_folders.conf").write_text("""\
+# whole: 1..
+names.suffix_length=12
+names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
+patterns.legacy-unique={purpose}{suffix}
+# range: 0.001..60
+locks.probe_wait_seconds=0.25
+# range: 0.001..1
+locks.probe_retry_seconds=0.005
+""")
+            request = folders.UniqueBuildFolder("persistent-", folders.ExplicitBuildParent(self.root))
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                with folders.leased_build_folder(request) as persistent:
+                    self.assertTrue(persistent.name.startswith("persistent-"))
+                    self.assertEqual(len(persistent.name.removeprefix("persistent-")), 12)
+                    self.assertEqual(folders.build_folder_state(persistent), "held")
+                    _ = (persistent / "proof").write_text("saved")
+                self.assertEqual(folders.build_folder_state(persistent), "free")
+                self.assertEqual((persistent / "proof").read_text(), "saved")
 
     def test_collector_scans_the_folder_path_after_the_parent_changes(self) -> None:
         old_parent = self.root / "old-parent"
@@ -1041,6 +1063,14 @@ print('signals')
             _ = folders.remove_build_folder(path, cleanup)
         cleanup.assert_called_once_with()
         self.assertFalse(path.parent.exists())
+
+    def test_retry_after_removal_does_not_leave_a_lock(self) -> None:
+        path = self.root / "tree"
+        path.mkdir()
+        self.assertTrue(folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+        with self.assertRaises(FileNotFoundError):
+            _ = folders.remove_build_folder(path, lambda: shutil.rmtree(path))
+        self.assertFalse(path.with_suffix(".lock").exists())
 
     def test_release_removed_folder_only_releases_a_free_pair_for_an_absent_path(self) -> None:
         outcome = folders.FolderPairRelease

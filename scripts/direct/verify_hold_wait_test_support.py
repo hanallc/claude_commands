@@ -37,7 +37,8 @@ from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct.verify_mac_offload_test_support import (
     VerifyMacOffloadFixture, CallRecord, CARGO_STUB, hold_recorder_exits, install_fixed_cargo, wait_for_marker_exit,
 )
-from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, episode_is_assigned, local_release_waiter
+from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib import inotify
 from scripts.lib.build_folders_test_support import tool_folders
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -76,6 +77,56 @@ class CallWithHoldWait(CallRecord):
 
 def read_cycle_file(path: Path) -> build_hold.HoldCycle:
     return cast(build_hold.HoldCycle, json.loads(path.read_text()))
+
+
+def wait_rows(session: Path) -> list[dict[str, object]]:
+    """Read the recorder's wait events from its private history."""
+    state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
+    return [row for line in Path(cast(str, state["history_file"])).read_text().splitlines(keepends=True)
+            if line.endswith("\n")
+            and str((row := cast(dict[str, object], json.loads(line)))["event_type"]).startswith("wait_")]
+
+
+def recorded_holders(rows: list[dict[str, object]]) -> list[object]:
+    return [row["holder"] for row in rows if row["event_type"] in ("wait_started", "wait_holder_seen")]
+
+
+def wait_for_verify_state(ready: Callable[[], bool], directory: Path, process: subprocess.Popen[str],
+                          what: str) -> None:
+    """Wait for the fixture state or the caller's exit."""
+    wait_until(lambda: ready() or process.poll() is not None, directory, processes=(process,))
+    if not ready():
+        raise AssertionError(f"verify exited {process.returncode} before {what}")
+
+
+def wait_for_target_holder(episode: str) -> None:
+    """Pause when the recorder writes a new holder entry."""
+    root = Path(os.environ["PACKAGE_ROOT"])
+    session = Path(os.environ["UNIT_RUN_DIR"])
+    pauses = int(os.environ["TEST_TARGET_PAUSES"])
+    admission = Path(os.environ["TEST_TARGET_ADMISSION"])
+    snapshot = admission / "queue.json"
+    state = admission / "state.json"
+
+    def snapshot_version() -> tuple[int, int] | None:
+        try:
+            status = snapshot.stat()
+        except FileNotFoundError:
+            return None
+        return status.st_ino, status.st_mtime_ns
+
+    previous = snapshot_version()
+    for number in range(1, pauses + 1):
+        resume = root / f"target-resume-{number}"
+        if resume.exists():
+            continue
+        if len(recorded_holders(wait_rows(session))) >= number:
+            (root / f"target-holder-{number}").touch()
+            wait_for_file(resume)
+            return
+        break
+    # The next pass can publish new provider evidence.
+    wait_until(lambda: snapshot_version() != previous or episode_is_assigned(state, episode), admission)
 
 
 @contextmanager
@@ -192,15 +243,15 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @classmethod
     @override
-    def setUpClass(cls) -> None:
+    def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
         # Copy files before starting the admission server for each test.
         builder = VerifyMacOffloadFixture()
         cls.addClassCleanup(builder.doCleanups)
-        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-")))
+        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-", dir=fixture_parent)))
         builder.build_fixture()
         _ = copy_helpers(builder.home, "scripts/astra", "scripts/accounts")
         cls.fixture_root = builder.root
-        seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-"))
+        seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-", dir=fixture_parent))
         cls.fixture_seed = Path(seed_directory) / "seed"
         # These tests select a known interpreter, including recorder observers.
         # Version discovery is the lib/py suite's boundary. Preserve every
@@ -256,12 +307,11 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
-        # Completed calls are drained here; the unchanged final marker scan
-        # still observes and reaps detached children before restoring the seed.
-        if process.poll() is None:
+        # Stop owned processes before draining pipes that a descendant can hold open.
+        if process.poll() is None or any(
+            stream is not None and not stream.closed for stream in (process.stdout, process.stderr)
+        ):
             super().stop_verify(process)
-        else:
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
 
 class VerifyHoldWaitFixture(unittest.TestCase):
@@ -278,9 +328,9 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     @classmethod
     @override
-    def setUpClass(cls) -> None:
+    def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
         cls.addClassCleanup(VerifyHoldTools.doClassCleanups)
-        VerifyHoldTools.setUpClass()
+        VerifyHoldTools.setUpClass(fixture_parent=fixture_parent)
 
     @override
     def setUp(self) -> None:
@@ -370,10 +420,7 @@ exit "$status"
             _ = admission.occupy_host()
             admission.free(0)
         _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
-            'lint_config_enabled() {\n'
-            + '    [[ "$1" == clippy ]] || return 1\n'
-            + '    exec {trace_fd}>&2; BASH_XTRACEFD=$trace_fd; set -x\n'
-            + '}\n'
+            'lint_config_enabled() { [[ "$1" == clippy ]]; }\n'
             + 'lint_config_skip_notice() { :; }\n')
         self.fixture.environment.update({
             "UNIT_RUN_DIR": str(self.fixture.board), "BUILDLOG_SYNC": "1",
