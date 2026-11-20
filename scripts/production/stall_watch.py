@@ -35,6 +35,7 @@ from uuid import uuid4
 
 
 from scripts.agents import detached_runs
+from scripts.build_targets.targets import Held, StartNotRecorded, StateUnreadable, local_hold_states
 from scripts.lib import conf_reads
 from scripts.lib import conf as tunables
 from scripts.message import session_send
@@ -66,6 +67,7 @@ WATCH_DEFAULTS = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
 WAITING_KINDS = ("done", "blocked", "gate", "decision")
 COMPACTION_WAKE_KIND = "blocked"
 HOLDING_KIND = "holding"
+BUILD_HOLD_WAIT = re.compile(r"\b(?:build\s+hold|hold\s+release)\b", re.IGNORECASE)
 TURN_END = re.compile(rf"^\s*(?:[●⏺]\s+)?(?P<status>(?:— )?(?P<kind>{'|'.join((*WAITING_KINDS, HOLDING_KIND))}):.*)$",
                       re.MULTILINE)
 # A time a holding line names: a date, with or without its year, is optional, and UTC or GMT marks a time
@@ -696,6 +698,14 @@ def status_defers_bump(status: str, peers: Iterable[str], own_names: tuple[str, 
         raise ValueError("external_wait_pattern must capture a nonempty owner")
     owner = owner.strip()
     return names_outside(owner, fields["external_owner_pattern"].strip(), peers, own_names, at_start=True)
+
+
+def build_hold_is_live() -> bool:
+    states = local_hold_states()
+    for state in states:
+        if isinstance(state, StateUnreadable):
+            print(f"stall-watch: build hold state unreadable: {state.reason}", file=sys.stderr)
+    return any(isinstance(state, Held) and not isinstance(state.since, StartNotRecorded) for state in states)
 
 
 def holding_names_outside(status: str, peers: Iterable[str], own_names: tuple[str, ...]) -> bool:
@@ -1398,6 +1408,7 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
     busy_pane_workers: PaneWorkersUnread | BusyPaneWorkerParents = PaneWorkersUnread()
     inspection_started = False
     labels_by_session: dict[str, dict[str, str]] = {}
+    live_build_hold = bool(work) and build_hold_is_live()
     for production_name, configured, zone, peers, name, unit, claude, row in inspection_order(work):
         if isinstance(rows, ProcessSnapshotFailure):
             continue
@@ -1523,7 +1534,9 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             own_names = (name, unit.unit, claude.name, labels.get(unit.place.pane, ""), f"session:{session_id}")
             try:
                 deferred = bool(turn) and status_defers_bump(last, peers, own_names)
-                holding = turn is not None and turn.group("kind") == HOLDING_KIND and holding_names_outside(last, peers, own_names)
+                holding = (turn is not None and turn.group("kind") == HOLDING_KIND
+                           and (holding_names_outside(last, peers, own_names)
+                                or (live_build_hold and BUILD_HOLD_WAIT.search(last) is not None)))
             except (OSError, UnicodeError, KeyError, ValueError, re.error, IndexError) as error:
                 print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
                 continue
@@ -1563,7 +1576,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             if not holding and socket and not stretch["bump_sent"]:
                 report.decision = "idle bump requested"
                 text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
-                        "Continue your run; if you are waiting on someone, say on whom in one line.")
+                        "Continue your run. If you wait for someone, name that person in your status line. "
+                        + "Do not reply to stall-watch.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
             if not holding and socket and not stretch["tell_sent"] and showrunner_socket:
                 text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
