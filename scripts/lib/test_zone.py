@@ -264,6 +264,26 @@ class SetTests(unittest.TestCase):
         self.assertFalse(self.queued().exists())
         self.assertFalse(any("broadcast.py" in call[-1] for call in self.log("ssh.log")[before:]))
 
+    def test_a_late_mac_write_failure_cannot_queue_a_superseded_notice(self) -> None:
+        def write_mac(stem: str, key: str, value: str, *, order: int) -> str:
+            self.assertEqual((stem, key), ("user_zone", "zone"))
+            if value == "America/Curacao":
+                self.assertEqual(order, 1)
+                self.assertEqual(zone.set_zone("Paris"), 0)
+                return "mac: not live yet (fixture timeout)"
+            self.assertEqual((value, order), ("Europe/Paris", 2))
+            return "mac: live now: zone=Europe/Paris"
+
+        with (mock.patch.dict(os.environ, self.env, clear=True),
+              mock.patch.object(user_zone, "CONF", self.checkout / "config/user_zone.conf"),
+              mock.patch.object(live_settings, "write_mac", side_effect=write_mac),
+              mock.patch.object(live_settings, "publish", return_value=[]),
+              mock.patch.object(zone, "broadcast_on_mac", return_value=(False, "zone differs")) as retry):
+            self.assertEqual(zone.set_zone("Curacao"), 0)
+
+        retry.assert_not_called()
+        self.assertFalse(self.queued().exists())
+
     def test_a_promotion_without_a_tip_receipt_retries_the_saved_pull(self) -> None:
         _ = (self.fakes / "OFFLINE").write_text("", encoding="utf-8")
         _ = self.run_zone("set", "Curacao")

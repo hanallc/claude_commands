@@ -245,11 +245,15 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
               patch("platform.system", return_value="Darwin"),
               patch.object(models_registry, "DEFAULT_PATH", registry),
               patch.object(main_push_lock, "main_push_lock", busy_lock),
+              patch.object(land_main, "land", wraps=land_main.land) as land,
               patch.object(main_push_lock, "request_publication", return_value=land_queue.SETTINGS_WAIT_NOTICE) as waiter):
             self.assertEqual(models_registry.store_registry(registry, before, after, "fixture"), after)
 
         waiter.assert_not_called()
         self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, after)
+        self.assertEqual(land.call_count, 1)
+        self.assertEqual(cast(object, land.call_args.kwargs.get("time_limit", land_main.UNLIMITED_GIT)),
+                         land_main.UNLIMITED_GIT)
 
     def test_registry_publication_uses_the_settings_push_time_limit(self) -> None:
         before = "[fixture]\nmodel=old\n"
@@ -259,6 +263,7 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         after = before.replace("model=old", "model=new")
         environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "1", "TMPDIR": str(self.root)}
         with (patch.dict(os.environ, environment, clear=True),
+              patch("platform.system", return_value="Linux"),
               patch.object(models_registry, "DEFAULT_PATH", registry),
               patch.object(land_main, "land", wraps=land_main.land) as land):
             self.assertEqual(models_registry.store_registry(registry, before, after, "fixture"), after)

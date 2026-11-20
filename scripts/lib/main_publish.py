@@ -56,6 +56,8 @@ class PendingMacPull:
     since: str
     reason: str
     pulls: tuple[MacCheckoutPull, ...] = _LEGACY_MAC_PULL
+    # Legacy notices and pull-only records use order zero.
+    notice_order: int = 0
 
 
 @dataclass(frozen=True)
@@ -277,8 +279,10 @@ def read_queue() -> PendingMacPull | NoPendingMacPull:
         source = str(row["source"])
         pulls.append(MacCheckoutPull(PurePosixPath(str(row["mac"])),
                                      Path(source) if source else MacPullSourceUnrecorded(), str(row.get("tip", ""))))
+    order = fields.get("notice_order", 0)
     return PendingMacPull(cast(str, fields["zone"]), cast(str, fields["text"]),
-                          cast(str, fields["since"]), cast(str, fields["reason"]), tuple(pulls))
+                          cast(str, fields["since"]), cast(str, fields["reason"]), tuple(pulls),
+                          order if type(order) is int else 0)
 
 
 @contextmanager
@@ -293,16 +297,30 @@ def _queue_update() -> Generator[None]:
 def queue(change: PendingMacPull) -> None:
     """Coalesce pulls while retaining an earlier zone notice."""
     with _queue_update():
-        previous = read_queue()
-        if isinstance(previous, PendingMacPull):
-            pulls = {pull.mac: pull for pull in previous.pulls}
-            for pull in change.pulls:
-                if pull.tip or pull.mac not in pulls or not pulls[pull.mac].tip:
-                    pulls[pull.mac] = pull
-            change = replace(change, pulls=tuple(pulls.values()))
-            if not change.text and previous.text:
-                change = replace(change, label=previous.label, text=previous.text, since=previous.since)
-        _write_queue(change)
+        _merge_queue(change)
+
+
+def queue_zone_notice(change: PendingMacPull) -> bool:
+    """Queue the notice if its Save is still current."""
+    with waiting_rows.locked_journal(waiting_rows.journal_path()) as journal:
+        if change.notice_order != journal.order("user_zone", "zone"):
+            return False
+        _merge_queue(change)
+        return True
+
+
+def _merge_queue(change: PendingMacPull) -> None:
+    previous = read_queue()
+    if isinstance(previous, PendingMacPull):
+        pulls = {pull.mac: pull for pull in previous.pulls}
+        for pull in change.pulls:
+            if pull.tip or pull.mac not in pulls or not pulls[pull.mac].tip:
+                pulls[pull.mac] = pull
+        change = replace(change, pulls=tuple(pulls.values()))
+        if not change.text and previous.text:
+            change = replace(change, label=previous.label, text=previous.text, since=previous.since,
+                             notice_order=previous.notice_order)
+    _write_queue(change)
 
 
 def _write_queue(change: PendingMacPull) -> None:
@@ -310,6 +328,7 @@ def _write_queue(change: PendingMacPull) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, json.dumps(dict(zone=change.label, text=change.text,
                                            since=change.since, reason=change.reason,
+                                           notice_order=change.notice_order,
                                            pulls=[dict(mac=str(pull.mac), tip=pull.tip,
                                                        source=str(pull.source) if isinstance(pull.source, Path) else "")
                                                   for pull in change.pulls]), indent=2) + "\n")
@@ -336,9 +355,17 @@ def clear_notice(notice: PendingMacPull) -> None:
     """Clear the notice only if it still matches the queue."""
     with _queue_update():
         pending = read_queue()
-        if isinstance(pending, PendingMacPull) and (pending.label, pending.since, pending.text) == (
-                notice.label, notice.since, notice.text):
-            _finish_queue_update(replace(pending, text=""))
+        if isinstance(pending, PendingMacPull) and (pending.label, pending.since, pending.text, pending.notice_order) == (
+                notice.label, notice.since, notice.text, notice.notice_order):
+            _finish_queue_update(replace(pending, text="", notice_order=0))
+
+
+def clear_superseded_zone_notice(save_order: int) -> None:
+    """Clear any queued notice this Mac write supersedes."""
+    with _queue_update():
+        pending = read_queue()
+        if isinstance(pending, PendingMacPull) and pending.text and pending.notice_order <= save_order:
+            _finish_queue_update(replace(pending, text="", notice_order=0))
 
 
 def _finish_queue_update(pending: PendingMacPull) -> None:

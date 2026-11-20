@@ -68,7 +68,7 @@ A Claude launch turns that word into the newest model of the family; see [Claude
 It first writes the changed rows live: it replays them against the latest text under an exclusive writer lock.
 It preserves unrelated edits, file mode, comments, and spacing.
 The live write never waits for the main push lock, so the new value is in effect at once.
-Publication follows the live write. During a land, a detached publisher waits for a gap.
+Publication follows the live write. During a land on natedev, a detached publisher waits for a gap.
 A failed publication keeps the rows live and reports `the rows are live; main does not have them yet`.
 `store_registry` returns the live text. The `store` command builds `configuration_shell` from that text.
 
@@ -79,7 +79,8 @@ The shared writer fetches origin and checks fast-forward safety with a temporary
 `models_registry._fetch(repo, branch)` fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` and reads that ref, never `FETCH_HEAD`.
 Every fetch in the checkout writes `FETCH_HEAD`, so another fetch between the fetch and the read cannot change the target.
 With `fetch.prune=true`, this one-ref refspec prunes no other `origin/*` ref.
-Main publication holds the gap and main push locks through Git and local reconciliation.
+On natedev, main publication holds the gap and main push locks through Git and local reconciliation.
+On the Mac, main publication takes only the main push lock.
 The writer lock protects the live edit.
 An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
 Its subject is `config(models): <description>`.

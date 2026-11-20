@@ -346,7 +346,8 @@ def _publish(repo: Path, path: Path, description: str) -> bool:
         raise OSError(f"registry publication refused: HEAD has {len(foreign)} commits that are not on "
                       + f"origin/{branch}: {' '.join(foreign[:5])}")
     last_error = ""
-    time_limit = land_main.CommandTimeLimit(conf.read_or_repository("live_settings").whole("push_seconds"))
+    time_limit = (land_main.UNLIMITED_GIT if platform.system() == "Darwin"
+                  else land_main.CommandTimeLimit(conf.read_or_repository("live_settings").whole("push_seconds")))
     for attempt in range(3):
         with waiting_rows.locked_checkout(repo):
             waiting_rows.restore_checkout(repo, "HEAD")

@@ -1063,6 +1063,8 @@ class MacPromotionPathTests(unittest.TestCase):
         self.assertTrue(remote.startswith(f"cd '/Users/someone/my repo' && {MAC_RECOVERY} && tip=$(git ls-remote"), remote)
 
     def test_mac_pull_queues_only_connection_failures_and_preserves_zone_notices(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ))
+        _ = os.environ.pop("MAC_WAKE_PROGRAM", None)
         cases = (("offline", 255, "", "", main_publish.MacPullPending),
                  ("remote failure", 0, "rc=1\n", "", checkpoint_gate.Stop),
                  ("remote exit 255", 255, "rc=1\n", "", checkpoint_gate.Stop),
@@ -1083,7 +1085,6 @@ class MacPromotionPathTests(unittest.TestCase):
                                       + "# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
                 with mock.patch.dict(os.environ, {"ZONE_STATE": str(state / "zone"), "CONF_DIR": folder,
                                                   "PATH": folder + os.pathsep + os.environ["PATH"]}):
-                    _ = os.environ.pop("MAC_WAKE_PROGRAM", None)
                     waiting = main_publish.PendingMacPull("zone", text, "2026-11-08", "earlier failure")
                     if text or expected is not main_publish.MacPullPending:
                         main_publish.queue(waiting)
