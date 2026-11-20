@@ -658,7 +658,7 @@ A fresh nextest estimate expires after one running-pass interval. Other history 
 A program uses its history estimate and refreshes it under the normal estimate policy.
 The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
-The gate removes its progress counter before reruns, which keep the full need.
+The gate removes its progress counter before reruns. The peak decay rule applies without a counter.
 The merge-gate progress profile key includes `shape` (`tests` or `types`).
 Earlier profiles do not match, and nightly runs use separate profiles.
 It reads `merge_gate_governor_gib` when the gate starts; the initial value is 4 GiB.
@@ -670,8 +670,8 @@ Renderers use its `StepNames` value without file reads.
 Other sentences read the step names when they need the text.
 The Builds page uses the configured step name, including `targeted test` for `targeted-test`.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
-The run calculation uses the accepted need before tests start.
-For nextest, an observed test phase can select the frozen test-phase need instead.
+The run calculation can use a progress window or a frozen nextest test-phase need.
+It also applies the scoped test peak decay rule below.
 
 Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
 Cargo estimates separate compile history from no-compile history.
@@ -1829,7 +1829,7 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 - **Unfaked memory pressure.** On 2026-10-29, `test_brp_launch_gate.py` took 169 s against a 6 s median because its pressure reading was unfaked.
 
 - **Memory gate sizes.** The first need comes from `program_first_peak_gib.cargo` in `config/build_admission.conf`. Build steps use shape tiers. Other steps retain measured, build-log, and pooled tiers. The service reads process memory before host memory during each pass.
-- **One admitter after a hold release.** The service reads memory, decides, and persists grants in its loop. Each step retains its accepted need unless an observed test phase selects its frozen test-phase need. Swap-backed use reduces its keep-aside. Simultaneous callers cannot reserve the same room.
+- **One admitter after a hold release.** The service reads memory, decides, and persists grants in its loop. The current need and swap-backed use determine the keep-aside. Simultaneous callers cannot reserve the same room.
 - **Release outcomes vanish with the last holder file**; set-aside `*.damaged-*` files are never cleaned up. A holder joining a no-cycle hold learns nothing until the final release line tells it to broadcast.
 - **earlyoom never logs "killed";** its line is `sending SIGTERM to process <pid> uid ... "<comm>": ...`.
 - **zram is invisible to slice limits.** earlyoom counts zram's virtual size as swap; `MemoryMax` counts RAM only, and compressed pages are charged to no slice.
@@ -1896,8 +1896,40 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 
 A second promise rule is measured and declined (showrunner, 2026-10-28: simple wins). The rule: a running build whose need is above a limit keeps its full promise; the running builds at or under it are promised the largest gap in full plus `max(0, 0.6 x need - anon)` each. The replay used 4 h of 5 s admission samples (2026-10-28 03:27-07:27Z, 240 waits, 1863 wait minutes), and "short" counts admitting ticks where the running builds' real growth after the tick passes `MemAvailable` minus the reserve. With a 6 GiB limit the rule saves 331 of 1863 minutes against 249 for the current rule, with the short rate at 0.8% against 0% (5 GiB: 326 min, 0.9%; 8 GiB: 501 min, 1.4%). The same rule limited by the waiting step's need never gets below 6.9% short. At about 4% of the wait for a second rule and a nonzero short rate, it is not built; a shortfall is the 2026-09-30 freeze. Do not measure it again unless the mix of steps changes.
 
-A scoped reservation retains its accepted need while its scope contains a process.
-Admission and queue views use the same lifetime rule.
+A reservation stays active while its owner or scope is live.
+The `populated` field in `cgroup.events` keeps the scope live while a child cgroup has members.
+A live owner missing from the process scan keeps its accepted need.
+For `merge-gate`, `targeted-test`, `nextest`, and `test`, a complete scope or process tree reading can reduce the need after `peak_hold`.
+The service assigns shared memory to one reservation before it measures the peak.
+The need uses the largest sample since decay, multiplied by `test_phase_margin` and capped at the accepted need.
+The accepted need applies until a complete post-decay sample arrives.
+A complete sample of zero counts toward the peak.
+The service keeps this peak in memory for the current decay. After a restart, the first sample starts the measurement again.
+A recorded near-peak sample retains the accepted need for `peak_hold`, including after a service restart.
+A compiler or linker in the scope or process tree restores the accepted need.
+Only a test step with a decayed peak checks for compilers before and after its memory read.
+Other steps use the current process table or scope membership for memory accounting.
+For each test step that can use decay, the reader checks the identity, size, and timestamps of `.max` and `.wave` around the memory read.
+A change to either file during the read makes the peak evidence incomplete.
+A matching progress profile can reduce the need when the peak files stay stable and no peak is recorded.
+Each compiler check captures the member set, process start times, executables, and relevant compiler service jobs.
+The reader matches build tool families by process name or executable name after removing the target prefix and numeric version.
+The reader also recognizes Cargo build scripts with hashes.
+Cargo can remain active while test binaries run and the need decreases.
+A tool with a name outside the supported patterns escapes detection by name.
+A new near-peak sample still restores the accepted need.
+An idle sccache daemon in the compiler service does not count as a compiler job.
+A scope reservation checks sccache jobs tagged with its scope or a descendant cgroup.
+A tree reservation checks sccache jobs tagged with a live tree member's cgroup or a descendant cgroup.
+A recognized compiler with an absent, empty, or unreadable tag keeps the accepted need.
+The closest reserved scope owns each job's memory use.
+Matching snapshots with a compiler keep the accepted need and report that a compiler is running.
+A failed read or changed snapshot keeps the accepted need and records the reason for incomplete evidence.
+The memory reader excludes processes whose start times no longer match.
+These conditions override the progress window and the frozen nextest test-phase need.
+The decay rule works without a progress counter or a profile.
+The freed room can admit another step before a second compile starts. `MemAvailable` and the PSI hold still guard this interval.
+Admission and queue views use the same need calculation.
 The service retains `.max` and `.wave` until the owner and scope both end.
 
 A test-width update persists the reservation in `state.json` through `os.replace`. A stopped write leaves the previous state intact.
@@ -2207,8 +2239,8 @@ The service applies each step's recorded headroom rule to the highest selected b
 `progress_lookahead_percent` is read at use; its initial value is 20.
 The window crosses Cargo phase boundaries, including repeated build phases.
 The merge gate window stops at the end of `suites:1`, even when history contains rerun phases.
-Reruns without a measured window retain the full need. Each step has its own history key.
-Missing counters, profiles, or anonymous readings retain the full need.
+Each step has its own history key.
+Missing counters or profiles prevent progress-based changes to the need. The scoped test peak decay rule can still apply.
 Each saved record names its peak reading source with `ScopeReading` or `ProcessTreeReading`.
 `ScopeReading` stores the scope directory. `ProcessTreeReading` stores the process ids.
 At each new run peak, the service records the phase, bin, anonymous bytes, and source processes.

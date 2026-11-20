@@ -14,12 +14,13 @@ import json
 import math
 import mmap
 import os
+import re
 from statistics import median
 import subprocess
 import sys
 import uuid
 from collections import deque
-from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
@@ -882,21 +883,107 @@ def observed_test_phase(row: Reservation) -> ObservedTestPhase | UnobservedTestP
     return UnobservedTestPhase()
 
 
-def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
-    # The service reads this table on each pass. Plain strings and bytes cost half the CPU of Path objects.
-    processes: dict[int, ProcessIdentity] = {}
+TOOLCHAIN_VERSION = re.compile(rb"-[0-9]+(?:\.[0-9]+)*$")
+TOOLCHAIN_NAME = re.compile(
+    rb"(?:[a-z0-9_]+-(?:[a-z0-9_.]+-){2,3})?"
+    + rb"(?P<program>as|ld|cc|c\+\+|collect2|mold|ar|ranlib|rustc|sccache"
+    + rb"|(?:clang|gcc|g\+\+|cc1|lld|ld\.).*|.+-(?:ld|lld|link)"
+    + rb"|(?:build-script-build|build_script_build)(?:-[0-9a-f]+)?)"
+)
+
+
+def toolchain_program(name: bytes) -> bytes:
+    """Match a tool family after removing its target prefix and version."""
+    match = TOOLCHAIN_NAME.fullmatch(TOOLCHAIN_VERSION.sub(b"", name))
+    return match["program"] if match else b""
+
+
+class ProcessTable(dict[int, ProcessIdentity]):
+    """The process scan records whether a live process could be missing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.incomplete: bool = False
+
+
+class EndedProcessStat(Exception):
+    """The stat record describes an ended process."""
+
+
+def process_stat(path: str) -> tuple[ProcessIdentity, bytes]:
+    """Read the process start time, parent and program name from one stat record."""
+    with open(path, "rb", buffering=0) as handle:
+        head, stat = handle.read().rsplit(b") ", 1)
+    fields = stat.split()
+    _, separator, program = head.partition(b" (")
+    if not separator or not program:
+        raise ValueError("missing process name")
+    if fields[0] in (b"Z", b"X"):
+        raise EndedProcessStat(path)
+    return ProcessIdentity(int(fields[1]), fields[19].decode()), program
+
+
+def process_table(proc: Path = PROC) -> ProcessTable:
+    """Read the process ancestry before selecting members of each tree."""
+    processes = ProcessTable()
     root = os.fspath(proc)
     for name in os.listdir(root):
         if not name.isdecimal():
             continue
         try:
-            with open(f"{root}/{name}/stat", "rb", buffering=0) as handle:
-                fields = handle.read().rsplit(b") ", 1)[1].split()
-            if fields[0] not in (b"Z", b"X"):
-                processes[int(name)] = ProcessIdentity(int(fields[1]), fields[19].decode())
+            processes[int(name)], _ = process_stat(f"{root}/{name}/stat")
+        except EndedProcessStat:
+            pass
+        except (FileNotFoundError, ProcessLookupError):
+            if os.path.exists(f"{root}/{name}"):
+                processes.incomplete = True
         except (OSError, ValueError, IndexError):
-            continue
+            processes.incomplete = True
     return processes
+
+
+@dataclass(frozen=True)
+class ExecutableUnreadable:
+    """The process executable link could not be read."""
+
+
+@dataclass(frozen=True)
+class MemberIdentity:
+    """The start time and executable identify one process in a membership read."""
+    start: str
+    program: bytes
+    executable: str | ExecutableUnreadable
+
+    def executable_name(self) -> bytes:
+        if isinstance(self.executable, ExecutableUnreadable):
+            return b""
+        return os.fsencode(os.path.basename(self.executable).removesuffix(" (deleted)"))
+
+    def build_tool(self) -> bool:
+        return bool(toolchain_program(self.program) or toolchain_program(self.executable_name()))
+
+    def sccache_daemon(self) -> bool:
+        return toolchain_program(self.executable_name()) == b"sccache"
+
+
+@dataclass(frozen=True)
+class MemberIdentityUnavailable:
+    """The process stat record did not identify a live process."""
+
+
+def member_identity(pid: int, proc: Path) -> MemberIdentity | MemberIdentityUnavailable:
+    """Capture the identity of one process selected by PID."""
+    folder = proc / str(pid)
+    try:
+        identity, program = process_stat(str(folder / "stat"))
+    except (OSError, ValueError, IndexError, EndedProcessStat):
+        return MemberIdentityUnavailable()
+    executable: str | ExecutableUnreadable
+    try:
+        executable = os.readlink(folder / "exe")
+    except OSError:
+        executable = ExecutableUnreadable()
+    return MemberIdentity(identity.start, program, executable)
 
 
 def process_tree(roots: Mapping[int, str], processes: dict[int, ProcessIdentity]) -> set[int]:
@@ -925,7 +1012,7 @@ class LiveOwnerProcess:
     pass
 
 
-def scope_members(directory: Path) -> set[int]:
+def scope_members(directory: Path, *, require_complete: bool = False) -> set[int]:
     """Read nested scope members and skip scopes removed during the walk."""
     members: set[int] = set()
     pending = [directory]
@@ -937,36 +1024,235 @@ def scope_members(directory: Path) -> set[int]:
             members.update(int(pid) for pid in path.read_text().split())
             pending.extend(child for child in scope.iterdir() if child.is_dir())
         except OSError as error:
-            if error.errno not in (errno.ENOENT, errno.ESRCH, errno.ENODEV):
+            if error.errno not in (errno.ENOENT, errno.ESRCH, errno.ENODEV) or (require_complete and scope.exists()):
                 raise
     return members
 
 
-def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> MeasuredMemory:
-    """Read swap-backed use from the scope or processes; retain resident bytes and swap."""
-    if isinstance(source, PopulatedStepScope):
-        reading = slice_working_set(source.directory)
+@dataclass(frozen=True)
+class MemberReadFailed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class CompleteMembership:
+    pass
+
+
+@dataclass(frozen=True)
+class MemberSnapshot:
+    identities: Mapping[int, MemberIdentity | MemberIdentityUnavailable]
+    jobs: Mapping[int, Path] = field(default_factory=dict[int, Path])
+    membership: CompleteMembership | MemberReadFailed = CompleteMembership()
+    job_scope_source: ScopeSource | records.NoSource = records.NoSource()
+
+    def membership_read(self) -> CompleteMembership | MemberReadFailed:
+        if isinstance(self.membership, MemberReadFailed):
+            return self.membership
+        for pid, identity in self.identities.items():
+            if isinstance(identity, MemberIdentityUnavailable):
+                return MemberReadFailed(f"process {pid}: identity unavailable")
+            if isinstance(identity.executable, ExecutableUnreadable):
+                return MemberReadFailed(f"process {pid}: executable unavailable")
+        return self.membership
+
+    def compiling(self) -> bool:
+        return bool(self.jobs) or any(isinstance(identity, MemberIdentity) and identity.build_tool()
+                                     for identity in self.identities.values())
+
+
+@dataclass(frozen=True)
+class MemorySnapshot:
+    members: MemberSnapshot
+    compiler_jobs: MemberSnapshot
+
+    def compiling(self) -> bool:
+        return self.members.compiling() or self.compiler_jobs.compiling()
+
+
+@dataclass(frozen=True)
+class MemberEvidence:
+    before: MemorySnapshot
+    after: MemorySnapshot
+
+    def stable_pids(self) -> frozenset[int]:
+        """Keep only processes whose start time still matches."""
+        return frozenset(pid for pid, first in self.before.members.identities.items()
+                         if isinstance(first, MemberIdentity)
+                         and isinstance(last := self.after.members.identities.get(pid), MemberIdentity)
+                         and first.start == last.start)
+
+    def compiler_evidence(self) -> records.CompilerEvidence:
+        for snapshot in (self.before, self.after):
+            for members in (snapshot.members, snapshot.compiler_jobs):
+                membership = members.membership_read()
+                if isinstance(membership, MemberReadFailed):
+                    return records.CompilerEvidenceIncomplete(membership.reason)
+        if self.before != self.after:
+            return records.CompilerEvidenceIncomplete("process members, identities, or compiler jobs changed")
+        return records.CompilerSeen() if self.before.compiling() else records.NoCompilerSeen()
+
+
+@dataclass(frozen=True)
+class SkipCompilerJobs:
+    """This read does not need a separate compiler service snapshot."""
+
+
+@dataclass(frozen=True)
+class MatchTreeCompilerJobs:
+    """Match jobs to the cgroups of the live tree members."""
+
+
+SKIP_COMPILER_JOBS = SkipCompilerJobs()
+
+
+def scope_contains_job(scope: Path, job_scope: Path) -> bool:
+    """Match a job in the scope or any of its descendants."""
+    return job_scope.is_relative_to(scope)
+
+
+def tree_member_cgroups(members: MemberSnapshot, proc: Path) -> set[Path] | MemberReadFailed:
+    """Read the unified cgroup of each live tree member."""
+    cgroups: set[Path] = set()
+    for pid, identity in members.identities.items():
+        if isinstance(identity, MemberIdentityUnavailable):
+            continue
+        path = proc / str(pid) / "cgroup"
         try:
-            members = frozenset(scope_members(source.directory))
-        except (OSError, ValueError) as error:
-            return replace(reading, anonymous=RunUseUnavailable(f"{source.directory}: {error}"),
-                           anonymous_source=ScopeSource(source.directory, frozenset()))
-        return replace(reading, anonymous_source=ScopeSource(source.directory, members))
-    used, swapped = 0, 0
-    process_uses: list[ProcessAnonymousUse] = []
-    for child in sorted(source):
-        path = proc / str(child) / "status"
-        try:
-            contents = _read_proc_text(path).splitlines()
+            for line in _read_proc_text(path).splitlines():
+                if line.startswith("0::/"):
+                    cgroups.add(Path("/sys/fs/cgroup") / line[4:].lstrip("/"))
+                    break
+            else:
+                return MemberReadFailed(f"{path}: unified cgroup unavailable")
         except OSError as error:
-            use = (AnonymousRunUse(0) if error.errno in (errno.ENOENT, errno.ESRCH) else
-                   RunUseUnavailable(f"{path}: {error.strerror or error}"))
+            return MemberReadFailed(f"{path}: {error}")
+    return cgroups
+
+
+def read_with_members[T](members: Callable[[], MemberSnapshot], read: Callable[[MemberSnapshot], T],
+                         proc: Path, compiler_scope: Path | MatchTreeCompilerJobs | SkipCompilerJobs = SKIP_COMPILER_JOBS
+                         ) -> tuple[T, MemberEvidence]:
+    """Check the same member and compiler job sets around a memory read."""
+    def capture() -> MemorySnapshot:
+        selected = members()
+        if isinstance(compiler_scope, SkipCompilerJobs):
+            return MemorySnapshot(selected, MemberSnapshot({}))
+        snapshot = compiler_members(proc)
+        if not snapshot.jobs or isinstance(snapshot.membership, MemberReadFailed):
+            return MemorySnapshot(selected, MemberSnapshot({}, membership=snapshot.membership))
+        scopes = ({compiler_scope} if isinstance(compiler_scope, Path)
+                  else tree_member_cgroups(selected, proc))
+        if isinstance(scopes, MemberReadFailed):
+            return MemorySnapshot(selected, MemberSnapshot({}, membership=scopes))
+        matching = {pid: job_scope for pid, job_scope in snapshot.jobs.items()
+                    if any(scope_contains_job(scope, job_scope) for scope in scopes)}
+        jobs = MemberSnapshot({pid: snapshot.identities[pid] for pid in matching}, matching)
+        return MemorySnapshot(selected, jobs)
+
+    before = capture()
+    reading = read(before.members)
+    return reading, MemberEvidence(before, capture())
+
+
+def capture_members(pids: set[int] | Mapping[int, str], proc: Path) -> MemberSnapshot:
+    identities: dict[int, MemberIdentity | MemberIdentityUnavailable] = {}
+    for pid in pids:
+        identity = member_identity(pid, proc)
+        if isinstance(identity, MemberIdentity) and isinstance(pids, Mapping) and identity.start != pids[pid]:
+            identity = MemberIdentityUnavailable()
+        identities[pid] = identity
+    return MemberSnapshot(identities)
+
+
+def scope_snapshot(directory: Path, proc: Path) -> MemberSnapshot:
+    try:
+        return capture_members(scope_members(directory, require_complete=True), proc)
+    except (OSError, ValueError) as error:
+        return MemberSnapshot({}, membership=MemberReadFailed(f"{directory}: {error}"))
+
+
+def scoped_memory(directory: Path, proc: Path, *, track_compilers: bool) -> MeasuredMemory:
+    if not track_compilers:
+        try:
+            starts = live_process_starts(scope_members(directory, require_complete=True), proc)
+        except (OSError, ValueError) as error:
+            reading = slice_working_set(directory)
+            return replace(reading, anonymous=RunUseUnavailable(f"{directory}: {error}"),
+                           anonymous_source=ScopeSource(directory, frozenset()))
+        reading = slice_working_set(directory)
+        return replace(reading, anonymous_source=ScopeSource(directory, matching_process_starts(starts, proc)))
+    reading, evidence = read_with_members(lambda: scope_snapshot(directory, proc),
+                                          lambda _: slice_working_set(directory), proc, directory)
+    membership = evidence.before.members.membership
+    anonymous = RunUseUnavailable(membership.reason) if isinstance(membership, MemberReadFailed) else reading.anonymous
+    compilers = evidence.compiler_evidence()
+    if isinstance(anonymous, RunUseUnavailable):
+        compilers = records.CompilerEvidenceIncomplete(anonymous.reason)
+    elif isinstance(compilers, records.NoCompilerSeen) and not evidence.before.members.identities:
+        compilers = records.CompilerEvidenceIncomplete(f"{directory}: scope has no members")
+    return replace(reading, anonymous=anonymous,
+                   anonymous_source=ScopeSource(directory, evidence.stable_pids(), compiler_evidence=compilers))
+
+
+def live_process_starts(pids: Iterable[int], proc: Path) -> dict[int, str]:
+    starts: dict[int, str] = {}
+    for pid in pids:
+        try:
+            identity, _ = process_stat(str(proc / str(pid) / "stat"))
+        except (OSError, ValueError, IndexError, EndedProcessStat):
+            continue
+        starts[pid] = identity.start
+    return starts
+
+
+def matching_process_starts(starts: Mapping[int, str], proc: Path) -> frozenset[int]:
+    return frozenset(pid for pid, current in live_process_starts(starts, proc).items() if current == starts[pid])
+
+
+def process_memory(source: set[int] | Mapping[int, str] | PopulatedStepScope, proc: Path = PROC, *,
+                   track_compilers: bool = False) -> MeasuredMemory:
+    """Read resident memory and swap from a scope or its processes."""
+    if isinstance(source, PopulatedStepScope):
+        return scoped_memory(source.directory, proc, track_compilers=track_compilers)
+    starts = live_process_starts(source, proc) if isinstance(source, set) else source
+    samples = read_process_samples(source, proc)
+    return measured_processes(samples, matching_process_starts(starts, proc), proc,
+                              compilers=records.CompilerEvidenceNotRecorded())
+
+
+def read_process_samples(pids: Iterable[int], proc: Path) -> dict[int, str | OSError]:
+    samples: dict[int, str | OSError] = {}
+    for pid in sorted(pids):
+        try:
+            samples[pid] = _read_proc_text(proc / str(pid) / "status")
+        except OSError as error:
+            samples[pid] = error
+    return samples
+
+
+def measured_processes(samples: Mapping[int, str | OSError], stable: Collection[int], proc: Path, *,
+                       compilers: records.CompilerEvidence | records.CompilerEvidenceNotRecorded) -> MeasuredMemory:
+    """Count memory only for processes with a matching start time."""
+    used, swapped = 0, 0
+    memory_read_incomplete = False
+    process_uses: list[ProcessAnonymousUse] = []
+    for child, sample in samples.items():
+        path = proc / str(child) / "status"
+        if not isinstance(sample, str):
+            memory_read_incomplete = True
+            use = (AnonymousRunUse(0) if sample.errno in (errno.ENOENT, errno.ESRCH)
+                   else RunUseUnavailable(f"{path}: {sample}"))
             process_uses.append(ProcessAnonymousUse(child, use))
+            continue
+        if child not in stable:
+            memory_read_incomplete = True
+            process_uses.append(ProcessAnonymousUse(child, RunUseUnavailable(f"{path}: process identity changed")))
             continue
         rss_present = False
         swap_backed_seen: set[str] = set()
         swap_backed_fields: dict[str, int] = {}
-        for line in contents:
+        for line in sample.splitlines():
             parts = line.split()
             if not parts:
                 continue
@@ -985,14 +1271,22 @@ def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> 
                 swap_backed_seen.add(parts[0])
                 swap_backed_fields.update(kib_fields(parts))
         if not rss_present:
+            memory_read_incomplete = True
             use = AnonymousRunUse(0)
         elif "RssAnon" in swap_backed_fields and "RssShmem" in swap_backed_fields:
             use = AnonymousRunUse(swap_backed_fields["RssAnon"] + swap_backed_fields["RssShmem"])
         else:
             use = RunUseUnavailable(f"{path}: swap-backed memory unavailable (RssAnon or RssShmem missing or invalid)")
         process_uses.append(ProcessAnonymousUse(child, use))
-    return MeasuredMemory(used, swap_bytes=swapped, anonymous=sum_swap_backed_use(item.use for item in process_uses),
-                          anonymous_source=ProcessSource(tuple(process_uses)))
+    anonymous = sum_swap_backed_use(item.use for item in process_uses)
+    if not isinstance(compilers, records.CompilerEvidenceNotRecorded):
+        if isinstance(anonymous, RunUseUnavailable):
+            compilers = records.CompilerEvidenceIncomplete(anonymous.reason)
+        elif memory_read_incomplete:
+            compilers = records.CompilerEvidenceIncomplete("process memory reading is incomplete")
+    return MeasuredMemory(used, swap_bytes=swapped, anonymous=anonymous,
+        anonymous_source=ProcessSource(tuple(process_uses), memory_read_incomplete=memory_read_incomplete,
+                                      compiler_evidence=compilers))
 
 
 def sum_swap_backed_use(readings: Iterable[AnonymousRunUse | RunUseUnavailable]) -> AnonymousRunUse | RunUseUnavailable:
@@ -1016,10 +1310,30 @@ def swap_backed_use_less(use: AnonymousRunUse | RunUseUnavailable,
 
 
 def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
-                proc: Path = PROC) -> MeasuredMemory | GoneMemory:
-    """Read resident bytes and swap separately from one process table reading."""
-    members = process_tree({pid: start}, processes)
-    return process_memory(members, proc) if members else GoneMemory()
+                proc: Path = PROC, *, track_compilers: bool = False) -> MeasuredMemory | GoneMemory:
+    """Read tree memory and capture compiler evidence for a decayed test."""
+    owner = processes.get(pid)
+    if owner is None or owner.start != start:
+        return GoneMemory()
+    roots = {pid: start}
+    if not track_compilers:
+        return process_memory({member: processes[member].start for member in process_tree(roots, processes)}, proc)
+
+    def members() -> MemberSnapshot:
+        try:
+            table = process_table(proc)
+        except OSError as error:
+            return MemberSnapshot({}, membership=MemberReadFailed(str(error)))
+        descendants = process_tree(roots, table)
+        starts = {member: processes.get(member, table[member]).start for member in descendants}
+        snapshot = capture_members(starts, proc)
+        if not descendants or table.incomplete:
+            return replace(snapshot, membership=MemberReadFailed("process tree is incomplete"))
+        return snapshot
+
+    samples, evidence = read_with_members(members, lambda snapshot: read_process_samples(snapshot.identities, proc),
+                                          proc, MatchTreeCompilerJobs())
+    return measured_processes(samples, evidence.stable_pids(), proc, compilers=evidence.compiler_evidence())
 
 
 @dataclass(frozen=True)
@@ -1040,10 +1354,10 @@ def reservation_lifetime(row: Reservation, owner_live: bool) -> StepLifetime:
             scope_name = ""
         if scope_name:
             scope = Path(scope_name)
-            members = scope / "cgroup.procs"
-            check_memory_reading(members)
+            events = scope / "cgroup.events"
+            check_memory_reading(events)
             try:
-                if members.read_text().split():
+                if any(line.split() == ["populated", "1"] for line in events.read_text().splitlines()):
                     return PopulatedStepScope(scope)
             except FileNotFoundError:
                 pass
@@ -1054,7 +1368,7 @@ def reservation_lifetime(row: Reservation, owner_live: bool) -> StepLifetime:
 
 
 def step_memory(row: Reservation, processes: dict[int, ProcessIdentity],
-                proc: Path = PROC) -> StepMemory:
+                proc: Path = PROC, *, track_compilers: bool = False) -> StepMemory:
     identity = processes.get(row["pid"])
     owner_live = identity is not None and identity.start == row["start_time"]
     lifetime = reservation_lifetime(row, owner_live)
@@ -1062,13 +1376,15 @@ def step_memory(row: Reservation, processes: dict[int, ProcessIdentity],
         return GoneMemory()
     if isinstance(lifetime, PopulatedStepScope):
         try:
-            reading = process_memory(lifetime, proc)
+            reading = process_memory(lifetime, proc, track_compilers=track_compilers)
         except FileNotFoundError:
             if not owner_live:
                 return GoneMemory()
-            reading = tree_memory(row["pid"], row["start_time"], processes, proc)
+            reading = tree_memory(row["pid"], row["start_time"], processes, proc,
+                                  track_compilers=track_compilers)
     else:
-        reading = tree_memory(row["pid"], row["start_time"], processes, proc)
+        reading = tree_memory(row["pid"], row["start_time"], processes, proc,
+                              track_compilers=track_compilers)
     return step_promise(row, reading)
 
 
@@ -1092,50 +1408,141 @@ def test_phase_history(row: Reservation, reading: StepMemory,
     return NoPeakRecorded()
 
 
-def reservation_memory(path: Path, row: Reservation, now: datetime,
-                       processes: dict[int, ProcessIdentity], proc: Path, policy: AdmissionPolicy) -> StepMemory:
-    reading = step_memory(row, processes, proc)
-    phase_history = test_phase_history(row, reading, observed_test_phase(row))
-    if isinstance(phase_history, TestPhaseStarted) and isinstance(reading, MeasuredMemory):
-        return replace(reading, peak_history=phase_history)
+@dataclass(frozen=True)
+class MissingSample:
+    """The sampler has not written this file."""
+
+
+@dataclass(frozen=True)
+class UnreadableSample:
+    """The sampler file could not be read."""
+
+
+@dataclass(frozen=True)
+class SampleFileVersion:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+    @classmethod
+    def from_stat(cls, status: os.stat_result) -> SampleFileVersion:
+        return cls(status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+
+
+@dataclass(frozen=True)
+class PeakFileSample:
+    text: str | MissingSample | UnreadableSample
+    version: SampleFileVersion | MissingSample | UnreadableSample
+
+
+def sample_peak_file(path: Path) -> PeakFileSample:
     try:
-        peak = int(path.with_suffix(".max").read_text())
-        if peak < 0:
-            raise ValueError("negative observed peak")
+        with path.open() as file:
+            version = SampleFileVersion.from_stat(os.fstat(file.fileno()))
+            return PeakFileSample(file.read(), version)
     except FileNotFoundError:
-        peak = 0  # The sampler has not recorded a peak (unscoped steps never do).
-    except (OSError, ValueError):
-        if isinstance(reading, MeasuredMemory):
-            return replace(reading, unknown_peak_promise=row["need"], peak_history=PeakFileUnreadable(row["need"]))
-        return reading
-    last_near_peak_at = now.timestamp()  # Unknown times retain the peak charge.
-    peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
+        missing = MissingSample()
+        return PeakFileSample(missing, missing)
+    except (OSError, UnicodeError):
+        unreadable = UnreadableSample()
+        return PeakFileSample(unreadable, unreadable)
+
+
+def sample_file_version(path: Path) -> SampleFileVersion | MissingSample | UnreadableSample:
+    try:
+        return SampleFileVersion.from_stat(path.stat())
+    except FileNotFoundError:
+        return MissingSample()
+    except OSError:
+        return UnreadableSample()
+
+
+@dataclass(frozen=True)
+class PeakSamplesChanged:
+    """The peak evidence changed during the memory read."""
+
+
+@dataclass(frozen=True)
+class PeakSamples:
+    peak: PeakFileSample
+    wave: PeakFileSample
+
+    @classmethod
+    def read(cls, path: Path) -> PeakSamples:
+        return cls(sample_peak_file(path.with_suffix(".max")), sample_peak_file(path.with_suffix(".wave")))
+
+    def after_memory_read(self, path: Path) -> PeakSamples | PeakSamplesChanged:
+        if (self.peak.version != sample_file_version(path.with_suffix(".max"))
+                or self.wave.version != sample_file_version(path.with_suffix(".wave"))):
+            return PeakSamplesChanged()
+        return self
+
+
+def reservation_peak_history(row: Reservation, samples: PeakSamples | PeakSamplesChanged,
+                             now: float, policy: AdmissionPolicy) -> tuple[int, PeakHistory]:
+    """Use the recorded peak and wave to determine whether the peak has decayed."""
+    if isinstance(samples, PeakSamplesChanged):
+        return 0, PeakFileUnreadable(row["need"])
+    peak_file, wave_file = samples.peak, samples.wave
+    decaying_test = row["step"] in DECAYING_TEST_STEPS
+    try:
+        if isinstance(peak_file.text, UnreadableSample):
+            raise ValueError("unreadable peak")
+        peak = 0 if isinstance(peak_file.text, MissingSample) else int(peak_file.text)
+        if peak < 0:
+            raise ValueError("negative peak")
+    except ValueError:
+        return 0, PeakFileUnreadable(row["need"])
+    last_near_peak = now
+    peak_at = (peak_file.version.modified_ns / 1_000_000_000
+               if peak > 0 and isinstance(peak_file.version, SampleFileVersion) else PeakTimeUnknown())
     peak_time: float | PeakTimeUnknown = PeakTimeUnknown()
     old_sampler = False
-    if peak > 0:
+    if isinstance(wave_file.text, MissingSample) and peak > 0:
+        old_sampler = True
+        if isinstance(peak_at, float):
+            last_near_peak = peak_at
+            peak_time = peak_at
+    elif isinstance(wave_file.text, str):
         try:
-            peak_at = path.with_suffix(".max").stat().st_mtime
-        except OSError:
+            sampled, recorded = map(int, wave_file.text.split())
+            if sampled == peak and recorded >= 0:
+                last_near_peak = recorded
+                peak_time = recorded
+        except ValueError:
             pass
-    try:
-        near_peak_bytes, recorded_at = map(int, path.with_suffix(".wave").read_text().split())
-        if near_peak_bytes == peak and recorded_at >= 0:
-            last_near_peak_at = recorded_at
-            peak_time = recorded_at
-    except FileNotFoundError:
-        # Samplers from before patch B write no .wave; use the last peak publication.
-        if peak > 0:
-            old_sampler = True
-            if isinstance(peak_at, float):
-                last_near_peak_at = peak_at
-                peak_time = peak_at
-    except (OSError, ValueError):
-        pass
-    history: PeakHistory = PeakSoFar(peak, peak_at, peak_time, old_sampler) if peak > 0 else NoPeakRecorded()
-    if not release_build(row) and now.timestamp() - last_near_peak_at >= policy.peak_hold.seconds_for(row.get("step", "")):
-        history = PeakDecayed(0, peak, last_near_peak_at, last_near_peak_at + policy.peak_hold.seconds_for(row.get("step", "")), old_sampler)
+    hold = policy.peak_hold.seconds_for(row.get("step", ""))
+    fresh_peak = peak > 0 and not isinstance(peak_time, PeakTimeUnknown) and now - last_near_peak < hold
+    history: PeakHistory = (PeakSoFar(peak, peak_at, peak_time, old_sampler,
+        near_peak_is_fresh=decaying_test and fresh_peak) if peak > 0 else NoPeakRecorded())
+    if decaying_test and peak > 0 and isinstance(peak_time, PeakTimeUnknown):
+        history = PeakFileUnreadable(row["need"])
+    elif peak > 0 and not release_build(row) and now - last_near_peak >= hold:
+        history = PeakDecayed(0, peak, last_near_peak, last_near_peak + hold, old_sampler)
         peak = 0
+    return peak, history
+
+
+def track_test_compilers(row: Reservation, history: PeakHistory) -> bool:
+    return row["step"] in DECAYING_TEST_STEPS and isinstance(history, PeakDecayed)
+
+
+def reservation_memory(path: Path, row: Reservation, now: datetime,
+                       processes: dict[int, ProcessIdentity], proc: Path, policy: AdmissionPolicy) -> StepMemory:
+    before = PeakSamples.read(path)
+    peak, history = reservation_peak_history(row, before, now.timestamp(), policy)
+    reading = step_memory(row, processes, proc, track_compilers=track_test_compilers(row, history))
+    if row["step"] in DECAYING_TEST_STEPS:
+        peak, history = reservation_peak_history(row, before.after_memory_read(path), now.timestamp(), policy)
+    phase_history = test_phase_history(row, reading, observed_test_phase(row))
+    if (isinstance(phase_history, TestPhaseStarted) and isinstance(reading, MeasuredMemory)
+            and not isinstance(history, PeakFileUnreadable)):
+        return replace(reading, peak_history=phase_history)
     if isinstance(reading, MeasuredMemory):
+        if isinstance(history, PeakFileUnreadable) and peak == 0:
+            return replace(reading, unknown_peak_promise=row["need"], peak_history=history)
         return replace(reading, observed_peak=peak, peak_history=history)
     if isinstance(reading, PromisedMemory):
         return PromisedMemory(max(reading.bytes, peak))
@@ -1171,43 +1578,84 @@ def named_step_scope(pid: int, proc: Path) -> Path | NoStepScope | ReadingUnavai
         return ReadingUnavailable(f"{path}: {error}")
     for entry in environment.split(b"\0"):
         if entry.startswith(STEP_SCOPE_ENTRY):
-            return Path(os.fsdecode(entry.removeprefix(STEP_SCOPE_ENTRY)))
+            scope = Path(os.fsdecode(entry.removeprefix(STEP_SCOPE_ENTRY)))
+            return scope if scope.is_absolute() else NoStepScope()
     return NoStepScope()
 
 
-def compiler_jobs(source: ScopeSource, proc: Path) -> tuple[tuple[CompilerJob, ...], ScopeSource | records.NoSource]:
-    """Group the compilers by step scope. Keep the source if all environments are readable."""
-    scopes: dict[Path, set[int]] = {}
-    complete = True
-    for pid in source.members:
+def compiler_members(proc: Path) -> MemberSnapshot:
+    """Capture the members and job scopes of the compiler service."""
+    directory = builds_slice_cgroup() / "sccache.service"
+    try:
+        _ = directory.stat()
+    except FileNotFoundError:
+        return MemberSnapshot({})
+    except OSError as error:
+        return MemberSnapshot({}, membership=MemberReadFailed(str(error)))
+    snapshot = scope_snapshot(directory, proc)
+    membership = snapshot.membership
+    source = (ScopeSource(directory, frozenset(snapshot.identities))
+              if isinstance(membership, CompleteMembership) else records.NoSource())
+    jobs: dict[int, Path] = {}
+    for pid, identity in snapshot.identities.items():
         scope = named_step_scope(pid, proc)
         if isinstance(scope, Path):
-            scopes.setdefault(scope, set()).add(pid)
-        elif isinstance(scope, ReadingUnavailable):
-            complete = False
-    jobs = tuple(CompilerJob(scope, process_memory(pids, proc).anonymous) for scope, pids in sorted(scopes.items()))
-    return jobs, source if complete else records.NoSource()
+            jobs[pid] = scope
+        if isinstance(scope, ReadingUnavailable):
+            source = records.NoSource()
+            membership = MemberReadFailed(scope.reason)
+        elif (not isinstance(identity, MemberIdentity) or isinstance(identity.executable, ExecutableUnreadable)
+              or isinstance(scope, NoStepScope) and identity.build_tool() and not identity.sccache_daemon()):
+            membership = MemberReadFailed("compiler service job identity is incomplete")
+    return replace(snapshot, jobs=jobs, membership=membership, job_scope_source=source)
 
 
 def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
-    """Charge the compiler service outside the step scopes. Each step counts its compiler jobs."""
+    """Charge each verified compiler job once inside the compiler service."""
     directory = builds_slice_cgroup() / "sccache.service"
+
+    def read(members: MemberSnapshot) -> tuple[MeasuredMemory, dict[int, str | OSError]]:
+        return slice_working_set(directory), read_process_samples(members.jobs, proc)
+
     try:
-        reading = slice_working_set(directory)
-        try:
-            members = (directory / "cgroup.procs").read_text().split()
-        except OSError:
-            return [CompilerServiceMemory(reading.bytes, swap_bytes=reading.swap_bytes, pid=PidNotRecorded())]
-        pids = frozenset(int(member) for member in members if member.isdecimal())
-        programs = member_programs(pids, proc, skip_unreadable=True)
-        servers = [pid for pid, program in programs.items() if program == "sccache"]
-        jobs, source = compiler_jobs(ScopeSource(directory, pids), proc)
-        charged = sum(job.use.bytes for job in jobs if isinstance(job.use, AnonymousRunUse))
-        return [CompilerServiceMemory(max(0, reading.bytes - charged), swap_bytes=reading.swap_bytes,
-                                      pid=min(servers) if servers else PidNotRecorded(), jobs=jobs,
-                                      anonymous_source=source)]
-    except (OSError, ValueError):
-        return []
+        (reading, samples), evidence = read_with_members(lambda: compiler_members(proc), read, proc)
+    except (OSError, ValueError) as error:
+        if isinstance(error, FileNotFoundError) and not directory.exists():
+            return []
+        return [CompilerServiceMemory(0, pid=PidNotRecorded(),
+                                      compiler_evidence=records.CompilerEvidenceIncomplete(str(error)))]
+    jobs: list[CompilerJob] = []
+    before = evidence.before.members
+    after = evidence.after.members
+    compilers = evidence.compiler_evidence()
+    if not before.jobs and not isinstance(compilers, records.CompilerEvidenceIncomplete):
+        compilers = records.NoCompilerSeen()
+    stable_pids = evidence.stable_pids()
+    scopes: dict[Path, dict[int, str | OSError]] = {}
+    for pid, scope in before.jobs.items():
+        if pid in stable_pids and after.jobs.get(pid) == scope:
+            scopes.setdefault(scope, {})[pid] = samples[pid]
+    for scope, processes in sorted(scopes.items()):
+        measured = measured_processes(processes, stable_pids, proc, compilers=compilers)
+        measured_source = measured.anonymous_source
+        use = measured.anonymous
+        if (isinstance(use, AnonymousRunUse) and isinstance(measured_source, ProcessSource)
+                and measured_source.memory_read_incomplete):
+            use = RunUseUnavailable(f"{scope}: compiler job memory unavailable")
+        jobs.append(CompilerJob(scope, use))
+        if isinstance(use, RunUseUnavailable):
+            compilers = records.CompilerEvidenceIncomplete(use.reason)
+    daemon_candidates = (before.identities.keys() & after.identities.keys()) - before.jobs.keys() - after.jobs.keys()
+    programs = member_programs(daemon_candidates, proc, skip_unreadable=True)
+    servers = [pid for pid in daemon_candidates if programs.get(pid) == "sccache" or (
+        pid in stable_pids and isinstance(identity := before.identities[pid], MemberIdentity) and identity.sccache_daemon())]
+    source = before.job_scope_source if before.job_scope_source == after.job_scope_source else records.NoSource()
+    if isinstance(reading.anonymous, RunUseUnavailable):
+        compilers = records.CompilerEvidenceIncomplete(reading.anonymous.reason)
+    charged = sum(job.use.bytes for job in jobs if isinstance(job.use, AnonymousRunUse))
+    return [CompilerServiceMemory(max(0, reading.bytes - charged), swap_bytes=reading.swap_bytes,
+        pid=min(servers) if servers else PidNotRecorded(), jobs=tuple(jobs), anonymous_source=source,
+        compiler_evidence=compilers)]
 
 
 class LiveMemoryReading(RuntimeError):
@@ -1855,8 +2303,42 @@ def test_phase_charge(phase: TestPhaseStarted) -> int:
     return math.ceil(max(phase.peak_so_far, phase.need.bytes) * phase.need.margin)
 
 
-def reservation_need(row: Reservation, reading: StepMemory) -> int:
-    """Select the full step need unless captured evidence proves a test phase."""
+DECAYING_TEST_STEPS = frozenset({"merge-gate", "targeted-test", "nextest", "test"})
+
+
+def test_need_override(row: Reservation, reading: StepMemory, compiling_scopes: Collection[Path]
+                       ) -> records.TestNeedOverride | records.NoTestNeedOverride:
+    """Select a test need that takes precedence over progress or phase estimates."""
+    if row["step"] not in DECAYING_TEST_STEPS or not isinstance(reading, MeasuredMemory):
+        return records.NoTestNeedOverride()
+    history = reading.peak_history
+    source = reading.anonymous_source
+    accepted = row["need"]
+    if (isinstance(reading.compiler_evidence, records.CompilerSeen)
+            or isinstance(source, ScopeSource)
+            and any(scope_contains_job(source.directory, job_scope) for job_scope in compiling_scopes)):
+        return records.TestNeedOverride(accepted, "compiler")
+    if isinstance(history, PeakSoFar) and history.near_peak_is_fresh:
+        return records.TestNeedOverride(accepted, "near-peak sample")
+    if isinstance(reading.compiler_evidence, records.CompilerEvidenceIncomplete):
+        return records.TestNeedOverride(accepted, "compiler evidence unavailable")
+    if isinstance(history, PeakFileUnreadable):
+        return records.TestNeedOverride(accepted, "peak evidence unavailable")
+    if isinstance(history, PeakDecayed):
+        if not isinstance(reading.compiler_evidence, records.NoCompilerSeen) or isinstance(reading.anonymous, RunUseUnavailable):
+            return records.TestNeedOverride(accepted, "compiler evidence unavailable")
+        # Older records used zero to mark a missing sample.
+        if (history.sampled or history.bytes > 0) and isinstance(source, (ScopeSource, ProcessSource)):
+            return records.TestNeedOverride(min(accepted, math.ceil(history.bytes * history.margin)), "peak after decay")
+        return records.TestNeedOverride(accepted, "post-decay sample unavailable")
+    return records.NoTestNeedOverride()
+
+
+def reservation_need(row: Reservation, reading: StepMemory, *, compiling_scopes: Collection[Path] = ()) -> int:
+    """Select the need from the accepted need and current memory evidence."""
+    override = test_need_override(row, reading, compiling_scopes)
+    if isinstance(override, records.TestNeedOverride):
+        return override.bytes
     if isinstance(reading, ProgressAdjustedMemory):
         return reading.remaining_need
     if row["step"] == "nextest" and isinstance(reading, MeasuredMemory) and isinstance(reading.peak_history, TestPhaseStarted):
@@ -1880,10 +2362,11 @@ def compiler_job_uses(running: Iterable[RunningStep]) -> dict[Path, AnonymousRun
     return uses
 
 
-def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, RunningStep, AttributedStepUse], ...]:
+def attributed_step_uses(inputs: QueueInputs, *,
+                         compiler_uses: Mapping[Path, AnonymousRunUse | RunUseUnavailable]
+                         ) -> tuple[tuple[Reservation, RunningStep, AttributedStepUse], ...]:
     """Assign each scope, process and compiler job to one step before any grouping."""
     attributed: list[tuple[Reservation, RunningStep, AttributedStepUse]] = []
-    compiled = compiler_job_uses(inputs.running)
     active = tuple(zip(inputs.reservations, (step for step in inputs.running if running_has_reservation(step)), strict=True))
     scope_holders: dict[Path, tuple[str, int, MeasuredMemory]] = {}
     process_holders: dict[int, tuple[int, str, int]] = {}
@@ -1902,6 +2385,13 @@ def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, Runnin
                 previous_process = process_holders.get(item.pid)
                 if previous_process is None or priority[:2] < previous_process[:2]:
                     process_holders[item.pid] = priority
+    scope_compilers: dict[Path, AnonymousRunUse | RunUseUnavailable] = {}
+    for job_scope, job_use in compiler_uses.items():
+        owner_scope = max((scope for scope in scope_holders if scope_contains_job(scope, job_scope)),
+                          key=lambda scope: len(scope.parts), default=None)
+        if owner_scope is not None:
+            scope_compilers[owner_scope] = sum_swap_backed_use((
+                scope_compilers.get(owner_scope, AnonymousRunUse(0)), job_use))
     scopes = set(scope_holders)
     roots = {scope for scope in scopes if scopes.isdisjoint(scope.parents)}
     children: dict[Path, list[Path]] = {}
@@ -1928,8 +2418,8 @@ def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, Runnin
                                                for child in children.get(source.directory, ()))
                     use = (AnonymousRunUse(max(0, use.bytes - nested.bytes))
                            if isinstance(nested, AnonymousRunUse) else nested)
-                if owns_source and source.directory in compiled:
-                    use = sum_swap_backed_use((use, compiled[source.directory]))
+                if owns_source and source.directory in scope_compilers:
+                    use = sum_swap_backed_use((use, scope_compilers[source.directory]))
             elif isinstance(source, ProcessSource):
                 assigned = tuple(item for item in source.processes
                                  if item.pid in unclaimed and process_holders[item.pid][2] == index)
@@ -1943,10 +2433,11 @@ def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, Runnin
 def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
     """Group attributed steps and ephemeral handoffs inside the pure pass."""
     groups: dict[str, RunMemory] = {}
-    for row, step, attributed in attributed_step_uses(inputs):
+    compiled = compiler_job_uses(inputs.running)
+    for row, step, attributed in attributed_step_uses(inputs, compiler_uses=compiled):
         run = reservation_run(row, step)
         owner = reservation_owner(row, step)
-        need = reservation_need(row, step.measured)
+        need = reservation_need(row, step.measured, compiling_scopes=compiled)
         use = attributed.use
         previous = groups.get(owner)
         if previous is None:
@@ -1980,12 +2471,16 @@ def reservation_profile_key(row: Reservation, host: str) -> str:
 def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: AttributedStepUse,
                     counter: progress.ProgressCounter | progress.NoCounter,
                     profile: progress.ProgressProfile | progress.NoMatchingProfile,
-                    policy: AdmissionPolicy) -> ProgressAdjustedMemory:
+                    policy: AdmissionPolicy, *, compiling_scopes: Collection[Path] = ()) -> ProgressAdjustedMemory:
     """Use a profile only with a current attributed swap-backed reading."""
-    full_need = reservation_need(row, reading)
-    window = (progress.window_peak(profile, counter, policy.progress_lookahead_percent)
-              if isinstance(attributed.use, AnonymousRunUse) else
-              progress.NoMatchingProfile("swap-backed use unavailable"))
+    override = test_need_override(row, reading, compiling_scopes)
+    full_need = reservation_need(row, reading, compiling_scopes=compiling_scopes)
+    if isinstance(override, records.TestNeedOverride):
+        window: progress.WindowPeak | progress.NoMatchingProfile = progress.NoMatchingProfile(override.reason)
+    elif isinstance(attributed.use, AnonymousRunUse):
+        window = progress.window_peak(profile, counter, policy.progress_lookahead_percent)
+    else:
+        window = progress.NoMatchingProfile("swap-backed use unavailable")
     need = full_need
     if isinstance(window, progress.WindowPeak):
         basis = read_need_basis(row.get("queue_waiter", {}).get("need_basis"))
@@ -2001,7 +2496,17 @@ def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: Attri
         anonymous_source=reading.anonymous_source, promise=reading.promise,
         swap_bytes=reading.swap_bytes, observed_peak=reading.observed_peak,
         unknown_peak_promise=reading.unknown_peak_promise, peak_history=reading.peak_history,
-        counter=counter, window=window, remaining_need=need)
+        compiler_evidence=reading.compiler_evidence, counter=counter, window=window, remaining_need=need,
+        test_need_override=override)
+
+
+def test_need_text(need: records.TestNeedOverride) -> str:
+    """Explain the test evidence that selected the need."""
+    if need.reason == "peak after decay":
+        return "peak after decay with the test margin"
+    if need.reason == "compiler":
+        return "full need: compiler running"
+    return f"full need: {need.reason}"
 
 
 def progress_text(reading: StepMemory) -> str:
@@ -2011,9 +2516,12 @@ def progress_text(reading: StepMemory) -> str:
     counter = reading.counter
     phase = (f"{counter.phase}, {format_percent(counter.percent, complete=counter.done == counter.total)} done" if isinstance(counter, progress.ProgressCounter)
              else counter.reason)
-    reason = (f"highest anonymous use in the next {format_percent(reading.window.lookahead_percent)}"
-              if isinstance(reading.window, progress.WindowPeak) else
-              f"full need: {reading.window.reason}")
+    if isinstance(reading.test_need_override, records.TestNeedOverride):
+        reason = test_need_text(reading.test_need_override)
+    elif isinstance(reading.window, progress.WindowPeak):
+        reason = f"highest anonymous use in the next {format_percent(reading.window.lookahead_percent)}"
+    else:
+        reason = f"full need: {reading.window.reason}"
     return f"{phase}; need {reading.remaining_need / GIB:.1f} GiB; {reason}"
 
 
@@ -2437,6 +2945,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
     totals = result.policy.totals
     explained: list[ExplainedRunningStep] = []
     reservations = iter(inputs.reservations)
+    compiled = compiler_job_uses(inputs.running)
     for step in inputs.running:
         reading = step.measured
         admitted_at: float | AdmissionTimeNotRecorded = AdmissionTimeNotRecorded()
@@ -2445,7 +2954,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
         if running_has_reservation(step):
             row = next(reservations)
             admitted_at = step_estimator.epoch(row["admitted_at"])
-            need = reservation_need(row, reading)
+            need = reservation_need(row, reading, compiling_scopes=compiled)
             owner = reservation_owner(row, step)
         measured = reading.bytes if isinstance(reading, (MeasuredMemory, CompilerServiceMemory, UnownedSliceMemory)) else 0
         charge = max(need, measured)
