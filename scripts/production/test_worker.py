@@ -430,12 +430,20 @@ class WorkerCommandTests(unittest.TestCase):
             code = worker.main(list(args))
         return code, output.getvalue(), errors.getvalue()
 
-    def test_restore_reaps_detached_orphans_once_before_resuming(self) -> None:
+    def start_orphaned_worker_run(self) -> tuple[worker_panes.OpenWorker, Path, detached_runs.RunRecord]:
+        config = self.fixture.root / "conf"
+        atomic_file.write_text_atomic(config / "detached_runs.conf",
+            "# whole: 1..\nPROCESS_CHECK_SECONDS=5\n"
+            + "# whole: 1..\nRESULT_LINE_CHARS=300\n"
+            + "# whole: 1..\nRESULT_TEXT_CHARS=2000\n")
+        atomic_file.write_text_atomic(config / "postmaster.conf",
+            "# range: 0.001..\nwait_seconds=1\n"
+            + "# range: 0.001..\nclaim_grace_seconds=1\n")
+        atomic_file.write_text_atomic(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n")
         opened = self.opened()
         _ = progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
             worker_name=opened.row.name, worker_id=opened.row.id, launcher_command=["assign.sh"],
             prompt=self.prompt, kind="impl", lens="")
-        _ = self.fixture.world.stop(opened.row, self.fixture.world)
         folder = self.run_dir / detached_runs.DETACHED_RUNS_DIR
         folder.mkdir()
         path = folder / "orphan.json"
@@ -446,23 +454,34 @@ class WorkerCommandTests(unittest.TestCase):
             "pid": 2 ** 22 + 12345, "director_dir": str(self.run_dir), "done_message_file": "",
         }
         atomic_file.write_text_atomic(path, json.dumps(run))
+        return opened, path, run
+
+    def test_restore_reaps_detached_orphans_once_before_resuming(self) -> None:
+        opened, path, run = self.start_orphaned_worker_run()
+        _ = self.fixture.world.stop(opened.row, self.fixture.world)
+        folder = path.parent
+        delivery = send.PaneTextDelivered("sent", f"worker {opened.row.name} at fixture pane")
 
         def resume(_row: staff.StaffRow, _active: progress_history.ActiveDispatch) -> worker.ExitCode:
             saved = cast(dict[str, object], json.loads(path.read_text()))
             self.assertEqual(saved["status"], "finished")
             return worker.ExitCode.OK
 
-        with (patch.object(detached_runs, "deliver", return_value="private fixture") as deliver,
+        with (patch.object(send, "deliver_worker_text", return_value=delivery),
+              patch.object(detached_runs, "deliver", wraps=detached_runs.deliver) as deliver,
               patch.object(detached_runs, "reap_orphans", wraps=detached_runs.reap_orphans) as reap,
               patch.object(unit_runs, "held", return_value=[str(self.run_dir)] * 2),
               patch.object(worker, "_resume_launcher", side_effect=resume)):
             for attempt in range(2):
                 with self.subTest(attempt=attempt):
                     code, output, errors = self.command("restore")
-                    self.assertEqual((code, errors), (0, ""))
+                    self.assertEqual((code, errors), (0, ""), errors)
                     self.assertEqual(output.count("reaped detached run orphan"), int(attempt == 0))
             deliver.assert_called_once()
             self.assertEqual(reap.call_args_list, [call(str(self.run_dir))] * 2)
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["delivery"], f"sent: {delivery.detail}")
+        self.assertIn("delivered_at", saved)
 
         sibling = self.opened("review", "review")
         for selection, selected in (("selected", frozenset({opened.row.id})),
@@ -477,7 +496,7 @@ class WorkerCommandTests(unittest.TestCase):
                     "log": str(folder / f"{identity}.log")}))
             sibling_before = paths[sibling.row.name].read_bytes()
             with (self.subTest(selection=selection),
-                  patch.object(detached_runs, "deliver", return_value="private fixture"),
+                  patch.object(send, "deliver_worker_text", return_value=delivery),
                   patch.object(detached_runs, "reap_orphans", wraps=detached_runs.reap_orphans) as reap,
                   patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK),
                   redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
@@ -487,6 +506,45 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(status, "finished" if opened.row.id in selected else "running")
                 self.assertEqual(reap.call_args_list,
                                  [call(str(self.run_dir), opened.row.name)] if selected == frozenset({opened.row.id}) else [])
+
+    def test_restore_retries_orphan_result_deferred_before_input(self) -> None:
+        opened, path, _ = self.start_orphaned_worker_run()
+        world = self.fixture.world
+        run = world.run
+        pane = world.locations[opened.pane]
+        pane["agent_status"] = "working"
+
+        def record_input(*arguments: str, deadline: float = math.inf) -> str:
+            result = run(*arguments, deadline=deadline)
+            if arguments[:3] == ("agent", "prompt", opened.pane):
+                self.assertIn("Detached run: orphan", arguments[3].splitlines())
+                self.agent.append(opened.pane, "user", arguments[3])
+                pane["agent_status"] = "working"
+            return result
+
+        with (patch.object(world, "run", side_effect=record_input),
+              patch.object(detached_runs, "deliver", wraps=detached_runs.deliver) as deliver,
+              patch.object(unit_runs, "held", return_value=[str(self.run_dir)]),
+              patch.object(worker, "_resume_launcher", return_value=worker.ExitCode.OK)):
+            code, _, errors = self.command("restore")
+            self.assertEqual((code, errors), (0, ""), errors)
+            deliver.assert_called_once()
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["delivery"], detached_runs.DEFERRED_WORKER_RESULT + "worker is working")
+            self.assertIs(saved["completion_pending"], True)
+            self.assertNotIn("delivered_at", saved)
+
+            pane["agent_status"] = "idle"
+            code, _, errors = self.command("restore")
+            self.assertEqual((code, errors), (0, ""), errors)
+            self.assertEqual(deliver.call_count, 2)
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["delivery"], f"sent: worker {opened.row.name} at {opened.pane}")
+            self.assertIn("delivered_at", saved)
+
+            code, _, errors = self.command("restore")
+            self.assertEqual((code, errors), (0, ""), errors)
+            self.assertEqual(deliver.call_count, 2)
 
     def test_restore_lists_finished_results_newest_first(self) -> None:
         for launcher in ("explicit", "assign"):
