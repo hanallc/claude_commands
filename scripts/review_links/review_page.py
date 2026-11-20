@@ -86,11 +86,16 @@ class ReviewIndexEntry(TypedDict):
 
 def record_revision(item: ReviewItem, assets: Mapping[str, str]) -> str:
     """Identify the complete retained record and its displayed assets."""
+    later_read_failed = item.times.later_read_failed
+    if later_read_failed:
+        item = replace(item, times=replace(item.times, later=review_items.NoLaterTime()))
     source = item.source
     # A Change verdict follows the current production when staff move.
     record = (source.path, source.row, source.slots, item.times.later) if isinstance(source, review_items.ChangeSource) else item
     if isinstance(source, review_items.ChangeSource) and item.state == ReviewState.VALIDATING:
         record = (record, item.owner)
+    if later_read_failed:
+        record = (record, 'Later file unreadable')
     retained = (record, assets.get(item.key, ''), assets.get('image:'+item.key, ''),
                 assets.get('submission:'+item.key, ''))
     return hashlib.sha256(repr(retained).encode()).hexdigest()[:16]
@@ -173,6 +178,7 @@ class ReviewSnapshot:
     read_at: float = 0
     render_seconds: float = 0
     notices: tuple[str, ...] = ()
+    later_read_failed: bool = False
     unavailable_cards: frozenset[str] = frozenset()
     title_limit: int = 100
     submission_keys: dict[str, str] = field(default_factory=dict)
@@ -411,12 +417,14 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     title_limit = conf.read_or_repository('production').whole('question_title_max_chars')
     index = index_json(entries)
     notices = tuple(sources.notices.values())
+    later_path = review_later.path()
     retained = repr((records, assets, members.rows, browser, words_rows, refresh_seconds, request_timeout,
                      card_motion, zone.key, notices, unavailable_cards, later, title_limit, names.colors))
     version = hashlib.sha256((index+retained).encode()).hexdigest()[:20]
     snapshot = ReviewSnapshot(version,records,entries,members,
         browser,words_rows,refresh_seconds,request_timeout,card_motion,assets,zone,sources.before_read,later,names,read_at=read_at,
-        notices=notices, unavailable_cards=frozenset(unavailable_cards),
+        notices=notices, later_read_failed=any(path == later_path for path, _ in sources.notices),
+        unavailable_cards=frozenset(unavailable_cards),
         title_limit=title_limit, submission_keys=submission_keys)
     return pack_snapshot(snapshot, index, started)
 
@@ -607,6 +615,7 @@ class ReviewSnapshotCache:
                      replaced_key: str = '') -> ReviewSnapshot:
         """Insert, replace or remove one retained record."""
         started = time.perf_counter()
+        later_read_failed = current.later_read_failed or (isinstance(item, ReviewItem) and item.times.later_read_failed)
         records = current.records.copy()
         assets = current.assets.copy()
         asset_keys = (key, 'image:'+key, 'submission:'+key)
@@ -630,7 +639,9 @@ class ReviewSnapshotCache:
         else:
             item = review_items.normalize_times(item, current.zone)
             retain_asset(item, assets)
-            if (stamps is not None and current.records.get(key) == item and members == current.members
+            retained = current.records.get(key)
+            if (stamps is not None and retained is not None and retained == item and members == current.members
+                    and retained.times.later_read_failed == item.times.later_read_failed
                     and key not in current.unavailable_cards
                     and all(assets.get(asset) == current.assets.get(asset) for asset in asset_keys)):
                 return current
@@ -648,6 +659,7 @@ class ReviewSnapshotCache:
         version = hashlib.sha256((current.version+record_version).encode()).hexdigest()[:20]
         fresh = pack_snapshot(replace(current, version=version, members=members, names=names, records=records, assets=assets, entries=entries,
                                       source_stamps={**current.source_stamps, **stamps} if stamps is not None else current.source_stamps,
+                                      later_read_failed=later_read_failed,
                                       unavailable_cards=current.unavailable_cards-{key, previous_key},
                                       submission_keys=submission_keys),
                               index_json(entries), started)
@@ -1017,20 +1029,22 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
             root, retained, staff.snapshot(), later_mode=review_items.LaterReadMode.DISPLAY)
         if current.state == ReviewState.DONE:
             raise review_items.ReviewRecordChanged('This item is already Done.')
-        if outcome == 'later' and current.times.later_read_failed:
+        if current.times.later_read_failed:
             raise review_later.LaterSaveRefused()
         assets: dict[str, str] = {}
         try:
             retain_asset(current, assets)
         except FileNotFoundError:
             raise review_items.ReviewRecordMissing('This item is no longer on the list.') from None
-        revision_item = current
-        if current.times.later_read_failed:
-            # Use the retained Later time to check the native record.
-            revision_item = replace(current, times=replace(current.times, later=retained.times.later))
-        if fields.get('revision', [''])[0] != record_revision(revision_item, assets):
-            raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
-        return current
+        revision = fields.get('revision', [''])[0]
+        if revision == record_revision(current, assets):
+            return current
+        # A form opened during the failure cannot replace a saved deadline.
+        if outcome != 'later' or isinstance(current.times.later, review_items.NoLaterTime):
+            recovered = replace(current, times=replace(current.times, later_read_failed=True))
+            if revision == record_revision(recovered, assets):
+                return current
+        raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
 
     item = validate()
     if item.type == ReviewType.RESPONSE:

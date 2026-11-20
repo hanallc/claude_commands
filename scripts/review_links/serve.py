@@ -1388,7 +1388,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                             except ValueError as error:
                                 print(f"review-links news: {page.identity}: {error}", file=sys.stderr)
                                 continue
-                            if any(item.times.later_read_failed for item in snapshot.records.values()):
+                            if snapshot.later_read_failed:
                                 raise review_later.LaterSaveRefused()
                             page = replace(page, items=partial(review_page.waiting_items, snapshot=snapshot))
                         elif page.items is images.waiting_images:

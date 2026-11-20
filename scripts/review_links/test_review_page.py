@@ -1188,6 +1188,31 @@ window.fetch=(url,options)=>{
             self.assertEqual(sum(call.args == (later,) for call in read.call_args_list), 1)
         self.assertEqual(saved.answer, 'question saved')
 
+    def test_a_card_opened_during_a_later_failure_can_save_after_recovery(self) -> None:
+        key = self.question()
+        until = datetime.now(user_zone()) - timedelta(days=1)
+        review_later.save(key, until)
+        target = review_later.path()
+        valid = target.read_bytes()
+        _ = target.write_bytes(b'{')
+        degraded = review_page.build_snapshot(self.root)
+        self.assertTrue(degraded.records[key].times.later_read_failed)
+        answer = self.card_body(degraded, key, 'answer', 'Use the first layout.')
+        later = self.card_body(degraded, key, 'later') + '&later=2099-01-01T12%3A00'
+
+        _ = target.write_bytes(valid)
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        self.assertEqual(cache.get().records[key].times.later, until)
+        with self.assertRaises(review_items.ReviewRecordChanged):
+            _ = cache.save(later, self.status)
+        self.assertEqual(target.read_bytes(), valid)
+
+        saved = cache.save(answer, self.status)
+        self.assertEqual(saved.answer, 'Use the first layout.')
+        self.assertNotIn(key, cache.get().records)
+        self.assertEqual(target.read_bytes(), valid)
+
     def test_delivery_park_waits_for_readable_later_times(self) -> None:
         from scripts.production import the_list
         from scripts.review_links import serve
