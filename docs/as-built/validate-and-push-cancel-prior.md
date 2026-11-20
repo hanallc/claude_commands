@@ -11,7 +11,7 @@ After a direct push, `validate_and_push.sh --cancel-prior` cancels the branch's 
 | File | Role |
 | --- | --- |
 | `scripts/validate_and_push/validate_and_push.sh` | The `--cancel-prior` flag and `cancel_prior_runs`. |
-| `scripts/validate_and_push/push_direct.sh` | Lands the default branch through `scripts/lib/land_main.py` under the main push lock, waits for the sha's run, and prints the CI handoff. |
+| `scripts/validate_and_push/push_direct.sh` | Lands the default branch through `scripts/lib/land_main.py` under the main push lock, then reports the CI run or a queued publication. |
 | `scripts/validate_and_push/test_cancel_prior.sh` | Test with stubbed `git` and `gh`. |
 | `commands/showrunner/produce.md` | The cancel-prior rule at <MergeCheckpoint/> (the `merge_checkpoint.py` call) and <CIPoint/> (`ci_points.py ci start`). |
 
@@ -32,6 +32,12 @@ Validation runs before it.
 CI discovery and cancellation run after it.
 A child of a checkpoint uses the inherited hold for the same repository.
 Other branches take no main push lock.
+
+A settings-only push can return `<commit> queued` before CI starts.
+A queued hand commit of `settings.json` becomes a journal edit in the live checkout.
+After the runner publishes it, the receipt records the commit that reached main.
+Run `ci start` again to follow that receipt and find its CI run.
+CI discovery and cancellation use the published commit.
 
 ### `cancel_prior_runs`
 

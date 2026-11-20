@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from scripts.lib import live_settings, models_registry
 from scripts.lib.test_models_registry import write_registry
+from scripts.production import land_queue
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -46,15 +48,21 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         _ = self.alert(notes, self.now + timedelta(minutes=60))
         self.assertEqual(self.assignments()["design_roles"], "codex")
 
-    def test_registry_publication_reports_only_a_publish_or_a_wait(self) -> None:
-        journal = Path(self.enterContext(tempfile.TemporaryDirectory())) / "waiting.json"
-        with mock.patch.object(live_settings, "journal_path", return_value=journal):
-            with mock.patch.object(models_registry, "publish_pending", return_value=False):
+    def test_notes_queue_registry_publication_for_the_runner(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        fixture = {"HOME": str(root), "CONF_DIR": str(root / "config"),
+                   "MODELS_CONFIG_FILE": str(root / "config/models.conf"),
+                   "MERGE_GATE_STATE_DIR": str(root / "land"),
+                   "XDG_STATE_HOME": str(root / "state")}
+        with mock.patch.dict(os.environ, fixture), mock.patch.object(
+                models_registry, "publish_pending", side_effect=AssertionError("notes ran the publisher")):
+            with mock.patch.object(models_registry, "has_pending", return_value=False):
                 self.assertEqual(live_settings.publish_waiting(), [])
-            with mock.patch.object(models_registry, "publish_pending", return_value=True):
-                self.assertEqual(live_settings.publish_waiting(), ["registry rows published"])
-            with mock.patch.object(models_registry, "publish_pending", side_effect=OSError("git fetch:\n offline")):
-                self.assertEqual(live_settings.publish_waiting(), ["registry rows not on main yet: git fetch: offline"])
+            with mock.patch.object(models_registry, "has_pending", return_value=True):
+                self.assertIn("main: waits", "\n".join(live_settings.publish_waiting()))
+                self.assertEqual(land_queue.listing(), "1. settings publish: waiting changes")
+            with mock.patch.object(models_registry, "has_pending", side_effect=OSError("git fetch:\n offline")):
+                self.assertEqual(live_settings.publish_waiting(), ["settings not on main yet: git fetch: offline"])
 
     def test_successful_claude_fallback_is_logged_without_a_session_or_phone_push(self) -> None:
         notes: Notes = [self.note("codex1.md", "active", "0")]

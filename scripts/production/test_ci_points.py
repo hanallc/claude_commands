@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import ClassVar, TypedDict, cast, final, override
 from unittest.mock import patch
 
+from scripts.production import land_queue
 from scripts.production import ci_points
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.merge_checkpoint import merge_lock
@@ -202,6 +203,9 @@ class CiPointsTests(unittest.TestCase):
         self.env = {**os.environ, **copies_environment(self.root, repository="origin"), "HOME": str(self.home), "CI_POINTS_TEST_STATE": str(self.stub_state), "TEST_PYTHON": sys.executable,
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
                     "CI_POINTS_REVIEW_REGIME": str(self.bin / "review_regime.py"),
+                    "MODELS_CONFIG_FILE": str(self.root / "config/models.conf"),
+                    "MERGE_GATE_STATE_DIR": str(self.root / "land-state"),
+                    "XDG_STATE_HOME": str(self.root / "xdg"),
                     "CLAUDE_CODE_SESSION_ID": "test-showrunner",
                     "UNIT_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
@@ -786,6 +790,26 @@ PY
             with self.subTest(command=command):
                 self.assertRegex(body, r"--state-dir\s+WAITING_STATE_DIR\b")
                 self.assertNotRegex(body, r"--state-dir\s+SCRATCH\b")
+
+    def test_ci_start_resumes_the_published_receipt_without_validating_again(self) -> None:
+        tip = self.git("rev-parse", "HEAD")
+        self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "land-state")
+        validate = self.home / ".claude/scripts/validate_and_push/validate_and_push.sh"
+        self.env["CI_POINTS_VALIDATE_SCRIPT"] = str(validate)
+        script = validate.with_name("push_direct.sh")
+        _ = script.write_text(PUSH_STUB.replace("%s contained", "%s queued"))
+        first = self.run_ci("ci", "start", "--state-dir", str(self.state))
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("ci start: pending", first.stdout)
+        self.assertFalse((self.state / "ci_run.json").exists())
+        with patch.dict(os.environ, self.env, clear=True):
+            land_queue.record_publication(self.checkout, tip, {"commit": "f" * 40, "state": "pushed"})
+        resumed = self.start_point()
+        self.assert_step(resumed, "ci start", True)
+        self.assertEqual((self.stub_state / "publish-calls").read_text().splitlines(),
+                         [f"false|--publish-only {tip}", f"false|--follow-published {'f' * 40} pushed"])
+        self.assertEqual(len((self.stub_state / "validate-calls").read_text().splitlines()), 1)
+        self.assertFalse((self.state / "ci_queued.json").exists())
 
     def test_ci_start_passes_cancel_prior_only_when_requested(self) -> None:
         tip = self.git("rev-parse", "HEAD")

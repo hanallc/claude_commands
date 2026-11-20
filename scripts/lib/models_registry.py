@@ -477,10 +477,10 @@ def _publish_in_gap(target: SharedRegistry, path: Path, description: str, replay
         return False
     with ExitStack() as locks:
         if on_main:
-            admission = locks.enter_context(main_push_lock.settings_push(target.repository, wait=wait, gap=gap))
-            if isinstance(admission, land_queue.SettingsWaiting):
-                print(admission.report(), file=sys.stderr)
+            admission = locks.enter_context(main_push_lock.settings_push(
+                target.repository, wait=isinstance(gap, land_queue.SettingsGap), gap=gap))
             if not isinstance(admission, main_push_lock.MainPushReady):
+                print(land_queue.enqueue_settings().report(), file=sys.stderr)
                 return False
         lock = locks.enter_context(_publish_lock_path(target, path).open("a"))
         try:
@@ -488,6 +488,19 @@ def _publish_in_gap(target: SharedRegistry, path: Path, description: str, replay
         except BlockingIOError:
             return False
         return _publish(target.repository, path, description, replay)
+
+
+def has_pending(registry: Path) -> bool:
+    path = registry.resolve()
+    if not path.is_file() or path != DEFAULT_PATH.resolve() or os.environ.get("MODELS_CONFIG_PUBLISH") == "0":
+        return False
+    target = _publish_repository(path)
+    if not isinstance(target, SharedRegistry):
+        return False
+    if platform.system() == "Darwin" and _on_main(target):
+        return bool(_read_mac_edits(target))
+    head = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
+    return waiting_rows.move_marker(target.repository).exists() or bool(registry_rows.changes(head, registry_text(path)))
 
 
 def publish_pending(registry: Path, *, gap: land_queue.SettingsGap | main_push_lock.CheckLandLine =

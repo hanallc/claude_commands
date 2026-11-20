@@ -165,6 +165,16 @@ def claude_catalog_environment(directory: Path, targets: Mapping[str, str]) -> d
 
 
 class RegistryPublicationTests(ScriptRepositoryTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.environment.update({
+            "CONF_DIR": str(self.repo / "config"),
+            "MODELS_CONFIG_FILE": str(self.repo / "config/models.conf"),
+            "MERGE_GATE_STATE_DIR": str(self.root / "land-state"),
+            "XDG_STATE_HOME": str(self.root / "state"),
+        })
+
     def _save_during_registry_move(self, *values: str) -> tuple[str, list[str]]:
         registry = self.write(self.repo / "config/models.conf", "[fixture]\nmodel=old\n")
         colors = self.write(self.repo / "config/statusline.conf", "account.claude1=brown\n")

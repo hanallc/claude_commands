@@ -124,12 +124,11 @@ CHECK_LAND_LINE = CheckLandLine()
 
 @contextmanager
 def settings_push(checkout: Path, *, wait: bool,
-                  gap: land_queue.SettingsGap | CheckLandLine = CHECK_LAND_LINE,
-                  request: land_queue.DeferredSettingsPush | None = None) -> Generator[
+                  gap: land_queue.SettingsGap | CheckLandLine = CHECK_LAND_LINE) -> Generator[
                       MainPushReady | MainPushBusy | land_queue.SettingsWaiting | land_queue.SettingsGapBusy]:
     """Get a publication gap and hold main while the caller publishes settings."""
     with ExitStack() as locks:
-        admission = locks.enter_context(land_queue.settings_gap(wait=wait, request=request)) if isinstance(gap, CheckLandLine) else gap
+        admission = locks.enter_context(land_queue.settings_gap(wait=wait)) if isinstance(gap, CheckLandLine) else gap
         if not isinstance(admission, land_queue.SettingsGap):
             yield admission
             return
@@ -153,10 +152,12 @@ def _settings_candidate(checkout: Path) -> land_queue.DirectSettingsPush | None:
         return None
     result = subprocess.run(["git", "-C", str(checkout), "log", "-m", "--format=", "--name-only",
                              "--no-renames", "-z", f"{base}..{commit}"], capture_output=True, text=True, check=False)
-    if result.returncode or not land_queue.settings_only([name for name in result.stdout.split("\0") if name]):
+    paths = [name for name in result.stdout.split("\0") if name]
+    if result.returncode or not land_queue.settings_only(paths):
         return None
     return {"kind": "direct", "checkout": str(checkout.resolve()), "commit": commit, "base": base, "branch": branch,
-            "validated_base": os.environ.get("CI_VALIDATED_BASE", "")}
+            "validated_base": os.environ.get("CI_VALIDATED_BASE", ""),
+            "settings_json_only": set(paths) == {"settings.json"}}
 
 
 class LockCommand(argparse.Namespace):
@@ -174,16 +175,16 @@ def main() -> int:
         command = command[1:]
     if not command:
         parser.error("supply a command after --")
+    request = _settings_candidate(args.checkout)
     with ExitStack() as locks:
-        request = _settings_candidate(args.checkout)
         if request is None:
             locks.enter_context(main_push_lock(args.checkout, Path(command[0]).name))
         else:
-            admission = locks.enter_context(settings_push(args.checkout, wait=True, request=request))
-            if isinstance(admission, land_queue.SettingsWaiting):
-                print(admission.report())
-                print(f"{request['commit']} queued")
-                return 0
+            admission = locks.enter_context(settings_push(args.checkout, wait=False))
+            if not isinstance(admission, MainPushReady):
+                script = Path(__file__).resolve().with_name("live_settings.py")
+                result = subprocess.run([sys.executable, str(script), "queue-direct", json.dumps(request)], check=False)
+                return result.returncode
         result = subprocess.run(command, check=False, env=held_environment(args.checkout))
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 

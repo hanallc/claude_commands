@@ -705,10 +705,12 @@ The runner takes each land item under the line lock.
 The units board shows `<Nth> in line` for each checkpoint that waits.
 
 A shared settings change takes effect before publication.
-When a land runs, the publisher places one `settings publish` item at the front of the line.
-`next` publishes the waiting changes, removes the settings item, and returns the next land item.
-A failed publication leaves the changes for the notes timer to retry.
-When no land runs, a settings push can use the gap immediately.
+When a land runs or a publisher holds the gap, a caller places one `settings publish` item at the front.
+`next` holds the gap and removes the settings item before it starts the publisher.
+The publisher inherits the gap lock, and Git runs after the runner releases the line lock.
+A failed publication keeps the journal entries and lets the runner return the next land.
+The notes timer requests another gap for pending entries without taking the publication locks.
+When the gap is free, a settings push can use it immediately.
 
 For an approved edit to the live `settings.json` on natedev, use
 `~/.claude/scripts/lib/py ~/.claude/scripts/lib/live_settings.py publish-json --message "<approved reason>"`.

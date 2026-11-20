@@ -26,6 +26,12 @@ class MainPushLockRecordTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.checkout = Path(folder.name)
+        self.enterContext(patch.dict(os.environ, {
+            "HOME": folder.name, "CONF_DIR": str(self.checkout / "config"),
+            "MODELS_CONFIG_FILE": str(self.checkout / "config/models.conf"),
+            "MERGE_GATE_STATE_DIR": str(self.checkout / "land-state"),
+            "XDG_STATE_HOME": str(self.checkout / "state"),
+        }))
         _ = subprocess.run(["git", "init", "-q", str(self.checkout)], check=True, timeout=30)
         self.record = self.checkout / ".git" / main_push_lock.RECORD_NAME
 

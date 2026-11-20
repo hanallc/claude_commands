@@ -108,6 +108,7 @@ class SetTests(unittest.TestCase):
         _ = (self.fakes / "broadcast.py").write_text(FAKE_BROADCAST, encoding="utf-8")
         self.env = {key: value for key, value in os.environ.items() if key not in ("USER_ZONE", "XDG_STATE_HOME")}
         self.env.update({
+            "HOME": str(self.root), "MODELS_CONFIG_FILE": str(self.checkout / "config/models.conf"),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "USER_ZONE_CONF": str(self.checkout / "config/user_zone.conf"),
             "ZONE_SSH": str(ssh), "ZONE_BROADCAST": str(self.fakes / "broadcast.py"),

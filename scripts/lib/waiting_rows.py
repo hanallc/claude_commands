@@ -148,6 +148,16 @@ class NoSettingsJsonSave:
     """No shared settings.json changes wait for publication."""
 
 
+class MacSettingsBaseline(TypedDict):
+    order: int
+    text: str
+
+
+@dataclass(frozen=True)
+class MacSettingsUntracked:
+    """The sender has no baseline for Mac settings delivery."""
+
+
 class SettingsJournalRecord(TypedDict):
     last_order: int
     accepted: NotRequired[dict[str, dict[str, AcceptedSaveRecord]]]
@@ -155,6 +165,7 @@ class SettingsJournalRecord(TypedDict):
     changes: list[WaitingChangeRecord]
     settings_json: NotRequired[SettingsJsonSave]
     settings_json_order: NotRequired[int]
+    mac_settings: NotRequired[MacSettingsBaseline]
 
 
 @dataclass
@@ -168,6 +179,7 @@ class LockedJournal:
     migrating: bool = False
     settings_json: SettingsJsonSave | NoSettingsJsonSave = NoSettingsJsonSave()
     settings_json_order: int = 0
+    mac_settings: MacSettingsBaseline | MacSettingsUntracked = MacSettingsUntracked()
 
     def save(self) -> None:
         record: dict[str, object] = {"last_order": self.last_order, "register": self.accepted,
@@ -176,6 +188,8 @@ class LockedJournal:
             record["settings_json"] = self.settings_json
         if self.settings_json_order:
             record["settings_json_order"] = self.settings_json_order
+        if not isinstance(self.mac_settings, MacSettingsUntracked):
+            record["mac_settings"] = self.mac_settings
         write_text_atomic(self.path, json.dumps(record, default=asdict, indent=2) + "\n", new_file_mode=0o600)
         self.migrating = False
 
@@ -236,7 +250,7 @@ class LockedJournal:
         return old != self.changes
 
 
-def _read_journal(path: Path) -> LockedJournal:
+def read_journal(path: Path) -> LockedJournal:
     try:
         data = cast(object, json.loads(path.read_text(encoding="utf-8")))
         if isinstance(data, list):
@@ -254,7 +268,8 @@ def _read_journal(path: Path) -> LockedJournal:
                            for key, row in keys.items()} for stem, keys in register.items()}
         return LockedJournal(path, record["last_order"], accepted, changes, migrating="register" not in record,
                              settings_json=record.get("settings_json", NoSettingsJsonSave()),
-                             settings_json_order=record.get("settings_json_order", 0))
+                             settings_json_order=record.get("settings_json_order", 0),
+                             mac_settings=record.get("mac_settings", MacSettingsUntracked()))
     except FileNotFoundError:
         return LockedJournal(path, 0, {}, [])
     except (ValueError, TypeError, KeyError) as error:
@@ -267,7 +282,7 @@ def locked_journal(path: Path, *, wait: bool = True) -> Generator[LockedJournal]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
-        yield _read_journal(path)
+        yield read_journal(path)
 
 
 def replace_value(source: str, index: int, value: str) -> str:
@@ -766,7 +781,7 @@ def tree_without(checkout: Path, tree: str, paths: Iterable[str], environment: d
 
 def check_move(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
                replace_registry: bool = False, registry_move: bool = False,
-               replay_registry: RegistryReplay = registry_rows.replay_pending) -> WaitingRows:
+               keep_live_json: bool = False, replay_registry: RegistryReplay = registry_rows.replay_pending) -> WaitingRows:
     """Check the move on a private index before Git changes the checkout."""
     index = index_path(checkout)
     folder = (build_folders.tool_folder("models-ff-index") if registry_move
@@ -778,6 +793,9 @@ def check_move(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
         index_before = git(checkout, "write-tree", environment=environment).strip()
         staged = changed_paths(checkout, move.head, index_before, *waiting_paths(checkout))
         plan = hold(checkout, move, pending, replace_registry=replace_registry, replay_registry=replay_registry)
+        if keep_live_json:
+            plan["before"][SETTINGS_JSON] = plan["after"][SETTINGS_JSON] = live_text(checkout / SETTINGS_JSON)
+            staged.discard(SETTINGS_JSON)
         target_entries = {path: index_entry(checkout, move.tip, path) for path in plan["after"]}
         merged_entries: dict[str, str] = {}
         for path in sorted(staged & target_entries.keys()):

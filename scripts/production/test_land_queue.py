@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
+from scripts.lib import file_lock
 from scripts.production import land_queue, land_runs, unit_phases
 from zoneinfo import ZoneInfo
 
@@ -21,7 +22,13 @@ class LandQueueTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(self.root)}))
+        (self.root / "land-state").mkdir()
+        self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root), "CONF_DIR": str(self.root / "config"),
+            "MODELS_CONFIG_FILE": str(self.root / "config/models.conf"),
+            "MERGE_GATE_STATE_DIR": str(self.root / "land-state"),
+            "XDG_STATE_HOME": str(self.root / "state"),
+        }))
 
     def run_line(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -62,8 +69,15 @@ class LandQueueTests(unittest.TestCase):
         with land_runs.landing(["b" * 40]), land_queue.settings_gap() as admission:
             self.assertIsInstance(admission, land_queue.SettingsWaiting)
 
-        def stopped(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+        def stopped(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             self.assertEqual(land_queue.listing(), "1. builds next: aaaaaaaaa")
+            descriptor = int(command[-1])
+            self.assertEqual(options["pass_fds"], (descriptor,))
+            self.assertEqual(land_queue.inherited_gap(descriptor).descriptor, descriptor)
+            with land_queue.gap_lock(wait=False) as competing:
+                self.assertIsInstance(competing, land_queue.SettingsGapBusy)
+            with land_queue.line_lock(wait=False) as line:
+                self.assertIs(line, file_lock.LockResult.ACQUIRED)
             return subprocess.CompletedProcess(command, -15, "", "")
 
         with patch.object(subprocess, "run", stopped):

@@ -20,6 +20,7 @@ from typing import NamedTuple, cast
 
 from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
+from scripts.production import land_queue
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.merge_checkpoint import git, merged_checkpoints, merge_lock
 
@@ -144,11 +145,41 @@ def handoff(output: str) -> CiRun:
     return CiRun(fields["repo"], fields["run_id"], fields["sha"])
 
 
+def _follow_ci(production: Production, push: tuple[str, ...], commit: str, publication: str) -> CiRun:
+    followed = required(command("ci start", *push, "--follow-published", commit, publication,
+                                cwd=production.checkout), "ci start")
+    return handoff(followed)
+
+
+def _save_run(state_dir: Path, run: CiRun) -> None:
+    write_json(state_dir / "ci_run.json", {"repo": run.repo, "run_id": run.run_id, "tip": run.tip})
+    report("ci start", "ok", f"run {run.run_id} on {run.tip} ({run.repo})")
+
+
+def _resume_ci(production: Production, state_dir: Path, script: Path) -> bool:
+    path = state_dir / "ci_queued.json"
+    try:
+        queued = cast(dict[str, str], json.loads(path.read_text()))
+    except FileNotFoundError:
+        return False
+    receipt = land_queue.publication_receipt(production.checkout, queued["commit"])
+    if receipt is None:
+        report("ci start", "pending", f"{queued['commit']} waits for the land gap")
+        return True
+    push = ("env", f"PUSH_TARGET_BRANCH={production.merge_branch}", f"CANCEL_PRIOR={queued['cancel_prior']}",
+            "bash", str(script.resolve().with_name("push_direct.sh")))
+    _save_run(state_dir, _follow_ci(production, push, receipt["commit"], receipt["state"]))
+    path.unlink()
+    return True
+
+
 def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior: bool) -> None:
     if no_ci:
         report("ci start", "ok", "skipped: no CI")
         return
     script = Path(os.environ.get("CI_POINTS_VALIDATE_SCRIPT", str(Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh")))
+    if _resume_ci(production, state_dir, script):
+        return
     tip = branch_tip(production)
     push_origin = required(git(production.checkout, "remote", "get-url", "--push", "origin"), "ci start")
     checkpoints = merged_checkpoints(production)
@@ -200,17 +231,19 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
             published = required(command("validation", *push, "--publish-only", validated,
                                          cwd=production.checkout), "validation")
         publication = published.splitlines()[-1].split() if published else []
-        if len(publication) != 2 or publication[1] not in ("pushed", "contained"):
-            raise PointFailure("ci start", "push did not provide a published commit; rerun ci start")
-        followed = required(command("ci start", *push, "--follow-published", *publication,
-                                    cwd=production.checkout), "ci start")
-        run = handoff(followed)
+        if len(publication) != 2 or publication[1] not in ("pushed", "contained", "queued"):
+            raise PointFailure("ci start", "push did not provide a publication receipt; rerun ci start")
+        if publication[1] == "queued":
+            write_json(state_dir / "ci_queued.json",
+                       {"commit": publication[0], "cancel_prior": str(cancel_prior).lower()})
+            report("ci start", "pending", f"{publication[0]} waits for the land gap")
+            return
+        run = _follow_ci(production, push, *publication)
         if publication[1] == "contained":
             report("validation", "ok", f"validated {tip}; no push; following {run.tip}")
         else:
             report("validation", "ok", f"validated {validated}; fast-forward push to origin/{production.merge_branch}")
-        write_json(state_dir / "ci_run.json", {"repo": run.repo, "run_id": run.run_id, "tip": run.tip})
-        report("ci start", "ok", f"run {run.run_id} on {run.tip} ({run.repo})")
+        _save_run(state_dir, run)
 
 
 def run_view(run: CiRun, checkout: Path) -> dict[str, object]:

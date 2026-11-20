@@ -650,6 +650,13 @@ def close_restore(runner: GitRunner, repo: Path, unit: str, identity: str) -> No
     print(f"automatic restore closed for {identity}")
 
 
+def _attempt_failed(path: Path, error: Exception, *, overlap: bool) -> None:
+    if overlap:
+        raise PublishedFailure(str(error)) from error
+    detail = " ".join(str(error).splitlines())
+    print(f"fast-track attempt {path.stem} remains pending: {detail}", file=sys.stderr)
+
+
 def reconcile(runner: GitRunner, repo: Path, unit: str, *, finish: bool = False, paths: tuple[str, ...] = (),
               published_commit: str = "", settings_read: conf.ConfigRead) -> str:
     """Publish review rows first; only command recovery restores and promotes."""
@@ -710,21 +717,26 @@ def reconcile(runner: GitRunner, repo: Path, unit: str, *, finish: bool = False,
                             raise PublishedFailure(f"{error}; retire automatic restore with: {command}") from error
                         attempt["restored"] = True
                         save_attempt(path, attempt)
-                    if not attempt["promoted"] or repeat:
-                        promote(runner, attempt["production"], repo, row["commit"], unit)
-                        attempt["promoted"] = True
-                        save_attempt(path, attempt)
+                    needs_promotion = not attempt["promoted"] or repeat
                 except (PublishedFailure, Refused, OSError, ValueError) as error:
-                    if overlap:
-                        raise PublishedFailure(str(error)) from error
-                    detail = " ".join(str(error).splitlines())
-                    print(f"fast-track attempt {path.stem} remains pending: {detail}", file=sys.stderr)
+                    _attempt_failed(path, error, overlap=overlap)
                     continue
-                if not overlap and not attempt["restored"] and not attempt["restore_closed"]:
-                    print(f"fast-track attempt {path.stem} remains pending: automatic restore needs an overlapping request",
-                          file=sys.stderr)
-                if matches:
-                    recovered = row["commit"]
+            if needs_promotion:
+                try:
+                    promote(runner, attempt["production"], repo, row["commit"], unit)
+                except (PublishedFailure, Refused, OSError, ValueError) as error:
+                    _attempt_failed(path, error, overlap=overlap)
+                    continue
+                with record_lock():
+                    current = read_attempt(path)
+                    if current["restore"]["record"]["commit"] == row["commit"]:
+                        current["promoted"] = True
+                        save_attempt(path, current)
+            if not overlap and not attempt["restored"] and not attempt["restore_closed"]:
+                print(f"fast-track attempt {path.stem} remains pending: automatic restore needs an overlapping request",
+                      file=sys.stderr)
+            if matches:
+                recovered = row["commit"]
         return recovered
 
 
@@ -790,9 +802,9 @@ def push_patch(runner: GitRunner, repo: Path, production: str, unit: str, why: s
                     with ExitStack() as locks:
                         if land_queue.settings_only(paths):
                             request: land_queue.FastTrackSettingsPush = {"kind": "fast-track", "attempt": str(attempt)}
-                            admission = locks.enter_context(main_push_lock.settings_push(repo, wait=True, request=request))
-                            if isinstance(admission, land_queue.SettingsWaiting):
-                                return admission
+                            admission = locks.enter_context(main_push_lock.settings_push(repo, wait=False))
+                            if not isinstance(admission, main_push_lock.MainPushReady):
+                                return land_queue.enqueue_settings(request)
                         else:
                             locks.enter_context(main_push_lock.main_push_lock(repo))
                         _ = runner.git(copy, "fetch", "origin", "main")
@@ -829,12 +841,12 @@ def resume_settings_push(path: Path, gap: land_queue.SettingsGap, *, wait: bool)
     with main_push_lock.settings_push(repo, wait=wait, gap=gap) as admission:
         if not isinstance(admission, main_push_lock.MainPushReady):
             return False
-        commit = main_publish.prepare_deferred_commit(repo, row["commit"], attempt["base"], "main")
+        commit, origin = main_publish.prepare_deferred_commit(repo, row["commit"], attempt["base"], "main")
         if commit != row["commit"]:
             with record_lock():
                 attempt = read_attempt(path)
                 attempt["restore"]["record"]["commit"] = commit
-                attempt["base"] = runner.git(repo, "rev-parse", "FETCH_HEAD").strip()
+                attempt["base"] = origin
                 _ = runner.git(repo, "update-ref", f"refs/fast-track/attempts/{path.stem}/commit", commit)
                 save_attempt(path, attempt)
         landed = land_main.land(repo, commit)

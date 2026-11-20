@@ -10,7 +10,7 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import cast
+from typing import NamedTuple, cast
 
 from scripts.lib import land_main, main_push_lock, waiting_rows
 from scripts.lib.land_main import CommandTimeLimit as CommandTimeLimit, NoTimeLimit as NoTimeLimit, UNLIMITED_GIT
@@ -168,22 +168,29 @@ def _rebuilt(checkout: Path, commits: list[tuple[str, str, str]], onto: str) -> 
     return tip
 
 
-def prepare_deferred_commit(checkout: Path, commit: str, base: str, branch: str, *, validated_base: str = "") -> str:
-    """Reapply the saved settings commits to the current origin tip."""
-    fetched = git(checkout, "fetch", "origin", branch)
+class PreparedDeferredCommit(NamedTuple):
+    commit: str
+    origin_tip: str
+
+
+def prepare_deferred_commit(checkout: Path, commit: str, base: str, branch: str, *,
+                            validated_base: str = "") -> PreparedDeferredCommit:
+    """Reapply the saved settings commits to the fetched branch."""
+    reference = f"refs/settings-publish/origin/{branch}"
+    fetched = git(checkout, "fetch", "origin", f"+refs/heads/{branch}:{reference}")
     if fetched.returncode:
         raise Refusal(first_line(fetched))
-    origin = waiting_rows.git(checkout, "rev-parse", "FETCH_HEAD").strip()
+    origin = waiting_rows.git(checkout, "rev-parse", reference).strip()
     if validated_base and git(checkout, "merge-base", "--is-ancestor", validated_base, commit).returncode:
         raise Refusal("merge branch moved during validation")
     if (not git(checkout, "merge-base", "--is-ancestor", commit, origin).returncode
             or not git(checkout, "merge-base", "--is-ancestor", origin, commit).returncode):
-        return commit
+        return PreparedDeferredCommit(commit, origin)
     if validated_base:
         raise Refusal("merge branch moved during validation")
     listed = waiting_rows.git(checkout, "log", "--format=%H %h %s", "--reverse", f"{base}..{commit}")
     commits = [cast(tuple[str, str, str], tuple(line.split(" ", 2))) for line in listed.splitlines()]
-    return _rebuilt(checkout, commits, origin)
+    return PreparedDeferredCommit(_rebuilt(checkout, commits, origin), origin)
 
 
 def commit(checkout: Path, conf: Path, message: str, before: ExistingFile | MissingFile,

@@ -92,7 +92,7 @@ class TuneTests(PublicationTestCase):
                 saved = self.save_amount("3")
                 self.assertEqual(saved.returncode, 0, saved.stderr)
                 self.assertIn("waits for the land", saved.stdout)
-            self.assertIn("main: pushed", live_settings.publish_waiting())
+            self.assertIn("main: pushed", live_settings.publish(repo.checkout, wait=True) or [])
             published = repo.remote_tip()
             pulls = repo.mac_pulls()
             self.assertEqual(land_queue.take_next(), "")
@@ -555,31 +555,50 @@ class TuneTests(PublicationTestCase):
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
         self.assertEqual(self.waiting(), [])
 
-    def test_a_change_is_live_here_and_on_the_mac_while_main_is_locked_and_main_gets_it_after(self) -> None:
+    def test_a_save_returns_while_main_and_the_line_are_busy(self) -> None:
         repo = self.repository
-        lock = (repo.checkout / ".git/main-push.lock").open("a")
-        self.addCleanup(lock.close)
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        running = subprocess.Popen(
-            [sys.executable, str(SCRIPT), "example", "amount", "3", "--why", "Approved tuning", "--user-words", "yes"],
-            cwd=repo.checkout, env=repo.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-        while not (repo.ssh_log.exists() and "live_settings.py" in repo.ssh_log.read_text()) \
-                and running.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        self.assertIsNone(running.poll())
-        self.assertIn("amount=3", repo.config.read_text())
-        self.assertIn("amount=2", repo.git(repo.checkout, "show", "HEAD:config/example.conf"))
-        self.assertIn(shlex.join(["example", "amount", "3"]), repo.ssh_log.read_text())
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        output, errors = running.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(running.returncode, 0, output + errors)
-        self.assertEqual(output.splitlines()[:2], ["live now: amount=3", "mac: live now: amount=3"])
+        with mock.patch.dict(os.environ, repo.env, clear=True):
+            with (repo.checkout / ".git/main-push.lock").open("a") as lock, land_queue.line_lock():
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                saved = self.save_amount("3")
+                self.assertEqual(saved.returncode, 0, saved.stderr)
+                self.assertIn("main: waits", saved.stdout)
+                self.assertIn("amount=3", repo.config.read_text())
+                self.assertIn("amount=2", repo.git(repo.checkout, "show", "HEAD:config/example.conf"))
+                self.assertIn(shlex.join(["example", "amount", "3"]), repo.ssh_log.read_text())
+            self.assertEqual(land_queue.take_next(), "")
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
-        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
         self.assertEqual(self.waiting(), [])
 
-    def test_a_refused_main_keeps_the_value_live_and_the_notes_pass_publishes_it(self) -> None:
+    def test_notes_notify_the_runner_without_waiting_on_the_journal(self) -> None:
+        repo = self.repository
+        base = repo.remote_tip()
+        with mock.patch.dict(os.environ, repo.env, clear=True):
+            _ = live_settings.stage_save(live_settings.WaitingChange(
+                "example", "amount", "3", "tune(example): increase amount"))
+            with waiting_rows.locked_journal(waiting_rows.journal_path()):
+                self.assertIn("main: waits", "\n".join(live_settings.publish_waiting()))
+                self.assertEqual(repo.remote_tip(), base)
+            self.assertEqual(land_queue.take_next(), "")
+        self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
+
+    def test_mac_delivery_retries_unacknowledged_json_fields(self) -> None:
+        repo = self.repository
+        settings = self.seed_settings('{"x": 1, "y": 1}\n')
+        offline = repo.root / "OFFLINE"
+        with mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()):
+            with land_runs.landing([repo.head()]):
+                offline.touch()
+                _ = settings.write_text('{"x": 2, "y": 1}\n')
+                self.assertEqual(live_settings.main(["publish-json", "--message", "Set x"]), 0)
+                offline.unlink()
+                _ = settings.write_text('{"x": 2, "y": 2}\n')
+                self.assertEqual(live_settings.main(["publish-json", "--message", "Set y"]), 0)
+        deliveries = [shlex.split(line)[-1] for line in repo.ssh_log.read_text().splitlines() if "apply-json" in line]
+        edits = cast(waiting_rows.SettingsJsonEdits, json.loads(deliveries[-1]))
+        self.assertEqual(edits["values"], {"x": 2, "y": 2})
+
+    def test_a_refused_main_keeps_the_value_live_for_the_runner(self) -> None:
         repo = self.repository
         _ = (repo.checkout / "other.txt").write_text("unrelated local commit\n")
         _ = repo.git(repo.checkout, "commit", "-qam", "unrelated work")
@@ -592,7 +611,8 @@ class TuneTests(PublicationTestCase):
         with mock.patch.dict(os.environ, repo.env, clear=True), \
                 mock.patch.object(models_registry, "publish_pending", return_value=False):
             lines = live_settings.publish_waiting()
-        self.assertEqual(lines, ["main: pushed", "mac: pulled"])
+            self.assertEqual(land_queue.take_next(), "")
+        self.assertEqual(lines, ["main: waits for the land that runs now"])
         self.assertEqual(repo.git(repo.origin, "log", "-1", "--format=%s", "main"), "tune(example): amount 2 -> 3")
         self.assertEqual(self.waiting(), [])
         with mock.patch.dict(os.environ, repo.env, clear=True), \

@@ -6,6 +6,7 @@ from collections.abc import Generator
 from contextlib import contextmanager, redirect_stderr
 from functools import cached_property
 import io
+import json
 from pathlib import Path, PurePosixPath
 import shlex
 import shutil
@@ -16,7 +17,7 @@ from typing import final, override
 import unittest
 from unittest import mock
 
-from scripts.lib import land_main, main_publish, main_sync, waiting_rows
+from scripts.lib import land_main, live_settings, main_publish, main_sync, waiting_rows
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import land_queue, land_runs
@@ -54,8 +55,11 @@ class PublicationRepository:
             + 'printf "rc=0\\n"\n',
         )
         self.ssh.chmod(0o755)
+        registry = root / "models.conf"
+        _ = registry.write_text("[codex.agents]\ngpt-6.2-sol=high\n", encoding="utf-8")
         self.env = {
             **os.environ, "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
+            "MODELS_CONFIG_FILE": str(registry),
             "ZONE_SSH": str(self.ssh), "ZONE_STATE": str(root / "state"),
             "SSH_LOG": str(self.ssh_log), "OFFLINE": str(root / "OFFLINE"),
             "XDG_STATE_HOME": str(root / "xdg"), "MERGE_GATE_STATE_DIR": str(root / "land-state"),
@@ -175,7 +179,7 @@ class MainPublishTests(PublicationTestCase):
                 )
                 self.assertEqual(child.returncode, 23, child.stdout + child.stderr)
 
-    def test_direct_settings_commit_waits_until_the_current_land_ends(self) -> None:
+    def test_direct_settings_commit_leaves_the_checkout_ready_for_promotion(self) -> None:
         repo = self.repository
         environment = {**repo.env, "PUSH_TARGET_BRANCH": "main", "MODELS_CONFIG_PUBLISH": "0"}
         origin = repo.remote_tip()
@@ -192,9 +196,58 @@ class MainPublishTests(PublicationTestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("main: waits for the land that runs now", result.stdout)
             self.assertEqual(repo.remote_tip(), origin)
+            self.assertEqual(repo.head(), origin)
+            self.assertIn("308800", settings.read_text())
         with mock.patch.dict(os.environ, environment, clear=True), redirect_stderr(io.StringIO()):
             self.assertEqual(land_queue.take_next(), "")
-        self.assertEqual(repo.remote_tip(), candidate)
+            receipt = land_queue.publication_receipt(repo.checkout, candidate)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(repo.remote_tip(), receipt["commit"])
+        self.assertIn("308800", repo.git(repo.origin, "show", "main:settings.json"))
+
+    def test_queued_hand_commit_gets_its_receipt_if_an_idle_publisher_finishes_first(self) -> None:
+        repo = self.repository
+        base = repo.head()
+        settings = repo.checkout / "settings.json"
+        _ = settings.write_text('{"autoCompactWindow": 308800}\n')
+        _ = repo.git(repo.checkout, "add", settings.name)
+        _ = repo.git(repo.checkout, "commit", "-qm", "Approve the window")
+        candidate = repo.head()
+        request: land_queue.DirectSettingsPush = {
+            "kind": "direct", "checkout": str(repo.checkout), "commit": candidate, "base": base,
+            "branch": "main", "validated_base": "", "settings_json_only": True,
+        }
+        with land_runs.landing([base]):
+            self.assertEqual(live_settings.main(["queue-direct", json.dumps(request)]), 0)
+        self.assertIn("main: pushed", live_settings.publish(repo.checkout, wait=True) or [])
+        receipt = land_queue.publication_receipt(repo.checkout, candidate)
+        self.assertEqual(receipt, {"commit": repo.remote_tip(), "state": "pushed"})
+        self.assertEqual(land_queue.take_next(), "")
+
+    def test_deferred_replay_ignores_fetch_head_from_another_branch(self) -> None:
+        repo = self.repository
+        base = repo.head()
+        _ = repo.git(repo.checkout, "checkout", "-qb", "production")
+        _ = (repo.checkout / "other.txt").write_text("Production only\n")
+        _ = repo.git(repo.checkout, "commit", "-qam", "Production only")
+        _ = repo.git(repo.checkout, "push", "origin", "production")
+        _ = repo.git(repo.checkout, "checkout", "-q", "main")
+        _ = repo.change()
+        _ = repo.git(repo.checkout, "commit", "-qam", "Tune fixture")
+        requested = repo.head()
+        real_git = main_publish.git
+
+        def fetch_other_branch(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+            done = real_git(checkout, *args)
+            if args[:2] == ("fetch", "origin"):
+                _ = repo.git(repo.checkout, "fetch", "origin", "production")
+            return done
+
+        with mock.patch.object(main_publish, "git", fetch_other_branch):
+            prepared = main_publish.prepare_deferred_commit(repo.checkout, requested, base, "main")
+        self.assertEqual(prepared.origin_tip, base)
+        self.assertEqual(prepared.commit, requested)
 
     def test_push_refuses_to_publish_unrelated_local_commits(self) -> None:
         repo = self.repository

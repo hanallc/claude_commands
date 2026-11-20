@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -295,6 +296,9 @@ class FastTrackTests(MergeCheckpointFixture):
             "FAST_TRACK_STATE_DIR": str(self.records_dir),
             "FAST_TRACK_TEST_EVENTS": str(self.events_path), "FAST_TRACK_TEST_CONTROL": str(self.control),
             "FAST_TRACK_TEST_LOCK": str(self.common_directory / "main-push.lock"),
+            "MODELS_CONFIG_FILE": str(self.config.with_name("models.conf")),
+            "MERGE_GATE_STATE_DIR": str(self.root / "land-line"),
+            "XDG_STATE_HOME": str(self.root / "state"),
         })
         self.settings = {
             "max_changed_lines": 100, "max_files": 10, "check_time_limit_seconds": 30,
@@ -445,7 +449,6 @@ class FastTrackTests(MergeCheckpointFixture):
     def test_fast_track_config_waits_and_publishes_its_saved_patch_in_the_gap(self) -> None:
         path = "config/example.conf"
         self.write(self.unit, path, "amount=3\n")
-        self.env["MERGE_GATE_STATE_DIR"] = str(self.root / "land-line")
         with patch.dict(os.environ, self.env, clear=True), land_runs.landing([self.initial]):
             result = self.fast_track(path)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -456,6 +459,22 @@ class FastTrackTests(MergeCheckpointFixture):
             self.assertEqual(land_queue.take_next(), "")
         self.assertEqual(self.git("show", f"main:{path}", cwd=self.origin), "amount=3")
         self.assertEqual(len(self.records()), 1)
+
+    def test_reconciliation_releases_the_record_lock_before_promotion(self) -> None:
+        self.change_module()
+        original = fast_track.promote
+        observed: list[str] = []
+
+        def promote(runner: fast_track.GitRunner, production: str, repo: Path, commit: str, unit: str) -> None:
+            with Path(self.env["FAST_TRACK_STATE_DIR"], "records.lock").open("a") as record:
+                fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            observed.append(commit)
+            original(runner, production, repo, commit, unit)
+
+        with patch.object(fast_track, "promote", promote):
+            result = self.fast_track()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(observed, [self.git("rev-parse", "main", cwd=self.origin)])
 
     def test_post_push_ref_lock_retries_then_restores_and_promotes(self) -> None:
         self.change_module()
