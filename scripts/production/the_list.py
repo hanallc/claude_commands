@@ -1120,29 +1120,25 @@ class WaitingForAnswer:
 
 
 @dataclass(frozen=True)
-class QuestionResend:
-    question: question_record.Question
-    delivery: change_page.QuestionDeliveryView
-
-
-@dataclass(frozen=True)
-class QuestionResends:
-    questions: tuple[QuestionResend, ...]
+class QuestionAttention:
+    failed: frozenset[str] = frozenset()
 
 
 def question_visibility(keeper: staff.StaffId, item: ListItem,
-                        status: change_page.DeliveryStatus) -> WaitingForAnswer | QuestionResends:
+                        status: change_page.DeliveryStatus) -> WaitingForAnswer | QuestionAttention:
     """Read the published state of each unanswered question."""
     unanswered = tuple(question for question in item.questions if question.answer is None)
     if not unanswered:
-        return QuestionResends(())
+        return QuestionAttention()
     target = _list_question_target(keeper, item)
-    resends: list[QuestionResend] = []
+    waiting = True
+    failed: set[str] = set()
     for question in unanswered:
         delivery = change_page.published_question_delivery_view(status, target.saved(question))
-        if not delivery.state.waits:
-            resends.append(QuestionResend(question, delivery))
-    return QuestionResends(tuple(resends)) if resends else WaitingForAnswer()
+        waiting &= delivery.state.waits
+        if delivery.state is delivery_state.QuestionSendState.FAILED:
+            failed.add(question.question_id)
+    return WaitingForAnswer() if waiting else QuestionAttention(frozenset(failed))
 
 
 def _check_links(read: Callable[[int], ListItem], number: int, changes: ItemChanges) -> None:
@@ -1727,12 +1723,9 @@ def _save_page_request(store: record_store.NumberedRecords, keeper: staff.StaffI
 class _ListQuestionStore:
     keeper: staff.StaffId
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
-    resend_id: str = ""
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
         current = load(self.keeper, item)
-        if self.resend_id:
-            return tuple(question for question in current.questions if question.question_id == self.resend_id)
         if isinstance(self.ask_request, PageRequest):
             # The shared allocator reserves IDs of resolved questions through its answer field.
             archived = tuple(replace(entry.what.question, answer=question_record.Answer(
@@ -1796,29 +1789,14 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
 
 
 def _claim_question(questions: _ListQuestionStore, item: ListItem, words: str,
-                    status: change_page.DeliveryStatus, *, resend_request: str = "") -> change_page.MessageDelivery:
-    return page_question.ask(questions, _list_question_target(questions.keeper, item), words, status,
-                             resend_unknown=bool(questions.resend_id), resend_request=resend_request)
+                    status: change_page.DeliveryStatus) -> change_page.MessageDelivery:
+    return page_question.ask(questions, _list_question_target(questions.keeper, item), words, status)
 
 
 def _list_question_target(keeper: staff.StaffId, item: ListItem) -> change_page.QuestionDeliveryTarget:
     owner = None if isinstance(item.owner, UnassignedOwner) else item.owner
     return change_page.list_question_target(_store(keeper).path(item.id), item.id, item.number, item.title,
                                            keeper, alert_owner=owner)
-
-
-def resend_question(keeper: staff.StaffId, identity: str, question_id: str,
-                    request: str, status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
-    """Claim delivery for the saved question with this ID."""
-    with _store(keeper).locked():
-        item = load(keeper, identity)
-        if item.state == ItemState.CLOSED:
-            return change_page.NoMessageDelivery()
-        for question in item.questions:
-            if question.question_id == question_id and question.answer is None:
-                return _claim_question(_ListQuestionStore(keeper, resend_id=question_id), item, question.words, status,
-                                       resend_request=request)
-        return change_page.NoMessageDelivery()
 
 
 def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) -> PageFeedback:

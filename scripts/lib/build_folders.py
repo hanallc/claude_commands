@@ -874,8 +874,13 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary:
                 return False
             if not build_folder_lock.lock_current(path, directory, descriptor):
                 return False
-            if cleanup() is False:
-                return False
+            try:
+                if cleanup() is False:
+                    return False
+            except FileNotFoundError:
+                if temporary and not _folder_exists(path, directory):
+                    _unlink_metadata(path, directory)
+                raise
             if _folder_exists(path, directory):
                 return False
             if temporary:

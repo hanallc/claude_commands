@@ -1555,16 +1555,19 @@ def _list_lock(path: Path) -> Generator[None]:
 
 
 @contextmanager
-def review_delivery_lock(root: Path) -> Generator[None]:
+def review_delivery_lock(root: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
     lock = root.resolve() / ".review-link-delivery.lock"
     held = _held_review_locks.get()
     if lock in held:
-        yield
+        yield file_lock.LockResult.ACQUIRED
         return
-    with file_lock.exclusive(lock):
+    with file_lock.exclusive(lock, wait=wait) as result:
+        if result is file_lock.LockResult.BUSY:
+            yield result
+            return
         token = _held_review_locks.set(held | {lock})
         try:
-            yield
+            yield result
         finally:
             _held_review_locks.reset(token)
 

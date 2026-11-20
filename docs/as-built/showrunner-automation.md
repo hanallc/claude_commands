@@ -559,7 +559,7 @@ Parking stores a time or a delivery condition and keeps the current item state.
 The List ends a delivery park automatically when the producer sets the item state to Delivered.
 Linked changes supply review information on the List.
 The List hides an item with unanswered questions while each send is pending or successful.
-If any unanswered question needs a resend, the item appears with its resend control.
+If a question send fails, the item shows Question not delivered.
 The `the_list.py list` command still shows the item.
 The producer uses `the_list.py answer` to save an answer and mark the item unread.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
