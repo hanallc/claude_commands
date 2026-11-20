@@ -142,7 +142,7 @@ Codex review prompts also include section 3's command block.
 2. Write no test for a refusal, a message text, a doc, a prompt or a config wording.
 3. Write no test for a helper, a fixture or test support code.
 4. Write no test for a case that an existing test of the same function reaches.
-5. For a fix, put the test where test rule 1 says. Add no function that test rule 1 does not allow.
+5. For a fix, add one row to an existing table. If no table fits, say so; do not add a function. A drawn-defect check follows test rule 1 instead.
 6. A rare case gets a test only when the defect destroys work or saved state for good.
 7. A test that needs a subprocess, a sleep or a real Git repository needs a reason in the summary.
 8. When your change makes a test a duplicate, delete it and name it in the summary.
