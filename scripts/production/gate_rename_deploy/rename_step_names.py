@@ -17,7 +17,7 @@ The program never stops services or changes a hold.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -126,23 +126,43 @@ class ProfileRename:
 
 @dataclass(frozen=True)
 class ConversionWrites:
-    """Record a possible live change before the first publication."""
+    """Keep evidence of the first change across interruptions."""
 
     marker: Path | None
 
+    @property
+    def pending(self) -> Path | None:
+        return self.marker.with_suffix(".pending") if self.marker is not None else None
+
+    def requires_completion(self) -> bool:
+        return any(move_gate_state.path_identity(path) is not None
+                   for path in (self.marker, self.pending) if path is not None)
+
+    def clear(self) -> None:
+        if self.marker is not None:
+            for path in (self.marker, self.pending):
+                if path is not None:
+                    path.unlink(missing_ok=True)
+            sync_folder(self.marker.parent)
+
     @contextmanager
-    def publish(self, *, unchanged_errors: tuple[type[Exception], ...] = ()) -> Generator[None]:
-        marker = self.marker
-        first = marker if marker is not None and not marker.exists() else None
-        if first is not None:
-            write_text_atomic(first, "Conversion can have written live records.\n", new_file_mode=0o600)
+    def publish(self, *, unchanged: Callable[[], bool] = lambda: True) -> Generator[None]:
+        marker, pending = self.marker, self.pending
+        if marker is None or pending is None or move_gate_state.path_identity(marker) is not None:
+            yield
+            return
+        first = move_gate_state.path_identity(pending) is None
+        if first:
+            write_text_atomic(pending, "First conversion write.\n", new_file_mode=0o600)
         try:
             yield
-        except unchanged_errors:
-            if first is not None:
-                first.unlink()
-                sync_folder(first.parent)
+        except (OSError, ValueError, sqlite3.Error):
+            if first and unchanged():
+                pending.unlink()
+                sync_folder(pending.parent)
             raise
+        os.replace(pending, marker)
+        sync_folder(marker.parent)
 
 
 def report(message: str, started: float, count: int = 0) -> None:
@@ -185,7 +205,7 @@ def require_no_waiting_callers(roots: RecordRoots) -> None:
              *sorted(admission.glob("*.reservation"))]
     for path in paths:
         if path.exists():
-            identities.update(recorded_callers(cast(JsonValue, json.loads(path.read_bytes()))))
+            identities.update(recorded_callers(decode_record(path, path.read_bytes())))
     entries = {"queue_place.py", "admission_client.py", "memory_admit.py", "gate.py", "merge_gate.py", "targeted_test.py"}
     modules = {"scripts.build_queue.queue_place", "scripts.build_queue.admission_client",
                "scripts.lint.memory_admit", "scripts.production.gate", "scripts.production.merge_gate",
@@ -215,7 +235,7 @@ def require_no_waiting_callers(roots: RecordRoots) -> None:
                 if separator and key == b"BUILDLOG_HOLD_WAITER_FILE" and value:
                     marker = Path(os.fsdecode(value))
                     try:
-                        identities.update(recorded_callers(cast(JsonValue, json.loads(marker.read_bytes()))))
+                        identities.update(recorded_callers(decode_record(marker, marker.read_bytes())))
                     except FileNotFoundError:
                         pass
             # Inspect argument words, never shell source or Python source strings.
@@ -258,17 +278,31 @@ def convert(value: JsonValue, fields: frozenset[str], names: Mapping[str, str]) 
     return count
 
 
+def record_text(path: Path, data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"Record must be UTF-8: {path}") from error
+
+
+def decode_record(path: Path, data: bytes) -> JsonValue:
+    try:
+        return cast(JsonValue, json.loads(record_text(path, data)))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid JSON record {path}: {error}") from error
+
+
 def records(path: Path) -> Iterator[tuple[bytes, JsonValue]]:
     with (gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb")) as stream:
         if path.suffix == ".jsonl":
             for line in stream:
                 if line.strip():
-                    yield line, cast(JsonValue, json.loads(line))
+                    yield line, decode_record(path, line)
                 else:
                     yield line, None
         else:
             data = stream.read()
-            yield data, cast(JsonValue, json.loads(data))
+            yield data, decode_record(path, data)
 
 
 def wait_files(roots: RecordRoots) -> list[Path]:
@@ -293,9 +327,10 @@ def wait_files(roots: RecordRoots) -> list[Path]:
                         continue
                     if path.is_symlink():
                         raise Refused(f"assignment wait record is a symlink: {path}")
+                    text = record_text(path, path.read_bytes())
                     try:
-                        value = cast(JsonValue, json.loads(path.read_bytes()))
-                    except ValueError:
+                        value = cast(JsonValue, json.loads(text))
+                    except json.JSONDecodeError:
                         if path.with_suffix("").exists():
                             raise Refused(f"cannot decode an assignment wait record: {path}") from None
                         continue
@@ -413,7 +448,7 @@ def write_record(change: RecordChange, names: Mapping[str, str], writes: Convers
         if count != change.count or RecordVersion.read(change.path) != change.version:
             raise Refused(f"record changed during conversion: {change.path}")
         temp.chmod(mode)
-        with writes.publish(unchanged_errors=(OSError,)):
+        with writes.publish():
             os.replace(temp, change.path)
         sync_folder(change.path.parent)
         report(f"Converted {change.path}", started, count)
@@ -425,6 +460,7 @@ def update_index(path: Path, names: Mapping[str, str], writes: ConversionWrites)
     started = time.monotonic()
     count = 0
     with closing(sqlite3.connect(path)) as connection:
+        updated: list[tuple[str, str, int]] = []
         tables = {str(row[0]) for row in cast(list[tuple[str]], connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall())}
         for table in ("gate_runs", "steps"):
@@ -432,16 +468,21 @@ def update_index(path: Path, names: Mapping[str, str], writes: ConversionWrites)
                 continue
             for old, new in names.items():
                 cursor = connection.execute(f"UPDATE {table} SET step = ? WHERE step = ?", (new, old))
-                count += cursor.rowcount
-        if count:
-            with writes.publish(unchanged_errors=(Refused,)):
-                try:
-                    connection.commit()
-                except sqlite3.Error as error:
-                    if connection.in_transaction:
-                        connection.rollback()
-                        raise Refused(f"index commit rolled back: {path}: {error}") from error
-                    raise
+                if cursor.rowcount:
+                    updated.append((table, old, cursor.rowcount))
+                    count += cursor.rowcount
+        if updated:
+            def index_unchanged() -> bool:
+                connection.rollback()
+                for table, old, expected in updated:
+                    row = cast(tuple[int], connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE step = ?", (old,)).fetchone())
+                    if row[0] != expected:
+                        return False
+                return True
+
+            with writes.publish(unchanged=index_unchanged):
+                connection.commit()
     report(f"Converted index {path}", started, count)
     return count
 
@@ -461,6 +502,13 @@ def check_early(roots: RecordRoots) -> None:
     move_gate_state.require_hold()
     require_no_waiting_callers(roots)
     require_expired_uploaded_attempts(roots)
+    for path in record_paths(roots):
+        try:
+            for _record in records(path):
+                pass
+        except FileNotFoundError:
+            # Active services can remove temporary records before the full check.
+            continue
 
 
 def inspect_conversion(roots: RecordRoots, started: float) -> Conversion:
@@ -492,7 +540,10 @@ def migrate(roots: RecordRoots, writes: ConversionWrites) -> int:
         began = time.monotonic()
         if os.path.lexists(rename.new):
             raise Refused(f"replacement profile appeared: {rename.new}")
-        with writes.publish(unchanged_errors=(FileExistsError,)):
+        source = move_gate_state.path_identity(rename.old)
+        if source is None:
+            raise Refused(f"source profile disappeared: {rename.old}")
+        with writes.publish(unchanged=lambda: move_gate_state.path_identity(rename.old) == source):
             move_gate_state.rename_folder(rename.old, rename.new)
         report(f"Renamed profile {rename.old} -> {rename.new}", began, 1)
         count += 1
@@ -500,7 +551,7 @@ def migrate(roots: RecordRoots, writes: ConversionWrites) -> int:
         count += update_index(path, names, writes)
     for path in caches:
         began = time.monotonic()
-        with writes.publish(unchanged_errors=(OSError,)):
+        with writes.publish():
             path.unlink()
         sync_folder(path.parent)
         report(f"Removed derived cache {path}", began, 1)
@@ -547,12 +598,12 @@ def require_expired_uploaded_attempts(roots: RecordRoots) -> None:
         if not root.exists():
             continue
         for request in root.rglob("request.json"):
-            data = cast(dict[str, JsonValue], json.loads(request.read_bytes()))
+            data = cast(dict[str, JsonValue], decode_record(request, request.read_bytes()))
             mode = data.get("mode")
             if not isinstance(mode, str) or mode not in modes or not (request.parent / "launch.json").exists():
                 continue
             outcome = request.parent / "outcome.json"
-            saved = cast(dict[str, JsonValue], json.loads(outcome.read_bytes())) if outcome.exists() else {}
+            saved = cast(dict[str, JsonValue], decode_record(outcome, outcome.read_bytes())) if outcome.exists() else {}
             expires = data.get("expires", 0)
             status = saved.get("status")
             if status not in ("complete", "fallback", "interrupted") and isinstance(expires, (int, float)) and expires > now:

@@ -51,6 +51,14 @@ def exists(path: Path) -> bool:
     return os.path.lexists(path)
 
 
+def path_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        status = path.lstat()
+        return status.st_dev, status.st_ino
+    except FileNotFoundError:
+        return None
+
+
 def rename_folder(old: Path, new: Path) -> None:
     """Move a folder only when the destination is absent."""
     with ExitStack() as parents:
@@ -173,9 +181,14 @@ def refuse_record_paths(old: Path) -> None:
             path = Path(directory) / name
             if path.suffix not in (".json", ".jsonl"):
                 continue
-            text = path.read_text(encoding="utf-8")
-            values = ([cast(object, json.loads(line)) for line in text.splitlines() if line.strip()]
-                      if path.suffix == ".jsonl" else [cast(object, json.loads(text))])
+            try:
+                text = path.read_text(encoding="utf-8")
+                values = ([cast(object, json.loads(line)) for line in text.splitlines() if line.strip()]
+                          if path.suffix == ".jsonl" else [cast(object, json.loads(text))])
+            except UnicodeDecodeError as error:
+                raise ValueError(f"Record must be UTF-8: {path}") from error
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid JSON record {path}: {error}") from error
             if any(contains_path(value, prefix) for value in values for prefix in prefixes):
                 found.append(path)
     if found:
@@ -208,7 +221,7 @@ def check_move(old: Path, new: Path) -> int:
     return 0
 
 
-def move_state(old: Path, new: Path) -> int:
+def move_state(old: Path, new: Path, *, defer_typecheck_cleanup: bool = False) -> int:
     step(f"Found folders: old={old} exists={exists(old)}; new={new} exists={exists(new)}")
     if exists(old) and exists(new):
         step("Refused: both folders exist")
@@ -231,7 +244,8 @@ def move_state(old: Path, new: Path) -> int:
         step("Refused: the new folder appeared before the rename")
         return 2
     step(f"Renamed folder: {old} -> {new}")
-    remove_typecheck_environment(new)
+    if not defer_typecheck_cleanup:
+        remove_typecheck_environment(new)
     step(f"Move complete: {new}")
     return 0
 
@@ -241,11 +255,14 @@ def main() -> int:
     _ = parser.add_argument("--old", type=Path, default=Path.home() / ".local/state/merge-gate")
     _ = parser.add_argument("--new", type=Path, default=Path.home() / ".local/state/gate")
     _ = parser.add_argument("--check", action="store_true", help="check the refusal conditions and move nothing")
+    _ = parser.add_argument("--defer-typecheck-cleanup", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     old = Path(os.path.abspath(cast(Path, args.old).expanduser()))
     new = Path(os.path.abspath(cast(Path, args.new).expanduser()))
     try:
-        return check_move(old, new) if cast(bool, args.check) else move_state(old, new)
+        if cast(bool, args.check):
+            return check_move(old, new)
+        return move_state(old, new, defer_typecheck_cleanup=cast(bool, args.defer_typecheck_cleanup))
     except (OSError, ValueError) as error:
         step(f"Refused: {error}")
         return 2
