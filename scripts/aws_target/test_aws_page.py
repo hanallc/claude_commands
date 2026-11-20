@@ -531,6 +531,22 @@ class AwsCombinedTableTests(PageCostFixture):
              'gpu': {**gpu, 'status': 'PENDING', 'created_at': None}},
         ))
 
+    def test_summary_omits_unknown_counts_before_the_first_request_history(self) -> None:
+        self.run_browser_checks('?types=gpu&show=quota', """
+    const summary = document.querySelector("#gpu-quota-summary");
+    const prefix = "G and VT quota (32 vCPUs): ";
+    check(summary.textContent === prefix + "3 granted · request history not measured yet",
+          "The summary keeps known grants and omits unknown counts");
+    const requests = [...document.querySelectorAll("#price-table .quota-request")];
+    check(requests.length === 3 && requests.every(cell => cell.textContent === "not measured"),
+          "All three request cells show that history is missing");
+    const note = document.querySelector("#quota-request-note");
+    check(!note.hidden && note.textContent === "The snapshot has no quota request history.", "One history note");
+    document.querySelector("#regions .all:last-child").click();
+    check(summary.textContent === prefix + "request history not measured yet",
+          "The summary omits the grant count when no grant is visible");
+""")
+
     def test_missing_history_note_requires_every_visible_row_to_lack_history(self) -> None:
         self.run_browser_checks('?types=gpu&show=quota', """
     const note = document.querySelector("#quota-request-note");

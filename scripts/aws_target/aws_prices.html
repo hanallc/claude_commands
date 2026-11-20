@@ -488,9 +488,16 @@ function drawPrices() {
   const requests = data.quota_history?.[types] || {};
   const summary = document.getElementById("gpu-quota-summary");
   const progress = data.quota_history?.gpu_summary;
-  summary.textContent = progress?.regions_by_outcome ? `G and VT quota (${progress.target_vcpus} vCPUs): `
-    + Object.entries(progress.regions_by_outcome).map(([outcome, regions]) =>
-      `${regions.filter(region => visibleRegions.has(region)).length} ${outcome}`).join(" · ") : "";
+  const gpuRequests = Object.values(data.quota_history?.gpu || {});
+  const missingHistory = gpuRequests.length > 0 && gpuRequests.every(request => request.history_missing);
+  const outcomes = [];
+  for (const [outcome, regions] of Object.entries(progress?.regions_by_outcome || {})) {
+    const count = regions.filter(region => visibleRegions.has(region)).length;
+    if (!missingHistory || (outcome === "granted" && count)) outcomes.push(`${count} ${outcome}`);
+  }
+  if (missingHistory) outcomes.push("request history not measured yet");
+  summary.textContent = progress && outcomes.length
+    ? `G and VT quota (${progress.target_vcpus} vCPUs): ${outcomes.join(" · ")}` : "";
   summary.hidden = !summary.textContent;
   const note = document.getElementById("quota-request-note");
   const visibleRequests = [...visibleRegions].map(region => requests[region]);
