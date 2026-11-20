@@ -191,7 +191,7 @@ def former_units(repository: Path, scope: RepositoryScope,
     found = git(repository, "grep", "-l", "^## Units", "refs/remotes/origin/main", "--", "docs/plans")
     if found.returncode != 1:
         found.check_returncode()
-    documents = (*live_documents, *(git_text(repository, "show", source) for source in found.stdout.splitlines()))
+    documents = (*(git_text(repository, "show", source) for source in found.stdout.splitlines()), *live_documents)
     units: list[FormerUnit] = []
     for document in documents:
         lines = document.splitlines()

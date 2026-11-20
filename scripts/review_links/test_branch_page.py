@@ -242,11 +242,11 @@ class BranchPageTests(unittest.TestCase):
                     _ = fixture.command("worktree", "add", str(integration), "TEST-production")
                     pointer = fixture.repository / "docs/plans/former-production.md"
                     live_doc = pointer.with_name("former-production-live.md")
+                    unit_table = pointer.read_text(encoding="utf-8").split("## Units", 1)[1]
                     _ = live_doc.write_text(
                         f"- **Repository:** `{fixture.repository}`\n- **Merge branch:** `TEST-production`\n"
-                        + f"- **Merge checkout:** `{integration}`\n- **Log:** `production.log`\n"
-                        + pointer.read_text(encoding="utf-8").partition("## Units")[1]
-                        + pointer.read_text(encoding="utf-8").partition("## Units")[2], encoding="utf-8")
+                        + f"- **Merge checkout:** `{fixture.repository}`\n- **Showrunner checkout:** `{integration}`\n"
+                        + f"- **Log:** `production.log`\n\n## Units{unit_table}", encoding="utf-8")
                     _ = pointer.write_text(f"Moved to staff {fixture.publisher}.\n", encoding="utf-8")
                     _ = fixture.command("commit", "-am", "Point to the live production")
                     _ = fixture.command("push", "origin", "main")
