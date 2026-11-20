@@ -4,12 +4,16 @@ emulate -L zsh
 zmodload zsh/datetime
 export LC_ALL=C
 program=${0:t}
-gate_bin=${0:a:h:A}
+invoking_bin=${0:a:h:A}
 gate_source=${0:A}
-# Remove the gate folder while preserving every other PATH entry.
+gate_bin=${gate_source:h}/bin
+nextest_bin=${gate_source:h}/nextest-bin
+# Find the real program before adding any gate links to PATH.
 real_path=()
 for folder in "${path[@]}"; do
-    [[ ${folder:A} == $gate_bin ]] || real_path+=("$folder")
+    real_folder=${folder:A}
+    [[ $real_folder == $invoking_bin || $real_folder == $gate_bin || $real_folder == $nextest_bin ]] \
+        || real_path+=("$folder")
 done
 path=("${real_path[@]}")
 real_program=$(whence -p "$program")
@@ -37,7 +41,6 @@ if (( agent_call )); then
     episode=${placement%/*}
     attempt=${placement##*/}
     [[ -n $episode && -n $attempt && $episode != *[^A-Za-z0-9._-]* && $attempt != *[^A-Za-z0-9._-]* ]] || refuse 'no placement'
-    mkdir -p "$state/checks" || exit 2
     recheck=$(conf_value mac_gate placement_recheck_seconds) || exit 2
     parse_answer() {
         local answer_text=$1 answer_status=$2
@@ -52,42 +55,45 @@ if (( agent_call )); then
             *) return 1 ;;
         esac
     }
-    cache_file=$state/checks/${placement//[^[:alnum:]_.-]/_}.live
-    checked=0 cached=''
-    if [[ -r $cache_file ]]; then
-        IFS=$'\t' read -r checked cached < "$cache_file"
-    fi
-    if [[ $cached != $placement ]] || (( EPOCHREALTIME - checked >= recheck )); then
-        check_command=$(conf_value mac_gate placement_check_command) || exit 2
-        limit=$(conf_value mac_gate placement_check_timeout_seconds) || exit 2
-        answer=$state/answer-$$-$EPOCHREALTIME-$RANDOM
-        timed_out=$answer.timeout
-        errors=$answer.errors
-        # No signal handler: the check and its timer share this process group, so a
-        # group signal ends them; a later call removes answer files left past the limit.
-        /bin/zsh -c "$check_command --episode ${(q)episode} --attempt ${(q)attempt}" > "$answer" 2> "$errors" &
-        check_pid=$!
-        ( zmodload zsh/zselect; zselect -t $(( limit * 100 ));
-          print timeout > "$timed_out"; kill -TERM "$check_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
-        timer_pid=$!
-        wait "$check_pid"
-        check_status=$?
-        kill -TERM "$timer_pid" 2>/dev/null
-        wait "$timer_pid" 2>/dev/null
-        reason='' timer_fired=0 newline=$'\n'
-        [[ ! -e $timed_out ]] || timer_fired=1
-        answer_text=$(< "$answer")
-        error_text=$(< "$errors")
-        rm -f -- "$answer" "$timed_out" "$errors"
-        if ! parse_answer "$answer_text" "$check_status"; then
-            (( ! timer_fired )) || refuse "no answer in ${limit}s" ''
-            (( check_status > 1 )) || refuse 'invalid placement answer' ''
-            refuse "placement check failed with status $check_status${error_text:+: ${error_text##*$newline}}" ''
+    check_placement() {
+        mkdir -p "$state/checks" || exit 2
+        local cache_file=$state/checks/${placement//[^[:alnum:]_.-]/_}.live
+        checked=0 cached=''
+        if [[ -r $cache_file ]]; then
+            IFS=$'\t' read -r checked cached < "$cache_file"
         fi
-        [[ -z $reason ]] || refuse "$reason"
-        print -r -- "$EPOCHREALTIME"$'\t'"$placement" > "$cache_file.$$"
-        mv -f -- "$cache_file.$$" "$cache_file"
-    fi
+        if [[ $cached != $placement ]] || (( EPOCHREALTIME - checked >= recheck )); then
+            check_command=$(conf_value mac_gate placement_check_command) || exit 2
+            limit=$(conf_value mac_gate placement_check_timeout_seconds) || exit 2
+            answer=$state/answer-$$-$EPOCHREALTIME-$RANDOM
+            timed_out=$answer.timeout
+            errors=$answer.errors
+            # No signal handler: the check and its timer share this process group, so a
+            # group signal ends them; a later call removes answer files left past the limit.
+            /bin/zsh -c "$check_command --episode ${(q)episode} --attempt ${(q)attempt}" > "$answer" 2> "$errors" &
+            check_pid=$!
+            ( zmodload zsh/zselect; zselect -t $(( limit * 100 ));
+              print timeout > "$timed_out"; kill -TERM "$check_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+            timer_pid=$!
+            wait "$check_pid"
+            check_status=$?
+            kill -TERM "$timer_pid" 2>/dev/null
+            wait "$timer_pid" 2>/dev/null
+            reason='' timer_fired=0 newline=$'\n'
+            [[ ! -e $timed_out ]] || timer_fired=1
+            answer_text=$(< "$answer")
+            error_text=$(< "$errors")
+            rm -f -- "$answer" "$timed_out" "$errors"
+            if ! parse_answer "$answer_text" "$check_status"; then
+                (( ! timer_fired )) || refuse "no answer in ${limit}s" ''
+                (( check_status > 1 )) || refuse 'invalid placement answer' ''
+                refuse "placement check failed with status $check_status${error_text:+: ${error_text##*$newline}}" ''
+            fi
+            [[ -z $reason ]] || refuse "$reason"
+            print -r -- "$EPOCHREALTIME"$'\t'"$placement" > "$cache_file.$$"
+            mv -f -- "$cache_file.$$" "$cache_file"
+        fi
+    }
     label="placement $placement"
 
     zmodload zsh/stat || exit 2
@@ -122,6 +128,9 @@ if (( agent_call )); then
     cap_nextest_threads() {
         setopt localoptions extended_glob
         local argument prefix logical_cpus=''
+        # Nextest 0.9.143 declares these short options with values in cargo_cli.rs
+        # (p, F, Z), dispatch/common.rs (P), and dispatch/core/{filter,list,run}.rs (E, T, R).
+        local switches='[rvqhV]#' value_option='[pFZPETR]'
         nextest_width "${NEXTEST_TEST_THREADS-$worker_budget}"
         export NEXTEST_TEST_THREADS=$REPLY
         nextest_arguments=()
@@ -130,60 +139,58 @@ if (( agent_call )); then
             shift
             case $argument in
                 --) nextest_arguments+=("$argument" "$@"); break ;;
-                --jobs|--test-threads|-[rvqhV]#j)
+                --jobs|--test-threads|-${~switches}j)
                     (( $# )) || refuse "missing nextest test thread count after $argument" ''
                     nextest_width "$1"
                     nextest_arguments+=("$argument" "$REPLY")
                     shift
                     ;;
-                --jobs=*|--test-threads=*|-[rvqhV]#j?*)
+                --jobs=*|--test-threads=*|-${~switches}j?*)
                     prefix=${argument%%j*}j
-                    if [[ $argument == *=* ]]; then prefix=${argument%%=*}=; fi
+                    if [[ $argument == --* || $argument == "$prefix="* ]]; then prefix=${argument%%=*}=; fi
                     nextest_width "${argument#"$prefix"}"
                     nextest_arguments+=("$prefix$REPLY")
                     ;;
-                -[rvqhV]#[pEFZC]*) nextest_arguments+=("$argument") ;;
+                -${~switches}${~value_option}*) nextest_arguments+=("$argument") ;;
                 -[^-]*j*) refuse "cannot read nextest test thread option: $argument" '' ;;
                 *) nextest_arguments+=("$argument") ;;
             esac
         done
     }
-    nextest_call=0
-    if [[ $program == cargo-nextest ]]; then
-        nextest_call=1
-    elif [[ $program == cargo ]]; then
-        skip_value=0
-        for argument in "$@"; do
-            if (( skip_value )); then skip_value=0; continue; fi
-            case $argument in
-                --config|--color|-Z|-C) skip_value=1 ;;
-                --) break ;;
-                -*|+*) ;;
-                nextest) nextest_call=1; break ;;
-                *) break ;;
-            esac
-        done
-    fi
-    if (( nextest_call )); then
-        nextest_arguments=()
+    if [[ $program == cargo-nextest || $program == cargo-ntr ]]; then
         cap_nextest_threads "$@"
         set -- "${nextest_arguments[@]}"
     fi
 fi
-# Verify both the ancestor relation and the recorded process start time.
+# Cargo can exec cargo-nextest in the recorded process.
 ancestor=${MAC_GATE_RECORD:-}
 recorded=0
 if [[ $ancestor == <-> && -r $state/records/$ancestor ]]; then
     IFS=$'\t' read -r recorded_pid recorded_start recorded_label < "$state/records/$ancestor"
     cursor=$PPID
+    [[ $recorded_pid != $$ ]] || cursor=$$
     while [[ $cursor == <-> && $cursor != 0 ]]; do
-        if [[ $cursor == $recorded_pid && $recorded_label == "$label" && $(process_start "$cursor") == $recorded_start ]]; then
+        if [[ $cursor == $recorded_pid && $recorded_label == "$label" && -n $recorded_start &&
+              $(process_start "$cursor") == $recorded_start ]]; then
             recorded=1
             break
         fi
         parent=$(ps -p "$cursor" -o ppid= 2>/dev/null)
         cursor=${parent//[[:space:]]/}
     done
+fi
+if (( agent_call )); then
+    if (( ! recorded )); then
+        # Each independent Cargo command owns an implicit slot. Give that slot to
+        # one command at a time. The command keeps the lock through exec.
+        pool_dir=$state/pools/episode-$episode
+        fifo=$pool_dir/attempt-$attempt.fifo
+        mkdir -p "$pool_dir" && exec {placement_lock}>>"$fifo.lock" \
+            || refuse 'cannot open the placement jobserver lock' ''
+        python3 -IS -c 'import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)' "$placement_lock" \
+            || refuse 'cannot lock the placement jobserver' ''
+    fi
+    check_placement
 fi
 if (( ! recorded )); then
     # Remove expired state only when this call writes a record.
@@ -195,7 +202,7 @@ if (( ! recorded )); then
             fi
         done
         limit=$(conf_value mac_gate placement_check_timeout_seconds) || exit 2
-        for file in "$state/"answer-*(N) "$state/"jobserver-*(N); do
+        for file in "$state/"answer-*(N); do
             zstat -A modified +mtime "$file" 2>/dev/null || continue
             (( EPOCHREALTIME - modified[1] <= limit + 1 )) || rm -f -- "$file"
         done
@@ -229,24 +236,46 @@ if (( agent_call )); then
         jobserver_identity && [[ $REPLY == ${inherited_pool#*:} ]] \
             || refuse 'ancestor jobserver descriptors are unavailable' ''
     else
-        fifo=$state/jobserver-$$-$EPOCHREALTIME-$RANDOM
-        mkfifo "$fifo" || refuse 'cannot create the jobserver' ''
+        [[ -e $fifo ]] || mkfifo "$fifo" || refuse 'cannot create the placement jobserver' ''
+        [[ -p $fifo ]] || refuse 'invalid placement jobserver' ''
         pipe_buf=$(getconf PIPE_BUF "$fifo" 2>/dev/null)
         if [[ $pipe_buf != <-> ]] || (( worker_budget - 1 > pipe_buf )); then
-            rm -f -- "$fifo"
             refuse 'worker_budget exceeds the jobserver pipe limit' ''
         fi
         # Open both ends before separate opens so neither end blocks at startup.
         exec {pool_hold}<>"$fifo" && exec {pool_read}<"$fifo" && exec {pool_write}>"$fifo" \
             || refuse 'cannot open the jobserver' ''
-        rm -f -- "$fifo" || refuse 'cannot unlink the jobserver' ''
         exec {pool_hold}>&- || refuse 'cannot close the jobserver setup descriptor' ''
         jobserver_identity || refuse 'cannot identify the jobserver' ''
+        # The previous command can release its lock before the kernel closes
+        # its pipe descriptors. Remove any remaining bytes before seeding.
+        zmodload zsh/system || exit 2
+        while true; do
+            sysread -t 0 -i "$pool_read" -s "$pipe_buf" unused_tokens
+            case $? in
+                0) ;;
+                4) break ;;
+                *) refuse 'cannot clear the placement jobserver' '' ;;
+            esac
+        done
         # Cargo and rustc already own one implicit slot.
         printf '%*s' "$(( worker_budget - 1 ))" '' >&$pool_write || refuse 'cannot seed the jobserver' ''
         export MAC_GATE_JOBSERVER="$pool_read,$pool_write:$REPLY"
     fi
     unset MAKEFLAGS MFLAGS
     export CARGO_MAKEFLAGS="-j --jobserver-fds=$pool_read,$pool_write --jobserver-auth=$pool_read,$pool_write"
+    if [[ $program == cargo ]]; then
+        # Cargo resolves aliases before it searches PATH for nextest.
+        # Keep Cargo from inserting its own bin ahead of the gate links.
+        cargo_home=${CARGO_HOME:-$HOME/.cargo}
+        [[ $cargo_home == /* ]] || refuse 'CARGO_HOME must be absolute' ''
+        cargo_home_bin=${cargo_home%/}/bin
+        [[ $cargo_home_bin != *:* && $nextest_bin != *:* && -x $nextest_bin/cargo-nextest && -x $nextest_bin/cargo-ntr ]] \
+            || refuse 'cannot route Cargo nextest through the gate' ''
+        if (( ! ${path[(Ie)$cargo_home_bin]} )); then
+            path=("$cargo_home_bin" "${path[@]}")
+        fi
+        path=("$nextest_bin" "${path[@]}")
+    fi
 fi
 exec "$real_program" "$@"

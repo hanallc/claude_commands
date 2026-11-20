@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -22,9 +23,33 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 GATE = Path(__file__).with_name("cargo_gate") / "bin"
 FIXTURE_WORKER_BUDGET = "3"
-PROGRAM = '''import json, os, stat, subprocess, sys
+PAUSE_GATE = '''
+def pause_gate(marker):
+    import socket
+    if event := os.environ.get("GATE_TEST_FIFO_EVENT"):
+        with socket.socket(fileno=int(event)) as channel:
+            channel.sendall(marker)
+            assert channel.recv(1) == b"+"
+'''
+PROGRAM = '''import json, os, shutil, stat, subprocess, sys, tomllib
 from pathlib import Path
+''' + PAUSE_GATE + '''
 root = Path(os.environ["GATE_TEST_ROOT"])
+arguments = sys.argv[1:]
+if Path(sys.argv[0]).name == "cargo" and arguments:
+    home = Path(os.environ.get("CARGO_HOME") or root / ".cargo")
+    config = home / "config.toml"
+    if config.exists():
+        alias = tomllib.loads(config.read_text()).get("alias", {}).get(arguments[0])
+        if alias:
+            arguments = alias.split() + arguments[1:]
+    if arguments[0] in ("nextest", "ntr"):
+        search = os.environ["PATH"].split(os.pathsep)
+        if str(home / "bin") not in search:
+            search.insert(0, str(home / "bin"))
+        nextest = shutil.which(f"cargo-{arguments[0]}", path=os.pathsep.join(search))
+        assert nextest is not None
+        os.execv(nextest, [nextest, *arguments])
 records = root / ".local/state/mac-gate/records"
 flags = os.environ.get("CARGO_MAKEFLAGS")
 pool = ()
@@ -53,6 +78,7 @@ with (root / "runs").open("a") as stream:
         "nextest_threads":os.environ.get("NEXTEST_TEST_THREADS"),
         "record":os.environ.get("MAC_GATE_RECORD"),
         "records":[path.read_text() for path in records.iterdir()]}) + "\\n")
+pause_gate(b"r")
 if sys.argv[1:] == ["child"]:
     raise SystemExit(subprocess.call([os.environ["GATE_TEST_BIN"] + "/rustc", "quoted value"], pass_fds=pool))
 raise SystemExit(int(os.environ.get("REAL_STATUS", "0")))
@@ -104,8 +130,22 @@ class CargoGateTests(unittest.TestCase):
         check = root / "check.py"
         _ = check.write_text(CHECK)
         parser = fake / "python3"
-        _ = parser.write_text("#!/bin/zsh -f\nprint parser >> \"$GATE_TEST_ROOT/parsers\"\nexec "
-                              + shlex.quote(sys.executable) + ' "$@"\n')
+        _ = parser.write_text(f"#!{sys.executable}\n" + '''import fcntl, os, socket, sys
+from pathlib import Path
+if sys.argv[1] == "-IS":
+    if event := os.environ.get("GATE_TEST_LOCK_EVENT"):
+        with socket.socket(fileno=int(event)) as channel:
+            try:
+                fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                channel.sendall(b"b")
+            else:
+                channel.sendall(b"f")
+else:
+    with (Path(os.environ["GATE_TEST_ROOT"]) / "parsers").open("a") as stream:
+        stream.write("parser\\n")
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+''')
         parser.chmod(0o755)
         ps = fake / "ps"
         list_processes = f"printf '%s' {shlex.quote(process_list)}" if process_list else '/bin/ps "$@"'
@@ -126,7 +166,7 @@ class CargoGateTests(unittest.TestCase):
         ssh.chmod(0o755)
         environment = {key: value for key, value in os.environ.items()
                        if key not in ("CLAUDECODE", "CODEX_HOME", "SSH_CONNECTION", "SSH_CLIENT", "MAC_PLACEMENT",
-                                      "MAC_GATE_RECORD", "MAC_GATE_JOBSERVER", "CARGO_BUILD_JOBS",
+                                      "MAC_GATE_RECORD", "MAC_GATE_JOBSERVER", "CARGO_BUILD_JOBS", "CARGO_HOME",
                                       "CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS", "NEXTEST_TEST_THREADS")}
         environment.update(config_environment(root / "config"))
         environment.update(HOME=str(root), GATE_TEST_ROOT=str(root), GATE_TEST_BIN=str(GATE),
@@ -240,7 +280,8 @@ class CargoGateTests(unittest.TestCase):
                 self.assertEqual(row["cargo_jobs"], "2")
                 self.assertIsNone(row["nextest_threads"])
                 self.assertEqual(row["argv"], list(arguments))
-                self.assertEqual(list((root / ".local/state/mac-gate").glob("jobserver-*")), [])
+                fifo, = (root / ".local/state/mac-gate/pools").glob("*/*.fifo")
+                self.assertEqual(fifo.stat().st_ino, row["jobserver_inode"])
 
     def test_a_single_jobserver_slot_needs_no_pipe_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -288,6 +329,8 @@ class CargoGateTests(unittest.TestCase):
             ("cargo-nextest", "2", "2", ("-j12",), (f"-j{budget}",)),
             ("cargo-nextest", "", budget, ("-vj12",), (f"-vj{budget}",)),
             ("cargo-nextest", "", budget, ("-vj00000000000000012",), (f"-vj{budget}",)),
+            ("cargo", "", budget, ("-Pjobs", "-j12"), ("-Pjobs", f"-j{budget}")),
+            ("cargo-nextest", "", budget, ("-R./jobs.zip",), ("-R./jobs.zip",)),
         ):
             with self.subTest(name=name, arguments=arguments), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -302,6 +345,93 @@ class CargoGateTests(unittest.TestCase):
                 self.assertEqual(row["jobserver_tokens"], int(budget) - 1)
                 self.assertEqual(row["nextest_threads"], threads)
                 self.assertEqual(row["argv"], ["nextest", "run", *expected, *tail])
+
+    def test_cargo_alias_caps_threads_after_cargo_resolves_the_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            home_bin = root / "cargo-home/bin"
+            home_bin.mkdir(parents=True)
+            _ = shutil.copy2(root / "real/cargo-nextest", home_bin / "cargo-nextest")
+            (home_bin / "cargo-ntr").symlink_to("cargo-nextest")
+            _ = (home_bin.parent / "config.toml").write_text(
+                '[alias]\nnx = "nextest run"\nnxr = "nextest run -j12"\n'
+            )
+            environment.update(CARGO_HOME=str(home_bin.parent), SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
+            calls = (("nx", "-j12"), ("nxr",), ("ntr", "-j12"))
+            for arguments in calls:
+                result = self.run_gate(environment, *arguments)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for row, arguments in zip(self.runs(root), calls, strict=True):
+                command = ["ntr"] if arguments[0] == "ntr" else ["nextest", "run"]
+                self.assertEqual(row["argv"], [*command, f"-j{FIXTURE_WORKER_BUDGET}"])
+                self.assertEqual(row["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
+                self.assertEqual(len(cast(list[str], row["records"])), 1)
+
+    def test_parallel_calls_share_the_fifo_and_live_setup_survives_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
+            getconf = root / "fake/getconf"
+            real_getconf = getconf.resolve()
+            getconf.unlink()
+            _ = getconf.write_text(f"#!{sys.executable}\nimport os, sys\n" + PAUSE_GATE + '''
+if sys.argv[1] == "PIPE_BUF" and "GATE_TEST_FIFO_EVENT" in os.environ:
+    os.utime(sys.argv[2], (1, 1))
+    pause_gate(b"f")
+getconf = os.environ["GATE_TEST_GETCONF"]
+os.execv(getconf, [getconf, *sys.argv[1:]])
+''')
+            getconf.chmod(0o755)
+            environment["GATE_TEST_GETCONF"] = str(real_getconf)
+            setup, setup_child = socket.socketpair()
+            queued, queued_child = socket.socketpair()
+            command = [str(GATE / "cargo"), "build"]
+            with setup, setup_child, queued, queued_child:
+                setup.settimeout(TEST_HANG_GUARD_SECS)
+                queued.settimeout(TEST_HANG_GUARD_SECS)
+                with subprocess.Popen(command + ["--first"], env={
+                    **environment, "GATE_TEST_FIFO_EVENT": str(setup_child.fileno()),
+                }, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    pass_fds=(setup_child.fileno(),)) as first:
+                    try:
+                        self.assertEqual(setup.recv(1), b"f")
+                        state = root / ".local/state/mac-gate"
+                        fifo, = (path for path in state.rglob("*") if path.is_fifo())
+                        inode = fifo.stat().st_ino
+                        other = self.run_gate({**environment, "MAC_PLACEMENT": "episode/other"}, "build", "--other")
+                        self.assertEqual(other.returncode, 0, other.stdout + other.stderr)
+                        self.assertEqual(fifo.stat().st_ino, inode)
+                        setup.sendall(b"+")
+                        self.assertEqual(setup.recv(1), b"r")
+                        with subprocess.Popen(command + ["--second"], env={
+                            **environment, "GATE_TEST_LOCK_EVENT": str(queued_child.fileno()),
+                        }, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            pass_fds=(queued_child.fileno(),)) as second:
+                            try:
+                                self.assertEqual(queued.recv(1), b"b")
+                                self.assertEqual(
+                                    [row["argv"] for row in self.runs(root)], [["build", "--other"], ["build", "--first"]]
+                                )
+                            finally:
+                                try:
+                                    setup.sendall(b"+")
+                                    first_output = first.communicate(timeout=TEST_HANG_GUARD_SECS)
+                                    second_output = second.communicate(timeout=TEST_HANG_GUARD_SECS)
+                                finally:
+                                    if second.returncode is None:
+                                        second.kill()
+                            self.assertEqual(second.returncode, 0, "".join(second_output))
+                    finally:
+                        if first.returncode is None:
+                            first.kill()
+                    self.assertEqual(first.returncode, 0, "".join(first_output))
+            other_row, first_row, second_row = self.runs(root)
+            self.assertNotEqual(other_row["jobserver_inode"], inode)
+            for row in (first_row, second_row):
+                self.assertEqual(row["jobserver_inode"], inode)
+                self.assertEqual(row["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
 
     def test_placed_nextest_refuses_unreadable_test_thread_options(self) -> None:
         for arguments in (("-vj",), ("-vjbad",), ("--test-threads=",), ("-xj12",)):
