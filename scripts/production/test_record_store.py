@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 from scripts.agents.remote import local_machine
 from scripts.production import record_store, staff
@@ -41,6 +42,27 @@ class NumberedRecordsTests(unittest.TestCase):
             git.assert_called_once()
         _ = self.commit_folder(doc, new)
         self.assertEqual(set(record_store.historical_issue_folders(doc)), {old, new})
+
+        with self.subTest(history="unknown account"):
+            old.mkdir()
+            new.mkdir()
+            _ = self.commit_folder(doc, Path(f"~review-test-{uuid4().hex}/proposals"))
+            _ = self.commit_folder(doc, new)
+            notices: list[Path] = []
+
+            def skipped(source: Path, error: Exception) -> None:
+                self.assertIsInstance(error, RuntimeError)
+                notices.append(source)
+
+            with (patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(doc.parent / "state")}),
+                  patch.object(subprocess, "run", wraps=subprocess.run) as git):
+                for _ in range(2):
+                    notices.clear()
+                    folders = record_store.known_folders(record_store.RecordKind.PROPOSAL, staff.StaffId("owner"),
+                        document=doc, strict=True, on_source_error=skipped)
+                    self.assertEqual(folders, (new.resolve(), old.resolve()))
+                    self.assertEqual(notices, [doc])
+                git.assert_called_once()
 
     def test_history_follows_branches_and_detached_worktree_heads(self) -> None:
         doc = self.git_history_fixture()
@@ -112,6 +134,27 @@ class NumberedRecordsTests(unittest.TestCase):
                 record_store.staff_store_folders(record_store.RecordKind.QUESTION, members=members),
                 [registered, root / owner / "questions"],
             )
+
+    def test_registry_skips_an_empty_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": directory}):
+            owner = staff.StaffId("producer")
+            registry = Path(directory) / "review-folders" / owner / "proposal.json"
+            registry.parent.mkdir(parents=True)
+            notices: list[Path] = []
+
+            def skipped(source: Path, error: Exception) -> None:
+                self.assertIsInstance(error, ValueError)
+                notices.append(source)
+
+            registered = Path(directory).resolve() / "proposals"
+            for valid in ((), (registered,)):
+                with self.subTest(valid=valid):
+                    notices.clear()
+                    _ = registry.write_text(json.dumps(["", *map(str, valid)]))
+                    folders = record_store.known_folders(record_store.RecordKind.PROPOSAL, owner,
+                                                          strict=True, on_source_error=skipped)
+                    self.assertEqual(folders, valid)
+                    self.assertEqual(notices, [registry])
 
     def test_unicode_separators_stay_inside_a_header_field(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": directory}):

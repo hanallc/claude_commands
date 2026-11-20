@@ -72,6 +72,9 @@ class ReviewSourceStamps(list[Path]):
         self.notices[path, entry] = utf8_display(f'Could not load {label}.')
         logging.getLogger(__name__).warning('Review source %s: %s', label, error)
 
+    def skip_source(self, path: Path, error: Exception) -> None:
+        self.skipped(path, '', error)
+
     @override
     def append(self, path: Path, /) -> None:
         super().append(path)
@@ -688,7 +691,8 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                     current = (folder.path,)
         with guard_source(location, sources, skip=(FileNotFoundError,)):
             for folder in record_store.known_folders(record_store.RecordKind.QUESTION, identity, current,
-                                                     document=document, strict=sources is not None, sources=sources):
+                    document=document, current_source=document, strict=sources is not None, sources=sources,
+                    on_source_error=sources.skip_source if isinstance(sources, ReviewSourceStamps) else None):
                 scopes.setdefault(folder, []).append(identity)
 
     if isinstance(selection, ExactReviewRecord):
@@ -749,7 +753,8 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
                 paths = (selection.path,)
             else:
                 folders = record_store.known_folders(record_store.RecordKind.INVESTIGATION, identity,
-                                                    strict=sources is not None, sources=sources)
+                    strict=sources is not None, sources=sources,
+                    on_source_error=sources.skip_source if isinstance(sources, ReviewSourceStamps) else None)
                 paths = store_paths(folders, sources)
             for path in paths:
                 if sources is not None and not isinstance(sources, ReviewSourceStamps):
@@ -954,17 +959,21 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             member = members.by_id(owner)
             doc = scope if isinstance(scope, Path) else record_store.local_document(member)
             current: tuple[Path, ...] = ()
+            current_source: Path | None = None
             if member is not None and member.kind == 'producer' and isinstance(member.doc, staff.LiveDoc):
                 producer_doc = member.doc.path
                 with suppress(OSError):
                     if producer_doc.is_file():
-                        if sources is not None:
+                        if sources is not None and not isinstance(sources, ReviewSourceStamps):
                             sources.append(producer_doc)
-                        if (configured := record_store.issues_folder(producer_doc)) is not None:
-                            current = (configured,)
+                        with guard_source(producer_doc, sources, skip=(RuntimeError,)):
+                            if (configured := record_store.issues_folder(producer_doc)) is not None:
+                                current = (configured,)
+                                current_source = producer_doc
             with guard_source(doc if doc is not None else state_root(), sources):
                 for folder in record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, current, document=doc,
-                                                         strict=sources is not None, sources=sources):
+                        current_source=current_source, strict=sources is not None, sources=sources,
+                        on_source_error=sources.skip_source if isinstance(sources, ReviewSourceStamps) else None):
                     folders.setdefault(folder, []).append(scope)
         for folder, owners in folders.items():
             for path in store_paths((folder,), sources):

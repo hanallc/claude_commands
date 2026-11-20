@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -14,10 +15,11 @@ from collections.abc import Callable, Collection, Generator, Iterable, Iterator,
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 from itertools import chain
 from pathlib import Path
 from threading import Lock
-from typing import NamedTuple, cast
+from typing import NamedTuple, NewType, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
@@ -58,12 +60,31 @@ def _folder_registry(owner: str, kind: str) -> Path:
     return state_root() / "review-folders" / (owner or ".unowned") / (kind + ".json")
 
 
-def _registered_folders(path: Path) -> tuple[Path, ...]:
+_RegisteredFolderPath = NewType("_RegisteredFolderPath", Path)
+
+
+def _registered_folders(path: Path, *, on_invalid_entry: Callable[[Path, Exception], None] | None = None
+                        ) -> tuple[_RegisteredFolderPath, ...]:
     try:
-        folders = cast(list[str], json.loads(path.read_text(encoding="utf-8")))
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except FileNotFoundError:
         return ()
-    return tuple(Path(folder) for folder in folders)
+    except (ValueError, RecursionError) as error:
+        raise ValueError(f"Cannot read the folder registry {path}: {error}") from error
+    if not isinstance(value, list):
+        raise ValueError(f"Expected a list of folder paths in {path}.")
+    folders: list[_RegisteredFolderPath] = []
+    for index, entry in enumerate(cast(list[object], value), start=1):
+        if isinstance(entry, str) and entry and "\x00" not in entry:
+            folder = Path(entry)
+            if folder.is_absolute():
+                folders.append(_RegisteredFolderPath(folder))
+                continue
+        error = ValueError(f"Folder path {index} in {path} must be absolute and contain no NUL.")
+        if on_invalid_entry is None:
+            raise error
+        on_invalid_entry(path, error)
+    return tuple(folders)
 
 
 def review_folders(owner: staff.StaffId, kind: str) -> tuple[Path, ...]:
@@ -74,6 +95,23 @@ def review_folders(owner: staff.StaffId, kind: str) -> tuple[Path, ...]:
 PROPOSALS_FIELD = "Proposals"
 
 
+def _expand_proposals_folder(doc: Path, value: Path) -> Path:
+    folder = value.expanduser()
+    # A relative folder starts at the checkout that contains docs/plans.
+    return folder if folder.is_absolute() else doc.parent.parent.parent / folder
+
+
+def _has_unknown_home_account(folder: Path) -> bool:
+    home = next(iter(folder.parts), "")
+    if not home.startswith("~") or home == "~" or "\x00" in str(folder):
+        return False
+    try:
+        _ = pwd.getpwnam(home[1:])
+    except KeyError:
+        return True
+    return False
+
+
 def issues_folder(doc: Path, *, lines: list[str] | None = None) -> Path | None:
     """Return the configured folder, or None when the document has no proposals field."""
     if lines is None:
@@ -82,11 +120,10 @@ def issues_folder(doc: Path, *, lines: list[str] | None = None) -> Path | None:
         except UnicodeError as error:
             raise OSError(f"{doc}: {error}") from error
     try:
-        folder = Path(production_field(lines, PROPOSALS_FIELD)).expanduser()
+        value = Path(production_field(lines, PROPOSALS_FIELD))
     except Refusal:
         return None
-    # A relative folder starts at the checkout that contains docs/plans.
-    return folder if folder.is_absolute() else doc.parent.parent.parent / folder
+    return _expand_proposals_folder(doc, value)
 
 
 FileStamp = tuple[int, int, int, int, int, int]
@@ -108,7 +145,7 @@ class _FolderHistory:
     query: Path
     environment: tuple[tuple[str, str], ...]
     stamps: dict[Path, FileStamp]
-    folders: tuple[Path, ...]
+    values: tuple[Path, ...]
 
 
 _history_cache: OrderedDict[Path, _FolderHistory] = OrderedDict()
@@ -233,15 +270,25 @@ def _read_folder_history(doc: Path) -> tuple[Path, ...] | None:
             raise OSError(f"Cannot read folder history for {doc}: {result.stderr.strip()}")
         return None
     prefix = f"- **{PROPOSALS_FIELD}:**"
-    folders: list[Path] = []
+    values: list[Path] = []
     for line in result.stdout.split("\n"):
         if line.startswith(("+" + prefix, "-" + prefix)):
-            if (folder := issues_folder(doc, lines=[line[1:]])) is not None:
-                folders.append(folder)
-    return tuple(folders)
+            try:
+                value = production_field([line[1:]], PROPOSALS_FIELD)
+            except Refusal:
+                continue
+            values.append(Path(value))
+    return tuple(values)
 
 
-def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) -> Iterator[Path]:
+def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None,
+                             expand_paths: bool = True) -> Iterator[Path]:
+    """Return the historical paths, with optional expansion for each path."""
+    for value in _historical_folder_values(doc, sources):
+        yield _expand_proposals_folder(doc, value) if expand_paths else value
+
+
+def _historical_folder_values(doc: Path, sources: list[Path] | None) -> Iterator[Path]:
     """Reuse successful Git history until a repository input changes."""
     if os.environ.get("GIT_DIR"):
         yield from _read_folder_history(doc) or ()
@@ -258,7 +305,7 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
         if sources is not None:
             sources.extend(cached.stamps)
         if _stamps_match(cached.stamps):
-            yield from cached.folders
+            yield from cached.values
             return
 
     root = next((folder for folder in resolved.parents
@@ -275,68 +322,101 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
         except (OSError, RuntimeError, ValueError):
             # Git still reports the original result or error when metadata cannot be stamped.
             pass
-    folders = _read_folder_history(doc)
-    if folders is None:
+    values = _read_folder_history(doc)
+    if values is None:
         return
     if stamps and _stamps_match(stamps):
         with _history_lock:
-            _history_cache[resolved] = _FolderHistory(query, environment, stamps, folders)
+            _history_cache[resolved] = _FolderHistory(query, environment, stamps, values)
             _history_cache.move_to_end(resolved)
             if len(_history_cache) > _HISTORY_LIMIT:
                 _ = _history_cache.popitem(last=False)
-    yield from folders
+    yield from values
 
 
 def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path] = (),
-                  *, document: Path | None = None, strict: bool = False,
+                  *, document: Path | None = None, current_source: Path | None = None, strict: bool = False,
                   include_history: bool = True, require_document: bool = True,
-                  require_existing_document: bool = False, sources: list[Path] | None = None) -> tuple[Path, ...]:
-    """Return current and former store roots. Use stored_paths to include their archives."""
+                  require_existing_document: bool = False, sources: list[Path] | None = None,
+                  skip_unknown_history_accounts: bool = False,
+                  on_source_error: Callable[[Path, Exception], None] | None = None) -> tuple[Path, ...]:
+    """Return current and former store roots. Use stored_paths to include their archives.
+
+    Use current_source to name the source of the supplied roots.
+    If given, on_source_error reports each source failure and keeps the other roots.
+    Use skip_unknown_history_accounts to omit historical paths with unknown named home accounts.
+    """
+    def source_failed(path: Path, error: Exception, *, required: bool) -> None:
+        if on_source_error is not None:
+            on_source_error(path, error)
+        elif required:
+            raise error
+
+    resolved: dict[Path, None] = {}
+
+    def add_resolved_folder(folder: Path, source: Path, *, expand_proposals_value: bool = False) -> None:
+        try:
+            if expand_proposals_value:
+                try:
+                    folder = _expand_proposals_folder(source, folder)
+                except RuntimeError:
+                    if skip_unknown_history_accounts and _has_unknown_home_account(folder):
+                        return
+                    raise
+            if "\x00" in str(folder):
+                raise ValueError("A folder path cannot contain NUL.")
+            resolved[folder.resolve()] = None
+        except (OSError, ValueError, RuntimeError) as error:
+            source_failed(source, error, required=strict)
+
     configured_roots = tuple(current)
-    roots = list(configured_roots)
+    for folder in configured_roots:
+        add_resolved_folder(folder, current_source if current_source is not None else folder)
+
+    registry = _folder_registry(owner, kind)
     if sources is not None:
-        sources.append(_folder_registry(owner, kind))
+        sources.append(registry)
     try:
-        roots.extend(review_folders(owner, kind))
-    except (OSError, ValueError):
-        if strict:
-            raise
+        registered = _registered_folders(registry, on_invalid_entry=partial(source_failed, required=strict))
+    except (OSError, ValueError) as error:
+        source_failed(registry, error, required=strict)
+    else:
+        for folder in registered:
+            add_resolved_folder(folder, registry)
     if kind is RecordKind.QUESTION and owner:
-        roots.append(default_question_folder(owner))
+        folder = default_question_folder(owner)
+        add_resolved_folder(folder, folder)
     if kind is RecordKind.INVESTIGATION and owner:
-        roots.append(state_root() / owner / "investigations")
+        folder = state_root() / owner / "investigations"
+        add_resolved_folder(folder, folder)
     if document is not None and kind is not RecordKind.INVESTIGATION:
         require_existing = strict and require_existing_document
+        document_required = strict and require_document
         try:
             read_document = require_existing or document.parent.is_dir()
-        except OSError:
-            if strict and require_document:
-                raise
+        except OSError as error:
+            source_failed(document, error, required=document_required)
             read_document = False
         if read_document:
             if not configured_roots or kind is RecordKind.PROPOSAL or not require_document:
                 try:
-                    if (configured := issues_folder(document)) is not None:
-                        roots.append(configured)
-                except FileNotFoundError:
+                    configured = issues_folder(document)
+                except FileNotFoundError as error:
                     if require_existing:
-                        raise
-                except OSError:
-                    if strict and require_document:
-                        raise
+                        source_failed(document, error, required=True)
+                except (OSError, ValueError, RuntimeError) as error:
+                    source_failed(document, error, required=document_required or isinstance(error, RuntimeError))
+                else:
+                    if configured is not None:
+                        add_resolved_folder(configured, document)
             if include_history:
                 try:
-                    roots.extend(historical_issue_folders(document, sources=sources))
-                except (OSError, UnicodeError):
-                    if strict and require_document:
-                        raise
-    resolved: dict[Path, None] = {}
-    for path in roots:
-        try:
-            resolved[path.resolve()] = None
-        except (OSError, RuntimeError):
-            if strict:
-                raise
+                    historical = dict.fromkeys(historical_issue_folders(document, sources=sources, expand_paths=False))
+                except (OSError, ValueError, RuntimeError) as error:
+                    source_failed(document, error, required=document_required or isinstance(error, RuntimeError))
+                else:
+                    for folder in historical:
+                        add_resolved_folder(folder, document, expand_proposals_value=True)
     return tuple(resolved)
 
 
@@ -479,7 +559,8 @@ def local_document(row: staff.StaffRow | None) -> Path | None:
 
 
 def staff_store_folders(kind: RecordKind, *, members: staff.StaffSnapshot | None = None,
-                        covered_owner: staff.StaffId | None = None) -> Iterator[Path]:
+                        covered_owner: staff.StaffId | None = None,
+                        skip_unknown_history_accounts: bool = False) -> Iterator[Path]:
     """Find store roots for owners whose folders the caller still needs."""
     if members is None:
         if kind is RecordKind.INVESTIGATION:
@@ -493,7 +574,8 @@ def staff_store_folders(kind: RecordKind, *, members: staff.StaffSnapshot | None
     owners = store_owners(kind, members, strict=True)
     for owner, row in owners.items():
         if owner != covered_owner:
-            yield from known_folders(kind, owner, document=local_document(row), strict=True)
+            yield from known_folders(kind, owner, document=local_document(row), strict=True,
+                                     skip_unknown_history_accounts=skip_unknown_history_accounts)
 
 
 def _legacy_high_water(kind: RecordKind) -> int:
@@ -549,17 +631,22 @@ class LockedRecordNumbers:
         match = re.fullmatch(self.kind.prefix + r"([1-9][0-9]*)", identity)
         return int(match[1]) if match else 0
 
-    def floor(self, *folders: Path, covered_owner: staff.StaffId | None = None) -> int:
+    def floor(self, *folders: Path, covered_owner: staff.StaffId | None = None,
+              skip_unknown_history_accounts: bool = False) -> int:
         """Read all stores. The supplied folders include the covered owner's roots."""
         if self.scanned_floor < 0:
-            folders += tuple(staff_store_folders(self.kind, covered_owner=covered_owner))
+            folders += tuple(staff_store_folders(self.kind, covered_owner=covered_owner,
+                                                 skip_unknown_history_accounts=skip_unknown_history_accounts))
             self.scanned_floor = max(_legacy_high_water(self.kind),
                                      max((self.number(self.read_id(path))
                                           for path in stored_paths(folders, strict=True)), default=0))
         return max(self.high_water, self.scanned_floor)
 
-    def next_id(self, *folders: Path, covered_owner: staff.StaffId | None = None) -> str:
-        return f"{self.kind.prefix}{self.floor(*folders, covered_owner=covered_owner) + 1}"
+    def next_id(self, *folders: Path, covered_owner: staff.StaffId | None = None,
+                skip_unknown_history_accounts: bool = False) -> str:
+        ceiling = self.floor(*folders, covered_owner=covered_owner,
+                             skip_unknown_history_accounts=skip_unknown_history_accounts)
+        return f"{self.kind.prefix}{ceiling + 1}"
 
     def next_id_after_collision(self, identity: str, path: Path) -> str:
         occupied = self.number(self.read_id(path)) if path.is_file() and not path.is_symlink() else 0
