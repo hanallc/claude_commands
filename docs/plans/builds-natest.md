@@ -217,26 +217,26 @@
   4. basedpyright zero errors and warnings on changed files.
   5. Full natedev gate passes (reds that also occur on base do not count).
 
-### Phase 392 — all three test walls on natedev for each start path  · status: todo
+### Phase 392 — bubble-wrapped tests on natedev for each start path  · status: todo
 **Depends on:** Phase 389 (plan 6994708e9 and bob's review); 383 lands first
 
 #### Work Order
-- **Goal:** every claude_commands test on natedev runs behind one Bubblewrap launch with the file, process and outside walls, or is refused (List item 141, delivery 1 of bob's reviewed route).
+- **Goal:** every claude_commands test on natedev runs inside one Bubblewrap launch that limits files, processes and network, or is refused (List item 141, delivery 1 of bob's reviewed route).
 - **Spec:** bob's review is the spec: /home/natepiano/rust/hanadocs/bob/designs/test-container/review.md ("Recommended route", "Start paths", "Safety and the proof checks", "Detail with file:line"). Pilot: /session/natest-impl5/guard-walls/probe_walls.py:89-130 (argument list), :347-398 (proof checks).
-  1. `scripts/lib/test_guard.py`: `command(argv, job_folder) -> list[str]`, `guarded() -> bool` (kernel facts only: home read-only or absent, /proc/1/comm is bwrap, /proc/net/dev has only lo), `enter(argv)` (exec behind the walls or raise; refuse if still unguarded after enter). Empty root; read-only binds for /nix/store, /bin, /usr/bin, the checkout at its own path, the gate checkout, /var/tmp/dataclass-code-<uid>; private /proc, /dev, /tmp, /dev/shm, home; job folder writable; --clearenv with kept_environment; --unshare-pid --die-with-parent; --remount-ro /; MERGE_GATE_PARENT_PID=1 inside; no jobserver FIFO, no /dev/steve, no user bus.
-  2. `config/test_guard.conf`: keys bubblewrap, live_roots, kept_environment (from phase 388's allow list, branch natest-cleanenv388), file_wall_only (empty list now). Names wait for nate's approval before landing.
+  1. `scripts/lib/bubble_wrapped_tests.py`: `command(argv, job_folder) -> list[str]`, `guarded() -> bool` (kernel facts only: home read-only or absent, /proc/1/comm is bwrap, /proc/net/dev has only lo), `enter(argv)` (exec inside Bubblewrap or raise; refuse if still unguarded after enter). Empty root; read-only binds for /nix/store, /bin, /usr/bin, the checkout at its own path, the gate checkout, /var/tmp/dataclass-code-<uid>; private /proc, /dev, /tmp, /dev/shm, home; job folder writable; --clearenv with kept_environment; --unshare-pid --die-with-parent; --remount-ro /; MERGE_GATE_PARENT_PID=1 inside; no jobserver FIFO, no /dev/steve, no user bus.
+  2. `config/bubble_wrapped_tests.conf`: keys bubblewrap, protected_folders, kept_environment (from phase 388's allow list). nate approved these names (List item 141); a further name needs nate again. `scripts/lib/direct_test_starts.py` identifies test starts for the shell hook and Python startup.
   3. No variable or flag turns the guard off. Absent Bubblewrap or a failed launch is a refusal.
   4. Gate: wrap both argument lists at merge_gate.py:1726-1729 with command(); the systemd scope prefix stays outside; SUITE_BOOTSTRAP starts with the gate interpreter and -I at :1094.
   5. module_run.py:684 and sitecustomize.py:220 call enter() (move the check before the return at :222; add test_*.py targets). coverage_overlap.py main calls enter().
-  6. Proof module `scripts/lib/test_test_guard.py`: the rows in bob's "Safety and the proof checks", plus phase 388's 7 leak checks and the COPIES_RUN_PID check.
-  7. Hook rule in hooks/pre-tool-use-build-hold-guard.py (with build_hold/hold_enforcer.py if the parser lives there): deny a raw test start (python3 -m unittest, pytest, bash test_*.sh, node *proof*.mjs) that does not go through scripts/lib/py or test_guard.py, and a test start in a checkout with no scripts/lib/test_guard.py.
+  6. Proof module `scripts/lib/test_bubble_wrapped_tests.py`: the rows in bob's "Safety and the proof checks", plus phase 388's 7 leak checks and the COPIES_RUN_PID check.
+  7. Hook rule in hooks/pre-tool-use-build-hold-guard.py (with build_hold/hold_enforcer.py if the parser lives there): deny a raw test start (python3 -m unittest, pytest, bash test_*.sh, node *proof*.mjs) that does not go through scripts/lib/py or bubble_wrapped_tests.py, and a test start in a checkout with no scripts/lib/bubble_wrapped_tests.py.
   8. No signal handlers, masks or dispositions; no lazy imports; tests read no /tune value.
-- **Files:** worker 1: scripts/lib/test_guard.py, config/test_guard.conf, scripts/production/merge_gate.py, scripts/test_times/module_run.py, scripts/lib/python_startup/sitecustomize.py, scripts/test_times/coverage_overlap.py and their test rows. Worker 2: scripts/lib/test_test_guard.py, scripts/hooks/pre-tool-use-build-hold-guard.py, scripts/build_hold/hold_enforcer.py and their hook tests.
-- **Workers:** 2 writers, no common file. Worker 2 codes against the test_guard.py API in Spec 1.
+- **Files:** worker 1: scripts/lib/bubble_wrapped_tests.py, scripts/lib/direct_test_starts.py, config/bubble_wrapped_tests.conf, scripts/production/merge_gate.py, scripts/test_times/module_run.py, scripts/lib/python_startup/sitecustomize.py, scripts/test_times/coverage_overlap.py and their test rows. Worker 2: scripts/lib/test_bubble_wrapped_tests.py, scripts/hooks/pre-tool-use-build-hold-guard.py, scripts/build_hold/hold_enforcer.py and their hook tests.
+- **Workers:** 2 writers, no common file. Worker 2 codes against the bubble_wrapped_tests.py API in Spec 1.
 - **Constraints from prior phases:** 383 lands first; 355 renames merge_gate.py to gate.py (merge main before checkpoint). 388 lands no code (folded here). User test hold: write and review now; run tests only after natemerge releases units. NixOS entry for bubblewrap is asked of natedev; until then the config names the store path.
 - **Acceptance gate:**
   1. The proof module passes behind the guard and fails with the guard removed (refusal row).
-  2. One full natedev gate behind the walls; failing modules go on file_wall_only with the reason; record the gate time with and without the guard and the cold bytecode cost (compileall pass if any loss).
+  2. One full natedev gate inside Bubblewrap; a failing module is fixed or reported with its reason; record the gate time with and without the guard and the cold bytecode cost (compileall pass if any loss).
   3. 20 repeated runs of the changed modules pass, TMPDIR=/tmp, 2 GB scope.
   4. basedpyright zero errors and warnings on changed files.
 
