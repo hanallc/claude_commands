@@ -22,6 +22,7 @@ import shlex
 import subprocess
 import sys
 
+from scripts.production.land_queue import gap_descriptors
 from scripts.lib import main_push_lock
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -93,6 +94,7 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         try:
             return subprocess.run(["git", "-C", str(checkout), *arguments],
                                   capture_output=True, text=True, check=False,
+                                  pass_fds=gap_descriptors() if arguments[0] == "push" else (),
                                   timeout=time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None)
         except subprocess.TimeoutExpired as error:
             details = "; ".join(output.decode(errors="replace").strip()

@@ -23,7 +23,7 @@ This command shows it or changes it, on both machines.
    - tells every session on both machines with `broadcast.py --all`;
    - commits and pushes the file in a gap between lands, then updates the Mac checkout;
    - prints the new zone and the time now.
-   If a land runs, the zone stays live and publication waits for the next gap.
+   If a land runs, the zone stays live and a detached publisher waits for a gap.
 3. Exit 2 with a `zone:` line before any `live now` line means nothing changed. Read the message:
    - **No zone has that name** (a city such as `Seattle`): find the IANA zone
      of the place (`America/Los_Angeles`) and run step 2 again with it.

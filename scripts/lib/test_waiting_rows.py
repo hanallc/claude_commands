@@ -226,6 +226,26 @@ class WaitingRowsTests(unittest.TestCase):
         self.assertEqual((self.checkout / relative).read_text(),
                          SETTINGS.replace("amount=2", "amount=4").replace("limit=5", "limit=7"))
 
+    def test_a_json_save_after_preflight_keeps_the_incoming_sibling(self) -> None:
+        name = waiting_rows.SETTINGS_JSON
+        live = self.checkout / name
+        _ = live.write_text('{"local": 1, "incoming": 1}\n')
+        self.run_git(self.checkout, "add", name)
+        self.run_git(self.checkout, "commit", "-qm", "Add settings")
+        self.run_git(self.checkout, "push", "-q", "origin", "main")
+        self.run_git(self.peer, "pull", "-q", "--ff-only")
+        target = self.peer_change(name, '"incoming": 1', '"incoming": 2')
+        with waiting_rows.locked_checkout(self.checkout):
+            rows = waiting_rows.check_move(self.checkout, waiting_rows.move_target(
+                self.checkout, target, fast_forward=True))
+            _ = live.write_text('{"local": 2, "incoming": 1}\n')
+            with mock.patch.object(live_settings, "publish", return_value=[]), \
+                    mock.patch.object(main_publish, "ssh", return_value=subprocess.CompletedProcess([], 0)):
+                self.assertEqual(live_settings.main(["publish-json", "--message", "Set local"]), 0)
+            waiting_rows.apply_move(self.checkout, rows)
+        self.assertEqual(cast(object, json.loads(live.read_text())), {"local": 2, "incoming": 2})
+        self.assertFalse(waiting_rows.move_marker(self.checkout).exists())
+
     def test_the_registry_fast_forward_restores_a_save_after_its_check(self) -> None:
         path = "config/statusline.conf"
         self.edit(path, "brown", "#112233")

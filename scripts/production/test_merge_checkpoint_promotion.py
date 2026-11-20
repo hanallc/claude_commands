@@ -83,7 +83,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         with mock.patch.dict(os.environ, environment, clear=True), redirect_stdout(StringIO()):
             if json_file:
                 self.write(self.promote, path, live)
-                with land_runs.landing([tip]):
+                with (land_runs.landing([tip]),
+                      mock.patch.object(live_settings, "request_publication", return_value="main: waits")):
                     self.assertEqual(live_settings.main(["publish-json", "--message", "Approved window"]), 0)
             else:
                 _ = live_settings.stage_save(live_settings.WaitingChange(

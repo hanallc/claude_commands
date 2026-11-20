@@ -14,7 +14,7 @@ Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/tune.py" <file> <
 Pass separate, quoted arguments. On the Mac, the script forwards them to natedev.
 The script checks the limits, writes the live value on both machines, and starts the configured readers.
 It commits the row and pushes main when no land runs.
-During a land, it reserves the next gap and returns.
+During a land, a detached publisher waits for a gap. The command returns at once.
 If the Mac is offline, the watcher sends the pull when the Mac answers.
 Run no test or gate. Add no approval step.
 

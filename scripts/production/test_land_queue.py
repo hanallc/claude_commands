@@ -4,15 +4,13 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-from scripts.lib import file_lock
-from scripts.production import land_queue, land_runs, unit_phases
+from scripts.production import land_queue, unit_phases
 from zoneinfo import ZoneInfo
 
 
@@ -64,42 +62,10 @@ class LandQueueTests(unittest.TestCase):
         self.assertEqual(self.run_line("list")[1], "the land line is empty\n")
         self.assertEqual(land_queue.places(), {})
 
-    def test_stopped_settings_worker_does_not_block_the_next_land(self) -> None:
+    def test_next_does_not_wait_for_the_settings_gap(self) -> None:
         land_queue.add("builds next", batch="", commits=["a" * 40], first=False, before=None)
-        with land_runs.landing(["b" * 40]), land_queue.settings_gap() as admission:
-            self.assertIsInstance(admission, land_queue.SettingsWaiting)
-
-        def stopped(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(land_queue.listing(), "1. builds next: aaaaaaaaa")
-            descriptor = int(command[-1])
-            self.assertEqual(options["pass_fds"], (descriptor,))
-            self.assertEqual(land_queue.inherited_gap(descriptor).descriptor, descriptor)
-            with land_queue.gap_lock(wait=False) as competing:
-                self.assertIsInstance(competing, land_queue.SettingsGapBusy)
-            with land_queue.line_lock(wait=False) as line:
-                self.assertIs(line, file_lock.LockResult.ACQUIRED)
-            return subprocess.CompletedProcess(command, -15, "", "")
-
-        with patch.object(subprocess, "run", stopped):
-            self.assertEqual(self.run_line("next"), (0, "builds next\n", "settings publication stopped with exit -15\n"))
-        self.assertEqual(land_queue.listing(), "the land line is empty")
-
-    def test_next_publishes_a_new_settings_request_before_the_following_land(self) -> None:
-        land_queue.add("builds next", batch="", commits=["a" * 40], first=False, before=None)
-        _ = land_queue.enqueue_settings()
-        publishes: list[str] = []
-
-        def publish(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(options["pass_fds"], (int(command[-1]),))
-            publishes.append("settings")
-            if len(publishes) == 1:
-                _ = land_queue.enqueue_settings()
-            return subprocess.CompletedProcess(command, 0, "", "")
-
-        with patch.object(subprocess, "run", publish):
-            self.assertEqual(self.run_line("next"), (0, "", ""))
+        with land_queue.gap_lock():
             self.assertEqual(self.run_line("next"), (0, "builds next\n", ""))
-        self.assertEqual(publishes, ["settings", "settings"])
 
     def test_next_prints_the_batch_path_stored_for_the_label(self) -> None:
         batch = self.batch("setupwait2", "aws hana-setup-wait " + "a" * 40)

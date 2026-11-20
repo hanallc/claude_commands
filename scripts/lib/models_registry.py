@@ -6,7 +6,6 @@ except FileNotFoundError:
     pass
 
 import argparse
-import fcntl
 import json
 import os
 import platform
@@ -294,7 +293,7 @@ def _fetch(repo: Path, branch: str) -> str:
 
 
 def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_shared: bool = False,
-                  expected_head: str = "", replay_registry: waiting_rows.RegistryReplay = registry_rows.replay_pending) -> None:
+                  expected_head: str = "", published_registry: str | None = None) -> None:
     with waiting_rows.locked_checkout(repo):
         try:
             move = waiting_rows.move_target(repo, target, fast_forward=True, allow_contained=True,
@@ -302,7 +301,7 @@ def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_share
             if move.head == move.tip:
                 return
             rows = waiting_rows.check_move(repo, move, replace_registry=registry_already_shared,
-                                           registry_move=True, replay_registry=replay_registry)
+                                           registry_move=True, published_registry=published_registry)
         except OSError as error:
             raise FastForwardCheckFailed(str(error)) from error
         try:
@@ -311,9 +310,9 @@ def _fast_forward(repo: Path, path: Path, target: str, *, registry_already_share
             raise OSError(f"registry fast-forward failed for {path}: {error}") from error
 
 
-def _reconcile_shared(repo: Path, path: Path, target: str, expected_head: str) -> bool:
+def _reconcile_shared(repo: Path, path: Path, target: str, expected_head: str, published: str) -> bool:
     try:
-        _fast_forward(repo, path, target, registry_already_shared=True, expected_head=expected_head)
+        _fast_forward(repo, path, target, registry_already_shared=True, expected_head=expected_head, published_registry=published)
     except OSError as error:
         raise OSError(f"{path} is shared, but local reconciliation failed: {error}") from error
     return True
@@ -331,24 +330,7 @@ def _registry_commit(repo: Path, parent: str, contents: str, description: str) -
         return _git(repo, "commit-tree", tree, "-p", parent, "-m", main_publish.REGISTRY_SUBJECT + ' '.join(description.splitlines()))
 
 
-def _catalog_replay(before: str, written: str, catalog: list[registry_rows.RowChange]) -> waiting_rows.RegistryReplay:
-    values = registry_rows.values(written)
-    undo = registry_rows.changes(written, before)
-
-    def replay(head: str, local: str, target: str) -> str:
-        committed, current = registry_rows.values(head), registry_rows.values(local)
-        catalog_text = registry_rows.replay(head, catalog, True)
-        catalog_values = registry_rows.values(catalog_text)
-        prior = [row for row in registry_rows.changes(catalog_text, head)
-                 if current.get((row.section, row.key)) == catalog_values.get((row.section, row.key))]
-        prior += [row for row in undo if current.get(key := (row.section, row.key)) == values.get(key) != committed.get(key)]
-        ordinary = registry_rows.replay(local, prior, False)
-        return registry_rows.replay(registry_rows.replay_pending(head, ordinary, target), catalog, True)
-
-    return replay
-
-
-def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_rows.RegistryReplay) -> bool:
+def _publish(repo: Path, path: Path, description: str) -> bool:
     head_and_branch = _git(repo, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD").splitlines()
     if len(head_and_branch) != 2 or not head_and_branch[1].startswith("refs/heads/"):
         raise OSError("registry publication refused: HEAD is not on a branch")
@@ -359,7 +341,7 @@ def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_
     except OSError as error:
         raise OSError(f"registry publication refused: fetch failed: {error}") from error
     try:
-        _fast_forward(repo, path, remote, expected_head=base, replay_registry=replay_registry)
+        _fast_forward(repo, path, remote, expected_head=base)
     except FastForwardCheckFailed as error:
         raise OSError(f"registry publication refused: fast-forward check failed: {error}") from error
     if foreign := _git(repo, "rev-list", "--abbrev-commit", f"{remote}..HEAD").split():
@@ -384,28 +366,28 @@ def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_
                 ancestor = _git(repo, "merge-base", commit, remote)
                 remote_text = _git(repo, "show", f"{remote}:{REGISTRY_PATH}") + "\n"
                 shared = ancestor == commit or (ancestor == base and not registry_rows.changes(
-                    remote_text, replay_registry(previous, contents, remote_text)))
+                    remote_text, waiting_rows.replay_registry_rows(repo, previous, contents, remote_text)))
             except OSError as retry_error:
                 last_error = str(retry_error)
                 break
             if shared:
-                return _reconcile_shared(repo, path, remote, base)
+                return _reconcile_shared(repo, path, remote, base, contents)
             try:
                 if attempt < 2:
-                    _fast_forward(repo, path, remote, expected_head=base, replay_registry=replay_registry)
+                    _fast_forward(repo, path, remote, expected_head=base)
             except OSError as retry_error:
                 last_error = f"retry fast-forward check failed: {retry_error}"
                 break
             continue
         if isinstance(landed.hook, land_main.HookFailed):
             print(land_main.hook_report(landed.hook), file=sys.stderr)
-        return _reconcile_shared(repo, path, commit, base)
+        return _reconcile_shared(repo, path, commit, base, contents)
     raise OSError(f"{path} is edited but not shared; publish failed after at most 3 tries: {last_error}")
 
 
 def _publish_lock_path(target: SharedRegistry | UnpublishedRegistry, path: Path) -> Path:
     if isinstance(target, SharedRegistry):
-        return target.git_directory / "models-config.publish.lock"
+        return waiting_rows.registry_writer_lock(target.git_directory)
     return path.with_name(path.name + ".lock")
 
 
@@ -469,25 +451,23 @@ def _receipt_path(target: SharedRegistry, receipt: str) -> Path:
     return target.git_directory / "models-config.receipts" / receipt
 
 
-def _publish_in_gap(target: SharedRegistry, path: Path, description: str, replay: waiting_rows.RegistryReplay,
-                    *, wait: bool, gap: land_queue.SettingsGap | main_push_lock.CheckLandLine) -> bool:
-    on_main = _on_main(target)
-    if on_main and platform.system() == "Darwin":
-        _forward_main_rows(target, path, wait=wait)
+def _publish_when_ready(target: SharedRegistry, path: Path, description: str) -> bool:
+    if not _on_main(target):
+        with main_push_lock.main_push_lock(target.repository):
+            return _publish(target.repository, path, description)
+    if platform.system() == "Darwin":
+        _forward_main_rows(target, path, wait=False)
         return False
-    with ExitStack() as locks:
-        if on_main:
-            admission = locks.enter_context(main_push_lock.settings_push(
-                target.repository, wait=isinstance(gap, land_queue.SettingsGap), gap=gap))
-            if not isinstance(admission, main_push_lock.MainPushReady):
-                print(land_queue.enqueue_settings().report(), file=sys.stderr)
-                return False
-        lock = locks.enter_context(_publish_lock_path(target, path).open("a"))
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
-        except BlockingIOError:
-            return False
-        return _publish(target.repository, path, description, replay)
+    with main_push_lock.settings_push(target.repository, wait=False) as gap, ExitStack() as locks:
+        if isinstance(gap, land_queue.SettingsGap):
+            try:
+                locks.enter_context(waiting_rows.locked_checkout(target.repository, wait=False))
+            except BlockingIOError:
+                pass
+            else:
+                return _publish(target.repository, path, description)
+    print(main_push_lock.request_publication(), file=sys.stderr)
+    return False
 
 
 def has_pending(registry: Path) -> bool:
@@ -503,9 +483,8 @@ def has_pending(registry: Path) -> bool:
     return waiting_rows.move_marker(target.repository).exists() or bool(registry_rows.changes(head, registry_text(path)))
 
 
-def publish_pending(registry: Path, *, gap: land_queue.SettingsGap | main_push_lock.CheckLandLine =
-                    main_push_lock.CHECK_LAND_LINE) -> bool:
-    """Publish waiting rows in a gap. Return False when publication waits."""
+def publish_pending(registry: Path, *, in_gap: bool = False) -> bool:
+    """Publish registry edits or leave them for the detached waiter."""
     path = registry.resolve()
     target = _publish_repository(path)
     if (not isinstance(target, SharedRegistry) or path != DEFAULT_PATH.resolve()
@@ -517,8 +496,14 @@ def publish_pending(registry: Path, *, gap: land_queue.SettingsGap | main_push_l
     head = _git(target.repository, "show", f"HEAD:{REGISTRY_PATH}") + "\n"
     if not waiting_rows.move_marker(target.repository).exists() and not registry_rows.changes(head, registry_text(path)):
         return False
-    return _publish_in_gap(target, path, "rows written while main was busy", registry_rows.replay_pending,
-                           wait=isinstance(gap, land_queue.SettingsGap), gap=gap)
+    description = "rows written while main was busy"
+    if in_gap:
+        with main_push_lock.main_push_lock(target.repository):
+            return _publish(target.repository, path, description)
+    with main_push_lock.settings_push(target.repository, wait=False) as gap:
+        if isinstance(gap, land_queue.SettingsGap):
+            return _publish(target.repository, path, description)
+    return False
 
 
 def store_registry(registry: Path, before: str, after: str, description: str, *,
@@ -527,33 +512,29 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     path = registry.resolve()
     changes = [row for row in registry_rows.changes(before, after)
                if not additive_catalog or row.section in ("codex.agents", "codex.families")]
-    replay = registry_rows.replay_pending
     target = _publish_repository(path)
     lock_path = _publish_lock_path(target, path)
     shared = isinstance(target, SharedRegistry) and path == DEFAULT_PATH.resolve()
     forwards = (shared and isinstance(target, SharedRegistry) and platform.system() == "Darwin"
                 and _on_main(target) and os.environ.get("MODELS_CONFIG_PUBLISH") != "0")
     receipt_path = _receipt_path(target, receipt) if receipt and isinstance(target, SharedRegistry) else None
-    with ExitStack() as locks:
-        lock = locks.enter_context(lock_path.open("a"))
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    if isinstance(target, SharedRegistry):
+        waiting_rows.recover_abandoned_move(target.repository)
+    with file_lock.exclusive(lock_path):
         if receipt_path is not None and receipt_path.exists():
             print(f"accepted {receipt}", flush=True)
             return registry_text(path)
-        if isinstance(target, SharedRegistry):
-            locks.enter_context(waiting_rows.locked_checkout(target.repository))
-            waiting_rows.restore_checkout(target.repository, "HEAD")
         if changes:
             latest = registry_text(path)
             result = registry_rows.replay(latest, changes, additive_catalog)
-            if additive_catalog:
-                replay = _catalog_replay(latest, result, changes)
             if registry_rows.values(latest) != registry_rows.values(result):
                 if forwards and isinstance(target, SharedRegistry):
                     edits = _read_mac_edits(target)
                     edits.append({"receipt": uuid4().hex, "before": latest, "after": result,
                                   "description": description, "additive_catalog": additive_catalog})
                     _save_mac_edits(target, edits)
+                if shared and isinstance(target, SharedRegistry):
+                    waiting_rows.record_registry_edit(target.git_directory, latest, result, additive_catalog)
                 write_text_atomic(path, after if latest == before and not additive_catalog else result)
         if receipt_path is not None:
             receipt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -562,7 +543,7 @@ def store_registry(registry: Path, before: str, after: str, description: str, *,
     if (shared and isinstance(target, SharedRegistry)
             and os.environ.get("MODELS_CONFIG_PUBLISH") not in ("0", "later")):
         try:
-            _ = _publish_in_gap(target, path, description, replay, wait=True, gap=main_push_lock.CHECK_LAND_LINE)
+            _ = _publish_when_ready(target, path, description)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise OSError(f"the rows are live; main does not have them yet: {' '.join(str(error).split())}; "
                           + "the notes timer tries again") from error

@@ -16,42 +16,67 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
-import os
 import re
-import subprocess
 import sys
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
-from uuid import uuid4
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import land_runs
 
 HASH = re.compile(r"[0-9a-f]{7,40}")
-SETTINGS_LABEL = "settings publish"
+
+
 SETTINGS_WAIT_NOTICE = "main: waits for the land that runs now"
 
 
 class SettingsGap(NamedTuple):
-    """An open descriptor holds the gap until the publisher exits."""
+    """The publisher holds an open descriptor for the gap."""
 
     descriptor: int
 
 
-class SettingsWaiting(NamedTuple):
-    """A running land has the line. One item holds the next gap."""
-
-    def report(self) -> str:
-        return SETTINGS_WAIT_NOTICE
-
-
 class SettingsGapBusy(NamedTuple):
-    """Another process holds the gap lock or edits the line."""
+    """A land or another publisher has the gap."""
+
+
+_gap_descriptors = ContextVar("settings_gap_descriptors", default=tuple[int, ...]())
+
+
+def gap_descriptors() -> tuple[int, ...]:
+    return _gap_descriptors.get()
+
+
+@contextmanager
+def gap_lock(*, wait: bool = True) -> Generator[SettingsGap | SettingsGapBusy]:
+    folder = land_runs.state_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "settings-gap.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield SettingsGapBusy()
+            return
+        token = _gap_descriptors.set((lock.fileno(),))
+        try:
+            yield SettingsGap(lock.fileno())
+        finally:
+            _gap_descriptors.reset(token)
+
+
+@contextmanager
+def landing(commits: Sequence[str], owners: Sequence[str] = ()) -> Generator[None]:
+    """Register the land after the current settings push ends."""
+    with ExitStack() as record:
+        with gap_lock():
+            record.enter_context(land_runs.landing(commits, owners))
+        yield
 
 
 class LineItem(TypedDict):
@@ -147,118 +172,16 @@ def read_items() -> list[LineItem] | NoLine:
     return cast(list[LineItem], json.loads(text))
 
 
-def _lock_path(name: str) -> Path:
-    folder = line_path().parent
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder / name
-
-
-@contextmanager
-def line_lock(*, wait: bool = True) -> Generator[file_lock.LockResult]:
-    with file_lock.exclusive(_lock_path("land_queue.json.lock"), wait=wait) as result:
-        yield result
-
-
-def _gap_lock_path() -> Path:
-    return _lock_path("settings-gap.lock")
-
-
-@contextmanager
-def gap_lock(*, wait: bool = True) -> Generator[SettingsGap | SettingsGapBusy]:
-    with _gap_lock_path().open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
-        except BlockingIOError:
-            yield SettingsGapBusy()
-        else:
-            yield SettingsGap(lock.fileno())
-
-
-def inherited_gap(descriptor: int) -> SettingsGap:
-    if not os.path.samestat(os.fstat(descriptor), _gap_lock_path().stat()):
-        raise OSError("the publisher did not receive the land gap")
-    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    return SettingsGap(descriptor)
-
-
-@contextmanager
-def landing(commits: Sequence[str], owners: Sequence[str]) -> Generator[None]:
-    """Register a land after the current settings push ends."""
-    with ExitStack() as record:
-        with gap_lock(), line_lock():
-            record.enter_context(land_runs.landing(commits, owners))
-        yield
-
-
-def write_items(items: list[LineItem]) -> None:
-    write_text_atomic(line_path(), json.dumps(items, indent=1) + "\n")
-
-
 @contextmanager
 def edited() -> Generator[list[LineItem]]:
-    """Hold the line lock through the edit."""
-    with line_lock():
+    """Hold the line lock, yield the items to change, and write them when the block ends."""
+    path = line_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.exclusive(path.with_name(path.name + ".lock")):
         read = read_items()
         items = [] if isinstance(read, NoLine) else read
         yield items
-        write_items(items)
-
-
-def _settings_item(item: LineItem) -> bool:
-    return item["label"] == SETTINGS_LABEL and not item["batch"] and not item["commits"]
-
-
-def _settings_row() -> LineItem:
-    return {"label": SETTINGS_LABEL, "batch": "", "commits": [],
-            "added": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-
-
-def enqueue_settings() -> SettingsWaiting:
-    """Record a publication request without waiting for the line editor."""
-    with line_lock(wait=False) as line:
-        if line is file_lock.LockResult.BUSY:
-            wakes = line_path().parent / "settings-wake"
-            wakes.mkdir(exist_ok=True)
-            write_text_atomic(wakes / uuid4().hex, "")
-        else:
-            _mark_settings()
-    return SettingsWaiting()
-
-
-def _mark_settings() -> None:
-    found = read_items()
-    items = [] if isinstance(found, NoLine) else found
-    if not any(_settings_item(item) for item in items):
-        items.insert(0, _settings_row())
-        write_items(items)
-
-
-def _visible_items() -> list[LineItem] | NoLine:
-    found = read_items()
-    if not any((line_path().parent / "settings-wake").glob("*")):
-        return found
-    items = [] if isinstance(found, NoLine) else found
-    return items if any(_settings_item(item) for item in items) else [_settings_row(), *items]
-
-
-@contextmanager
-def settings_gap(*, wait: bool = True) -> Generator[SettingsGap | SettingsWaiting | SettingsGapBusy]:
-    """Reserve the next gap or hold the current gap without holding the line."""
-    # Take the gap, line, main push, and journal locks in this order.
-    # Release the line lock before Git runs.
-    with gap_lock(wait=wait) as gap:
-        if isinstance(gap, SettingsGapBusy):
-            yield SettingsGapBusy()
-            return
-        with line_lock(wait=wait) as line:
-            if line is file_lock.LockResult.BUSY:
-                admission = SettingsGapBusy()
-            elif land_runs.running_lands():
-                _mark_settings()
-                admission = SettingsWaiting()
-            else:
-                admission = gap
-        yield admission
+        write_text_atomic(path, json.dumps(items, indent=1) + "\n")
 
 
 def batch_commits(batch: str) -> tuple[BatchCommit, ...]:
@@ -281,7 +204,7 @@ def places() -> dict[str, Place] | NoLine:
     """The place of each commit in the line; an unreadable line is an empty line."""
     found: dict[str, Place] = {}
     try:
-        items = _visible_items()
+        items = read_items()
         if isinstance(items, NoLine):
             return items
         for number, item in enumerate(items, 1):
@@ -302,7 +225,6 @@ def place_of(line: dict[str, Place], commit: str) -> Place | None:
 
 def land_view(repo: Path) -> LandView:
     """Read the lands; one git call for each listed commit finds the commits it carries."""
-    # Load the board reader here. Publication only needs the line.
     carried = cast(Callable[[Path, str], list[str]],
                    import_module("scripts.production.waits_on").carried)
     running, line = land_runs.running_lands(), places()
@@ -344,10 +266,6 @@ def position(items: list[LineItem], label: str) -> int:
 
 def insert(items: list[LineItem], item: LineItem, *, first: bool, before: str | None) -> None:
     index = 0 if first else position(items, before) if before is not None else len(items)
-    if _settings_item(item):
-        index = 0
-    elif items and _settings_item(items[0]):
-        index = max(index, 1)
     items.insert(index, item)
 
 
@@ -392,62 +310,25 @@ def remove(label: str) -> None:
         _ = items.pop(position(items, label))
 
 
-def _take_land_item(items: list[LineItem]) -> str:
-    if not items or _settings_item(items[0]):
-        return ""
-    label, batch = items[0]["label"], items[0]["batch"]
-    check_label(label)
-    check_batch_path(batch)
-    _ = items.pop(0)
-    return f"{label} {batch}" if batch else label
-
-
 def take_next() -> str:
-    """Claim the gap and consume the settings row before starting the publisher."""
-    with gap_lock() as gap:
-        assert isinstance(gap, SettingsGap)
-        with edited() as items:
-            wakes = list((line_path().parent / "settings-wake").glob("*"))
-            marker = bool(items and _settings_item(items[0]))
-            if not marker and not wakes:
-                return _take_land_item(items)
-            if land_runs.running_lands():
-                return ""
-            if marker:
-                _ = items.pop(0)
-            for wake in wakes:
-                wake.unlink(missing_ok=True)
-        _publish_claim(gap)
-        with edited() as items:
-            if next((line_path().parent / "settings-wake").glob("*"), None) is not None:
-                return ""
-            return _take_land_item(items)
-
-
-def _publish_claim(gap: SettingsGap) -> None:
-    script = Path(__file__).resolve().parents[1] / "lib/live_settings.py"
-    command = [sys.executable, str(script), "publish-queued", str(gap.descriptor)]
-    try:
-        result = subprocess.run(command, pass_fds=(gap.descriptor,), capture_output=True, text=True, check=False)
-    except OSError as error:
-        print(f"settings publication could not start: {error}", file=sys.stderr)
-    else:
-        for output in (result.stderr, result.stdout):
-            if output:
-                print(output, end="", file=sys.stderr)
-        if result.returncode:
-            print(f"settings publication stopped with exit {result.returncode}", file=sys.stderr)
+    """Check the first item before removal and format its label and batch path."""
+    with edited() as items:
+        if not items:
+            return ""
+        item = items[0]
+        label, batch = item["label"], item["batch"]
+        check_label(label)
+        check_batch_path(batch)
+        _ = items.pop(0)
+        return f"{label} {batch}" if batch else label
 
 
 def listing() -> str:
-    items = _visible_items()
+    items = read_items()
     if isinstance(items, NoLine) or not items:
         return "the land line is empty"
     rows: list[str] = []
     for number, item in enumerate(items, 1):
-        if _settings_item(item):
-            rows.append(f"{number}. {SETTINGS_LABEL}: waiting changes")
-            continue
         named = [f"{entry.unit} {entry.phase} {entry.commit[:9]}" for entry in batch_commits(item["batch"])]
         named += [commit[:9] for commit in item["commits"]]
         rows.append(f"{number}. {item['label']}: {', '.join(named) or 'no commit'}")

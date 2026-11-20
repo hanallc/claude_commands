@@ -68,7 +68,7 @@ A Claude launch turns that word into the newest model of the family; see [Claude
 It first writes the changed rows live: it replays them against the latest text under an exclusive writer lock.
 It preserves unrelated edits, file mode, comments, and spacing.
 The live write never waits for the main push lock, so the new value is in effect at once.
-Publication follows the live write. During a land, the publisher reserves the next gap.
+Publication follows the live write. During a land, a detached publisher waits for a gap.
 A failed publication keeps the rows live and reports `the rows are live; main does not have them yet`.
 `store_registry` returns the live text. The `store` command builds `configuration_shell` from that text.
 
@@ -79,10 +79,8 @@ The shared writer fetches origin and checks fast-forward safety with a temporary
 `models_registry._fetch(repo, branch)` fetches `+refs/heads/<branch>:refs/remotes/origin/<branch>` and reads that ref, never `FETCH_HEAD`.
 Every fetch in the checkout writes `FETCH_HEAD`, so another fetch between the fetch and the read cannot change the target.
 With `fetch.prune=true`, this one-ref refspec prunes no other `origin/*` ref.
-Main publication checks the line under its lock and releases it before Git runs.
-The gap lock, main push lock, and registry writer lock protect publication.
-The hold covers fetch, row replay, commit, push retries, and local reconciliation.
-Other target branches retain only the registry writer lock.
+Main publication holds the gap and main push locks through Git and local reconciliation.
+The writer lock protects the live edit.
 An isolated index and `commit-tree` make a commit containing only `config/models.conf`.
 Its subject is `config(models): <description>`.
 Temporary index folders use the `models-index-` and `models-ff-index-` prefixes.
@@ -100,8 +98,8 @@ The quota alert's `edit_registry` uses this mode for its role routing.
 The Mac forwards its edits to natedev and records the acceptance of each edit.
 `publish_pending(registry)` commits and pushes the rows that HEAD does not have.
 It returns `False` when another process holds the main push lock or a land runs.
-The notes timer requests a gap for pending registry rows through `live_settings.publish_waiting()`.
-The land runner publishes those rows when it takes the gap.
+The notes timer starts a detached publisher through `live_settings.publish_waiting()`.
+One detached publisher handles all pending saves.
 Exhaustion reports that the file is edited but not shared.
 Local integration uses fast-forward only.
 A successful push with failed local reconciliation reports both facts.

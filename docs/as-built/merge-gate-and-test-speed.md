@@ -706,11 +706,10 @@ The units board shows `<Nth> in line` for each checkpoint that waits.
 
 Tune, zone, and the registry writer apply their changes before publication.
 When the gap is free, these tools can publish immediately.
-When a land runs or a publisher holds the gap, a caller places one `settings publish` item at the front.
-`next` holds the gap and removes the settings item before it starts the publisher.
-The publisher inherits the gap lock, and Git runs after the runner releases the line lock.
-A failed publication keeps the journal entries and lets the runner return the next land.
-The notes timer requests another gap for pending entries without taking the publication locks.
+Otherwise, one detached publisher waits for the running lands to finish.
+The publisher checks for running lands while it holds the gap lock.
+Registration for a new land waits on that lock until the push ends.
+The notes timer starts the publisher again if a failed push leaves changes pending.
 Ask natemerge for a gap before you push a hand commit to main during a land.
 
 For an approved edit to the live `settings.json` on natedev, use

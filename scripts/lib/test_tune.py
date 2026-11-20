@@ -6,9 +6,9 @@ import io
 import json
 import os
 from pathlib import Path
-import pwd
-import fcntl
 import shlex
+import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -17,7 +17,9 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.direct.wait_for_test_state import wait_for_pid
 from scripts.lib import conf, live_settings, main_publish, models_registry, tune, user_zone, waiting_rows, zone
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import PublicationTestCase, pending_rows
 from scripts.production import land_queue, land_runs
@@ -63,67 +65,61 @@ class TuneTests(PublicationTestCase):
         self.assertIn("main: pushed", result.stdout)
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
 
-    def test_running_land_reserves_the_first_gap_for_all_saves(self) -> None:
+    def test_one_detached_waiter_publishes_two_saves_after_the_land(self) -> None:
         repo = self.repository
         base = repo.remote_tip()
-        with mock.patch.dict(os.environ, repo.env, clear=True):
-            land_queue.add("fixture next", batch="", commits=[base], first=False, before=None)
-            with land_runs.landing([base]):
-                for amount in ("3", "4"):
-                    result = self.save_amount(amount)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIn(f"mac: live now: amount={amount}", result.stdout)
-                    self.assertIn("main: waits for the land that runs now", result.stdout)
-                    self.assertIn(f"amount={amount}", repo.config.read_text())
+        with mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()) as output, \
+                mock.patch.object(subprocess, "Popen", wraps=subprocess.Popen) as launched:
+            with land_queue.landing([base]):
+                for key, value in (("amount", "3"), ("mode", "slow")):
+                    self.assertEqual(tune.main(["example", key, value, "--why", "fixture", "--user-words", "yes"]), 0)
+                    self.assertIn(f"mac: live now: {key}={value}", output.getvalue())
+                    self.assertIn("main: waits for the land that runs now", output.getvalue())
+                    self.assertIn(f"{key}={value}", repo.config.read_text())
                     self.assertEqual(repo.head(), base)
                     self.assertEqual(repo.remote_tip(), base)
-                self.assertEqual(land_queue.listing().splitlines(), [
-                    "1. settings publish: waiting changes", f"2. fixture next: {base[:9]}",
-                ])
-            with redirect_stderr(io.StringIO()):
-                self.assertEqual(land_queue.take_next(), "fixture next")
-            self.assertEqual(land_queue.listing(), "the land line is empty")
-        self.assertIn("amount=4", repo.git(repo.origin, "show", "main:config/example.conf"))
+                waiter_calls = [str(cast(object, call.args[0])) for call in launched.call_args_list
+                                if "publish-waiting" in str(cast(object, call.args[0]))]
+                self.assertEqual(len(waiter_calls), 1)
+                self.assertEqual(land_queue.listing(), "the land line is empty")
+            repo.finish_waiter()
+        contents = repo.git(repo.origin, "show", "main:config/example.conf")
+        self.assertIn("amount=3", contents)
+        self.assertIn("mode=slow", contents)
         self.assertEqual(self.waiting(), [])
 
-    def test_next_discards_the_settings_item_after_another_publication(self) -> None:
+    def test_a_land_waits_for_git_after_the_waiter_stops(self) -> None:
         repo = self.repository
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        ready = repo.root / "push-parent"
+        release = repo.root / "push-release"
+        os.mkfifo(release)
+        program = repo.programs / "git"
+        _ = program.write_text(
+            f"#!{sys.executable}\n"
+            + "import os, sys\nfrom pathlib import Path\n"
+            + 'if sys.argv[1:4:2] == ["-C", "push"]:\n'
+            + f"    Path({str(ready)!r}).write_text(str(os.getppid()))\n"
+            + f"    with open({str(release)!r}) as stream: stream.read()\n"
+            + f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n")
+        program.chmod(0o755)
+        base = repo.head()
         with mock.patch.dict(os.environ, repo.env, clear=True):
-            with land_runs.landing([repo.head()]):
-                saved = self.save_amount("3")
-                self.assertEqual(saved.returncode, 0, saved.stderr)
-                self.assertIn("waits for the land", saved.stdout)
-            self.assertIn("main: pushed", live_settings.publish(repo.checkout, wait=True) or [])
-            published = repo.remote_tip()
-            pulls = repo.mac_pulls()
-            self.assertEqual(land_queue.take_next(), "")
-            self.assertEqual(land_queue.listing(), "the land line is empty")
-        self.assertEqual(repo.remote_tip(), published)
-        self.assertEqual(repo.mac_pulls(), pulls)
-
-    def test_registry_and_tune_share_one_waiting_publication(self) -> None:
-        repo = self.repository
-        registry = repo.checkout / "config/models.conf"
-        before, after = "[fixture]\nmodel=old\n", "[fixture]\nmodel=new\n"
-        _ = registry.write_text(before)
-        _ = repo.git(repo.checkout, "add", str(registry))
-        _ = repo.git(repo.checkout, "commit", "-qm", "registry fixture")
-        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
-        base = repo.remote_tip()
-        environment = {**repo.env, "MODELS_CONFIG_PUBLISH": "1", "MODELS_CONFIG_FILE": str(registry)}
-        with mock.patch.dict(os.environ, environment, clear=True), \
-                mock.patch.object(models_registry, "DEFAULT_PATH", registry), redirect_stderr(io.StringIO()) as errors:
-            with land_runs.landing([base]):
-                self.assertEqual(models_registry.store_registry(registry, before, after, "Approved model"), after)
-                self.assertIn("main: waits for the land that runs now", errors.getvalue())
-                saved = self.save_amount("3")
-                self.assertEqual(saved.returncode, 0, saved.stderr)
+            with land_queue.landing([base]):
+                self.assertIn("main: waits", self.save_amount("3").stdout)
+            worker = wait_for_pid(ready)
+            try:
+                os.kill(worker, signal.SIGTERM)
+                repo.finish_waiter()
+                with land_queue.gap_lock(wait=False) as gap:
+                    self.assertIsInstance(gap, land_queue.SettingsGapBusy)
                 self.assertEqual(repo.remote_tip(), base)
-                self.assertEqual(land_queue.listing(), "1. settings publish: waiting changes")
-            self.assertEqual(land_queue.take_next(), "")
-            self.assertEqual(land_queue.listing(), "the land line is empty")
-        self.assertEqual(repo.git(repo.origin, "show", "main:config/models.conf"), after.strip())
-        self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
+            finally:
+                _ = release.write_text("finish\n")
+            with land_queue.landing([base]):
+                self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
+            self.assertEqual(repo.head(), base)
 
     def test_settings_json_is_live_before_its_commit_and_uses_the_same_gap(self) -> None:
         repo = self.repository
@@ -142,8 +138,7 @@ class TuneTests(PublicationTestCase):
             self.assertEqual(repo.head(), base)
             self.assertEqual(repo.remote_tip(), base)
             self.assertIn("308800", settings.read_text())
-            with redirect_stderr(io.StringIO()):
-                self.assertEqual(land_queue.take_next(), "")
+            repo.finish_waiter()
             self.assertEqual(land_queue.listing(), "the land line is empty")
         self.assertIn("308800", repo.git(repo.origin, "show", "main:settings.json"))
         self.assertEqual(repo.git(repo.checkout, "log", "-1", "--format=%s"),
@@ -172,26 +167,10 @@ class TuneTests(PublicationTestCase):
                 _ = repo.git(peer, "-c", "user.name=Land fixture", "-c", "user.email=land@example.invalid",
                              "commit", "-qam", "Deny Write")
                 _ = repo.git(peer, "push", "-q", "origin", "main")
-            self.assertEqual(land_queue.take_next(), "")
+            repo.finish_waiter()
         expected = {"permissions": {"allow": ["Read"], "deny": ["Write"]}}
         self.assertEqual(cast(object, json.loads(repo.git(repo.origin, "show", "main:settings.json"))), expected)
         self.assertEqual(cast(object, json.loads(settings.read_text())), expected)
-
-    def test_reversing_a_waiting_json_save_cancels_publication_and_restores_the_mac_value(self) -> None:
-        repo = self.repository
-        settings = self.seed_settings('{"autoCompactWindow": 283800}\n')
-        base = repo.head()
-        with mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            with land_runs.landing([base]):
-                for value in (308800, 283800):
-                    _ = settings.write_text(json.dumps({"autoCompactWindow": value}) + "\n")
-                    self.assertEqual(live_settings.main(["publish-json", "--message", "Set the window"]), 0)
-            self.assertEqual(land_queue.take_next(), "")
-        self.assertEqual(repo.remote_tip(), base)
-        deliveries = [shlex.split(line)[-1] for line in repo.ssh_log.read_text().splitlines() if "apply-json" in line]
-        self.assertEqual(len(deliveries), 2)
-        edits = cast(waiting_rows.SettingsJsonEdits, json.loads(deliveries[-1]))
-        self.assertEqual(edits["values"], {"autoCompactWindow": 283800})
 
     def test_only_a_saved_guest_key_prints_the_hana_image_notice(self) -> None:
         source = self.repository.checkout / 'hana_aws.conf'
@@ -556,21 +535,6 @@ class TuneTests(PublicationTestCase):
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
         self.assertEqual(self.waiting(), [])
 
-    def test_a_save_returns_while_main_and_the_line_are_busy(self) -> None:
-        repo = self.repository
-        with mock.patch.dict(os.environ, repo.env, clear=True):
-            with (repo.checkout / ".git/main-push.lock").open("a") as lock, land_queue.line_lock():
-                fcntl.flock(lock, fcntl.LOCK_EX)
-                saved = self.save_amount("3")
-                self.assertEqual(saved.returncode, 0, saved.stderr)
-                self.assertIn("main: waits", saved.stdout)
-                self.assertIn("amount=3", repo.config.read_text())
-                self.assertIn("amount=2", repo.git(repo.checkout, "show", "HEAD:config/example.conf"))
-                self.assertIn(shlex.join(["example", "amount", "3"]), repo.ssh_log.read_text())
-            self.assertEqual(land_queue.take_next(), "")
-        self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
-        self.assertEqual(self.waiting(), [])
-
     def test_tune_records_a_save_while_checkout_work_holds_the_lock(self) -> None:
         repo = self.repository
         base = repo.head()
@@ -581,10 +545,10 @@ class TuneTests(PublicationTestCase):
             self.assertEqual(repo.head(), base)
             self.assertIn("amount=3", repo.config.read_text())
         with mock.patch.dict(os.environ, repo.env, clear=True):
-            self.assertEqual(land_queue.take_next(), "")
+            repo.finish_waiter()
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
 
-    def test_notes_notify_the_runner_without_waiting_on_the_journal(self) -> None:
+    def test_notes_start_the_waiter_without_waiting_on_the_journal(self) -> None:
         repo = self.repository
         base = repo.remote_tip()
         with mock.patch.dict(os.environ, repo.env, clear=True):
@@ -593,23 +557,16 @@ class TuneTests(PublicationTestCase):
             with waiting_rows.locked_journal(waiting_rows.journal_path()):
                 self.assertIn("main: waits", "\n".join(live_settings.publish_waiting()))
                 self.assertEqual(repo.remote_tip(), base)
-            self.assertEqual(land_queue.take_next(), "")
+            repo.finish_waiter()
         self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
 
     def test_settings_publish_paths_leave_the_live_land_line_unchanged(self) -> None:
-        live_line = Path(pwd.getpwuid(os.getuid()).pw_dir, ".local/state/merge-gate/land_queue.json")
-
-        def live_snapshot() -> tuple[bytes, int] | None:
-            try:
-                with live_line.open("rb") as source:
-                    return source.read(), os.fstat(source.fileno()).st_mtime_ns
-            except FileNotFoundError:
-                return None
-
-        before = live_snapshot()
-        self.addCleanup(lambda: self.assertEqual(live_snapshot(), before))
-
         repo = self.repository
+
+        def private_write(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            self.assertTrue(path.resolve().is_relative_to(repo.root), f"write outside the fixture: {path}")
+            write_text_atomic(path, text, new_file_mode=new_file_mode)
+
         settings = self.seed_settings('{"autoCompactWindow": 208800}\n')
         config = repo.config.parent
         zone_file = config / "user_zone.conf"
@@ -628,34 +585,24 @@ class TuneTests(PublicationTestCase):
                        "USER_ZONE_CONF": str(zone_file), "ZONE_BROADCAST": str(broadcast), "TMPDIR": str(repo.root)}
         with (mock.patch.dict(os.environ, environment, clear=True),
               mock.patch.object(user_zone, "CONF", str(zone_file)),
+              mock.patch.object(land_queue, "write_text_atomic", private_write),
+              mock.patch.object(land_runs, "write_text_atomic", private_write),
               mock.patch.object(models_registry, "DEFAULT_PATH", registry),
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
             with land_runs.landing([base]):
                 self.assertEqual(tune.main(["example", "amount", "4", "--why", "fixture", "--user-words", "yes"]),
                                  0, output.getvalue() + errors.getvalue())
                 self.assertEqual(zone.main(["set", "Europe/Paris"]), 0, output.getvalue() + errors.getvalue())
-                pending = waiting_rows.read_journal(waiting_rows.journal_path())
-                self.assertEqual([(change.stem, change.value) for change in pending.changes],
-                                 [("example", "4"), ("user_zone", "Europe/Paris")])
-
-                land_queue.remove(land_queue.SETTINGS_LABEL)
                 self.assertIn("main: waits for the land that runs now", live_settings.publish_waiting())
-                land_queue.remove(land_queue.SETTINGS_LABEL)
                 contents = current.replace("model=old", "model=new")
-                self.assertEqual(models_registry.store_registry(registry, current, contents, "Set fixture model"),
-                                 contents)
-                self.assertIn(land_queue.SETTINGS_LABEL, land_queue.listing())
-
+                self.assertEqual(models_registry.store_registry(registry, current, contents, "Set fixture model"), contents)
                 _ = settings.write_text('{"autoCompactWindow": 308800}\n')
                 self.assertEqual(live_settings.main(["publish-json", "--message", "Approve the window"]), 0)
                 land_queue.add("fixture phase", batch="", commits=[base], first=False, before=None)
-                self.assertEqual(land_queue.line_path(), Path(repo.env["MERGE_GATE_STATE_DIR"]) / "land_queue.json")
-                items = land_queue.read_items()
-                self.assertIsInstance(items, list)
-                assert isinstance(items, list)
-                self.assertEqual([item["label"] for item in items], [land_queue.SETTINGS_LABEL, "fixture phase"])
+                self.assertEqual(land_queue.listing(), f"1. fixture phase: {base[:9]}")
                 self.assertEqual(repo.remote_tip(), base)
 
+            repo.finish_waiter()
             self.assertEqual(land_queue.take_next(), "fixture phase", errors.getvalue())
             self.assertEqual(land_queue.listing(), "the land line is empty")
 
@@ -676,9 +623,33 @@ class TuneTests(PublicationTestCase):
                 offline.unlink()
                 _ = settings.write_text('{"x": 2, "y": 2}\n')
                 self.assertEqual(live_settings.main(["publish-json", "--message", "Set y"]), 0)
+            repo.finish_waiter()
         deliveries = [shlex.split(line)[-1] for line in repo.ssh_log.read_text().splitlines() if "apply-json" in line]
         edits = cast(waiting_rows.SettingsJsonEdits, json.loads(deliveries[-1]))
         self.assertEqual(edits["values"], {"x": 2, "y": 2})
+
+    def test_notes_retry_a_reversal_without_a_new_main_commit(self) -> None:
+        repo = self.repository
+        settings = self.seed_settings('{"x": 1}\n')
+        base = repo.head()
+        offline = repo.root / "OFFLINE"
+        with mock.patch.dict(os.environ, repo.env, clear=True), redirect_stdout(io.StringIO()):
+            with land_runs.landing([base]):
+                _ = settings.write_text('{"x": 2}\n')
+                self.assertEqual(live_settings.main(["publish-json", "--message", "Set x"]), 0)
+                offline.touch()
+                _ = settings.write_text('{"x": 1}\n')
+                self.assertEqual(live_settings.main(["publish-json", "--message", "Restore x"]), 0)
+            repo.finish_waiter()
+            self.assertEqual(repo.remote_tip(), base)
+            offline.unlink()
+            self.assertIn("main: waits", "\n".join(live_settings.publish_waiting()))
+            repo.finish_waiter()
+            self.assertEqual(live_settings.publish_waiting(), [])
+        self.assertEqual(repo.remote_tip(), base)
+        deliveries = [shlex.split(line)[-1] for line in repo.ssh_log.read_text().splitlines() if "apply-json" in line]
+        edits = cast(waiting_rows.SettingsJsonEdits, json.loads(deliveries[-1]))
+        self.assertEqual(edits["values"], {"x": 1})
 
     def test_mac_delivery_resends_reversed_fields_after_a_lost_reply(self) -> None:
         repo = self.repository
@@ -702,10 +673,11 @@ class TuneTests(PublicationTestCase):
             self.assertIn('"Read"', mac_text)
             _ = settings.write_text(initial)
             self.assertEqual(live_settings.main(["publish-json", "--message", "Restore allow"]), 0)
+        repo.finish_waiter()
         self.assertEqual(deliveries, 2)
         self.assertEqual(cast(object, json.loads(mac_text)), cast(object, json.loads(initial)))
 
-    def test_a_refused_main_keeps_the_value_live_for_the_runner(self) -> None:
+    def test_a_refused_main_keeps_the_value_live_for_the_waiter(self) -> None:
         repo = self.repository
         _ = (repo.checkout / "other.txt").write_text("unrelated local commit\n")
         _ = repo.git(repo.checkout, "commit", "-qam", "unrelated work")
@@ -718,7 +690,7 @@ class TuneTests(PublicationTestCase):
         with mock.patch.dict(os.environ, repo.env, clear=True), \
                 mock.patch.object(models_registry, "publish_pending", return_value=False):
             lines = live_settings.publish_waiting()
-            self.assertEqual(land_queue.take_next(), "")
+            repo.finish_waiter()
         self.assertEqual(lines, ["main: waits for the land that runs now"])
         self.assertEqual(repo.git(repo.origin, "log", "-1", "--format=%s", "main"), "tune(example): amount 2 -> 3")
         self.assertEqual(self.waiting(), [])
@@ -826,13 +798,13 @@ class TuneTests(PublicationTestCase):
         hook.chmod(0o755)
         return hook
 
-    def test_same_value_rerun_publishes_a_previously_rejected_push_without_a_new_commit(self) -> None:
+    def test_same_value_rerun_publishes_after_a_rejected_push_keeps_local_main(self) -> None:
         repo = self.repository
         hook = self.reject_push()
         arguments = ("example", "amount", "3", "--why", "Approved tuning", "--user-words", "yes")
         first = self.run_tune(*arguments)
         self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertNotEqual(repo.remote_tip(), repo.head())
+        self.assertEqual(repo.remote_tip(), repo.head())
         self.assertEqual(repo.mac_pulls(), 0)
         self.assertFalse((repo.root / "state/mac.json").exists())
         head = repo.head()
@@ -841,8 +813,8 @@ class TuneTests(PublicationTestCase):
         repeated = self.run_tune(*arguments)
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertEqual(repeated.stdout, "already amount=3\n")
-        self.assertEqual(repo.head(), head)
-        self.assertEqual(repo.remote_tip(), head)
+        self.assertNotEqual(repo.head(), head)
+        self.assertEqual(repo.remote_tip(), repo.head())
         self.assertEqual((repo.config.read_bytes(), repo.config.stat().st_mtime_ns), contents)
         self.assertIn("git fetch -q --no-write-fetch-head", repo.ssh_log.read_text())
 
@@ -937,7 +909,7 @@ class TuneTests(PublicationTestCase):
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             status = tune.main(arguments)
         self.assertEqual(status, 2)
-        self.assertNotEqual(repo.head(), repo.remote_tip())
+        self.assertEqual((repo.head(), repo.remote_tip()), (head, remote))
         self.assertEqual(repo.mac_pulls(), 0)
         stage = "mac"
         with mock.patch.dict(os.environ, repo.env, clear=True), \

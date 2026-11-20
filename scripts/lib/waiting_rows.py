@@ -6,7 +6,7 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Generator, Iterable, Mapping
+from collections.abc import Generator, Iterable, Mapping
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
@@ -21,7 +21,7 @@ import sys
 import tempfile
 from typing import Literal, NotRequired, TypedDict, cast
 
-from scripts.lib import build_folders, conf, conf_reads, git_index, registry_rows
+from scripts.lib import build_folders, conf, conf_reads, file_lock, git_index, registry_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.transcripts import config_dirs
 
@@ -29,7 +29,6 @@ WAITING_CONFIG = ":(glob)config/*.conf"
 REGISTRY_PATH = "config/models.conf"
 SETTINGS_JSON = "settings.json"
 ORDER_PATH = "config/settings-orders.json"
-RegistryReplay = Callable[[str, str, str], str]
 _CHECKOUT_LOCKS = ContextVar("checkout_locks", default=frozenset[Path]())
 
 
@@ -170,6 +169,7 @@ class SettingsJournalRecord(TypedDict):
     settings_json: NotRequired[SettingsJsonSave]
     settings_json_order: NotRequired[int]
     mac_settings: NotRequired[MacSettingsBaseline]
+    received_settings_json: NotRequired[SettingsJsonEdits]
 
 
 @dataclass
@@ -184,6 +184,7 @@ class LockedJournal:
     settings_json: SettingsJsonSave | NoSettingsJsonSave = NoSettingsJsonSave()
     settings_json_order: int = 0
     mac_settings: MacSettingsBaseline | MacSettingsUntracked = MacSettingsUntracked()
+    received_settings_json: SettingsJsonEdits | None = None
 
     def save(self) -> None:
         record: dict[str, object] = {"last_order": self.last_order, "register": self.accepted,
@@ -192,6 +193,8 @@ class LockedJournal:
             record["settings_json"] = self.settings_json
         if self.settings_json_order:
             record["settings_json_order"] = self.settings_json_order
+        if self.received_settings_json is not None:
+            record["received_settings_json"] = self.received_settings_json
         if not isinstance(self.mac_settings, MacSettingsUntracked):
             record["mac_settings"] = self.mac_settings
         write_text_atomic(self.path, json.dumps(record, default=asdict, indent=2) + "\n", new_file_mode=0o600)
@@ -262,7 +265,8 @@ def read_journal(path: Path) -> LockedJournal:
         return LockedJournal(path, record["last_order"], accepted, changes, migrating="register" not in record,
                              settings_json=record.get("settings_json", NoSettingsJsonSave()),
                              settings_json_order=record.get("settings_json_order", 0),
-                             mac_settings=record.get("mac_settings", MacSettingsUntracked()))
+                             mac_settings=record.get("mac_settings", MacSettingsUntracked()),
+                             received_settings_json=record.get("received_settings_json"))
     except FileNotFoundError:
         return LockedJournal(path, 0, {}, [])
     except (ValueError, TypeError, KeyError) as error:
@@ -458,15 +462,69 @@ def pending_files(checkout: Path, journal: LockedJournal) -> dict[str, dict[str,
             if any(isinstance(save, AcceptedSave) for save in keys.values())}
 
 
+type AdditiveCatalogRows = dict[tuple[str, str], str]
+
+
+def registry_writer_lock(git_directory: Path) -> Path:
+    return git_directory / "models-config.publish.lock"
+
+
+def _catalog_modes_path(git_directory: Path) -> Path:
+    return git_directory / "models-config.additive.json"
+
+
+def _catalog_modes(git_directory: Path) -> AdditiveCatalogRows:
+    source = live_text(_catalog_modes_path(git_directory))
+    rows = cast(list[tuple[str, str, str]], json.loads(source)) if source is not None else []
+    return {(section, key): line for section, key, line in rows}
+
+
+def record_registry_edit(git_directory: Path, before: str, after: str, additive: bool) -> None:
+    """Keep the replay mode for each pending catalog row."""
+    modes = _catalog_modes(git_directory)
+    previous = modes.copy()
+    for row in registry_rows.changes(before, after):
+        address = row.section, row.key
+        if additive:
+            modes[address] = row.replacement
+        else:
+            _ = modes.pop(address, None)
+    if modes != previous:
+        path = _catalog_modes_path(git_directory)
+        if modes:
+            write_text_atomic(path, json.dumps([(*key, line) for key, line in modes.items()]) + "\n")
+        else:
+            path.unlink(missing_ok=True)
+
+
+def _registry_git_directory(checkout: Path) -> Path:
+    return Path(git(checkout, "rev-parse", "--absolute-git-dir").strip())
+
+
+def _replay_registry(git_directory: Path, base: str, local: str, target: str) -> str:
+    modes = _catalog_modes(git_directory)
+    ordinary: list[registry_rows.RowChange] = []
+    catalog: list[registry_rows.RowChange] = []
+    for row in registry_rows.changes(base, local):
+        edits = catalog if modes.get((row.section, row.key)) == row.replacement else ordinary
+        edits.append(row)
+    text = registry_rows.replay(target, ordinary, False) if ordinary else target
+    return registry_rows.replay(text, catalog, True) if catalog else text
+
+
+def replay_registry_rows(checkout: Path, base: str, local: str, target: str) -> str:
+    return _replay_registry(_registry_git_directory(checkout), base, local, target)
+
+
 def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
-         replace_registry: bool, replay_registry: RegistryReplay) -> MovePlan:
+         replace_registry: bool, published_registry: str | None) -> MovePlan:
     """Plan writes for paths that Git must leave in place."""
     target = move.tip
     changed = changed_paths(checkout, move.head, target, *waiting_paths(checkout))
     managed = pending_files(checkout, pending)
     orders = published_orders(checkout, target)
     plan = MovePlan(source=move.head, target=target, before={}, after={})
-    forced = {REGISTRY_PATH} if replace_registry else set[str]()
+    forced = {REGISTRY_PATH} if replace_registry or REGISTRY_PATH in changed else set[str]()
     touched = (changed & set(waiting_files(checkout))) | managed.keys() | forced
     for path in sorted(touched):
         stem, saves = Path(path).stem, managed.get(path, {})
@@ -481,7 +539,8 @@ def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
         local = live_text(checkout / path)
         plan["before"][path] = local
         if path == REGISTRY_PATH and incoming is not None:
-            plan["after"][path] = incoming if replace_registry else replay_registry(head or "", local or "", incoming)
+            baseline = published_registry if published_registry is not None else head or ""
+            plan["after"][path] = replay_registry_rows(checkout, baseline, local or "", incoming)
         else:
             plan["after"][path] = replay_settings(path, head or "", local or "", incoming, saves, settled)
     if SETTINGS_JSON in changed:
@@ -496,8 +555,6 @@ def _hold_settings_json(checkout: Path, plan: MovePlan) -> None:
     head = tree_text(checkout, plan["source"], SETTINGS_JSON)
     incoming = tree_text(checkout, plan["target"], SETTINGS_JSON)
     edits = settings_json_edits(head or "{}\n", clean_settings_json(checkout))
-    if not has_settings_json_edits(edits):
-        return
     plan["before"][SETTINGS_JSON] = local
     if incoming is None:
         plan["after"][SETTINGS_JSON] = local
@@ -671,14 +728,29 @@ def recover_move(checkout: Path, head: str) -> None:
     elif head == plan["source"]:
         rollback_move(checkout, plan, writes)
     else:
-        with locked_journal(journal_path()) as pending:
-            saves = pending_files(checkout, pending)
+        with ExitStack() as locks:
             restored = dict(plan["after"])
+            registry_dir = _registry_git_directory(checkout) if REGISTRY_PATH in restored else None
+            if registry_dir is not None:
+                _ = locks.enter_context(file_lock.exclusive(registry_writer_lock(registry_dir)))
+            pending = locks.enter_context(locked_journal(journal_path()))
+            saves = pending_files(checkout, pending)
             for path, after in restored.items():
                 current = live_text(checkout / path)
                 before = plan["before"][path]
                 if current == after or (current == before and file_version(checkout / path) == writes["files_before"][path]):
                     continue
+                if path == REGISTRY_PATH and registry_dir is not None and current is not None:
+                    restored[path] = _replay_registry(registry_dir, before or "", current, after or "")
+                    continue
+                if path == SETTINGS_JSON and current is not None:
+                    settings_save = pending.settings_json
+                    edits = settings_save["edits"] if isinstance(settings_save, dict) else pending.received_settings_json
+                    if edits is not None:
+                        staged = apply_settings_json_edits(before or "{}\n", edits)
+                        if not has_settings_json_edits(settings_json_edits(staged, current)):
+                            restored[path] = apply_settings_json_edits(after or "{}\n", edits)
+                            continue
                 keys = saves.get(path)
                 if not keys or current != apply_accepted_values(before or "", keys):
                     raise worktree_edit(path)
@@ -767,6 +839,8 @@ def rollback_move(checkout: Path, plan: MovePlan, writes: MoveWrites) -> None:
             if path in files:
                 if current_version != files[path]:
                     raise worktree_edit(path)
+            elif path in (REGISTRY_PATH, SETTINGS_JSON) and path in plan["before"]:
+                continue
             elif current_version != version and (path not in plan["before"]
                                                  or live_text(checkout / path) != plan["before"][path]):
                 raise worktree_edit(path)
@@ -788,7 +862,7 @@ def tree_without(checkout: Path, tree: str, paths: Iterable[str], environment: d
 
 def check_move(checkout: Path, move: CheckoutMove, *,
                replace_registry: bool = False, registry_move: bool = False,
-               replay_registry: RegistryReplay = registry_rows.replay_pending) -> WaitingRows:
+               published_registry: str | None = None) -> WaitingRows:
     """Check the move on a private index before Git changes the checkout."""
     pending = read_journal(journal_path())
     index = index_path(checkout)
@@ -800,7 +874,7 @@ def check_move(checkout: Path, move: CheckoutMove, *,
         git_index.private_copy(index, trial)
         index_before = git(checkout, "write-tree", environment=environment).strip()
         staged = changed_paths(checkout, move.head, index_before, *waiting_paths(checkout))
-        plan = hold(checkout, move, pending, replace_registry=replace_registry, replay_registry=replay_registry)
+        plan = hold(checkout, move, pending, replace_registry=replace_registry, published_registry=published_registry)
         target_entries = {path: index_entry(checkout, move.tip, path) for path in plan["after"]}
         merged_entries: dict[str, str] = {}
         for path in sorted(staged & target_entries.keys()):

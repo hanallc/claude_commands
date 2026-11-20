@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import Future, ThreadPoolExecutor
-import fcntl
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import pwd
@@ -11,13 +10,12 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from threading import Event, get_ident
 import unittest
 from contextlib import contextmanager
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO, cast, final, override
+from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.lib import land_main, live_settings, main_publish, main_push_lock, models_registry, registry_rows, waiting_rows
@@ -189,57 +187,44 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         environment = {**self.environment, "CONF_DIR": str(colors.parent),
                        "XDG_STATE_HOME": str(self.root / "state"), "MODELS_CONFIG_PUBLISH": "1",
                        "TMPDIR": str(self.root)}
-        caller = get_ident()
-        attempted, blocked = Event(), Event()
-        flock, give = fcntl.flock, waiting_rows.give
-        saves: list[Future[list[int]]] = []
-
-        def observe_lock(descriptor: TextIO, operation: int) -> None:
-            if get_ident() != caller and operation == fcntl.LOCK_EX:
-                try:
-                    flock(descriptor, operation | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    blocked.set()
-                else:
-                    attempted.set()
-                    return
-                attempted.set()
-            flock(descriptor, operation)
+        give = waiting_rows.give
+        saves: list[int] = []
 
         def save() -> list[int]:
-            return [live_settings.main(["statusline", "account.claude1", value]) for value in values]
+            results: list[int] = []
+            for order, value in enumerate(values, start=1):
+                with patch.dict(os.environ, {live_settings.SAVE_ORDER_ENV: str(order)}):
+                    results.append(live_settings.main(["statusline", "account.claude1", value]))
+            return results
 
         with patch.dict(os.environ, environment, clear=True), \
                 patch.object(models_registry, "DEFAULT_PATH", registry), \
-                patch.object(fcntl, "flock", observe_lock), ThreadPoolExecutor(max_workers=1) as executor:
+                ThreadPoolExecutor(max_workers=1) as executor:
             def start_save(checkout: Path, rows: waiting_rows.WaitingRows,
                            environment: dict[str, str] | None = None) -> None:
                 if environment is None:
-                    saves.append(executor.submit(save))
-                    self.assertTrue(attempted.wait(TEST_HANG_GUARD_SECS))
-                    self.assertTrue(blocked.is_set(), "The Save acquired the lock during the move")
+                    saves.extend(executor.submit(save).result(timeout=TEST_HANG_GUARD_SECS))
                 give(checkout, rows, environment)
 
             before = registry.read_text()
             with patch.object(waiting_rows, "give", start_save):
                 _ = models_registry.store_registry(registry, before, before, "fixture")
-            self.assertEqual(len(saves), 1)
-            self.assertEqual(saves[0].result(timeout=TEST_HANG_GUARD_SECS), [0] * len(values))
+            self.assertEqual(saves, [0] * len(values))
             with waiting_rows.locked_journal(waiting_rows.journal_path()) as journal:
                 queued = [row.value for row in journal.changes]
                 queued.extend(save.value for keys in journal.accepted.values() for save in keys.values()
                               if isinstance(save, waiting_rows.AcceptedSave))
                 return colors.read_text(), queued
 
-    def test_registry_pull_and_save_share_one_lock_until_restore(self) -> None:
+    def test_mac_save_returns_during_a_registry_move(self) -> None:
         text, pending = self._save_during_registry_move("#667788", "#112233")
         self.assertEqual(text, "account.claude1=#112233\n")
         self.assertEqual(pending, ["#112233"])
 
-    def test_a_save_matching_the_registry_pull_leaves_no_receipt(self) -> None:
+    def test_a_save_matching_the_registry_pull_keeps_its_order(self) -> None:
         text, pending = self._save_during_registry_move("#445566")
         self.assertEqual(text, "account.claude1=#445566\n")
-        self.assertEqual(pending, [])
+        self.assertEqual(pending, ["#445566"])
 
     def test_registry_publication_finishes_a_failed_write_at_the_same_tip(self) -> None:
         before = "[fixture]\nmodel=old\nsecond=old\n"
@@ -316,7 +301,26 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
     def test_catalog_retry_keeps_the_newer_peer_family_after_the_downgrade_is_shared(self) -> None:
         self._publish_catalog_with_pending_family(peer_advances=True)
 
-    def test_a_deferred_registry_write_waits_for_move_restore(self) -> None:
+    def test_deferred_catalog_replay_keeps_the_newer_family(self) -> None:
+        before = "[codex.families]\ncustom=gpt-6.1-sol\n"
+        registry = self.write(self.repo / "config/models.conf", before)
+        self.seed()
+        base = self.git("rev-parse", "HEAD").stdout.strip()
+        newest = before.replace("6.1", "6.3")
+        _ = self.write(registry, newest)
+        _ = self.git("commit", "-qam", "Publish a newer family")
+        _ = self.git("push", "-q", "origin", "main")
+        _ = self.git("reset", "--hard", base)
+        older = before.replace("6.1", "6.2")
+        environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "later", "TMPDIR": str(self.root)}
+        with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry):
+            self.assertEqual(models_registry.store_registry(registry, before, older, "catalog", additive_catalog=True),
+                             older)
+            self.assertFalse(models_registry.publish_pending(registry))
+        self.assertEqual(registry.read_text(), newest)
+        self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, newest)
+
+    def test_a_deferred_registry_write_returns_during_move_preflight(self) -> None:
         before = "[fixture]\nmodel=old\nsecond=old\n"
         registry = self.write(self.repo / "config/models.conf", before)
         self.seed()
@@ -331,34 +335,15 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
         after = local.replace("model=local", "model=latest")
         environment = {**self.environment, "MODELS_CONFIG_PUBLISH": "later",
                        "XDG_STATE_HOME": str(self.root / "state"), "TMPDIR": str(self.root)}
-        attempted = Event()
-        blocked: list[bool] = []
-        flock = fcntl.flock
-
-        def observe_lock(lock: TextIO, operation: int) -> None:
-            if Path(lock.name).name == "waiting-rows.lock" and get_ident() != caller:
-                try:
-                    flock(lock, operation | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    blocked.append(True)
-                else:
-                    blocked.append(False)
-                attempted.set()
-            flock(lock, operation)
-
-        caller = get_ident()
-        with patch.dict(os.environ, environment, clear=True), patch.object(fcntl, "flock", observe_lock), \
-                ThreadPoolExecutor(max_workers=1) as executor:
+        with patch.dict(os.environ, environment, clear=True), ThreadPoolExecutor(max_workers=1) as executor:
             with waiting_rows.locked_checkout(self.repo):
                 move = waiting_rows.move_target(self.repo, target, fast_forward=True)
                 rows = waiting_rows.check_move(self.repo, move)
                 writer = executor.submit(models_registry.store_registry, registry, local, after, "deferred fixture")
-                self.assertTrue(attempted.wait(TEST_HANG_GUARD_SECS))
-                self.assertEqual(blocked, [True])
-                self.assertEqual(registry.read_text(), local)
+                self.assertEqual(writer.result(timeout=TEST_HANG_GUARD_SECS), after)
+                self.assertEqual(registry.read_text(), after)
                 waiting_rows.apply_move(self.repo, rows)
             expected = after.replace("second=old", "second=new")
-            self.assertEqual(writer.result(timeout=TEST_HANG_GUARD_SECS), expected)
         self.assertEqual(registry.read_text(), expected)
         self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), target)
 

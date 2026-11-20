@@ -7,12 +7,14 @@ from contextlib import contextmanager, redirect_stderr
 from functools import cached_property
 import fcntl
 import io
+import json
 from pathlib import Path, PurePosixPath
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from typing import final, override
 import unittest
 from unittest import mock
@@ -63,6 +65,7 @@ class PublicationRepository:
             "ZONE_SSH": str(self.ssh), "ZONE_STATE": str(root / "state"),
             "SSH_LOG": str(self.ssh_log), "OFFLINE": str(root / "OFFLINE"),
             "XDG_STATE_HOME": str(root / "xdg"), "MERGE_GATE_STATE_DIR": str(root / "land-state"),
+            "TMPDIR": str(root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "PATH": str(self.programs) + os.pathsep + os.environ.get("PATH", os.defpath),
@@ -96,6 +99,19 @@ class PublicationRepository:
         if not self.ssh_log.exists():
             return 0
         return self.ssh_log.read_text().count("git fetch -q --no-write-fetch-head")
+
+    def finish_waiter(self) -> None:
+        lock = Path(self.env["MERGE_GATE_STATE_DIR"]) / "settings-waiter.lock"
+        self.wait_for_lock(lock)
+
+    def wait_for_lock(self, path: Path) -> None:
+        code = textwrap.dedent("""
+            import fcntl, sys
+            with open(sys.argv[1], "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+        """)
+        _ = subprocess.run([sys.executable, "-c", code, str(path)], env=self.env, check=True,
+                           timeout=TEST_HANG_GUARD_SECS)
 
     def change(self, value: str = "3") -> str:
         before = self.config.read_text()
@@ -462,23 +478,25 @@ class MainPublishTests(PublicationTestCase):
             check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
-    def rejected_tune(self) -> str:
+    def rejected_tune(self) -> live_settings.WaitingChange:
         repo = self.repository
         hook = repo.origin / "hooks/pre-receive"
         _ = hook.write_text("#!/bin/sh\necho fixture-rejected >&2\nexit 1\n")
         hook.chmod(0o755)
+        head = repo.head()
         first = self.retry_tune()
         self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
         self.assertIn("not pushed", first.stderr)
         self.assertIn("amount=3 stays live", first.stderr)
-        self.assertNotEqual(repo.head(), repo.remote_tip())
+        self.assertEqual((repo.head(), repo.remote_tip()), (head, head))
         self.assertEqual(repo.mac_pulls(), 0)
         hook.unlink()
-        return repo.git(repo.checkout, "log", "-1", "--format=%B")
+        [pending] = waiting_rows.read_journal(waiting_rows.journal_path()).changes
+        return pending
 
     def test_same_value_retry_rebases_a_rejected_tune_after_another_writer_pushes(self) -> None:
         repo = self.repository
-        approval = self.rejected_tune()
+        approval = self.rejected_tune().message
         advanced = self.advance_origin(self.other_writer())
 
         repeated = self.retry_tune()
@@ -501,11 +519,12 @@ class MainPublishTests(PublicationTestCase):
 
     def test_same_value_retry_drops_a_rejected_change_already_published_by_another_writer(self) -> None:
         repo = self.repository
-        _ = self.rejected_tune()
+        pending = self.rejected_tune()
         clone = self.other_writer()
         config = clone / "config/example.conf"
         _ = config.write_text(config.read_text().replace("amount=2", "amount=3"))
-        _ = shutil.copyfile(repo.checkout / waiting_rows.ORDER_PATH, clone / waiting_rows.ORDER_PATH)
+        _ = (clone / waiting_rows.ORDER_PATH).write_text(
+            json.dumps({pending.stem: {pending.key: pending.save_order}}) + "\n")
         _ = repo.git(clone, "add", "config/example.conf", waiting_rows.ORDER_PATH)
         _ = repo.git(clone, "commit", "-qm", "approved value from another writer")
         advanced = self.advance_origin(clone)

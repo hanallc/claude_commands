@@ -20,7 +20,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import models_registry, atomic_file, registry_rows  # noqa: E402
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS  # noqa: E402
-from scripts.lib.main_push_lock_test_support import publish_after_contender
+from scripts.lib.git_test_support import git_fixture_environment
 
 AGENTS = Path(__file__).resolve().parent
 REPO = AGENTS.parents[1]
@@ -85,8 +85,11 @@ class RegistryFixture(unittest.TestCase):
         self.registry = self.root / relative_path
         self.registry.parent.mkdir(parents=True, exist_ok=True)
         _ = write_registry(self.registry, base_text=DEFAULTS)
-        self.environment = {**os.environ, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.home),
+        self.environment = {**git_fixture_environment(), **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.home),
                             "MODELS_CONFIG_FILE": str(self.registry),
+                            "CONF_DIR": str(self.registry.parent),
+                            "MERGE_GATE_STATE_DIR": str(self.root / "land-state"),
+                            "XDG_STATE_HOME": str(self.root / "publication-state"), "TMPDIR": str(self.root),
                             "MODELS_CONFIG_PUBLISH": "1" if publishing else "0",
                             "MODELS_CONFIG_TIER_ONLY": "1", "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
                             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
@@ -95,8 +98,6 @@ class RegistryFixture(unittest.TestCase):
                             "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "Registry Test",
                             "GIT_AUTHOR_EMAIL": "registry@example.invalid", "GIT_COMMITTER_NAME": "Registry Test",
                             "GIT_COMMITTER_EMAIL": "registry@example.invalid"}
-        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG", "GIT_CONFIG_COUNT"):
-            _ = self.environment.pop(key, None)
 
     def command(self, *arguments: str, cwd: Path | None = None,
                 input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -417,8 +418,20 @@ class RegistryPublishingTests(RegistryFixture):
             program = ("from scripts.lib import models_registry; "
                        "p=models_registry.registry_path(); before=p.read_text(); "
                        "models_registry.store_registry(p,before,before.replace('review=gpt-a:high','review=gpt-b:max'),'row edit')")
-            _ = publish_after_contender(self, self.checkout, self.remote, [sys.executable, "-c", program],
-                                    self.environment, cwd=self.checkout)
+            state = Path(self.environment["MERGE_GATE_STATE_DIR"])
+            state.mkdir(exist_ok=True)
+            with (state / "settings-gap.lock").open("a") as gap:
+                fcntl.flock(gap, fcntl.LOCK_EX)
+                tip = self.git("rev-parse", "HEAD")
+                result = self.command(sys.executable, "-c", program)
+                self.assert_ok(result)
+                self.assertIn("main: waits for the land that runs now", result.stderr)
+                self.assertEqual(self.value("direct.codex", "review"), "gpt-b:max")
+                self.assertEqual(self.git("rev-parse", "HEAD"), tip)
+            waiter = state / "settings-waiter.lock"
+            self.assert_ok(self.command(sys.executable, "-c",
+                           "import fcntl, sys; lock = open(sys.argv[1]); fcntl.flock(lock, fcntl.LOCK_EX)",
+                           str(waiter)))
             self.assert_published(before, expected="review=gpt-b:max")
 
     def test_identical_edit_publishes_after_interruption_following_the_atomic_write(self) -> None:

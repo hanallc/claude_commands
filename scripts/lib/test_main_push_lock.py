@@ -60,8 +60,8 @@ class MainPushLockRecordTests(unittest.TestCase):
     def test_settings_push_leaves_the_line_free_and_nonblocking_admission_returns_busy(self) -> None:
         with patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(self.checkout / "land-state")}):
             with main_push_lock.settings_push(self.checkout, wait=True) as publisher:
-                self.assertIsInstance(publisher, main_push_lock.MainPushReady)
-                path = land_queue.line_path().with_suffix(".json.lock")
+                self.assertIsInstance(publisher, land_queue.SettingsGap)
+                path = self.checkout / "land-state/land_queue.json.lock"
                 with file_lock.exclusive(path, wait=False) as line:
                     self.assertIs(line, file_lock.LockResult.ACQUIRED)
                 with main_push_lock.settings_push(self.checkout, wait=False) as timer:

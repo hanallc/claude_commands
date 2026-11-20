@@ -17,10 +17,10 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import NamedTuple, cast
+from typing import cast
 
-from scripts.lib import conf
-from scripts.production import land_queue
+from scripts.lib import conf, file_lock
+from scripts.production import land_queue, land_runs
 
 
 _HELD_LOCKS: set[str] = set()
@@ -107,37 +107,39 @@ def main_push_lock(checkout: Path, holder: str = "", *, wait: bool = True) -> Ge
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-class MainPushReady(NamedTuple):
-    """The settings publisher holds the gap and main push locks."""
-
-
-class MainPushBusy(NamedTuple):
-    """Another process holds the main push lock."""
-
-
-class CheckLandLine(NamedTuple):
-    """The publisher still needs a gap in the line."""
-
-
-CHECK_LAND_LINE = CheckLandLine()
-
-
 @contextmanager
-def settings_push(checkout: Path, *, wait: bool,
-                  gap: land_queue.SettingsGap | CheckLandLine = CHECK_LAND_LINE) -> Generator[
-                      MainPushReady | MainPushBusy | land_queue.SettingsWaiting | land_queue.SettingsGapBusy]:
-    """Get a publication gap and hold main while the caller publishes settings."""
-    with ExitStack() as locks:
-        admission = locks.enter_context(land_queue.settings_gap(wait=wait)) if isinstance(gap, CheckLandLine) else gap
-        if not isinstance(admission, land_queue.SettingsGap):
-            yield admission
-            return
+def settings_push(checkout: Path, *, wait: bool) -> Generator[land_queue.SettingsGap | land_queue.SettingsGapBusy]:
+    """Hold the gap and main push locks while no land runs."""
+    with land_queue.gap_lock(wait=wait) as gap, ExitStack() as locks:
+        if isinstance(gap, land_queue.SettingsGap) and not land_runs.running_lands():
+            try:
+                locks.enter_context(main_push_lock(checkout, wait=wait))
+            except BlockingIOError:
+                pass
+            else:
+                yield gap
+                return
+        yield land_queue.SettingsGapBusy()
+
+
+def _waiter_lock_path() -> Path:
+    directory = land_runs.state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / "settings-waiter.lock"
+
+
+def request_publication() -> str:
+    """Start one detached publisher for all pending changes."""
+    lock = file_lock.take_exclusive(_waiter_lock_path())
+    if isinstance(lock, file_lock.ExclusiveLock):
         try:
-            locks.enter_context(main_push_lock(checkout, wait=wait))
-        except BlockingIOError:
-            yield MainPushBusy()
-        else:
-            yield MainPushReady()
+            _ = subprocess.Popen([sys.executable, str(Path(__file__).with_name("live_settings.py").resolve()),
+                                  "publish-waiting", str(lock.descriptor)],
+                                 pass_fds=(lock.descriptor,), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+        finally:
+            lock.close()
+    return land_queue.SETTINGS_WAIT_NOTICE
 
 
 class LockCommand(argparse.Namespace):
