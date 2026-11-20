@@ -1996,6 +1996,19 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.session("bogus", "bogus")
         return send.send(local_options(["--to", "bogus", "--from", "test", *args]))
 
+    def test_disabled_review_sends_without_reading_damaged_hold_state(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=off")
+        self.session("recipient", "Recipient")
+        review_hold.set_count("recipient", 2, send.now().timestamp(), self.fail,
+            record_keys=send.record_released_acceptances)
+        state = self.root / ".local/state/adhoc_review/.holds/recipient.json"
+        damaged = "{invalid JSON"
+        _ = state.write_text(damaged, encoding="utf-8")
+        result = send.send(local_options(["--to", "session:recipient", "--from", "test", "--text", "New update."]))
+        self.assertEqual(result.outcome, "sent", result.detail)
+        self.assertEqual([message.text for message in self.relayed], ["New update."])
+        self.assertEqual(state.read_text(encoding="utf-8"), damaged)
+
     def test_review_hold_keeps_the_send_and_its_repeat_window(self) -> None:
         _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
         self.session("recipient", "Recipient")

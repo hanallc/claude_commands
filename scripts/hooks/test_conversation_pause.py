@@ -470,14 +470,18 @@ class ConversationPauseTests(ConversationPauseFixture):
             assert isinstance(delivery, review_hold.ReleasedMessages)
             self.assertEqual(delivery.messages, ())
 
-    def test_disabled_review_delivers_saved_messages_at_the_next_user_prompt(self) -> None:
-        self.open_review()
-        held = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Saved update."), now=101))
-        self.assertEqual(held["decision"], "block")
-        self.write_review_config("off")
-        reply = self.parsed_reply(self.run_prompt("Continue the review.", now=102))
-        self.assertIn("Saved update.", str(reply["hookSpecificOutput"]))
-        self.assertEqual(self.end_review(103), [])
+    def test_disabled_review_delivers_saved_messages_at_the_next_prompt(self) -> None:
+        for prompt in (cross_session("Review peer", "New update."),
+                       cross_session("stall-watch", "Report the current status."),
+                       IDLE_NOTICE, "Continue the review."):
+            with self.subTest(prompt=prompt):
+                self.open_review()
+                held = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Saved update."), now=101))
+                self.assertEqual(held["decision"], "block")
+                self.write_review_config("off")
+                reply = self.parsed_reply(self.run_prompt(prompt, now=102))
+                self.assertIn("Saved update.", str(reply["hookSpecificOutput"]))
+                self.assertEqual(self.end_review(103), [])
 
     def test_count_set_while_disabled_preserves_items_without_opening_a_hold(self) -> None:
         self.write_review_config("off")
