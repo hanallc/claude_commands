@@ -91,13 +91,14 @@ runpy.run_path(str(uploaded), run_name='__main__')
 
 
 LOCAL_MAC_SSH = """\
-import os, shlex, subprocess, sys
+import os, shlex, signal, subprocess, sys
 command = shlex.split(sys.argv[-1])
 environment = {
     # Keep the fixture PATH when the NixOS startup file runs.
     **os.environ, '__ETC_ZSHENV_SOURCED': '1',
     'ZDOTDIR': os.environ['FAKE_QUEUE_STATE'],
 }
+signal.signal(signal.SIGINT, signal.SIG_DFL)
 raise SystemExit(subprocess.run(command, env=environment, start_new_session=True).returncode)
 """
 
@@ -152,9 +153,10 @@ else:
 """
 
 CALL_ROUTE = """\
-import os, sys
+import os, signal, sys
 from pathlib import Path
 
+signal.signal(signal.SIGINT, signal.SIG_DFL)
 sys.path.insert(0, os.environ['MAC_GATE_FIXTURE_ROOT'])
 from scripts.mac_test import mac_gate
 from scripts.production.merge_gate import SuiteMode
