@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -23,7 +24,7 @@ from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssign
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.herdr import herdr, turn_end, worker_panes
 from scripts.herdr.test_worker_panes import live_detached_run
-from scripts.lib import unit_runs
+from scripts.lib import conf, unit_runs
 from scripts.lint import style_review
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_models_registry import write_registry
@@ -98,7 +99,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
               if after_pass_start else ()),
             *(("    progress_history.begin_dispatch(run, **fields, launcher_command=['another-launcher'])",)
               if replace_pass else ()),
-            "    print('The worker command failed at launch.', file=sys.stderr)",
+            "    print(os.environ.get('FIXTURE_WORKER_DIAGNOSTIC', 'The worker command failed at launch.'), file=sys.stderr)",
             f"    raise SystemExit({code})",
             f"os.execv({assign.PYTHON!r}, [{assign.PYTHON!r}, *arguments])",
         )) + "\n")
@@ -286,12 +287,59 @@ class FailedLaunchRunTests(HookAssignmentFixture):
         self.assertEqual((other / state.name).read_bytes(), before)
 
     def test_a_herdr_exit_that_keeps_a_worker_keeps_the_run(self) -> None:
-        self.commit_project()
-        calls = self.failing_worker(7)
-        self.assert_run_active(self.launch(), 7)
-        command = cast(list[str], json.loads(calls.read_text()))
-        self.assertEqual(command[1], "assign")
-        self.assertEqual(self.native.fixture.world.launches, [])
+        for name, code, diagnostic in (
+            ("worker kept", worker.ExitCode.KEPT, ""),
+            ("helper exit before startup", worker.ExitCode.REFUSED, "compaction helper did not start: exit 1 before startup."),
+            ("uncertain with worker lock held", worker.ExitCode.UNCERTAIN, "compaction helper submission is uncertain."),
+        ):
+            with self.subTest(name=name):
+                case = FailedLaunchRunTests("runTest")
+                case.setUp()
+                try:
+                    case.commit_project()
+                    message = f"{diagnostic} Log {case.session_dir / 'compact-fixture.log'}" if diagnostic else ""
+                    with patch.dict(os.environ, {"FIXTURE_WORKER_DIAGNOSTIC": message} if message else {}):
+                        if code is worker.ExitCode.UNCERTAIN:
+                            row = case.native.fixture.worker("impl", family="codex")
+                            calls = case.failing_worker(code, after_pass_start=True)
+                            result = case.launch_with_held_worker_lock(row.id)
+                            passed = worker_panes.worker_pass(row, case.session_dir)
+                            case.assertEqual(passed["status"], "active")
+                            case.assertEqual((case.session_dir / "phases/7/impl_status").read_text(), "running\n")
+                            case.assertEqual([event for event in case.events() if event["event_type"] == "pass_finished"], [])
+                        else:
+                            calls = case.failing_worker(code)
+                            result = case.launch()
+                    case.assert_run_active(result, code)
+                    command = cast(list[str], json.loads(calls.read_text()))
+                    case.assertEqual(command[1], "assign")
+                    case.assertEqual(case.native.fixture.world.launches, [])
+                    if message:
+                        case.assertIn(message, result.stderr.splitlines())
+                        case.assertIn(message, (case.session_dir / "phases/7/impl_agent.log").read_text())
+                finally:
+                    case.doCleanups()
+
+    def launch_with_held_worker_lock(self, identity: staff.StaffId) -> subprocess.CompletedProcess[str]:
+        timeout = conf.read("direct").number("WORKER_SETTLE_SECONDS")
+        source = """import select, sys
+from scripts.herdr.worker_panes import worker_id_lock
+from scripts.production.staff import StaffId
+with worker_id_lock(StaffId(sys.argv[1])):
+    print("locked", flush=True)
+    select.select([sys.stdin], [], [], float(sys.argv[2]))
+"""
+        with subprocess.Popen([assign.PYTHON, "-c", source, str(identity), str(timeout)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as holder:
+            assert holder.stdin is not None and holder.stdout is not None
+            try:
+                self.assertTrue(select.select([holder.stdout], [], [], timeout)[0], "The child must acquire the worker lock.")
+                self.assertEqual(holder.stdout.readline(), "locked\n")
+                result = self.launch()
+                self.assertIsNone(holder.poll(), "The launcher must return before the child releases the lock.")
+                return result
+            finally:
+                holder.stdin.close()
 
     def test_a_refusal_before_the_worker_command_keeps_the_run(self) -> None:
         calls = self.failing_worker()
@@ -1305,7 +1353,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         failed = self.launch()
         self.assertEqual(failed.returncode, worker.ExitCode.UNCERTAIN, failed.stdout + failed.stderr)
         status = self.session_dir / "phases/7/impl_status"
-        self.assertEqual(status.read_text(), "error\n")
+        self.assertEqual(status.read_text(), "running\n")
         passed = worker_panes.worker_pass(opened.row, self.session_dir)
         self.assertEqual(passed["status"], "active")
         self.native.agent.error = ""

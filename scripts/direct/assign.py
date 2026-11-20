@@ -24,6 +24,7 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from tempfile import TemporaryFile
 from typing import Literal, NoReturn, cast, final, overload
 
 from scripts.astra import astra_roles
@@ -582,15 +583,22 @@ def _execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
               f"role={role}; status in {status}"], env)
     _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
               "header", slot, role], env, check=False)
-    with log.open("a") as output:
+    with log.open("a") as output, TemporaryFile(mode="w+t") as diagnostics:
         offset = output.tell()
-        result = subprocess.run(command, env=worker_env, text=True, stdout=output, stderr=subprocess.STDOUT,
+        result = subprocess.run(command, env=worker_env, text=True, stdout=output, stderr=diagnostics,
                                 pass_fds=(prompt_lock,))
+        _ = diagnostics.seek(0)
+        errors = diagnostics.read()
+        _ = output.write(errors)
     with log.open() as output:
         _ = output.seek(offset)
         for line in output:
             if line.rstrip().endswith(staff_worker.COMPACTION_STARTED_TEXT):
                 print(line, end="")
+    if result.returncode and errors:
+        print(errors, end="", file=sys.stderr)
+    if result.returncode == staff_worker.ExitCode.UNCERTAIN:
+        return result.returncode
     outcome = progress_history.AssignmentLaunchExit.SUBMITTED
     if result.returncode:
         outcome = (progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS if result.returncode in (1, 2)

@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import selectors
 import threading
 import time
 from pathlib import Path
@@ -583,13 +584,50 @@ def _compaction_retry_pending(run: Path, selection: progress_history.DispatchSel
             and bool(passed.completion_id) and _compaction_pending(run, passed.completion_id))
 
 
+def _pending_compaction_result(run: Path, selection: progress_history.DispatchSelection) -> DispatchSubmission | ExitCode:
+    try:
+        if progress_history.pending_dispatch_confirmed(run, selection):
+            return DispatchSubmission.SUBMITTED
+    except progress_history.DispatchSelectionChanged as error:
+        return _selection_changed(error)
+    print("compaction helper submission is uncertain; the completion lock is held", file=sys.stderr)
+    return ExitCode.UNCERTAIN
+
+
+class CompactionStartupUncertain(Exception):
+    """The launcher could not confirm whether the helper started."""
+
+
 def _spawn_compaction(command: list[str], lock: file_lock.ExclusiveLock, log: Path) -> None:
-    """Pass the held lock to the child at spawn."""
-    with log.open("ab") as output:
-        child = subprocess.Popen([*command, "--lock-fd", str(lock.descriptor)],
-                                 pass_fds=(lock.descriptor,), start_new_session=True,
-                                 stdin=subprocess.DEVNULL, stdout=output, stderr=output)
-    threading.Thread(target=child.wait, daemon=True).start()
+    """Pass the lock to the helper and confirm that it reached its handler."""
+    timeout = conf.read("direct").number("WORKER_SETTLE_SECONDS")
+    with ExitStack() as pipe:
+        reader, writer = os.pipe()
+        _ = pipe.callback(os.close, reader)
+        try:
+            with log.open("ab") as output:
+                child = subprocess.Popen([*command, "--lock-fd", str(lock.descriptor), "--started-fd", str(writer)],
+                                         pass_fds=(lock.descriptor, writer), start_new_session=True,
+                                         stdin=subprocess.DEVNULL, stdout=output, stderr=output)
+        finally:
+            os.close(writer)
+        deadline = time.monotonic() + timeout
+        try:
+            with selectors.DefaultSelector() as ready:
+                _ = ready.register(reader, selectors.EVENT_READ)
+                if not ready.select(max(0, deadline - time.monotonic())):
+                    raise CompactionStartupUncertain(f"compaction helper startup timed out. Log {log}")
+                if os.read(reader, 1):
+                    return
+            status = child.wait(timeout=max(0, deadline - time.monotonic()))
+            if status == 0:
+                raise CompactionStartupUncertain(f"compaction helper exited without a startup byte. Log {log}")
+            raise herdr_types.HerdrFailure(f"exit {status} before startup")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise CompactionStartupUncertain(f"compaction helper startup is uncertain. Log {log}. {error}") from error
+        finally:
+            if child.returncode is None:
+                threading.Thread(target=child.wait, daemon=True).start()
 
 
 def finish_dispatch_command(parent: StaffId, identity: StaffId, run: Path, instance: str, completion_id: str) -> list[str]:
@@ -599,16 +637,17 @@ def finish_dispatch_command(parent: StaffId, identity: StaffId, run: Path, insta
             "--completion-id", completion_id]
 
 
-def _detach_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: str, completion_id: str) -> None:
-    command = finish_dispatch_command(parent, row.id, run, instance, completion_id)
+def _detach_dispatch(parent: StaffId, identity: StaffId, run: Path, slot: str, instance: str, completion_id: str) -> None:
+    command = finish_dispatch_command(parent, identity, run, instance, completion_id)
+    log = run / f"compact-{instance}.log"
     lock = file_lock.take_exclusive(_compaction_lock(run, completion_id))
     if lock is file_lock.LockResult.BUSY:
-        return
+        raise CompactionStartupUncertain(f"compaction helper submission is uncertain; the completion lock is held. Log {log}")
     try:
-        _spawn_compaction(command, lock, run / f"compact-{instance}.log")
-    except OSError as error:
-        progress_history.complete_dispatch(run, row.name, instance, status="error")
-        raise herdr_types.HerdrFailure(f"compaction helper did not start: {error}") from error
+        _spawn_compaction(command, lock, log)
+    except (OSError, conf.Unusable, herdr_types.HerdrFailure) as error:
+        progress_history.fail_dispatch_start(run, slot, instance)
+        raise herdr_types.HerdrFailure(f"compaction helper did not start: {error}. Log {log}") from error
     finally:
         lock.close()
 
@@ -786,15 +825,14 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             delivery = progress_history.dispatch_delivery(passed)
             same_pass = passed.get("instance_id") == matched.instance_id
             retired = recovered is CompletionRecovery.RECOVERED and staff.snapshot().by_id(row.id) is None
-            pending = _compaction_retry_pending(session_dir, selection)
+            if _compaction_retry_pending(session_dir, selection):
+                return _pending_compaction_result(session_dir, selection)
             completed = same_pass and passed.get("status") == "completed"
-            if retired or completed or pending:
+            if retired or completed:
                 try:
                     progress_history.validate_dispatch_selection(session_dir, selection)
                 except progress_history.DispatchSelectionChanged as error:
                     return _selection_changed(error)
-                if pending:
-                    return DispatchSubmission.SUBMITTED
                 if recovered is CompletionRecovery.RECOVERED:
                     return DispatchSubmission.SUBMITTED
                 receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
@@ -863,15 +901,21 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
 
         def defer_compaction() -> None:
             nonlocal deferred
-            _detach_dispatch(parent, started.row, session_dir, instance, saved.completion_id)
+            _detach_dispatch(parent, started.row.id, session_dir, slot, instance, saved.completion_id)
             deferred = True
             print(f"{started.row.name}: {COMPACTION_STARTED_TEXT}")
 
         before_input = partial(availability.check, record=record, hold=hold,
                                retry=RetryingAssignment(session_dir.resolve(), instance))
-        result = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id,
-                               run=session_dir, instance_id=instance, on_submission=submitted, defer_compaction=defer_compaction,
-                               before_input=before_input)
+        try:
+            result = dispatch_turn(parent, started, _client(), saved.line, saved.completion_id,
+                                   run=session_dir, instance_id=instance, on_submission=submitted, defer_compaction=defer_compaction,
+                                   before_input=before_input)
+        except CompactionStartupUncertain as error:
+            # The helper can still deliver the prompt after this launcher returns.
+            submitted()
+            print(f"{started.row.name}: {error}", file=sys.stderr)
+            return ExitCode.UNCERTAIN
         if result is DispatchSubmission.SUBMITTED:
             submitted()
         elif result is ExitCode.BUSY:
@@ -1050,8 +1094,16 @@ class CompactionLockAtUse(Enum):
 
 
 def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str, completion_id: str, *,
-                    lock: file_lock.ExclusiveLock | CompactionLockAtUse = CompactionLockAtUse.ACQUIRE) -> int:
+                    lock: file_lock.ExclusiveLock | CompactionLockAtUse = CompactionLockAtUse.ACQUIRE,
+                    started_fd: int = -1) -> int:
     """Hold the compaction lock until the detached dispatch ends."""
+    if started_fd >= 0:
+        try:
+            # The launcher can close its pipe after the startup deadline.
+            with suppress(BrokenPipeError):
+                _ = os.write(started_fd, b"1")
+        finally:
+            os.close(started_fd)
     with ExitStack() as notices, ExitStack() as completion_lock:
         if isinstance(lock, CompactionLockAtUse):
             _ = completion_lock.enter_context(file_lock.exclusive(_compaction_lock(run, completion_id)))
@@ -1067,6 +1119,11 @@ def _finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: st
     diagnostics = io.StringIO()
     result: DispatchSubmission | ExitCode = ExitCode.UNCERTAIN
     submission_unproved = False
+
+    def prompt_input_possible() -> None:
+        nonlocal submission_unproved
+        submission_unproved = True
+
     try:
         with suppress(OSError, ValueError):
             _ = recorder_state.read_state(run / recorder_state.STATE_FILENAME)
@@ -1097,8 +1154,10 @@ def _finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: st
                 before_input = partial(availability.check, record=record, hold=hold,
                                        retry=RetryingAssignment(run.resolve(), instance))
                 result = dispatch_turn(parent, current, _client(), delivery.line, completion_id, run=run,
-                                       instance_id=instance, before_input=before_input)
+                                       instance_id=instance, before_input=before_input,
+                                       on_submission=prompt_input_possible)
                 if result is DispatchSubmission.SUBMITTED:
+                    prompt_input_possible()
                     _accept_dispatch(parent, row, run, instance, completion_id)
                     return result
         detail = diagnostics.getvalue().strip() or f"dispatch failed with exit {int(result)}"
@@ -1107,7 +1166,7 @@ def _finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: st
             _ = notices.callback(_dispatch_failure_step, identity, "notice",
                 partial(_dispatch_notice, parent, identity, run, instance, passed, "busy", detail))
             return result
-        submission_unproved = result is ExitCode.UNCERTAIN
+        submission_unproved = submission_unproved or result is ExitCode.UNCERTAIN
     except recorder_state.OldRecorderState as error:
         print(str(error), file=sys.stderr)
         return ExitCode.UNCERTAIN
@@ -1130,8 +1189,9 @@ def _finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: st
         if row is None:
             _dispatch_notice(parent, identity, run, instance, passed, "error", detail)
         else:
-            notify = cast(Callable[[str], None], import_module("scripts.herdr.turn_end").run_finished)
-            notify(str(row.current_session))
+            notify = cast(Callable[[StaffId], detached_runs.CompletionReplay],
+                          import_module("scripts.herdr.turn_end").run_finished)
+            _ = notify(row.id)
 
     row = staff.snapshot().by_id(identity)
     with worker_panes.worker_id_lock(identity, blocking=True):
@@ -1354,11 +1414,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                 prompt=prompt.resolve(), launcher_command=launcher_command,
                 work=progress_history.DispatchWork(kind, lens, fix_pass), target=chosen)
             if isinstance(pending, progress_history.DispatchSelection) and _compaction_retry_pending(session_dir, pending):
-                try:
-                    progress_history.validate_dispatch_selection(session_dir, pending)
-                except progress_history.DispatchSelectionChanged as error:
-                    return _selection_changed(error)
-                return DispatchSubmission.SUBMITTED
+                return _pending_compaction_result(session_dir, pending)
             print(hold.blocker, file=sys.stderr)
             return ExitCode.BUSY
         record = staff.snapshot()
@@ -2166,6 +2222,7 @@ class Arguments(argparse.Namespace):
     dispatch_id: str = ""
     completion_id: str = ""
     lock_fd: int = -1
+    started_fd: int = -1
     worker_id: str = ""
     fix_cause: str = ""
     fix_pass: int = 0
@@ -2219,6 +2276,7 @@ def main(arguments: list[str] | None = None) -> int:
     for flag in ("parent", "worker-id", "session-dir", "dispatch-id", "completion-id"):
         _ = finishing.add_argument("--" + flag, required=True)
     _ = finishing.add_argument("--lock-fd", type=int, default=-1)
+    _ = finishing.add_argument("--started-fd", type=int, default=-1)
     args = parser.parse_args(arguments, namespace=Arguments())
     if args.command in ("add", "assign") and quota_state.no_worker_mode():
         print(f"worker.py: {quota_state.NO_WORKER_START}", file=sys.stderr)
@@ -2227,7 +2285,7 @@ def main(arguments: list[str] | None = None) -> int:
         if args.command == "finish-dispatch":
             return finish_dispatch(StaffId(args.parent), StaffId(args.worker_id), Path(args.session_dir),
                                    args.dispatch_id, args.completion_id, lock=file_lock.ExclusiveLock(args.lock_fd)
-                                   if args.lock_fd >= 0 else CompactionLockAtUse.ACQUIRE)
+                                   if args.lock_fd >= 0 else CompactionLockAtUse.ACQUIRE, started_fd=args.started_fd)
         if args.command == "list" and args.all_parents:
             record = staff.local_snapshot()
             return _print_workers(list_all_workers(record, selection=args.selection, as_json=args.json), args.json, record)

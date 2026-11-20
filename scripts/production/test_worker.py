@@ -8,7 +8,9 @@ import json
 import math
 import os
 import re
+import select
 import shlex
+import signal
 from pathlib import Path
 from datetime import datetime, timezone
 import subprocess
@@ -23,7 +25,7 @@ from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdo
 from typing import Literal, TextIO, cast, final, override
 import unittest
 from unittest.mock import ANY, Mock, call, patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.agents import pane_record
@@ -37,7 +39,7 @@ from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production import fake_unit_host, staff, worker, worker_admission
 from scripts.production.staff_test_support import fixture_member, fixture_session, record_fixture_claude_start, fixture_runtime_id, fixture_worker
-from scripts.lib import atomic_file, file_lock, unit_runs
+from scripts.lib import atomic_file, conf, file_lock, unit_runs
 from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.transcripts import open_transcript
@@ -48,6 +50,93 @@ from scripts.message import send, sessions
 from scripts.usage import agents_log
 
 from scripts.herdr import herdr
+
+
+def run_compaction_helper_fixture() -> int:
+    """Run the helper CLI with a private pane transport and notice sink."""
+    case, worker_pane, worker_terminal, transcript, notices, done, *arguments = sys.argv[1:]
+    source = Path(transcript)
+    run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+    class HelperPane(herdr.Herdr):
+        @override
+        def composer(self, pane: str) -> herdr.NoComposer:
+            assert pane == worker_pane
+            return herdr.NoComposer()
+
+        @override
+        def wait_turn_end(self, pane: str, timeout_ms: int) -> herdr.WaitTimedOut:
+            assert pane == worker_pane and timeout_ms >= 0
+            return herdr.WaitTimedOut()
+
+    def observe(parent: staff.StaffId, row: staff.StaffRow, record: staff.StaffSnapshot) -> worker_panes.OpenWorker:
+        assert row.reports_to(parent) and record.by_id(row.id) == row
+        return worker_panes.OpenWorker(row, worker_pane, worker_terminal, herdr.AgentStatus.IDLE)
+
+    def close_pane(parent: staff.StaffId, name: staff.WorkerName, *,
+                   lock: worker_panes.WorkerLockHold) -> worker_panes.Closed:
+        row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
+        assert row is not None and lock.owns(row)
+        return worker_panes.Closed()
+
+    def check_target(target: str, *, action: str, place: herdr.HerdrPlace, terminal: str,
+                     **options: object) -> bool:
+        del options
+        row = staff.snapshot().by_current_session(target)
+        return (row is not None and row.kind == "worker" and action == "keys"
+                and place.pane == worker_pane and terminal == worker_terminal)
+
+    def record_prompt(line: str) -> None:
+        with source.open("a") as stream:
+            _ = stream.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "user_message", "message": line}}) + "\n")
+
+    def pane_transport(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        if command[0] != os.environ["HERDR_BIN"]:
+            return run_process(command, **options)
+        assert case != "receipt with failed confirmation", command
+        assert command[3:6] == ["agent", "prompt", worker_pane], command
+        line = command[6]
+        if line == "/compact":
+            if case == "failure before input":
+                raise OSError("fixture compaction failed")
+            with source.open("a") as stream:
+                _ = stream.write('{"type":"compacted"}\n')
+            return subprocess.CompletedProcess(command, 0, "{}", "")
+        record_prompt(line)
+        raise OSError("fixture lost the prompt response")
+
+    def refuse_confirmation(run: Path, instance_id: str, completion_id: str) -> None:
+        assert run == Path(arguments[arguments.index("--session-dir") + 1])
+        assert instance_id == arguments[arguments.index("--dispatch-id") + 1]
+        assert completion_id == arguments[arguments.index("--completion-id") + 1]
+        raise OSError("fixture could not save confirmation")
+
+    def notify(options: send.Options, *, membership: staff.StaffSnapshot) -> send.Result:
+        assert membership.rows
+        with Path(notices).open("a") as stream:
+            _ = stream.write(json.dumps(send.body_text(options)) + "\n")
+        return send.Result("sent", "private director")
+
+    with (ExitStack() as faults, patch.object(worker_panes, "observe_worker", new=observe),
+          patch.object(worker_panes, "close", new=close_pane),
+          patch.object(herdr, "check_target", new=check_target),
+          patch.object(herdr, "Herdr", new=HelperPane),
+          patch.object(subprocess, "run", new=pane_transport),
+          patch.object(send, "_send", new=notify)):
+        if case == "receipt with failed confirmation":
+            run = Path(arguments[arguments.index("--session-dir") + 1])
+            record = staff.snapshot()
+            row = record.by_id(staff.StaffId(arguments[arguments.index("--worker-id") + 1]))
+            assert row is not None
+            delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, run, record=record))
+            assert delivery.line
+            record_prompt(delivery.line)
+            _ = faults.enter_context(patch.object(progress_history, "confirm_assignment_submission", new=refuse_confirmation))
+        code = worker.main(arguments)
+    with Path(done).open("w") as stream:
+        _ = stream.write(f"{int(code)}\n")
+    return code
 
 
 @final
@@ -1296,7 +1385,9 @@ class WorkerCommandTests(unittest.TestCase):
             def sleep(self, seconds: float) -> None:
                 self.seconds += seconds
 
-        for outcome in ("new worker", "compacted", "timeout with proof", "no proof", "timeout", "no receipt", "first staff read",
+        for outcome in ("new worker", "old helper arguments", "helper import failure", "exit zero without a byte",
+                        "missing startup deadline", "failure before input", "failure after input",
+                        "receipt with failed confirmation", "compacted", "timeout with proof", "no proof", "timeout", "no receipt", "first staff read",
                         "hook write",
                         "reply write", "notice failure", "attached", "admission waits for dispatch",
                         "live detached run", "busy twice", "confirmed before notice", "replaced before notice",
@@ -1313,6 +1404,26 @@ class WorkerCommandTests(unittest.TestCase):
                     _ = stream.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
                         "last_token_usage": {"input_tokens": 43000 if outcome == "attached" else 43001,
                                              "cached_input_tokens": 0, "output_tokens": 0}}}}) + "\n")
+                if outcome == "missing startup deadline":
+                    config = self.fixture.root / "conf/direct.conf"
+                    original = config.read_text()
+                    atomic_file.write_text_atomic(config, original.replace("WORKER_SETTLE_SECONDS=30\n", ""))
+                    before = len(self.agent.submitted)
+                    try:
+                        code, output, errors = self.command("assign", "impl", str(self.prompt), "--name", current.row.name,
+                            "--slot", current.row.name, "--phase", "8", "--kind", "impl", "--session-dir", str(self.run_dir))
+                    finally:
+                        atomic_file.write_text_atomic(config, original)
+                    self.assertEqual(code, worker.ExitCode.REFUSED)
+                    self.assertNotIn("submitted", output)
+                    self.assertIn("WORKER_SETTLE_SECONDS", errors)
+                    self.assertEqual(worker_panes.worker_pass(current.row, self.run_dir)["status"], "error")
+                    self.assertEqual(len(self.agent.submitted), before)
+                    continue
+                if outcome in ("old helper arguments", "helper import failure", "exit zero without a byte",
+                               "failure before input", "failure after input", "receipt with failed confirmation"):
+                    self.check_compaction_helper_process(outcome, current, source)
+                    continue
                 self.agent.compact_proof = "absent"
                 self.agent.compact_inputs[current.pane] = ""
                 self.agent.defer_prompt_transcript = outcome == "no receipt"
@@ -1593,6 +1704,94 @@ class WorkerCommandTests(unittest.TestCase):
                     self.assertEqual(len(self.agent.submitted), before)
                 self.assertEqual(self.agent.compact_inputs[current.pane], "")
 
+    def check_compaction_helper_process(self, outcome: str, current: worker_panes.OpenWorker, source: Path) -> None:
+        row = current.row
+        notices = self.run_dir / f"{row.name}-notices.jsonl"
+        _ = notices.write_text("")
+        done = self.run_dir / f"{row.name}-exit"
+        os.mkfifo(done)
+        spawn = cast(Callable[[list[str], file_lock.ExclusiveLock, Path], None], getattr(worker, "_spawn_compaction"))
+        before = len(self.agent.submitted)
+        startup_failure = outcome in ("old helper arguments", "helper import failure")
+
+        def start(command: list[str], lock: file_lock.ExclusiveLock, log: Path) -> None:
+            if outcome == "old helper arguments":
+                index = command.index("--completion-id")
+                command = command[:index] + command[index + 2:]
+            elif outcome == "helper import failure":
+                command = [command[0], "-c", "raise ImportError('fixture helper import failed')"]
+            elif outcome == "exit zero without a byte":
+                command = [command[0], "-c", "raise SystemExit(0)"]
+            else:
+                fixture = ("import sys; sys.path.insert(0, sys.argv.pop(1)); "
+                           + "from scripts.production.test_worker import run_compaction_helper_fixture; "
+                           + "raise SystemExit(run_compaction_helper_fixture())")
+                command = [command[0], "-c", fixture, str(Path(command[1]).parents[2]), outcome, current.pane, current.terminal,
+                           str(source), str(notices), str(done), *command[2:]]
+            spawn(command, lock, log)
+
+        descriptor = os.open(done, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            with patch.object(worker, "_spawn_compaction", new=start):
+                code, output, errors = self.command("assign", "impl", str(self.prompt), "--name", row.name,
+                    "--slot", row.name, "--phase", "8", "--kind", "impl", "--session-dir", str(self.run_dir),
+                    "--launcher-command", json.dumps(["assign.sh", "--to", row.name]))
+            passed = worker_panes.worker_pass(row, self.run_dir)
+            instance = str(passed["instance_id"])
+            log = self.run_dir / f"compact-{instance}.log"
+            if startup_failure:
+                self.assertEqual(code, worker.ExitCode.REFUSED)
+                self.assertNotIn("submitted", output)
+                self.assertIn(str(log), errors)
+                expected = "exit 2" if outcome == "old helper arguments" else "exit 1"
+                self.assertIn(expected, errors)
+                self.assertIn("required: --completion-id" if outcome == "old helper arguments"
+                              else "fixture helper import failed", log.read_text())
+            elif outcome == "exit zero without a byte":
+                self.assertEqual(code, worker.ExitCode.UNCERTAIN)
+                self.assertNotIn("submitted", output)
+                self.assertIn(f"compaction helper exited without a startup byte. Log {log}", errors)
+            else:
+                self.assertEqual(code, worker.ExitCode.OK, errors)
+                self.assertIn("submitted\n", output)
+                guard = LauncherHangGuard(f"{outcome}: {log}")
+                self.assertTrue(select.select([descriptor], [], [], guard.remaining())[0], log.read_text())
+                helper_exit = int(os.read(descriptor, 16))
+                self.assertEqual(helper_exit, worker.ExitCode.REFUSED if outcome == "failure before input"
+                                 else worker.ExitCode.UNCERTAIN, log.read_text())
+        finally:
+            os.close(descriptor)
+
+        passed = worker_panes.worker_pass(row, self.run_dir)
+        delivery = progress_history.dispatch_delivery(passed)
+        receipt = worker.dispatch_receipt(row, delivery.line, delivery.completion_id, run=self.run_dir)
+        delivered = [cast(str, json.loads(line)) for line in notices.read_text().splitlines()]
+        self.assertEqual(len(self.agent.submitted), before)
+        self.assertNotIn("confirmed_delivery_ids", passed)
+        with file_lock.exclusive(self.run_dir / f"compact-{delivery.completion_id}.lock", wait=False) as lock:
+            self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+        if outcome in ("receipt with failed confirmation", "failure after input"):
+            self.assertEqual(passed["status"], "active")
+            self.assertIsInstance(receipt, worker.DispatchSubmitted)
+            notice, = delivered
+            self.assertIn(f"uncertain; pass {instance}", notice)
+            self.assertIn("fixture could not save confirmation" if outcome == "receipt with failed confirmation"
+                          else "fixture lost the prompt response", notice)
+        elif outcome == "exit zero without a byte":
+            self.assertEqual(passed["status"], "active")
+            self.assertIsInstance(receipt, worker.DispatchNotSubmitted)
+            self.assertEqual(delivered, [])
+        else:
+            self.assertEqual(passed["status"], "error")
+            self.assertIsInstance(receipt, worker.DispatchNotSubmitted)
+            if startup_failure:
+                self.assertEqual(delivered, [])
+            else:
+                notice, = delivered
+                self.assertIn(f"{row.name}: phase 8: error;", notice)
+                self.assertIn(f"; pass {instance}", notice)
+                self.assertIn("fixture compaction failed", notice)
+
     def check_new_worker_before_pass(self) -> None:
         name = staff.WorkerName.parse("fresh-dispatch")
         before = len(self.agent.submitted)
@@ -1684,6 +1883,12 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertEqual(passed["confirmed_delivery_ids"], [saved.get("pane_dispatch_id")])
 
     def test_assignment_retry_uses_the_pending_compaction(self) -> None:
+        with self.subTest(outcome="helper lock held"):
+            self.check_pending_compaction_retry()
+        with self.subTest(outcome="retry proves startup failure"):
+            self.check_retry_closes_compaction_startup_failure()
+
+    def check_pending_compaction_retry(self) -> None:
         opened = self.opened()
         row = opened.row
         backend = staff.backend(row)
@@ -1702,10 +1907,31 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(code, 0, errors)
                 self.assertIn(worker.COMPACTION_STARTED_TEXT, output)
                 passed = worker_panes.worker_pass(row, self.run_dir)
-                self.assertEqual(self.command(*command), (0, "submitted\n", ""))
-                with worker_panes.worker_lock(self.fixture.parent.id, staff.WorkerName.parse(row.name)) as hold:
-                    self.assertIsInstance(hold, worker_panes.WorkerLockHold)
-                    self.assertEqual(self.command(*command), (0, "submitted\n", ""))
+                for worker_locked, recorder_locked in ((False, False), (True, False), (False, True), (True, True)):
+                    with self.subTest(worker_locked=worker_locked, recorder_locked=recorder_locked), ExitStack() as retry:
+                        if worker_locked:
+                            hold = retry.enter_context(worker_panes.worker_lock(self.fixture.parent.id,
+                                staff.WorkerName.parse(row.name)))
+                            self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+                        if recorder_locked:
+                            lock = retry.enter_context(file_lock.exclusive(self.run_dir / ".progress_history.lock"))
+                            self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+                            timeout = conf.read("direct").number("WORKER_SETTLE_SECONDS")
+
+                            def retry_assignment() -> int:
+                                code, output, errors = self.command(*command)
+                                print(output, end="")
+                                print(errors, end="", file=sys.stderr)
+                                return code
+
+                            with ForkChildren() as children:
+                                result = children.start(retry_assignment).result(timeout=timeout)
+                            code, output, errors = result.returncode, result.stdout, result.stderr
+                        else:
+                            code, output, errors = self.command(*command)
+                        self.assertEqual(code, worker.ExitCode.UNCERTAIN)
+                        self.assertNotIn("submitted", output)
+                        self.assertIn("compaction helper submission is uncertain", errors)
                 self.assertEqual(worker_panes.worker_pass(row, self.run_dir), passed)
                 spawn.assert_called_once()
             self.assertEqual(self.agent.submitted, [])
@@ -1718,25 +1944,83 @@ class WorkerCommandTests(unittest.TestCase):
         current = worker_panes.worker_pass(row, self.run_dir)
         self.assertEqual(current["confirmed_delivery_ids"], [delivery.completion_id])
 
+    def check_retry_closes_compaction_startup_failure(self) -> None:
+        row = self.opened("impl2").row
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.CodexBackend)
+        command = ("assign", "impl", str(self.prompt), "--name", row.name, "--slot", row.name,
+                   "--phase", "8", "--kind", "assign", "--session-dir", str(self.run_dir),
+                   "--launcher-command", json.dumps(["assign.sh", "--to", row.name]))
+        status = self.run_dir / f"{row.name}_status"
+        retry_status = self.run_dir / "retry_status"
+        atomic_file.write_text_atomic(status, "running\n")
+        atomic_file.write_text_atomic(retry_status, "running\n")
+        proposed = str(uuid4())
+        first = str(uuid4())
+        spawn = cast(Callable[[list[str], file_lock.ExclusiveLock, Path], None], getattr(worker, "_spawn_compaction"))
+
+        def start_without_byte(helper: list[str], lock: file_lock.ExclusiveLock, log: Path) -> None:
+            spawn([helper[0], "-c", f"raise SystemExit({int(retrying)})"], lock, log)
+
+        submitted = len(self.agent.submitted)
+        retrying = False
+        with (patch.object(worker, "_spawn_compaction", new=start_without_byte),
+              patch.object(worker, "_compaction_plan", return_value=worker.CompactionRequired(backend, 0))):
+            with patch.dict(os.environ, {progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}):
+                code, output, errors = self.command(*command, "--new-pass-instance-id", first)
+            self.assertEqual(code, worker.ExitCode.UNCERTAIN, errors)
+            self.assertNotIn("submitted", output)
+            passed = worker_panes.worker_pass(row, self.run_dir)
+            self.assertEqual((passed["instance_id"], passed["status"]), (first, "active"))
+            self.assertEqual(status.read_text(), "running\n")
+
+            retrying = True
+            with patch.dict(os.environ, {progress_history.ASSIGN_STATUS_FILE_ENV: str(retry_status)}):
+                code, output, errors = self.command(*command, "--new-pass-instance-id", proposed)
+            self.assertEqual(code, worker.ExitCode.REFUSED, errors)
+            self.assertNotIn("submitted", output)
+            self.assertIn(f"exit 1 before startup. Log {self.run_dir / f'compact-{first}.log'}", errors)
+        passed = worker_panes.worker_pass(row, self.run_dir)
+        self.assertEqual((passed["instance_id"], passed["status"]), (first, "error"))
+        self.assertEqual(status.read_text(), "error\n")
+        self.assertEqual(retry_status.read_text(), "running\n")
+        self.assertEqual(len(self.agent.submitted), submitted)
+
+        following = self.run_dir / "next-prompt.md"
+        atomic_file.write_text_atomic(following, "Check the next change.\n")
+        code, output, errors = self.command(*command[:2], str(following), *command[3:])
+        self.assertEqual(code, worker.ExitCode.OK, errors)
+        self.assertIn("submitted", output)
+        self.assertEqual(len(self.agent.submitted), submitted + 1)
+
     def test_launcher_death_after_spawn_keeps_the_compaction_lock(self) -> None:
-        opened = self.opened()
+        for timing in ("before the byte", "after the byte"):
+            with self.subTest(launcher_death=timing):
+                self.check_launcher_death_during_compaction(timing == "after the byte")
+
+    def check_launcher_death_during_compaction(self, acknowledged: bool) -> None:
+        opened = self.opened("impl-after-byte" if acknowledged else "impl-before-byte")
         backend = staff.backend(opened.row)
         assert isinstance(backend, staff.CodexBackend)
         name = opened.row.name
         command = ("assign", "impl", str(self.prompt), "--name", name, "--slot", name,
                    "--phase", "8", "--kind", "assign", "--session-dir", str(self.run_dir),
                    "--launcher-command", json.dumps(["assign.sh", "--to", name]))
-        gate = self.run_dir / "helper-gate"
+        gate = self.run_dir / f"{name}-helper-gate"
         os.mkfifo(gate)
         descriptor = os.open(gate, os.O_RDWR)
-        spawn = worker._spawn_compaction  # pyright: ignore[reportPrivateUsage]
+        spawn = cast(Callable[[list[str], file_lock.ExclusiveLock, Path], None], getattr(worker, "_spawn_compaction"))
+        timeout = conf.read("direct").number("WORKER_SETTLE_SECONDS")
 
         def crash_after_spawn(_command: list[str], lock: file_lock.ExclusiveLock, log: Path) -> None:
-            # The helper stops before it enters worker.py.
+            startup = ("os.write(started, b'1'); os.close(started); " if acknowledged
+                       else "assert os.getppid() == int(sys.argv[3]); os.kill(int(sys.argv[3]), signal.SIGKILL); ")
             child = [
-                sys.executable, "-c",
-                "import os, select, sys; fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK); "
-                + "select.select([fd], [], [], 10)", str(gate),
+                sys.executable, "-c", "import os, select, signal, sys; "
+                + "fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK); "
+                + "started = int(sys.argv[sys.argv.index('--started-fd') + 1]); " + startup
+                + "select.select([fd], [], [], float(sys.argv[2]))",
+                str(gate), str(timeout), str(os.getpid()),
             ]
             spawn(child, lock, log)
             os._exit(91)
@@ -1750,12 +2034,16 @@ class WorkerCommandTests(unittest.TestCase):
         try:
             with ForkChildren() as children:
                 crashed = children.start(launch)
-                result = crashed.result()
-                self.assertEqual(result.returncode, 91, result.stderr)
+                result = crashed.result(timeout=timeout)
+                self.assertEqual(result.returncode, 91 if acknowledged else -signal.SIGKILL, result.stderr)
                 with patch.object(worker, "_spawn_compaction") as duplicate:
-                    self.assertEqual(self.command(*command), (0, "submitted\n", ""))
+                    code, output, errors = self.command(*command)
+                    self.assertEqual(code, worker.ExitCode.UNCERTAIN)
+                    self.assertNotIn("submitted", output)
+                    self.assertIn("compaction helper submission is uncertain", errors)
                 duplicate.assert_not_called()
                 passed = worker_panes.worker_pass(opened.row, self.run_dir)
+                self.assertEqual(passed["status"], "active")
                 self.assertNotIn("confirmed_delivery_ids", passed)
                 self.assertEqual(self.agent.submitted, [])
         finally:
@@ -1831,8 +2119,9 @@ class WorkerCommandTests(unittest.TestCase):
             code = worker.finish_dispatch(parent, opened.row.id, self.run_dir, instance, second_id)
 
         dispatch.assert_called_once_with(parent, opened, self.fixture.world, second.line, second_id,
-                                         run=self.run_dir, before_input=ANY)
+                                         run=self.run_dir, instance_id=instance, before_input=ANY, on_submission=ANY)
         self.assertTrue(callable(cast(object, dispatch.call_args.kwargs["before_input"])))
+        self.assertTrue(callable(cast(object, dispatch.call_args.kwargs["on_submission"])))
         self.assertEqual(code, worker.ExitCode.REFUSED)
         passed = worker_panes.worker_pass(opened.row, self.run_dir)
         self.assertEqual(passed["status"], "error")
@@ -1841,7 +2130,7 @@ class WorkerCommandTests(unittest.TestCase):
         assert isinstance(completion, progress_history.HookCompletion)
         self.assertEqual(completion.outcome, "error")
         self.assertIn("dispatch failed", Path(completion.reply_file).read_text())
-        completion_notice.assert_called_once_with(str(opened.row.current_session))
+        completion_notice.assert_called_once_with(opened.row.id)
 
     def test_detached_stage_one_failure_keeps_stage_two_pending_after_a_staff_read_failure(self) -> None:
         opened = self.opened("review", "review")
