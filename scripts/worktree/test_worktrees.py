@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -18,32 +20,15 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
-
-from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
-
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
-from scripts.lib import build_folders, cargo_seed, conf, git_files, scratch
-from scripts.lint.memory_test_support import config_environment
+from scripts.lib import build_folders, cargo_seed, conf, copy_record, git_files, git_test_support, scratch
+from scripts.worktree import worktrees
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 MAKE_WORKTREE = CHECKOUT / "scripts/worktree/make_worktree.sh"
 WORKTREES = CHECKOUT / "scripts/worktree/worktrees.py"
-
-END_LANDED = """
-import json
-from pathlib import Path
-import sys
-from scripts.worktree.worktrees import Ended, end_landed
-
-results = end_landed(Path(sys.argv[1]), sys.argv[2])
-print("RESULT=" + json.dumps([
-    {"kind": type(result).__name__, "path": str(result.path),
-     "detail": result.branch if isinstance(result, Ended) else result.reason}
-    for result in results
-]))
-"""
 
 
 class MadeWorktree(TypedDict):
@@ -80,53 +65,96 @@ class WorktreeLifecycleTests(unittest.TestCase):
     trees: Path = Path()
     state: Path = Path()
     environment: dict[str, str] = {}
+    seed: Path = Path()
+    command_environment: dict[str, str] = {}
     base: str = ""
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="worktree-seed-")))
+        cls.seed = root / "seed"
+        cls.seed.mkdir()
+        git_environment = git_test_support.fixture_git_environment(root)
+        cls.command_environment = {
+            "PATH": git_environment.get("PATH", os.defpath),
+            "GIT_CONFIG_NOSYSTEM": git_environment["GIT_CONFIG_NOSYSTEM"],
+            "GIT_CONFIG_GLOBAL": git_environment["GIT_CONFIG_GLOBAL"],
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ALLOW_PROTOCOL": "file",
+            "GIT_AUTHOR_NAME": "Worktree fixture",
+            "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_NAME": "Worktree fixture",
+            "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+            **interpreter_cache_environment(root / "cache"),
+        }
+        _ = subprocess.run(["git", "init", "--initial-branch=main"], cwd=cls.seed,
+                           env=cls.command_environment, check=True, capture_output=True, timeout=20)
+        _ = (cls.seed / "code.txt").write_text("base\n")
+        document = cls.seed / "docs/production.md"
+        document.parent.mkdir()
+        _ = document.write_text("# Fixture production\n")
+        _ = (cls.seed / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
+        cls.base = git_test_support.commit_repository(cls.seed, "Create the fixture", env=cls.command_environment)
+        _ = subprocess.run(["git", "branch", "integration"], cwd=cls.seed,
+                           env=cls.command_environment, check=True, capture_output=True, timeout=20)
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="worktree-lifecycle-")))
         self.home = self.root / "home"
         self.home.mkdir()
-        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/worktree", "config")
         self.origin = self.root / "origin.git"
         self.repository = self.root / "clone"
         self.merge_tree = self.root / "integration"
         self.trees = self.root / "trees"
         self.trees.mkdir()
         self.state = self.root / "worktrees-state"
-        config = self.root / "staff.conf"
+        settings = self.root / "settings"
+        settings.mkdir()
+        config = settings / "staff.conf"
         _ = config.write_text("# range: 0.001..\nOPERATION_LOCK_SECONDS=5\n"
                               + "# range: 0.001..\nREMOTE_SECONDS=5\n")
+        _ = (settings / "build_folders.conf").write_text(f"""\
+roots.slot_cargo={self.root / "unmanaged-cargo"}
+# range: 0.001..60
+locks.probe_wait_seconds=0.001
+# range: 0.001..1
+locks.probe_retry_seconds=0.001
+# whole: 0..1
+seed.enabled=0
+""")
+        copies = settings / "copies.conf"
+        _ = copies.write_text("git_timeout_seconds=20\n")
+        _ = (settings / "scratch.conf").write_text("""\
+# whole: 0..
+repo_depth=3
+repo_skip=target node_modules .git
+""")
+        _ = (settings / "lint.conf").write_text("# whole: 1..\nsweep_max_tree_depth=3\n")
         staff_file = self.root / "staff.json"
         self.environment = {
-            **config_environment(self.root / "settings"),
-            "HOME": str(self.home), "PATH": os.environ.get("PATH", os.defpath),
+            **self.command_environment,
+            "HOME": str(self.home), "TMPDIR": str(self.root),
             "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+            "CONF_DIR": str(settings), "COPIES_CONFIG": str(copies),
+            copy_record.ROOT_ENV: str(self.root / "scratch"),
+            copy_record.COPIES_ENV: str(self.root / "copies"),
+            scratch.VISIBLE_ROOT_ENV: str(self.root / "visible-scratch"),
+            scratch.HOLDS_ENV: str(self.root / "holds.json"),
             "WORKTREES_STATE_DIR": str(self.state),
             "STAFF_CONFIG": str(config), "STAFF_FILE": str(staff_file),
             "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
             "CODEX_HOME": str(self.root / "codex"),
-            **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT / "scripts/lib/python_startup"),
+            "PYTHONPATH": str(CHECKOUT / "scripts/lib/python_startup"),
             "HERDR_BIN": "/nonexistent/herdr",
-            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",
-            "GIT_AUTHOR_NAME": "Worktree fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
-            "GIT_COMMITTER_NAME": "Worktree fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
         }
-        _ = self.git(self.root, "init", "--bare", "--initial-branch=main", str(self.origin))
-        _ = self.git(self.root, "clone", str(self.origin), str(self.repository))
-        _ = (self.repository / "code.txt").write_text("base\n")
-        document = self.repository / "docs/production.md"
-        document.parent.mkdir()
-        _ = document.write_text("# Fixture production\n")
-        _ = (self.repository / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
-        _ = self.git(self.repository, "add", ".")
-        _ = self.git(self.repository, "commit", "-m", "Create the fixture")
-        self.base = self.git(self.repository, "rev-parse", "HEAD")
-        _ = self.git(self.repository, "push", "-u", "origin", "main")
-        _ = self.git(self.repository, "remote", "set-head", "origin", "main")
-        _ = self.git(self.repository, "worktree", "add", str(self.merge_tree), "-b", "integration")
-        _ = self.git(self.merge_tree, "push", "-u", "origin", "integration")
+        # The clone must fetch new origin objects before it can read them.
+        _ = self.git(self.root, "clone", "--bare", "--shared", str(self.seed), str(self.origin))
+        _ = self.git(self.root, "clone", "--shared", str(self.seed), str(self.repository))
+        _ = self.git(self.repository, "remote", "set-url", "origin", str(self.origin))
+        _ = self.git(self.repository, "worktree", "add", "--track", "-b", "integration",
+                     str(self.merge_tree), "origin/integration")
         _ = self.git(self.repository, "checkout", "-b", "unit-home")
         machine = socket.gethostname().split(".", 1)[0]
         runner_id, unit_id = str(uuid4()), str(uuid4())
@@ -150,21 +178,25 @@ class WorktreeLifecycleTests(unittest.TestCase):
         return result.stdout.strip()
 
     def finish_landed(self) -> list[EndResult]:
-        python = self.home / ".claude/scripts/lib/py"
-        result = self.command(self.repository, [str(python), "-c", END_LANDED,
-                                               str(self.repository), "integration"])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        payload = next(line.removeprefix("RESULT=") for line in result.stdout.splitlines()
-                       if line.startswith("RESULT="))
-        return cast(list[EndResult], json.loads(payload))
+        with patch.dict(os.environ, self.environment, clear=True), chdir(self.repository):
+            results = worktrees.end_landed(self.repository, "integration")
+        return [{"kind": type(result).__name__, "path": str(result.path),
+                 "detail": result.branch if isinstance(result, worktrees.Ended) else result.reason}
+                for result in results]
 
     def cleanup_result(self, tree: Path) -> subprocess.CompletedProcess[str]:
-        python = self.home / ".claude/scripts/lib/py"
-        return self.command(self.repository, [str(python), str(WORKTREES), "cleanup", str(tree)])
+        return self.command(self.repository, [sys.executable, str(WORKTREES), "cleanup", str(tree)])
 
-    def make(self, tree: Path, branch: str) -> None:
-        result = self.command(self.repository, ["bash", str(MAKE_WORKTREE), str(tree), branch])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    def make(self, tree: Path, branch: str, *, through_shell: bool = False) -> None:
+        if through_shell:
+            result = self.command(self.repository, ["bash", str(MAKE_WORKTREE), str(tree), branch])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return
+        arguments = [str(WORKTREES), "make", str(tree), branch]
+        with (patch.dict(os.environ, self.environment, clear=True), chdir(self.repository),
+              patch.object(sys, "argv", arguments), io.StringIO() as output,
+              redirect_stdout(output), redirect_stderr(output)):
+            self.assertEqual(worktrees.main(), 0, output.getvalue())
 
     def commit(self, tree: Path, path: str, contents: str) -> str:
         destination = tree / path
@@ -228,7 +260,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     self.assertEqual(blocked_state.read_text(), "retain this file\n")
                 else:
                     before = datetime.now(UTC)
-                    self.make(tree, branch)
+                    self.make(tree, branch, through_shell=True)
                     after = datetime.now(UTC)
                     record = self.record(tree)
                     self.assertEqual({key: value for key, value in record.items() if key != "made_at"}, {
@@ -240,7 +272,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     self.assertLessEqual(made_at, after)
                     self.assertEqual((tree / "code.txt").read_text(), "base\n")
                     self.assertEqual(self.git(tree, "branch", "--show-current"), branch)
-                    self.assertEqual(build_folders.build_folder_state(tree), "free")
+                    with patch.dict(os.environ, self.environment, clear=True):
+                        self.assertEqual(build_folders.build_folder_state(tree), "free")
                     lease = cast(dict[str, object], json.loads(tree.with_name(tree.name + ".lease.json").read_text()))
                     self.assertEqual(lease["purpose"], tree.name)
 
@@ -390,8 +423,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         override = limits.cargo_root / "override"
         git_dir = git_files.at(tree).git_dir
         before = set(git_dir.iterdir())
-        helper = self.home / ".claude/scripts/lib"
-        result = self.command(tree, [str(helper / "py"), str(helper / "cargo_seed.py"), "cargo", "+stable",
+        helper = CHECKOUT / "scripts/lib/cargo_seed.py"
+        result = self.command(tree, [sys.executable, str(helper), "cargo", "+stable",
                                      "check", "--config", "build.build-dir=" + json.dumps(str(override))])
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertFalse(override.exists())
@@ -593,7 +626,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                     lease = tree.with_name(tree.name + ".lease.json")
                     lock = tree.with_name(tree.name + ".lock")
                     retained_lease = lease.read_bytes()
-                    holder = subprocess.Popen([str(self.home / ".claude/scripts/lib/py"), "-c",
+                    holder = subprocess.Popen([sys.executable, "-I", "-c",
                         "import fcntl, sys\n"
                         + "with open(sys.argv[1], 'r+') as lock:\n"
                         + "    fcntl.flock(lock, fcntl.LOCK_EX)\n"
