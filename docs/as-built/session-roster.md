@@ -213,7 +213,7 @@ The two flags together cause a usage error.
 `send.py` reads one `staff.snapshot()` for each session send. `resolve_staff_recipient` selects each staff recipient.
 A typed name first matches an exact canonical staff path or short name. Unit names use the staff name.
 A `<name>-unit` target finds the unit `<name>` when no staff row or live session has that exact name.
-The `<name>-unit` form uses `copies.unit_owner` and matches only rows of kind `unit`.
+The `<name>-unit` form uses `copy_record.unit_owner` and matches only rows of kind `unit`.
 In a `/` path, only the last part uses the form, and the earlier parts must match the parent chain.
 
 A `RecipientLookupFailed` route or a missing recipient name calls `failed_lookup.report`.

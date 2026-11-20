@@ -36,7 +36,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 
-from scripts.lint import memory_admit as gate, sweep_state, tmp_sweep
+from scripts.lint import memory_admit as gate, sweep_state
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib import conf
@@ -1365,7 +1365,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         (self.worktree / "target").mkdir(parents=True)
         self.state = self.root / "sweep-state"
         self.state.mkdir()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(self.state)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {sweep_state.STATE_ENV: str(self.state)})))
         (self.root / "admission").mkdir()
         with closing(sqlite3.connect(file_marks.index_path_in(self.root))) as db, db:
             _ = db.execute("CREATE TABLE steps(host TEXT, repo TEXT, step TEXT, started_at TEXT, "
@@ -1701,7 +1701,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         _ = (other / "target-deletes.json").write_text(json.dumps({
             str(self.worktree / "target"): (NOW - timedelta(seconds=30)).timestamp(),
         }))
-        with patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(other)}):
+        with patch.dict(os.environ, {sweep_state.STATE_ENV: str(other)}):
             self.assertFalse(self.fresh())
         self.assertTrue(self.fresh())
         with patch.object(sweep_state, "state_dir", return_value=other) as authority:

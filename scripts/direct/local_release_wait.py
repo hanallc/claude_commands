@@ -9,13 +9,7 @@ except FileNotFoundError:
 import sys
 import time
 
-from scripts.direct.release_events import (
-    IntervalReleasePolling as IntervalReleasePolling,
-    LocalReleaseEvents as LocalReleaseEvents,
-    RELEASE_CHANGES as RELEASE_CHANGES,
-    episode_is_assigned as episode_is_assigned,
-    local_release_waiter as local_release_waiter,
-)
+from scripts.direct.release_events import episode_is_assigned, local_release_waiter
 
 
 def wait_for_local_release(seconds: float, call_id: str, episode: str = "",

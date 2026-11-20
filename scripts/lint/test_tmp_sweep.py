@@ -25,7 +25,7 @@ from functools import cached_property
 from typing import TextIO, cast, override
 from unittest import mock
 
-from scripts.lint import tmp_sweep
+from scripts.lint import sweep_state, tmp_sweep
 from scripts.mac_test import nextest_log
 from scripts.direct import recorder_state
 from scripts.copies.copies_test_support import copies_environment
@@ -137,7 +137,7 @@ class TmpSweepCase(unittest.TestCase):
         ]
         self.addCleanup(pane_patches.clear)
         self.now = time.time() + 2 * DAY
-        _ = self.enterContext(mock.patch.object(tmp_sweep, "state_dir", return_value=self.state))
+        _ = self.enterContext(mock.patch.object(sweep_state, "state_dir", return_value=self.state))
         # A private default root exposes callers that fail to set their session roots.
         default_session = write(base / "default-session" / ENDED_SESSION / "file").parents[1]
         _ = self.enterContext(mock.patch.object(tmp_sweep, "SESSION_TEMP_ROOT", str(default_session)))

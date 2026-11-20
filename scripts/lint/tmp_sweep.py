@@ -117,10 +117,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.agents import remote
 from scripts.mac_test import nextest_log
-from scripts.lint.sweep_state import (
-    DEFAULT_STATE_DIR as DEFAULT_STATE_DIR, STATE_ENV as STATE_ENV,
-    TARGET_DELETES_NAME as TARGET_DELETES_NAME, state_dir as state_dir,
-)
+from scripts.lint import sweep_state
 from scripts.direct import phase_reservation, recorder_state
 
 if TYPE_CHECKING:
@@ -1485,7 +1482,7 @@ def apply_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str, *,
             print(f"tmp sweep: deleted {path} ({removed['gib']:.1f} GiB), last changed {removed['last_change']}")
     for failure in result.failed:
         print(f"tmp sweep: could not delete {failure['path']}: {failure['error']}", file=sys.stderr)
-    append_log(state_dir() / LOG_NAME, record(result, False, now, lint_settings=lint_settings), now,
+    append_log(sweep_state.state_dir() / LOG_NAME, record(result, False, now, lint_settings=lint_settings), now,
                lint_settings=lint_settings)
     return 1 if result.failed else 0
 
@@ -1659,7 +1656,7 @@ def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, pro
         print(f"tmp sweep: removed {result.dataclass_code_removed} dataclass code entries")
     print(summary(result, dry_run))
     if not dry_run:
-        append_log(state_dir() / LOG_NAME, record(result, dry_run, moment, lint_settings=lint_settings), moment,
+        append_log(sweep_state.state_dir() / LOG_NAME, record(result, dry_run, moment, lint_settings=lint_settings), moment,
                    lint_settings=lint_settings)
     return 1 if result.failed else 0
 
@@ -1689,7 +1686,7 @@ def run_if_due(dry_run: bool, now: float | None = None, *,
 ) -> SweepAssessment:
     """Assess only a due sweep. Move the stamp before the attempt."""
     moment = time.time() if now is None else now
-    stamp = state_dir() / STAMP_NAME
+    stamp = sweep_state.state_dir() / STAMP_NAME
     try:
         if stamp.stat().st_mtime > moment - RUN_INTERVAL_SECONDS:
             return SkippedSweepAssessment()

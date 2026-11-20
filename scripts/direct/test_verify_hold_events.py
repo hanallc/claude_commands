@@ -45,7 +45,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
 
     def test_local_admission_waits_for_release_notifications_instead_of_sleeping(self) -> None:
         from scripts.build_targets import build_targets
-        from scripts.direct.local_release_wait import LocalReleaseEvents
+        from scripts.direct.release_events import LocalReleaseEvents
 
         self.hold()
         def grant_on_notification(_seconds: float) -> None:
@@ -163,7 +163,7 @@ class PlacementWaitModeTests(unittest.TestCase):
 
 class ReleaseDeadlineTests(unittest.TestCase):
     def test_wait_returns_by_its_deadline_when_irrelevant_events_never_stop(self) -> None:
-        from scripts.direct.local_release_wait import LocalReleaseEvents
+        from scripts.direct.release_events import LocalReleaseEvents
 
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "watched"

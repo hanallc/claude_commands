@@ -323,8 +323,8 @@ Stable session folders retain their short paths and mode `0700`.
 The session hook defines the session temporary root.
 The admission fixture uses `short_socket_directory(prefix)` for its separate short socket parent.
 The service keeps `admission/state.json` and `admission/queue.json` outside temporary build folders.
-`step_estimator.is_fresh_test()` and the disk sweep read `tmp_sweep.state_dir()` at use.
-`tmp_sweep.TARGET_DELETES_NAME` defines the shared deletion record name.
+`step_estimator.is_fresh_test()` and the disk sweep read `sweep_state.state_dir()` when they need the state directory.
+`sweep_state.TARGET_DELETES_NAME` defines the shared deletion record name.
 
 ### Machine side (`/etc/nixos`, natedev only)
 

@@ -30,7 +30,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 
-from scripts.lint import sweep, tmp_sweep
+from scripts.lint import sweep, sweep_state, tmp_sweep
 from scripts.lib import cargo_target_config
 from scripts.lib import file_lock
 from scripts.message import send_budget, session_send
@@ -265,7 +265,7 @@ class SweepCase(unittest.TestCase):
         state = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **{key: value for key, value in copies_environment(state).items() if key != "HOME"},
-            tmp_sweep.STATE_ENV: str(state / "sweep"),
+            sweep_state.STATE_ENV: str(state / "sweep"),
             "BUILDLOG_DIR": str(state / "buildlog"),
             copy_record.ROOT_ENV: str(state / "scratch"),
         })))
@@ -689,7 +689,7 @@ class RebuildTests(SweepCase):
         _ = path.write_text("".join(json.dumps(record) + "\n" for record in self.records))
         before = {item.relative_to(root): (item.read_bytes(), item.stat().st_mtime_ns)
                   for item in root.rglob("*") if item.is_file()}
-        state = Path(os.environ[tmp_sweep.STATE_ENV])
+        state = Path(os.environ[sweep_state.STATE_ENV])
         state_before = {item.relative_to(state): (item.read_bytes(), item.stat().st_mtime_ns)
                         for item in state.rglob("*") if item.is_file()}
         output = io.StringIO()
@@ -3500,7 +3500,7 @@ class FloorTests(SweepCase):
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, {
             **{key: value for key, value in copies_environment(base).items() if key != "HOME"},
-            tmp_sweep.STATE_ENV: str(base),
+            sweep_state.STATE_ENV: str(base),
             "BUILDLOG_DIR": str(base / "buildlog"),
             "BUILD_HOLD_DIR": str(base / "build-hold"),
         }))
@@ -3559,7 +3559,7 @@ class FloorTests(SweepCase):
         _ = write_config_fixture(conf.path("lint"),
                                  f"sweep_floor_roots={base}\n")
         with (self.free_space(free, scanned),
-              mock.patch.object(tmp_sweep, "state_dir", return_value=base), redirect_stdout(output)):
+              mock.patch.object(sweep_state, "state_dir", return_value=base), redirect_stdout(output)):
             status = sweep.hold_floor(floor, dry_run, policy=policy)
         return status, output.getvalue()
 
@@ -3570,7 +3570,7 @@ class FloorTests(SweepCase):
 
     def prior(self, free: int, caches: int, age: int = 60, alert_at: float | None = None,
               push_at: float | None = None) -> None:
-        roots = fixture_target_dirs([os.environ[tmp_sweep.STATE_ENV]], lint_settings=conf.read("lint"))
+        roots = fixture_target_dirs([os.environ[sweep_state.STATE_ENV]], lint_settings=conf.read("lint"))
         roots.extend(path for path in conf.read("lint").words("sweep_ci_targets") if os.path.isdir(path))
         sizes = {path: sweep.directory_blocks(path) for path in roots}
         if sizes:
@@ -6977,7 +6977,7 @@ raise SystemExit(int(os.environ[variable]))
         base = self.base()
         for name in ("first state", "second state"):
             state = base / name
-            with mock.patch.dict(os.environ, {tmp_sweep.STATE_ENV: str(state)}), \
+            with mock.patch.dict(os.environ, {sweep_state.STATE_ENV: str(state)}), \
                  mock.patch.object(sweep, "recover_pending_trims"), \
                  mock.patch.object(sweep, "free_bytes", return_value=0), \
                  mock.patch.object(sweep, "try_lock", return_value=None) as acquire, \
@@ -6985,7 +6985,7 @@ raise SystemExit(int(os.environ[variable]))
                 self.assertEqual(sweep.hold_floor(GIB, False), 0)
                 acquire.assert_called_once_with(str(state / "floor.lock"))
                 self.assertEqual(sweep.floor_record_path(), state / "floor.json")
-                self.assertEqual(sweep.target_deletes_path(), state / tmp_sweep.TARGET_DELETES_NAME)
+                self.assertEqual(sweep.target_deletes_path(), state / sweep_state.TARGET_DELETES_NAME)
                 self.assertTrue(state.is_dir())
 
     def test_own_deletes_do_not_hold_a_target_but_a_later_build_write_does(self) -> None:
@@ -7554,7 +7554,7 @@ class HolderSessionTests(unittest.TestCase):
             300: process_table.Process(300, 100, "cargo", "cargo build"),
         }
         with (mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(holders),
-                                          tmp_sweep.STATE_ENV: str(base / "state")}),
+                                          sweep_state.STATE_ENV: str(base / "state")}),
               mock.patch.object(sessions, "live_sessions", return_value=[record]),
               mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(sweep, "PROC_DIR", str(proc))):
@@ -7627,7 +7627,7 @@ class BudgetTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         state = self.enterContext(tempfile.TemporaryDirectory())
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {tmp_sweep.STATE_ENV: state})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {sweep_state.STATE_ENV: state})))
 
     def config(self) -> str:
         path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "lint.conf"

@@ -34,7 +34,6 @@ from uuid import UUID
 
 
 from scripts.lib import build_folders, build_slots, conf, copy_record, file_lock, git_index, git_rescue, scratch
-from scripts.lib.copy_record import unit_owner as unit_owner
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
     SelectedRepository as SelectedRepository,
@@ -52,7 +51,6 @@ from scripts.lib.process_failure import failure_detail
 from scripts.message import process_table, sessions
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import floor_claims
-from scripts.mac_test.floor_claims import inherited_mirror_descriptors as inherited_mirror_descriptors
 if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
     from scripts.production import staff

@@ -229,7 +229,7 @@ Acquire and materialize the slot inside the systemd command unit.
 Do not acquire its process lock before `systemd-run` and assume the service manager inherits that descriptor.
 Keep the `LeasedSource` context open through shell preparation, Cargo, recording, and result capture.
 Pass the held maker descriptors to source, shell-preparation, and Cargo subprocesses through `pass_fds`.
-Reuse `copies.inherited_mirror_descriptors` at its existing boundary; do not pretend it already includes maker slot locks.
+Use `floor_claims.inherited_mirror_descriptors` for mirror leases. Read maker slot locks separately.
 Extend that handoff with the actual `build_folder_lock_fd` values.
 A child that outlives its wrapper must retain the lease until that child ends.
 

@@ -38,6 +38,7 @@ from scripts.mac_test import claim_state, eligibility
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.lib import build_folders, process_start as process_identity
 from scripts.direct import step_record
+from scripts.direct.release_events import LocalReleaseEvents, episode_is_assigned, local_release_waiter
 from scripts.build_queue import placement, admission_protocol as wire
 
 
@@ -596,7 +597,6 @@ class Watch:
 
     def run(self, wakeup: Wakeup) -> WatchReport:
         from scripts.buildlog import store
-        from scripts.direct.local_release_wait import LocalReleaseEvents, episode_is_assigned, local_release_waiter
 
         tick = min(1.0, self.poll_s)
         state_file = store.root() / "admission/state.json"

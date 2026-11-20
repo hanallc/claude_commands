@@ -15,6 +15,7 @@ from dataclasses import replace
 from unittest import mock
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_queue.test_placement import local_candidate, placement_request
+from scripts.direct import release_events
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -27,7 +28,7 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
         call_id = "already-released"
         with mock.patch.dict(os.environ, self.environment), self.hold_environment():
             self.release_local_hold()
-            with mock.patch.object(local_release_wait.LocalReleaseEvents, "wait",
+            with mock.patch.object(release_events.LocalReleaseEvents, "wait",
                                    side_effect=AssertionError("an admitted call must not wait for another event")):
                 local_release_wait.wait_for_local_release(3600, call_id)
         self.assert_no_pending_calls(cycle)
@@ -57,14 +58,14 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
                 with mock.patch.dict(os.environ, self.environment):
                     if timing == "before-arm":
                         assign()
-                        with mock.patch.object(local_release_wait.LocalReleaseEvents, "wait",
+                        with mock.patch.object(release_events.LocalReleaseEvents, "wait",
                                 side_effect=AssertionError("an existing assignment must wake before waiting")):
                             local_release_wait.wait_for_local_release(3600, call_id, request.episode,
                                                                      wait_for_assignment=True)
                     else:
                         waiting = threading.Event()
                         failures: list[BaseException] = []
-                        real_wait = local_release_wait.LocalReleaseEvents.wait
+                        real_wait = release_events.LocalReleaseEvents.wait
 
                         def publish_assignment() -> None:
                             try:
@@ -74,14 +75,14 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
                             except BaseException as error:
                                 failures.append(error)
 
-                        def observe_wait(waiter: local_release_wait.LocalReleaseEvents, seconds: float) -> None:
+                        def observe_wait(waiter: release_events.LocalReleaseEvents, seconds: float) -> None:
                             waiting.set()
                             real_wait(waiter, seconds)
 
                         publisher = threading.Thread(target=publish_assignment)
                         publisher.start()
                         try:
-                            with mock.patch.object(local_release_wait.LocalReleaseEvents, "wait", autospec=True,
+                            with mock.patch.object(release_events.LocalReleaseEvents, "wait", autospec=True,
                                                    side_effect=observe_wait):
                                 local_release_wait.wait_for_local_release(3600, call_id, request.episode,
                                                                          wait_for_assignment=True)
@@ -121,7 +122,7 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
             wait_calls: list[float] = []
             replay_failures: list[BaseException] = []
             new_attempts: list[str] = []
-            replay_real_wait = local_release_wait.LocalReleaseEvents.wait
+            replay_real_wait = release_events.LocalReleaseEvents.wait
 
             def replace_consumed() -> None:
                 try:
@@ -143,7 +144,7 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
                 except BaseException as error:
                     replay_failures.append(error)
 
-            def observe_consumed_wait(waiter: local_release_wait.LocalReleaseEvents, seconds: float) -> None:
+            def observe_consumed_wait(waiter: release_events.LocalReleaseEvents, seconds: float) -> None:
                 wait_calls.append(seconds)
                 replay_waiting.set()
                 replay_real_wait(waiter, seconds)
@@ -152,7 +153,7 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
             publisher.start()
             try:
                 with mock.patch.dict(os.environ, self.environment), \
-                     mock.patch.object(local_release_wait.LocalReleaseEvents, "wait", autospec=True,
+                     mock.patch.object(release_events.LocalReleaseEvents, "wait", autospec=True,
                                        side_effect=observe_consumed_wait):
                     local_release_wait.wait_for_local_release(3600, call_id, request.episode, wait_for_assignment=True)
             finally:

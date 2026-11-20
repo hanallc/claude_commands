@@ -198,6 +198,7 @@ from scripts.lib.cargo_target_config import (
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_start import ProcessStart, Started, process_start
 from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.lint import sweep_state
 if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
     from scripts.copies import copies
@@ -367,9 +368,7 @@ def on_floor_filesystem(path: str) -> bool:
 
 
 def cargo_output_cache_path() -> Path:
-    from scripts.lint import tmp_sweep
-
-    return tmp_sweep.state_dir() / "cargo-output-roots.json"
+    return sweep_state.state_dir() / "cargo-output-roots.json"
 
 
 def _cargo_mapping_rows(rows: object) -> tuple[CargoOutputRoots, ...]:
@@ -3034,11 +3033,9 @@ def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | No
 
 
 def floor_record_path() -> Path:
-    from scripts.lint import tmp_sweep
-
     filesystem = FLOOR_FILESYSTEM.get()
     stem = filesystem.record_stem if isinstance(filesystem, FilesystemFloor) else "floor"
-    return tmp_sweep.state_dir() / f"{stem}.json"
+    return sweep_state.state_dir() / f"{stem}.json"
 
 
 def _finite_number(value: object) -> TypeGuard[int | float]:
@@ -3046,9 +3043,7 @@ def _finite_number(value: object) -> TypeGuard[int | float]:
 
 
 def target_deletes_path() -> Path:
-    from scripts.lint import tmp_sweep
-
-    return tmp_sweep.state_dir() / tmp_sweep.TARGET_DELETES_NAME
+    return sweep_state.state_dir() / sweep_state.TARGET_DELETES_NAME
 
 
 def read_target_deletes(path: Path, now: float) -> dict[str, float]:

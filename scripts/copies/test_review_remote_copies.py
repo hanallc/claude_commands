@@ -31,7 +31,7 @@ from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lint import sweep
-from scripts.lib import conf, scratch
+from scripts.lib import conf, copy_record, scratch
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_group import send_process_group
@@ -281,7 +281,7 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(copies.owned_remote_mirrors("alpha"), [mirror])
 
     def test_unit_owner_keeps_underscore_spelling_and_removes_only_its_mirrors(self) -> None:
-        owner = copies.unit_owner("alpha_unit")
+        owner = copy_record.unit_owner("alpha_unit")
         self.assertEqual(owner, "alpha_unit-unit")
         mine = self.mirror_record(owner)
         other = self.mirror_record("beta-unit", self.mirror.parent / "other")
