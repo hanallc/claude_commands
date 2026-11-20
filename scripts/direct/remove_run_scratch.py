@@ -12,7 +12,8 @@ folder the ending director holds. In each one this removes:
     in ~/.local/state/verify/saved.jsonl;
   * every folder, at any depth, that holds .git (a folder or a file): a checkout;
   * every folder, at any depth, that holds .rustc_info.json or CACHEDIR.TAG: a
-    cargo target.
+    cargo target;
+  * each generated assignment prompt that no current dispatch can use.
 
 With --tracked it also ends tracked scratch for these runs, preserving live
 command directories and the scratch registry's existing unsaved-work holds.
@@ -35,17 +36,20 @@ except FileNotFoundError:
     pass
 
 import argparse
+import fcntl
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import cast
 
-from scripts.direct import workers
+from scripts.direct import recorder_state, workers
 from scripts.lib import git_files, scratch
 
 VERIFY_CACHE = "verify_cache"
+ASSIGNMENT_PROMPT_LOCK = "assignment_prompts.lock"
 # A folder holding any of these is a checkout or a cargo target.
 COPY_MARKERS = (".git", ".rustc_info.json", "CACHEDIR.TAG")
 
@@ -133,6 +137,45 @@ def end_tracked_scratch(run: Path) -> int:
     return len(result)
 
 
+def remove_assignment_prompts(run: Path) -> None:
+    """Keep prompts for current passes that can still accept a retry."""
+    if run.is_symlink() or not run.is_dir():
+        return
+    phases = run / "phases"
+    if phases.is_symlink() or not phases.is_dir():
+        return
+    with (run / ASSIGNMENT_PROMPT_LOCK).open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = recorder_state.read_state(run / recorder_state.STATE_FILENAME)
+        except FileNotFoundError:
+            state = {}
+        slots = state.get("pass", {})
+        if not isinstance(slots, dict):
+            raise ValueError("Invalid assignment pass records")
+        slots = cast(dict[str, object], slots)
+        passes = (slots,) if "instance_id" in slots else slots.values()
+        retained = set[str]()
+        for item in passes:
+            if isinstance(item, dict):
+                passed = cast(dict[str, object], item)
+                if passed.get("status") in ("active", "refused", "completed"):
+                    prompt = passed.get("prompt_file")
+                    if isinstance(prompt, str):
+                        retained.add(prompt)
+        for phase in phases.iterdir():
+            if phase.is_symlink() or not phase.is_dir():
+                continue
+            prompts = phase / "prompts"
+            if prompts.is_symlink() or not prompts.is_dir():
+                continue
+            for path in prompts.iterdir():
+                if str(path.resolve()) in retained:
+                    continue
+                if re.fullmatch(r"[0-9a-f]{64}\.txt", path.name) and not path.is_symlink() and path.is_file():
+                    path.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
     _ = parser.add_argument("runs", nargs="*", help="run folders whose scratch copies go")
@@ -142,6 +185,11 @@ def main() -> int:
     failed = 0
     for run in runs:
         removed = 0
+        try:
+            remove_assignment_prompts(run)
+        except (OSError, ValueError, recorder_state.OldRecorderState) as error:
+            failed += 1
+            print(f"remove_run_scratch: could not remove assignment prompts from {run}: {error}", file=sys.stderr)
         for folder in scratch_folders(run):
             try:
                 remove(folder)

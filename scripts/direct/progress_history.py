@@ -2370,6 +2370,29 @@ def dispatch_submission_confirmed(run: Path, instance_id: str, completion_id: st
         return isinstance(slot, str) and completion_id in _string_list(passes[slot].get("confirmed_delivery_ids"))
 
 
+def handoff_busy_dispatch_notice(run: Path, worker_id: staff.StaffId, instance_id: str,
+                                 completion_id: str, attempt_id: uuid.UUID) -> bool:
+    """Save the notice handoff while the exact delivery is active and unconfirmed."""
+    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not _state_path(run).is_file():
+            return False
+        state = _read_state(run, resolve_staff=False)
+        matches = [passed for passed in _open_passes(state).values() if passed.get("worker_id") == worker_id]
+        if len(matches) != 1:
+            return False
+        passed, = matches
+        stamp = f"busy:{attempt_id}"
+        if (passed.get("instance_id") != instance_id or passed.get("status") != "active"
+                or not completion_id or dispatch_delivery(passed).completion_id != completion_id
+                or completion_id in _string_list(passed.get("confirmed_delivery_ids"))
+                or passed.get("hook_notice") == stamp):
+            return False
+        passed["hook_notice"] = stamp
+        _write_state(run, state)
+        return True
+
+
 def confirm_assignment_submission(run: Path, instance_id: str, completion_id: str) -> None:
     """Confirm the delivery and restore running status for the open pass."""
     with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:

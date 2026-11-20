@@ -17,11 +17,12 @@ from unittest.mock import patch
 from uuid import UUID
 
 from scripts.agents import codex_test_support as codex_fixture
-from scripts.direct import assign, progress_history, recorder_state
+from scripts.direct import assign, progress_history, recorder_state, remove_run_scratch
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 from scripts.direct.assign_launcher_test_support import ASSIGN, ROOT, HookAssignmentFixture, InProcessAssignment, assignment_helpers, invoke_assignment, read_object
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.herdr import herdr, turn_end, worker_panes
+from scripts.herdr.test_worker_panes import live_detached_run
 from scripts.lib import unit_runs
 from scripts.lint import style_review
 from scripts.lib.atomic_file import write_text_atomic
@@ -544,16 +545,16 @@ class PaneReviewLauncherTests(unittest.TestCase):
                         with patch.dict(os.environ, {"UNIT_RUN_ROOT": str(root)}):
                             self.assertEqual(unit_runs.held(staff.runtime_id(), root), [str(case.fixture.run_dir)])
                             result = invoke_cli(assign, assign.main, arguments, os.environ.copy(), ROOT)
-                        self.assertEqual(result.returncode, worker.ExitCode.REFUSED, result.stdout + result.stderr)
-                        self.assertIn("role change blocked by active work: submitted pass awaits completion",
+                        self.assertEqual(result.returncode, worker.ExitCode.BUSY, result.stdout + result.stderr)
+                        self.assertIn("workers unavailable: impl: submitted pass awaits completion",
                                       (case.phase / "impl_agent_1.log").read_text())
                         self.assertNotIn("status", read_object(state_path))
                         self.assertEqual(unit_runs.open_run(staff.runtime_id()), case.fixture.run_dir)
                         self.assertFalse((case.phase / "impl_status_1").exists())
                     else:
-                        with patch("scripts.agents.detached_runs.live_runs", return_value=[object()]):
-                            case.assert_start_not_delivered(worker.ExitCode.REFUSED,
-                                "role change blocked by active work: a detached run is live")
+                        with live_detached_run(case.fixture.run_dir, opened.row):
+                            case.assert_start_not_delivered(worker.ExitCode.BUSY,
+                                "workers unavailable: review: a detached run is live")
                     self.assertEqual(case.fixture.agent.submitted, submitted)
                     self.assertEqual(progress_history.active_dispatch(opened.row.id, case.fixture.run_dir), active)
                     self.assertEqual(case.fixture.fixture.staff_state(), before)
@@ -1225,6 +1226,48 @@ class AssignLauncherTests(HookAssignmentFixture):
         result = self.launch(execution=InProcessAssignment())
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.turn_starts, 1)
+
+    def test_refused_assignment_keeps_the_active_prompt(self) -> None:
+        self.native.agent.finish_after = 100
+        first = self.launch("implement", "--to", "impl")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        (pane, delivery), = self.native.agent.submitted
+        row = self.native.agent.row(pane)
+        passed = worker_panes.worker_pass(row, self.session_dir)
+        output = Path(str(passed["prompt_file"]))
+        original = output.read_bytes(), output.stat().st_ino
+
+        retry = self.launch("implement", "--to", "impl")
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        self.assertEqual(worker_panes.worker_pass(row, self.session_dir)["prompt_file"], str(output))
+
+        self.native.fixture.world.locations[pane]["agent_status"] = "idle"
+        self.write_phase_prompt("7", "Assignment core", "Implement the second change.")
+        refused = self.launch("implement", "--to", "impl")
+        self.assertEqual(refused.returncode, worker.ExitCode.BUSY, refused.stdout + refused.stderr)
+        self.assertEqual(self.native.agent.submitted, [(pane, delivery)])
+        self.assertEqual((output.read_bytes(), output.stat().st_ino), original)
+        self.assertEqual(worker_panes.worker_pass(row, self.session_dir)["instance_id"], passed["instance_id"])
+
+    def test_scratch_cleanup_keeps_only_prompts_that_a_dispatch_can_retry(self) -> None:
+        self.native.agent.finish_after = 100
+        first = self.launch("implement", "--to", "impl")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        (pane, _), = self.native.agent.submitted
+        row = self.native.agent.row(pane)
+        passed = worker_panes.worker_pass(row, self.session_dir)
+        prompt = Path(str(passed["prompt_file"]))
+        saved = prompt.read_bytes()
+        stale = prompt.with_name("a" * 64 + ".txt")
+        write_text_atomic(stale, "An unused prompt.\n")
+
+        remove_run_scratch.remove_assignment_prompts(self.session_dir)
+        self.assertFalse(stale.exists())
+        self.assertEqual(prompt.read_bytes(), saved)
+        retry = self.launch("implement", "--to", "impl")
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        self.assertEqual(len(self.native.agent.submitted), 1)
+        self.assertEqual(worker_panes.worker_pass(row, self.session_dir)["prompt_file"], str(prompt))
 
     def test_busy_launch_preserves_the_completed_slot_status(self) -> None:
         _ = self.successful()

@@ -210,11 +210,6 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
     return NotDetachedWorker()
 
 
-def _worker_reference(session_dir: str, name: str) -> str:
-    member = worker_admission.member(Path(session_dir), name)
-    return str(member.id) if member is not None else ""
-
-
 @dataclass(frozen=True)
 class RunOwnerUnavailable:
     reason: str
@@ -436,11 +431,25 @@ def stop_command(path: Path, reason: str) -> bool:
         return False
 
 
-def seat_name(session_dir: str, name: str) -> str:
+@dataclass(frozen=True)
+class PaneRunSeat:
+    name: str
+    staff_id: staff.StaffId
+
+
+@dataclass(frozen=True)
+class UnregisteredRunSeat:
+    name: str
+
+
+def _run_seat(session_dir: str, name: str) -> PaneRunSeat | UnregisteredRunSeat:
     """Resolve the current staff worker through its active recorder slot."""
     run = Path(session_dir)
     membership = staff.local_snapshot()
-    owner = worker_admission.parent(membership, run=run)
+    try:
+        owner = worker_admission.parent(membership, run=run)
+    except worker_admission.RunOwnerUnavailable:
+        return UnregisteredRunSeat(name)
     state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
     passes = state.get("pass")
     current = cast(dict[str, object], passes).get(name) if isinstance(passes, dict) else None
@@ -450,9 +459,11 @@ def seat_name(session_dir: str, name: str) -> str:
         if dispatch.get("status") == "active":
             name = str(dispatch.get("worker_name", "")) or name
             member = membership.by_id(staff.StaffId(str(dispatch.get("worker_id", ""))))
-    if member is None:
+    if member is None or member.kind != "worker" or not member.reports_to(owner.id):
         member = worker_admission.find_worker(membership, owner.id, name)
-    return member.name if member is not None and member.kind == "worker" and member.reports_to(owner.id) else name
+    if member is not None:
+        return PaneRunSeat(member.name, member.id)
+    return UnregisteredRunSeat(name)
 
 
 def _integer(value: object) -> int:
@@ -1093,23 +1104,29 @@ def command_start(args: argparse.Namespace) -> int:
         print("detached_runs: start needs a command after --", file=sys.stderr)
         return 2
     session_dir = str(getattr(args, "session_dir", "") or "")
-    name = str(getattr(args, "to", "") or "")
-    caller = caller_from_environment(dict(os.environ))
-    reference = ""
+    requested_name = str(getattr(args, "to", "") or "")
+    environment = dict(os.environ)
+    caller = caller_from_environment(environment)
+    target: PaneRunSeat | DirectorCaller | UnregisteredRunSeat
     if isinstance(caller, PaneCaller):
-        if name and name != caller.name:
-            print(f"detached_runs: --to {name} ignored; run belongs to worker {caller.name}", file=sys.stderr)
-        session_dir, name = caller.session_dir, caller.name
-        reference = caller.staff_id
-    elif isinstance(caller, DirectorCaller) and session_dir and not name:
-        name, reference = caller.name, caller.staff_id
+        if requested_name and requested_name != caller.name:
+            print(f"detached_runs: --to {requested_name} ignored; run belongs to worker {caller.name}", file=sys.stderr)
+        session_dir = caller.session_dir
+        target = PaneRunSeat(caller.name, caller.staff_id)
+    elif isinstance(caller, DirectorCaller) and session_dir and not requested_name:
+        target = caller
     else:
-        if bool(session_dir) != bool(name):
+        if bool(session_dir) != bool(requested_name):
             print("detached_runs: --session-dir and --to go together", file=sys.stderr)
             return 2
         if not session_dir:
             return NOT_A_DETACHED_WORKER
-        name = seat_name(session_dir, name)
+        target = _run_seat(session_dir, requested_name)
+        if isinstance(target, UnregisteredRunSeat):
+            print(f"detached_runs: {target.name}: worker is not registered; started nothing", file=sys.stderr)
+            return 2
+    name = target.name
+    identity = target.staff_id
     session_dir = str(Path(session_dir).resolve())
     label = str(getattr(args, "label", "") or "") or " ".join(command)
     done_file = str(getattr(args, "done_message_file", "") or "")
@@ -1120,7 +1137,17 @@ def command_start(args: argparse.Namespace) -> int:
     tree_key = treekey.tree_key(cwd) or ""
     reaped = OrphanReapResult()
     try:
-        with (runs / ".start.lock").open("a") as admission:
+        with contextlib.ExitStack() as locks:
+            if isinstance(target, PaneRunSeat):
+                from scripts.herdr import worker_panes
+
+                locks.enter_context(worker_panes.worker_id_lock(target.staff_id, blocking=True))
+                unchanged = (caller_from_environment(environment) == caller if isinstance(caller, PaneCaller)
+                             else _run_seat(session_dir, requested_name) == target)
+                if not unchanged:
+                    print(f"detached_runs: {name}: worker changed before admission; started nothing", file=sys.stderr)
+                    return 2
+            admission = locks.enter_context((runs / ".start.lock").open("a"))
             fcntl.flock(admission, fcntl.LOCK_EX)
             reaped = _reap_orphans_locked(runs)
             if twin := live_twin(runs, name, command, tree_key):
@@ -1142,8 +1169,7 @@ def command_start(args: argparse.Namespace) -> int:
                       + "Or put more files in one run.", file=sys.stderr)
                 return LIVE_RUN_LIMIT_REACHED
             run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{secrets.token_hex(2)}"
-            identity = reference or _worker_reference(session_dir, name)
-            if identity and not isinstance(caller, DirectorCaller):
+            if isinstance(target, PaneRunSeat):
                 run_id += f"@{identity}"
             record_path = runs / f"{run_id}.json"
             log_path = runs / f"{run_id}.log"
@@ -1155,18 +1181,16 @@ def command_start(args: argparse.Namespace) -> int:
             }
             from scripts.direct import progress_history
 
-            if isinstance(caller, DirectorCaller) and reference:
+            if isinstance(target, DirectorCaller):
                 record["pane_dispatch_id"] = ""
-            elif record["staff_id"]:
-                dispatch = progress_history.active_dispatch(staff.StaffId(record["staff_id"]), Path(session_dir))
+            else:
+                dispatch = progress_history.active_dispatch(identity, Path(session_dir))
                 if isinstance(dispatch, progress_history.ActiveDispatch):
                     record["pane_dispatch_id"] = dispatch.instance_id
                 elif isinstance(dispatch, progress_history.NoActiveDispatch):
                     record["pane_dispatch_id"] = ""
                 else:
                     record["pane_dispatch_id"] = {"unavailable": dispatch.reason}
-            else:
-                record["pane_dispatch_id"] = {"unavailable": "the worker staff row is unavailable"}
             with record_lock(record_path):
                 write_text_atomic(record_path, json.dumps(record, indent=2, sort_keys=True))
             with log_path.open("ab") as log:
