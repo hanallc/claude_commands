@@ -3152,6 +3152,31 @@ process.stdout.write(JSON.stringify({
             with self.subTest(gpu_slot=code):
                 self.assertEqual(memory_feed.memory_status(gpu_wait, self.fixture_room(available), 0)["code"], code)
 
+        older: admission_records.Waiter = {**waiter, "pid": 300, "need": 9 * gib,
+            "since": inputs.now - 3, "step": "merge-gate"}
+        landing: admission_records.Waiter = {**waiter, "pid": 350, "need": 5 * gib,
+            "since": inputs.now - 2, "step": "merge-gate"}
+        younger: admission_records.Waiter = {**waiter, "pid": 400, "since": inputs.now - 1, "step": "merge-gate"}
+        checking = frozenset({admission_records.waiter_owner(older)})
+        landing_held = frozenset({admission_records.waiter_owner(landing)})
+        policy = admission_policy_fixture()
+        for name, waiters, expired, held, next_need, starts in (
+            ("before route deadline", (older, younger), frozenset[str](), frozenset[str](), 9 * gib, ()),
+            ("past route deadline", (older, younger), checking, frozenset[str](), gib, (400,)),
+            ("past route deadline with landing hold", (older, landing, younger), checking, landing_held, gib, (400,)),
+        ):
+            with self.subTest(route_check=name):
+                evidence = replace(inputs, ordered=[(Path(str(row["pid"])), row) for row in waiters],
+                    cloud_route_waiters=checking, cloud_route_waiters_past_deadline=expired, landing_waiters=held)
+                result = gate.admission_pass(evidence, evidence.now, policy)
+                report = gate.queue_read_from_pass(evidence, policy, result).explanation
+                assert isinstance(report.room, admission_records.MemoryRoom)
+                status = memory_feed.memory_status(report, report.room, active_local_builds=0)
+                self.assertEqual(status["next_need_bytes"], next_need)
+                self.assertEqual([row["pid"] for row in report.ordered], [row["pid"] for row in waiters])
+                self.assertEqual(tuple(row["pid"] for row, decision in zip(report.ordered, result.rows, strict=True)
+                                       if isinstance(decision.admission, gate.ProposedAdmission)), starts)
+
     def test_detached_python_counts_in_other_and_reserved_cargo_counts_once(self) -> None:
         for cargo_use in (0, 2 * admission_records.GIB):
             with self.subTest(cargo_use=cargo_use), AdmissionFixture(root=self.root / str(cargo_use)) as fixture:

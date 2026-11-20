@@ -309,16 +309,6 @@ def waiter_state(row: Waiter) -> QueuedWaiter | TokenWaitingWaiter:
     return QueuedWaiter(row)
 
 
-def first_queued_waiter(rows: Iterable[Waiter], pending_remote_starts: frozenset[str]) -> QueuedWaiter | NoWaiter:
-    for row in rows:
-        if records.waiter_owner(row) in pending_remote_starts:
-            return QueuedWaiter(row)
-        state = waiter_state(row)
-        if isinstance(state, QueuedWaiter):
-            return state
-    return NoWaiter()
-
-
 def queue_priority_path(directory: Path) -> Path:
     return directory / "queue_priority.json"
 
@@ -2248,6 +2238,7 @@ class NoQueuedHead:
 class HeadPolicy:
     walk: tuple[WaiterAdmission, ...]
     queued_head: QueuedHead | NoQueuedHead
+    local_head: QueuedWaiter | NoWaiter
     totals: AdmissionDecision
     room: MemoryRoom | ReadingUnavailable
     returned_claims: frozenset[str]
@@ -2565,21 +2556,38 @@ def route_check_keeps_order(inputs: QueueInputs, owner: str) -> bool:
     return owner not in inputs.cloud_route_waiters_past_deadline
 
 
+def admission_heads(
+    inputs: QueueInputs, ordered: Sequence[tuple[Path, RankedWaiter]],
+) -> tuple[QueuedHead | NoQueuedHead, QueuedWaiter | NoWaiter]:
+    """Select the queue head for wait messages and the head for local admission."""
+    queued_head: QueuedHead | NoQueuedHead = NoQueuedHead()
+    for _, row in ordered:
+        owner = records.waiter_owner(row)
+        if not route_check_keeps_order(inputs, owner):
+            continue
+        state = QueuedWaiter(row) if owner in inputs.pending_remote_starts else waiter_state(row)
+        if isinstance(state, TokenWaitingWaiter):
+            continue
+        if isinstance(queued_head, NoQueuedHead):
+            queued_head = QueuedHead(row)
+        if can_use_natedev(row) and not waits_for_landing(inputs, row):
+            return queued_head, state
+    return queued_head, NoWaiter()
+
+
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt, *,
                 resolved_order: bool = False,
                 claim_policy: ContinuationClaimPolicy = ContinuationClaimPolicy.RELEASE_FOR_EARLIER_WAITER
                 ) -> HeadPolicy:
     ordered = ranked_queue_waiters(inputs, resolved_order=resolved_order)
-    candidate = first_queued_waiter((row for _, row in ordered
-        if route_check_keeps_order(inputs, records.waiter_owner(row))), inputs.pending_remote_starts)
-    queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
+    queued_head, local_head = admission_heads(inputs, ordered)
     safety = policy.safety_bytes
     returned_claims: set[str] = set()
     while True:
         room = inputs_room(inputs, policy)
         kept, used = (room.kept, room.used) if isinstance(room, MemoryRoom) else (0, 0)
         admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start,
-                                    claim_policy=claim_policy)
+                                    local_head=local_head, claim_policy=claim_policy)
         if claim_policy is ContinuationClaimPolicy.KEEP_FOR_OWNER or not inputs.slots:
             break
         held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
@@ -2594,7 +2602,7 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
             if not isinstance(slot, ContinuationSlot) or slot.owner not in held_owners))
     totals = AdmissionDecision("admit" if isinstance(room, MemoryRoom) and isinstance(inputs.pressure, NoPressureHold) else "hold",
         kept + safety, kept, safety, used, inputs.pressure, used + kept)
-    return HeadPolicy(tuple(admissions), queued_head, totals, room, frozenset(returned_claims))
+    return HeadPolicy(tuple(admissions), queued_head, local_head, totals, room, frozenset(returned_claims))
 
 
 def start_spacing_after(now: float, policy: AdmissionPolicy) -> NextStartAt:
@@ -2631,8 +2639,9 @@ def waits_for_landing(inputs: QueueInputs, row: Waiter) -> bool:
 def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]],
                    room: MemoryRoom | ReadingUnavailable,
                    now: float, policy: AdmissionPolicy, kept: int, used: int, safety: int,
-                   next_start: NextStartAt, *, claim_policy: ContinuationClaimPolicy) -> list[WaiterAdmission]:
-    """Admit local steps in order and name the first local step that waits."""
+                   next_start: NextStartAt, *, local_head: QueuedWaiter | NoWaiter,
+                   claim_policy: ContinuationClaimPolicy) -> list[WaiterAdmission]:
+    """Decide which local steps can start in this pass."""
     if isinstance(room, MemoryRoom):
         remaining, readable = room.signed_room, True
     else:
@@ -2641,9 +2650,6 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     decisions: list[WaiterAdmission] = []
     clear = isinstance(inputs.pressure, NoPressureHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
-    local_head = first_queued_waiter((row for _, row in ordered
-        if can_use_natedev(row) and not waits_for_landing(inputs, row)
-        and route_check_keeps_order(inputs, records.waiter_owner(row))), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
     head_can_start_alone = not inputs.reservations and all(
         not slot_in_force(slot, inputs.now)
@@ -2942,6 +2948,11 @@ def decision_checks(decision: AdmissionDecision, need: int, available: int) -> t
             FreeCheck(available, need, decision.reserve, decision.promised, decision.threshold, decision.free_passes))
 
 
+def local_head_cause(reason: WaitReason) -> HeadCause:
+    """Read the cause for the selected local waiter."""
+    return reason.cause if isinstance(reason, HeadAdmissionStatus) else cast(HeadCause, reason)
+
+
 def queue_read_from(inputs: QueueInputs, policy: AdmissionPolicy) -> QueueRead:
     return queue_read_from_pass(inputs, policy, admission_pass(inputs, inputs.now, policy))
 
@@ -2951,7 +2962,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
     paths = {records.waiter_owner(row): path for path, row in inputs.ordered}
     ordered = [(paths[owner], rank_waiter(entry.waiter, inputs.waiter_orders[owner]))
                for entry in result.policy.walk if (owner := records.waiter_owner(entry.waiter)) in paths]
-    candidate = result.policy.queued_head
+    candidate = result.policy.local_head
     identities = RecordedQueueIdentities()
     available = inputs.host.available if isinstance(inputs.host, HostMemory) else 0
     totals = result.policy.totals
@@ -2985,7 +2996,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                            job=row.get("job", GATE_JOB_NOT_RECORDED),
                            route=records.waiter_route(row))
         waiting.append(step)
-        if isinstance(candidate, QueuedHead) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
+        if isinstance(candidate, QueuedWaiter) and records.waiter_owner(row) == records.waiter_owner(candidate.waiter):
             width = row.get("test_threads")
             source: RecordedNeed | NeedSourceNotRecorded = NeedSourceNotRecorded()
             if "need_source" in row:
@@ -2994,7 +3005,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                     width if width is not None else WidthNotRecorded(), read_need_basis(row.get("need_basis")))
             first = HeadExplanation(step, source, own, *decision_checks(own, step.need, available),
                                     isinstance(records.waiter_priority(row), PriorityUnit),
-                                    cause=cast(HeadAdmissionStatus, admission.reason).cause)
+                                    cause=local_head_cause(admission.reason))
         else:
             line.append(LineWaiter(step, own.state == "admit", own, *decision_checks(own, step.need, available)))
     if waiting and isinstance(first, NoWaiter) and all(
@@ -3064,12 +3075,12 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
     released = [row for index, row in enumerate(explanation.running) if index in indices]
     inputs = inputs_after_steps_end(explanation.decided_from, indices, explanation.policy)
     result = admission_pass(inputs, explanation.now, explanation.policy, resolved_order=True)
-    candidate = result.policy.queued_head
-    if isinstance(candidate, NoQueuedHead):
+    candidate = result.policy.local_head
+    if isinstance(candidate, NoWaiter):
         return NoWaiter()
     owner = records.waiter_owner(candidate.waiter)
     row = next(row for row in result.rows if row.owner == owner)
-    cause = cast(HeadAdmissionStatus, row.reason).cause
+    cause = local_head_cause(row.reason)
     if isinstance(cause, (EstimateExpired, ReadingUnavailable, records.LandingWait)):
         return cause
     decision = row.decision
