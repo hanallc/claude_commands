@@ -25,7 +25,7 @@ from unittest import mock
 
 from scripts.aws_target import cloud_gate, gpu_size_trial as trial, ledger
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, largest_gate_vcpus
-from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.ledger_test_support import CostFixture, install_cost_settings, write_gate_config
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
 from scripts.lib import conf
@@ -80,6 +80,8 @@ class GpuTrialTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        install_cost_settings(self.root / 'config/aws_target.conf')
+        write_gate_config(self.root / 'config/cloud_gate.conf')
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**config_environment(self.root / 'config'),
                 'HOME': str(self.root), 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'})))
 

@@ -20,7 +20,7 @@ from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, Meas
 from scripts.aws_target.ledger_test_support import account_reply, instant
 from scripts.aws_target.control_test_support import AwsReplies
 
-from scripts.buildlog import aws_report, index, report
+from scripts.buildlog import aws_report, index, report, store
 
 
 class MeasurementTests(MeasurementFixture):
@@ -129,7 +129,7 @@ class MeasurementTests(MeasurementFixture):
         _ = path.write_text(json.dumps(row))
         self.assertEqual(measurement.read_charge(path), reading)
 
-    def test_wait_estimate_uses_the_report_local_day_instead_of_the_accounting_day(self) -> None:
+    def test_wait_estimate_uses_the_explicit_day_bounds(self) -> None:
         self.text_setting("accounting_zone", "Asia/Tokyo")
         departure = instant("2026-01-16T02:00:00+00:00")
         local = self.local_step("local-day", 300, 100, started_at="2026-01-16T01:00:00+00:00")
@@ -147,6 +147,63 @@ class MeasurementTests(MeasurementFixture):
             self.assertEqual(result.queue_saved_s, Decimal(200))
         finally:
             time.tzset()
+
+    def test_aws_lead_uses_one_utc_window_when_new_york_is_on_the_previous_day(self) -> None:
+        self.text_setting('accounting_zone', 'UTC')
+        self.seed_previous_day(hours=1)
+        book = self.book()
+        start = MIDNIGHT + 1800
+        stop = start + 7200
+        now = instant('2026-01-14T22:30:00-05:00')
+        book.record_price(ledger.PriceSample(start, Decimal(1), 'fixture price'))
+        book.observe(ledger.InstanceObservation(start, 'running', 'fixture'))
+        book.observe(ledger.InstanceObservation(stop, 'stopped', 'fixture'))
+
+        self.write_records(
+            self.local_step('utc-comparison', 1900, 100, started_at=store.utc_iso(start),
+                            ended_at=store.utc_iso(start + 100)),
+            self.call('utc-comparison'), self.call('utc-run'),
+            self.remote_step(call_id='utc-run', started_at=store.utc_iso(stop - 300),
+                             ended_at=store.utc_iso(stop - 100)),
+            self.attempt('utc-run', call_id='utc-run', at=store.utc_iso(stop - 100),
+                         queued_at=stop - 400, departed_at=stop - 300, evidence_at=stop - 100),
+            self.call('previous-run'),
+            self.attempt('previous-run', call_id='previous-run', at=store.utc_iso(MIDNIGHT - 300),
+                         queued_at=MIDNIGHT - 600, departed_at=MIDNIGHT - 500, evidence_at=MIDNIGHT - 300),
+        )
+        with (mock.patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}),
+              mock.patch.object(time, 'time', return_value=float(now)),
+              mock.patch.object(report, 'ssh_target_state_directory', return_value=self.state)):
+            _ = index.update()
+            with closing(index.read_only()) as connection, read_only_evidence(self, self.root):
+                lines = report.aws_section(connection, '2026-01-14',
+                                           day_selection=report.ReportDaySelection.CURRENT_DAY)
+        lead = [line for line in lines if line.startswith('- AWS: up ')]
+        self.assertEqual(lead, [
+            '- AWS: up 2.00 h, 1 steps, about 0.50 h of queue wait saved for $2.00 ($4.00 per saved hour, estimated).',
+        ])
+
+    def test_explicit_report_date_uses_its_utc_accounting_day(self) -> None:
+        self.seed_previous_day(hours=1)
+        now = instant('2026-01-14T22:30:00-05:00')
+        departure = MIDNIGHT - 300
+        self.write_records(
+            self.local_step('january-14-local', 1000, 100, started_at=store.utc_iso(departure - 300),
+                            ended_at=store.utc_iso(departure - 200)),
+            self.call('january-14-local'), self.call('january-14-aws'),
+            self.attempt('january-14-aws', call_id='january-14-aws', at=store.utc_iso(departure + 100),
+                         queued_at=departure - 100, departed_at=departure, evidence_at=departure + 100),
+        )
+        with (mock.patch.dict(os.environ, {'USER_ZONE': 'America/New_York'}),
+              mock.patch.object(time, 'time', return_value=float(now)),
+              mock.patch.object(report, 'ssh_target_state_directory', return_value=self.state)):
+            _ = index.update()
+            with closing(index.read_only()) as connection, read_only_evidence(self, self.root):
+                lines = report.aws_section(connection, '2026-01-14')
+        lead = [line for line in lines if line.startswith('- AWS: up ')]
+        self.assertEqual(lead, [
+            '- AWS: up 1.00 h, 1 steps, about 0.25 h of queue wait saved for $1.00 ($4.00 per saved hour, estimated).',
+        ])
 
     def test_charge_query_uses_whole_utc_days_and_reconciles_the_queried_period(self) -> None:
         cases = (
