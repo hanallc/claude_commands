@@ -23,7 +23,7 @@ from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledg
 from scripts.aws_target import config as aws_config
 from scripts.aws_target import plan_identity, quota_requests
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, text_setting
 from scripts.buildlog import aws_report
 from scripts.lib import atomic_file, conf
 from scripts.message import send_budget
@@ -1229,7 +1229,9 @@ class HoursCheckTests(CostFixture):
 
     def notice_run(self, *, code: int = 0, stdout: str = 'SENT: fixture\n', sender_times_out: bool = False) -> int:
         def run(arguments: Sequence[str], *, capture_output: bool, text: bool, check: bool,
-                timeout: float) -> subprocess.CompletedProcess[str]:
+                timeout: float = 0) -> subprocess.CompletedProcess[str]:
+            if arguments[0] == 'git':
+                return git_only(arguments, check=check)
             self.assertEqual((capture_output, text, check, timeout), (True, True, False, send_budget.seconds(5)))
             self.assertGreater(timeout, 5)
             self.notice_commands.append(tuple(arguments))

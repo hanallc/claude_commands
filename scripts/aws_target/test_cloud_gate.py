@@ -3245,7 +3245,8 @@ class CloudRouteTests(CostFixture):
         mode = gate.SuiteMode.MERGE_GATE
         incoming_job = StepJob('integrate', unit='new-unit', branch='new-branch')
         unknown_job = {'kind': 'GateJobNotRecorded'}
-        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        cloud_gate.save(self.state / 'gate-deployment.json',
+                        {'bucket': 'fixture-bucket', 'image': 'fixture-image', 'template': 'fixture-template'})
         root = Path(gate.checked_git(self.repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
         folder = root / 'legacy-attempt'
         request = cloud_gate.prepare(self.repo, folder, mode, 1800)
