@@ -163,6 +163,8 @@ def sent_question_action(item: review_items.ReviewItem, record: update_registrat
     if action not in ('answer', 'feedback', 'question'):
         raise question_record.AnswerRefused('Choose an action on this card.')
     ask = action == 'question'
+    if ask:
+        words = words.strip()
     identity = record.item.get('review_id', '')
     if not identity:
         raise question_record.AnswerRefused('The sent question has no Review ID.')

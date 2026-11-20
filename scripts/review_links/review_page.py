@@ -44,6 +44,12 @@ ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewTy
          ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap', ReviewType.BUG: 'bug', ReviewType.RESPONSE: 'inbox'}
 INDEX_STATES = (ReviewState.OPEN, ReviewState.WAITING, ReviewState.VALIDATING)
 SHOWS = (('all', 'All'), ('open', 'Open'), (ReviewState.WAITING, 'Waiting'), (ReviewState.VALIDATING, 'Validating'))
+SHOW_VALUES = tuple(value for value, _ in SHOWS)
+SHOWS_BY_TYPE: dict[str, tuple[str, ...]] = {
+    ReviewType.RESPONSE: tuple(value for value in SHOW_VALUES if value != ReviewState.VALIDATING),
+}
+SHOW_CHIPS = tuple(record_table.Chip(value, label) for value, label in SHOWS)
+FILTER_FACETS = record_table.filter_facets({'type': 'type', 'show': 'chip', 'owner': 'owner'})
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
           ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies', ReviewType.BUG: 'Bugs',
           ReviewType.RESPONSE: 'Responses'}
@@ -164,14 +170,14 @@ class ReviewSnapshot:
     def index_response(self) -> bytes:
         return self.payload
 
-    def render(self, *, show: str = 'open') -> bytes:
-        selected = next((value for value, _ in SHOWS if value.lower() == show.lower()), 'open')
-        page = self.page.replace(b'data-show="open"', ('data-show="'+selected+'"').encode(), 1)
-        if selected != 'open':
-            page = page.replace(b'data-show-chip="open" aria-pressed="true"',b'data-show-chip="open" aria-pressed="false"',1)
-            page = page.replace(('data-show-chip="'+selected+'" aria-pressed="false"').encode(),
-                                ('data-show-chip="'+selected+'" aria-pressed="true"').encode(),1)
-        return page
+    def render(self, *, show: str = 'open', kind: str = '') -> bytes:
+        allowed = SHOWS_BY_TYPE.get(kind, SHOW_VALUES)
+        selected = next((value for value in allowed if value.lower() == show.lower()), 'open')
+        if selected == 'open':
+            return self.page
+        return self.page.replace(b'data-show="open"', f'data-show="{selected}"'.encode(), 1).replace(
+            record_table.chip_row('Show', SHOW_CHIPS, 'open').encode(),
+            record_table.chip_row('Show', SHOW_CHIPS, selected).encode(), 1)
 
     def body(self, key: str, *, view: ReviewBodyView = ReviewBodyView.TABLE) -> bytes:
         """Render one retained record without a store read."""
@@ -227,6 +233,30 @@ def retain_asset(item: ReviewItem, assets: dict[str, str]) -> None:
     origin = review_items.submission_origin(item)
     if isinstance(origin, new_item_dialog.ReviewSubmission):
         assets['submission:'+item.key] = submission_assets(item.key, origin)
+
+
+def retain_question_delivery(item: ReviewItem, assets: dict[str, str], status: change_page.DeliveryStatus,
+                             sources: ReviewSourceStamps) -> None:
+    source = item.source
+    if isinstance(source, review_items.ChangeSource):
+        row = source.row['#']
+        page = change_page.ReviewPage(source.path, source.path.parent, (row,), '')
+        question = source.slots.question
+    elif item.state == ReviewState.WAITING and isinstance(
+            source, (review_items.QuestionSource, review_items.InvestigationSource,
+                     review_items.ProposalSource, review_items.EfficiencySource)):
+        page = review_actions.delivery_page(item, status)
+        row = page.rows[0]
+        path = status.path(page, row)
+        sources.append(path)
+        question = status.slots(page, row).question
+    else:
+        return
+    if not isinstance(question, change_page.OpenQuestion) or isinstance(question, change_page.OpenFeedback):
+        return
+    sources.append(status.closeout_path(page, row))
+    if change_page.review_question_failed(status, page, row, question):
+        assets['question-delivery:'+item.key] = change_page.question_failure_html(True)
 
 
 def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str:
@@ -362,6 +392,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     assets: dict[str, str] = {}
     submission_keys: dict[str, str] = {}
     unavailable_cards: set[str] = set()
+    status = change_page.DeliveryStatus(root)
     for item in review_items.read(root, members=members, show='active', sources=sources, assign_ids=False):
         path = review_items.source_path(item)
         with guard_source(path, sources, entry=item.id):
@@ -369,6 +400,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
             try:
                 record_assets: dict[str, str] = {}
                 retain_asset(item, record_assets)
+                retain_question_delivery(item, record_assets, status, sources)
                 validate_body_inputs(item, record_assets)
                 summary = card_entry(item, members, names)
             except (UnicodeError, TypeError, ValueError, OSError, RuntimeError) as error:
@@ -588,13 +620,13 @@ class ReviewSnapshotCache:
         started = time.perf_counter()
         records = current.records.copy()
         assets = current.assets.copy()
-        asset_keys = (key, 'image:'+key, 'submission:'+key)
+        asset_keys = (key, 'image:'+key, 'submission:'+key, 'question-delivery:'+key)
         previous_key = replaced_key or key
         previous = records.get(previous_key)
         if previous_key != key:
             _ = records.pop(previous_key, None)
         for removed in {previous_key, key}:
-            for asset in (removed, 'image:'+removed, 'submission:'+removed):
+            for asset in (removed, 'image:'+removed, 'submission:'+removed, 'question-delivery:'+removed):
                 _ = assets.pop(asset, None)
         submission_keys = current.submission_keys.copy()
         if previous is not None:
@@ -852,6 +884,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     footer = ('' if response is not None else '<p class="review-source">Owner: '+names.html(item.owner, owner)
               +' · Source: '+names.html(item.source_unit, review_items.name(item.source_unit, inputs.members))+'</p>')
     fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
+    body += inputs.assets.get('question-delivery:'+item.key, '')
     body += inputs.assets.get('submission:'+item.key, '')
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div><div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+exchange+'</div>'
@@ -893,19 +926,10 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
     owners = {entry['owner']:(entry['ownerName'], entry['ownerHtml']) for entry in entries}
     owners.update({entry['sourceOwner']:(entry['sourceName'], entry['sourceHtml'])
                    for entry in entries if entry['type'] in review_items.INVESTIGATION_TYPES})
-    owner_chips = '<button id="review-owner-all" type="button" data-owner-chip="" aria-pressed="true">All <b></b></button>'
-    for owner, (name, markup) in sorted(owners.items(), key=lambda pair: pair[1][0].casefold()):
-        identity, label = html.escape(owner, quote=True), html.escape(name, quote=True)
-        owner_chips += (f'<button id="review-owner-{identity}" type="button" data-owner-chip="{identity}" '
-                        +f'data-owner-name="{label}" aria-pressed="false">{markup or label} <b></b></button>')
-    chips = '<button id="review-type-all" type="button" data-type-chip="" aria-pressed="true">All <b></b></button>'
-    chips += ('<button type="button" data-type-chip="investigations" aria-pressed="false" hidden>'
-              'Investigations and Bugs <b></b></button>')
-    chips += ''.join('<button id="review-type-'+kind+'" type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
-                     +' <b></b></button>' for kind in TYPE_CHIPS)
-    shows = ''.join('<button id="review-show-'+value.lower().replace(' ', '-')+'" type="button" data-show-chip="'
-                    +value+'" aria-pressed="'+str(value == show).lower()+'">'+label
-                    +' <b></b></button>' for value, label in SHOWS)
+    owner_chips = [record_table.Chip(f'staff:{owner}', markup or html.escape(name), owner_name=name)
+                   for owner, (name, markup) in sorted(owners.items(), key=lambda pair: pair[1][0].casefold())]
+    type_chips = [record_table.Chip('investigations', 'Investigations and Bugs', hidden=True),
+                  *(record_table.Chip(kind, icon(kind) + LABELS[kind]) for kind in TYPE_CHIPS)]
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
     content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE
@@ -918,9 +942,9 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +'<div class="record-filter-words"><label class="list-search-label" for="list-search">Search</label>'
         +'<input type="search" id="list-search" placeholder="Filter by id or words"></div>'
         +'<div class="review-queue">'
-        +record_table.labelled_chip_row('Type', chips, chip_classes='review-types')
-        +record_table.labelled_chip_row('State', shows, chip_classes='review-types review-shows', chip_id='list-show')
-        +record_table.labelled_chip_row('Owner', owner_chips, chip_classes='review-types', chip_id='list-owner')
+        +record_table.chip_row('Type', type_chips, 'all')
+        +record_table.chip_row('Show', SHOW_CHIPS, show)
+        +record_table.chip_row('Owner', owner_chips, 'all', encode_values=True)
         +'<div class="list-filters">'
         +'<button type="button" data-clear-linked-reviews aria-label="Clear linked reviews filter"'
         +' aria-pressed="true" hidden>Linked reviews <span aria-hidden="true">×</span></button>'
@@ -1133,12 +1157,10 @@ main:has(>[data-review]){max-width:1124px}
 .review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
 [data-review] .record-filter-row{margin-bottom:12px}
 [data-review] .list-filters:has(>[data-clear-linked-reviews][hidden]){display:none}
-.record-filter-row>.review-types{gap:8px}
-.review-types button{max-width:100%;overflow-wrap:anywhere}
-:is(.review-types button,[data-clear-linked-reviews]){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
+[data-review] .record-filter-row>div{gap:8px}
+[data-clear-linked-reviews]{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
-:is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
-#review-show-validating[data-empty-count]{opacity:.55}
+[data-clear-linked-reviews][aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
 .change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
 .proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}.bug{--type-color:#ed876b}.response{--type-color:#edc46d}
@@ -1452,7 +1474,7 @@ const firstReviewCard=(()=>{
   if(!history.state?.recordTable && place===location.pathname+location.search+location.hash)
    history.replaceState({recordTable:table},'');
  }
- const params=recordPlaceParams();
+ const params=recordPlaceParams(reviewPlaceOptions);
  legacyReviewPlace(params);
  const key=recordItemLink(params,value=>resolveShownRecordId(index,value));
  if(!index.has(key)) return null;
@@ -1483,7 +1505,6 @@ function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys
   (show==='all' || entry.state===(show==='open' ? 'Open' : show));
 }
 function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
-function matching(filters){return allEntries().filter(entry=>!pendingSaves.has(entry.key) && matches(entry,filters));}
 function savedEntry(key,result){
  if(result.state==='Done'){index.delete(key);return;}
  const entry=index.get(key);if(!entry) return;
@@ -1507,28 +1528,41 @@ try{
  }
 }catch{}
 storeSavedVerdicts();
-const showValues=[...content.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip);
-const view=createRecordTable({content:()=>content,
+const filterRow=name=>filterControl.row(content,name);
+const showValues=filterControl.buttons(filterRow('show')).map(button=>filterControl.value(button));
+const showsByType=new Map(''' + json.dumps(tuple(SHOWS_BY_TYPE.items())) + r''');
+const showChoices=type=>showsByType.get(type) ?? showValues;
+const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
  entries:allEntries,mount:entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
-  content.querySelector('[data-type-chip="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
+  filterRow('type').querySelector('[data-filter-value="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
  focusKey:()=>focusAfterLoad?.key,
  unmount:row=>{if(!saved.has(row.dataset.key)) rememberForm(row.querySelector('[data-review-form]'));},
  place:params=>{
   reviewPlace(params);
   const show=showValues.find(value=>value.toLowerCase()===params.get('show')?.toLowerCase());
-  if(show) params.set('show',params.get('type')==='response' && show==='Validating' ? 'open' : show);
+  if(show) params.set('show',show);
  },
+ selectShow:(show,type)=>showChoices(type).includes(show) ? show : 'open',
  persistLinkedTarget:true,
  missingItem:()=> 'This review is no longer on the Review page.',
  resolveOwner:owner=>{
-  const button=[...content.querySelectorAll('[data-owner-chip]')].find(button=>
-   button.dataset.ownerChip===owner || button.dataset.ownerName===owner);
-  return button ? button.dataset.ownerChip : owner;
+  const button=filterControl.buttons(filterRow('owner')).find(button=>
+   filterControl.ownerId(button)===owner || button.dataset.ownerName===owner);
+  return button ? filterControl.ownerId(button) : owner;
  },
  selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
  resolveItem:value=>resolveShownRecordId(index,value),
  hasKey:key=>index.has(key),
  shows:showValues,
+ staffChipFilters:['owner'],
+ filterFacets:''' + json.dumps(FILTER_FACETS) + r''',
+ eligibleChip:(entry,query,{keys})=>!pendingSaves.has(entry.key) && matches(entry,{query,keys}) ?
+  (entry.state==='Open' ? 'open' : entry.state) : '',
+ facetAlternates:{
+  owner:entry=>isInvestigation(entry) ? entry.sourceOwner : '',
+  type:entry=>isInvestigation(entry) ? 'investigations' : '',
+ },
+ countFacet:(name,entry,{sourceOwner})=>name==='owner' || !sourceOwner || entry.sourceOwner===sourceOwner,
  visible:(data,filters)=>{
   const key=data.key,entry=index.get(key),departure=saved.get(key);
   if(!entry || pendingSaves.get(key)?.departing) return false;
@@ -1536,31 +1570,17 @@ const view=createRecordTable({content:()=>content,
   return (!departure || departure.handed && entry.state!=='Open') && matches(entry,filters);
  },
  sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
- applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
+ applied:(_items,{type,show,owner,query,keys})=>{
   content.dataset.show=show;loadBodies();
-  const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys}));
-  const shownOwners=matching({show,type,query,keys});
-  const matchesOwner=(entry,id)=>!id || entry.owner===id || isInvestigation(entry) && entry.sourceOwner===id;
-  content.querySelectorAll('[data-owner-chip]').forEach(button=>{
-   const id=button.dataset.ownerChip;
-   button.hidden=Boolean(id) && id!==owner && !eligibleOwners.some(entry=>matchesOwner(entry,id));
-   button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,id)).length;
-  });
-  const eligible=matching({type,owner,query,sourceOwner,keys});
-  const stateCounts=new Map();
-  for(const {state} of eligible) stateCounts.set(state,(stateCounts.get(state) ?? 0)+1);
-  content.querySelectorAll('[data-show-chip]').forEach(button=>{
-   const show=button.dataset.showChip;
-   button.hidden=type==='response' && show==='Validating';
-   const count=show==='all' ? eligible.length : stateCounts.get(show==='open' ? 'Open' : show) ?? 0;
-   button.querySelector('b').textContent=count;
-   button.toggleAttribute('data-empty-count',count===0);
-  });
-  content.querySelectorAll('[data-type-chip]').forEach(button=>{
-   if(button.dataset.typeChip==='investigations') button.hidden=type!=='investigations';
-   button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
-   button.querySelector('b').textContent=matching({owner,show,query,sourceOwner,keys,type:button.dataset.typeChip}).length;
-  });
+  const owners=new Set([staffChipValue(owner)]);
+  for(const entry of allEntries()){
+   if(!matches(entry,{type,query,keys})) continue;
+   owners.add(staffChipValue(entry.owner));
+   if(isInvestigation(entry)) owners.add(staffChipValue(entry.sourceOwner));
+  }
+  filterControl.setVisible(filterRow('owner'),owners);
+  filterControl.setVisible(filterRow('show'),showChoices(type));
+  filterRow('type').querySelector('[data-filter-value="investigations"]').hidden=type!=='investigations';
  }
 });
 async function afterRowAnimations(run,current=()=>true){
@@ -1758,10 +1778,6 @@ function bindForm(row){
   remember:()=>rememberForm(form,true),send});
 }
 function bind(){view.replace(false);}
-content.addEventListener('click',event=>{
- if(content.dataset.show==='Validating' && event.target.closest('[data-type-chip="response"]'))
-  document.getElementById('review-show-open').click();
-},true);
 function revealNewItem(){
  if(!revealCreated || !index.has(revealCreated)) return false;
  const key=revealCreated;
@@ -1811,29 +1827,15 @@ function applyReviewIndex(payload){
  }));
  notices.hidden=!notices.children.length;
  bodies.clear();bodyRequests.clear();
- const menu=content.querySelector('#list-owner'),pairs=new Map();
- const focusedOwner=document.activeElement?.dataset.ownerChip;
- const selectedOwner=menu.querySelector('[aria-pressed="true"]')?.dataset.ownerChip;
+ const ownerRow=filterRow('owner'),pairs=new Map();
+ const focusedOwner=ownerRow.contains(document.activeElement);
  for(const entry of index.values()){
-  pairs.set(entry.owner,{name:entry.ownerName,markup:entry.ownerHtml});
+  pairs.set(entry.owner,{name:entry.ownerName,label:colored(entry.ownerName,entry.ownerHtml)});
  }
  for(const entry of index.values()){
-  if(isInvestigation(entry)) pairs.set(entry.sourceOwner,{name:entry.sourceName,markup:entry.sourceHtml});
+  if(isInvestigation(entry)) pairs.set(entry.sourceOwner,{name:entry.sourceName,label:colored(entry.sourceName,entry.sourceHtml)});
  }
- for(const button of menu.querySelectorAll('[data-owner-chip]')){
-  const id=button.dataset.ownerChip;
-  if(id && id!==selectedOwner && !pairs.has(id)) button.remove();
- }
- for(const [id,{name,markup}] of [...pairs].sort((a,b)=>a[1].name.localeCompare(b[1].name))){
-  let button=menu.querySelector('[data-owner-chip="'+CSS.escape(id)+'"]');
-  if(!button){
-   button=document.createElement('button');button.type='button';
-   button.id='review-owner-'+id;button.dataset.ownerChip=id;menu.append(button);
-  }
-  const count=button.querySelector('b') || document.createElement('b');
-  button.dataset.ownerName=name;
-  button.innerHTML=colored(name,markup)+' ';button.append(count);
- }
+ filterControl.updateOwners(ownerRow,new Map([...pairs].sort((a,b)=>a[1].name.localeCompare(b[1].name))));
  for(const [key,result] of saved){
   const entry=index.get(key);
   if(!entry || (result.later && Date.now()>=result.later)) {saved.delete(key);continue;}
@@ -1849,8 +1851,8 @@ function applyReviewIndex(payload){
  const openedLink=view.retryItemLink();
  if(!openedLink) view.apply(false);
  if(focusAfterLoad) restoreFocus(focusAfterLoad.key);
- if(focusedOwner!==undefined && (!document.activeElement?.hasAttribute('data-owner-chip') || document.activeElement.hidden))
-  menu.querySelector('[aria-pressed="true"]')?.focus({preventScroll:true});
+ if(focusedOwner && (!ownerRow.contains(document.activeElement) || document.activeElement.hidden))
+  ownerRow.querySelector('[aria-pressed="true"]')?.focus({preventScroll:true});
  content.dataset.loaded='true';
  if(!revealNewItem() && !openedLink) scrollTo({top,behavior:'instant'});
  content.dispatchEvent(new Event('review-refreshed'));

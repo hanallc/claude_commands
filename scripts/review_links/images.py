@@ -13,7 +13,6 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import cast
@@ -38,35 +37,21 @@ ANSWERS = {"approved": "your image is approved.", "not approved": "your image is
 ACTIONS = frozenset(("delete", "question", *ANSWERS))
 
 
-class QuestionDelivery(StrEnum):
-    ACCEPTED = "Waiting for the owner"
-    SENDING = "Sending"
-    RETRY = "Not sent. Press Ask question again with the same words."
-    UNCONFIRMED = "The send result is unknown. Enter the same words and press Ask question to send it again."
-
-    @property
-    def waits(self) -> bool:
-        return self in (self.ACCEPTED, self.SENDING)
-
-
-type ImageQuestionDelivery = QuestionDelivery | change_page.ResendBlocked
-NO_OPEN_QUESTIONS: Mapping[str, ImageQuestionDelivery] = MappingProxyType({})
+NO_OPEN_QUESTIONS: Mapping[str, QuestionSendState] = MappingProxyType({})
 
 
 @dataclass(frozen=True)
 class ImageReview:
     record: image_store.ImageRecord
-    open_questions: Mapping[str, ImageQuestionDelivery] = NO_OPEN_QUESTIONS
+    open_questions: Mapping[str, QuestionSendState] = NO_OPEN_QUESTIONS
 
     def visible(self) -> bool:
         if self.open_questions:
-            return any(isinstance(delivery, change_page.ResendBlocked) or not delivery.waits
-                       for delivery in self.open_questions.values())
+            return any(not delivery.waits for delivery in self.open_questions.values())
         return "feedback_at" not in self.record
 
     def refresh(self) -> bool:
-        return any(isinstance(delivery, change_page.ResendBlocked) or delivery.waits
-                   for delivery in self.open_questions.values())
+        return any(delivery.waits for delivery in self.open_questions.values())
 
 
 class AnswerNotSent(Exception):
@@ -114,22 +99,12 @@ def records(root: Path) -> list[image_store.ImageRecord]:
 
 
 def question_delivery(status: change_page.DeliveryStatus, saved: change_page.SavedQuestionDelivery
-                      ) -> ImageQuestionDelivery:
+                      ) -> QuestionSendState:
     """Read the delivery state while the caller holds the delivery lock."""
     delivery = change_page.question_delivery_view(status, saved)
-    match delivery.state:
-        case QuestionSendState.CLAIMED | QuestionSendState.SENDING:
-            return QuestionDelivery.SENDING
-        case QuestionSendState.READY | QuestionSendState.PREPARED:
-            if status.startup_recovery_pending.is_set():
-                return QuestionDelivery.SENDING
-            return QuestionDelivery.RETRY
-        case QuestionSendState.FAILED:
-            return QuestionDelivery.RETRY
-        case QuestionSendState.UNKNOWN:
-            return delivery if isinstance(delivery, change_page.ResendBlocked) else QuestionDelivery.UNCONFIRMED
-        case QuestionSendState.SENT | QuestionSendState.QUEUED:
-            return QuestionDelivery.ACCEPTED
+    if delivery.state in (QuestionSendState.READY, QuestionSendState.PREPARED) and status.startup_recovery_pending.is_set():
+        return QuestionSendState.SENDING
+    return delivery.state
 
 
 def image_review(status: change_page.DeliveryStatus, record: image_store.ImageRecord) -> ImageReview:
@@ -202,25 +177,17 @@ def picture(record: image_store.ImageRecord, label: str, file: str) -> str:
     return f'<figure><figcaption>{label}</figcaption>{linked}</figure>' if label else linked
 
 
-def question_html(question: question_record.Question, open_questions: Mapping[str, ImageQuestionDelivery]) -> str:
+def question_html(question: question_record.Question, open_questions: Mapping[str, QuestionSendState]) -> str:
     answer = question.answer
     if answer is not None:
         return page_question.answered_question_html(question, answer)
-    content = page_question.open_question_html(question)
-    delivery = open_questions.get(question.question_id, QuestionDelivery.ACCEPTED)
-    if isinstance(delivery, QuestionDelivery) and delivery.waits:
-        return content
-    if isinstance(delivery, change_page.ResendBlocked):
-        notice = page_frame.action_failure(None, delivery.reason)
-    else:
-        words = html.escape(question.words, quote=True)
-        notice = f'<p role="status" data-resend-question="{words}">{delivery}</p>'
-    return content.removesuffix('</section>') + notice + '</section>'
+    failed = open_questions.get(question.question_id) is QuestionSendState.FAILED
+    return page_question.open_question_html(question, failed=failed)
 
 
 def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int,
          names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT, *,
-         open_questions: Mapping[str, ImageQuestionDelivery] = NO_OPEN_QUESTIONS) -> str:
+         open_questions: Mapping[str, QuestionSendState] = NO_OPEN_QUESTIONS) -> str:
     """Show the caption as the title, then the aligned details, the image or pair, the feedback field and the answer buttons."""
     pair = "before" in record
     pictures = "".join(picture(record, label, file) for label, file in shown_files(record))
@@ -328,7 +295,7 @@ def ask_question(root: Path, identity: str, words: str, status: change_page.Deli
     folder = store.folder(identity)
     record = image_store.read_record(folder)
     target = change_page.image_question_target(folder / image_store.RECORD, record)
-    return page_question.ask(store, target, words, status, resend_unknown=True)
+    return page_question.ask(store, target, words, status)
 
 
 def answer_question(root: Path, identity: str, question_id: str, text: str) -> None:
@@ -521,15 +488,8 @@ function bind(root) {
         throw new Error(reason || 'HTTP ' + response.status);
       }
       if (question) {
-        const words = form.elements.feedback.value.trim();
-        const otherResend = [...card.querySelectorAll('[data-resend-question],.page-question .action-failure')]
-          .some(notice => notice.dataset.resendQuestion !== words);
-        if (otherResend) {
-          form.elements.feedback.value = '';
-        } else {
-          card.remove();
-          list.dataset.waitingImages += ' ' + card.dataset.image;
-        }
+        card.remove();
+        list.dataset.waitingImages += ' ' + card.dataset.image;
         list.dataset.refreshSeconds = list.dataset.answerRefreshSeconds;
         apply();
         pageRefresh.restart();

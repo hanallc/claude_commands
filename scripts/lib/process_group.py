@@ -20,8 +20,20 @@ def check_process_group(pid: object) -> int:
 
 
 def send_process_group(pid: object, signum: int) -> None:
-    """Check the group id and send; let the caller handle a missing group."""
-    os.killpg(check_process_group(pid), signum)
+    """Send a signal to a checked group."""
+    _send_checked_group(check_process_group(pid), signum)
+
+
+def terminate_owned_process_group() -> None:
+    """Send SIGTERM to the group that the caller leads."""
+    pid = os.getpid()
+    if pid <= 1 or pid != os.getpgrp():
+        raise ValueError("the caller must lead its process group")
+    _send_checked_group(pid, signal.SIGTERM)
+
+
+def _send_checked_group(group: int, signum: int) -> None:
+    os.killpg(group, signum)
 
 
 def main(argv: Sequence[str]) -> int:

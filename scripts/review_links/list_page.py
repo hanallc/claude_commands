@@ -22,11 +22,11 @@ from urllib.parse import parse_qs, urlencode
 from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
+from scripts.production import change_review, delivery_state, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
-from scripts.review_links import new_item_dialog, review_actions, review_items, review_page
+from scripts.review_links import new_item_dialog, review_actions, review_items, review_legacy, review_page
 from scripts.review_links import search_fold, staff_names
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
@@ -67,25 +67,14 @@ CHIP_BY_STATE = {
 }
 
 
-class FilterFacet(NamedTuple):
-    name: str
-    field: str
-    bit: int
-    count_mask: int
-
-
 FILTER_FIELDS = {"show": "chip", "owner": "owner", "producer": "producer"}
-ALL_FILTER_BITS = (1 << len(FILTER_FIELDS)) - 1
-# Each count ignores its own filter.
-FILTER_FACETS = tuple(FilterFacet(name, field, 1 << index, ALL_FILTER_BITS ^ (1 << index))
-                      for index, (name, field) in enumerate(FILTER_FIELDS.items()))
+FILTER_FACETS = record_table.filter_facets(FILTER_FIELDS)
 STAFF_FILTERS = ("owner", "producer")
 SEARCH_FIELDS = {"number": r"^#?l?(?=[0-9])", "ownerName": "", "title": "", "state": "", "parkingLabel": ""}
 PARKED_SEARCH_LABEL = search_fold.fold("Parked")
 STATE_SEARCH_TEXT = {state: search_fold.fold(state.value) for state in the_list.ItemState}
 UNREAD_FILTER = ("unread", "1", "true")
 UNREAD_FIELD, UNREAD_VALUE, UNREAD_MATCH = UNREAD_FILTER
-LIST_QUERY_FIELDS = ("show", UNREAD_FIELD, *record_table.OWNER_QUERY_KEYS, "producer", "q", "key", "item", "reveal", "state")
 LINK_REVEAL_FIELDS = (("openQuestion", "true", ""), (UNREAD_FIELD, "false", UNREAD_FIELD))
 # Match the whitespace that String.trim removes.
 QUERY_WHITESPACE = ("\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
@@ -122,9 +111,11 @@ SHOW_ALIASES = show_aliases()
 
 
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
-              unread_delivery: bool = False) -> ListChip:
+              unread_delivery: bool = False, unread_answer: bool = False) -> ListChip:
     """Find the one status chip for this item."""
     chip = CHIP_BY_STATE[state]
+    if unread_answer:
+        return ListChip.NEEDS_ME
     if parked:
         return ListChip.PARKED
     if unread_delivery:
@@ -445,38 +436,22 @@ def signed_form_fields(entry: ListRecord, secret: str) -> str:
                    for name, value in fields.items())
 
 
-def feedback_form(entry: ListRecord, secret: str, today: datetime, resends: tuple[the_list.QuestionResend, ...],
-                  *, parking_label: str = "") -> str:
+def feedback_form(entry: ListRecord, secret: str, *, parking_label: str = "") -> str:
     hidden = signed_form_fields(entry, secret)
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     key = html.escape(entry.key.replace('/', '-'), quote=True)
     parked = '' if parking_label else ' hidden'
     note = 'Parked until ' + parking_label if parking_label else ''
-    retry = "".join(question_resend(resend, today) for resend in resends)
     return ('<form method="post" data-feedback-form>' + hidden + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read
             + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
             + record_table.park_control("Park", field="until", action="action", value="park",
                                         identity="park-" + key, allow_delivery=True) + '</div></div>'
-            + retry
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + 'placeholder="Your words for morty about this item" aria-label="Your words for morty about this item"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
             + '<button name="action" value="question" disabled>Ask question</button>'
             + '<button name="action" value="tell" disabled>Tell morty</button></div></form>')
-
-
-def question_resend(resend: the_list.QuestionResend, today: datetime) -> str:
-    question = resend.question
-    notice = {"failed": "did not reach morty", "ready": "is ready to send",
-              "prepared": "is ready to send"}.get(resend.delivery.state, "may not have reached morty")
-    block = resend.delivery
-    action = (f'<p>{html.escape(block.reason)}</p>' if isinstance(block, change_page.ResendBlocked)
-              else f'<button name="action" value="resend-{question.question_id}">Resend question {question.question_id}</button>')
-    return (f'<section class="page-question" data-question="{question.question_id}">'
-            + f'<h3>Question {question.question_id} {notice}</h3>'
-            + question_time_html(question.asked_at, today)
-            + f'<p>{html.escape(question.words)}</p>' + action + '</section>')
 
 
 def review_card_link(key: str, label: str) -> str:
@@ -515,6 +490,7 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
 
 
 WAITING_NOTE = "The producer will answer."
+NO_FAILED_QUESTIONS: frozenset[str] = frozenset()
 
 
 def question_time_html(stamp: str, today: datetime) -> str:
@@ -522,15 +498,15 @@ def question_time_html(stamp: str, today: datetime) -> str:
 
 
 def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: frozenset[str],
-                    resends: tuple[the_list.QuestionResend, ...] = ()) -> str:
-    retry = {resend.question.question_id for resend in resends}
+                    failed: frozenset[str] = NO_FAILED_QUESTIONS) -> str:
     sections: list[str] = []
     for question in item.questions:
         answer = question.answer
-        if answer is None and question.question_id not in retry:
+        if answer is None:
             sections.append(page_question.open_question_html(
-                question, asked_time_html=question_time_html(question.asked_at, today)))
-        elif answer is not None and question.question_id in unread_answers:
+                question, asked_time_html=question_time_html(question.asked_at, today),
+                failed=question.question_id in failed))
+        elif question.question_id in unread_answers:
             sections.append(page_question.answered_question_html(question, answer,
                 asked_time_html=question_time_html(question.asked_at, today),
                 answer_time_html=question_time_html(answer.answered_at, today),
@@ -608,8 +584,7 @@ def review_version(item: the_list.ListItem) -> str:
     return html.escape(json.dumps((str(item.updated), len(item.log), item.reviews)), quote=True)
 
 
-def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str) -> str:
-    unread = the_list.unread_delivery(entry.item)
+def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *, unread: bool) -> str:
     if not parking_label and not unread:
         return ""
     parked = '' if parking_label else ' hidden'
@@ -631,12 +606,13 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
                     reviews: ReviewDisplay, parking_label: str) -> str:
     sections = (f'<p data-waiting-note>{WAITING_NOTE}</p><div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
-                + review_links(entry.item, reviews, today) + waiting_feedback_form(entry, secret, parking_label))
+                + review_links(entry.item, reviews, today) + waiting_feedback_form(
+                    entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item)))
     return detail_panel(entry, sections, today, names, unread_answers, secret)
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
-            names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionResends,
+            names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
             unread_answers: frozenset[str], *, parking_label: str) -> str:
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
@@ -654,20 +630,20 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     if links:
         sections += '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>'
     sections += review_links(item, reviews, today)
-    questions = panel_questions(item, today, unread_answers, visibility.questions)
-    form = feedback_form(entry, secret, today, visibility.questions, parking_label=parking_label)
+    questions = panel_questions(item, today, unread_answers, visibility.failed)
+    form = feedback_form(entry, secret, parking_label=parking_label)
     return f'<p data-waiting-note hidden>{WAITING_NOTE}</p>' + detail_panel(
         entry, sections + questions + form, today, names, unread_answers, secret)
 
 
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
               reviews: ReviewDisplay, *, owner_cell: str, owner_sort: str, search_text: SearchText, parked: bool,
-              open_question: bool, visibility: the_list.WaitingForAnswer | the_list.QuestionResends,
+              open_question: bool, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
+              unread_answers: frozenset[str],
               hidden: bool = False) -> str:
     item = entry.item
     producer = owner_name(names.members, item.producer)
     unread = isinstance(item.unread_since, datetime)
-    unread_answers = the_list.unread_answer_ids(item)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
     due = the_list.eta_due(item.eta)
     eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(item.eta, today).casefold())
@@ -683,6 +659,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
              + f' data-unread="{str(unread).lower()}" data-parked="{parking}" data-waiting-for-answer="{str(waiting).lower()}"'
              + f' data-open-question="{str(open_question).lower()}"'
              + f' data-unread-delivery="{str(the_list.unread_delivery(item)).lower()}"'
+             + f' data-unread-answer="{str(bool(unread_answers)).lower()}"'
              + f' data-title="{html.escape(search_text.title)}" data-owner-name="{html.escape(search_text.owner)}"'
              + f' data-order="{index}" data-sort-values="{html.escape(json.dumps(values, ensure_ascii=False))}"')
     panel = f'list-detail-{index}'
@@ -781,6 +758,7 @@ class SavedActionState(TypedDict):
     waiting_for_answer: str
     open_question: str
     unread_delivery: NotRequired[str]
+    unread_answer: NotRequired[str]
     waiting_details_html: NotRequired[str]
     review_summary_html: NotRequired[str]
     park_request_saved: NotRequired[bool]
@@ -795,10 +773,10 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     today = the_list.now()
     local_today = today.astimezone(zone)
     parking = item.parked_until
-    parked_until = (parked_label(parking, zone)
-                    if parking is not the_list.NoTimestamp.UNSET and the_list.parking_active(parking, today) else "")
-    parked = bool(parked_until)
+    parked = the_list.parking_active(parking, today)
+    parked_until = parked_label(parking, zone) if parked and parking is not the_list.NoTimestamp.UNSET else ""
     unread = item.unread_since
+    unread_answers = the_list.unread_answer_ids(item)
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
     open_question = item.state != the_list.ItemState.CLOSED and has_open_question(item)
     waiting = open_question and isinstance(the_list.question_visibility(owner, item, reading), the_list.WaitingForAnswer)
@@ -809,7 +787,8 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                                "check_html": check_row_html(item.next_check, local_today, parked=parked),
                                "waiting_for_answer": str(waiting).lower(),
                                "open_question": str(open_question).lower(),
-                               "unread_delivery": str(the_list.unread_delivery(item)).lower()}
+                               "unread_delivery": str(the_list.unread_delivery(item)).lower(),
+                               "unread_answer": str(bool(unread_answers)).lower()}
     if park_request:
         saved["park_request_saved"] = the_list.has_park_receipt(item, park_request)
     if waiting:
@@ -825,7 +804,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                     reviews = review_records
             saved["review_summary_html"] = review_summary(item, reviews, today)
         saved["waiting_details_html"] = waiting_details(
-            ListRecord(owner, item), local_today, names, the_list.unread_answer_ids(item),
+            ListRecord(owner, item), local_today, names, unread_answers,
             form_secret(reading.root), reviews, parked_until)
     return saved
 
@@ -837,6 +816,47 @@ def _mark_seen_update_read(keeper: staff.StaffId, item: the_list.ListItem,
             _ = the_list.mark_read(keeper, item.id, source=the_list.PAGE_SOURCE, update=update)
         except (OSError, the_list.ListError):
             pass
+
+
+def _replay_ask(keeper: staff.StaffId, item: the_list.ListItem, receipt: the_list.QuestionRequestReceipt,
+                status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    if item.state == the_list.ItemState.CLOSED:
+        return change_page.NoMessageDelivery()
+    question = next((question for question in item.questions
+                     if question.question_id == receipt.question_id and question.answer is None), None)
+    if question is None:
+        return change_page.NoMessageDelivery()
+    owner = None if isinstance(item.owner, the_list.UnassignedOwner) else item.owner
+    source = the_list.folder(keeper) / f"{item.id}.md"
+    target = change_page.list_question_target(source, item.id, item.number, item.title, keeper, alert_owner=owner)
+    saved = target.saved(question)
+    page = saved.page()
+    path = status.path(page, saved.source.row)
+    with status.locked():
+        view = change_page.question_delivery_view(status, saved)
+        attempt = view.attempt
+        if not isinstance(attempt, delivery_state.QuestionAttempt):
+            return change_page.NoMessageDelivery()
+        if isinstance(view, change_page.QuestionSendPermitted) and view.state is not delivery_state.QuestionSendState.FAILED:
+            return change_page.ready_and_claim_question(status, path, attempt, saved)
+        if isinstance(view, change_page.ResendBlocked):
+            status.defer_question(path)
+        return change_page.question_envelope(page, attempt)
+
+
+def _submit_ask(keeper: staff.StaffId, identity: str, request: the_list.PageRequest,
+                status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    """Serialize the receipt check and submission of List Ask requests."""
+    with exclusive(the_list.folder(keeper) / f".{identity}.ask.lock"):
+        item = the_list.load(keeper, identity)
+        receipt = next((entry.what for entry in item.log
+                        if entry.source == the_list.PAGE_SOURCE and isinstance(entry.what, the_list.QuestionRequestReceipt)
+                        and entry.what.request.request == request.request), None)
+        if receipt is None:
+            return the_list.ask_question(keeper, identity, request, status)
+        if receipt.request != request:
+            raise the_list.ListError("this request already has a different action or words")
+        return _replay_ask(keeper, item, receipt, status)
 
 
 def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = None) -> ListActionSubmission:
@@ -863,14 +883,11 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
                                page_request=the_list.PageRequest(request, "read", words))
         return change_page.NoMessageDelivery()
     item = the_list.load(morty.id, identity)
-    resend = re.fullmatch(r"resend-(Q[1-9]\d*)", action)
-    if action == "question" or resend is not None:
+    if action == "question":
         status = change_page.DeliveryStatus(root) if status is None else status
-        question = (the_list.resend_question(morty.id, identity, resend[1], request, status) if resend is not None
-                    else the_list.ask_question(morty.id, identity, the_list.PageRequest(request, "question", words), status))
+        question = _submit_ask(morty.id, identity, the_list.PageRequest(request, "question", words), status)
         if isinstance(question, change_page.MessageDelivery):
-            if resend is None:
-                _mark_seen_update_read(morty.id, item, prefix.seen_update)
+            _mark_seen_update_read(morty.id, item, prefix.seen_update)
             return ListQuestionDelivery(question, status)
         return question
     if action == "remove":
@@ -1032,7 +1049,7 @@ class ListQuery:
     @classmethod
     def read(cls, query: str, items: list[ListRecord]) -> ListQuery:
         fields = {name: values for name, values in parse_qs(query, keep_blank_values=True).items()
-                  if name in LIST_QUERY_FIELDS}
+                  if name in record_table.LIST_QUERY_FIELDS}
 
         def first(name: str) -> str:
             return fields.get(name, [""])[0]
@@ -1053,12 +1070,11 @@ class ListQuery:
                 keys -= {item}
         return cls({
             "show": show if show in ListChip and show != ListChip.ALL else "",
-            "owner": owner if any(entry.item.owner == owner for entry in items) else "",
-            "producer": producer if any(entry.item.producer == producer for entry in items) else "",
+            "owner": owner if owner and any(entry.item.owner == owner for entry in items) else "",
+            "producer": producer if producer and any(entry.item.producer == producer for entry in items) else "",
         }, first("q"), first(UNREAD_FIELD) == UNREAD_VALUE, keys, item, first("reveal") == "1")
 
-    def count_row(self, entry: ListRecord, text: SearchText, chip: ListChip,
-                  counts: dict[str, Counter[str]], search: str) -> bool:
+    def eligible(self, entry: ListRecord, text: SearchText, search: str, *, parked: bool) -> bool:
         item = entry.item
         if self.keys and entry.key not in self.keys:
             return False
@@ -1067,20 +1083,11 @@ class ListQuery:
         if search:
             search_values = {"number": str(item.number), "ownerName": text.owner, "title": text.title,
                              "state": STATE_SEARCH_TEXT[item.state],
-                             "parkingLabel": PARKED_SEARCH_LABEL if chip == ListChip.PARKED else ""}
+                             "parkingLabel": PARKED_SEARCH_LABEL if parked else ""}
             if not any((re.sub(pattern, "", search) if pattern else search) in search_values[field]
                        for field, pattern in SEARCH_FIELDS.items()):
                 return False
-        data = {"chip": chip, "owner": str(item.owner), "producer": item.producer}
-        excluded = sum(bit for name, field, bit, _ in FILTER_FACETS
-                       if self.selected[name] and data[field] != self.selected[name])
-        for name, field, _, count_mask in FILTER_FACETS:
-            if not excluded & count_mask:
-                counts[name]["all"] += 1
-                value = f"staff:{data[field]}" if name in STAFF_FILTERS else data[field]
-                if value != "all":
-                    counts[name][value] += 1
-        return not excluded
+        return True
 
     def reveals(self, entry: ListRecord, open_question: bool) -> bool:
         if self.item != entry.key:
@@ -1116,16 +1123,18 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     today = datetime.fromtimestamp(read_at, zone)
     ordered_items = [(entry, the_list.parking_active(entry.item.parked_until, today)) for entry in items]
     ordered_items.sort(key=lambda pair: pair[1])
+    park_deadline = min((deadline.timestamp() for entry, parked in ordered_items
+                         if parked and isinstance(deadline := entry.item.parked_until, datetime)), default=None)
+    deadline_attr = f' data-park-deadline="{park_deadline}"' if park_deadline is not None else ''
     secret = form_secret(root)
-    selection = ListQuery.read(query, items) if query else None
+    selection = ListQuery.read(query, items)
     chip_totals: dict[str, Counter[str]] = {facet.name: Counter() for facet in FILTER_FACETS}
-    search = normalize_search_text(selection.words.strip(QUERY_WHITESPACE)) if selection else ""
-    owners: Counter[the_list.ItemOwner] = Counter()
-    producers: Counter[the_list.ItemOwner] = Counter()
+    search = normalize_search_text(selection.words.strip(QUERY_WHITESPACE))
+    owners: set[the_list.ItemOwner] = set()
+    producers: set[the_list.ItemOwner] = set()
     rows: list[str] = []
     linked_row = ''
     deferred_links = False
-    chip_counts: Counter[ListChip] = Counter()
     shown = 0
 
     @cache
@@ -1136,17 +1145,19 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         return cell, owner.casefold(), normalize_search_text(owner)
 
     for index, (entry, parked) in enumerate(ordered_items):
-        owners[entry.item.owner] += 1
-        producers[entry.item.producer] += 1
+        owners.add(entry.item.owner)
+        producers.add(entry.item.producer)
         open_question = has_open_question(entry.item)
         visibility = the_list.question_visibility(entry.keeper, entry.item, status)
+        unread_answers = the_list.unread_answer_ids(entry.item)
         chip = list_chip(entry.item.state, parked=parked, open_question=open_question,
-                         unread_delivery=the_list.unread_delivery(entry.item))
-        chip_counts[chip] += 1
+                         unread_delivery=the_list.unread_delivery(entry.item), unread_answer=bool(unread_answers))
         owner_cell, owner_sort, owner_search = owner_display(entry.item.owner)
         search_text = SearchText(owner_search, normalize_search_text(entry.item.title))
-        visible = selection is None or selection.count_row(entry, search_text, chip, chip_totals, search)
-        linked = not visible and selection is not None and selection.reveals(entry, open_question)
+        visible = selection.eligible(entry, search_text, search, parked=parked) and record_table.count_filter_row(
+            FILTER_FACETS, {"chip": chip, "owner": entry.item.owner, "producer": entry.item.producer},
+            selection.selected, chip_totals, staff_filters=STAFF_FILTERS)
+        linked = not visible and selection.reveals(entry, open_question)
         shown += visible
         row_reviews = reviews
         if entry.item.reviews and (
@@ -1158,28 +1169,21 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             deferred_links = True
         row = item_rows(entry, names, today, index, secret, row_reviews, owner_cell=owner_cell, owner_sort=owner_sort,
                         search_text=search_text, parked=parked, open_question=open_question, visibility=visibility,
-                        hidden=not (visible or linked))
+                        unread_answers=unread_answers, hidden=not (visible or linked))
         if linked:
             linked_row = row
         else:
             rows.append(row)
-    shows = [record_table.Chip("all", "All", len(items)),
-             *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
-               for chip in ListChip if chip != ListChip.ALL)]
-    if selection is not None:
-        shows = [replace(chip, count=chip_totals["show"][chip.value]) for chip in shows]
-    else:
-        for name, totals in (("owner", owners), ("producer", producers)):
-            chip_totals[name].update({f"staff:{identity}": total for identity, total in totals.items()})
-            chip_totals[name]["all"] = totals.total()
+    shows = [record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_totals["show"][chip])
+             for chip in ListChip]
     owner_chips = staff_chips(members, owners, chip_totals["owner"])
     producer_chips = staff_chips(members, producers, chip_totals["producer"])
-    owner_selected = f'staff:{selection.selected["owner"]}' if selection and selection.selected["owner"] else "all"
-    producer_selected = f'staff:{selection.selected["producer"]}' if selection and selection.selected["producer"] else "all"
-    show_selected = (selection.selected["show"] or "all") if selection else "all"
-    check_unread = ' checked' if selection and selection.unread else ''
-    words = selection.words if selection else ''
-    hide_empty = ' hidden' if shown or selection is None else ''
+    owner_selected = f'staff:{selection.selected["owner"]}' if selection.selected["owner"] else "all"
+    producer_selected = f'staff:{selection.selected["producer"]}' if selection.selected["producer"] else "all"
+    show_selected = selection.selected["show"] or "all"
+    check_unread = ' checked' if selection.unread else ''
+    words = selection.words
+    hide_empty = ' hidden' if shown or not query else ''
     hide_link = '' if linked_row else ' hidden'
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
                       + '<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
@@ -1204,7 +1208,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     content = (STYLE + page_frame.title("The List", "list", action=new_item_dialog.title_button("list"), compact_actions=True)
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}"'
-               + f' data-park-retry-seconds="{park_retry}"'
+               + f' data-park-retry-seconds="{park_retry}"' + deadline_attr
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem">'
@@ -1327,6 +1331,7 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 
 # Use the Python case-folding table for browser search.
 SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
+          + review_legacy.SHOW_ALIAS_SCRIPT
           + record_table.DATE_TIME_SCRIPT + '''(() => {
 const chipsByQuestion=''' + json.dumps({
     str(open_question).lower(): {
@@ -1358,6 +1363,7 @@ const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + 
 const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed') return;
+ if(data.unread==='true' && data.unreadAnswer==='true') return 'needs-me';
  const byDelivery=chipsByQuestion[data.openQuestion][String(isParked(data))];
  return byDelivery[String(data.unreadDelivery==='true')][data.state];
 };
@@ -1380,7 +1386,38 @@ function refreshAfterListSave(needed){
  refreshNeeded ||= needed;
  if(saving) return;
  if(savedReview) void refreshSavedReview();
- else if(refreshNeeded || createdItem) void pageRefresh.refresh(true);
+ else if(refreshNeeded || parkExpiryOwed || createdItem) void pageRefresh.refresh(true);
+}
+let parkExpiryTimer,parkExpiryOwed=false;
+const parkExpiryObserver=new MutationObserver(refreshAfterParkExpiry);
+function parkPickerBlocksRefresh(){
+ const open=dateTimePickerOpen(content);
+ if(open && parkExpiryOwed)
+  parkExpiryObserver.observe(content,{subtree:true,childList:true,attributes:true,attributeFilter:['hidden']});
+ return open;
+}
+function refreshAfterParkExpiry(){
+ if(parkPickerBlocksRefresh()) return;
+ parkExpiryObserver.disconnect();
+ refreshAfterListSave(false);
+}
+function scheduleParkExpiry({readAt},requestStarted){
+ clearTimeout(parkExpiryTimer);
+ parkExpiryObserver.disconnect();
+ parkExpiryOwed=false;
+ if(!content.dataset.parkDeadline) return;
+ const expiresAt=requestStarted+(Number(content.dataset.parkDeadline)-readAt)*1000;
+ const schedule=()=>{
+  const delay=Math.ceil(expiresAt-performance.now());
+  // The browser cannot schedule a timeout longer than a signed 32-bit integer.
+  parkExpiryTimer=setTimeout(check,Math.max(0,Math.min(delay,2147483647)));
+ };
+ const check=()=>{
+  if(performance.now()<expiresAt){schedule();return;}
+  parkExpiryOwed=true;
+  refreshAfterParkExpiry();
+ };
+ schedule();
 }
 const drafts=new Map();
 const unparkFailures={
@@ -1448,7 +1485,8 @@ function syncUnread(item,form,unread,unreadSort){
   update.querySelector('[aria-label="No unread update"]')?.remove();
   if(!dot){const mark=document.createElement('span');mark.className='list-dot';mark.setAttribute('role','img');
    mark.setAttribute('aria-label','Unread update');update.prepend(mark);}
-  const canRead=!form.hasAttribute('data-waiting-actions') || item.dataset.unreadDelivery==='true';
+  const canRead=!form.hasAttribute('data-waiting-actions') ||
+   item.dataset.unreadDelivery==='true' || item.dataset.unreadAnswer==='true';
   if(!canRead) read?.remove();
   if(canRead && !read){
    const button=document.createElement('button');button.name='action';button.value='read';
@@ -1541,18 +1579,17 @@ async function markOpenedAnswerRead(item,watch){
 const tableView=createRecordTable({content:()=>content,
  shows,
  defaultShow:'all',
- queryFields:''' + json.dumps(LIST_QUERY_FIELDS) + r''',
  normalizeWords,
  expandFilters:params=>{
-  const show=params.get('show') || '',state=params.get('state') || '';
+  const show=params.get('show') || '';
   if(show===unreadField) params.set(unreadField,unreadValue);
   else if(params.has(unreadField) && params.get(unreadField)!==unreadValue) params.set(unreadField,'');
-  if(params.has('show') || params.has('state')){
+  expandStateAlias(params,(show,state)=>{
+   show=show || '';
    const aliases=Object.hasOwn(showAliases,show) ? showAliases[show] : showAliases['*'];
    const alias=Object.hasOwn(aliases,state) ? state : '';
-   params.set('show',Object.hasOwn(aliases,alias) ? aliases[alias] : show);
-   params.delete('state');
-  }
+   return Object.hasOwn(aliases,alias) ? aliases[alias] : show;
+  });
   const [owner,showrunner]=ownerQueryKeys;
   if(params.has(showrunner)){
    params.set(owner,params.get(owner) || params.get(showrunner));
@@ -1561,6 +1598,7 @@ const tableView=createRecordTable({content:()=>content,
  },
  filters:['producer',unreadField],
  staffChipFilters:staffFilters,
+ encodedStaffFields:true,
  beforeApply:rememberLogPositions,
  applied:(_items,{show,filters})=>{
   const nextUnreadShow=filters.unread ? show : '';
@@ -1654,13 +1692,14 @@ function bindFeedbackForm(form){
   showActionFailure(notice,tableView.actionFailure(item));
   const waitingForm=form.hasAttribute('data-waiting-actions');
   const confirmed={state:item.dataset.state,parked:item.dataset.parked,
-   unread:item.dataset.unread==='true',unreadDelivery:item.dataset.unreadDelivery,
+   unread:item.dataset.unread==='true',unreadDelivery:item.dataset.unreadDelivery,unreadAnswer:item.dataset.unreadAnswer,
    unreadSort:JSON.parse(item.dataset.sortValues)[7]};
   const syncConfirmed=()=>{
    item.dataset.state=confirmed.state;
    item.dataset.parked=confirmed.parked;
    item.dataset.unreadDelivery=confirmed.unreadDelivery;
-   unpark.hidden=confirmed.parked==='false' || confirmed.state==='Closed';
+   item.dataset.unreadAnswer=confirmed.unreadAnswer;
+   unpark.hidden=!isParked(confirmed) || confirmed.state==='Closed';
    syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
   };
   const applySavedState=(result,keepDetailFocus=false)=>{
@@ -1678,6 +1717,7 @@ function bindFeedbackForm(form){
    if(['true','false'].includes(result.parked))
     confirmed.parked=result.parked_until===deliveryParking ? deliveryParking : result.parked;
    if(['true','false'].includes(result.unread_delivery)) confirmed.unreadDelivery=result.unread_delivery;
+   if(['true','false'].includes(result.unread_answer)) confirmed.unreadAnswer=result.unread_answer;
    if(['true','false'].includes(result.unread)){
     confirmed.unread=unread;
     confirmed.unreadSort=unread ? (result.unread_sort ?? confirmed.unreadSort) : 0;
@@ -1768,7 +1808,7 @@ function bindFeedbackForm(form){
    const changesParking=parks || action==='unpark';
    const focusUnpark=action==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
-   const asksQuestion=action==='question' || action.startsWith('resend-');
+   const asksQuestion=action==='question';
    if(usesWords && !words.value.trim()) return;
    const retry=parks ? undefined : matching(action);
    const parkingTime=parks ? parkRequestTime(form,submitter,zone,parkSettings(),until.value) : '';
@@ -1958,8 +1998,9 @@ async function readListCounts(source){
  }
 }
 async function refresh(_supersede=false,current=()=>true){
- if(saving || dateTimePickerOpen(content)) return;
+ if(saving || parkPickerBlocksRefresh()) return;
  const signal=AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000);
+ const requestStarted=performance.now();
  const response=await fetch(location.pathname,{cache:'no-store',signal});
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
@@ -1967,7 +2008,7 @@ async function refresh(_supersede=false,current=()=>true){
  if(!fresh) throw new Error('The page has no list.');
  decodeListKeys(fresh);
  await tableView.settled();
- if(saving || dateTimePickerOpen(content) || !current()) return;
+ if(!current() || saving || parkPickerBlocksRefresh()) return;
  refreshNeeded=false;
  const top=scrollY,field=listOwnsFocus() ? document.activeElement : null;
  const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
@@ -2008,7 +2049,9 @@ async function refresh(_supersede=false,current=()=>true){
   tableView.followItemLink({inheritFilters:true});
  } else scrollTo({top,behavior:'instant'});
  watchLinkedAnswer();
- return pageRefreshFacts(page);
+ const facts=pageRefreshFacts(page);
+ scheduleParkExpiry(facts,requestStarted);
+ return facts;
 }
 const reviewDialog=document.querySelector('[data-list-review-dialog]');
 const reviewClose=reviewDialog.querySelector('button');
@@ -2138,6 +2181,7 @@ addEventListener('hashchange',event=>{
  watchLinkedAnswer();
 });
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+scheduleParkExpiry(pageRefreshFacts(),performance.getEntriesByType('navigation')[0]?.requestStart ?? 0);
 document.addEventListener('review-item-created',event=>{
  if(typeof event.detail?.list_key!=='string') return;
  createdItem=event.detail.list_key;

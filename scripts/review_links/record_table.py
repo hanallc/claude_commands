@@ -4,8 +4,10 @@ from __future__ import annotations
 import html
 import json
 import re
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import NamedTuple
 from urllib.parse import quote
 
 from scripts.lib import conf
@@ -17,9 +19,44 @@ class Chip:
     value: str
     label_html: str
     count: int | None = None
+    owner_name: str | None = None
+    hidden: bool = False
+
+
+class FilterFacet(NamedTuple):
+    name: str
+    field: str
+    bit: int
+    count_mask: int
+
+
+def filter_facets(fields: Mapping[str, str]) -> tuple[FilterFacet, ...]:
+    """Give each count a mask that excludes its own filter."""
+    all_bits = (1 << len(fields)) - 1
+    return tuple(FilterFacet(name, field, 1 << index, all_bits ^ (1 << index))
+                 for index, (name, field) in enumerate(fields.items()))
+
+
+def count_filter_row(facets: tuple[FilterFacet, ...], data: Mapping[str, str],
+                     selected: Mapping[str, str], counts: Mapping[str, Counter[str]], *,
+                     staff_filters: tuple[str, ...]) -> bool:
+    """Count an eligible row for every facet and return whether it matches."""
+    excluded = sum(bit for name, field, bit, _ in facets
+                   if (choice := selected.get(name)) and choice != data[field]
+                   and (name != "show" or choice != "all"))
+    for name, field, _, count_mask in facets:
+        if excluded & count_mask:
+            continue
+        total = counts[name]
+        total["all"] += 1
+        value = f"staff:{data[field]}" if name in staff_filters else data[field]
+        if value != "all":
+            total[value] += 1
+    return not excluded
 
 
 OWNER_QUERY_KEYS = ("owner", "showrunner")
+LIST_QUERY_FIELDS = ("show", "unread", *OWNER_QUERY_KEYS, "producer", "q", "key", "item", "reveal", "state")
 
 
 def identity_attribute(value: str) -> str:
@@ -31,7 +68,7 @@ def identity_attribute(value: str) -> str:
 
 def chip_row(name: str, chips: Iterable[Chip], selected: str, *, encode_values: bool = False) -> str:
     """Render a named filter with All as its first choice."""
-    key = name.lower().replace(' ', '-')
+    key = html.escape(name.lower().replace(' ', '-'), quote=True)
     choices = {chip.value: chip for chip in chips}
     all_chip = choices.pop('all', Chip('all', 'All'))
     selected = selected if selected in choices else 'all'
@@ -40,22 +77,15 @@ def chip_row(name: str, chips: Iterable[Chip], selected: str, *, encode_values: 
         value = identity_attribute(chip.value) if encode_values else html.escape(chip.value, quote=True)
         pressed = str(chip.value == selected).lower()
         count = '' if chip.count is None else str(chip.count)
-        buttons.append(f'<button type="button" id="filter-{html.escape(key, quote=True)}-{quote(chip.value, safe="")}"'
+        owner = (f' data-owner-name="{html.escape(chip.owner_name, quote=True)}"'
+                 if chip.owner_name is not None else '')
+        hidden = ' hidden' if chip.hidden else ''
+        buttons.append(f'<button type="button"{owner}{hidden} id="filter-{key}-{quote(chip.value, safe="")}"'
                        + f' data-filter-value="{value}" aria-pressed="{pressed}" data-filter-count="{count}">'
-                       + f'{chip.label_html}<b>{count}</b></button>')
-    return labelled_chip_row(name, ''.join(buttons), filter_key=key)
-
-
-def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_classes: str = '', chip_id: str = '') -> str:
-    """Render a visible label and a group of filter buttons."""
+                       + f'{chip.label_html} <b>{count}</b></button>')
     label = html.escape(name, quote=True)
-    group = f' role="group" aria-label="{label}"'
-    key = f' data-filter-row="{html.escape(filter_key, quote=True)}"' if filter_key else ''
-    classes = f' class="{html.escape(chip_classes, quote=True)}"' if chip_classes else ''
-    identity = f' id="{html.escape(chip_id, quote=True)}"' if chip_id else ''
-    return (f'<div class="record-filter-row"{group + key if filter_key else ""}>'
-            + f'<span aria-hidden="true">{label}</span>'
-            + f'<div{classes}{identity}{"" if filter_key else group}>{buttons}</div></div>')
+    return (f'<div class="record-filter-row" role="group" aria-label="{label}" data-filter-row="{key}">'
+            + f'<span aria-hidden="true">{label}</span><div id="list-{key}">' + ''.join(buttons) + '</div></div>')
 
 
 def words_box(element_id: str, placeholder: str, *, value: str = '') -> str:
@@ -147,7 +177,8 @@ border:0;border-radius:8px;background:none;color:var(--ink-2);font-size:22px;cur
 .record-filter-row>span{color:var(--ink-2);font-size:13px}
 .record-filter-row>div{display:flex;flex-wrap:wrap;gap:6px}
 [data-filter-row] button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
-color:var(--ink);border:1px solid var(--line);border-radius:999px;background:var(--card);padding:4px 10px;margin:0}
+color:var(--ink);border:1px solid var(--line);border-radius:999px;background:var(--card);padding:4px 10px;margin:0;
+max-width:100%;overflow-wrap:anywhere}
 [data-filter-row] button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
 color:var(--filter-selected-ink)}
 .record-filter-row button[aria-pressed=true] .staff-name{color:inherit!important}
@@ -269,7 +300,25 @@ min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;colo
 </style>'''
 
 
-SCRIPT = page_frame.ACTION_STATUS_SCRIPT + 'const ownerQueryKeys=' + json.dumps(OWNER_QUERY_KEYS) + r''';
+PLACE_SCRIPT = 'const listQueryFields=' + json.dumps(LIST_QUERY_FIELDS) + r''';
+function recordPlaceParams({expandFilters}={}, {search,hash}=location){
+ const params=new URLSearchParams(search);
+ expandFilters?.(params);
+ const preferred=new Set(listQueryFields.filter(key=>params.has(key)));
+ // The server cannot see the fragment, so its values apply after load.
+ const fragment=new URLSearchParams(hash.slice(1));
+ expandFilters?.(fragment);
+ for(const key of new Set(fragment.keys())) if(!preferred.has(key)) params.delete(key);
+ for(const [key,value] of fragment) if(!preferred.has(key)) params.append(key,value);
+ return params;
+}
+'''
+
+SCRIPT = PLACE_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + 'const ownerQueryKeys=' + json.dumps(OWNER_QUERY_KEYS) + r''';
+const staffChipPrefix='staff:';
+const encodeIdentity=value=>value.replace(/[%\r\0]/g,character=>encodeURIComponent(character));
+const staffChipId=value=>decodeURIComponent(value.slice(staffChipPrefix.length));
+const staffChipValue=id=>staffChipPrefix+encodeIdentity(id);
 const filterControl={
  wordValues:new WeakMap(),
  getWords(control){return this.wordValues.get(control) ?? '';},
@@ -277,7 +326,10 @@ const filterControl={
   this.wordValues.set(control,value);
   if(control.value!==value) control.value=value;
  },
+ row(root,name){return root.querySelector('[data-filter-row="'+name+'"]');},
  buttons(row){return [...row.querySelectorAll('[data-filter-value]')];},
+ value(button){return button.dataset.filterValue;},
+ ownerId(button){return this.value(button)==='all' ? '' : staffChipId(this.value(button));},
  setCounts(row,counts){
   for(const button of this.buttons(row)){
    const count=Object.hasOwn(counts,button.dataset.filterValue) ? counts[button.dataset.filterValue] : 0;
@@ -292,11 +344,31 @@ const filterControl={
    button.hidden=button.dataset.filterValue!=='all' && !visible.has(button.dataset.filterValue);
   return this.select(row,selected?.dataset.filterValue);
  },
- select(row,value){
+ select(row,value,{allowHidden=false,fallback='all'}={}){
   const buttons=this.buttons(row);
-  const selected=buttons.some(button=>!button.hidden && button.dataset.filterValue===value) ? value : 'all';
+  const selected=buttons.some(button=>(allowHidden || !button.hidden) && button.dataset.filterValue===value) ? value : fallback;
   for(const button of buttons) button.setAttribute('aria-pressed',String(button.dataset.filterValue===selected));
   return selected;
+ },
+ updateOwners(row,owners){
+  const [all,...choices]=this.buttons(row);
+  const current=new Map(choices.map(button=>[this.ownerId(button),button]));
+  for(const [id,button] of current)
+   if(!owners.has(id) && button.getAttribute('aria-pressed')!=='true') button.remove();
+  for(const [id,{name,label}] of owners){
+   let button=current.get(id);
+   if(!button){
+    button=all.cloneNode(true);
+    button.id='filter-owner-'+encodeURIComponent(staffChipPrefix+id).replace(/[!'()*]/g,character=>
+     '%'+character.charCodeAt(0).toString(16).toUpperCase());
+    button.dataset.filterValue=staffChipValue(id);
+    button.setAttribute('aria-pressed','false');
+    all.parentElement.append(button);
+   }
+   const count=button.querySelector('b');
+   button.dataset.ownerName=name;
+   button.innerHTML=label+' ';button.append(count);
+  }
  },
  bind(control,change){
   control.addEventListener('filterchange',event=>change(event.detail));
@@ -321,22 +393,13 @@ const filterControl={
     clear();
    });
   }else{
-   for(const button of this.buttons(control))
-    button.addEventListener('click',()=>{if(!button.hidden) emit(this.select(control,button.dataset.filterValue));});
+   control.addEventListener('click',event=>{
+    const button=event.target.closest('[data-filter-value]');
+    if(button && !button.hidden) emit(this.select(control,button.dataset.filterValue));
+   });
   }
  }
 };
-function recordPlaceParams({queryFields=[],expandFilters}={}){
- const params=new URLSearchParams(location.search);
- expandFilters?.(params);
- const preferred=new Set(queryFields.filter(key=>params.has(key)));
- // The server cannot see the fragment, so its values apply after load.
- const fragment=new URLSearchParams(location.hash.slice(1));
- expandFilters?.(fragment);
- for(const key of new Set(fragment.keys())) if(!preferred.has(key)) params.delete(key);
- for(const [key,value] of fragment) if(!preferred.has(key)) params.append(key,value);
- return params;
-}
 function recordItemLink(params,resolve){
  const item=params.get('jump') || params.get('item'),saved=history.state?.recordTable;
  return item && (!saved || saved.pendingItem) ? resolve(item) : item;
@@ -463,41 +526,26 @@ const words=()=>content.querySelector('[data-filter-words]') ?? content.querySel
 const sharedWords=()=>words().hasAttribute?.('data-filter-words');
 const currentWords=()=>sharedWords() ? filterControl.getWords(words()) : words().value;
 if(sharedWords()) addEventListener('pageshow',()=>setTimeout(()=>filterControl.setWords(words(),currentWords()),0));
-const chipRow=name=>content.querySelector('[data-filter-row="'+name+'"]');
-const staffChipPrefix='staff:';
+const chipRow=name=>filterControl.row(content,name);
 const isStaffChipFilter=name=>options.staffChipFilters?.includes(name);
-const encodeIdentity=value=>value.replace(/[%\r\0]/g,character=>encodeURIComponent(character));
 const filterChipValue=(name,value)=>value ? (isStaffChipFilter(name) ? staffChipPrefix+value : value) : 'all';
 function filterSelection(name){
  const row=chipRow(name),all=name==='show' ? 'all' : '';
  if(row){
-  const filterValue=value=>value==='all' ? all : isStaffChipFilter(name) ? decodeURIComponent(value.slice(staffChipPrefix.length)) : value;
+  const filterValue=value=>value==='all' ? all : isStaffChipFilter(name) ? staffChipId(value) : value;
   return {
-   set(value){
+   set(value,fallback='all'){
     const stored=isStaffChipFilter(name) ? encodeIdentity(value) : value;
-    return filterValue(filterControl.select(row,filterChipValue(name,stored)));
+    return filterValue(filterControl.select(row,filterChipValue(name,stored),{allowHidden:true,fallback}));
    },
    bind(change){filterControl.bind(row,value=>change(filterValue(value)));},
    setCounts(counts){filterControl.setCounts(row,counts);}
   };
  }
  const control=content.querySelector('#list-'+name);
- if(control?.matches('input[type="checkbox"]')) return {
+ return {
   set(value){control.checked=value===control.value;return control.checked ? control.value : '';},
   bind(change){control.addEventListener('change',()=>change(control.checked ? control.value : ''));}
- };
- const attribute='data-'+name+'-chip';
- return {
-  set(value){
-   control.querySelectorAll('['+attribute+']').forEach(button=>button.setAttribute('aria-pressed',String(button.getAttribute(attribute)===value)));
-   return value;
-  },
-  bind(change){
-   control.addEventListener('click',event=>{
-   const button=event.target.closest('['+attribute+']');
-   if(button) change(button.getAttribute(attribute));
-  });
-  }
  };
 }
 function placeParams(){
@@ -522,6 +570,7 @@ function readPlace(params,followingItemLink=false){
  sourceOwner=params.get('source-owner') || '';
  for(const name of filterNames) filters[name]=params.get(name) || '';
  if(!options.shows.includes(show)) show=defaultShow;
+ show=options.selectShow?.(show,type) ?? show;
  if(!columns.includes(sort)) sort='';
  const item=params.get('item');if(item && !followingItemLink){
   if(keys.size) keys.add(item);
@@ -661,22 +710,24 @@ function canRevealLinked(item,selection){
 }
 function matches(item,selection,counts,allowExpanded=false){
  if(!isSelected(item)) return false;
- if(!options.eligibleChip) return options.visible(item.dataset,selection);
- const data=item.dataset;
+ const data=item.dataset,visible=options.visible;
+ if(visible && !counts) return visible(data,selection);
  let chip=options.eligibleChip(data,selection.query,selection);
  const expanded=!chip && allowExpanded && opened.has(data.key) && options.expandedSelection?.(data,selection);
  if(expanded) chip=options.eligibleChip(data,expanded.query,expanded);
- if(!chip) return false;
+ if(!chip) return visible ? visible(data,selection) : false;
  let excluded=0;
+ const fieldValue=field=>field==='chip' ? chip : data[field];
  for(const [name,field,bit] of options.filterFacets){
   const chosen=selection[name] ?? selection.filters[name];
   if(!chosen || (name==='show' && chosen==='all')) continue;
-  const actual=field==='chip' ? chip : isStaffChipFilter(name) ? decodeURIComponent(data[field]) : data[field];
-  if(chosen===actual) continue;
+  const raw=fieldValue(field),actual=options.encodedStaffFields && isStaffChipFilter(name) ? decodeURIComponent(raw) : raw;
+  if(chosen===actual || chosen===options.facetAlternates?.[name]?.(data)) continue;
   excluded|=bit;
  }
  if(counts) for(const [name,field,,countMask] of options.filterFacets){
   if(excluded & countMask) continue;
+  if(options.countFacet && !options.countFacet(name,data,selection)) continue;
   const values=counts[name];
   // A change to Show ends the exception for an open read row.
   if(expanded && name==='show'){
@@ -684,10 +735,16 @@ function matches(item,selection,counts,allowExpanded=false){
    continue;
   }
   values.all=(values.all ?? 0)+1;
-  const value=filterChipValue(name,field==='chip' ? chip : data[field]);
+  const raw=fieldValue(field);
+  const value=filterChipValue(name,!options.encodedStaffFields && isStaffChipFilter(name) ? encodeIdentity(raw) : raw);
   if(value!=='all') values[value]=(values[value] ?? 0)+1;
+  const alternate=options.facetAlternates?.[name]?.(data);
+  if(alternate && alternate!==raw){
+   const other=filterChipValue(name,isStaffChipFilter(name) ? encodeIdentity(alternate) : alternate);
+   values[other]=(values[other] ?? 0)+1;
+  }
  }
- return !excluded;
+ return visible ? visible(data,selection) : !excluded;
 }
 const normalizeWords=value=>options.normalizeWords?.(value) ?? value.trim().toLowerCase();
 function currentSelection(overrides={}){
@@ -719,6 +776,8 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(normalizeOwner) owner=options.selectOwner?.({owner,type,query:normalizeWords(query),keys}) ?? owner;
  owner=filterSelection('owner').set(owner);
  if(previousOwner && !owner) sourceOwner='';
+ if(chipRow('type')) filterSelection('type').set(type,null);
+ show=options.selectShow?.(show,type) ?? show;
  show=filterSelection('show').set(show);
  if(!sharedWords()) words().value=query;
  for(const name of filterNames)
@@ -925,6 +984,7 @@ function bind(){
  });
  filterSelection('owner').bind(value=>{if(value===owner) return;owner=value;sourceOwner='';changeFilter();});
  filterSelection('show').bind(value=>{if(value===show) return;show=value;changeFilter();});
+ if(chipRow('type')) filterSelection('type').bind(value=>{if(value===type) return;type=value;changeFilter();});
  for(const name of filterNames)
   filterSelection(name).bind(value=>{if(value===filters[name]) return;filters[name]=value;changeFilter();});
  if(sharedWords()) filterControl.bind(words(),value=>{if(value!==query){query=value;changePlace();}});
@@ -941,9 +1001,6 @@ function bind(){
   apply(true,{animate:true});
   if(expanded && !item.hidden) options.itemOpened?.(item);
  });
- content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
-  type=button.dataset.typeChip;changeFilter();
- }));
 }
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
  revealMatchingItem(key){

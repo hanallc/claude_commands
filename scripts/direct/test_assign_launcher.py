@@ -1081,7 +1081,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(self.turn_starts, 1)
         prompt = (self.session_dir / f"phases/7/{name}_prompt.txt").read_text()
         self.assertIn(self.prompt.read_text().strip(), prompt)
-        for text in ("detached_runs.py start", "Simple, Fast and Beautiful", "poll"):
+        for text in ("detached_runs.py start", "--kind python-tests before --", "Simple, Fast and Beautiful", "poll"):
             self.assertIn(text, prompt)
         manifest = self.session_dir / "phases/7/dispatch_1_paths.json"
         self.assertEqual(read_object(manifest), {"worker": name, "round": 1,

@@ -518,12 +518,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     self.review_response(content, 'application/json; charset=utf-8',snapshot.payload_gzip)
                     return None
                 else:
-                    content = snapshot.render(show=fields.get('show',['open'])[0])
+                    filters = parse_qs(route.query, keep_blank_values=True)
+                    show = filters.get('show', filters.get('state', ['open']))[0]
+                    kind = filters.get('type', [''])[0]
+                    content = snapshot.render(show=show or 'open', kind=kind)
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
                 return None
-            prepared = snapshot.page_gzip if fields.get('show',['open'])[0]=='open' else b''
+            prepared = snapshot.page_gzip if content is snapshot.page else b''
             owned = owned_document(content, "review")
             self.review_response(owned, 'text/html; charset=utf-8', prepared if owned is content else b'')
             return None
@@ -1308,7 +1311,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         try:
             action = fields["action"][0]
-            state = "saved" if action.startswith("resend-") else {"read": "read", "question": "saved"}.get(action, "sent")
+            state = {"read": "read", "question": "saved"}.get(action, "sent")
             current = list_page.saved_action_state(fields["keeper"][0], fields["id"][0],
                                                    status=server.delivery_status,
                                                    review_records=server.list_review_records())
@@ -1545,6 +1548,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.page_captures: PageCaptures = PageCaptures()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
+        self.question_recovery: threading.Thread | None = None
+        self.alert_recovery: threading.Thread | None = None
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
         self.module_stamps: dict[Path, tuple[int, int] | ModuleStampUnavailable] = loaded_module_stamps()
         if mode is ServerMode.LIVE:
@@ -1736,6 +1741,16 @@ class ReviewLinksServer(ThreadingHTTPServer):
                             return
                     raise CodeChanged(f"code changed: {path}")
             self.module_stamps.update(stamps)
+            if (self.delivery_status.has_deferred_questions()
+                    and (self.question_recovery is None or not self.question_recovery.is_alive())):
+                self.question_recovery = threading.Thread(
+                    target=change_page.recover_deferred_questions, args=(self.delivery_status,), daemon=True)
+                self.question_recovery.start()
+            if (self.delivery_status.has_deferred_alerts()
+                    and (self.alert_recovery is None or not self.alert_recovery.is_alive())):
+                self.alert_recovery = threading.Thread(
+                    target=self.delivery_status.recover_deferred_alerts, daemon=True)
+                self.alert_recovery.start()
 
 
 def main(arguments: list[str]) -> int:

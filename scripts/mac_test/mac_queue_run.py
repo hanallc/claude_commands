@@ -21,16 +21,20 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 import os
+import select
+import signal
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import TextIO, TypedDict, cast
 import uuid
 
-from scripts.lib import conf
+from scripts.lib import conf, process_group
+from scripts.lib.atomic_file import write_text_atomic
 
 
 def admission_command() -> list[str]:
@@ -61,13 +65,24 @@ def placement_arguments(episode: str, since: float, pid: int, worktree: Path, pa
         "--assignment-file", str(assignment_file), "--token", "none", "--", *argv]
 
 
-def remote_wrapper(work: str, on_close: str, grace_polls: int) -> str:
+def remote_wrapper(work: str, on_close: str, grace_polls: int, *, owned_close: bool = False) -> str:
     """Run the work in the SSH session's process group, and stop the work when the SSH input closes.
 
     zsh refuses job control without a terminal, so the work shares the session's group. When the
     input closes, the watcher ends every other process of the group, then runs `on_close` (work
     such as a GUI app that started outside the group).
     """
+    if owned_close:
+        # The gate hook stops the guest. Leave the hook alive until it finishes.
+        return ("work=" + shlex.quote(work) + "\non_close=" + shlex.quote(on_close) + r"""
+exec 3<&0
+{
+    read -r _ <&3
+    exec /bin/zsh -c "$on_close"
+} </dev/null >/dev/null 2>&1 &!
+/bin/zsh -c "$work" </dev/null
+printf '\nmac_exit=%s\n' $?
+""")
     return ("work=" + shlex.quote(work) + "\non_close=" + shlex.quote(on_close)
             + f"\ngrace_polls={grace_polls}" + r"""
 exec 3<&0
@@ -92,12 +107,13 @@ printf '\nmac_exit=%s\n' $code
 """)
 
 
-def remote_command(placement: MacPlacement, cwd: str, argv: list[str], on_close: str) -> list[str]:
+def remote_command(placement: MacPlacement, cwd: str, argv: list[str], on_close: str,
+                   *, owned_close: bool = False) -> list[str]:
     work = ("cd " + shlex.quote(cwd) + " && " if cwd else "")
     work += "MAC_PLACEMENT=" + shlex.quote(placement.episode + "/" + placement.attempt) + " " + shlex.join(argv)
     # Ten polls a second while the group ends.
     grace_polls = max(1, math.ceil(conf.read("mac_gate").number("terminate_grace_seconds") * 10))
-    wrapper = remote_wrapper(work, on_close, grace_polls)
+    wrapper = remote_wrapper(work, on_close, grace_polls, owned_close=owned_close)
     return ["ssh", "-o", "BatchMode=yes", placement.host, "/bin/zsh -c " + shlex.quote(wrapper)]
 
 
@@ -132,7 +148,7 @@ printf 'mac_stopped=%s\\n' "$group"
     return result.returncode == 0 and result.stdout.strip() == f"mac_stopped={remote.group}"
 
 
-def stop_command(process: subprocess.Popen[str]) -> None:
+def stop_command(process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
         process.terminate()
         try:
@@ -152,38 +168,44 @@ def capture_command(command: list[str]) -> tuple[int, str]:
             stop_command(process)
 
 
-def stream_remote(command: list[str], remote: RemoteRun) -> int:
-    # The SSH input stays open and empty while this process lives; the Mac wrapper stops the work when it closes.
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
-                          errors="replace") as process:
-        try:
-            remote.state = RemoteState.LIVE
-            assert process.stdout is not None
-            last = ""
-            for line in cast(TextIO, process.stdout):
-                if line.startswith("mac_group=") and line.removeprefix("mac_group=").strip().isdigit():
-                    remote.group = int(line.removeprefix("mac_group="))
-                    continue
-                print(line, end="", flush=True)
-                last = line.rstrip("\n")
-            ssh_status = process.wait()
-            if last.startswith("mac_exit=") and last.removeprefix("mac_exit=").isdigit():
-                remote.state = RemoteState.EXITED
-                return int(last.removeprefix("mac_exit="))
-            print("mac queue: the Mac returned no exit status", file=sys.stderr)
-            return ssh_status or 255
-        finally:
-            stop_command(process)
+def stream_remote(command: list[str], remote: RemoteRun, ssh: contextlib.ExitStack) -> int:
+    process = ssh.enter_context(subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"))
+    _ = ssh.callback(stop_command, process)
+    remote.state = RemoteState.LIVE
+    assert process.stdout is not None
+    last = ""
+    for line in cast(TextIO, process.stdout):
+        if line.startswith("mac_group=") and line.removeprefix("mac_group=").strip().isdigit():
+            remote.group = int(line.removeprefix("mac_group="))
+            continue
+        print(line, end="", flush=True)
+        last = line.rstrip("\n")
+    ssh_status = process.wait()
+    if last.startswith("mac_exit=") and last.removeprefix("mac_exit=").isdigit():
+        remote.state = RemoteState.EXITED
+        return int(last.removeprefix("mac_exit="))
+    print("mac queue: the Mac returned no exit status", file=sys.stderr)
+    return ssh_status or 255
 
 
-def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str], environment: dict[str, str]) -> int:
+def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str],
+                 environment: dict[str, str], *, interrupt_prepare: bool = False) -> int:
     with subprocess.Popen([script, phase, str(argv_file), *arguments], env=environment, text=True) as process:
         try:
             return process.wait()
+        except KeyboardInterrupt:
+            if interrupt_prepare and process.poll() is None:
+                # Let prepare stop its commands and remove its temporary refs.
+                process.send_signal(signal.SIGINT)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    _ = process.wait(timeout=conf.read("mac_gate").number("terminate_grace_seconds"))
+            raise
         finally:
             stop_command(process)
 
 
+MAC_BUSY_STATUS = 78
 RUNS = ".local/state/mac-queue/runs"
 RECEIPTS = ".local/state/mac-queue/receipts"
 
@@ -209,7 +231,8 @@ def run_directory(episode: str) -> Generator[Path]:
         try:
             yield directory
         finally:
-            shutil.rmtree(directory, ignore_errors=True)
+            if not (directory / "run.json").exists():
+                shutil.rmtree(directory, ignore_errors=True)
     finally:
         os.close(descriptor)
 
@@ -232,8 +255,12 @@ def clean_ended_runs(environment: dict[str, str]) -> None:
             record = directory / "run.json"
             if record.exists():
                 saved = cast(SavedRun, json.loads(record.read_text()))
-                status = run_callback(saved["lifecycle_script"], "cleanup", directory / "argv.json",
-                                      saved["arguments"], {**environment, "MAC_QUEUE_HOST": saved["host"]})
+                try:
+                    status = run_callback(saved["lifecycle_script"], "cleanup", directory / "argv.json",
+                                          saved["arguments"], {**environment, "MAC_QUEUE_HOST": saved["host"]})
+                except OSError as error:
+                    print(f"mac queue: cleanup of an ended run failed: {error}; kept {directory}", file=sys.stderr)
+                    continue
                 if status:
                     print(f"mac queue: cleanup of an ended run failed ({status}); kept {directory}", file=sys.stderr)
                     continue
@@ -250,6 +277,9 @@ class Arguments(argparse.Namespace):
     worktree: Path = Path()
     cwd: str = ""
     lifecycle_script: str = ""
+    caller_fd: int = -1
+    no_wait: bool = False
+    owned_close: bool = False
     argv: list[str] = []
 
 
@@ -271,7 +301,7 @@ def run(args: Arguments) -> int:
     assignment_file = receipts / (episode + ".json")
     _ = assignment_file.write_text(json.dumps({"episode": episode, "pid": pid}))
     assignment_file.chmod(0o600)
-    with run_directory(episode) as directory:
+    with run_directory(episode) as directory, contextlib.ExitStack() as ssh:
         argv_file = directory / "argv.json"
         callback_environment = dict(os.environ)
         lease_descriptor = -1
@@ -279,7 +309,7 @@ def run(args: Arguments) -> int:
             while True:
                 code, output = capture_command(admission_command() + placement_arguments(episode, since, pid,
                     args.worktree, args.package, args.kind, source_key, session, assignment_file, command))
-                if code != 78:
+                if code != MAC_BUSY_STATUS or args.no_wait:
                     break
                 print(output, end="", flush=True)
                 time.sleep(conf.read("build_admission").number("waiting_pass_seconds"))
@@ -292,11 +322,12 @@ def run(args: Arguments) -> int:
                 clean_ended_runs(callback_environment)
                 on_close = ""
                 if args.lifecycle_script:
-                    prepared = True
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
                                        "host": placement.host}
-                    _ = (directory / "run.json").write_text(json.dumps(saved))
-                    status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command, callback_environment)
+                    write_text_atomic(directory / "run.json", json.dumps(saved))
+                    prepared = True
+                    status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command,
+                                          callback_environment, interrupt_prepare=args.owned_close)
                     if status == 0:
                         command = cast(list[str], json.loads(argv_file.read_text()))
                         close_path = argv_file.with_suffix(".json.close")
@@ -310,18 +341,23 @@ def run(args: Arguments) -> int:
                 if status == 0:
                     # A run that ends before the Mac answers reports a failure, not success.
                     status = 1
-                    status = stream_remote(remote_command(placement, args.cwd, command, on_close), remote)
+                    if args.owned_close and not on_close:
+                        raise ValueError("the run needs a close hook")
+                    status = stream_remote(remote_command(placement, args.cwd, command, on_close,
+                                                          owned_close=args.owned_close), remote, ssh)
         except (OSError, ValueError) as error:
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
         finally:
+            if not args.owned_close:
+                ssh.close()
             safe = remote.state != RemoteState.LIVE
-            if not safe:
+            if not safe and not args.owned_close:
                 try:
                     safe = stop_remote(placement, remote)
                 except OSError:
                     safe = False
-            if prepared and safe:
+            if prepared and (safe or args.owned_close):
                 try:
                     cleanup_status = run_callback(args.lifecycle_script, "cleanup", argv_file, original_command, callback_environment)
                 except OSError as error:
@@ -330,6 +366,13 @@ def run(args: Arguments) -> int:
                 if cleanup_status:
                     print(f"mac queue: lifecycle cleanup failed ({cleanup_status})", file=sys.stderr)
                     status = status or cleanup_status
+                    if args.owned_close and remote.state is not RemoteState.NOT_STARTED:
+                        safe = False
+                else:
+                    safe = True
+                    (directory / "run.json").unlink()
+            # Owned cleanup uses the close hook while SSH still holds its input open.
+            ssh.close()
             if lease_descriptor >= 0:
                 os.close(lease_descriptor)
             # A Mac placement has no local grant, so the run returns it with a cancel that names the result.
@@ -353,7 +396,95 @@ def run(args: Arguments) -> int:
     return status
 
 
+CALLER_EXITED = 3
+
+
+def watch_caller(caller: int, queue: int) -> int:
+    """Report readiness and wait for a caller or queue exit."""
+    watch = select.poll()
+    try:
+        watch.register(queue, select.POLLIN)
+        watch.register(caller, select.POLLIN)
+        if watch.poll(0):
+            return 2
+        print("ready", flush=True)
+        events = dict(watch.poll())
+        if queue in events:
+            return 0
+        if events.get(caller, 0) & (select.POLLIN | select.POLLHUP):
+            return CALLER_EXITED
+    except OSError as error:
+        print(f"mac queue: caller watch failed: {error}", file=sys.stderr)
+    return 2
+
+
+@contextlib.contextmanager
+def caller_watch(caller: int) -> Generator[None]:
+    pid = os.getpid()
+    if os.getpgrp() != pid:
+        raise ValueError("the Mac queue must own its process group")
+    reader, writer = os.pipe()
+    closing = threading.Event()
+    failed = threading.Event()
+    try:
+        try:
+            watcher = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watch-caller",
+                                        str(caller), str(reader)],
+                                       pass_fds=(caller, reader), start_new_session=True,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+        finally:
+            os.close(reader)
+            os.close(caller)
+        with watcher:
+            try:
+                assert watcher.stdout is not None
+                output = watcher.stdout.fileno()
+                readiness = select.poll()
+                readiness.register(output, select.POLLIN)
+                grace = conf.read("mac_gate").number("terminate_grace_seconds")
+                if not readiness.poll(math.ceil(grace * 1000)) or os.read(output, 6) != b"ready\n":
+                    raise ValueError("the Mac queue caller watch did not start")
+
+                def monitor() -> None:
+                    status = watcher.wait()
+                    if closing.is_set():
+                        return
+                    if status != CALLER_EXITED:
+                        print(f"mac queue: caller watch ended unexpectedly ({status})", file=sys.stderr, flush=True)
+                        failed.set()
+                    # Let the queue reap prepare and obtain the remote cleanup result.
+                    os.kill(pid, signal.SIGINT)
+
+                supervisor = threading.Thread(target=monitor, daemon=True)
+                supervisor.start()
+                try:
+                    yield
+                finally:
+                    closing.set()
+                    os.close(writer)
+                    writer = -1
+                # Detect a watcher that failed just as queue work finished.
+                try:
+                    status = watcher.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    status = 2
+                if status:
+                    if status != CALLER_EXITED:
+                        failed.set()
+                    raise ValueError(f"the Mac queue caller watch ended with status {status}")
+            finally:
+                stop_command(watcher)
+    finally:
+        if writer >= 0:
+            os.close(writer)
+        if failed.is_set():
+            process_group.terminate_owned_process_group()
+
+
 def main(argv: list[str] | None = None) -> int:
+    words = sys.argv[1:] if argv is None else argv
+    if len(words) == 3 and words[0] == "watch-caller":
+        return watch_caller(int(words[1]), int(words[2]))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
     _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)
@@ -361,11 +492,21 @@ def main(argv: list[str] | None = None) -> int:
     _ = parser.add_argument("--worktree", type=Path, default=Path.cwd())
     _ = parser.add_argument("--cwd", default="")
     _ = parser.add_argument("--lifecycle-script", default="")
+    _ = parser.add_argument("--caller-fd", type=int, help=argparse.SUPPRESS)
+    _ = parser.add_argument("--owned-close", action="store_true", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--no-wait", action="store_true", help="exit with status 78 when the Mac is busy")
     _ = parser.add_argument("argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv, namespace=Arguments())
     if not args.argv or args.argv == ["--"]:
         parser.error("an argv is required")
-    return run(args)
+    if args.caller_fd < 0:
+        return run(args)
+    try:
+        with caller_watch(args.caller_fd):
+            return run(args)
+    except (OSError, ValueError) as error:
+        print(f"mac queue: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

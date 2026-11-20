@@ -52,9 +52,9 @@ from scripts.production import (
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
-from scripts.review_links import new_item_dialog, page_frame, page_question, question_record, review_submissions
+from scripts.review_links import new_item_dialog, page_frame, page_question, question_record, record_table, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
-from scripts.lib import atomic_file, conf, file_lock, scratch, urgency
+from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -1061,7 +1061,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     state = new_item_dialog.BugPageState(
                         url, new_item_dialog.PageViewport(1280, 800, True), 2.4, ("Could not load brain.",),
                         (new_item_dialog.PageScriptError("Error", url, 9, 3, "2026-11-18T16:05:00Z"),),
-                        "State Open · Owner builds", checked)
+                        "Show Open · Owner builds", checked)
                     data = new_item_dialog.PageDataEvidence("Review", (("Item", "State"), ("Console", "Open")))
                     request = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
                                       page="review", request_id="r2-" + uuid4().hex, evidence=data, page_state=state)
@@ -1754,13 +1754,28 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_review_request_passes_the_selected_show_view(self) -> None:
         snapshot = review_page.build_snapshot(self.review_fixture().root)
         for query, show in (('', 'open'), ('?show=Done', 'Done'), ('?show=all', 'all'),
-                            ('?show=For+you', 'For you'), ('?show=Waiting', 'Waiting')):
-            with self.subTest(show=show), patch.object(review_page.ReviewSnapshotCache,'get',return_value=snapshot), patch.object(
+                            ('?show=For+you', 'For you'), ('?show=Waiting', 'Waiting'),
+                            ('?state=Waiting', 'Waiting'), ('?state=Waiting&show=all', 'all'),
+                            ('?state=Waiting&show=', 'open'), ('?show=&show=Waiting', 'open')):
+            with self.subTest(query=query), patch.object(review_page.ReviewSnapshotCache,'get',return_value=snapshot), patch.object(
                     review_page.ReviewSnapshot,'render',return_value=b'Review') as render:
                 reply = self.request('/console/review.html'+query)
                 self.assertEqual(reply.status, 200)
                 self.assertEqual(reply.body, b'Review')
-                render.assert_called_once_with(show=show)
+                render.assert_called_once_with(show=show, kind='')
+
+    def test_review_initial_html_falls_back_to_open_for_unavailable_show(self) -> None:
+        snapshot = review_page.build_snapshot(self.review_fixture().root)
+        with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
+            for kind in ('', 'investigations', *review_page.TYPES):
+                show = 'Validating' if kind == review_items.ReviewType.RESPONSE else 'Done'
+                with self.subTest(kind=kind, show=show):
+                    query = urlencode({'state': show, 'type': kind})
+                    reply = self.request(review_page.PAGE_PATH+'?'+query)
+                    self.assertEqual(reply.status, 200)
+                    self.assertIn(b'data-show="open"', reply.body)
+                    self.assertIn(b'data-filter-value="open" aria-pressed="true"', reply.body)
+                    self.assertNotIn(f'data-filter-value="{show}" aria-pressed="true"'.encode(), reply.body)
 
     def test_review_snapshot_endpoints_do_not_read_stores_and_use_gzip(self) -> None:
         case = self.review_fixture()
@@ -1769,6 +1784,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(review_page.ReviewSnapshotCache,'get',return_value=snapshot), patch.object(
                 review_items,'read',side_effect=AssertionError('A GET read a store.')), patch.object(
                 staff,'snapshot',side_effect=AssertionError('A GET read staff.')):
+            waiting = self.request(review_page.PAGE_PATH+'?state=Waiting')
+            self.assertEqual(waiting.status, 200)
+            self.assertIn(b'data-show="Waiting"', waiting.body)
+            self.assertIn(b'data-filter-value="Waiting" aria-pressed="true"', waiting.body)
             version=self.request(review_page.PAGE_PATH+'?version=1')
             self.assertEqual(version.status,200)
             self.assertEqual(json.loads(version.body)['version'],snapshot.version)
@@ -2892,6 +2911,30 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(path.read_bytes(), prior_log)
                 self.assertEqual(review_later.path().read_bytes(), prior_deadline)
 
+    def test_review_shows_only_current_question_failures(self) -> None:
+        case = self.review_fixture(changes=1)
+        report = case.investigation()
+        investigation_key = f'investigation/{report.owner}/{report.id}'
+        proposal, efficiency = case.decisions()
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        for key in ('page-owner/C1', investigation_key, proposal, efficiency):
+            with self.subTest(key=key):
+                saved = cache.save(case.card_body(cache.get(), key, 'question', 'Which checks passed?'), case.status)
+                assert isinstance(saved.delivery, change_page.MessageDelivery)
+                with patch.object(change_page, 'send_to_staff', side_effect=ValueError('The fixture owner is offline.')):
+                    change_page.deliver(saved.delivery, case.status)
+                current = review_page.build_snapshot(case.root)
+                self.assertIn('Question not delivered.', current.assets['question-delivery:'+key])
+                if key == investigation_key:
+                    question = case.status.slots(saved.delivery.page, saved.delivery.row).question
+                    assert isinstance(question, change_page.OpenQuestion)
+                    _ = investigation.answer(report.owner, report.id, 'The smoke checks passed.',
+                                             question_id=question.question_id)
+                    current = review_page.build_snapshot(case.root)
+                    self.assertNotIn('question-delivery:'+investigation_key, current.assets)
+                elif key in (proposal, efficiency):
+                    self.assertNotIn('question-delivery:'+investigation_key, current.assets)
+
     def test_review_returns_conflict_for_a_deleted_investigation(self) -> None:
         case = self.review_fixture()
         report = case.investigation()
@@ -3122,14 +3165,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                 _ = the_list.mark_read(keeper, item.id, source="nate")
 
     def list_filter_markup(self, query: str = "") -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
-        response = self.request(list_page.PAGE_PATH + query)
+        with patch.object(record_table, "count_filter_row", wraps=record_table.count_filter_row) as count:
+            response = self.request(list_page.PAGE_PATH + query)
         self.assertEqual(response.status, 200)
+        count.assert_called()
         markup = response.body.decode()
         visible = [match[1] for match in re.finditer(
             r'<tbody data-list-item[^>]+ data-number="([^"]+)"([^>]*)>', markup) if not match[2].endswith(' hidden')]
-        chips = {(match[1], match[2]): (match[3], match[4]) for match in re.finditer(
-            r'id="filter-(owner|producer|show)-[^"]+" data-filter-value="([^"]+)" '
-            + r'aria-pressed="([^"]+)" data-filter-count="([^"]+)"', markup)}
+        rows = re.finditer(r'<div [^>]*data-filter-row="(owner|producer|show)"[^>]*>(.*?)</div>', markup, re.S)
+        chips = {(row[1], chip[1]): (chip[2], chip[3]) for row in rows for chip in re.finditer(
+            r'<button [^>]*data-filter-value="([^"]+)" aria-pressed="([^"]+)" data-filter-count="([^"]+)"', row[2])}
         return visible, chips
 
     def test_list_applies_address_filters_before_javascript_runs(self) -> None:
@@ -3143,6 +3188,26 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(chips["producer", "staff:pa"], ("true", "1"))
         self.assertEqual(chips["producer", "staff:pb"], ("false", "1"))
         self.assertEqual(chips["owner", "all"], ("true", "1"))
+
+    def test_list_search_shows_a_parked_item_with_an_unread_answer_before_javascript_runs(self) -> None:
+        morty = fixture_member("producer", name="morty")
+        item = the_list.add(morty.id, "Check the result", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={}, number=1)
+        _ = the_list.park(morty.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        _ = the_list.add(morty.id, "Read the next result", owner=the_list.UnassignedOwner.NATE,
+                         source="nate", changes={}, number=2)
+        status = self.server.delivery_status
+        with (patch.object(change_page, "send_question", return_value=question_outcome()),
+              patch.object(staff, "caller_identity", return_value=morty.current_session),
+              redirect_stdout(StringIO())):
+            question = the_list.PageRequest(uuid4().hex, "question", "Which check passed?")
+            change_page.deliver(the_list.ask_question(morty.id, item.id, question, status), status)
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The gate passed."]), 0)
+
+        visible, chips = self.list_filter_markup("?q=parked")
+        self.assertEqual(visible, ["1"])
+        self.assertEqual(chips["show", "needs-me"], ("false", "1"))
+        self.assertEqual(chips["show", "parked"], ("false", "0"))
 
     def test_list_drops_a_missing_linked_item_before_counting(self) -> None:
         self.add_list_filter_items()
@@ -3367,12 +3432,11 @@ class ReviewLinksServerTests(unittest.TestCase):
         ask = page_question.ask
 
         def claim(store: page_question.QuestionStore, target: change_page.QuestionDeliveryTarget, words: str,
-                  status: change_page.DeliveryStatus, *, resend_unknown: bool = False,
-                  resend_request: str = "") -> change_page.MessageDelivery:
+                  status: change_page.DeliveryStatus) -> change_page.MessageDelivery:
             list_locked.set()
             if not finish_ask.wait(TEST_HANG_GUARD_SECS):
                 raise TimeoutError("The test did not finish Ask.")
-            return ask(store, target, words, status, resend_unknown=resend_unknown, resend_request=resend_request)
+            return ask(store, target, words, status)
 
         with (patch.object(page_question, "ask", side_effect=claim),
               patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
@@ -3883,6 +3947,102 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
                 self.assertEqual(status.request_attempts, {})
 
+    def test_list_question_claim_failure_and_deferred_recovery(self) -> None:
+        keeper = staff.StaffId("fixture-morty")
+        item = the_list.add(keeper, "Check the queue", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        status = change_page.DeliveryStatus(self.root)
+        words = "Which check passed?"
+        request = the_list.PageRequest(uuid4().hex, "question", words)
+        with (patch.object(process_start, "process_start",
+                           return_value=process_start.Unreadable("fixture read error")),
+              redirect_stderr(StringIO()) as errors):
+            refused = the_list.ask_question(keeper, item.id, request, status)
+        assert isinstance(refused, change_page.PageQuestionSend)
+        path = status.path(refused.page, refused.row)
+        failed = change_page.read_question_attempt(path)
+        self.assertEqual(failed.state, delivery_state.QuestionSendState.FAILED)
+        self.assertIsInstance(failed.owner, delivery_state.NoQuestionSendOwner)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+
+        # A new Ask can try the same saved question after a confirmed refusal.
+        request = the_list.PageRequest(uuid4().hex, "question", words)
+        pending = the_list.ask_question(keeper, item.id, request, status)
+        assert isinstance(pending, change_page.PageQuestionSend)
+        assert isinstance(pending.job, change_page.QuestionJob)
+        restarted = change_page.DeliveryStatus(self.root)
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            try:
+                change_page.recover_review_messages(restarted)
+                send.assert_not_called()
+                self.assertTrue(restarted.has_deferred_questions())
+            finally:
+                pending.job.release()
+            change_page.recover_deferred_questions(restarted)
+            change_page.recover_deferred_questions(restarted)
+        send.assert_called_once()
+        self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+        self.assertFalse(restarted.has_deferred_questions())
+
+    def test_list_question_recovers_when_the_failure_cannot_be_recorded(self) -> None:
+        keeper = staff.StaffId("fixture-morty")
+        for fault in ("read", "write"):
+            with self.subTest(fault=fault):
+                item = the_list.add(keeper, "Check the queue", owner=the_list.UnassignedOwner.NATE,
+                                    source="nate", changes={})
+                status = change_page.DeliveryStatus(self.root)
+                request = the_list.PageRequest(uuid4().hex, "question", "Which check passed?")
+                delivery = the_list.ask_question(keeper, item.id, request, status)
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                path = status.path(delivery.page, delivery.row)
+                attempt = change_page.read_question_attempt(path)
+                failure = OSError("Cannot access the delivery record.")
+                writer = change_page.publish_question_attempt
+
+                def write_attempt(path: Path, record: delivery_state.QuestionAttempt) -> None:
+                    if record.state is delivery_state.QuestionSendState.FAILED:
+                        raise failure
+                    writer(path, record)
+
+                fault_patch = (patch.object(change_page, "read_question_attempt", side_effect=failure)
+                               if fault == "read" else patch.object(change_page, "publish_question_attempt",
+                                                                    side_effect=write_attempt))
+                with (fault_patch, redirect_stderr(StringIO()) as errors,
+                      patch.object(change_page, "send_question", return_value=question_outcome("refused")) as send):
+                    change_page.deliver(delivery, status)
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn(str(failure), errors.getvalue())
+                self.assertTrue(status.has_deferred_questions())
+                self.assertFalse(status.question_jobs)
+                if fault == "read":
+                    send.assert_not_called()
+
+                with patch.object(change_page, "send_question", return_value=question_outcome()) as recover:
+                    change_page.recover_deferred_questions(status)
+                    change_page.recover_deferred_questions(status)
+                recover.assert_called_once_with(keeper, attempt.message, attempt.message_id)
+                self.assertEqual(change_page.read_question_attempt(path).state, delivery_state.QuestionSendState.SENT)
+
+    def test_list_question_shows_a_failed_saved_message_mismatch(self) -> None:
+        keeper = staff.StaffId("fixture-morty")
+        item = the_list.add(keeper, "Check the queue", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
+        status = change_page.DeliveryStatus(self.root)
+        request = the_list.PageRequest(uuid4().hex, "question", "Which check passed?")
+        pending = the_list.ask_question(keeper, item.id, request, status)
+        assert isinstance(pending, change_page.PageQuestionSend)
+        assert isinstance(pending.job, change_page.QuestionJob)
+        pending.job.release()
+        path = status.path(pending.page, pending.row)
+        attempt = change_page.read_question_attempt(path)
+        with status.locked():
+            change_page.advance_question_attempt(path, attempt, replace(attempt, message="Different message"))
+        with (patch.object(change_page, "send_question") as send, redirect_stderr(StringIO()) as errors):
+            change_page.recover_review_messages(status)
+        send.assert_not_called()
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        saved = the_list.load(keeper, item.id)
+        view = the_list.question_visibility(keeper, saved, status)
+        self.assertEqual(view, the_list.QuestionAttention(frozenset({"Q1"})))
+
     def test_list_ask_preserves_unicode_separators(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
                                current_session=staff.StaffId("fixture-morty-session"))
@@ -3913,7 +4073,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual([(question.question_id, question.words) for question in the_list.load(morty.id, item.id).questions],
                          [("Q1", words)])
 
-    def test_exhausted_list_question_returns_to_open_and_resends_the_same_id(self) -> None:
+    def test_exhausted_list_question_reports_failure_after_automatic_retries(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
                                current_session=staff.StaffId("fixture-morty-session"))
         item = the_list.add(morty.id, "The question item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
@@ -3940,7 +4100,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(change_page, "deliver", side_effect=deliver),
               patch.object(change_page, "alert_delivery_failures"),
               patch.object(change_page, "send_question", side_effect=[
-                  *([question_outcome("refused", "Producer offline")] * tries), question_outcome()]) as send):
+                  *([question_outcome("refused", "Producer offline")] * tries)]) as send):
             code, response = self.post(list_page.PAGE_PATH, urlencode(fields))
             self.assertEqual(code, 200)
             self.assertEqual(json.loads(response)["waiting_for_answer"], "true")
@@ -3953,22 +4113,16 @@ class ReviewLinksServerTests(unittest.TestCase):
             markup = opened.body.decode().split('<script>', 1)[0]
             self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
             self.assertIn('data-open-question="true"', markup)
-            self.assertIn('value="resend-Q1">Resend question Q1</button>', markup)
-            signed = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', markup))
-            finished.clear()
-            code, response = self.post(list_page.PAGE_PATH, urlencode({
-                **signed, "action": "resend-Q1", "words": "Ignore these new words.", "until": ""}))
-            self.assertEqual(code, 200)
-            self.assertEqual(json.loads(response)["waiting_for_answer"], "true")
-            self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
-            self.assertEqual(send.call_count, tries + 1)
-            self.assertEqual(messages, [messages[0], messages[0]])
+            self.assertIn("Question not delivered.", markup)
+            self.assertNotIn('value="resend-', markup)
+            self.assertNotIn("ready to send", markup)
+            code, _ = self.post(list_page.PAGE_PATH, urlencode({**fields, "action": "resend-Q1"}))
+            self.assertEqual(code, 400)
+            self.assertEqual(the_list.load(morty.id, item.id), saved)
+            self.assertEqual(send.call_count, tries)
+            self.assertEqual(len(messages), 1)
             self.assertIn(f"\n{words}\n", messages[0])
             self.assertIn("answer L1 --question Q1", messages[0])
-            self.assertEqual(the_list.load(morty.id, item.id), saved)
-            waiting = self.request(list_page.PAGE_PATH).body.decode().split('<script>', 1)[0]
-            self.assertRegex(waiting, r'<tbody data-list-item[^>]*data-waiting-for-answer="true"[^>]*">')
-            self.assertNotIn('value="resend-Q1"', waiting)
 
     def test_an_image_question_delivers_when_the_browser_response_fails(self) -> None:
         _ = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))

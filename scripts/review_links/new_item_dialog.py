@@ -997,13 +997,13 @@ SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
 
  function collectBugPage() {
   const filters = [];
-  for (const chip of document.querySelectorAll('[data-type-chip],[data-show-chip],[data-owner-chip],[data-filter-value]')) {
+  for (const chip of document.querySelectorAll('[data-filter-row] [data-filter-value]')) {
    if (chip.getAttribute('aria-pressed') !== 'true' || !visible(chip)) continue;
    const group = chip.closest('[role="group"]')?.getAttribute('aria-label');
    if (!group) continue;
    const label = chip.cloneNode(true);
    label.querySelector('b')?.remove();
-   filters.push((group === 'Show' ? 'State' : group) + ' ' + clip(label.textContent));
+   filters.push(group + ' ' + clip(label.textContent));
   }
   const search = document.querySelector('#list-search,[data-filter-words]');
   if (search?.value && visible(search)) filters.push('Search ' + clip(search.value));
