@@ -3258,6 +3258,15 @@ Tests: one row in the existing placement retry test for a busy local refusal wit
 
 Tests: the module passes 24 runs, 8 at a time, with no read of another process's `/proc` entries.
 
+### Phase 44dv — Admission tests run on the Mac, with no skip  · status: todo
+**From builds, 2026-11-20 05:30 EST (found by report).** After the group merges; not urgent. User rule: tests run on the Mac too; no Mac skip.
+
+1. `AdmissionFixture` (scripts/build_queue/admission_test_support.py:356) raises `SkipTest` when the host has no `os.pidfd_open` or no cgroup v2. Mac modules reach it through `caller_admission`, so on the Mac route they run 0 tests (`mac_test/test_offload_cleanup_leftovers.py`: "Ran 0 tests (skipped=1)").
+2. First, list every module that skips on the Mac now. Run each candidate through the Mac route of the build queue (verify.sh), never with direct Mac cargo or python. Candidates on main 740aae528: every module that imports `AdmissionFixture`, `caller_admission` or `admission_test_support`, directly or through a support module (75 files, among them mac_test/test_offload_cleanup_leftovers.py, offload_cleanup_test_support.py, offload_test_support.py, test_copy_watch.py, test_failed_probe_mark.py, test_offload.py and most direct/test_verify_*.py). Send the list to builds.
+3. Fix it where it lives: in the admission service's process and owner watch, or in `admission_test_support` / `caller_admission`. A Mac host watches owners with its own process mechanism (kqueue `EVFILT_PROC` or an equal one). No module-level skip and no Linux-only entry.
+
+Tests: each listed module runs all its tests on the Mac route and on natedev, with the same assertions.
+
 ### Phase 44dn — The sweep and scratch end keep going past a bad backlink or journal  · status: todo
 **Hold (builds, 2026-11-19 21:29):** these are removal sites under item 152 (user rule 20:42: no automatic deletion until the bubblewrap proof exists). resources owns them now: phase 181 (scratch task end) and phase 178 (the sweep). After 181 and 178 merge, merge main in, check with resources that nothing removes more than 178 and 181 allow, then send the hash. No more work until then.
 **From the 44de reviews (pass 1 and closure pass 2), 2026-11-19:** the builds landing rule moves these gaps out of 44de. After 44de merges.
