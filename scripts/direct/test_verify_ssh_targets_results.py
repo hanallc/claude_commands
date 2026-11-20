@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from scripts.build_queue import placement
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 
 
@@ -48,8 +49,10 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
     def test_linux_loss_keeps_the_attempt_and_queue_age_after_local_success(self) -> None:
         self.configure("linux,natedev")
         first, wait_environment = self.first_wait()
-        result = self.verify("test", "sample", "--no-cache", extra={
-            "TEST_SSH_MODES": '{"linux":"lost"}', **wait_environment})
+        with self.change_host_after_linux_refusal(
+                "linux", before=placement.AllowedHost(), after=placement.TemporaryExclusion("unreachable")):
+            result = self.verify("test", "sample", "--no-cache", extra={
+                "TEST_SSH_MODES": '{"linux":"lost"}', **wait_environment})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.local_runs()), 1)
         self.assertTrue(self.ssh_events(), result.stdout + result.stderr)

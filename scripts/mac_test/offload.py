@@ -405,13 +405,8 @@ class PendingClaimOperation:
 
 
 @dataclass(frozen=True)
-class PreparedStartOperation:
-    """The start fence needs settlement if the runner does not send the command."""
-
-
-@dataclass(frozen=True)
 class PendingStartOperation:
-    """The remote start has no acknowledgement and can still arrive."""
+    """The start fence needs settlement before the claim can be released."""
 
 
 @dataclass(frozen=True)
@@ -464,7 +459,7 @@ class StartSettled:
 
 @dataclass(frozen=True)
 class StartUnsettled:
-    """The remote start remains unsettled with a reason and cleanup result."""
+    """The reason and cleanup result explain why the start remains pending."""
     reason: str
     leftovers: LeftoverCheckResult
 
@@ -906,7 +901,7 @@ class ProcessController:
         self.copy_failure_detail: str = ""
         self.placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
         self.pending: (
-            SettledDispatchOperations | PendingClaimOperation | PreparedStartOperation | PendingStartOperation
+            SettledDispatchOperations | PendingClaimOperation | PendingStartOperation | StartUnsettled
             | AcknowledgedStartOperation | PendingHanaOperation | ClaimReleaseUnconfirmed
         ) = SettledDispatchOperations()
         self.hana_output: HanaCommandOutput = HanaCommandOutput()
@@ -1072,7 +1067,6 @@ class ProcessController:
         return result
 
     def stream_mac_run(self, arguments: Sequence[str]) -> RemoteRunStatus:
-        before_launch = self.pending
         self.pending = PendingStartOperation()
         try:
             process = subprocess.Popen(
@@ -1081,7 +1075,6 @@ class ProcessController:
                 stderr=subprocess.STDOUT,
             )
         except OSError:
-            self.pending = before_launch
             return MISSING_MAC_STATUS
         self.attempt_evidence.execution = execution_identity.ExecutionEvidenceUnavailable(
             "the remote start has no final observation", time.time())
@@ -1113,8 +1106,9 @@ class ProcessController:
                 identity = self.claim_identity
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_settled=" + pending_start_key(identity)):
-                    self.pending = SettledDispatchOperations()
-                    pending_start_path(self.claim_target, identity).unlink(missing_ok=True)
+                    settled = self.settle_start_journal(self.claim_target, identity)
+                    if isinstance(settled, StartUnsettled):
+                        raise OSError(settled.reason)
                     if not isinstance(status, ReportedMacStatus):
                         self.attempt_evidence.execution = execution_identity.ExecutionNotStarted()
                     continue
@@ -1173,7 +1167,8 @@ class ProcessController:
                 self.stop()
             self.active = IDLE_PROCESS
             startup_refused = isinstance(status, UnresolvedSlotStartup)
-            if isinstance(self.pending, AcknowledgedStartOperation) or mirror_refused or mismatch or startup_refused:
+            if not isinstance(self.pending, StartUnsettled) and (
+                    isinstance(self.pending, AcknowledgedStartOperation) or mirror_refused or mismatch or startup_refused):
                 self.pending = SettledDispatchOperations()
             if (mirror_refused or mismatch or startup_refused) and not isinstance(status, ReportedMacStatus):
                 self.attempt_evidence.execution = execution_identity.ExecutionNotStarted()
@@ -1193,6 +1188,18 @@ class ProcessController:
         if isinstance(status, UnresolvedSlotStartup):
             return status
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
+
+    def settle_start_journal(self, target: str, identity: claim_state.ClaimIdentity) -> StartSettled | StartUnsettled:
+        """Remove the local journal after the exact remote fence settles."""
+        try:
+            pending_start_path(target, identity).unlink(missing_ok=True)
+        except OSError as error:
+            reason = f"cannot remove the start journal: {error}"
+            failure = StartUnsettled(reason, LeftoverCheckFailed(reason))
+            self.pending = failure
+            return failure
+        self.pending = SettledDispatchOperations()
+        return StartSettled(LeftoversEnded())
 
 
 def parse_cleanup(value: str) -> CleanupOutcome:
@@ -2419,9 +2426,7 @@ def settle_pending_start(controller: ProcessController, config: OffloadConfig, h
     observed = read_leftovers(connection, host, command, target)
     if (isinstance(observed.result, LeftoversEnded)
             and "dispatch_start_settled=" + pending_start_key(identity) in observed.output.splitlines()):
-        controller.pending = SettledDispatchOperations()
-        pending_start_path(target, identity).unlink(missing_ok=True)
-        return StartSettled(observed.result)
+        return controller.settle_start_journal(target, identity)
     return StartUnsettled("the original remote start has not settled", observed.result)
 
 
@@ -2551,16 +2556,17 @@ def authorize_ssh_start(controller: ProcessController, assignment: placement.Pla
 
 def finish_claimed_run(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
                        repository: KnownRepository, *, release_allowed: bool, sync_after_release: bool) -> None:
-    """Settle a prepared start before releasing its exact claim."""
+    """Settle an unacknowledged start before releasing its exact claim."""
     evidence = controller.attempt_evidence
-    if isinstance(controller.pending, PreparedStartOperation):
+    if isinstance(controller.pending, PendingStartOperation):
         settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
         release_allowed = isinstance(settlement, StartSettled)
         observe_cleanup(evidence, settlement.leftovers)
         report_leftover_check(settlement.leftovers, request)
+    release_allowed = release_allowed and isinstance(controller.pending, SettledDispatchOperations)
     evidence.cleanup = "confirmed" if release_allowed else "unconfirmed"
     evidence.evidence_at = time.time()
-    if not release_allowed or not isinstance(controller.pending, SettledDispatchOperations):
+    if not release_allowed:
         return
 
     evidence.unresolved_count = 0
@@ -2668,7 +2674,7 @@ def claimed_run(
                     not isinstance(copied.tree_key, KnownTreeKey) or copied.tree_key.value != source.key):
                 release_allowed = True
                 return DeclinedMacRun("source_changed", elapsed_seconds(started), "the copied source differs from the assignment")
-            controller.pending = PreparedStartOperation()
+            controller.pending = PendingStartOperation()
             if not authorize_ssh_start(controller, assignment):
                 return declined("state", started)
             evidence.launch_authorized = True
@@ -2688,17 +2694,11 @@ def claimed_run(
             write_mirror_busy(config, repository.name, request.target)
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         if not isinstance(remote_status, (ReportedMacStatus, MacNextestSetupFailed)):
-            if isinstance(controller.pending, PendingStartOperation):
-                settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
-                if isinstance(settlement, StartUnsettled):
-                    observe_cleanup(evidence, settlement.leftovers)
-                    report_leftover_check(settlement.leftovers, request)
-                    return LostMacRun(elapsed_seconds(started), "remote startup has no acknowledgement")
-                checked = settlement.leftovers
-            elif not isinstance(controller.pending, SettledDispatchOperations):
-                return LostMacRun(elapsed_seconds(started), "remote startup has no acknowledgement")
-            else:
-                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
+            if not isinstance(controller.pending, SettledDispatchOperations):
+                detail = (remote_status.detail if isinstance(remote_status, MissingMacStatus)
+                          else "remote startup has no acknowledgement")
+                return LostMacRun(elapsed_seconds(started), detail)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -3552,7 +3552,7 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
         outcome = placement.AttemptOutcomeUnavailable("the provider has unresolved execution or cleanup")
     pending = controller.pending
     path = (placement.DispatchPathSettled() if isinstance(pending, SettledDispatchOperations)
-            else placement.DispatchPathPending(pending.reason if isinstance(pending, ClaimReleaseUnconfirmed)
+            else placement.DispatchPathPending(pending.reason if isinstance(pending, (ClaimReleaseUnconfirmed, StartUnsettled))
                                                else "a claim or start child remains active"))
     _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, provider,
                                                                evidence.execution, outcome, path))

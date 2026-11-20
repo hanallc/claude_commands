@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 
 import json
 import os
@@ -125,6 +125,7 @@ source = Path(os.environ["TEST_SOURCE_REPO"])
 with open(source / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.mac_test import eligibility, offload, mac_test, claim_state
 from scripts.build_queue import admission_client, admission_protocol as queue_wire, execution_identity, placement
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 args = offload.parser().parse_args(namespace=offload.CliArguments())
@@ -143,8 +144,10 @@ reserved = bool(args.claim_owner_pid and any(claim.record["pid"] == args.claim_o
 same_path = False
 remote_output = ""
 remote_status = 0
-check_start_fence = mode in ("start-fence-confirmed", "start-fence-unconfirmed",
-                             "start-fence-interrupted", "start-release-unconfirmed", "start-launch-failed")
+launch_error = (offload.OffloadInterrupted(SIGTERM) if mode == "start-launch-interrupted" else
+                OSError("SSH could not start") if mode in ("start-launch-failed", "start-journal-unremovable") else None)
+check_start_fence = launch_error is not None or mode in (
+    "start-fence-confirmed", "start-fence-unconfirmed", "start-fence-interrupted", "start-release-unconfirmed")
 
 def run_start_fence(command):
     settled = real_run(["bash", "-c", command], capture_output=True,
@@ -175,7 +178,7 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
     if len(arguments) > 2 and arguments[2] == "release":
         parsed = mac_test.parser().parse_args(arguments[2:], namespace=mac_test.CliArguments())
         actions.append("release")
-        if mode in ("start-release-unconfirmed", "takeover-release-unconfirmed"):
+        if mode in ("start-release-unconfirmed", "takeover-release-unconfirmed", "run-release-unconfirmed"):
             return offload.CommandOutput(1, "", "release was not confirmed")
         return offload.CommandOutput(mac_test.command_release(parsed, mac_test.state_paths(parsed.target)), "", "")
     versions = {("rustc", "-V"): "rustc fixture",
@@ -227,8 +230,8 @@ def copy_source(*arguments):
 def stream(arguments):
     global remote_output, remote_status
     actions.append("run")
-    if mode == "start-launch-failed":
-        with mock.patch.object(subprocess, "Popen", side_effect=OSError("SSH could not start")):
+    if launch_error is not None:
+        with mock.patch.object(subprocess, "Popen", side_effect=launch_error):
             return offload.ProcessController.stream_mac_run(controller, arguments)
     if mode in ("run-refusal", "after-probe"):
         wire, status = "linux_startup=unresolved\n", 75
@@ -271,13 +274,17 @@ def commands(arguments, **options):
         if check_start_fence and isinstance(identity, claim_state.ClaimIdentity):
             command = offload.start_fence_command(identity, request.target, settle=True, scope_key=controller.claim_scope_key)
             settles_fence = arguments[-1].startswith(command + " || exit 1\n")
-            if mode in ("start-fence-interrupted", "start-launch-failed"):
+            if mode == "start-fence-interrupted" or launch_error is not None:
                 if settles_fence:
                     actions.append("settle-start")
             else:
                 assert settles_fence
             if settles_fence and mode not in ("start-fence-interrupted", "start-fence-unconfirmed"):
                 fence = run_start_fence(command)
+                if mode == "start-journal-unremovable":
+                    journal = offload.pending_start_path(request.target, identity)
+                    journal.unlink()
+                    journal.mkdir()
         elif not unresolved and count == 0 and isinstance(identity, claim_state.ClaimIdentity):
             fence = "dispatch_start_settled=" + offload.pending_start_key(identity) + "\n"
         return subprocess.CompletedProcess(arguments, 3 if unresolved else 0,
@@ -314,22 +321,17 @@ with mock.patch.object(controller, "complete_claim", side_effect=complete), \
         result = offload.run_offload(controller, config, request, started)
     except offload.OffloadInterrupted as interrupted:
         interrupted_status = 128 + interrupted.signal_number
-        result = offload.LostMacRun(offload.elapsed_seconds(started), "interrupted during authorization")
+        result = offload.LostMacRun(offload.elapsed_seconds(started), "interrupted before remote start")
+    except IsADirectoryError as error:
+        if mode != "start-journal-unremovable":
+            raise
+        result = offload.LostMacRun(offload.elapsed_seconds(started), str(error))
 
-configured_mode = json.loads(os.environ.get("TEST_SSH_MODES", "{}" )).get(request.target, "passed")
-if not configured_mode.endswith("-once"):
-    cleanup_pending = controller.attempt_evidence.cleanup != "confirmed"
-    reason = ("unreachable" if isinstance(result, offload.LostMacRun) else
-              "busy" if isinstance(result, offload.BusyMacDecline) and cleanup_pending else
-              result.reason if isinstance(result, offload.DeclinedMacRun)
-              and (cleanup_pending or mode in ("disk", "version-mismatch", "runtime-version-mismatch")) else "")
-    outcome = root / ("provider-outcome-" + request.target + ".json")
-    if reason:
-        ready = outcome.with_suffix(".ready")
-        ready.write_text(json.dumps({"target": request.target, "reason": reason}))
-        os.replace(ready, outcome)
-    else:
-        outcome.unlink(missing_ok=True)
+outcome = root / ("provider-outcome-" + request.target + ".json")
+if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
+    write_text_atomic(outcome, json.dumps({"target": request.target, "reason": "busy"}))
+elif adopted_claim_ids:
+    outcome.unlink(missing_ok=True)
 
 event = dict(target=request.target, owner=args.claim_owner_pid, slot=controller.attempt_evidence.slot,
              token_held=(Path(os.environ["TEST_TOKEN_RECORD"]).exists()
@@ -425,11 +427,17 @@ source() {
 
         _ = self.enterContext(mock.patch.object(self.admission.server, "handle_request", side_effect=observe))
 
-    @contextmanager
-    def spare_after_linux_refusal(self) -> Generator[None]:
+    def spare_after_linux_refusal(self) -> AbstractContextManager[None]:
         """Make the spare available after the first provider refuses the step."""
+        return self.change_host_after_linux_refusal(
+            "spare", before=placement.TemporaryExclusion("starting"), after=placement.AllowedHost())
+
+    @contextmanager
+    def change_host_after_linux_refusal(self, target: str, *, before: placement.HostEligibility,
+                                        after: placement.HostEligibility) -> Generator[None]:
+        """Change private host evidence when Linux reports a refusal."""
         controls = caller_provider_controls(self, self.admission)
-        controls.set_host("spare", placement.TemporaryExclusion("starting"))
+        controls.set_host(target, before)
         previous = self.admission.server.handle_request
 
         def observe(request: wire.Request,
@@ -437,9 +445,9 @@ source() {
             replies = previous(request, connection)
             if (isinstance(request, wire.ClaimFailure)
                     or isinstance(request, wire.ExecutionReport)
-                    and isinstance(request.outcome, placement.PrelaunchRefused)):
+                    and isinstance(request.outcome, (placement.PrelaunchRefused, placement.AttemptDeclined))):
                 if request.assignment.destination.target == "linux":
-                    controls.set_host("spare", placement.AllowedHost())
+                    controls.set_host(target, after)
             return replies
 
         with mock.patch.object(self.admission.server, "handle_request", side_effect=observe):

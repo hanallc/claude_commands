@@ -37,12 +37,22 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
                 for line in lines]
 
     def test_ssh_launch_failure_settles_start_before_releasing_claim(self) -> None:
+        self.check_launch_refusal("start-launch-failed")
+
+    def test_ssh_launch_interrupt_settles_start_before_releasing_claim(self) -> None:
+        self.check_launch_refusal("start-launch-interrupted")
+
+    def test_start_journal_removal_failure_keeps_dispatch_pending(self) -> None:
+        self.check_launch_refusal("start-journal-unremovable")
+
+    def check_launch_refusal(self, mode: Literal[
+            "start-launch-failed", "start-launch-interrupted", "start-journal-unremovable"]) -> None:
         self.configure("natedev,linux")
         result = self.verify("test", "sample", "--no-cache", "--target", "linux", extra={
-            "TEST_SSH_MODES": '{"linux":"start-launch-failed"}'})
+            "TEST_SSH_MODES": json.dumps({"linux": mode})})
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         attempt, = self.ssh_events()
-        self.assertEqual(attempt["actions"][-4:], ["run", "cleanup", "settle-start", "release"], attempt)
+        self.assertEqual(attempt["actions"].count("run"), 1, attempt)
         self.assertEqual(attempt["result_type"], "LostMacRun")
         requests = self.queue_requests()
         report, = [request for request in requests if isinstance(request, wire.ExecutionReport)]
@@ -50,11 +60,41 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
         self.assertEqual(claims, {report.claim})
         assert isinstance(report.claim, placement.ProviderClaimReference)
         self.assertEqual(report.evidence, execution_identity.ExecutionNotStarted())
-        self.assertEqual(report.outcome, placement.AttemptDeclined("lost"))
-        self.assertIsInstance(report.path, placement.DispatchPathSettled)
         self.assertEqual(attempt["adopted_claim_ids"], [report.claim.claim_id])
-        self.assertEqual(attempt["remaining_claim_ids"], [])
+        identity = claim_state.ClaimIdentity(report.claim.claim_id, report.claim.episode, report.claim.attempt)
+        state = self.target_state("linux")
+        key = offload.pending_start_key(identity)
+        journal = state / "pending-starts" / key
+        if mode == "start-journal-unremovable":
+            self.assertIsInstance(report.path, placement.DispatchPathPending)
+            assert isinstance(report.path, placement.DispatchPathPending)
+            self.assertIn("cannot remove the start journal", report.path.reason)
+            self.assertEqual(attempt["actions"][-3:], ["run", "cleanup", "settle-start"], attempt)
+            self.assertEqual(attempt["remaining_claim_ids"], [identity.claim_id])
+            self.assertTrue(journal.is_dir())
+        else:
+            self.assertEqual(attempt["actions"][-4:], ["run", "cleanup", "settle-start", "release"], attempt)
+            self.assertEqual(report.outcome, placement.AttemptDeclined("lost"))
+            self.assertIsInstance(report.path, placement.DispatchPathSettled)
+            self.assertEqual(attempt["remaining_claim_ids"], [])
+            self.assertFalse(journal.exists())
+        self.assertFalse(list((state / "dispatch-fences").glob(f"*/{key}.lock")))
         self.assertEqual(self.local_runs(), [])
+
+    def test_fixture_exclusion_follows_exact_release(self) -> None:
+        self.configure("natedev,linux")
+        exclusion = self.runner_state / "provider-outcome-linux.json"
+        for mode, retained in (("start-launch-failed", False), ("run-release-unconfirmed", True)):
+            with self.subTest(mode=mode):
+                self.clear_observations()
+                result = self.verify("test", "sample", "--no-cache", "--target", "linux", extra={
+                    "TEST_SSH_MODES": json.dumps({"linux": mode})})
+                attempt = self.ssh_events()[-1]
+                self.assertEqual(result.returncode == 0, retained, result.stdout + result.stderr)
+                self.assertEqual(attempt["actions"][-1], "release", attempt)
+                self.assertEqual(attempt["result_type"], "PassedOnTarget" if retained else "LostMacRun")
+                self.assertEqual(attempt["remaining_claim_ids"], attempt["adopted_claim_ids"] if retained else [])
+                self.assertEqual(exclusion.exists(), retained, attempt)
 
     def test_lost_authorization_releases_the_exact_settled_start(self) -> None:
         self.check_lost_authorization("start-fence-confirmed")
@@ -309,7 +349,7 @@ steps_path.write_text(json.dumps(steps))
 '''
         self.write_executable(self.runner, support.SSH_RUNNER.replace(
             "started = time.monotonic()", before_attempt + "\nstarted = time.monotonic()").replace(
-            "\nconfigured_mode = ", after_attempt + "\nconfigured_mode = "))
+            "\noutcome = ", after_attempt + "\noutcome = "))
         with self.spare_after_linux_refusal():
             result = self.verify("test", "sample", "--no-cache", extra={
                 "TEST_SSH_MODES": '{"linux":"retained-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
