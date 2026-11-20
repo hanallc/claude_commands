@@ -389,10 +389,13 @@ function drawSpend() {
   document.getElementById("spend-note").textContent = data.spend.unavailable || data.spend.forecast;
   const refused = data.spend.refused_bills ?? [];
   billRefusals.hidden = refused.length === 0;
-  billRefusalSummary.textContent = refused.length === 0 ? "" : refused.length === 1
-    ? "1 AWS bill record refused; that day shows our estimate."
-    : `${refused.length} AWS bill records refused; those days show our estimate.`;
-  billRefusalTip.replaceChildren(...refused.flatMap(record => [element("dt", record.day), element("dd", record.reason)]));
+  const days = new Set(refused.flatMap(record => record.days));
+  const records = refused.length === 1 ? "record" : "records";
+  const estimate = days.size === 1 ? "that day shows our estimate" : "those days show our estimate";
+  billRefusalSummary.textContent = refused.length === 0 ? "" : `${refused.length} AWS bill ${records} refused; ${estimate}.`;
+  billRefusalTip.replaceChildren(...refused.flatMap(record => [
+    element("dt", record.days.join(", ")), element("dd", record.reason)
+  ]));
   const settled = (data.settled_notes ?? []).map(note => element("p", note, "note"));
   document.getElementById("settled-notes").replaceChildren(...settled);
 }

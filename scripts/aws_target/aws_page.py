@@ -86,7 +86,7 @@ class SpendTile(TypedDict):
 
 
 class RefusedBillData(TypedDict):
-    day: str
+    days: list[str]
     reason: str
 
 
@@ -353,8 +353,9 @@ def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: 
         row.day in (today.isoformat(), yesterday.isoformat())
         or (month is not None and row.day.startswith(f'{today:%Y-%m}')))}
     refused: list[RefusedBillData] = [
-        {'day': record.day_label(), 'reason': record.reason.value}
-        for record in spend.refused_bills if record.day_label() in shown_estimates]
+        {'days': labels, 'reason': record.reason.value}
+        for record in spend.refused_bills
+        if (labels := [day.isoformat() for day in record.days if day.isoformat() in shown_estimates])]
     if month is None:
         tiles.append({'label': 'Month to date', 'usd': '—', 'note': f'UTC {today:%Y-%m}: no billed day yet'})
         return {'unavailable': '', 'tiles': tiles, 'forecast': '', 'refused_bills': refused}

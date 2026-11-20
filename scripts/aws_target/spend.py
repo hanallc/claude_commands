@@ -47,8 +47,8 @@ def spend_from(inputs: measurement.MeasurementInputs, snapshot: measurement.AwsM
         return aws_config.MeasurementUnavailable(snapshot.costs.reason)
     if isinstance(inputs.settings, aws_config.MeasurementUnavailable):
         return inputs.settings
-    refused_days = {record.day.isoformat(): record.day for record in refused
-                    if isinstance(record.day, date) and record.day.isoformat() <= last_day}
+    refused_days = {day.isoformat(): day for record in refused for day in record.days
+                    if day.isoformat() <= last_day}
     spends = book.spend_days(inputs.settings, instant, estimate_days=tuple(refused_days.values()))
     newest_bill_day = max((spend.day for spend in spends if spend.source == 'AWS bill'), default='')
 

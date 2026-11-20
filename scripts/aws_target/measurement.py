@@ -142,11 +142,11 @@ def daily_usage_from(source: MeasurementInputs, book: ledger.CostLedger, day: st
             return MeasurementUnavailable('report day is in the future')
         costs = ledger.costs_from_evidence(source.state, source.settings, end, window=accounting_day)
         uptime = sum(row.confirmed_uptime_s for row in costs.intervals)
-        usd = ledger.period_cost(costs.intervals, start, end)
+        usd = ledger.period_cost(ledger.local_charge_intervals(costs.intervals), start, end)
         first_utc_day = datetime.fromtimestamp(start, UTC).date()
         last_utc_day = datetime.fromtimestamp(max(start, end - 1), UTC).date()
-        estimate_days = tuple(record.day for record in refused if isinstance(record.day, date)
-                              and first_utc_day <= record.day <= last_utc_day)
+        estimate_days = tuple(day for record in refused for day in record.days
+                              if first_utc_day <= day <= last_utc_day)
         if estimate_days or source.state.gate_reservations or book.validated_bills(now):
             spends = book.spend_days(source.settings, now, estimate_days=estimate_days)
             usd = ledger.period_cost((charge for spend in spends for charge in spend.intervals), start, end)

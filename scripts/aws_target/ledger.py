@@ -1238,6 +1238,11 @@ def costs_from_evidence(state: LedgerEvidence, settings: SpendingSettings, now: 
                     window=window, pricing_end=pricing_end)
 
 
+def local_charge_intervals(intervals: Sequence[ChargedInterval]) -> tuple[ChargedInterval, ...]:
+    """Keep local charges and Cost Explorer query fees for an estimate."""
+    return tuple(charge for charge in intervals if charge.kind != 'reconciliation')
+
+
 def period_cost(intervals: Sequence[ChargedInterval] | Iterator[ChargedInterval], start: int, end: int) -> Decimal:
     """Return the sum of charges inside the requested period."""
     return sum((_overlap(charge, start, end) for charge in intervals), Decimal(0))
@@ -1418,31 +1423,27 @@ class BillRecordRejection(Enum):
 
 
 @dataclass(frozen=True)
-class BillDayUnavailable:
-    """The record has no usable UTC day."""
-
-
-@dataclass(frozen=True)
 class RefusedBillRecord:
-    day: date | BillDayUnavailable
+    days: tuple[date, ...]
     reason: BillRecordRejection
 
-    def day_label(self) -> str:
-        return self.day.isoformat() if isinstance(self.day, date) else 'UTC day unavailable'
-
     def display_line(self) -> str:
-        return f'{self.day_label()}: {self.reason.value}'
+        labels = ', '.join(day.isoformat() for day in self.days) or 'UTC day unavailable'
+        return f'{labels}: {self.reason.value}'
 
 
-def _refused_bill_day(name: str, label: str = '') -> date | BillDayUnavailable:
+def _refused_bill_days(name: str, label: object = '') -> tuple[date, ...]:
+    days: set[date] = set()
     for candidate in (name.removesuffix('.json'), label):
+        if not isinstance(candidate, str):
+            continue
         try:
             day = date.fromisoformat(candidate)
         except ValueError:
             continue
         if day.isoformat() == candidate:
-            return day
-    return BillDayUnavailable()
+            days.add(day)
+    return tuple(sorted(days))
 
 
 @dataclass(frozen=True)
@@ -1456,6 +1457,10 @@ class SavedBillRecord:
 def read_saved_bill(path: Path, now: int) -> SavedBillRecord:
     """Validate the saved account bill and keep its existing pricing evidence."""
     fields, duplicates = _read_charge_fields(path.read_text())
+    return _validate_saved_bill(path.name, fields, duplicates, now)
+
+
+def _validate_saved_bill(name: str, fields: dict[str, object], duplicates: bool, now: int) -> SavedBillRecord:
     reading = _decode_charge(fields)
     if duplicates:
         return SavedBillRecord(reading, BillRecordRejection.DUPLICATE_FIELDS)
@@ -1464,7 +1469,7 @@ def read_saved_bill(path: Path, now: int) -> SavedBillRecord:
     except (ValueError, ArithmeticError):
         return SavedBillRecord(reading, BillRecordRejection.INVALID_HISTORY)
     try:
-        matches = matches_utc_charge_day(path.name, reading, date.fromisoformat(reading.day))
+        matches = matches_utc_charge_day(name, reading, date.fromisoformat(reading.day))
     except (OSError, ValueError, ArithmeticError):
         matches = False
     if not matches:
@@ -1931,7 +1936,10 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
     latest = max(bills.values(), key=lambda row: row.day, default=None)
     base = _charges(replace(state, gate_reservations=[], hana_compute=[], hana_storage=[]), replace(settings, accounting_zone=zone), now,
                     require_fresh=False)
-    older = tuple(row for row in base.intervals if row.kind == 'instance')
+    base_intervals = base.intervals if reserve else local_charge_intervals(base.intervals)
+    older = tuple(row for row in base_intervals if row.kind == 'instance')
+    query_charges = tuple(row for row in base_intervals if row.kind == 'explorer')
+    storage_costs = tuple(row for row in base_intervals if row.kind in ('fixed', 'reconciliation'))
     if latest is not None:
         older = older_compute_intervals(older, readings, settings, now)
     gate_compute: dict[str, list[ChargedInterval]] = {}
@@ -1972,10 +1980,9 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
                 intervals.append(replace(charge, start=max(start, charge.start), end=min(end, charge.end),
                                          usd=_overlap(charge, start, end)))
 
-        for charge in base.intervals:
-            if charge.kind == 'explorer':
-                include(charge)
-        query_usd = period_cost(tuple(row for row in base.intervals if row.kind == 'explorer'), start, end)
+        for charge in query_charges:
+            include(charge)
+        query_usd = period_cost(query_charges, start, end)
         bill = bills.get(key)
         use_local_charges = day in local_estimate_days
         runs = sum(start <= r.at < end and isinstance(r.state, (GateRunning, GateTerminated))
@@ -2004,8 +2011,6 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             else:
                 if use_local_charges:
                     groups['other'] += query_usd
-                storage_costs = tuple(row for row in base.intervals
-                                      if row.kind == 'fixed' or (row.kind == 'reconciliation' and not use_local_charges))
                 groups['storage'] += period_cost(storage_costs, start, end)
                 for charge in storage_costs:
                     include(charge)
@@ -2338,15 +2343,19 @@ class CostLedger:
         refused: list[RefusedBillRecord] = []
         for path in self.bill_paths():
             try:
-                record = read_saved_bill(path, now)
+                fields, duplicates = _read_charge_fields(path.read_text())
             except OSError:
-                refused.append(RefusedBillRecord(_refused_bill_day(path.name), BillRecordRejection.UNREADABLE))
+                refused.append(RefusedBillRecord(_refused_bill_days(path.name), BillRecordRejection.UNREADABLE))
+                continue
             except (ValueError, ArithmeticError):
-                refused.append(RefusedBillRecord(_refused_bill_day(path.name), BillRecordRejection.MALFORMED))
-            else:
-                if isinstance(reason := record.validation_result, BillRecordRejection):
-                    day = _refused_bill_day(path.name, record.pricing_read.day)
-                    refused.append(RefusedBillRecord(day, reason))
+                refused.append(RefusedBillRecord(_refused_bill_days(path.name), BillRecordRejection.MALFORMED))
+                continue
+            try:
+                result = _validate_saved_bill(path.name, fields, duplicates, now).validation_result
+            except (ValueError, ArithmeticError):
+                result = BillRecordRejection.MALFORMED
+            if isinstance(result, BillRecordRejection):
+                refused.append(RefusedBillRecord(_refused_bill_days(path.name, fields.get('day')), result))
         return tuple(refused)
 
     def launches(self) -> tuple[dict[str, object], ...]:

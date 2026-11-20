@@ -938,9 +938,12 @@ The newest read time must be valid and cannot be in the future.
 The check rejects duplicate JSON fields and invalid amount histories.
 The history times must increase and the last entry must match the newest read.
 A legacy file without a history supplies one read.
-For a refused day, the page and buildlog report use all local charges, including Hana storage that starts before the newest bill.
+The page and daily usage use an accepted bill for its UTC day.
+Estimates exclude saved reconciliation adjustments.
+For a refused day, estimates include local charges such as Hana storage that starts before the newest bill.
 The spend view includes an earlier refused day when it has local charges.
 The page shows one notice when a displayed amount includes a refused day.
+The notice lists the dates from the file name and the bill when the page uses their estimates.
 The tooltip and buildlog report give the UTC day and reason for each applicable record.
 Each publication loads the account settings once.
 Known limit. Concurrent refreshes can record one USD 0.01 fee for two Cost Explorer reads.

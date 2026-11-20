@@ -393,6 +393,17 @@ class AwsCombinedTableTests(PageCostFixture):
         self.run_browser_checks('', """
     check(document.querySelector("#bill-refusals").hidden, "The valid bill still supplies the day");
 """)
+        mismatched = ledger.ChargeRead('2026-01-14', now, start + 86400, start + 2 * 86400,
+                                       Decimal(5), Decimal(0), Decimal(0))
+        mismatched_path = charges / '2026-01-15.json'
+        _ = mismatched_path.write_text(json.dumps(ledger.charge_record(mismatched)))
+        self.run_browser_checks('', """
+    const summary = document.querySelector("#bill-refusal-summary");
+    check(summary.textContent === "1 AWS bill record refused; those days show our estimate.", "One record");
+    check(document.querySelector("dl[role=tooltip] dt").textContent === "2026-01-14, 2026-01-15",
+          "The refusal lists both UTC dates");
+""")
+        mismatched_path.unlink()
         _ = (charges / '2026-01-14.json').write_text('{broken')
         self.run_browser_checks('', """
     const summary = document.querySelector("#bill-refusal-summary");

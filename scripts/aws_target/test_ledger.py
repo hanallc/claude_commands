@@ -44,15 +44,36 @@ class RefusedBillEstimateTests(unittest.TestCase):
             state.charge_refresh_at = end
         charges = state_folder / 'charges'
         charges.mkdir()
-        _ = (charges / 'alias.json').write_text(json.dumps(ledger.charge_record(bill)))
-
         expected = Decimal(3) + query_usd
+        for name, dates in (('alias.json', (date(2026, 1, 15),)),
+                            ('2026-01-14.json', (date(2026, 1, 14), date(2026, 1, 15)))):
+            with self.subTest(name=name):
+                path = charges / name
+                _ = path.write_text(json.dumps(ledger.charge_record(bill)))
+                page = spend.read_spend(settings, state_folder, now, '2026-01-16')
+                assert isinstance(page, spend.Spend)
+                self.assertEqual(page.refused_bills, (
+                    ledger.RefusedBillRecord(dates, ledger.BillRecordRejection.UTC_DAY_MISMATCH),))
+                estimate = next(row for row in page.days if row.day == day)
+                self.assertEqual((estimate.usd, estimate.query_usd), (expected, query_usd))
+                self.assertEqual(measurement.daily_usage(settings, state_folder, day, now),
+                                 measurement.DailyUsage(0, expected))
+                path.unlink()
+
         page = spend.read_spend(settings, state_folder, now, '2026-01-16')
         assert isinstance(page, spend.Spend)
         estimate = next(row for row in page.days if row.day == day)
-        self.assertEqual((estimate.usd, estimate.query_usd), (expected, query_usd))
+        self.assertEqual((estimate.usd, estimate.query_usd), (Decimal(3), query_usd))
         self.assertEqual(measurement.daily_usage(settings, state_folder, day, now),
                          measurement.DailyUsage(0, expected))
+
+        _ = (charges / (day + '.json')).write_text(json.dumps(ledger.charge_record(bill)))
+        page = spend.read_spend(settings, state_folder, now, '2026-01-16')
+        assert isinstance(page, spend.Spend)
+        accepted = next(row for row in page.days if row.day == day)
+        self.assertEqual((accepted.usd, accepted.query_usd), (Decimal(5), query_usd))
+        self.assertEqual(measurement.daily_usage(settings, state_folder, day, now),
+                         measurement.DailyUsage(0, Decimal(5) + query_usd))
 
 
 class LedgerTests(CostFixture):
@@ -1180,7 +1201,8 @@ class LedgerTests(CostFixture):
                     path = self.state / 'charges' / name
                     if extra:
                         _ = path.write_text('{' + extra + path.read_text()[1:])
-                    self.assertEqual(self.book.refused_bill_records(now), (ledger.RefusedBillRecord(date.fromisoformat(day), reason),))
+                    dates = tuple(sorted({date.fromisoformat(day), date.fromisoformat(reading.day)}))
+                    self.assertEqual(self.book.refused_bill_records(now), (ledger.RefusedBillRecord(dates, reason),))
                     check_amounts(expected)
                     path.unlink()
 
