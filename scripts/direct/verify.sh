@@ -2825,6 +2825,7 @@ placement_failed() {
 }
 
 placement_once() {
+    local repository="${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
     local token=none reply line route="" status=0 monitor=0 refresh_source=${1:-0}
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
@@ -2847,8 +2848,7 @@ placement_once() {
             snapshot=$(verify_helper "$STEP_COPIES_SCRIPT" snapshot-tree --repo "$VERIFY_SLOT_SOURCE") || return $?
             read -r tree key head <<< "$snapshot"
         else
-            key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key \
-                --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}") || return $?
+            key=$(verify_helper "$BUILD_TARGETS_SCRIPT" source-key --repo-root "$repository") || return $?
         fi
         VERIFY_SLOT_TREE=$tree PLACEMENT_SOURCE_KEY=$key VERIFY_SLOT_HEAD=$head
         PLACEMENT_ASSIGNMENT_FILE="$HOLD_WAIT_DIR/placement-$PLACEMENT_STEP_NUMBER.json"
@@ -2864,7 +2864,7 @@ placement_once() {
     if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
-        --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
+        --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "$repository" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$token"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
@@ -3666,8 +3666,7 @@ supersede_older_waiters() {
         [[ "$pid" =~ ^[0-9]+$ && "$stamp" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
         if ! kill -0 "$pid" 2>/dev/null; then
             rm -f "$file"
-        elif (( 10#$stamp < 10#$own )) \
-            && ps -p "$pid" -o args= 2>/dev/null | grep -q 'verify\.sh'; then
+        elif (( 10#$stamp < 10#$own )) && token_waiter_runs_verify "$pid"; then
             kill -USR1 "$pid" 2>/dev/null || true
         fi
     done

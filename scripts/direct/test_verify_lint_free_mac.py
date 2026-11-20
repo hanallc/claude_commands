@@ -18,6 +18,7 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
     @override
     def setUp(self) -> None:
         super().setUp()
+        caller_admission(self, self.root, self.environment).configure(waiting_pass_seconds=0.25)
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
         self.write_executable(self.bin_directory / "taplo", TAPLO_STUB)
         config = self.root / "lint.conf"
