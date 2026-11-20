@@ -559,24 +559,24 @@ function hoursTable(rows) {
   return table;
 }
 
-function hoursAnswer(compared, marked, limitPercent) {
-  const more = marked.filter(row => row.limit_result === "higher_bill");
+function hoursAnswer(compared, higherBills, limitPercent) {
   const difference = rows => {
     const tenths = Math.abs(rows.reduce((total, row) => total + row.difference_tenths, 0));
     return tenths ? `${(tenths / 10).toFixed(1)} hours` : "less than 0.1 hours";
   };
   const rowCount = rows => `${rows.length} ${rows.length === 1 ? "row" : "rows"}`;
-  if (more.length) {
-    return `Yes. AWS billed ${difference(more)} more than our records, in ${rowCount(more)}.`;
+  if (higherBills.length) {
+    return `Yes. AWS billed ${difference(higherBills)} more than our records, in ${rowCount(higherBills)}.`;
   }
+  const lowerBills = compared.filter(row => row.limit_result === "lower_bill");
   const total = key => compared.reduce((hours, row) => hours + row[key], 0).toFixed(1);
   const billed = total("billed");
   const recorded = total("recorded");
-  const answer = marked.length
-    ? `No. AWS billed ${difference(marked)} less than our records, in ${rowCount(marked)}.`
+  const answer = lowerBills.length
+    ? `No. AWS billed ${difference(lowerBills)} less than our records, in ${rowCount(lowerBills)}.`
     : `No. AWS billed ${billed} hours and our records show ${recorded} hours.`;
   if (Number(billed) > Number(recorded)) {
-    return answer + ` No row is more than ${limitPercent} above its recorded hours plus any hours reserved for Hana.`;
+    return answer + ` No row is more than ${limitPercent} above the sum of its recorded hours and the hours reserved for Hana.`;
   }
   return answer;
 }
@@ -595,11 +595,11 @@ function drawHours() {
     section.appendChild(element("p", "There are no machine hours to compare in the selected regions.", "answer"));
     return;
   }
-  const marked = compared.filter(row => row.limit_result !== "within_limit");
-  const answer = compared.length ? hoursAnswer(compared, marked, data.hours.limit_percent)
+  const higherBills = compared.filter(row => row.limit_result === "higher_bill");
+  const answer = compared.length ? hoursAnswer(compared, higherBills, data.hours.limit_percent)
     : "No AWS bill is available yet for the recorded hours.";
   section.appendChild(element("p", answer, "answer"));
-  if (marked.length) section.appendChild(hoursTable(marked));
+  if (higherBills.length) section.appendChild(hoursTable(higherBills));
   const details = element("details");
   details.open = wasOpen;
   details.addEventListener("toggle", markOverflow);

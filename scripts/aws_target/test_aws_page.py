@@ -652,15 +652,18 @@ class AwsCombinedTableTests(PageCostFixture):
     const cells = row => [...row.cells].map(cell => cell.textContent).join("|");
     const toggleRegion = region => document.querySelector(`#regions [data-region='${region}']`).click();
     check(answer() === "Yes. AWS billed 4.2 hours more than our records, in 2 rows.", "Sum marked higher bills");
+    const reported = answer().match(/billed ([0-9.]+) hours more than our records, in ([0-9]+) rows/);
+    const visibleSum = rows().reduce((sum, row) => sum + Number(row.cells[4].textContent), 0);
+    check(reported && visibleSum.toFixed(1) === reported[1] && rows().length === Number(reported[2]),
+          "The amount and count in the answer match the visible rows");
     check(cells(table().tHead.rows[0]) === "type|region|AWS billed|our records|difference|Hana reserved", "Hours headings");
     check(table().tHead.rows[0].cells[5].title ===
           "The check adds these hours reserved for Hana in this region to our recorded hours when it checks for a higher bill.",
           "Hana reserved has a tooltip");
     check(rows().map(cells).join("\\n") === [
       "c7a.4xlarge|eu-west-1|5.7|2.0|+3.7|1.0",
-      "c7a.4xlarge|us-east-1|1.5|1.0|+0.5|—",
-      "m7a.8xlarge|us-west-1|0.0|2.1|-2.1|—"
-    ].join("\\n"), "Only marked rows are visible. Hana reserved applies to one row.");
+      "c7a.4xlarge|us-east-1|1.5|1.0|+0.5|—"
+    ].join("\\n"), "The visible rows are the marked higher bills");
     check([2, 3, 4, 5].every(index => getComputedStyle(rows()[0].cells[index]).textAlign === "right"),
           "Hours align right");
     check(!details().open && details().querySelector("summary").textContent === "All rows (4)", "Closed by default");
@@ -671,15 +674,16 @@ class AwsCombinedTableTests(PageCostFixture):
     toggleRegion("us-east-1");
     toggleRegion("us-west-1");
     check(answer() === "No. AWS billed 1.5 hours and our records show 1.0 hours. "
-          + "No row is more than 15% above its recorded hours plus any hours reserved for Hana.",
+          + "No row is more than 15% above the sum of its recorded hours and the hours reserved for Hana.",
           "An in-limit higher bill explains the configured limit");
     check(!table() && details().open, "The region filter leaves only the disclosure open");
     check(details().querySelector("tbody tr").cells[5].textContent === "0.5", "The in-limit row used Hana reserved");
     toggleRegion("us-east-2");
     toggleRegion("us-west-1");
     check(answer() === "No. AWS billed 2.1 hours less than our records, in 1 row.", "One marked lower bill");
-    check(rows().length === 1 && cells(rows()[0]) === "m7a.8xlarge|us-west-1|0.0|2.1|-2.1",
-          "A marked lower bill has a negative difference and does not use Hana reserved");
+    check(!table(), "A marked lower bill stays out of the visible table");
+    check(cells(details().querySelector("tbody tr")) === "m7a.8xlarge|us-west-1|0.0|2.1|-2.1",
+          "All rows shows the marked lower bill and its negative difference");
 """)
 
     def test_hours_answer_sums_the_displayed_differences(self) -> None:

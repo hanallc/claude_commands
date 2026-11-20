@@ -1111,7 +1111,7 @@ When a higher bill exceeds the limit, the answer sums the displayed differences 
 If only lower bills exceed the limit, the answer sums the displayed differences for those rows and gives their count.
 If all comparisons pass, the answer gives the total billed hours and the total recorded hours.
 If the answer is “No” and the displayed billed total is higher, a second sentence explains the limit and the Hana allowance.
-The visible table includes only rows that exceed the limit.
+The visible table includes only higher bills that exceed the limit.
 The closed “All rows” control opens a table for every type and region with hours in the selected regions.
 The tables show billed hours, recorded hours and the signed difference to one decimal place.
 The difference subtracts the full values before rounding.
