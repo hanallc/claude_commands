@@ -30,17 +30,10 @@ WORK_SLICE = 'hana-work.slice'
 SYSTEM_BIN = '/run/current-system/sw/bin'
 
 
-@dataclass(frozen=True)
-class PermitWindow:
-    enabled: bool
-    permit_max_seconds: int
-
-
-def read_permit_window(configuration: conf.ConfigRead, *, recover_invalid: bool = True) -> PermitWindow:
+def read_permit_max_seconds(configuration: conf.ConfigRead, *, recover_invalid: bool = True) -> int:
     from scripts.lib import conf
 
-    return PermitWindow(configuration.value('enabled', conf.on_off, recover_invalid=recover_invalid),
-                        configuration.value('permit_max_seconds', conf.positive_whole, recover_invalid=recover_invalid))
+    return configuration.value('permit_max_seconds', conf.positive_whole, recover_invalid=recover_invalid)
 
 
 @dataclass(frozen=True)
@@ -69,12 +62,12 @@ def decode_settings(values: Mapping[str, object]) -> SafetySettings:
     return SafetySettings(enabled, **numbers)
 
 
-def read_settings(configuration: conf.ConfigRead, *, recover_invalid: bool = True) -> SafetySettings:
+def read_settings(configuration: conf.ConfigRead, *, enabled: bool, recover_invalid: bool = True) -> SafetySettings:
     """Read Hana settings without reading deployment or credential files."""
     from scripts.lib import conf
 
-    permit = read_permit_window(configuration, recover_invalid=recover_invalid)
-    values: dict[str, object] = {'enabled': permit.enabled, 'permit_max_seconds': permit.permit_max_seconds}
+    permit_max_seconds = read_permit_max_seconds(configuration, recover_invalid=recover_invalid)
+    values: dict[str, object] = {'enabled': enabled, 'permit_max_seconds': permit_max_seconds}
     for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'step_cpu_limit',
                 'step_memory_gib', 'mount_timeout_seconds'):
         values[key] = configuration.value(key, conf.positive_whole, recover_invalid=recover_invalid)

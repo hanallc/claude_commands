@@ -51,7 +51,7 @@ def read_settings(configuration: conf.ConfigRead) -> HanaRouteSettings:
             raise ValueError('Hana permits only check and lint judgments')
         return cast('tuple[placement.CommandKind, ...]', kinds)
 
-    if not configuration.value('enabled', conf.on_off):
+    if machine_switch.read(machine_switch.Machine.HANA_AWS) is machine_switch.MachineSwitch.OFF:
         return DisabledHanaRoute()
     key = configuration.value('repository_identity', repository_key)
     kinds = configuration.value('kinds', permitted_kinds)

@@ -47,7 +47,7 @@ A missing SSH setting must never become a fake host or timeout value.
 ## 3. Configuration and semantic values
 
 The later implementation adds only inactive configuration.
-It leaves `enabled=off` and the existing `targets=` value unchanged.
+The registry uses `enabled.hana-aws` to control new Hana work.
 The target name occurs in configuration and fixtures, never in production selection conditions.
 
 | File | Proposed new entries |

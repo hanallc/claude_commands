@@ -34,7 +34,7 @@ from uuid import uuid4
 
 
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
-from scripts.aws_target import admin_secrets, aws_test_identity, box, gate_probe, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote, retained, spot_end, teardown
+from scripts.aws_target import admin_secrets, aws_test_identity, box, gate_probe, hana_box, hana_image, hana_render, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, quota_requests, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
@@ -534,14 +534,6 @@ def _hana_setup_ownership(saved: dict[str, object]) -> HanaBoxOwnership:
     return HanaBoxOwnership.DIRECT
 
 
-def _print_hana_placement(workload: conf.ConfigRead) -> None:
-    enabled = workload.text('enabled')
-    if enabled not in ('on', 'off'):
-        raise ValueError('enabled must be on or off')
-    state = 'enabled' if enabled == 'on' else 'disabled'
-    print(f'Hana placement is {state}. This command does not change it.')
-
-
 def _hana_lifecycle_idle(registration: dict[str, object]) -> bool:
     operation = registration.get('operation', {})
     observing = (isinstance(operation, dict)
@@ -772,18 +764,18 @@ class Deployment:
             return prepared
 
     @staticmethod
-    def _print_hana_setup(workload: conf.ConfigRead, limits: hana_spend.PermitSettings) -> None:
+    def _print_hana_setup(limits: hana_spend.PermitSettings) -> None:
         print(f'Hana plan: separate stack; {limits.instance_type}; persistent Spot; interruption stop')
         print(f'Hana plan: root {limits.root_gib} GiB; data {limits.data_gib} GiB; compute ceiling ${limits.spot_max_usd_per_hour}/hour')
         print('Hana resources: instance, retained data disk, launch template, security group, private control bucket, scaler policy')
-        _print_hana_placement(workload)
+        print('Hana placement stays as configured.')
 
     def hana_setup(self, *, approve_resources: bool = False) -> bool:
         """Deploy one retained Spot box and confirm its stopped state before registration."""
         workload = conf.read_or_repository('hana_aws')
-        limits = hana_spend.read_settings(workload)
+        limits = hana_spend.read_resource_settings(workload)
         if not approve_resources and isinstance(self.mode, plan_run.ApprovedSetup):
-            self._print_hana_setup(workload, limits)
+            self._print_hana_setup(limits)
             return False
         if isinstance(self.mode, plan_run.PlanRun):
             return self._plan_hana_replacement(workload, limits)
@@ -794,7 +786,7 @@ class Deployment:
             if self._hana_root_replacement(workload, limits):
                 return True
             self._refuse_hana_replacement()
-            self._print_hana_setup(workload, limits)
+            self._print_hana_setup(limits)
             child = self._hana_output()
             path = self.directory / 'hana' / 'setup.json'
             saved = remote.read_record(path) if path.exists() else {}
@@ -991,7 +983,7 @@ class Deployment:
             hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
                 clock=self.clock).register(identity)
             print('Hana setup complete. The box is stopped.')
-            _print_hana_placement(workload)
+            print('Hana placement stays as configured.')
             return self._probe_hana_scaler(provider, identity)
 
     @contextmanager
@@ -1072,7 +1064,7 @@ class Deployment:
         registered = hana_image.saved(self.directory)
         if not isinstance(registered, hana_image.RegisteredImage):
             raise DeploymentRefused('Hana has no verified image registration. ' + hana_replacement.REGISTER_IMAGE)
-        if not hana_image.guest_digest_is_current(registered.digest, configuration):
+        if not hana_image.guest_digest_matches_build(registered.digest, configuration):
             raise DeploymentRefused('The registered Hana image is older than the current guest files. '
                                     + 'Build the Hana image from the current input. ' + hana_replacement.REGISTER_IMAGE)
         return registered
@@ -1165,7 +1157,8 @@ class Deployment:
 
     @staticmethod
     def _print_hana_image_status(saved: dict[str, object], configuration: conf.ConfigRead) -> None:
-        current = hana_image.setup_image_is_current(saved, configuration)
+        digest = hana_render.decode_guest_digest(saved.get('guest_digest'))
+        current = isinstance(digest, hana_render.GuestDigest) and hana_image.guest_digest_matches_build(digest, configuration)
         print('Hana image is current.' if current else hana_box.HANA_IMAGE_STALE)
 
     @staticmethod
@@ -1556,11 +1549,11 @@ class Deployment:
         workload = conf.read_or_repository('hana_aws')
         print(f'Hana image plan: {built.name}; {built.logical_bytes / 2**30:.1f} GiB; boot {built.boot_mode}')
         print('Hana image resources: one EBS snapshot and one registered image; no instance')
-        _print_hana_placement(workload)
+        print('Hana placement stays as configured.')
         if not approve_resources:
             return False
         self._authorize(True)
-        limits = hana_spend.read_settings(workload)
+        limits = hana_spend.read_resource_settings(workload)
         settings = replace(read_deployment_settings(self.settings_path), region=limits.region,
                            timeout_s=workload.whole('aws_timeout_s'))
         zone = workload.text('availability_zone')
@@ -1890,7 +1883,7 @@ class Deployment:
                     else:
                         kept |= deleted
                 retained.delete(api, kept, wait_s=timeout)
-            spending = hana_spend.HanaSpending(book, self.settings_path, hana_spend.read_settings(workload))
+            spending = hana_spend.HanaSpending(book, self.settings_path, hana_spend.read_resource_settings(workload))
             now = int(self.clock())
             compute = book.read_snapshot().hana_compute if book.path.exists() else []
             if compute:
@@ -2024,7 +2017,7 @@ class Deployment:
         """Share the existing deployment validation and use only Hana sizes and prices."""
         if workload is None:
             workload = conf.read_or_repository('hana_aws')
-        limits = hana_spend.read_settings(workload)
+        limits = hana_spend.read_resource_settings(workload)
         # Empty identity values are allowed here; text() refuses an empty value.
         present = workload.values('ami_id', 'ami_owner_id', 'vpc_id', 'subnet_id')
         names = {key: workload.text(key) for key in ('stack_name', 'availability_zone')}

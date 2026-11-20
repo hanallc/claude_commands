@@ -17,7 +17,7 @@ from unittest import mock
 
 from scripts.aws_target import admin_secrets, aws_target, deploy, hana_box, hana_placement, hana_provider, hana_render, hana_replacement_record, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, HANA_GUEST_RUNTIME_SETTINGS, git_only, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, HANA_GUEST_RUNTIME_SETTINGS, git_only, text_setting, set_hana_switch
 from scripts.lib import conf, process_start
 
 
@@ -26,8 +26,8 @@ IDENTITY = hana_box.DeploymentIdentity('fixture-deployment', 'fixture-instance',
 
 def write_lifecycle_configuration(path: Path) -> None:
     """Give lifecycle tests fixed limits in their private configuration."""
+    set_hana_switch(path.parent, 'on')
     _ = path.write_text("""\
-enabled=on
 host=fixture-hana
 region=us-east-2
 instance_type=m7a.2xlarge
@@ -986,7 +986,7 @@ class HanaBoxTests(CostFixture):
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
 
     def test_automatic_restart_is_counted_without_caller_while_disabled(self) -> None:
-        text_setting(self.workload_path, 'enabled', 'off')
+        set_hana_switch(self.root, 'off')
         self.provider.state = 'running'
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
         exposure = self.book.read_snapshot().hana_compute[-1]

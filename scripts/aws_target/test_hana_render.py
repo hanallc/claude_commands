@@ -31,6 +31,7 @@ IMAGE_INPUTS = (
     'config/build_folders.conf',
     'scripts/aws_target/hana_image.files',
     'scripts/aws_target/hana_render.py',
+    'scripts/build_targets/machine_switch.py',
     'scripts/lib/conf.py',
     'scripts/lib/conf_reads.py',
 )
@@ -99,7 +100,8 @@ class HanaRenderTests(unittest.TestCase):
                         _ = shutil.copyfile(ROOT / entry, destination)
             _ = shutil.copyfile(RUNTIME_LIST, checkout / RUNTIME_LIST.relative_to(ROOT))
             targets = image_inputs / 'config/build_targets.conf'
-            target_values = ('loopback.shell_timeout_s=7\nloopback.shell_timeout_s.fixture-guest=11\n'
+            target_values = ('enabled.hana-aws=on\nenabled.hana-aws.fixture-guest=off\n'
+                + 'loopback.shell_timeout_s=7\nloopback.shell_timeout_s.fixture-guest=11\n'
                 + '# range: 1..\nloopback.command_timeout_s.fixture-guest=23\n'
                 + 'loopback.command_timeout_s.fixture-other=29\nsync.rsync_timeout_s=60\n')
             _ = targets.write_text(target_values)
@@ -119,7 +121,7 @@ class HanaRenderTests(unittest.TestCase):
             _ = copies.write_text(copies_config)
             configuration_path = image_inputs / 'config/hana_aws.conf'
             _ = configuration_path.write_text(
-                'host=fixture-guest\nenabled=on\n# whole: 1..\nguard_grace_seconds=60\n'
+                'host=fixture-guest\n# whole: 1..\nguard_grace_seconds=60\n'
                 + '# whole: 1..\nwatchdog_check_seconds=1\n'
                 + '# whole: 1..\npermit_max_seconds=1800\n# whole: 1..\nstep_cpu_limit=4\n'
                 + '# whole: 1..\nstep_memory_gib=24\n# whole: 1..\nmount_timeout_seconds=15\n'
@@ -153,7 +155,7 @@ class HanaRenderTests(unittest.TestCase):
             self.assertEqual({path.name for path in output.iterdir()}, {*expected_modes, 'runtime'})
             configuration = conf.read(configuration_path)
             with mock.patch('socket.gethostname', return_value='fixture-guest'):
-                files = (*hana_guest.render_files(hana_guest.read_settings(configuration), device=Path('/dev/sdf')),
+                files = (*hana_guest.render_files(hana_guest.read_settings(configuration, enabled=True), device=Path('/dev/sdf')),
                          *hana_receiver.render_files(hana_receiver.read_settings(configuration, command_timeout_s=23.0)))
             for file in files:
                 actual = output / file.path.name
@@ -218,6 +220,9 @@ class HanaRenderTests(unittest.TestCase):
                 (targets, 'loopback.command_timeout_s.fixture-guest', True),
                 (targets, 'loopback.command_timeout_s.fixture-other', False),
                 (targets, 'loopback.shell_timeout_s.fixture-guest', False),
+                (targets, 'enabled.hana-aws', True),
+                (targets, 'enabled.hana-aws.fixture-guest', False),
+                (targets, 'enabled.mac', False),
                 (folders, 'locks.probe_wait_seconds.fixture-guest', True),
                 (folders, 'locks.probe_wait_seconds', False),
                 (folders, 'patterns.tool', False),
@@ -275,7 +280,8 @@ class HanaRenderTests(unittest.TestCase):
                 _ = configuration_path.write_text(original.replace(
                     'result_transfer_timeout_s.fixture-guest=83', 'result_transfer_timeout_s.fixture-guest=89'))
                 self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
-            _ = configuration_path.write_text(original.replace('enabled=on', 'enabled=off'))
+            _ = configuration_path.write_text(original)
+            _ = targets.write_text(target_values.replace('enabled.hana-aws=on', 'enabled.hana-aws=off'))
             self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
             self.assertEqual({str(path.relative_to(runtime)) for path in runtime.rglob('*') if path.is_file()},
                              ({*runtime_entries} - {str(hana_render.RUNNER_ENTRY)}) | {

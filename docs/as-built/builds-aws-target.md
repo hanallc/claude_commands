@@ -200,7 +200,8 @@ It passes when every region passes.
 ## Hana guest safety files
 
 `scripts/aws_target/hana_guest.py` renders safety files for the kept Hana box.
-`config/hana_aws.conf` supplies the image's admission setting, safety timing, and resource values.
+`config/hana_aws.conf` supplies the image's safety timing and resource limits.
+The renderer copies `enabled.hana-aws` from `config/build_targets.conf` to `enabled` in `safety.json`.
 
 `scripts/aws_target/hana_render.py` renders the safety and receiver entry points, settings, and systemd units.
 It applies each rendered file's mode.
@@ -569,7 +570,7 @@ NixOS supplies the approved slot roots and capacity, compiler version, and runne
 Those NixOS settings take effect with a new image.
 
 An edit to a runtime-only file leaves the image digest unchanged.
-The receiver still uses `enabled` as an independent image admission switch.
+The receiver uses the installed `enabled` value in `safety.json` for guest admission.
 This split requires one image replacement before the box accepts a combined payload.
 
 `hana-image` reads the digest from the renderer output in the built image's Nix derivation closure.
@@ -1691,7 +1692,8 @@ The active `hana-aws` target accepts one assigned step at a time.
 The route accepts check and lint judgments for the normalized Hana repository.
 These judgments run direct `cargo check` or `cargo clippy` commands.
 The command policy rejects repairs, builds, nextest, final steps, path overrides, and unknown wrappers.
-`enabled=on` enables the route in `hana_aws.conf`.
+`enabled.hana-aws=on` in `build_targets.conf` permits new placed work.
+Manual Hana AWS resource commands and status reports continue independently of the switch.
 The queue checks the Hana image and capacity before it assigns work.
 A pinned request uses only its requested target.
 

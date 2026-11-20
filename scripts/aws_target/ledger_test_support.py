@@ -13,7 +13,7 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.aws_target import ledger
@@ -110,12 +110,16 @@ source_allowed_environment=RUST_BACKTRACE
 """
 
 
+def set_hana_switch(folder: Path, value: str) -> None:
+    _ = write_config_fixture(folder / 'build_targets.conf', f'enabled.hana-aws={value}\n')
+
+
 def write_hana_config(path: Path | None = None) -> Path:
     """Write fixed setup settings to the test configuration directory."""
     if path is None:
         path = conf.path('hana_aws')
+    set_hana_switch(path.parent, 'off')
     _ = path.write_text("""\
-enabled=off
 host=fixture-hana
 region=us-east-2
 availability_zone=us-east-2b
@@ -191,7 +195,7 @@ def install_aws_fixture_settings(folder: Path) -> None:
 def install_hana_spending_settings(path: Path) -> None:
     """Enable private Hana spending at the test price."""
     _ = write_hana_config(path)
-    text_setting(path, 'enabled', 'on')
+    set_hana_switch(path.parent, 'on')
     numeric_settings(path, {'spot_max_usd_per_hour': '0.15'})
 
 

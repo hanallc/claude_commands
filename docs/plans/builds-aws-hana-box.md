@@ -19,7 +19,7 @@ Reuse build holds, exact-source ownership, the Linux runner, and buildlog result
 Use the existing gate S3 transport instead of adding SSH credentials or an instance IAM role.
 Read the candidate target row only through `target_config.read_targets`.
 Put the target name `hana-aws` in configuration, not in code.
-Disable the candidate when `config/hana_aws.conf` has `enabled=off`.
+Disable the candidate when `config/build_targets.conf` has `enabled.hana-aws=off`.
 Extend the existing `build_targets` capability path; add no second placement rule.
 Register the box as `kind=ssh` and `platform=linux`.
 Put Hana capability keys in its settings file.
@@ -213,10 +213,10 @@ Keep `start_timeout_seconds=120`, `idle_stop_seconds=600`, and `max_steps=1` as 
 | `kind.hana-aws` | `ssh` |
 | `platform.hana-aws` | `linux` |
 | `settings.hana-aws` | `hana_aws.conf` |
+| `enabled.hana-aws` | `on` or `off` |
 
 | New key | Value | Reason |
 | --- | --- | --- |
-| `enabled` | `off` | Require an explicit decision before routing Hana work. |
 | `region` | `us-east-2` | Use the supplied Ohio prices and one storage zone. |
 | `instance_type` | `m7a.4xlarge` | Provide 64 GiB of memory. |
 | `fallback_instance_types` | `c7a.4xlarge,m7i.4xlarge,m6a.4xlarge` | Try these types when the first choice cannot launch. |

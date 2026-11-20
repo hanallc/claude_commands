@@ -22,7 +22,7 @@ from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting, set_hana_switch
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.build_targets import build_targets, target_config
 from scripts.build_queue import admission_protocol as wire, admission_records as records, placement
@@ -150,10 +150,10 @@ class HanaPlacementTests(CostFixture):
             _ = target_config.read_execution_transport(self.target)
 
     def test_disabled_and_wrong_repository_create_no_provider_calls(self) -> None:
-        text_setting(self.workload, 'enabled', 'off')
+        set_hana_switch(self.root, 'off')
         self.assertEqual(hana.fixed_policy(hana.HanaControlTransport(self.workload, 'fixture-hana'), str(self.root), 'check'),
             hana.HanaStepRefused('off'))
-        text_setting(self.workload, 'enabled', 'on')
+        set_hana_switch(self.root, 'on')
         with mock.patch.object(eligibility, 'repository_identity', return_value=eligibility.KnownRepository('hana', 'wrong-origin')):
             self.assertEqual(hana.fixed_policy(hana.HanaControlTransport(self.workload, 'fixture-hana'), str(self.root), 'check'),
                 hana.HanaStepRefused('repo'))

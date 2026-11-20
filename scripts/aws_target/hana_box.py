@@ -63,7 +63,7 @@ class LifecycleSettings:
 def read_settings(configuration: conf.ConfigRead) -> LifecycleSettings:
     settings = LifecycleSettings(*(configuration.whole(key) for key in
         ('idle_stop_seconds', 'start_timeout_seconds', 'tick_interval_s', 'controller_tick_timeout_s')))
-    safety = hana_guest.read_settings(configuration)
+    safety = hana_guest.read_settings(configuration, enabled=True)
     if (min(settings.idle_stop_seconds, settings.start_timeout_seconds, settings.tick_interval_s,
             settings.controller_tick_timeout_s) <= 0
             or settings.tick_interval_s + settings.controller_tick_timeout_s >= safety.guard_grace_seconds

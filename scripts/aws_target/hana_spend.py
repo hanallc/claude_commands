@@ -11,6 +11,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import hana_guest, ledger, remote
+from scripts.build_targets import machine_switch
 from scripts.lib import conf
 
 
@@ -65,13 +66,22 @@ def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permi
         configuration.value('gp3_usd_per_gib_month', _positive_amount), permit_max_seconds)
 
 
-def read_settings(configuration: conf.ConfigRead) -> PermitSettings:
+def read_settings(configuration: conf.ConfigRead, *,
+                  switch: machine_switch.MachineSwitch | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                  ) -> PermitSettings:
     """Read spending and guest safety limits before execution."""
-    safety = hana_guest.read_settings(configuration)
+    if isinstance(switch, conf.UseConfiguredValue):
+        switch = machine_switch.read(machine_switch.Machine.HANA_AWS)
+    safety = hana_guest.read_settings(configuration, enabled=switch is machine_switch.MachineSwitch.ON)
     start = _read_start_settings(configuration, enabled=safety.enabled, permit_max_seconds=safety.permit_max_seconds)
     return PermitSettings(start.enabled, start.region, start.instance_type, start.fallback_instance_types,
         start.spot_max_usd_per_hour, start.root_gib, start.data_gib, start.daily_budget_usd,
         start.gp3_usd_per_gib_month, start.permit_max_seconds, safety.guard_grace_seconds)
+
+
+def read_resource_settings(configuration: conf.ConfigRead) -> PermitSettings:
+    """Read spending limits for manual resource commands and reports."""
+    return read_settings(configuration, switch=machine_switch.MachineSwitch.ON)
 
 
 @dataclass(frozen=True)
@@ -123,6 +133,7 @@ def _setup_record_path(book: ledger.CostLedger) -> Path:
 def _preview_inputs(book: ledger.CostLedger, account: Path, workload: Path, lifecycle: Path) -> _PreviewInputs:
     versions: _PreviewInputs = {}
     for path in (book.path, book.launch_history_path, account, workload, lifecycle, _setup_record_path(book),
+                 conf.path('build_targets'),
                  conf.path('cloud_gate'), _REPOSITORY_GATE_CONFIG, *book.bill_paths()):
         try:
             stat = path.stat()
@@ -168,9 +179,9 @@ class _PlacementPreview:
                 return saved.result
             self.cached = _NoPlacementPreview()
             with conf.diagnostics() as configuration_warnings:
-                permit = hana_guest.read_permit_window(configuration)
-                settings = _read_start_settings(configuration, enabled=permit.enabled,
-                                                permit_max_seconds=permit.permit_max_seconds)
+                enabled = machine_switch.read(machine_switch.Machine.HANA_AWS) is machine_switch.MachineSwitch.ON
+                settings = _read_start_settings(configuration, enabled=enabled,
+                                                permit_max_seconds=hana_guest.read_permit_max_seconds(configuration))
                 try:
                     max_age = configuration.whole('preview_max_age_s')
                 except conf.Unusable:
