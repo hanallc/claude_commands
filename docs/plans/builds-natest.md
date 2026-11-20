@@ -305,3 +305,21 @@
   2. 20 repeated runs pass, TMPDIR=/tmp, 2 GB scope.
   3. basedpyright zero errors and warnings on changed files.
   4. Full natedev gate passes (reds that also occur on base do not count).
+
+### Phase 396 — the wait holder tests pass under load  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** scripts/direct/test_verify_wait_holder.py (VerifyTargetWaitHolderTests) passes under gate load. bb6 went red at 2e7145b7b: the holder list had only the first session (the NEXT_SESSION NamedHolder was missing), and VerifyHoldTools.runTest hit "synchronous fixture hang guard expired" in selectors.select. Runs took 640-1225 s against 58 s alone.
+- **Spec:**
+  1. Find each place where the test or its fixture (scripts/direct/verify_hold_wait_test_support.py) depends on time: a hang guard, a deadline, a poll, or an order of events that load can change.
+  2. Make each wait end on the event the code gives (the second claim's record, a pipe, a FIFO, a reap). A hang guard stays only as a last limit far above any healthy run.
+  3. Fix it in the test or fixture. Change verify code only when production has the same race.
+  4. Tests read no /tune value. No signal handler, mask or disposition.
+- **Files:** `scripts/direct/test_verify_wait_holder.py`, `scripts/direct/verify_hold_wait_test_support.py`; verify production files only for a production race.
+- **Workers:** 1 writer.
+- **Constraints from prior phases:** test hold until natemerge lifts it (about 23:55 EST): static work first. Builds ranks it after 355.
+- **Acceptance gate:**
+  1. 20 repeated runs pass under a load like the gate's, TMPDIR=/tmp, 2 GB scope.
+  2. basedpyright zero errors and warnings on changed files.
+  3. Full natedev gate passes (reds that also occur on base do not count).
