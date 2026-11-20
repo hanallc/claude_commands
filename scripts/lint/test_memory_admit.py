@@ -6944,7 +6944,9 @@ class QueueExplanationTests(MemoryQueueFixture):
         _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         _ = self.waiting(300, 15 * GIB, 1)
         _ = self.waiting(400, 10 * GIB, 0)
-        reading = gate.queue_read_from(self.snapshot_inputs(), admission_policy_fixture())
+        inputs = self.snapshot_inputs()
+        policy = admission_policy_fixture()
+        reading = gate.queue_read_from(inputs, policy)
         head = reading.explanation.head
         assert isinstance(head, admission_records.HeadExplanation)
         follower = reading.explanation.line.steps[0]
@@ -6958,6 +6960,24 @@ class QueueExplanationTests(MemoryQueueFixture):
         self.assertEqual((follower.room, follower.free),
                          gate.decision_checks(follower.decision, 10 * GIB, 60 * GIB))
         self.assertEqual((head.room, head.free), gate.decision_checks(head.decision, 15 * GIB, 60 * GIB))
+
+        (older_path, older), (younger_path, younger) = inputs.ordered
+        checking = frozenset({admission_records.waiter_owner(older)})
+        route_check = replace(inputs, cloud_route_waiters=checking, ordered=[
+            (older_path, {**older, "step": "merge-gate", "need": 9 * GIB}),
+            (younger_path, {**younger, "step": "merge-gate", "need": GIB}),
+        ])
+        for name, past_deadline, next_need in (
+            ("before route deadline", frozenset[str](), 9 * GIB),
+            ("past route deadline", checking, GIB),
+        ):
+            with self.subTest(route_check=name):
+                evidence = replace(route_check, cloud_route_waiters_past_deadline=past_deadline)
+                report = gate.queue_read_from(evidence, policy).explanation
+                assert isinstance(report.room, admission_records.MemoryRoom)
+                status = memory_feed.memory_status(report, report.room, active_local_builds=0)
+                self.assertEqual(status["next_need_bytes"], next_need)
+                self.assertEqual([row["pid"] for row in report.ordered], [300, 400])
 
     def test_waiter_and_running_identity_matching_and_place_boundaries(self) -> None:
         _ = self.waiting(300, 12 * GIB, 20)

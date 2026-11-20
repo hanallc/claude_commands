@@ -2560,12 +2560,18 @@ class ContinuationClaimPolicy(Enum):
     KEEP_FOR_OWNER = "keep_for_owner"
 
 
+def route_check_keeps_order(inputs: QueueInputs, owner: str) -> bool:
+    """A route check keeps its order until its deadline."""
+    return owner not in inputs.cloud_route_waiters_past_deadline
+
+
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt, *,
                 resolved_order: bool = False,
                 claim_policy: ContinuationClaimPolicy = ContinuationClaimPolicy.RELEASE_FOR_EARLIER_WAITER
                 ) -> HeadPolicy:
     ordered = ranked_queue_waiters(inputs, resolved_order=resolved_order)
-    candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
+    candidate = first_queued_waiter((row for _, row in ordered
+        if route_check_keeps_order(inputs, records.waiter_owner(row))), inputs.pending_remote_starts)
     queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
     safety = policy.safety_bytes
     returned_claims: set[str] = set()
@@ -2637,7 +2643,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
     local_head = first_queued_waiter((row for _, row in ordered
         if can_use_natedev(row) and not waits_for_landing(inputs, row)
-        and records.waiter_owner(row) not in inputs.cloud_route_waiters_past_deadline), inputs.pending_remote_starts)
+        and route_check_keeps_order(inputs, records.waiter_owner(row))), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
     head_can_start_alone = not inputs.reservations and all(
         not slot_in_force(slot, inputs.now)
@@ -2673,7 +2679,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
         landing_wait = waits_for_landing(inputs, row)
-        keeps_order = not landing_wait and owner not in inputs.cloud_route_waiters_past_deadline
+        keeps_order = not landing_wait and route_check_keeps_order(inputs, owner)
         local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
         folder = inputs.cargo_folders.get(owner) if local_route else None
@@ -2991,7 +2997,8 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
                                     cause=cast(HeadAdmissionStatus, admission.reason).cause)
         else:
             line.append(LineWaiter(step, own.state == "admit", own, *decision_checks(own, step.need, available)))
-    if waiting and isinstance(first, NoWaiter):
+    if waiting and isinstance(first, NoWaiter) and all(
+            isinstance(entry.state, TokenWaitingWaiter) for entry in result.policy.walk):
         first = TokenWaitersOnly()
     # The compiler source records scan evidence for the alert. The queue view uses sources for swap ownership.
     running = tuple(replace(step, measured=replace(step.measured, anonymous_source=records.NoSource()))
