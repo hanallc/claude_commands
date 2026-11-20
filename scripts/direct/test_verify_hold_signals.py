@@ -150,10 +150,11 @@ read -r command
         history = self.record_phase()
         self.hold_after_first_step()
         observation = self.observe_waits()
-        ready = self.observe_step_hold_waiter()
+        pid_saved, ready = self.observe_step_hold_waiter()
         process = self.start("final")
         self.wait_for_call(process)
-        wait_for_verify_state(ready.exists, ready.parent, process, "the step hold waiter started")
+        wait_for_verify_state(lambda: pid_saved.exists() and ready.exists(), ready.parent, process,
+                              "verify saved the PID and the step hold waiter reached its file wait")
         process.send_signal(signal.SIGTERM)
         code, output = self.finish(process)
         self.assertEqual(code, 143, output)

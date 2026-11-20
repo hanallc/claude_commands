@@ -637,8 +637,9 @@ if arguments[:1] == ["metadata"]:''',
         )
         self.fixture.write_executable(cargo, source)
 
-    def observe_step_hold_waiter(self) -> Path:
-        """Mark the step wait after verify saves the waiter's PID."""
+    def observe_step_hold_waiter(self) -> tuple[Path, Path]:
+        """Mark when verify saves the PID and when the child enters the hold wait."""
+        pid_saved = self.fixture.root / "step-hold-pid-saved"
         ready = self.fixture.root / "step-hold-ready"
         script = self.fixture.verify_script
         source = script.read_text()
@@ -647,11 +648,26 @@ if arguments[:1] == ["metadata"]:''',
         wait = '    wait "$HOLD_WAITER_PID" || true'
         assert function.count(launch) == function.count(wait) == 1
         held = '    if [[ "$PHASE_RESOURCE_WAIT" == "natedev:build hold" ]]; then\n'
-        observed = function.replace(launch, held + '        local BUILD_TARGETS_POLL_S=$TEST_STEP_HOLD_GUARD\n    fi\n' + launch)
-        observed = observed.replace(wait, held + '        : > "$TEST_STEP_HOLD_READY"\n    fi\n' + wait)
+        observed = function.replace(launch, held + '''        local BUILD_TARGETS_POLL_S=$TEST_STEP_HOLD_GUARD
+        local -x TEST_STEP_HOLD_READY=$TEST_STEP_HOLD_MARKER
+    fi
+''' + launch)
+        observed = observed.replace(wait, held + '        : > "$TEST_STEP_HOLD_PID_SAVED"\n    fi\n' + wait)
         self.fixture.write_executable(script, source.replace(function, observed, 1))
+
+        waiter = script.with_name("local_release_wait.py")
+        source = waiter.read_text()
+        wait_for_events = "            events.wait(remaining)"
+        assert source.count(wait_for_events) == 1
+        # The waiter reaches this point after it arms inotify and reads the active hold.
+        observed_wait = '''            if marker := os.environ.get("TEST_STEP_HOLD_READY"):
+                Path(marker).touch()
+''' + wait_for_events
+        _ = waiter.write_text(source.replace(wait_for_events, observed_wait, 1))
         self.fixture.environment.update({
-            "TEST_STEP_HOLD_READY": str(ready),
+            "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(waiter),
+            "TEST_STEP_HOLD_PID_SAVED": str(pid_saved),
+            "TEST_STEP_HOLD_MARKER": str(ready),
             "TEST_STEP_HOLD_GUARD": str(TEST_HANG_GUARD_SECS),
         })
-        return ready
+        return pid_saved, ready
