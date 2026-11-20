@@ -793,8 +793,7 @@ class AccountsTests(unittest.TestCase):
                             unproved = accounts.move_group(group, "claude2", dry_run=True)
                 if missing_settings:
                     self.assertEqual(len(errors.getvalue().splitlines()), 1)
-                    self.assertIn("missing-settings-producer", errors.getvalue())
-                    self.assertIn("invalid producer settings", errors.getvalue())
+                    self.assertIn("invalid launch settings for producers.missing-settings-producer:", errors.getvalue())
                 else:
                     self.assertEqual(errors.getvalue(), "")
                 document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
@@ -7853,8 +7852,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 if missing_settings:
                     self.assertEqual(code, 1)
                     self.assertEqual(len(errors.splitlines()), 1)
-                    self.assertIn("missing-settings-producer", errors)
-                    self.assertIn("invalid producer settings", errors)
+                    self.assertIn("invalid launch settings for producers.missing-settings-producer:", errors)
                 else:
                     self.assertEqual((code, errors), (1, ""), errors)
                 self.assertEqual(agent_accounts.workers_home(), target)
@@ -7881,8 +7879,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                 if missing_settings:
                     self.assertEqual(code, 0)
                     self.assertEqual(len(errors.splitlines()), 1)
-                    self.assertIn("missing-settings-producer", errors)
-                    self.assertIn("invalid producer settings", errors)
+                    self.assertIn("invalid launch settings for producers.missing-settings-producer:", errors)
                 else:
                     self.assertEqual((code, errors), (0, ""))
                 self.assertEqual({cast(staff.StaffRow, entry.args[0]).id for entry in preview.call_args_list}, {failed.id, pending.id})
