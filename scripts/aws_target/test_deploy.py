@@ -1105,7 +1105,8 @@ class HanaSetupFailureTests(CostFixture):
                 self.instance_reads.append(list(arguments))
                 self.assertEqual(arguments[offset + 2:offset + 4], ['--instance-ids', instance])
                 reply = {'Reservations': [{'Instances': [{'InstanceId': instance,
-                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state}, 'InstanceLifecycle': 'spot',
+                    'ImageId': prepared.parameters['Image'], 'LaunchTime': 'fixture-launch',
+                    'State': {'Name': live_state}, 'InstanceLifecycle': 'spot',
                     'BlockDeviceMappings': [{'DeviceName': '/dev/sdf', 'Ebs': {
                         'VolumeId': volume, 'DeleteOnTermination': False}}],
                     'SpotInstanceRequestId': saved['spot_request']}]}]}
