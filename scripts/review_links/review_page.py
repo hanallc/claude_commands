@@ -1520,7 +1520,15 @@ const firstReviewCard=(()=>{
 })();
 '''
 
-REVIEW_TABLE_SCRIPT = r'''
+SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + record_table.DATE_TIME_SCRIPT
+          + REVIEW_CARD_SCRIPT + r'''(reviewPlace => {
+let content=document.querySelector('[data-review]');
+const saved=new Map(),bodies=new Map(),bodyRequests=new Map();
+const pendingSaves=new Map(),recovering=new Map();
+const scrollDepartures=new Set();
+const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
+let focusAfterLoad=null,firstRequest=firstReviewCard;
+let deferredLink=null,revealCreated=null;
 function allEntries(){return [...index.values()];}
 function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
 function matchesOwner(entry,owner){return !owner || entry.owner===owner || isInvestigation(entry) && entry.sourceOwner===owner;}
@@ -1612,17 +1620,7 @@ const view=createRecordTable({content:()=>content,
    button.querySelector('b').textContent=matching({...filters,type:button.dataset.typeChip}).length;
   });
  }
-});'''
-
-SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + record_table.DATE_TIME_SCRIPT
-          + REVIEW_CARD_SCRIPT + r'''(reviewPlace => {
-let content=document.querySelector('[data-review]');
-const saved=new Map(),bodies=new Map(),bodyRequests=new Map();
-const pendingSaves=new Map(),recovering=new Map();
-const scrollDepartures=new Set();
-const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
-let focusAfterLoad=null,firstRequest=firstReviewCard;
-let deferredLink=null,revealCreated=null;''' + REVIEW_TABLE_SCRIPT + r'''
+});
 async function afterRowAnimations(run,current=()=>true){
  while(current() && view.hasActiveRowAnimations) await view.settled();
  if(current()) return run();
